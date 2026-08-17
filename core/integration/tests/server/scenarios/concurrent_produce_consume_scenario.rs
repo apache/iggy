@@ -49,7 +49,7 @@ const MAX_TEST_DURATION: Duration = Duration::from_secs(60);
 /// `messages_required_to_save = "1"` forces every batch to trigger an inline
 /// journal commit. The next send arrives before async persist completes, creating
 /// State C (journal non-empty + in-flight non-empty simultaneously).
-#[iggy_harness(server(message_saver.enabled = true, message_saver.interval = "100ms"))]
+#[iggy_harness]
 async fn concurrent_produce_consume_no_offset_skip(harness: &TestHarness) {
     let stream_id = Identifier::named(STREAM_NAME).unwrap();
     let topic_id = Identifier::named(TOPIC_NAME).unwrap();

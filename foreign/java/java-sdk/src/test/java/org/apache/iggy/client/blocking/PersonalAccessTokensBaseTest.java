@@ -23,7 +23,7 @@ import org.apache.iggy.user.IdentityInfo;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.math.BigInteger;
+import java.time.Duration;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -51,8 +51,7 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
     @Test
     void shouldManagePersonalAccessTokens() {
         // when
-        var createdToken =
-                personalAccessTokensClient.createPersonalAccessToken("new-token", BigInteger.valueOf(50_000));
+        var createdToken = personalAccessTokensClient.createPersonalAccessToken("new-token", Duration.ofHours(1));
 
         // then
         assertThat(createdToken).isNotNull();
@@ -75,8 +74,7 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
     @Test
     void shouldCreateAndLogInWithPersonalAccessToken() {
         // given
-        var createdToken =
-                personalAccessTokensClient.createPersonalAccessToken("new-token", BigInteger.valueOf(50_000));
+        var createdToken = personalAccessTokensClient.createPersonalAccessToken("new-token", Duration.ofHours(1));
         client.users().logout();
 
         // when

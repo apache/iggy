@@ -41,6 +41,22 @@ runs:
         dotnet restore
       shell: bash
 
+    - name: Validate package metadata
+      run: |
+        cd foreign/csharp
+        PACKAGE=$(dotnet msbuild ./Iggy_SDK -nologo -getProperty:PackageId)
+        VERSION=$(dotnet msbuild ./Iggy_SDK -nologo -getProperty:Version)
+
+        if [ "$PACKAGE" != "Apache.Iggy" ]; then
+          echo "❌ Iggy_SDK.csproj PackageId must be Apache.Iggy, got: $PACKAGE"
+          exit 1
+        fi
+        if [ "$VERSION" != "${{ inputs.version }}" ]; then
+          echo "❌ Iggy_SDK.csproj version ($VERSION) does not match ${{ inputs.version }}"
+          exit 1
+        fi
+      shell: bash
+
     - name: Build Release
       run: |
         cd foreign/csharp
@@ -73,9 +89,16 @@ runs:
         ls -la ./nupkgs/ || echo "No packages found"
       shell: bash
 
+    - name: Authenticate with NuGet
+      if: inputs.dry_run == 'false'
+      id: nuget-auth
+      uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+      with:
+        user: apache.iggy
+
     - name: Publish to NuGet
       env:
-        NUGET_API_KEY: ${{ env.NUGET_API_KEY }}
+        NUGET_API_KEY: ${{ steps.nuget-auth.outputs.NUGET_API_KEY }}
       run: |
         cd foreign/csharp
 
@@ -92,7 +115,7 @@ runs:
           done
         else
           if [ -z "$NUGET_API_KEY" ]; then
-            echo "❌ NUGET_API_KEY is not set"
+            echo "❌ NuGet trusted publishing did not return an API key"
             exit 1
           fi
 

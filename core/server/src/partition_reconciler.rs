@@ -140,7 +140,7 @@
 //! so a parked op N is re-queued *behind* an op N+1 that was already sitting in
 //! the inbox. The partition plane then sees N+1 first, rejects it against its
 //! backup gap check, and N+1 is gone -- with no normal-status repair driver to
-//! refetch it (see the TODO below). Ordering has to be restored at the plane, by
+//! refetch it (see the TODO above). Ordering has to be restored at the plane, by
 //! buffering out-of-order prepares rather than dropping them, or by re-dispatching
 //! through a priority path that preserves op order.
 //!
@@ -1084,9 +1084,10 @@ fn shards_table_has_epoch(ctx: &ReconcilerCtx, ns: IggyNamespace, epoch: u64) ->
 /// so a redundant pass triggered by an unrelated revision bump is harmless.
 /// A watermark whose enforcement is still incomplete (first local segment
 /// starts below it) counts as pending work: the pump may be blocked by a
-/// consumer barrier or by a rejoin whose offsets arrive via journal repair,
-/// and neither unblocking bumps `Streams::revision`, so the pass must keep
-/// the reconciler ticking until the layout converges.
+/// consumer barrier, by a rejoin whose offsets arrive via journal repair, or
+/// by the per-pass removal budget that keeps one trim from monopolising the
+/// pump, and no such unblocking bumps `Streams::revision`, so the pass must
+/// keep the reconciler ticking until the layout converges.
 fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let partitions = ctx.shard.plane.partitions();
     let namespaces: Vec<_> = partitions.namespaces().copied().collect();

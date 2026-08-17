@@ -21,10 +21,9 @@ use super::server::{
 };
 use super::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
-    server::MessageSaverConfig,
     system::{
-        CompressionConfig, EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig,
-        StateConfig, StreamConfig, SystemConfig, TopicConfig,
+        EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig, StreamConfig,
+        SystemConfig, TopicConfig,
     },
 };
 use configs::ConfigEnvMappings;
@@ -93,16 +92,6 @@ impl Display for HttpTlsConfig {
     }
 }
 
-impl Display for CompressionConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ allowed_override: {}, default_algorithm: {} }}",
-            self.allow_override, self.default_algorithm
-        )
-    }
-}
-
 impl Display for DataMaintenanceConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{{ messages: {} }}", self.messages)
@@ -121,21 +110,7 @@ impl Display for MessagesMaintenanceConfig {
 
 impl Display for ConsumerGroupConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ rebalancing_timeout: {}, rebalancing_check_interval: {} }}",
-            self.rebalancing_timeout, self.rebalancing_check_interval
-        )
-    }
-}
-
-impl Display for MessageSaverConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ enabled: {}, enforce_fsync: {}, interval: {} }}",
-            self.enabled, self.enforce_fsync, self.interval
-        )
+        write!(f, "{{ rebalancing_timeout: {} }}", self.rebalancing_timeout)
     }
 }
 
@@ -179,11 +154,7 @@ impl Display for PartitionConfig {
 
 impl Display for SegmentConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ cache_indexes: {}, archive_expired: {} }}",
-            self.cache_indexes, self.archive_expired,
-        )
+        write!(f, "{{ archive_expired: {} }}", self.archive_expired,)
     }
 }
 
@@ -223,16 +194,6 @@ impl Display for TelemetryLogsConfig {
     }
 }
 
-impl Display for StateConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ enforce_fsync: {}, max_file_operation_retries: {}, retry_delay: {} }}",
-            self.enforce_fsync, self.max_file_operation_retries, self.retry_delay,
-        )
-    }
-}
-
 impl Display for TelemetryTracesConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -247,7 +208,7 @@ impl<S: ConfigEnvMappings> Display for SystemConfig<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {}, state: {} }}",
+            "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {} }}",
             self.path,
             self.logging,
             self.stream,
@@ -255,7 +216,6 @@ impl<S: ConfigEnvMappings> Display for SystemConfig<S> {
             self.partition,
             self.segment,
             self.encryption,
-            self.state,
         )
     }
 }

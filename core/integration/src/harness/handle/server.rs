@@ -18,7 +18,7 @@
 use super::client_builder::{ClientBuilder, ServerConnection};
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
-use crate::harness::config::{ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig};
+use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
@@ -296,12 +296,6 @@ impl ServerHandle {
         self.envs
             .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
-
-        if self.config.ip_kind == IpAddrKind::V6 {
-            self.envs
-                .entry("IGGY_TCP_IPV6".to_string())
-                .or_insert_with(|| "true".to_string());
-        }
 
         self.envs
             .entry("IGGY_ROOT_USERNAME".to_string())

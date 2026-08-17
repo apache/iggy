@@ -92,7 +92,6 @@ use tracing::{debug, warn};
 // `SendMessages` retries are at-least-once and may commit multiple times.
 // Duplicate suppression is a consensus-layer concern: the VSR client table
 // dedups by request id (at-most-once), so the data plane needs no message-id set.
-// (message-id based) if they care.
 pub struct IggyPartition<B = IggyMessageBus, SB = PingPongSuperblock>
 where
     B: MessageBus,
@@ -2893,10 +2892,13 @@ where
             }
             return Ok(());
         }
-        // Persist the prefix in segment-sized chunks: a segment seals exactly
-        // when its committed bytes reach `max_size`, no matter how many
-        // entries this flush happens to cover. A backup commits in bursts
-        // behind the primary, so any grouping- or timing-sensitive roll rule
+        // Persist the prefix in segment-sized chunks: a segment seals on the
+        // first flush whose committed bytes reach OR EXCEED `max_size`, no
+        // matter how many entries this flush happens to cover. The batch that
+        // crosses the cap is appended whole, so a sealed segment lands
+        // anywhere in `[max_size, max_size + one maximum batch)` and never
+        // exactly at `max_size`. A backup commits in bursts behind the
+        // primary, so any grouping- or timing-sensitive roll rule
         // (like keying rotation on the journal-position `is_full` above)
         // seals segments at per-replica offsets, and the offset-keyed segment
         // GC staged by the reconciler never converges across the cluster.
@@ -3844,19 +3846,22 @@ where
     }
 
     /// Time-expiry plus size-retention in one pass: remove the leading sealed
-    /// segments that have expired or that push the partition past `max_bytes`.
-    /// Returns the `(segments, messages)` removed.
+    /// segments that have expired or that push the partition's SEALED bytes
+    /// past `max_bytes`. Capped per call by
+    /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
+    /// [`SegmentRemoval::budget_spent`] tells the caller whether the rest is
+    /// still waiting.
     pub async fn clean_expired_segments(
         &mut self,
         now: IggyTimestamp,
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
-    ) -> (u64, u64) {
+    ) -> SegmentRemoval {
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
             max_bytes.and_then(|max_bytes| leading_oversized_end(self.log.segments(), max_bytes));
         let Some(up_to) = expired.into_iter().chain(oversized).max() else {
-            return (0, 0);
+            return SegmentRemoval::default();
         };
         self.remove_sealed_segments_up_to(up_to).await
     }
@@ -3865,12 +3870,20 @@ where
     /// never the active segment and never past the consumer barrier (the
     /// minimum committed consumer/group offset). Unlinks the messages and
     /// index files and decrements partition stats. Idempotent: an offset below
-    /// the oldest sealed segment removes nothing. Returns the
-    /// `(segments, messages)` removed.
+    /// the oldest sealed segment removes nothing.
+    ///
+    /// NOT exhaustive: at most `SEGMENT_REMOVAL_BUDGET_PER_PASS` segments go
+    /// per call, so a caller enforcing a retention decision has to re-issue it
+    /// until the layout converges rather than assume one call finished the job.
+    /// Both callers already do: the segment cleaner re-stages on
+    /// [`SegmentRemoval::budget_spent`] and again on its
+    /// `data_maintenance.messages.interval` tick, and the partition reconciler
+    /// re-stages a committed delete watermark on every pass while the first
+    /// local segment still starts below it.
     ///
     /// Holds `write_lock` to serialize against the commit/rotate path, which
     /// runs on the separate consensus-tick loop.
-    pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> (u64, u64) {
+    pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
@@ -3880,7 +3893,13 @@ where
             let segments = self.log.segments();
             let last_idx = segments.len().saturating_sub(1);
             let mut removable = 0usize;
-            for (idx, segment) in segments.iter().enumerate() {
+            // One past the budget: the extra slot separates a run that ends
+            // exactly on the budget from one with more still waiting.
+            for (idx, segment) in segments
+                .iter()
+                .enumerate()
+                .take(SEGMENT_REMOVAL_BUDGET_PER_PASS + 1)
+            {
                 if idx == last_idx || !segment.sealed || segment.end_offset > up_to_offset {
                     break;
                 }
@@ -3905,8 +3924,12 @@ where
             removable
         };
 
-        let mut deleted_segments = 0u64;
-        let mut deleted_messages = 0u64;
+        let budget_spent = removable > SEGMENT_REMOVAL_BUDGET_PER_PASS;
+        let removable = removable.min(SEGMENT_REMOVAL_BUDGET_PER_PASS);
+        let mut removal = SegmentRemoval {
+            budget_spent,
+            ..SegmentRemoval::default()
+        };
         for _ in 0..removable {
             // The removable run is always a prefix (oldest first), so the next
             // victim is the front once the previous one is gone.
@@ -3946,8 +3969,8 @@ where
             self.stats.decrement_segments_count(1);
             self.stats.decrement_messages_count(messages_in_segment);
 
-            deleted_segments += 1;
-            deleted_messages += messages_in_segment;
+            removal.segments += 1;
+            removal.messages += messages_in_segment;
 
             debug!(
                 target: "iggy.partitions.diag",
@@ -3959,7 +3982,7 @@ where
             );
         }
 
-        (deleted_segments, deleted_messages)
+        removal
     }
 
     /// Build and install a fresh empty segment starting at `start_offset` with
@@ -4910,6 +4933,41 @@ fn accumulate_committed_info(
     info.max_timestamp = info.max_timestamp.max(base_timestamp);
 }
 
+/// Sealed segments one call to [`IggyPartition::remove_sealed_segments_up_to`]
+/// may unlink before it stops and leaves the rest to the next pass.
+///
+/// The removal loop runs inside ONE frame body on the shard pump, and this
+/// shard's consensus ticks are a sibling select arm that stays unpolled while
+/// that body awaits, so the budget is really a bound on how long every OTHER
+/// group on this core goes without a heartbeat. Uncapped it is a bound on the
+/// backlog instead: the first pass after the cleaner is switched on walks
+/// however many segments retention accumulated, which on a large log silences
+/// those groups long enough to lose them to a view change.
+///
+/// A SEGMENT budget standing in for a time bound, so the margin is filesystem
+/// specific: 16 segments is at most 32 unlinks (log plus index), a few hundred
+/// milliseconds on commodity `NVMe` against the shipped 5 s
+/// `cluster.heartbeat_timeout`, and still under 2 s if each unlink costs a
+/// pathological 50 ms on a contended journal. Large enough that steady-state
+/// retention, which reclaims a handful of segments per interval, never reaches
+/// it -- only a backlog does, and that one drains over several passes.
+const SEGMENT_REMOVAL_BUDGET_PER_PASS: usize = 16;
+
+/// What one call to [`IggyPartition::remove_sealed_segments_up_to`] reclaimed.
+///
+/// `budget_spent` reports that the pass stopped on
+/// `SEGMENT_REMOVAL_BUDGET_PER_PASS` rather than on the end of the removable
+/// run, so a caller can re-stage immediately instead of leaving the rest until
+/// its next interval tick. The budget itself stays private: the signal is what
+/// callers need, and reading the number would invite them to rebuild the
+/// comparison.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentRemoval {
+    pub segments: u64,
+    pub messages: u64,
+    pub budget_spent: bool,
+}
+
 /// Highest `end_offset` among the leading run of expired sealed segments, or
 /// `None` when none are expired. The last element is the active segment and is
 /// never considered. `expiry` must be resolved; a `ServerDefault` expires
@@ -4930,14 +4988,21 @@ fn leading_expired_end(
     up_to
 }
 
-/// Highest `end_offset` to drop so the resident size falls to `max_bytes`, or
-/// `None` when already under budget. The active segment (last element) is
-/// never dropped. The budget is per-partition: the cluster has no single owner
-/// of a topic-wide total, so each replica trims its own log.
+/// Highest `end_offset` to drop so the SEALED resident size falls to
+/// `max_bytes`, or `None` when already under budget. The active segment (last
+/// element) is never dropped. The budget is per-partition: the cluster has no
+/// single owner of a topic-wide total, so each replica trims its own log.
+///
+/// The active segment's bytes are excluded from the running total, not merely
+/// from the deletions. Counting bytes that can never be reclaimed lets them
+/// evict the sealed history instead: at a budget near one segment the active
+/// one alone exceeds it, and every sealed segment is dropped no matter how
+/// small the log is.
 fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut resident: u64 = segments
         .iter()
+        .take(last_idx)
         .map(|segment| segment.size.as_bytes_u64())
         .sum();
     let mut up_to = None;
@@ -7008,6 +7073,68 @@ mod retention_tests {
         IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)))
     }
 
+    /// Shape of one sealed segment in the [`partition_with_sealed_run`] fixture.
+    const MESSAGES_PER_SEGMENT: u64 = 10;
+    const BYTES_PER_SEGMENT: u64 = 100;
+
+    /// A topic's configured segment size, and the largest batch that can be
+    /// appended to it.
+    const SEGMENT_SIZE: u64 = 1_000;
+    const MAX_BATCH_SIZE: u64 = 100;
+    /// The size a sealed segment actually reaches. The batch that crosses
+    /// `SEGMENT_SIZE` is appended whole, so a sealed segment closes somewhere
+    /// in `[SEGMENT_SIZE, SEGMENT_SIZE + MAX_BATCH_SIZE)`. Retention asserted
+    /// at exactly `SEGMENT_SIZE` would miss that entirely.
+    const SEALED_SIZE: u64 = SEGMENT_SIZE + 40;
+    /// What the cleaner enforces for a cap of one segment: the per-partition
+    /// share, floored at the largest a sealed segment can be.
+    const FLOORED_BUDGET: u64 = SEGMENT_SIZE + MAX_BATCH_SIZE;
+
+    fn sealed_run_segment(start_offset: u64) -> Segment {
+        let mut segment = segment(
+            start_offset + MESSAGES_PER_SEGMENT - 1,
+            1,
+            BYTES_PER_SEGMENT,
+            true,
+        );
+        segment.start_offset = start_offset;
+        segment
+    }
+
+    /// Partition whose log is `sealed_count` sealed segments followed by the
+    /// active one, with stats seeded to match. Every storage is the in-memory
+    /// default (no reader, so no path), which is what lets retirement run its
+    /// full body here without touching the filesystem.
+    fn partition_with_sealed_run(sealed_count: u64) -> IggyPartition<IggyMessageBus> {
+        let mut partition = super::tests::test_partition();
+        // The fixture ships one unsealed segment: rewrite it as the head of the
+        // run and append a fresh active segment last, where the removal walk
+        // always stops.
+        partition.log.segments_mut()[0] = sealed_run_segment(0);
+        for index in 1..sealed_count {
+            partition.log.add_persisted_segment(
+                sealed_run_segment(index * MESSAGES_PER_SEGMENT),
+                SegmentStorage::default(),
+                None,
+                None,
+            );
+        }
+        partition.log.add_persisted_segment(
+            Segment::new(
+                sealed_count * MESSAGES_PER_SEGMENT,
+                IggyByteSize::from(0u64),
+            ),
+            SegmentStorage::default(),
+            None,
+            None,
+        );
+        let stats = &partition.stats;
+        stats.increment_segments_count(u32::try_from(sealed_count).expect("run fits a u32"));
+        stats.increment_messages_count(sealed_count * MESSAGES_PER_SEGMENT);
+        stats.increment_size_bytes(sealed_count * BYTES_PER_SEGMENT);
+        partition
+    }
+
     #[test]
     fn leading_expired_end_skips_active_and_returns_last_expired() {
         let segments = vec![
@@ -7055,15 +7182,15 @@ mod retention_tests {
 
     #[test]
     fn leading_oversized_end_trims_oldest_until_under_budget() {
-        // 4 x 100 = 400 resident, active excluded. Budget 250: drop seg0 (300
-        // left) then seg1 (200 <= 250, stop). up_to = seg1.end_offset.
+        // 3 x 100 = 300 SEALED resident, the active segment's bytes excluded.
+        // Budget 250: drop seg0 (200 <= 250, stop). up_to = seg0.end_offset.
         let segments = vec![
             segment(9, 1, 100, true),
             segment(19, 2, 100, true),
             segment(29, 3, 100, true),
             segment(39, 0, 100, false),
         ];
-        assert_eq!(leading_oversized_end(&segments, 250), Some(19));
+        assert_eq!(leading_oversized_end(&segments, 250), Some(9));
     }
 
     #[test]
@@ -7076,6 +7203,38 @@ mod retention_tests {
     fn leading_oversized_end_never_drops_active_segment() {
         let segments = vec![segment(9, 1, 1_000, false)];
         assert_eq!(leading_oversized_end(&segments, 10), None);
+    }
+
+    #[test]
+    fn leading_oversized_end_retains_an_overshot_sealed_segment_at_the_floored_budget() {
+        // The shape admission accepts at the floor: max_topic_size == one
+        // segment. The sealed segment overshot, and the active one holds far
+        // more than the budget. Counting the active segment, or dividing the
+        // cap without a floor, deletes the only history this partition has.
+        let segments = vec![
+            segment(9, 1, SEALED_SIZE, true),
+            segment(19, 0, SEGMENT_SIZE * 5, false),
+        ];
+        assert_eq!(leading_oversized_end(&segments, FLOORED_BUDGET), None);
+        // The same segments against the UNFLOORED share, which is what a cap of
+        // one segment divides into. It is under what a sealed segment reaches,
+        // so the history goes -- which is why the budget carries a floor.
+        assert_eq!(leading_oversized_end(&segments, SEGMENT_SIZE), Some(9));
+    }
+
+    #[test]
+    fn leading_oversized_end_still_drops_the_oldest_once_two_sealed_segments_exceed_the_budget() {
+        // Same budget, one sealed segment more: the cap is real, not disabled.
+        let segments = vec![
+            segment(9, 1, SEALED_SIZE, true),
+            segment(19, 2, SEALED_SIZE, true),
+            segment(29, 0, SEGMENT_SIZE * 5, false),
+        ];
+        assert_eq!(
+            leading_oversized_end(&segments, FLOORED_BUDGET),
+            Some(9),
+            "the oldest sealed segment goes, the newest one stays"
+        );
     }
 
     #[test]
@@ -7108,6 +7267,73 @@ mod retention_tests {
     fn nth_oldest_sealed_end_none_for_lone_active_segment() {
         let segments = vec![segment(9, 1, 100, false)];
         assert_eq!(nth_oldest_sealed_end(&segments, 1), None);
+    }
+
+    #[compio::test]
+    async fn removal_spends_the_per_pass_budget_and_resumes_on_the_next_pass() {
+        let budget = u64::try_from(SEGMENT_REMOVAL_BUDGET_PER_PASS).expect("budget fits a u64");
+        let sealed_count = budget + 3;
+        let mut partition = partition_with_sealed_run(sealed_count);
+        // The whole run qualifies: every sealed segment ends at or below
+        // `up_to`, and a partition nobody has committed against has no barrier.
+        let up_to = sealed_count * MESSAGES_PER_SEGMENT - 1;
+        let segments_len = |partition: &IggyPartition<IggyMessageBus>| {
+            u64::try_from(partition.log.segments().len()).expect("log fits a u64")
+        };
+
+        let removal = partition.remove_sealed_segments_up_to(up_to).await;
+        assert_eq!(removal.segments, budget, "one pass stops at the budget");
+        assert_eq!(removal.messages, budget * MESSAGES_PER_SEGMENT);
+        assert!(
+            removal.budget_spent,
+            "a pass that stopped on the budget must ask to be re-staged"
+        );
+        assert_eq!(segments_len(&partition), sealed_count + 1 - budget);
+        assert_eq!(
+            partition.log.segments()[0].start_offset,
+            budget * MESSAGES_PER_SEGMENT,
+            "the surviving run starts where the budget stopped"
+        );
+
+        let remainder = sealed_count - budget;
+        let removal = partition.remove_sealed_segments_up_to(up_to).await;
+        assert_eq!(
+            removal.segments, remainder,
+            "a later pass finishes the run it was handed"
+        );
+        assert_eq!(removal.messages, remainder * MESSAGES_PER_SEGMENT);
+        assert!(
+            !removal.budget_spent,
+            "a pass that drained the run must not re-stage"
+        );
+        assert_eq!(
+            segments_len(&partition),
+            1,
+            "only the active segment survives"
+        );
+
+        let stats = &partition.stats;
+        assert_eq!(stats.segments_count_inconsistent(), 1);
+        assert_eq!(stats.messages_count_inconsistent(), 0);
+        assert_eq!(stats.size_bytes_inconsistent(), 0);
+        assert_eq!(
+            partition.remove_sealed_segments_up_to(up_to).await,
+            SegmentRemoval::default(),
+            "a converged partition removes nothing"
+        );
+
+        // A run that ends exactly on the budget is finished by the pass that
+        // spends it; re-staging would hand the pump a no-op frame.
+        let mut exact = partition_with_sealed_run(budget);
+        let removal = exact
+            .remove_sealed_segments_up_to(budget * MESSAGES_PER_SEGMENT - 1)
+            .await;
+        assert_eq!(removal.segments, budget, "the whole run goes in one pass");
+        assert!(
+            !removal.budget_spent,
+            "a run that ends on the budget has nothing left to re-stage"
+        );
+        assert_eq!(segments_len(&exact), 1, "only the active segment survives");
     }
 }
 

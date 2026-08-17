@@ -42,9 +42,8 @@ use std::sync::Arc;
 
 pub use crate::common::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
-    MessageSaverConfig, MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig,
-    PersonalAccessTokenConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
-    TelemetryTransport,
+    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
+    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
@@ -108,7 +107,6 @@ pub struct ServerConfig {
     pub data_maintenance: DataMaintenanceConfig,
     #[serde(default)]
     pub extra: ExtraConfig,
-    pub message_saver: MessageSaverConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
     pub system: Arc<ServerSystemConfig>,
