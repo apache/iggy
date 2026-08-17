@@ -765,3 +765,76 @@ enum ReplicaHandshakeOutcome {
     ReleaseSlot(u64),
     ClearDial(u8),
 }
+
+#[cfg(test)]
+mod tests {
+    use iggy_binary_protocol::{
+        Command2, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader, frame_checksum_bytes,
+    };
+    use server_common::iobuf::Owned;
+    use server_common::{MESSAGE_ALIGN, Message, MessageBag};
+    use std::mem::offset_of;
+
+    /// RED SPEC, expected to FAIL: pins the mixed-cluster upgrade hole in
+    /// `dispatch`'s decode seam.
+    ///
+    /// An `Operation` discriminant this build does not know, arriving on an
+    /// otherwise wire-valid consensus frame (correct command, size, checksum:
+    /// exactly what a newer release sends after an op addition), decodes to
+    /// the same undifferentiated `ConsensusError::InvalidBitPattern` as random
+    /// memory corruption. `dispatch` answers both identically: a warn log and
+    /// a dropped frame. No metric, no peer error, no eviction, no version
+    /// fence. An old node in a mixed cluster therefore gap-stops its consensus
+    /// group silently (never journals the op, never sends a `PrepareOk`, every
+    /// later prepare dies on the gap check) while quorum hides the outage.
+    ///
+    /// Passes once the decode surfaces a dedicated unsupported-operation
+    /// signal the router can fence and account, instead of collapsing it into
+    /// the corruption error.
+    #[test]
+    // TODO(hubcio): fix this test
+    #[ignore = "unknown operation collapses into InvalidBitPattern; no upgrade fence"]
+    fn given_an_unknown_operation_when_a_consensus_frame_decodes_should_surface_an_upgrade_fence_signal()
+     {
+        // Far past every defined Operation discriminant (the highest is 165).
+        const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let frame = owned.as_mut_slice();
+            let size_offset = offset_of!(PrepareHeader, size);
+            let frame_size = u32::try_from(HEADER_SIZE).expect("header size fits in u32");
+            frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
+            frame[offset_of!(PrepareHeader, command)] = Command2::Prepare as u8;
+            let client_offset = offset_of!(PrepareHeader, client);
+            frame[client_offset..client_offset + 16].copy_from_slice(&0xCAFE_u128.to_le_bytes());
+            frame[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+            // Seal the checksum the way a real sender does, so the frame's
+            // only anomaly is the operation byte itself.
+            let header: &[u8; HEADER_SIZE] = frame[..HEADER_SIZE]
+                .try_into()
+                .expect("frame spans a full header");
+            let checksum = frame_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&checksum.to_le_bytes());
+        }
+
+        // The generic view carries no operation field, so the receive path
+        // accepts the frame; the unknown byte is first seen by the typed
+        // decode inside `MessageBag::try_from`, which is what `dispatch` runs.
+        let message = Message::<GenericHeader>::try_from(owned)
+            .expect("a sealed Prepare frame is wire-valid in the generic view");
+
+        let Err(error) = MessageBag::try_from(message) else {
+            panic!("an operation this build does not know must not decode into a bag");
+        };
+
+        assert!(
+            !matches!(error, ConsensusError::InvalidBitPattern),
+            "unknown operation {OPERATION_FROM_A_NEWER_RELEASE:#x} is silently dropped: the \
+             typed decode collapses a wire-valid frame from a newer release into the same \
+             InvalidBitPattern as corruption, and dispatch drops both with only a warn log, \
+             no operator signal and no upgrade fence, so an old node in a mixed cluster \
+             gap-stops its consensus group while quorum hides it; got {error:?}"
+        );
+    }
+}
