@@ -82,14 +82,14 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
     if !config.server_address.is_empty() {
         builder = builder.with_server_address(config.server_address);
     }
-    match config.auto_login_kind.as_str() {
-        "" | "disabled" => {}
-        "username_password" => {
+    match config.auto_login_kind {
+        ffi::AutoLoginKind::Disabled => {}
+        ffi::AutoLoginKind::UsernamePassword => {
             builder = builder.with_auto_sign_in(RustAutoLogin::Enabled(
                 RustCredentials::UsernamePassword(config.username, config.password.into()),
             ));
         }
-        "personal_access_token" => {
+        ffi::AutoLoginKind::PersonalAccessToken => {
             builder = builder.with_auto_sign_in(RustAutoLogin::Enabled(
                 RustCredentials::PersonalAccessToken(config.personal_access_token.into()),
             ));

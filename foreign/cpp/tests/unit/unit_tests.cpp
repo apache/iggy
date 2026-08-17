@@ -202,6 +202,21 @@ TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
     EXPECT_THROW(client.Logout(), iggy::IggyException);
 }
 
+TEST(AutoLoginKindTest, HasStableDiscriminantsAndZeroInitializedDefault) {
+    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::Disabled), 0u);
+    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::UsernamePassword), 1u);
+    EXPECT_EQ(static_cast<std::uint8_t>(iggy::ffi::AutoLoginKind::PersonalAccessToken), 2u);
+
+    const iggy::ffi::IggyClientConfig config{};
+    EXPECT_EQ(config.auto_login_kind, iggy::ffi::AutoLoginKind::Disabled);
+}
+
+TEST(IggyBlockingClientBuilderTest, BuildsWithEachAutoLoginKind) {
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().Build());
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().WithAutoLogin("iggy", "iggy").Build());
+    EXPECT_NO_THROW((void)iggy::IggyBlockingClient::Builder().WithPersonalAccessToken("token").Build());
+}
+
 TEST(IggyBlockingClientBuilderTest, RejectsTlsDomainWhenTlsIsDisabled) {
     EXPECT_THROW((void)iggy::IggyBlockingClient::Builder().WithTlsDomain("localhost").Build(), iggy::IggyException);
 }

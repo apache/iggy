@@ -117,7 +117,7 @@ IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithServerAddress(std:
 }
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithAutoLogin(std::string username, std::string password) {
-    auto_login_kind_     = "username_password";
+    auto_login_kind_     = ffi::AutoLoginKind::UsernamePassword;
     auto_login_username_ = std::move(username);
     auto_login_password_ = std::move(password);
     personal_access_token_.clear();
@@ -125,7 +125,7 @@ IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithAutoLogin(std::str
 }
 
 IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithPersonalAccessToken(std::string token) {
-    auto_login_kind_       = "personal_access_token";
+    auto_login_kind_       = ffi::AutoLoginKind::PersonalAccessToken;
     personal_access_token_ = std::move(token);
     auto_login_username_.clear();
     auto_login_password_.clear();

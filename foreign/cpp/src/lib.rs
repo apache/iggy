@@ -401,9 +401,16 @@ mod ffi {
         access_token_expiry: u64,
     }
 
+    #[repr(u8)]
+    enum AutoLoginKind {
+        Disabled = 0,
+        UsernamePassword,
+        PersonalAccessToken,
+    }
+
     struct IggyClientConfig {
         server_address: String,
-        auto_login_kind: String,
+        auto_login_kind: AutoLoginKind,
         username: String,
         password: String,
         personal_access_token: String,

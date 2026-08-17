@@ -870,7 +870,7 @@ class IggyBlockingClient::Builder final {
 
   private:
     std::string server_address_;
-    std::string auto_login_kind_ = "disabled";
+    ffi::AutoLoginKind auto_login_kind_ = ffi::AutoLoginKind::Disabled;
     std::string auto_login_username_;
     std::string auto_login_password_;
     std::string personal_access_token_;
