@@ -58,7 +58,14 @@ pub(in crate::http) fn encode_send_messages(
     let raw_messages: Vec<RawMessage<'_>> = views
         .iter()
         .map(|view| RawMessage {
-            id: view.header().id(),
+            // HTTP producers send no id; the producer side owns minting now
+            // (the id sits under the frame checksum), and for JSON bodies
+            // this handler IS the producer encoder.
+            id: if view.header().id() == 0 {
+                iggy_common::random_id::get_uuid()
+            } else {
+                view.header().id()
+            },
             origin_timestamp: view.header().origin_timestamp(),
             headers: view.user_headers(),
             payload: view.payload(),
@@ -310,6 +317,33 @@ mod tests {
             batch_origin + u64::from(views[1].header.timestamp_delta),
             origin_timestamps[1]
         );
+    }
+
+    #[test]
+    fn encode_send_messages_mints_ids_for_zero_id_messages() {
+        // JSON producers send no id; the frame checksum covers the id field,
+        // so this handler must mint before encoding - the server no longer
+        // assigns ids at admission.
+        let stream_id = Identifier::from_str_value("1").expect("valid stream id");
+        let topic_id = Identifier::from_str_value("orders").expect("valid topic id");
+        let message = iggy_common::IggyMessage::builder()
+            .payload(Bytes::from_static(b"no-id"))
+            .build()
+            .expect("valid message");
+        assert_eq!(message.header.id, 0, "builder default id must be zero");
+        let command = SendMessages {
+            partitioning: Partitioning::partition_id(1),
+            batch: IggyMessagesBatch::from(&vec![message]),
+            ..Default::default()
+        };
+
+        let bytes = encode_send_messages(&stream_id, &topic_id, &command).expect("encodes");
+        let metadata_length =
+            u32::from_le_bytes(bytes[..4].try_into().expect("length prefix")) as usize;
+        let batch = iggy_binary_protocol::batch::decode_batch_slice(&bytes[4 + metadata_length..])
+            .expect("valid producer batch");
+        let views: Vec<_> = batch.iter().collect();
+        assert_ne!(views[0].header.id, 0, "zero id must be minted at encode");
     }
 
     #[test]
