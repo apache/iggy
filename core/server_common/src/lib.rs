@@ -42,6 +42,7 @@ mod memory_pool;
 mod segment_storage;
 pub mod send_messages;
 pub mod sharding;
+mod storage;
 
 pub use bootstrap::create_directories;
 pub use buffer::PooledBuffer;
@@ -55,3 +56,4 @@ pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_poo
 pub use segment_storage::{
     IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
 };
+pub use storage::Storage;

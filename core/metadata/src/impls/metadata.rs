@@ -2663,9 +2663,11 @@ where
         // else re-peeks and moves on to the next committable op.
         let mut wire_replies: Vec<(CommitLogEvent, Message<ReplyHeader>)> = Vec::new();
         while let Some(prepare_header) = peek_committable_head(consensus) {
-            // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
-            // When journal compaction is implemented compaction could race
-            // with this lookup if it removes entries below the commit number.
+            // A committed prepare missing from the journal is divergence; a
+            // warn-and-return here would strand `commit_min` behind
+            // `commit_max` forever (nothing re-applies a skipped op), so
+            // panicking is the answer. Journal compaction, if ever added,
+            // must not remove entries at or above the commit floor.
             let prepare = journal
                 .handle()
                 .entry(&prepare_header)
