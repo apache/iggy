@@ -46,6 +46,9 @@ pub const BATCH_CHECKSUM_OFFSET: usize = 40;
 /// Byte offset of `message_count` inside the batch header.
 pub const BATCH_MESSAGE_COUNT_OFFSET: usize = 48;
 
+/// Byte offset where the reserved region of the batch header starts.
+pub const BATCH_RESERVED_OFFSET: usize = 52;
+
 /// Upper bound on a message's `timestamp_delta`: the field is a `u32`
 /// microsecond delta against the batch `origin_timestamp`, so a single batch
 /// spans at most ~71.6 minutes of producer clock.
@@ -90,7 +93,8 @@ impl BatchHeader {
 
     /// # Errors
     /// [`WireError::UnexpectedEof`] on a short buffer;
-    /// [`WireError::Validation`] on a `batch_length` smaller than the header.
+    /// [`WireError::Validation`] on a `batch_length` smaller than the header
+    /// or nonzero reserved bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         if bytes.len() < BATCH_HEADER_SIZE {
             return Err(WireError::UnexpectedEof {
@@ -104,6 +108,17 @@ impl BatchHeader {
         if batch_length < BATCH_HEADER_SIZE as u64 {
             return Err(WireError::Validation(std::borrow::Cow::Borrowed(
                 "batch length must cover the batch header",
+            )));
+        }
+
+        // Every encoder zeroes the reserved region. Admitting nonzero bytes
+        // would let unchecksummed data ride the header to disk and replicas.
+        if bytes[BATCH_RESERVED_OFFSET..BATCH_HEADER_SIZE]
+            .iter()
+            .any(|&reserved_byte| reserved_byte != 0)
+        {
+            return Err(WireError::Validation(std::borrow::Cow::Borrowed(
+                "batch header reserved bytes must be zero",
             )));
         }
 
@@ -267,6 +282,9 @@ pub struct BatchMessageView<'a> {
     pub payload: &'a [u8],
 }
 
+/// Infallible frame walk over a blob whose layout has already been proven by
+/// [`decode_batch_slice_with`]: on an unvalidated blob it stops at the first
+/// malformed frame instead of erroring.
 pub struct BatchIterator<'a> {
     blob: &'a [u8],
     position: usize,
@@ -469,7 +487,10 @@ pub fn verify_and_recompute_batch_checksum(batch: &BatchRef<'_>) -> Result<u64, 
             return Err(WireError::InvalidMessageChecksum {
                 stored,
                 computed: expected,
-                offset: batch.header.base_offset + u64::from(framed.message.header.offset_delta),
+                offset: batch
+                    .header
+                    .base_offset
+                    .saturating_add(u64::from(framed.message.header.offset_delta)),
             });
         }
         hasher.write(&blob[framed.start..framed.start + 8]);
@@ -625,5 +646,18 @@ mod tests {
         let mut bytes = batch_bytes(&[frame(1, 0, 0, b"payload")]);
         bytes[BATCH_HEADER_SIZE + 40] = 1;
         assert!(decode_batch_slice_with(&bytes, BatchIntegrity::LayoutOnly).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_nonzero_header_reserved() {
+        let mut bytes = batch_bytes(&[frame(1, 0, 0, b"payload")]);
+        bytes[BATCH_RESERVED_OFFSET] = 1;
+        assert!(matches!(
+            BatchHeader::decode(&bytes),
+            Err(WireError::Validation(_))
+        ));
+        bytes[BATCH_RESERVED_OFFSET] = 0;
+        bytes[BATCH_HEADER_SIZE - 1] = 1;
+        assert!(BatchHeader::decode(&bytes).is_err());
     }
 }

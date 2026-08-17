@@ -19,6 +19,7 @@ package command
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 
@@ -54,6 +55,12 @@ func (s *SendMessages) MarshalBinary() ([]byte, error) {
 // [stream id][topic id][partitioning][messages_count u32], then one canonical
 // batch record: a 256-byte batch header followed by one frame per message.
 func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
+	// The server rejects an empty batch at admission. Refuse it before the
+	// wire, matching every other SDK encoder.
+	if len(s.Messages) == 0 {
+		return b, errors.New("cannot encode an empty message batch")
+	}
+
 	s.compressPayloads()
 
 	metadataStart := len(b)

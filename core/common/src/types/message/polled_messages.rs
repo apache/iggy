@@ -59,6 +59,9 @@ impl PolledMessages {
     /// [`IggyError::InvalidNumberEncoding`] on a short prefix;
     /// [`IggyError::InvalidMessagePayloadLength`] on a malformed record.
     pub fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
+        if bytes.len() < 16 {
+            return Err(IggyError::InvalidNumberEncoding);
+        }
         let partition_id = u32::from_le_bytes(
             bytes[0..4]
                 .try_into()

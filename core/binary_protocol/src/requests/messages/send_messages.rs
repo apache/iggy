@@ -81,6 +81,7 @@ impl SendMessagesEncoder {
     /// Encode the full `SendMessages` body into `buf`.
     ///
     /// # Errors
+    /// [`WireError::Validation`] on an empty message batch;
     /// [`WireError::InvalidMessageTimestampDelta`] when a message's
     /// `origin_timestamp` runs more than [`MAX_TIMESTAMP_DELTA_MICROS`] ahead
     /// of the batch's earliest one; [`WireError::PayloadTooLarge`] when a
@@ -92,6 +93,12 @@ impl SendMessagesEncoder {
         partitioning: &WirePartitioning,
         messages: &[RawMessage<'_>],
     ) -> Result<(), WireError> {
+        if messages.is_empty() {
+            return Err(WireError::Validation(std::borrow::Cow::Borrowed(
+                "cannot encode an empty message batch",
+            )));
+        }
+
         let metadata_inner =
             stream_id.encoded_size() + topic_id.encoded_size() + partitioning.encoded_size() + 4;
 
@@ -156,13 +163,16 @@ impl SendMessagesEncoder {
             buf[frame_start..frame_start + 8].copy_from_slice(&checksum.to_le_bytes());
         }
 
-        let batch_length =
-            u64::try_from(BATCH_HEADER_SIZE + (buf.len() - blob_start)).map_err(|_| {
-                WireError::PayloadTooLarge {
-                    size: buf.len() - blob_start,
-                    max: u32::MAX as usize,
-                }
-            })?;
+        // Request framing carries the body size in a u32, so a batch past
+        // u32::MAX cannot ride any request frame.
+        let batch_size = BATCH_HEADER_SIZE + (buf.len() - blob_start);
+        if batch_size > u32::MAX as usize {
+            return Err(WireError::PayloadTooLarge {
+                size: batch_size,
+                max: u32::MAX as usize,
+            });
+        }
+        let batch_length = batch_size as u64;
         let mut batch_header = BatchHeader::new(0, origin_timestamp, batch_length, message_count);
         batch_header.batch_checksum = calculate_batch_checksum(&batch_header, &buf[blob_start..]);
         let header_bytes: &mut [u8] = &mut buf[header_start..header_start + BATCH_HEADER_SIZE];

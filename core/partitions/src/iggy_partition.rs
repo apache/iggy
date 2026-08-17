@@ -1893,9 +1893,9 @@ where
                 // Skip the batch-checksum pass: on the partition ingest path
                 // nothing reads it before `stamp_prepare_for_persistence`
                 // recomputes it over the stamped header. An already-canonical
-                // batch (native v2, or the plane's pre-encrypt convert output)
-                // returns early above, so Skip only affects the legacy
-                // transcode, whose output goes straight to project/stamp.
+                // batch (the plane's pre-encrypt convert output) returns early
+                // inside the convert, so Skip only affects the wire-form
+                // admission, whose output goes straight to project/stamp.
                 match convert_request_message(namespace, message, ChecksumMode::Skip) {
                     Ok(message) => message,
                     Err(error) => {

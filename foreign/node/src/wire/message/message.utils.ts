@@ -48,7 +48,9 @@ export type CreateMessage = {
   /** Optional user-defined headers */
   headers?: Headers,
   /** Message payload as string or Buffer */
-  payload: string | Buffer
+  payload: string | Buffer,
+  /** Optional origin timestamp in microseconds (defaults to send time) */
+  originTimestamp?: bigint
 };
 
 /**
@@ -239,13 +241,13 @@ export const serializeSendMessages = (
       bPartitioning.length + bMessagesCount.length
   );
 
-  const originTimestamp = BigInt(Date.now()) * 1000n;
+  const sendTimestamp = BigInt(Date.now()) * 1000n;
   const bBatch = encodeMessagesBatch(messages.map(
-    ({ id, headers, payload }) => ({
+    ({ id, headers, payload, originTimestamp }) => ({
       id: resolveMessageId(id),
       payload: 'string' === typeof payload ? Buffer.from(payload) : payload,
       userHeaders: serializeHeaders(headers),
-      originTimestamp
+      originTimestamp: originTimestamp ?? sendTimestamp
     })
   ));
 

@@ -443,7 +443,9 @@ pub enum ChecksumMode {
 ///   re-enters here with its own output. Detected first via the
 ///   checksum-verified decode - a wire-form body cannot pass it, since its
 ///   leading metadata bytes cannot form a batch whose length and checksum
-///   both match.
+///   both match. The only legitimate producer of this shape is the earlier
+///   convert, which stamped the resolved partition, so a `partition_id` that
+///   does not match the namespace is rejected rather than persisted verbatim.
 ///
 /// Either way the batch must fill the body exactly: `size` and `batch_length`
 /// are independent client-supplied fields, and a suffix past `batch_length`
@@ -464,7 +466,10 @@ pub fn convert_request_message(
     let body = &message.as_slice()[std::mem::size_of::<RoutedRequestHeader>()..total_size];
 
     if let Ok(batch) = decode_batch_slice(body) {
-        if batch.message_count() == 0 || body.len() != batch.header.total_size() {
+        if batch.message_count() == 0
+            || body.len() != batch.header.total_size()
+            || batch.header.partition_id != namespace.partition_id() as u64
+        {
             return Err(IggyError::InvalidCommand);
         }
         return Ok(message);
@@ -660,8 +665,9 @@ pub fn stamp_prepare_for_persistence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BufMut;
     use iggy_binary_protocol::requests::messages::{RawMessage, SendMessagesEncoder};
-    use iggy_binary_protocol::{Command, Operation, WireIdentifier, WirePartitioning};
+    use iggy_binary_protocol::{Command, Operation, WireEncode, WireIdentifier, WirePartitioning};
     use iggy_common::Aes256GcmEncryptor;
     use std::hash::Hasher;
 
@@ -1015,7 +1021,22 @@ mod tests {
         canonical
             .header
             .encode_into(&mut canonical_body[..COMMAND_HEADER_SIZE]);
-        let wire_body = wire_send_messages_body(&messages);
+        // The client encoder refuses an empty batch, so assemble the wire form
+        // from the metadata primitives directly to prove admission rejects one
+        // independently.
+        let stream_id = WireIdentifier::numeric(1);
+        let topic_id = WireIdentifier::numeric(1);
+        let partitioning = WirePartitioning::Balanced;
+        let metadata_length =
+            stream_id.encoded_size() + topic_id.encoded_size() + partitioning.encoded_size() + 4;
+        let mut wire_buf = BytesMut::new();
+        wire_buf.put_u32_le(u32::try_from(metadata_length).expect("metadata fits u32"));
+        stream_id.encode(&mut wire_buf);
+        topic_id.encode(&mut wire_buf);
+        partitioning.encode(&mut wire_buf);
+        wire_buf.put_u32_le(0);
+        wire_buf.extend_from_slice(&canonical_body);
+        let wire_body = wire_buf.to_vec();
 
         for mode in [ChecksumMode::Compute, ChecksumMode::Skip] {
             let canonical_result =

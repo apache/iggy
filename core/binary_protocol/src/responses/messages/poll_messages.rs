@@ -24,7 +24,7 @@
 //! batch, so `base_offset + offset_delta` of the first frame is the first
 //! polled offset, not necessarily `base_offset` itself.
 
-use crate::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchIterator};
+use crate::batch::{BatchHeader, BatchIntegrity, BatchIterator, decode_batch_slice_with};
 use crate::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
 use crate::error::WireError;
 use bytes::{BufMut, BytesMut};
@@ -87,8 +87,11 @@ pub struct PolledMessageView<'a> {
 
 /// Iterator over every message in a stream of served batch records.
 ///
-/// Walks records by `batch_length` and flattens their frames. Framing errors
-/// surface as `Some(Err(_))` and end the iteration.
+/// Walks records by `batch_length` and flattens their frames. Each record's
+/// layout is proven up front (frames must tile `message_count` exactly), so
+/// framing errors, including frame-level corruption inside a record, surface
+/// as `Some(Err(_))` and end the iteration. Checksums are passed through
+/// unverified, as served.
 pub struct PolledBatchesIterator<'a> {
     batches: &'a [u8],
     position: usize,
@@ -113,20 +116,15 @@ impl<'a> PolledBatchesIterator<'a> {
         if self.position >= self.batches.len() {
             return Ok(false);
         }
-        let header = BatchHeader::decode(&self.batches[self.position..])?;
-        let blob_len = header.blob_len()?;
-        let blob_start = self.position + BATCH_HEADER_SIZE;
-        let blob = self
-            .batches
-            .get(blob_start..blob_start + blob_len)
-            .ok_or_else(|| WireError::UnexpectedEof {
-                offset: self.position,
-                need: header.total_size(),
-                have: self.batches.len() - self.position,
-            })?;
-        self.position += header.total_size();
-        self.frames = Some(crate::batch::BatchRef::new(header, blob).iter());
-        self.current_header = Some(header);
+        // Layout-only decode proves the frames tile `message_count` exactly
+        // before any of them are yielded, so a corrupt record errors instead
+        // of silently truncating. Poll replies pass checksums through as
+        // served, so no integrity verification here.
+        let batch =
+            decode_batch_slice_with(&self.batches[self.position..], BatchIntegrity::LayoutOnly)?;
+        self.position += batch.header.total_size();
+        self.frames = Some(batch.iter());
+        self.current_header = Some(batch.header);
         Ok(true)
     }
 }
@@ -193,7 +191,7 @@ impl<'a> PollMessagesResponse<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch::{BATCH_MESSAGE_HEADER_SIZE, calculate_batch_checksum};
+    use crate::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE, calculate_batch_checksum};
     use twox_hash::XxHash3_64;
 
     #[allow(clippy::cast_possible_truncation)]
