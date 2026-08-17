@@ -63,8 +63,7 @@ pub async fn run(harness: &mut TestHarness) {
             &stream_id,
             TOPIC_NAME,
             // High flush threshold so post-restart messages accumulate in the
-            // journal (which is what exposed the base_offset=0 bug); the
-            // message_saver flushes the pre-restart data before the restart.
+            // journal (which is what exposed the base_offset=0 bug).
             &TopicCreateOptions {
                 partitions_count: Some(1),
                 message_expiry: Some(IggyExpiry::NeverExpire),

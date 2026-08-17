@@ -71,7 +71,13 @@ new session. Transient not-committed responses retry the exact encoded request
 within one bounded deadline. A disconnected mutation is never replayed under a
 new session.
 
-When the server's `[heartbeat]` eviction is enabled, configure the client's `heartbeatInterval` below the server heartbeat interval. Client heartbeats are disabled when `heartbeatInterval` is unset.
+The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
+keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
+The server evicts a connection silent for 36 s, which is 1.2 x its 30 s
+heartbeat interval. Raising the client interval past that window, or setting it
+to 0 to disable client heartbeats, exposes an idle consumer-group member to
+eviction; a connection holding no group membership is left alone. Any other
+unusable value is rejected instead of silently disabling the heartbeat.
 
 `sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 

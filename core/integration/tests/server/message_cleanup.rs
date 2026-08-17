@@ -93,6 +93,18 @@ async fn run_cleanup_scenario(scenario: CleanupScenarioFn) {
                         "IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL".to_string(),
                         "100ms".to_string(),
                     ),
+                    // Size retention floors each partition's budget at one
+                    // SEALED segment, `segment_size + max_message_size`, so the
+                    // shipped 64 MiB bus cap would put the floor far above the
+                    // few MiB these scenarios produce and no size-based
+                    // deletion could ever fire. 2 MiB keeps the floor under the
+                    // topic caps below while still clearing the largest request
+                    // any scenario sends (a 10-message batch, ~1.002 MiB).
+                    // Byte-size env leaves carry a raw byte count.
+                    (
+                        "IGGY_MESSAGE_BUS_MAX_MESSAGE_SIZE".to_string(),
+                        (2 * 1024 * 1024).to_string(),
+                    ),
                 ]))
                 .build(),
         )

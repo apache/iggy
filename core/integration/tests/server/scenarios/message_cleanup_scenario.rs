@@ -551,16 +551,20 @@ pub async fn run_expiry_with_multiple_partitions(client: &IggyClient, data_path:
         .unwrap();
 }
 
-/// Tests fair size-based cleanup across multiple partitions.
+/// Tests fair size-based cleanup across multiple partitions: the topic cap is
+/// enforced as a per-partition SHARE, not as a topic-wide total.
 pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, data_path: &Path) {
     const PARTITIONS_COUNT: u32 = 3;
 
     let stream = client.create_stream(STREAM_NAME).await.unwrap();
     let stream_id = stream.id;
 
-    // 6 MiB max, cleanup at 90% = 5.4 MiB. Above `PARTITIONS_COUNT` * the 1 MiB
-    // segment size, so every partition can seal a segment before the cap trips.
-    let max_size_bytes = 6 * 1024 * 1024;
+    // 12 MiB over 3 partitions = a 4 MiB share each. The SHARE is what has to
+    // clear the retention floor of one sealed segment (`segment_size` plus the
+    // bus message cap), not the topic-wide figure: a cap that looks large
+    // enough before the divisor still leaves every partition floored and
+    // reclaiming nothing.
+    let max_size_bytes = 12 * 1024 * 1024;
     let topic = client
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
@@ -578,17 +582,26 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
 
     let payload = make_payload('E');
 
-    // Send 30 messages per partition = ~9.5 MiB total, exceeds 5.4 MiB threshold
+    // A 10-message batch is already past the 1 MiB segment size on its own and
+    // the crossing batch is written whole, so each batch seals exactly one
+    // segment: 7 batches leave ~7 MiB of SEALED bytes per partition plus an
+    // empty active one, well past the 4 MiB share. Batched rather than one
+    // request per message because each request costs a consensus round-trip
+    // plus an fsync.
+    let batches_per_partition = 7u32;
+    let batch_size = 10u32;
+    let messages_per_partition = batches_per_partition * batch_size;
     for partition_id in 0..PARTITIONS_COUNT {
-        for i in 0..30 {
-            let msg_id = partition_id as u128 * 1000 + i as u128;
-            let message = IggyMessage::builder()
-                .id(msg_id)
-                .payload(payload.clone())
-                .build()
-                .unwrap();
-
-            let mut messages = vec![message];
+        for batch in 0..batches_per_partition {
+            let mut messages: Vec<IggyMessage> = (0..batch_size)
+                .map(|i| {
+                    IggyMessage::builder()
+                        .id(u128::from(partition_id * 1000 + batch * batch_size + i))
+                        .payload(payload.clone())
+                        .build()
+                        .unwrap()
+                })
+                .collect();
             client
                 .send_messages(
                     &Identifier::named(STREAM_NAME).unwrap(),
@@ -604,7 +617,7 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
     // Wait for cleaner
     tokio::time::sleep(CLEANER_BUFFER).await;
 
-    // Verify segments exist for all partitions
+    // Verify every partition kept an active segment and lost its oldest ones.
     for partition_id in 0..PARTITIONS_COUNT {
         let partition_path = data_path
             .join(format!(
@@ -617,6 +630,35 @@ pub async fn run_fair_size_based_cleanup_multipartition(client: &IggyClient, dat
             !segments.is_empty(),
             "Partition {} should have at least 1 segment",
             partition_id
+        );
+
+        let polled = client
+            .poll_messages(
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                Some(partition_id),
+                &Consumer::default(),
+                &PollingStrategy::offset(0),
+                messages_per_partition,
+                false,
+            )
+            .await
+            .unwrap();
+        let first_offset = polled
+            .messages
+            .first()
+            .map(|m| m.header.offset)
+            .unwrap_or(0);
+
+        // The divisor is what this asserts: ~7 MiB per partition never reaches
+        // the 12 MiB topic-wide figure, so a cap enforced without dividing by
+        // the partition count would delete nothing here.
+        assert!(
+            first_offset > 0,
+            "Partition {} should have lost its oldest messages to the per-partition share, \
+             got first_offset {}",
+            partition_id,
+            first_offset
         );
     }
 
