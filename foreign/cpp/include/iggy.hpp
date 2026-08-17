@@ -407,22 +407,22 @@ class TopicOption final {
     ///
     /// Must be a multiple of 512 bytes, at least 1 MiB, and no larger than the
     /// server's segment ceiling.
-    static iggy::ffi::HeaderEntry segment_size(const std::uint64_t bytes) {
+    static iggy::ffi::HeaderEntry SegmentSize(const std::uint64_t bytes) {
         return detail::to_option_entry("segment_size", iggy::ffi::HeaderKind::Uint64,
                                        detail::to_little_endian_bytes(bytes));
     }
 
     /// Choose whether writes to this topic's partitions are fsynced.
-    static iggy::ffi::HeaderEntry enforce_fsync(const bool enabled) {
+    static iggy::ffi::HeaderEntry EnforceFsync(const bool enabled) {
         return detail::to_option_entry("enforce_fsync", iggy::ffi::HeaderKind::Bool, detail::to_bool_bytes(enabled));
     }
 
     /// Flush the journal once it holds this many messages.
     ///
     /// Must be non-zero. Paired with
-    /// `size_of_messages_required_to_save(bytes)`: whichever threshold trips
+    /// `SizeOfMessagesRequiredToSave(bytes)`: whichever threshold trips
     /// first flushes.
-    static iggy::ffi::HeaderEntry messages_required_to_save(const std::uint32_t messages) {
+    static iggy::ffi::HeaderEntry MessagesRequiredToSave(const std::uint32_t messages) {
         return detail::to_option_entry("messages_required_to_save", iggy::ffi::HeaderKind::Uint32,
                                        detail::to_little_endian_bytes(messages));
     }
@@ -431,7 +431,7 @@ class TopicOption final {
     ///
     /// Capped at 1 GiB: a threshold above the largest a segment may be never
     /// trips, and the journal does not survive a crash.
-    static iggy::ffi::HeaderEntry size_of_messages_required_to_save(const std::uint64_t bytes) {
+    static iggy::ffi::HeaderEntry SizeOfMessagesRequiredToSave(const std::uint64_t bytes) {
         return detail::to_option_entry("size_of_messages_required_to_save", iggy::ffi::HeaderKind::Uint64,
                                        detail::to_little_endian_bytes(bytes));
     }
@@ -440,7 +440,7 @@ class TopicOption final {
     ///
     /// Reserves `segment_size * partitions_count` up front, which the server
     /// caps at 64 GiB per topic.
-    static iggy::ffi::HeaderEntry preallocate_segments(const bool enabled) {
+    static iggy::ffi::HeaderEntry PreallocateSegments(const bool enabled) {
         return detail::to_option_entry("preallocate_segments", iggy::ffi::HeaderKind::Bool,
                                        detail::to_bool_bytes(enabled));
     }
