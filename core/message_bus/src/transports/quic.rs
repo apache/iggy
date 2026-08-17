@@ -119,9 +119,9 @@ const DEFAULT_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 /// schema (so a misconfigured operator config cannot break the
 /// SDK-client plane):
 ///
-/// - Exactly one bidirectional stream per peer carries every consensus
-///   frame; `tuning.max_concurrent_bidi_streams` clamps to a `u32`
-///   `VarInt` at conversion time but the bus opens only one stream.
+/// - Each SDK request opens a fresh bidirectional stream;
+///   `tuning.max_concurrent_bidi_streams` caps how many a client
+///   connection may hold open at once (clamped to a `u32` `VarInt`).
 /// - Zero unidirectional streams (no datagram traffic on this plane).
 /// - CUBIC congestion controller (no scheme-level switch yet exposed
 ///   to operators).
@@ -133,19 +133,18 @@ const DEFAULT_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 /// # Panics
 ///
 /// Panics if `tuning.max_idle_timeout` is non-zero but outside
-/// quinn-proto's `IdleTimeout` range (`TryFrom<Duration>` rejects
-/// values above `VarInt::MAX_U64` ms, i.e. ~292 years). Schema
-/// validation rejects values that large.
+/// quinn-proto's `IdleTimeout` range: `TryFrom<Duration>` counts the
+/// duration in milliseconds and rejects anything above `VarInt::MAX`
+/// (`2^62 - 1`). `QuicConfig::validate` rejects those values at boot.
 #[must_use]
 pub fn transport_config_from(tuning: &QuicTuning) -> compio_quic::TransportConfig {
     let mut cfg = compio_quic::TransportConfig::default();
     cfg.max_concurrent_bidi_streams(VarInt::from_u32(tuning.max_concurrent_bidi_streams))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
-        .stream_receive_window(VarInt::from_u32(tuning.receive_window))
+        .stream_receive_window(VarInt::from_u32(tuning.stream_receive_window))
         .receive_window(VarInt::from_u32(tuning.receive_window))
         .send_window(tuning.send_window)
         .initial_mtu(tuning.initial_mtu)
-        .datagram_send_buffer_size(tuning.datagram_send_buffer_size)
         .congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
 
     if !tuning.max_idle_timeout.is_zero() {

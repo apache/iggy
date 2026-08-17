@@ -577,11 +577,12 @@ mod tests {
         assert_eq!(mgr.get_session(c2), Some((200, 20)));
     }
     // Every disconnect releases its consensus session, group member or not.
-    // Holding the slot open for a resume window instead leaked it: the sweep
-    // that would have collected it rides the heartbeat verifier, which only
-    // runs when `heartbeat.enabled` is set, and that ships false -- so the
-    // slot survived for the process lifetime and pushed the client table
-    // toward capacity eviction, which silently erases dedup watermarks.
+    // Holding the slot open for a resume window instead leaked it: nothing
+    // sweeps it afterwards. The heartbeat verifier runs only when
+    // `heartbeat.enabled` is set, and even then evicts only connections that
+    // still hold a consumer-group membership, so the slot survived for the
+    // process lifetime and pushed the client table toward capacity eviction,
+    // which silently erases dedup watermarks.
     #[test]
     fn disconnect_releases_the_bound_session_for_logout() {
         let mut mgr = SessionManager::new();

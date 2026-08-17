@@ -156,7 +156,8 @@ impl HttpClient {
             .expect("get request")
     }
 
-    /// Unauthenticated GET (no bearer) for the public `/ping` probe.
+    /// Unauthenticated GET (no bearer): the public `/ping` probe and 401
+    /// assertions on protected routes.
     pub async fn get_anonymous(&self, path: &str) -> Response {
         self.client
             .get(self.url(path))
