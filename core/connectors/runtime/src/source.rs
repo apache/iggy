@@ -644,7 +644,16 @@ pub(crate) fn spawn_source_handler(
     );
 
     let blocking_handle = tokio::task::spawn_blocking(move || {
-        callback(plugin_id, handle_produced_messages);
+        // Same family as the close-code check in stop_connector. The SDK
+        // returns non-zero when it could not register the handler, and an
+        // instance that never registered produces nothing while still
+        // reporting Running.
+        let handle_result = callback(plugin_id, handle_produced_messages);
+        if handle_result != 0 {
+            warn!(
+                "iggy_source_handle returned {handle_result} for source connector with ID: {plugin_id}; the plugin may not be producing"
+            );
+        }
     });
     let handler_task = tokio::spawn(async move {
         source_forwarding_loop(
