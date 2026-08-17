@@ -685,6 +685,7 @@ class IggyBlockingClient final {
   private:
     explicit IggyBlockingClient(ffi::Client *client);
 
+    ffi::Client *Handle() const;
     void Reset() noexcept;
 
     ffi::Client *client_;

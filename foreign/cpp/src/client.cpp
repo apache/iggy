@@ -46,7 +46,7 @@ IggyBlockingClient IggyBlockingClient::FromConnectionString(std::string connecti
 
 void IggyBlockingClient::Connect() {
     try {
-        client_->connect();
+        Handle()->connect();
     } catch (const std::exception &error) {
         throw IggyException(error.what());
     }
@@ -54,7 +54,7 @@ void IggyBlockingClient::Connect() {
 
 void IggyBlockingClient::Disconnect() {
     try {
-        client_->disconnect();
+        Handle()->disconnect();
     } catch (const std::exception &error) {
         throw IggyException(error.what());
     }
@@ -62,7 +62,7 @@ void IggyBlockingClient::Disconnect() {
 
 void IggyBlockingClient::Shutdown() {
     try {
-        client_->shutdown();
+        Handle()->shutdown();
     } catch (const std::exception &error) {
         throw IggyException(error.what());
     }
@@ -70,7 +70,7 @@ void IggyBlockingClient::Shutdown() {
 
 LoginInfo IggyBlockingClient::Login(std::string username, std::string password) {
     try {
-        return client_->login_user(std::move(username), std::move(password));
+        return Handle()->login_user(std::move(username), std::move(password));
     } catch (const std::exception &error) {
         throw IggyException(error.what());
     }
@@ -78,7 +78,7 @@ LoginInfo IggyBlockingClient::Login(std::string username, std::string password) 
 
 void IggyBlockingClient::Logout() {
     try {
-        client_->logout_user();
+        Handle()->logout_user();
     } catch (const std::exception &error) {
         throw IggyException(error.what());
     }
@@ -88,6 +88,13 @@ IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {
     if (client_ == nullptr) {
         throw IggyException("Could not create Iggy client");
     }
+}
+
+ffi::Client *IggyBlockingClient::Handle() const {
+    if (client_ == nullptr) {
+        throw IggyException("Cannot use a moved-from IggyBlockingClient");
+    }
+    return client_;
 }
 
 void IggyBlockingClient::Reset() noexcept {

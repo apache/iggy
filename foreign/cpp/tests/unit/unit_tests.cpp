@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -187,6 +188,18 @@ TEST(IggyExceptionTest, StoresMessage) {
     const std::string message = "boom2";
     const iggy::IggyException from_string(message);
     EXPECT_EQ(std::string(from_string.what()), message);
+}
+
+TEST(IggyBlockingClientTest, MovedFromOperationsThrow) {
+    auto client   = iggy::IggyBlockingClient::Builder().Build();
+    auto moved_to = std::move(client);
+    (void)moved_to;
+
+    EXPECT_THROW(client.Connect(), iggy::IggyException);
+    EXPECT_THROW(client.Disconnect(), iggy::IggyException);
+    EXPECT_THROW(client.Shutdown(), iggy::IggyException);
+    EXPECT_THROW(client.Login("iggy", "iggy"), iggy::IggyException);
+    EXPECT_THROW(client.Logout(), iggy::IggyException);
 }
 
 TEST(IggyBlockingClientBuilderTest, RejectsTlsDomainWhenTlsIsDisabled) {
