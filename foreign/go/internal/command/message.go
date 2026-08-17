@@ -29,14 +29,6 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-const (
-	partitionPresenceSize = 1
-	partitionFieldSize    = 4
-	partitionStrategySize = partitionPresenceSize + partitionFieldSize + 1
-	offsetSize            = 12
-	commitFlagSize        = 1
-)
-
 type SendMessages struct {
 	Compression iggcon.IggyMessageCompression
 

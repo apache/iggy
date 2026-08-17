@@ -44,7 +44,6 @@ comfy-table = { workspace = true }
 derive_more = { workspace = true }
 humantime = { workspace = true }
 iggy_binary_protocol = { workspace = true }
-lending-iterator = { workspace = true }
 papaya = { workspace = true }
 ring = { workspace = true }
 secrecy = { workspace = true }

@@ -339,8 +339,6 @@ public final class BytesDeserializer {
         return userHeaders;
     }
 
-    private record UserHeaderField(HeaderKind kind, byte[] value) {}
-
     private static UserHeaderField readUserHeaderField(ByteBuf slice) {
         if (slice.readableBytes() < 1 + Integer.BYTES) {
             return null;
@@ -761,4 +759,6 @@ public final class BytesDeserializer {
     private static byte[] newByteArray(Long size) {
         return new byte[size.intValue()];
     }
+
+    private record UserHeaderField(HeaderKind kind, byte[] value) {}
 }

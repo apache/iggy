@@ -104,26 +104,6 @@ public final class BytesSerializer {
         return buffer;
     }
 
-    /**
-     * Encodes messages as one batch record: a batch header followed by per-message frames.
-     * The server stamps {@code partition_id}, {@code base_offset}, and {@code base_timestamp},
-     * so they are encoded as zero here.
-     */
-    public static ByteBuf toMessagesBatch(List<Message> messages) {
-        if (messages.isEmpty()) {
-            throw new IggyInvalidArgumentException("Cannot encode an empty message batch");
-        }
-        List<RawMessage> rawMessages = new ArrayList<>(messages.size());
-        for (Message message : messages) {
-            rawMessages.add(new RawMessage(
-                    encodedMessageId(message.header().id()),
-                    message.header().originTimestamp(),
-                    message.payload(),
-                    readAllBytes(toBytes(message.userHeaders()))));
-        }
-        return encodeBatch(rawMessages);
-    }
-
     public static ByteBuf toBytes(PollingStrategy strategy) {
         var buffer = Unpooled.buffer(9);
         buffer.writeByte(strategy.kind().asCode());
@@ -273,15 +253,23 @@ public final class BytesSerializer {
     }
 
     /**
-     * One message as it enters the batch encoder: the id already encoded to its 16 wire bytes
-     * and the user headers already encoded to their opaque bytes.
+     * Encodes messages as one batch record: a batch header followed by per-message frames.
+     * The server stamps {@code partition_id}, {@code base_offset}, and {@code base_timestamp},
+     * so they are encoded as zero here.
      */
-    record RawMessage(byte[] id, BigInteger originTimestamp, byte[] payload, byte[] userHeaders) {
-        RawMessage {
-            if (id.length != 16) {
-                throw new IggyInvalidArgumentException("Message id must have 16 bytes");
-            }
+    public static ByteBuf toMessagesBatch(List<Message> messages) {
+        if (messages.isEmpty()) {
+            throw new IggyInvalidArgumentException("Cannot encode an empty message batch");
         }
+        List<RawMessage> rawMessages = new ArrayList<>(messages.size());
+        for (Message message : messages) {
+            rawMessages.add(new RawMessage(
+                    encodedMessageId(message.header().id()),
+                    message.header().originTimestamp(),
+                    message.payload(),
+                    readAllBytes(toBytes(message.userHeaders()))));
+        }
+        return encodeBatch(rawMessages);
     }
 
     static ByteBuf encodeBatch(List<RawMessage> messages) {
@@ -384,6 +372,18 @@ public final class BytesSerializer {
         if (length < 1 || length > MAX_HEADER_FIELD_LENGTH) {
             throw new IggyInvalidArgumentException("Invalid header " + field + " length: " + length
                     + " bytes, must be between 1 and " + MAX_HEADER_FIELD_LENGTH);
+        }
+    }
+
+    /**
+     * One message as it enters the batch encoder: the id already encoded to its 16 wire bytes
+     * and the user headers already encoded to their opaque bytes.
+     */
+    record RawMessage(byte[] id, BigInteger originTimestamp, byte[] payload, byte[] userHeaders) {
+        RawMessage {
+            if (id.length != 16) {
+                throw new IggyInvalidArgumentException("Message id must have 16 bytes");
+            }
         }
     }
 }

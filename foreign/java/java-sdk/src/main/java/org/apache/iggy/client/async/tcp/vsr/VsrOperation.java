@@ -152,9 +152,7 @@ public final class VsrOperation {
      * section ({@code [count:u32][{index,result} x count]}).
      */
     static boolean isResultFramed(int operation) {
-        return isMetadata(operation)
-                || operation == STORE_CONSUMER_OFFSET
-                || operation == DELETE_CONSUMER_OFFSET;
+        return isMetadata(operation) || operation == STORE_CONSUMER_OFFSET || operation == DELETE_CONSUMER_OFFSET;
     }
 
     /**

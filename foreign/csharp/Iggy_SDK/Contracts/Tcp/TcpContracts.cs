@@ -439,8 +439,8 @@ internal static class TcpContracts
         }
 
         var batchStart = position;
-        bytes[batchStart..(batchStart + BatchWireFormat.BatchHeaderSize)].Clear();
-        position += BatchWireFormat.BatchHeaderSize;
+        bytes[batchStart..(batchStart + BatchWireFormat.BATCH_HEADER_SIZE)].Clear();
+        position += BatchWireFormat.BATCH_HEADER_SIZE;
         var blobStart = position;
         var offsetDelta = 0u;
 
@@ -461,7 +461,7 @@ internal static class TcpContracts
                 }
 
                 var frameStart = position;
-                var payloadStart = frameStart + BatchWireFormat.FrameHeaderSize;
+                var payloadStart = frameStart + BatchWireFormat.FRAME_HEADER_SIZE;
 
                 int payloadLength;
                 if (encryptor is null)
@@ -548,7 +548,7 @@ internal static class TcpContracts
             }
         }
 
-        var batchLength = (ulong)(BatchWireFormat.BatchHeaderSize + (position - blobStart));
+        var batchLength = (ulong)(BatchWireFormat.BATCH_HEADER_SIZE + (position - blobStart));
         BinaryPrimitives.WriteUInt64LittleEndian(bytes[(batchStart + 24)..(batchStart + 32)], originTimestamp);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes[(batchStart + 32)..(batchStart + 40)], batchLength);
         BinaryPrimitives.WriteUInt32LittleEndian(bytes[(batchStart + 48)..(batchStart + 52)], (uint)messages.Length);
@@ -574,7 +574,7 @@ internal static class TcpContracts
             hasher.Append(bytes.Slice(cursor, 8));
             var headersLength = BinaryPrimitives.ReadInt32LittleEndian(bytes[(cursor + 32)..(cursor + 36)]);
             var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(bytes[(cursor + 36)..(cursor + 40)]);
-            cursor += BatchWireFormat.FrameHeaderSize + payloadLength + headersLength;
+            cursor += BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength;
         }
 
         return hasher.GetCurrentHashAsUInt64();

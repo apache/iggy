@@ -374,7 +374,7 @@ internal static class BinaryMapper
                 }
             }
 
-            var maxMessages = (length - 16) / BatchWireFormat.FrameHeaderSize;
+            var maxMessages = (length - 16) / BatchWireFormat.FRAME_HEADER_SIZE;
             var capacity = (int)Math.Min(messagesCount, (uint)maxMessages);
             List<RentedMessageResponse> messages = new(capacity);
 
@@ -385,7 +385,7 @@ internal static class BinaryMapper
                 // Broker append time is stamped once per batch record; the per-frame delta applies to the
                 // origin timestamp only.
                 var timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(baseTimestamp);
-                var cursor = position + BatchWireFormat.BatchHeaderSize;
+                var cursor = position + BatchWireFormat.BATCH_HEADER_SIZE;
                 while (cursor < batchEnd)
                 {
                     ReadFrameLengths(span, cursor, batchEnd, out var headersLength, out var payloadLength);
@@ -396,7 +396,7 @@ internal static class BinaryMapper
                     var timestampDelta = BinaryPrimitives.ReadUInt32LittleEndian(span[(cursor + 28)..(cursor + 32)]);
                     var offset = baseOffset + offsetDelta;
 
-                    var payloadRangeStart = cursor + BatchWireFormat.FrameHeaderSize;
+                    var payloadRangeStart = cursor + BatchWireFormat.FRAME_HEADER_SIZE;
                     var headersRangeStart = payloadRangeStart + payloadLength;
 
                     ReadOnlyMemory<byte> payloadSlice = payload.Slice(payloadRangeStart, payloadLength);
@@ -479,7 +479,7 @@ internal static class BinaryMapper
     private static int ReadBatchExtent(ReadOnlySpan<byte> span, int length, int position, out ulong baseOffset,
         out ulong baseTimestamp, out ulong originTimestamp)
     {
-        if (position + BatchWireFormat.BatchHeaderSize > length)
+        if (position + BatchWireFormat.BATCH_HEADER_SIZE > length)
         {
             throw new MalformedResponseException(
                 $"Malformed batch record at byte {position}: {length - position} bytes cannot hold a batch header.");
@@ -489,7 +489,7 @@ internal static class BinaryMapper
         baseTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 16)..(position + 24)]);
         originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 24)..(position + 32)]);
         var batchLength = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 32)..(position + 40)]);
-        if (batchLength < BatchWireFormat.BatchHeaderSize || (ulong)position + batchLength > (ulong)length)
+        if (batchLength < BatchWireFormat.BATCH_HEADER_SIZE || (ulong)position + batchLength > (ulong)length)
         {
             throw new MalformedResponseException(
                 $"Malformed batch record at byte {position}: batch length {batchLength} does not fit the response.");
@@ -501,7 +501,7 @@ internal static class BinaryMapper
     private static void ReadFrameLengths(ReadOnlySpan<byte> span, int cursor, int batchEnd,
         out int headersLength, out int payloadLength)
     {
-        if (cursor + BatchWireFormat.FrameHeaderSize > batchEnd)
+        if (cursor + BatchWireFormat.FRAME_HEADER_SIZE > batchEnd)
         {
             throw new MalformedResponseException(
                 $"Malformed message frame at byte {cursor}: {batchEnd - cursor} bytes cannot hold a frame header.");
@@ -523,7 +523,7 @@ internal static class BinaryMapper
         }
 
         // Overflow-safe: server-controlled lengths can approach int.MaxValue, so compute the bound in long.
-        if ((long)cursor + BatchWireFormat.FrameHeaderSize + payloadLength + headersLength > batchEnd)
+        if ((long)cursor + BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength > batchEnd)
         {
             throw new MalformedResponseException(
                 $"Malformed message frame at byte {cursor}: frame runs past its batch record.");
@@ -539,7 +539,7 @@ internal static class BinaryMapper
         while (position < length)
         {
             var batchEnd = ReadBatchExtent(span, length, position, out _, out _, out _);
-            var cursor = position + BatchWireFormat.BatchHeaderSize;
+            var cursor = position + BatchWireFormat.BATCH_HEADER_SIZE;
             while (cursor < batchEnd)
             {
                 ReadFrameLengths(span, cursor, batchEnd, out var headersLength, out var payloadLength);
@@ -549,7 +549,7 @@ internal static class BinaryMapper
                     total += encryptor.GetMaxDecryptedLength(headersLength);
                 }
 
-                cursor += BatchWireFormat.FrameHeaderSize + payloadLength + headersLength;
+                cursor += BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength;
             }
 
             position = batchEnd;

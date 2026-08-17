@@ -24,7 +24,7 @@ namespace Apache.Iggy.Messages;
 /// </summary>
 internal static class BatchWireFormat
 {
-    internal const int BatchHeaderSize = 256;
+    internal const int BATCH_HEADER_SIZE = 256;
 
-    internal const int FrameHeaderSize = 48;
+    internal const int FRAME_HEADER_SIZE = 48;
 }

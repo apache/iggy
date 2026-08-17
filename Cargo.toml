@@ -213,7 +213,6 @@ jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 keyring-core = "1.0.0"
 lazy_static = "1.5.0"
 left-right = "0.11"
-lending-iterator = "0.1.7"
 libc = "0.2.188"
 log = "0.4.33"
 lz4_flex = "0.14.0"
