@@ -19,9 +19,14 @@ package command
 
 import (
 	"encoding/binary"
+	"fmt"
+	"math"
 
 	"github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/batch"
+	"github.com/google/uuid"
 	"github.com/klauspost/compress/s2"
+	"github.com/zeebo/xxh3"
 )
 
 const (
@@ -30,7 +35,6 @@ const (
 	partitionStrategySize = partitionPresenceSize + partitionFieldSize + 1
 	offsetSize            = 12
 	commitFlagSize        = 1
-	indexSize             = 16
 )
 
 type SendMessages struct {
@@ -46,17 +50,17 @@ func (s *SendMessages) Code() Code {
 	return SendMessagesCode
 }
 
-// zeroIndex is the blank per-message index entry reserved ahead of the
-// message section and filled in as messages are appended.
-var zeroIndex [indexSize]byte
+// zeroBatchHeader is the blank batch header reserved ahead of the message
+// frames and backpatched once every frame checksum is known.
+var zeroBatchHeader [batch.HeaderSize]byte
 
 func (s *SendMessages) MarshalBinary() ([]byte, error) {
 	return s.AppendBinary(nil)
 }
 
 // AppendBinary encodes the batch straight into b: [metadata_length u32]
-// [stream id][topic id][partitioning][messages_count u32], the per-message
-// index section, then each message as header, payload, user headers.
+// [stream id][topic id][partitioning][messages_count u32], then one canonical
+// batch record: a 256-byte batch header followed by one frame per message.
 func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
 	s.compressPayloads()
 
@@ -76,30 +80,65 @@ func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
 	metadataLength := len(b) - metadataStart - 4
 	binary.LittleEndian.PutUint32(b[metadataStart:], uint32(metadataLength))
 
-	indexesStart := len(b)
-	for range s.Messages {
-		b = append(b, zeroIndex[:]...)
+	var originTimestamp uint64
+	for i := range s.Messages {
+		if i == 0 || s.Messages[i].Header.OriginTimestamp < originTimestamp {
+			originTimestamp = s.Messages[i].Header.OriginTimestamp
+		}
 	}
 
-	msgSize := uint32(0)
+	headerStart := len(b)
+	b = append(b, zeroBatchHeader[:]...)
+
+	blobStart := len(b)
+	frameChecksums := make([]byte, 0, len(s.Messages)*8)
 	for i := range s.Messages {
 		message := &s.Messages[i]
+		// The id sits under the frame checksum, so it must exist before the
+		// frame is hashed; the server never mints ids.
+		if message.Header.Id == (iggcon.MessageID{}) {
+			id, err := uuid.NewRandom()
+			if err != nil {
+				return b, err
+			}
+			message.Header.Id = iggcon.MessageID(id)
+		}
 		// The header lengths and the appended slices must agree, or every
 		// message boundary after a mismatch mis-frames; deriving both from
 		// the same slice makes the disagreement impossible.
 		message.Header.PayloadLength = uint32(len(message.Payload))
 		message.Header.UserHeaderLength = uint32(len(message.UserHeaders))
-		if b, err = message.Header.AppendBinary(b); err != nil {
-			return b, err
+		timestampDelta := message.Header.OriginTimestamp - originTimestamp
+		if timestampDelta > math.MaxUint32 {
+			return b, fmt.Errorf(
+				"message origin timestamp %d runs more than %d microseconds past the batch's earliest %d",
+				message.Header.OriginTimestamp, uint64(math.MaxUint32), originTimestamp)
 		}
+
+		frameStart := len(b)
+		b = binary.LittleEndian.AppendUint64(b, 0)
+		b = append(b, message.Header.Id[:]...)
+		b = binary.LittleEndian.AppendUint32(b, uint32(i))
+		b = binary.LittleEndian.AppendUint32(b, uint32(timestampDelta))
+		b = binary.LittleEndian.AppendUint32(b, message.Header.UserHeaderLength)
+		b = binary.LittleEndian.AppendUint32(b, message.Header.PayloadLength)
+		b = binary.LittleEndian.AppendUint64(b, 0)
 		b = append(b, message.Payload...)
 		b = append(b, message.UserHeaders...)
 
-		msgSize += iggcon.MessageHeaderSize +
-			message.Header.PayloadLength + message.Header.UserHeaderLength
-		binary.LittleEndian.PutUint32(b[indexesStart+i*indexSize+4:], msgSize)
+		checksum := xxh3.Hash(b[frameStart+8:])
+		binary.LittleEndian.PutUint64(b[frameStart:], checksum)
+		message.Header.Checksum = checksum
+		frameChecksums = binary.LittleEndian.AppendUint64(frameChecksums, checksum)
 	}
 
+	batchHeader := batch.Header{
+		OriginTimestamp: originTimestamp,
+		BatchLength:     uint64(batch.HeaderSize + len(b) - blobStart),
+		MessageCount:    uint32(len(s.Messages)),
+	}
+	batchHeader.BatchChecksum = batchHeader.Checksum(frameChecksums)
+	batchHeader.EncodeInto(b[headerStart:blobStart])
 	return b, nil
 }
 

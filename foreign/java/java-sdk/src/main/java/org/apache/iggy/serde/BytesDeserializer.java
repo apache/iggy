@@ -250,47 +250,113 @@ public final class BytesDeserializer {
         var messagesCount = response.readUnsignedIntLE();
         var messages = new ArrayList<Message>();
         while (response.isReadable()) {
-            messages.add(readPolledMessage(response));
+            readBatchRecord(response, messages);
         }
         return new PolledMessages(partitionId, currentOffset, messagesCount, messages);
     }
 
-    public static Message readPolledMessage(ByteBuf response) {
-        var checksum = readU64AsBigInteger(response);
-        var id = readBytesMessageId(response);
-        var offset = readU64AsBigInteger(response);
-        var timestamp = readU64AsBigInteger(response);
-        var originTimestamp = readU64AsBigInteger(response);
-        var userHeadersLength = response.readUnsignedIntLE();
-        var payloadLength = response.readUnsignedIntLE();
-        var reserved = readU64AsBigInteger(response);
-        var header = new MessageHeader(
-                checksum, id, offset, timestamp, originTimestamp, userHeadersLength, payloadLength, reserved);
-        var payload = newByteArray(payloadLength);
-        response.readBytes(payload);
-        Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
-        if (userHeadersLength > 0) {
-            ByteBuf userHeadersBuffer = response.readSlice(toInt(userHeadersLength));
-            Map<HeaderKey, HeaderValue> headers = new HashMap<>();
-            while (userHeadersBuffer.isReadable()) {
-                var userHeaderKeyKindCode = userHeadersBuffer.readUnsignedByte();
-                var userHeaderKeyLength = userHeadersBuffer.readUnsignedIntLE();
-                byte[] userHeaderKeyBytes = new byte[toInt(userHeaderKeyLength)];
-                userHeadersBuffer.readBytes(userHeaderKeyBytes);
-                var userHeaderKey = new HeaderKey(HeaderKind.fromCode(userHeaderKeyKindCode), userHeaderKeyBytes);
-
-                var userHeaderValueKindCode = userHeadersBuffer.readUnsignedByte();
-                var userHeaderValueLength = userHeadersBuffer.readUnsignedIntLE();
-                byte[] userHeaderValueBytes = new byte[toInt(userHeaderValueLength)];
-                userHeadersBuffer.readBytes(userHeaderValueBytes);
-                headers.put(
-                        userHeaderKey,
-                        new HeaderValue(HeaderKind.fromCode(userHeaderValueKindCode), userHeaderValueBytes));
-            }
-            userHeaders = headers;
+    /**
+     * Reads one batch record ({@code [256B batch header][frames]}) into messages with absolute
+     * offsets and timestamps. A record may be a server-sliced view of a stored batch, so the
+     * first frame's offset delta is not necessarily zero.
+     */
+    private static void readBatchRecord(ByteBuf response, List<Message> messages) {
+        if (response.readableBytes() < BytesSerializer.BATCH_HEADER_SIZE) {
+            throw new IggyMalformedResponseException(
+                    "Truncated batch header: " + response.readableBytes() + " bytes left");
         }
+        var headerStart = response.readerIndex();
+        response.skipBytes(Long.BYTES); // partition_id, already carried by the poll response header
+        var baseOffset = readU64AsBigInteger(response);
+        var baseTimestamp = readU64AsBigInteger(response);
+        var batchOriginTimestamp = readU64AsBigInteger(response);
+        var batchLength = readU64AsBigInteger(response);
+        response.readerIndex(headerStart + BytesSerializer.BATCH_HEADER_SIZE);
 
-        return new Message(header, payload, userHeaders);
+        var blobLength = batchLength.subtract(BigInteger.valueOf(BytesSerializer.BATCH_HEADER_SIZE));
+        if (blobLength.signum() < 0 || blobLength.compareTo(BigInteger.valueOf(response.readableBytes())) > 0) {
+            throw new IggyMalformedResponseException("Batch length " + batchLength + " exceeds remaining payload of "
+                    + response.readableBytes() + " bytes");
+        }
+        ByteBuf blob = response.readSlice(blobLength.intValueExact());
+        while (blob.isReadable()) {
+            messages.add(readBatchMessage(blob, baseOffset, baseTimestamp, batchOriginTimestamp));
+        }
+    }
+
+    private static Message readBatchMessage(
+            ByteBuf blob, BigInteger baseOffset, BigInteger baseTimestamp, BigInteger batchOriginTimestamp) {
+        if (blob.readableBytes() < MessageHeader.SIZE) {
+            throw new IggyMalformedResponseException(
+                    "Truncated message frame header: " + blob.readableBytes() + " bytes left");
+        }
+        var checksum = readU64AsBigInteger(blob);
+        var id = readBytesMessageId(blob);
+        var offsetDelta = blob.readUnsignedIntLE();
+        var timestampDelta = blob.readUnsignedIntLE();
+        var userHeadersLength = blob.readUnsignedIntLE();
+        var payloadLength = blob.readUnsignedIntLE();
+        var reserved = readU64AsBigInteger(blob);
+        if (reserved.signum() != 0) {
+            throw new IggyMalformedResponseException("Message frame reserved bytes must be zero");
+        }
+        if (payloadLength + userHeadersLength > blob.readableBytes()) {
+            throw new IggyMalformedResponseException("Message frame length " + (payloadLength + userHeadersLength)
+                    + " exceeds remaining batch of " + blob.readableBytes() + " bytes");
+        }
+        var header = new MessageHeader(
+                checksum,
+                id,
+                baseOffset.add(BigInteger.valueOf(offsetDelta)),
+                baseTimestamp,
+                batchOriginTimestamp.add(BigInteger.valueOf(timestampDelta)),
+                userHeadersLength,
+                payloadLength,
+                BigInteger.ZERO);
+        var payload = newByteArray(payloadLength);
+        blob.readBytes(payload);
+        return new Message(header, payload, readUserHeaders(blob, userHeadersLength));
+    }
+
+    /**
+     * User headers ride the frame as opaque bytes, so another SDK may put non-TLV data there;
+     * such bytes decode to an empty map while {@code userHeadersLength} still reports them.
+     */
+    private static Map<HeaderKey, HeaderValue> readUserHeaders(ByteBuf frame, Long userHeadersLength) {
+        Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
+        if (userHeadersLength == 0) {
+            return userHeaders;
+        }
+        ByteBuf slice = frame.readSlice(toInt(userHeadersLength));
+        while (slice.isReadable()) {
+            var key = readUserHeaderField(slice);
+            var value = key == null ? null : readUserHeaderField(slice);
+            if (value == null) {
+                return new HashMap<>();
+            }
+            userHeaders.put(new HeaderKey(key.kind(), key.value()), new HeaderValue(value.kind(), value.value()));
+        }
+        return userHeaders;
+    }
+
+    private record UserHeaderField(HeaderKind kind, byte[] value) {}
+
+    private static UserHeaderField readUserHeaderField(ByteBuf slice) {
+        if (slice.readableBytes() < 1 + Integer.BYTES) {
+            return null;
+        }
+        var kindCode = slice.readUnsignedByte();
+        var length = slice.readUnsignedIntLE();
+        if (length > slice.readableBytes()) {
+            return null;
+        }
+        byte[] value = newByteArray(length);
+        slice.readBytes(value);
+        try {
+            return new UserHeaderField(HeaderKind.fromCode(kindCode), value);
+        } catch (IggyInvalidArgumentException unknownKind) {
+            return null;
+        }
     }
 
     public static Stats readStats(ByteBuf response) {

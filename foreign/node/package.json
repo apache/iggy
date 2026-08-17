@@ -50,6 +50,7 @@
   "author": "github.com/T1B0",
   "license": "Apache-2.0",
   "dependencies": {
+    "@node-rs/xxhash": "1.7.6",
     "debug": "4.4.3",
     "generic-pool": "3.9.0",
     "uuidv7": "1.2.1"

@@ -51,6 +51,7 @@ import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesSerializer.toBytes;
+import static org.apache.iggy.serde.BytesSerializer.toMessagesBatch;
 
 /**
  * Async TCP implementation of MessagesClient using Netty for non-blocking I/O.
@@ -181,35 +182,16 @@ public class MessagesTcpClient implements MessagesClient {
     private CompletableFuture<SendMessagesResponse> sendToPartition(
             StreamId streamId, TopicId topicId, Partitioning partitioning, List<Message> messages) {
 
-        // Build metadata section following the blocking client pattern
         var metadataLength = streamId.getSize() + topicId.getSize() + partitioning.getSize() + 4;
-        var payload = Unpooled.buffer(4 + metadataLength);
+        var batch = toMessagesBatch(messages);
+        var payload = Unpooled.buffer(4 + metadataLength + batch.readableBytes());
 
-        // Write metadata length and components
         payload.writeIntLE(metadataLength);
         payload.writeBytes(toBytes(streamId));
         payload.writeBytes(toBytes(topicId));
         payload.writeBytes(toBytes(partitioning));
         payload.writeIntLE(messages.size());
-
-        // Write message index metadata (required by server)
-        var position = 0;
-        for (var message : messages) {
-            // Calculate position for next message
-            position += message.getSize();
-
-            // offset (4 bytes)
-            payload.writeIntLE(0);
-            // position (4 bytes)
-            payload.writeIntLE(position);
-            // timestamp (8 bytes)
-            payload.writeZero(8);
-        }
-
-        // Write actual message data
-        for (var message : messages) {
-            payload.writeBytes(toBytes(message));
-        }
+        payload.writeBytes(batch);
 
         return connection().send(CommandCode.Messages.SEND.getValue(), payload).thenApply(response -> {
             try {
