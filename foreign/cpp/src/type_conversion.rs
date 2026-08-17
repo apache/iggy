@@ -37,7 +37,7 @@ use iggy_common::{
     HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
     Permissions as RustPermissions, Stats as RustStats, StreamPermissions as RustStreamPermissions,
     TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
-    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails,
+    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 use std::collections::BTreeMap;
 
@@ -151,7 +151,7 @@ impl From<RustUserInfo> for ffi::UserInfo {
         ffi::UserInfo {
             id: user.id,
             created_at: user.created_at.as_micros(),
-            status: user.status.as_code(),
+            status: ffi::UserStatus::from(user.status),
             username: user.username,
         }
     }
@@ -163,10 +163,31 @@ impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
         ffi::UserInfoDetails {
             id: user.id,
             created_at: user.created_at.as_micros(),
-            status: user.status.as_code(),
+            status: ffi::UserStatus::from(user.status),
             username: user.username,
             has_permissions,
             permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
+        }
+    }
+}
+
+impl From<RustUserStatus> for ffi::UserStatus {
+    fn from(status: RustUserStatus) -> Self {
+        match status {
+            RustUserStatus::Active => ffi::UserStatus::Active,
+            RustUserStatus::Inactive => ffi::UserStatus::Inactive,
+        }
+    }
+}
+
+impl TryFrom<ffi::UserStatus> for RustUserStatus {
+    type Error = String;
+
+    fn try_from(status: ffi::UserStatus) -> Result<Self, Self::Error> {
+        match status {
+            ffi::UserStatus::Active => Ok(RustUserStatus::Active),
+            ffi::UserStatus::Inactive => Ok(RustUserStatus::Inactive),
+            _ => Err("invalid user status".to_owned()),
         }
     }
 }

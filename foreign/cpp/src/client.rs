@@ -1218,11 +1218,11 @@ impl Client {
         &self,
         username: String,
         password: String,
-        status: u8,
+        status: ffi::UserStatus,
         has_permissions: bool,
         permissions: ffi::Permissions,
     ) -> Result<ffi::UserInfoDetails, String> {
-        let rust_status = RustUserStatus::from_code(status)
+        let rust_status = RustUserStatus::try_from(status)
             .map_err(|error| format!("Could not create user '{username}': {error}"))?;
         let rust_permissions = has_permissions
             .then(|| RustPermissions::try_from(permissions))
@@ -1258,12 +1258,12 @@ impl Client {
         has_username: bool,
         username: String,
         has_status: bool,
-        status: u8,
+        status: ffi::UserStatus,
     ) -> Result<(), String> {
         let rust_user_id = RustIdentifier::try_from(user_id)
             .map_err(|error| format!("Could not update user: invalid user identifier: {error}"))?;
         let rust_status = has_status
-            .then(|| RustUserStatus::from_code(status))
+            .then(|| RustUserStatus::try_from(status))
             .transpose()
             .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
 

@@ -165,7 +165,7 @@ class E2ETestFixture : public ::testing::Test {
     iggy::ffi::UserInfoDetails CreateUser(iggy::ffi::Client *client,
                                           const std::string &username,
                                           const std::string &password,
-                                          const std::uint8_t status,
+                                          const iggy::ffi::UserStatus status,
                                           const bool has_permissions         = false,
                                           iggy::ffi::Permissions permissions = {}) {
         auto user = client->create_user(username, password, status, has_permissions, std::move(permissions));

@@ -372,17 +372,23 @@ mod ffi {
         streams: Vec<StreamPermissionEntry>,
     }
 
+    #[repr(u8)]
+    enum UserStatus {
+        Active = 1,
+        Inactive = 2,
+    }
+
     struct UserInfo {
         id: u32,
         created_at: u64,
-        status: u8,
+        status: UserStatus,
         username: String,
     }
 
     struct UserInfoDetails {
         id: u32,
         created_at: u64,
-        status: u8,
+        status: UserStatus,
         username: String,
         has_permissions: bool,
         permissions: Permissions,
@@ -603,7 +609,7 @@ mod ffi {
             self: &Client,
             username: String,
             password: String,
-            status: u8,
+            status: UserStatus,
             has_permissions: bool,
             permissions: Permissions,
         ) -> Result<UserInfoDetails>;
@@ -614,7 +620,7 @@ mod ffi {
             has_username: bool,
             username: String,
             has_status: bool,
-            status: u8,
+            status: UserStatus,
         ) -> Result<()>;
         fn update_permissions(
             self: &Client,
