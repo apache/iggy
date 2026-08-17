@@ -199,7 +199,6 @@ IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithNoDelay() {
 }
 
 IggyBlockingClient IggyBlockingClient::Builder::Build() const {
-    ffi::Client *client = nullptr;
     try {
         ffi::IggyClientConfig config{};
         config.server_address               = server_address_;
@@ -219,18 +218,8 @@ IggyBlockingClient IggyBlockingClient::Builder::Build() const {
         config.has_tls_validate_certificate = tls_validate_certificate_.has_value();
         config.tls_validate_certificate     = tls_validate_certificate_.value_or(false);
         config.no_delay                     = no_delay_;
-        client                              = ffi::new_connection(std::move(config));
-        if (client == nullptr) {
-            throw IggyException("Could not create Iggy client");
-        }
-        return IggyBlockingClient(client);
+        return IggyBlockingClient(ffi::new_connection(std::move(config)));
     } catch (const std::exception &error) {
-        if (client != nullptr) {
-            try {
-                ffi::delete_client(client);
-            } catch (...) {
-            }
-        }
         throw IggyException(error.what());
     }
 }
