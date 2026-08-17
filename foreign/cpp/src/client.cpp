@@ -37,51 +37,29 @@ IggyBlockingClient::~IggyBlockingClient() {
 }
 
 IggyBlockingClient IggyBlockingClient::FromConnectionString(std::string connection_string) {
-    try {
-        return IggyBlockingClient(ffi::from_connection_string(connection_string));
-    } catch (const std::exception &error) {
-        throw IggyException(error.what());
-    }
+    return RethrowAsIggyException(
+        [&connection_string] { return IggyBlockingClient(ffi::from_connection_string(connection_string)); });
 }
 
 void IggyBlockingClient::Connect() {
-    try {
-        Handle()->connect();
-    } catch (const std::exception &error) {
-        throw IggyException(error.what());
-    }
+    RethrowAsIggyException([this] { Handle()->connect(); });
 }
 
 void IggyBlockingClient::Disconnect() {
-    try {
-        Handle()->disconnect();
-    } catch (const std::exception &error) {
-        throw IggyException(error.what());
-    }
+    RethrowAsIggyException([this] { Handle()->disconnect(); });
 }
 
 void IggyBlockingClient::Shutdown() {
-    try {
-        Handle()->shutdown();
-    } catch (const std::exception &error) {
-        throw IggyException(error.what());
-    }
+    RethrowAsIggyException([this] { Handle()->shutdown(); });
 }
 
 LoginInfo IggyBlockingClient::Login(std::string username, std::string password) {
-    try {
-        return Handle()->login_user(std::move(username), std::move(password));
-    } catch (const std::exception &error) {
-        throw IggyException(error.what());
-    }
+    return RethrowAsIggyException(
+        [this, &username, &password] { return Handle()->login_user(std::move(username), std::move(password)); });
 }
 
 void IggyBlockingClient::Logout() {
-    try {
-        Handle()->logout_user();
-    } catch (const std::exception &error) {
-        throw IggyException(error.what());
-    }
+    RethrowAsIggyException([this] { Handle()->logout_user(); });
 }
 
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {
@@ -196,7 +174,7 @@ IggyBlockingClient::Builder &IggyBlockingClient::Builder::WithNoDelay() {
 }
 
 IggyBlockingClient IggyBlockingClient::Builder::Build() const {
-    try {
+    return IggyBlockingClient::RethrowAsIggyException([this] {
         ffi::IggyClientConfig config{};
         config.server_address               = server_address_;
         config.auto_login_kind              = auto_login_kind_;
@@ -216,9 +194,7 @@ IggyBlockingClient IggyBlockingClient::Builder::Build() const {
         config.tls_validate_certificate     = tls_validate_certificate_.value_or(false);
         config.no_delay                     = no_delay_;
         return IggyBlockingClient(ffi::new_connection(std::move(config)));
-    } catch (const std::exception &error) {
-        throw IggyException(error.what());
-    }
+    });
 }
 
 }  // namespace iggy

@@ -685,6 +685,15 @@ class IggyBlockingClient final {
   private:
     explicit IggyBlockingClient(ffi::Client *client);
 
+    template <typename Operation>
+    static decltype(auto) RethrowAsIggyException(Operation &&operation) {
+        try {
+            return std::forward<Operation>(operation)();
+        } catch (const std::exception &error) {
+            throw IggyException(error.what());
+        }
+    }
+
     ffi::Client *Handle() const;
     void Reset() noexcept;
 
