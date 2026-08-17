@@ -455,7 +455,7 @@ pub enum DiskReadOutcome {
 impl DiskReadPlan {
     /// Serve a poll from the on-disk segment files, off the partition borrow.
     /// Reads from owned descriptors so no partition reference is held across
-    /// the file IO. Walks stamped `[256B SendMessagesHeader][blob]` batches in
+    /// the file IO. Walks stamped `[256B BatchHeader][blob]` batches in
     /// chunked reads, re-reading a batch split across a chunk boundary in the
     /// next chunk.
     #[allow(clippy::cast_possible_truncation)]
@@ -901,7 +901,7 @@ pub fn upsert_offset_max<K>(
     }
 }
 
-/// Walk stamped `[256B SendMessagesHeader][blob]` batches in one disk
+/// Walk stamped `[256B BatchHeader][blob]` batches in one disk
 /// chunk, pushing matching fragments. Returns bytes consumed: the start
 /// of the first batch that did not fully fit in the chunk (the caller
 /// re-reads from there), or the chunk end when everything decoded.

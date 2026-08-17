@@ -377,26 +377,18 @@ pub async fn ensure_initial_segment(
     // this with a stale `.index` at offset 0 on disk. The `partitions`-side
     // writers with the same names do NOT truncate, so opening them directly
     // instead would read index entries from a previous generation.
-    let storage = SegmentStorage::new(
-        &messages_path,
-        &index_path,
-        0,
-        0,
-        enforce_fsync,
-        enforce_fsync,
-        false,
-    )
-    .await
-    .map_err(|source| {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            error = %source,
-            "failed to create initial segment storage"
-        );
-        source
-    })?;
+    let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+        .await
+        .map_err(|source| {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                error = %source,
+                "failed to create initial segment storage"
+            );
+            source
+        })?;
     // Share the storage's size counters so reads observe persisted bytes;
     // a writer with a private counter grows the file invisibly to readers.
     let messages_size_counter = storage

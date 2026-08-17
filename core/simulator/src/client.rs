@@ -70,12 +70,11 @@ pub struct SimClient {
     /// [`SimClient::request_id_for`].
     partition_counter: Cell<u64>,
     /// Deterministic per-message id source for produced messages. The real SDK
-    /// sends `id: 0` and lets the server mint a random UUID
-    /// (`transcode_legacy_request` -> `random_id::get_uuid`); that
-    /// mint is unseeded, so under the deterministic executor a produce's
-    /// replicated body bytes (and their checksums) would differ run to run,
-    /// silently breaking seeded replay. Stamping a deterministic id here keeps
-    /// the body a pure function of the seed. See [`SimClient::next_message_id`].
+    /// mints a random UUID for a zero message id before encoding; that mint is
+    /// unseeded, so under the deterministic executor a produce's replicated
+    /// body bytes (and their checksums) would differ run to run, silently
+    /// breaking seeded replay. Stamping a deterministic id here keeps the body
+    /// a pure function of the seed. See [`SimClient::next_message_id`].
     message_counter: Cell<u64>,
     session: Cell<u64>,
 }
@@ -512,12 +511,12 @@ impl SimClient {
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())
     }
 
-    /// Build a `SendMessages` request in the legacy `SendMessagesEncoder` wire
-    /// shape, byte-compatible with what the real SDK sends (`common` binary
-    /// client). VSR clients resolve to an explicit partition before sending, so
-    /// the sim always emits `WirePartitioning::PartitionId`: that is the shape
-    /// the shell's `resolve_partition_request_namespace` decodes, and the raw
-    /// path converts it to `SendMessages` via `transcode_legacy_request`.
+    /// Build a `SendMessages` request in the `SendMessagesEncoder` wire shape,
+    /// byte-compatible with what the real SDK sends (`common` binary client).
+    /// VSR clients resolve to an explicit partition before sending, so the sim
+    /// always emits `WirePartitioning::PartitionId`: that is the shape the
+    /// shell's `resolve_partition_request_namespace` decodes before admission
+    /// strips the metadata and stamps the batch.
     ///
     /// # Panics
     /// Panics if a group id exceeds `u32` or the request buffer is invalid.
@@ -548,7 +547,8 @@ impl SimClient {
 
         let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, &raw);
         let mut buf = BytesMut::with_capacity(size);
-        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw);
+        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw)
+            .expect("simulator send batch encodes");
 
         self.build_request_with_namespace(Operation::SendMessages, &buf, group)
     }

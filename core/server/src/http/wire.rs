@@ -77,7 +77,13 @@ pub(in crate::http) fn encode_send_messages(
         &wire_topic_id,
         &wire_partitioning,
         &raw_messages,
-    );
+    )
+    .map_err(|error| match error {
+        iggy_binary_protocol::WireError::InvalidMessageTimestampDelta(delta) => {
+            IggyError::InvalidMessageTimestampDelta(delta)
+        }
+        _ => IggyError::InvalidCommand,
+    })?;
     Ok(buf.freeze())
 }
 
@@ -214,8 +220,6 @@ mod tests {
 
     use iggy_binary_protocol::WireDecode;
     use iggy_binary_protocol::WireEncode;
-    use iggy_binary_protocol::WireMessageIterator;
-    use iggy_binary_protocol::message_layout::WIRE_MESSAGE_INDEX_SIZE;
     use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
     use iggy_common::{
         Consumer, ConsumerKind, IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind,
@@ -225,7 +229,7 @@ mod tests {
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Owned;
     use server_common::send_messages::{
-        COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesHeader,
+        BatchHeader, COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages,
         SendMessagesOwned,
     };
 
@@ -286,18 +290,26 @@ mod tests {
         );
         assert_eq!(header.messages_count, 2);
 
-        let data_offset = 4 + metadata_length + 2 * WIRE_MESSAGE_INDEX_SIZE;
-        let views: Vec<_> = WireMessageIterator::new(&bytes[data_offset..], 2)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("valid message frames");
-        assert_eq!(views[0].id(), 7);
-        assert_eq!(views[0].payload(), b"first");
-        assert_eq!(views[0].user_headers(), b"");
-        assert_eq!(views[0].origin_timestamp(), origin_timestamps[0]);
-        assert_eq!(views[1].id(), 8);
-        assert_eq!(views[1].payload(), b"second");
-        assert_eq!(views[1].user_headers(), b"raw-header-bytes");
-        assert_eq!(views[1].origin_timestamp(), origin_timestamps[1]);
+        let batch = iggy_binary_protocol::batch::decode_batch_slice(&bytes[4 + metadata_length..])
+            .expect("valid producer batch");
+        assert_eq!(batch.header.partition_id, 0);
+        assert_eq!(batch.message_count(), 2);
+        let views: Vec<_> = batch.iter().collect();
+        let batch_origin = batch.header.origin_timestamp;
+        assert_eq!(views[0].header.id, 7);
+        assert_eq!(views[0].payload, b"first");
+        assert_eq!(views[0].user_headers, b"");
+        assert_eq!(
+            batch_origin + u64::from(views[0].header.timestamp_delta),
+            origin_timestamps[0]
+        );
+        assert_eq!(views[1].header.id, 8);
+        assert_eq!(views[1].payload, b"second");
+        assert_eq!(views[1].user_headers, b"raw-header-bytes");
+        assert_eq!(
+            batch_origin + u64::from(views[1].header.timestamp_delta),
+            origin_timestamps[1]
+        );
     }
 
     #[test]
@@ -469,7 +481,7 @@ mod tests {
     /// Wrap one stored `SendMessages` batch (`[256B header][blob]`) as the
     /// poll fragment the owning shard replies, the shape
     /// `build_polled_messages_body` consumes.
-    fn fragment_from_stored_batch(header: &SendMessagesHeader, blob: &[u8]) -> PollFragments {
+    fn fragment_from_stored_batch(header: &BatchHeader, blob: &[u8]) -> PollFragments {
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(COMMAND_HEADER_SIZE + blob.len());
         header.encode_into(buffer.as_mut_slice());
         buffer.as_mut_slice()[COMMAND_HEADER_SIZE..].copy_from_slice(blob);

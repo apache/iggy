@@ -70,7 +70,7 @@ use server_common::{
     MESSAGE_ALIGN, Message, SegmentStorage,
     iobuf::{Frozen, Owned},
     send_messages::{
-        ChecksumMode, SendMessagesHeader, convert_request_message, decode_prepare_slice,
+        BatchHeader, ChecksumMode, convert_request_message, decode_prepare_slice,
         decode_prepare_slice_trusted, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
@@ -2652,7 +2652,7 @@ where
     async fn append_stamped_messages(
         &mut self,
         message: Message<PrepareHeader>,
-        batch: SendMessagesHeader,
+        batch: BatchHeader,
     ) -> Result<JournaledMessages, IggyError> {
         let batch_messages_count = batch.message_count;
         if batch_messages_count == 0 {
@@ -3639,7 +3639,6 @@ where
             let segment_index = self.log.segments().len() - 1;
             let segment = &mut self.log.segments_mut()[segment_index];
             segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved_bytes as u64);
-            self.log.clear_in_flight();
             return Ok(());
         }
 
@@ -3691,7 +3690,6 @@ where
         let segment = &mut self.log.segments_mut()[segment_index];
         segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
 
-        self.log.clear_in_flight();
         Ok(())
     }
 
@@ -3735,17 +3733,9 @@ where
             },
         );
 
-        let storage = SegmentStorage::new(
-            &messages_path,
-            &index_path,
-            0,
-            0,
-            enforce_fsync,
-            enforce_fsync,
-            false,
-        )
-        .await
-        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
@@ -4011,17 +4001,9 @@ where
         let enforce_fsync = self.effective_enforce_fsync(config);
         let preallocate_segments = self.effective_preallocate_segments(config);
         let segment = Segment::new(start_offset, segment_size);
-        let storage = SegmentStorage::new(
-            &messages_path,
-            &index_path,
-            0,
-            0,
-            enforce_fsync,
-            enforce_fsync,
-            false,
-        )
-        .await
-        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
@@ -6447,10 +6429,9 @@ mod tests {
         let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
         let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
         partition.log.segments_mut()[0].sealed = true;
-        partition.log.storages_mut()[0] =
-            SegmentStorage::new(&log_path, &index_path, 0, 0, false, false, false)
-                .await
-                .expect("create segment storage");
+        partition.log.storages_mut()[0] = SegmentStorage::new(&log_path, &index_path, 0, 0, false)
+            .await
+            .expect("create segment storage");
 
         let record = build_segment_record(namespace, 0);
         let record_len = record.len() as u64;

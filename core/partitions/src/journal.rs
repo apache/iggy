@@ -19,7 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
-    send_messages::{COMMAND_HEADER_SIZE, SendMessagesRef, decode_prepare_slice_trusted},
+    send_messages::{self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice_trusted},
 };
 use std::io;
 use std::{
@@ -1023,7 +1023,7 @@ impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMe
 }
 
 pub fn select_batch_slice(
-    batch: &SendMessagesRef<'_>,
+    batch: &BatchRef<'_>,
     query: MessageLookup,
     already_matched: u32,
 ) -> Option<SelectedBatchSlice> {
@@ -1087,7 +1087,7 @@ pub fn select_batch_slice(
 
 /// Push the fragments for one selected batch, shared by the resident-journal
 /// walk and the disk-chunk walk. `source` holds a stamped
-/// `[256B SendMessagesHeader][blob]` batch starting at byte `batch_base`
+/// `[256B BatchHeader][blob]` batch starting at byte `batch_base`
 /// (the disk walk passes the chunk cursor; the resident walk passes
 /// `size_of::<PrepareHeader>()`, the batch's offset past the prepare header).
 /// A full-body selection forwards the original batch bytes by reference; a
@@ -1099,7 +1099,7 @@ pub fn push_selected_batch_fragments(
     matched_messages: &mut u32,
     source: &Frozen<4096>,
     batch_base: usize,
-    batch: &SendMessagesRef<'_>,
+    batch: &BatchRef<'_>,
     selection: SelectedBatchSlice,
 ) {
     let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
@@ -1122,7 +1122,9 @@ pub fn push_selected_batch_fragments(
                 .get(selection.start..selection.end)
                 .expect("selected batch slice must stay within blob bounds"),
         );
-        fragments.push(Fragment::whole(rewritten.into_frozen()));
+        fragments.push(Fragment::whole(send_messages::frozen_batch_header(
+            &rewritten,
+        )));
         fragments.push(Fragment::slice(
             source.clone(),
             batch_base + COMMAND_HEADER_SIZE + selection.start,

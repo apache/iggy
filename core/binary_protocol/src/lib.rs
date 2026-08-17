@@ -55,14 +55,13 @@
 //!   [`StartViewHeader`]
 //! - Dispatch: [`GenericHeader`] for type-erased initial parsing
 
+pub mod batch;
 pub mod codec;
 pub mod codes;
 pub mod consensus;
 pub mod dispatch;
 pub mod error;
 pub mod framing;
-pub mod message_layout;
-pub mod message_view;
 pub mod namespace;
 pub mod primitives;
 pub mod requests;
@@ -84,9 +83,6 @@ pub use consensus::{
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
 pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
-pub use message_view::{
-    WireMessageIterator, WireMessageIteratorMut, WireMessageView, WireMessageViewMut,
-};
 pub use primitives::ack_level::AckLevel;
 pub use primitives::consumer::{KIND_CONSUMER_GROUP, WireConsumer};
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
