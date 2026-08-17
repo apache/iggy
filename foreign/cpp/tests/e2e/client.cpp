@@ -695,11 +695,7 @@ TEST_F(LowLevelE2E_Client, UpdateUserByUsernameChangesUsernameAndStatus) {
     iggy::ffi::UserInfoDetails created{};
     ASSERT_NO_THROW({ created = CreateUser(client, username, "secret123", iggy::ffi::UserStatus::Active); });
     ASSERT_NO_THROW(client->update_user(make_string_identifier(username), true, replacement, true, iggy::ffi::UserStatus::Inactive));
-    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), username);
-    ASSERT_NE(tracked_user, tracked_user_names_.end());
-    if (tracked_user != tracked_user_names_.end()) {
-        *tracked_user = replacement;
-    }
+    RenameTrackedUser(username, replacement);
 
     ASSERT_THROW(client->get_user(make_string_identifier(username)), std::exception);
     iggy::ffi::UserInfoDetails fetched{};
@@ -717,11 +713,7 @@ TEST_F(LowLevelE2E_Client, UpdateUserByNumericIdChangesUsernameAndStatus) {
     iggy::ffi::UserInfoDetails created{};
     ASSERT_NO_THROW({ created = CreateUser(client, username, "secret123", iggy::ffi::UserStatus::Inactive); });
     ASSERT_NO_THROW(client->update_user(make_numeric_identifier(created.id), true, replacement, true, iggy::ffi::UserStatus::Active));
-    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), username);
-    ASSERT_NE(tracked_user, tracked_user_names_.end());
-    if (tracked_user != tracked_user_names_.end()) {
-        *tracked_user = replacement;
-    }
+    RenameTrackedUser(username, replacement);
 
     iggy::ffi::UserInfoDetails by_id{};
     iggy::ffi::UserInfoDetails by_name{};
@@ -751,11 +743,7 @@ TEST_F(LowLevelE2E_Client, UpdateUserAllowsUsernameAndStatusToBeUpdatedIndepende
 
     ASSERT_NO_THROW(client->update_user(make_numeric_identifier(created.id), true, replacement, false,
                                         iggy::ffi::UserStatus::Active));
-    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), username);
-    ASSERT_NE(tracked_user, tracked_user_names_.end());
-    if (tracked_user != tracked_user_names_.end()) {
-        *tracked_user = replacement;
-    }
+    RenameTrackedUser(username, replacement);
 
     iggy::ffi::UserInfoDetails username_updated{};
     ASSERT_NO_THROW({ username_updated = client->get_user(make_numeric_identifier(created.id)); });
@@ -777,17 +765,9 @@ TEST_F(LowLevelE2E_Client, UpdateUserAcceptsUsernameLengthBounds) {
     ASSERT_NO_THROW({ first = CreateUser(client, first_username, "secret123", iggy::ffi::UserStatus::Active); });
     ASSERT_NO_THROW({ second = CreateUser(client, second_username, "secret123", iggy::ffi::UserStatus::Active); });
     ASSERT_NO_THROW(client->update_user(make_string_identifier(first_username), true, first_replacement, true, iggy::ffi::UserStatus::Active));
-    const auto first_tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), first_username);
-    ASSERT_NE(first_tracked_user, tracked_user_names_.end());
-    if (first_tracked_user != tracked_user_names_.end()) {
-        *first_tracked_user = first_replacement;
-    }
+    RenameTrackedUser(first_username, first_replacement);
     ASSERT_NO_THROW(client->update_user(make_string_identifier(second_username), true, second_replacement, true, iggy::ffi::UserStatus::Active));
-    const auto second_tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), second_username);
-    ASSERT_NE(second_tracked_user, tracked_user_names_.end());
-    if (second_tracked_user != tracked_user_names_.end()) {
-        *second_tracked_user = second_replacement;
-    }
+    RenameTrackedUser(second_username, second_replacement);
 
     iggy::ffi::UserInfoDetails fetched_first{};
     iggy::ffi::UserInfoDetails fetched_second{};
@@ -832,11 +812,7 @@ TEST_F(LowLevelE2E_Client, UpdateUserAcceptsNonAsciiAndNonAlphabeticUsername) {
         ASSERT_NO_THROW({ created = CreateUser(client, sources[index], "secret123", iggy::ffi::UserStatus::Active); });
         ASSERT_NO_THROW(
             client->update_user(make_string_identifier(sources[index]), true, replacements[index], true, iggy::ffi::UserStatus::Active));
-        const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), sources[index]);
-        ASSERT_NE(tracked_user, tracked_user_names_.end());
-        if (tracked_user != tracked_user_names_.end()) {
-            *tracked_user = replacements[index];
-        }
+        RenameTrackedUser(sources[index], replacements[index]);
         iggy::ffi::UserInfoDetails fetched{};
         ASSERT_NO_THROW({ fetched = client->get_user(make_string_identifier(replacements[index])); });
         EXPECT_EQ(fetched.id, created.id);
@@ -917,11 +893,7 @@ TEST_F(LowLevelE2E_Client, UpdateUserPreservesPasswordPermissionsAndCreationData
     iggy::ffi::UserInfoDetails created{};
     ASSERT_NO_THROW({ created = CreateUser(root_client, username, "known-secret", iggy::ffi::UserStatus::Active, true, std::move(permissions)); });
     ASSERT_NO_THROW(root_client->update_user(make_string_identifier(username), true, replacement, true, iggy::ffi::UserStatus::Active));
-    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), username);
-    ASSERT_NE(tracked_user, tracked_user_names_.end());
-    if (tracked_user != tracked_user_names_.end()) {
-        *tracked_user = replacement;
-    }
+    RenameTrackedUser(username, replacement);
     iggy::ffi::UserInfoDetails fetched{};
     ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(replacement)); });
     EXPECT_EQ(fetched.id, created.id);
@@ -957,11 +929,7 @@ TEST_F(LowLevelE2E_Client, UpdateUserRenameMakesOldUsernameReusable) {
     iggy::ffi::UserInfoDetails first{};
     ASSERT_NO_THROW({ first = CreateUser(client, old_username, "secret123", iggy::ffi::UserStatus::Active); });
     ASSERT_NO_THROW(client->update_user(make_string_identifier(old_username), true, new_username, true, iggy::ffi::UserStatus::Active));
-    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), old_username);
-    ASSERT_NE(tracked_user, tracked_user_names_.end());
-    if (tracked_user != tracked_user_names_.end()) {
-        *tracked_user = new_username;
-    }
+    RenameTrackedUser(old_username, new_username);
     iggy::ffi::UserInfoDetails second{};
     ASSERT_NO_THROW({ second = CreateUser(client, old_username, "secret123", iggy::ffi::UserStatus::Active); });
     EXPECT_EQ(static_cast<std::string>(client->get_user(make_string_identifier(new_username)).username), new_username);
@@ -1025,11 +993,7 @@ TEST_F(LowLevelE2E_Client, ManageUsersPermissionAllowsUpdateWithoutReadUsers) {
     ASSERT_NO_THROW(manager_client->connect());
     ASSERT_NO_THROW(manager_client->login_user(manager_username, "secret123"));
     ASSERT_NO_THROW(manager_client->update_user(make_string_identifier(target_username), true, replacement, true, iggy::ffi::UserStatus::Inactive));
-    const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), target_username);
-    ASSERT_NE(tracked_user, tracked_user_names_.end());
-    if (tracked_user != tracked_user_names_.end()) {
-        *tracked_user = replacement;
-    }
+    RenameTrackedUser(target_username, replacement);
     iggy::ffi::UserInfoDetails fetched{};
     ASSERT_NO_THROW({ fetched = root_client->get_user(make_string_identifier(replacement)); });
     EXPECT_EQ(fetched.id, target.id);

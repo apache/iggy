@@ -178,6 +178,12 @@ class E2ETestFixture : public ::testing::Test {
                                   tracked_user_names_.end());
     }
 
+    void RenameTrackedUser(const std::string &from, const std::string &to) {
+        const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), from);
+        ASSERT_NE(tracked_user, tracked_user_names_.end());
+        *tracked_user = to;
+    }
+
     void TrackStream(const std::string &stream_name) { tracked_stream_names_.push_back(stream_name); }
     void TrackStream(const std::uint32_t stream_id) { tracked_stream_ids_.push_back(stream_id); }
     void TrackConsumerGroup(const std::string &stream_name,
@@ -422,7 +428,7 @@ class E2ETestFixture : public ::testing::Test {
         clients_.clear();
     }
 
-  protected:
+  private:
     std::vector<iggy::ffi::Client *> clients_;
     std::vector<std::string> tracked_user_names_;
     std::vector<std::string> tracked_stream_names_;
