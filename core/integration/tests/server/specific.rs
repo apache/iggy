@@ -62,8 +62,6 @@ async fn should_handle_single_message_per_batch_with_delayed_persistence(harness
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket, Quic],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -80,8 +78,6 @@ async fn producer_reconnect_after_server_restart(harness: &mut TestHarness) {
 #[iggy_harness(
     test_client_transport = [Tcp, WebSocket],
     server(
-        tcp.socket.override_defaults = true,
-        tcp.socket.nodelay = true,
         quic.max_idle_timeout = "500s",
         quic.keep_alive_interval = "15s"
     )
@@ -120,9 +116,8 @@ async fn consumer_offset_ahead_after_crash(harness: &mut TestHarness) {
 /// gaps.
 ///
 /// Config: high messages_required_to_save so post-restart messages accumulate in
-/// the journal (exposing the base_offset=0 bug). message_saver flushes pre-restart
-/// data before the restart.
-#[iggy_harness(server(message_saver.enabled = true, message_saver.interval = "1s"))]
+/// the journal (exposing the base_offset=0 bug).
+#[iggy_harness]
 async fn restart_offset_skip(harness: &mut TestHarness) {
     restart_offset_skip_scenario::run(harness).await;
 }
@@ -135,22 +130,14 @@ async fn restart_offset_skip(harness: &mut TestHarness) {
 /// Server configuration:
 /// - Smallest segment size a topic may declare (1 MiB), plus a payload sized
 ///   to keep rotations frequent at that floor (~240 rolls per run)
-/// - Short message_saver interval (1s) to add concurrent persist operations
 /// - Small messages_required_to_save (32) to trigger more frequent saves
-/// - cache_indexes = none to trigger clear_active_indexes path
 ///
 /// Test configuration:
 /// - 8 producers total (2 per protocol: TCP, HTTP, QUIC, WebSocket)
 /// - All producers write to the same partition for maximum lock contention
 // Concurrency race test: runs over the three VSR transports (TCP/QUIC/
 // WebSocket -- HTTP/REST carries no VSR framing).
-#[iggy_harness(server(
-    message_saver.interval = "1s",
-    segment.cache_indexes = "none",
-    tcp.socket_migration = false,
-    tcp.socket.override_defaults = true,
-    tcp.socket.nodelay = true
-))]
+#[iggy_harness]
 async fn segment_rotation_scenario(harness: &TestHarness) {
     segment_rotation_race_scenario::run(harness).await;
 }

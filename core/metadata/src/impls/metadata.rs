@@ -3434,9 +3434,6 @@ where
         }
     }
 
-    // TODO: Implement jump_to_newer_op
-    // fn jump_to_newer_op(&self, header: &PrepareHeader) {}
-
     /// Apply ops `[commit_min+1 .. commit_max]` to state machine and
     /// `client_table`. Backup does NOT ship wire replies (primary's job).
     ///

@@ -87,7 +87,6 @@ pub struct SendMessagesResult {
 }
 
 /// Consumer identification for offset operations.
-// TODO(hubcio): unify with server's `PollingConsumer` in `streaming/polling_consumer.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollingConsumer {
     /// Regular consumer with (`consumer_id`, `partition_id`)
