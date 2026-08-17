@@ -68,7 +68,7 @@ use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::{
-    GetConsumerOffsetRequest, StoreConsumerOffset2Request,
+    GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::partitions::{
@@ -88,7 +88,7 @@ use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{
-    AckLevel, ClientVersionInfo, Command2, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
+    AckLevel, ClientVersionInfo, Command, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
     ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, KIND_CONSUMER_GROUP,
     MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader, RoutedRequestHeader,
@@ -404,7 +404,7 @@ fn submit_auto_commit<B, MJ, S, SB>(
     shard.dispatch(message.into_generic());
 }
 
-/// Build the synthetic `StoreConsumerOffset2` request for an auto-commit, keyed
+/// Build the synthetic `StoreConsumerOffset` request for an auto-commit, keyed
 /// to the resolved numeric consumer/group id and stamped with the reserved
 /// [`AUTO_COMMIT_CLIENT_ID`] so the commit path skips the (unwaited) reply. The
 /// wire stream/topic ids are cosmetic here -- admission and apply key off the
@@ -414,7 +414,7 @@ fn build_auto_commit_request(
     namespace: IggyNamespace,
     applied: &AutoCommitApplied,
 ) -> Result<Message<RoutedRequestHeader>, IggyError> {
-    let request = StoreConsumerOffset2Request {
+    let request = StoreConsumerOffsetRequest {
         consumer: WireConsumer {
             kind: applied.kind.as_code(),
             id: WireIdentifier::Numeric(applied.consumer_id),
@@ -434,8 +434,8 @@ fn build_auto_commit_request(
     Ok(
         message.transmute_header(|_, header: &mut RoutedRequestHeader| {
             *header = RoutedRequestHeader {
-                command: Command2::Request,
-                operation: Operation::StoreConsumerOffset2,
+                command: Command::Request,
+                operation: Operation::StoreConsumerOffset,
                 size,
                 client: AUTO_COMMIT_CLIENT_ID,
                 // The partition plane is sessionless (no `ClientTable` dedup); a
@@ -2840,7 +2840,7 @@ fn build_forward_register_message(
 ) -> Message<ForwardRegisterHeader> {
     Message::<ForwardRegisterHeader>::new(HEADER_SIZE).transmute_header(
         |_, header: &mut ForwardRegisterHeader| {
-            header.command = Command2::ForwardRegister;
+            header.command = Command::ForwardRegister;
             header.cluster = cluster;
             header.view = view;
             header.replica = replica;
@@ -2865,7 +2865,7 @@ fn build_forward_register_result_message(
     let (session, outcome) = forward_register_outcome(bound);
     Message::<ForwardRegisterResultHeader>::new(HEADER_SIZE).transmute_header(
         |_, header: &mut ForwardRegisterResultHeader| {
-            header.command = Command2::ForwardRegisterResult;
+            header.command = Command::ForwardRegisterResult;
             header.cluster = cluster;
             header.view = view;
             header.replica = replica;
@@ -3029,7 +3029,7 @@ fn build_forward_logout_message(
 ) -> Message<ForwardLogoutHeader> {
     Message::<ForwardLogoutHeader>::new(HEADER_SIZE).transmute_header(
         |_, header: &mut ForwardLogoutHeader| {
-            header.command = Command2::ForwardLogout;
+            header.command = Command::ForwardLogout;
             header.cluster = cluster;
             header.view = view;
             header.replica = replica;
@@ -3055,7 +3055,7 @@ fn build_forward_logout_result_message(
     let (commit, outcome) = forward_logout_outcome(result);
     Message::<ForwardLogoutResultHeader>::new(HEADER_SIZE).transmute_header(
         |_, header: &mut ForwardLogoutResultHeader| {
-            header.command = Command2::ForwardLogoutResult;
+            header.command = Command::ForwardLogoutResult;
             header.cluster = cluster;
             header.view = view;
             header.replica = replica;
@@ -4028,7 +4028,7 @@ mod tests {
             client,
             request: 0,
             commit: session,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::Register,
             ..Default::default()
         };
@@ -4051,7 +4051,7 @@ mod tests {
             let header =
                 bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
             *header = RoutedRequestHeader {
-                command: Command2::Request,
+                command: Command::Request,
                 operation,
                 size: u32::try_from(total).expect("test request fits u32"),
                 client,
@@ -4083,7 +4083,7 @@ mod tests {
             let header =
                 bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut slice[..header_size]);
             *header = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 operation,
                 size: u32::try_from(total).expect("test prepare fits u32"),
                 op: 1,
@@ -4559,7 +4559,7 @@ mod tests {
         await_forward(&bus).await;
         let (target, forward) = bus.sole_replica_send::<ForwardRegisterHeader>();
         assert_eq!(target, 0, "forward must address the view's primary");
-        assert_eq!(forward.command, Command2::ForwardRegister);
+        assert_eq!(forward.command, Command::ForwardRegister);
         assert_eq!(forward.client, CLIENT);
         assert_eq!(
             forward.user_id, USER,
@@ -4605,7 +4605,7 @@ mod tests {
         await_forward(&bus).await;
         let (target, forward) = bus.sole_replica_send::<ForwardLogoutHeader>();
         assert_eq!(target, 0, "forward must address the view's primary");
-        assert_eq!(forward.command, Command2::ForwardLogout);
+        assert_eq!(forward.command, Command::ForwardLogout);
         assert_eq!(forward.client, CLIENT);
         assert_eq!(forward.session, SESSION);
         assert_eq!(forward.request, REQUEST);
@@ -4944,7 +4944,7 @@ mod tests {
                     &mut message.as_mut_slice()[..header_size],
                 );
                 *header = RequestHeader {
-                    command: Command2::Request,
+                    command: Command::Request,
                     operation: Operation::NonReplicated,
                     size: u32::try_from(header_size).expect("header fits u32"),
                     client: TRANSPORT,
@@ -5002,7 +5002,7 @@ mod tests {
             assert_eq!(*client, TRANSPORT);
             assert_eq!(
                 frame[COMMAND_OFFSET],
-                Command2::Reply as u8,
+                Command::Reply as u8,
                 "an unbound cluster-metadata read must be denied with a Reply, not evicted"
             );
             let status =

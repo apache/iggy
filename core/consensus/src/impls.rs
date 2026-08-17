@@ -27,7 +27,7 @@ use crate::{
 use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    Command, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     ReplyHeader, RequestStartViewHeader, RoutedRequestHeader, StartViewChangeHeader,
     StartViewHeader, frame_body,
 };
@@ -3562,14 +3562,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Caller (`on_ack`) should validate `is_primary` and status before calling.
     ///
     /// # Panics
-    /// - If `header.command` is not `Command2::PrepareOk`.
+    /// - If `header.command` is not `Command::PrepareOk`.
     /// - If `header.replica >= self.replica_count`.
     pub fn handle_prepare_ok(
         &self,
         plane: PlaneKind,
         header: &PrepareOkHeader,
     ) -> PrepareOkOutcome {
-        assert_eq!(header.command, Command2::PrepareOk);
+        assert_eq!(header.command, Command::PrepareOk);
         assert!(
             header.replica < self.replica_count,
             "handle_prepare_ok: invalid replica {}",
@@ -3772,7 +3772,7 @@ where
                 size: old.size,
                 view: consensus.view.get(),
                 release: old.release,
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 replica: consensus.replica,
                 client: old.client,
                 parent: consensus.last_prepare_checksum(),
@@ -3814,7 +3814,7 @@ where
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
-                command: Command2::PrepareOk,
+                command: Command::PrepareOk,
                 parent: old.parent,
                 prepare_checksum: old.checksum,
                 request: old.request,
@@ -3881,7 +3881,7 @@ where
 #[cfg(test)]
 mod request_queue_tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, Operation};
+    use iggy_binary_protocol::{Command, Operation};
 
     fn make_request(client: u128, request_num: u64) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
@@ -3891,7 +3891,7 @@ mod request_queue_tests {
         )
         .expect("zeroed bytes are valid");
         *header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             client,
             session: 1,
             request: request_num,
@@ -4035,7 +4035,7 @@ mod pipeline_entry_tests {
     //! subscriber `Canceled` even on happy path. Tests pin both halves.
 
     use super::*;
-    use iggy_binary_protocol::{Command2, ReplyHeader};
+    use iggy_binary_protocol::{Command, ReplyHeader};
     use server_common::Message;
 
     fn make_reply(client: u128, request: u64) -> Message<ReplyHeader> {
@@ -4046,7 +4046,7 @@ mod pipeline_entry_tests {
         )
         .expect("zeroed bytes are valid");
         *header = ReplyHeader {
-            command: Command2::Reply,
+            command: Command::Reply,
             client,
             request,
             ..ReplyHeader::default()
@@ -4126,7 +4126,7 @@ mod pipeline_entry_tests {
         for op in 1..=depth as u64 {
             let checksum = u128::from(op);
             let header = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 size: std::mem::size_of::<PrepareHeader>() as u32,
                 op,
                 parent,
@@ -4259,7 +4259,7 @@ mod timestamp_clamp_tests {
             &mut msg.as_mut_slice()[..size],
         )
         .expect("zeroed bytes are a valid StartViewHeader");
-        header.command = Command2::StartView;
+        header.command = Command::StartView;
         header.cluster = 1;
         header.view = view;
         header.op = op;
@@ -4361,7 +4361,7 @@ mod timestamp_clamp_tests {
                 &mut msg.as_mut_slice()[..header_size],
             )
             .expect("zeroed bytes are a valid RoutedRequestHeader");
-            header.command = Command2::Request;
+            header.command = Command::Request;
             header.client = 1;
             header.request = 1;
             header.operation = iggy_binary_protocol::Operation::SendMessages;
@@ -4703,7 +4703,7 @@ mod vsr_consensus_tests {
     fn projected_prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(|_, new| {
             *new = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 size: size_of::<PrepareHeader>() as u32,
                 op,
                 parent,
@@ -4723,7 +4723,7 @@ mod vsr_consensus_tests {
     ) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(|_, new| {
             *new = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 size: size_of::<PrepareHeader>() as u32,
                 op,
                 parent,
@@ -4760,7 +4760,7 @@ mod vsr_consensus_tests {
         Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>()).transmute_header(
             |_, new| {
                 *new = RoutedRequestHeader {
-                    command: Command2::Request,
+                    command: Command::Request,
                     size: size_of::<RoutedRequestHeader>() as u32,
                     client,
                     session: 1,

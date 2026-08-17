@@ -26,7 +26,7 @@ public sealed class VsrReplyDecoderTests
     private static byte[] ReplyHeader(VsrOperation operation, int bodyLength, uint status = 0)
     {
         var header = new byte[VsrHeader.HEADER_SIZE];
-        header[VsrHeader.COMMAND_OFFSET] = (byte)Command2.Reply;
+        header[VsrHeader.COMMAND_OFFSET] = (byte)Command.Reply;
         header[VsrHeader.REPLY_OPERATION_OFFSET] = (byte)operation;
         BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(VsrHeader.SIZE_OFFSET),
             (uint)(VsrHeader.HEADER_SIZE + bodyLength));
@@ -38,7 +38,7 @@ public sealed class VsrReplyDecoderTests
     private static byte[] EvictionHeader(EvictionReason reason, uint version = 0, uint versionMin = 0)
     {
         var header = new byte[VsrHeader.HEADER_SIZE];
-        header[VsrHeader.COMMAND_OFFSET] = (byte)Command2.Eviction;
+        header[VsrHeader.COMMAND_OFFSET] = (byte)Command.Eviction;
         header[VsrHeader.EVICTION_REASON_OFFSET] = (byte)reason;
         BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(VsrHeader.EVICTION_PROTOCOL_VERSION_OFFSET), version);
         BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(VsrHeader.EVICTION_PROTOCOL_VERSION_MIN_OFFSET),

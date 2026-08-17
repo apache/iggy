@@ -3207,7 +3207,7 @@ mod tests {
         name: &str,
         op: u64,
     ) -> server_common::Message<iggy_binary_protocol::PrepareHeader> {
-        use iggy_binary_protocol::{Command2, Operation, PrepareHeader};
+        use iggy_binary_protocol::{Command, Operation, PrepareHeader};
         use server_common::Message;
         use server_common::iobuf::Owned;
         use std::mem::size_of;
@@ -3224,7 +3224,7 @@ mod tests {
             let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
                 &mut buffer.as_mut_slice()[..header_size],
             );
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = Operation::CreateStream;
             header.op = op;
             header.size = u32::try_from(total).unwrap();

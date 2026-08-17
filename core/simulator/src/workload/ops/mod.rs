@@ -38,7 +38,6 @@ pub mod create_topic;
 pub mod create_user;
 pub mod delete_consumer_group;
 pub mod delete_consumer_offset;
-pub mod delete_consumer_offset_2;
 pub mod delete_partitions;
 pub mod delete_personal_access_token;
 pub mod delete_segments;
@@ -49,7 +48,6 @@ pub mod purge_stream;
 pub mod purge_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
-pub mod store_consumer_offset_2;
 pub mod update_permissions;
 pub mod update_stream;
 pub mod update_topic;
@@ -172,7 +170,7 @@ op_dispatch! {
     // First three positions lock the hash baseline (do not reorder).
     CreateStream              => create_stream,
     SendMessages              => send_messages,
-    StoreConsumerOffset2      => store_consumer_offset_2,
+    StoreConsumerOffset       => store_consumer_offset,
     // Append-only; mirrors actions::Action declaration order.
     DeleteStream              => delete_stream,
     UpdateStream              => update_stream,
@@ -193,7 +191,5 @@ op_dispatch! {
     UpdatePermissions         => update_permissions,
     CreatePersonalAccessToken => create_personal_access_token,
     DeletePersonalAccessToken => delete_personal_access_token,
-    StoreConsumerOffset       => store_consumer_offset,
     DeleteConsumerOffset      => delete_consumer_offset,
-    DeleteConsumerOffset2     => delete_consumer_offset_2,
 }

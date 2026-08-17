@@ -45,8 +45,7 @@ use consensus::{
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::responses::messages::{
     SendMessagesConfirmationResponse, SendMessagesResponse,
@@ -70,8 +69,8 @@ use message_bus::{IggyMessageBus, MessageBus, is_auto_commit_client};
 use server_common::{
     MESSAGE_ALIGN, Message, SegmentStorage,
     iobuf::{Frozen, Owned},
-    send_messages2::{
-        ChecksumMode, SendMessages2Header, convert_request_message, decode_prepare_slice,
+    send_messages::{
+        ChecksumMode, SendMessagesHeader, convert_request_message, decode_prepare_slice,
         decode_prepare_slice_trusted, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
@@ -1268,7 +1267,7 @@ where
             // primary is real divergence (log corruption / out-of-order apply)
             // and must surface rather than silently mask a split state. A
             // FOLLOWER may legitimately miss the offset: `AckLevel::NoAck`
-            // (v2) stores apply on the primary only and are never replicated,
+            // stores apply on the primary only and are never replicated,
             // so a later quorum delete finds nothing on the backups -- erroring
             // there would fail the committed apply, panic the replica as
             // divergent, and crash-loop on every journal replay. The
@@ -1918,10 +1917,7 @@ where
 
             // Parse once for both the delete-existence check and AckLevel dispatch.
             let consumer_offset = match message.header().operation {
-                Operation::StoreConsumerOffset
-                | Operation::StoreConsumerOffset2
-                | Operation::DeleteConsumerOffset
-                | Operation::DeleteConsumerOffset2 => {
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                     match Self::parse_consumer_offset_request(message.header().operation, &message)
                     {
                         Ok(parsed) => Some(parsed),
@@ -1945,10 +1941,8 @@ where
                 _ => None,
             };
 
-            if matches!(
-                message.header().operation,
-                Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2
-            ) && let Some((kind, consumer_id, _, _)) = consumer_offset
+            if matches!(message.header().operation, Operation::DeleteConsumerOffset)
+                && let Some((kind, consumer_id, _, _)) = consumer_offset
                 && let Err(error) = self.ensure_consumer_offset_exists(kind, consumer_id)
             {
                 emit_partition_diag(
@@ -1984,10 +1978,8 @@ where
             // `InvalidOffset` rides `ReplyHeader.status` (op=0, empty body): the
             // status-only `classify_partition_reply` would misread a result-body
             // code on this committed-shaped frame (op=commit_max) as success.
-            if matches!(
-                message.header().operation,
-                Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2
-            ) && let Some((_, _, Some(requested_offset), _)) = consumer_offset
+            if matches!(message.header().operation, Operation::StoreConsumerOffset)
+                && let Some((_, _, Some(requested_offset), _)) = consumer_offset
             {
                 let current_offset = self.stats.current_offset();
                 let partition_empty =
@@ -2039,11 +2031,11 @@ where
                 return;
             }
 
-            // NoAck v2 -> fast path. Quorum + v1 -> VSR pipeline.
+            // NoAck -> fast path. Quorum -> VSR pipeline.
             if let Some((kind, consumer_id, offset, AckLevel::NoAck)) = consumer_offset
                 && matches!(
                     message.header().operation,
-                    Operation::StoreConsumerOffset2 | Operation::DeleteConsumerOffset2,
+                    Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset,
                 )
             {
                 Disposition::NoAck {
@@ -2546,10 +2538,7 @@ where
                 );
                 Ok(frozen)
             }
-            Operation::StoreConsumerOffset
-            | Operation::DeleteConsumerOffset
-            | Operation::StoreConsumerOffset2
-            | Operation::DeleteConsumerOffset2 => {
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 // Replicated path is Quorum-only by construction; ack ignored.
                 let (kind, consumer_id, offset, _ack) =
                     Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
@@ -2574,7 +2563,7 @@ where
                     .map_err(|_| IggyError::CannotAppendMessage)?;
 
                 match header.operation {
-                    Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+                    Operation::StoreConsumerOffset => {
                         self.stage_consumer_offset_upsert(
                             header.op,
                             kind,
@@ -2583,7 +2572,7 @@ where
                             is_auto_commit_client(header.client),
                         );
                     }
-                    Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                    Operation::DeleteConsumerOffset => {
                         self.stage_consumer_offset_delete(header.op, kind, consumer_id);
                     }
                     _ => unreachable!(),
@@ -2663,7 +2652,7 @@ where
     async fn append_stamped_messages(
         &mut self,
         message: Message<PrepareHeader>,
-        batch: SendMessages2Header,
+        batch: SendMessagesHeader,
     ) -> Result<JournaledMessages, IggyError> {
         let batch_messages_count = batch.message_count;
         if batch_messages_count == 0 {
@@ -3367,10 +3356,7 @@ where
                 }
                 !*failed_commit
             }
-            Operation::StoreConsumerOffset
-            | Operation::DeleteConsumerOffset
-            | Operation::StoreConsumerOffset2
-            | Operation::DeleteConsumerOffset2 => {
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.commit_consumer_offset_entry(prepare_header, failed_commit)
                     .await
             }
@@ -3499,7 +3485,7 @@ where
         let (kind, consumer_id, offset, _ack) =
             Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
         match header.operation {
-            Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+            Operation::StoreConsumerOffset => {
                 let offset = offset.ok_or(IggyError::InvalidCommand)?;
                 Ok(if is_auto_commit_client(header.client) {
                     PendingConsumerOffsetCommit::upsert_auto_commit(kind, consumer_id, offset)
@@ -3507,7 +3493,7 @@ where
                     PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset)
                 })
             }
-            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+            Operation::DeleteConsumerOffset => {
                 Ok(PendingConsumerOffsetCommit::delete(kind, consumer_id))
             }
             _ => Err(IggyError::InvalidCommand),
@@ -3540,20 +3526,10 @@ where
             Operation::StoreConsumerOffset => {
                 let request = StoreConsumerOffsetRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                (request.consumer, Some(request.offset), AckLevel::Quorum)
-            }
-            Operation::StoreConsumerOffset2 => {
-                let request = StoreConsumerOffset2Request::decode_from(body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
                 (request.consumer, Some(request.offset), request.ack)
             }
             Operation::DeleteConsumerOffset => {
                 let request = DeleteConsumerOffsetRequest::decode_from(body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
-                (request.consumer, None, AckLevel::Quorum)
-            }
-            Operation::DeleteConsumerOffset2 => {
-                let request = DeleteConsumerOffset2Request::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
                 (request.consumer, None, request.ack)
             }
@@ -5042,11 +5018,11 @@ mod tests {
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
-    use iggy_binary_protocol::{Command2, ReplyHeader, WireConsumer, WireEncode};
+    use iggy_binary_protocol::{Command, ReplyHeader, WireConsumer, WireEncode};
     use message_bus::SendError;
     use server_common::MESSAGE_ALIGN;
-    use server_common::send_messages2::{
-        COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
+    use server_common::send_messages::{
+        COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -5354,7 +5330,7 @@ mod tests {
         let size = std::mem::size_of::<PrepareHeader>();
         let prepare = Message::<PrepareHeader>::new(size).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = 1;
                 // Current view: an older-view prepare is fenced as deposed-primary
                 // traffic and would never reach the ack send under test.
@@ -5479,7 +5455,7 @@ mod tests {
         request_id: u64,
         consumer_id: u32,
     ) -> Message<RoutedRequestHeader> {
-        let body = DeleteConsumerOffset2Request {
+        let body = DeleteConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
             stream_id: WireIdentifier::Numeric(1),
             topic_id: WireIdentifier::Numeric(1),
@@ -5492,8 +5468,8 @@ mod tests {
         let mut message = Message::<RoutedRequestHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&body);
         message.transmute_header(|_, header: &mut RoutedRequestHeader| {
-            header.command = Command2::Request;
-            header.operation = Operation::DeleteConsumerOffset2;
+            header.command = Command::Request;
+            header.operation = Operation::DeleteConsumerOffset;
             header.client = client_id;
             header.session = 1;
             header.request = request_id;
@@ -5527,7 +5503,7 @@ mod tests {
                 &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
             )
             .expect("deny frame starts with a valid reply header");
-            assert_eq!(header.command, Command2::Reply);
+            assert_eq!(header.command, Command::Reply);
             assert_eq!(
                 header.status,
                 IggyError::ConsumerOffsetNotFound(0).as_code()
@@ -5784,17 +5760,17 @@ mod tests {
     /// stamped at `base_offset`, with a valid batch checksum so it decodes
     /// through `decode_batch_slice` and matches an `Offset` poll.
     pub(super) fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
-        let mut batch = IggyMessages2::with_capacity(1);
-        batch.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        let mut batch = IggyMessages::with_capacity(1);
+        batch.push(IggyMessage {
+            header: IggyMessageHeader {
                 payload_length: 8,
                 ..Default::default()
             },
             payload: Bytes::from_static(b"abcdefgh"),
             user_headers: None,
         });
-        let mut owned = SendMessages2Owned::from_messages(namespace, &batch)
-            .expect("build send_messages batch");
+        let mut owned =
+            SendMessagesOwned::from_messages(namespace, &batch).expect("build send_messages batch");
         owned.header.base_offset = base_offset;
         owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
 
@@ -6594,7 +6570,7 @@ mod tests {
         let size = std::mem::size_of::<PrepareHeader>();
         let prepare = Message::<PrepareHeader>::new(size).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = op;
                 header.operation = operation;
                 header.size = u32::try_from(size).expect("prepare header size fits in u32");
@@ -7043,7 +7019,7 @@ mod tests {
     #[test]
     fn given_result_framed_operation_when_committed_should_reply_empty_result_section() {
         assert_eq!(
-            &committed_reply_body(Operation::StoreConsumerOffset2)[..],
+            &committed_reply_body(Operation::StoreConsumerOffset)[..],
             &[0, 0, 0, 0]
         );
     }
@@ -7341,7 +7317,7 @@ mod retention_tests {
 mod purge_floor_tests {
     use super::tests::{build_segment_record, repair_config, test_partition};
     use super::*;
-    use iggy_binary_protocol::{Command2, WireConsumer, WireEncode};
+    use iggy_binary_protocol::{Command, WireConsumer, WireEncode};
 
     /// Fresh temp dir wired as the partition dir, so `purge()` can recreate
     /// real segment files and write `purge.gen`.
@@ -7371,7 +7347,7 @@ mod purge_floor_tests {
         let mut message = Message::<PrepareHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&record);
         let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = Operation::SendMessages;
             header.op = op;
             header.timestamp = op;
@@ -7385,7 +7361,7 @@ mod purge_floor_tests {
         partition.consensus().sequencer().set_sequence(op);
     }
 
-    /// A `StoreConsumerOffset2` prepare for `op`, journaled and staged through
+    /// A `StoreConsumerOffset` prepare for `op`, journaled and staged through
     /// the replicated-apply path.
     async fn journal_store_offset(
         partition: &mut IggyPartition<IggyMessageBus>,
@@ -7393,7 +7369,7 @@ mod purge_floor_tests {
         consumer_id: u32,
         offset: u64,
     ) {
-        let body = StoreConsumerOffset2Request {
+        let body = StoreConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
             stream_id: WireIdentifier::Numeric(1),
             topic_id: WireIdentifier::Numeric(1),
@@ -7407,8 +7383,8 @@ mod purge_floor_tests {
         let mut message = Message::<PrepareHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&body);
         let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
-            header.operation = Operation::StoreConsumerOffset2;
+            header.command = Command::Prepare;
+            header.operation = Operation::StoreConsumerOffset;
             header.op = op;
             header.group = IggyNamespace::new(1, 1, 0).inner();
             header.size = u32::try_from(total).expect("prepare size fits u32");
@@ -7737,7 +7713,7 @@ mod purge_floor_tests {
         let mut message = Message::<PrepareHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&record);
         let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = Operation::SendMessages;
             header.op = 1;
             header.group = namespace.inner();

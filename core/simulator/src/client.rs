@@ -22,8 +22,7 @@ use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
     PollMessagesRequest, RawMessage, SendMessagesEncoder,
@@ -165,7 +164,7 @@ impl SimClient {
     pub fn register(&self) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let header = RoutedRequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
+            command: iggy_binary_protocol::Command::Request,
             operation: Operation::Register,
             size: header_size as u32,
             client: self.client_id,
@@ -214,7 +213,7 @@ impl SimClient {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + body.len();
         let header = RoutedRequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
+            command: iggy_binary_protocol::Command::Request,
             operation: Operation::Register,
             size: total_size as u32,
             client: self.client_id,
@@ -518,7 +517,7 @@ impl SimClient {
     /// client). VSR clients resolve to an explicit partition before sending, so
     /// the sim always emits `WirePartitioning::PartitionId`: that is the shape
     /// the shell's `resolve_partition_request_namespace` decodes, and the raw
-    /// path converts it to `SendMessages2` via `transcode_legacy_request`.
+    /// path converts it to `SendMessages` via `transcode_legacy_request`.
     ///
     /// # Panics
     /// Panics if a group id exceeds `u32` or the request buffer is invalid.
@@ -584,7 +583,7 @@ impl SimClient {
         let mut reserved = [0u8; 52];
         reserved[..4].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
         let header = RoutedRequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
+            command: iggy_binary_protocol::Command::Request,
             operation: Operation::NonReplicated,
             size: total_size as u32,
             client: self.client_id,
@@ -602,55 +601,13 @@ impl SimClient {
             .expect("poll request must be valid")
     }
 
-    pub fn store_consumer_offset(
-        &self,
-        group: IggyNamespace,
-        consumer_kind: u8,
-        consumer_id: u32,
-        offset: u64,
-    ) -> Message<RoutedRequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(group);
-        let request = StoreConsumerOffsetRequest {
-            consumer: namespace_consumer(consumer_kind, consumer_id),
-            stream_id,
-            topic_id,
-            partition_id,
-            offset,
-        };
-        self.build_request_with_namespace(
-            Operation::StoreConsumerOffset,
-            &request.to_bytes(),
-            group,
-        )
-    }
-
-    pub fn delete_consumer_offset(
-        &self,
-        group: IggyNamespace,
-        consumer_kind: u8,
-        consumer_id: u32,
-    ) -> Message<RoutedRequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(group);
-        let request = DeleteConsumerOffsetRequest {
-            consumer: namespace_consumer(consumer_kind, consumer_id),
-            stream_id,
-            topic_id,
-            partition_id,
-        };
-        self.build_request_with_namespace(
-            Operation::DeleteConsumerOffset,
-            &request.to_bytes(),
-            group,
-        )
-    }
-
     /// Store offset with explicit `AckLevel`. `NoAck` takes the primary's
     /// fast path (no replication); `Quorum` goes through VSR.
     ///
     /// # Panics
     /// Panics on payload too large for `Owned::<4096>` or invalid
     /// `Message<RoutedRequestHeader>` parse; both are simulator misconfig.
-    pub fn store_consumer_offset_2(
+    pub fn store_consumer_offset(
         &self,
         group: IggyNamespace,
         consumer_kind: u8,
@@ -659,7 +616,7 @@ impl SimClient {
         ack: AckLevel,
     ) -> Message<RoutedRequestHeader> {
         let (stream_id, topic_id, partition_id) = namespace_ids(group);
-        let request = StoreConsumerOffset2Request {
+        let request = StoreConsumerOffsetRequest {
             consumer: namespace_consumer(consumer_kind, consumer_id),
             stream_id,
             topic_id,
@@ -668,7 +625,7 @@ impl SimClient {
             ack,
         };
         self.build_request_with_namespace(
-            Operation::StoreConsumerOffset2,
+            Operation::StoreConsumerOffset,
             &request.to_bytes(),
             group,
         )
@@ -679,7 +636,7 @@ impl SimClient {
     /// # Panics
     /// Panics on payload too large for `Owned::<4096>` or invalid
     /// `Message<RoutedRequestHeader>` parse; both are simulator misconfig.
-    pub fn delete_consumer_offset_2(
+    pub fn delete_consumer_offset(
         &self,
         group: IggyNamespace,
         consumer_kind: u8,
@@ -687,7 +644,7 @@ impl SimClient {
         ack: AckLevel,
     ) -> Message<RoutedRequestHeader> {
         let (stream_id, topic_id, partition_id) = namespace_ids(group);
-        let request = DeleteConsumerOffset2Request {
+        let request = DeleteConsumerOffsetRequest {
             consumer: namespace_consumer(consumer_kind, consumer_id),
             stream_id,
             topic_id,
@@ -695,7 +652,7 @@ impl SimClient {
             ack,
         };
         self.build_request_with_namespace(
-            Operation::DeleteConsumerOffset2,
+            Operation::DeleteConsumerOffset,
             &request.to_bytes(),
             group,
         )
@@ -742,7 +699,7 @@ impl SimClient {
     #[allow(clippy::cast_possible_truncation)]
     fn header(&self, operation: Operation, group: u64, total_size: usize) -> RoutedRequestHeader {
         RoutedRequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
+            command: iggy_binary_protocol::Command::Request,
             operation,
             size: total_size as u32,
             cluster: 0, // TODO: Get from config

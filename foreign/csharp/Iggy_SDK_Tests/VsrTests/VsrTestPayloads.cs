@@ -71,7 +71,9 @@ internal static class VsrTestPayloads
             BinaryPrimitives.WriteUInt32LittleEndian(partition.AsSpan(1), partitionId.Value);
         }
 
-        return Concat([1], NumericIdentifier(1), streamId, topicId, partition);
+        byte[] ack = [1];
+
+        return Concat([1], NumericIdentifier(1), streamId, topicId, partition, ack);
     }
 
     internal static byte[] DeleteSegments(byte[] streamId, byte[] topicId, uint partitionId, uint segmentsCount = 1)

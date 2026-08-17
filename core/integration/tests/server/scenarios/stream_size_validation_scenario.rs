@@ -38,8 +38,8 @@ const T2_NAME: &str = "test-topic-2";
 const MESSAGE_PAYLOAD_SIZE_BYTES: u64 = 57;
 const MSGS_COUNT: u64 = 117; // number of messages in a single topic after one pass of appending
 // The server accounts the actual on-disk batch framing: one 256-byte
-// `SendMessages2` command header per append pass plus a 48-byte per-message
-// header (`server_common::send_messages2::{COMMAND_HEADER_SIZE,
+// `SendMessages` command header per append pass plus a 48-byte per-message
+// header (`server_common::send_messages::{COMMAND_HEADER_SIZE,
 // MESSAGE_HEADER_SIZE}`). Each pass below sends all `MSGS_COUNT` messages in
 // one batch.
 const NG_BATCH_HEADER_SIZE: u64 = 256;

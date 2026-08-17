@@ -24,7 +24,7 @@
 
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
-use iggy_binary_protocol::consensus::{Command2, Operation, RequestHeader};
+use iggy_binary_protocol::consensus::{Command, Operation, RequestHeader};
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::{
     ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, WireName,
@@ -79,7 +79,7 @@ async fn assert_login_evicted(
     expected_window: (u32, u32),
 ) {
     let header = RequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::Register,
         size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
         client: 0xC0FFEE,
@@ -103,7 +103,7 @@ async fn assert_login_evicted(
     let command_offset = offset_of!(RequestHeader, command);
     assert_eq!(
         reply[command_offset],
-        Command2::Eviction as u8,
+        Command::Eviction as u8,
         "expected an Eviction frame"
     );
     assert_eq!(

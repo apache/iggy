@@ -42,7 +42,7 @@ use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::SegmentStorage;
-use server_common::send_messages2::decode_batch_slice;
+use server_common::send_messages::decode_batch_slice;
 use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;

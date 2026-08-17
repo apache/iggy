@@ -33,7 +33,7 @@ use iggy_common::{IggyByteSize, IggyError, PartitionStats};
 use partitions::state_transfer::STAGING_SUFFIX;
 use partitions::{IggyIndexReader, Segment};
 use server_common::SegmentStorage;
-use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header, decode_batch_slice};
+use server_common::send_messages::{COMMAND_HEADER_SIZE, SendMessagesHeader, decode_batch_slice};
 use std::fs;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -521,7 +521,7 @@ async fn recover_segment_bounds(
 fn batch_verifies(
     messages: &fs::File,
     position: u64,
-    header: &SendMessages2Header,
+    header: &SendMessagesHeader,
     scratch: &mut Vec<u8>,
 ) -> bool {
     scratch.clear();
@@ -536,11 +536,11 @@ fn read_batch_header(
     messages: &fs::File,
     position: u64,
     messages_size: u64,
-) -> Option<SendMessages2Header> {
+) -> Option<SendMessagesHeader> {
     if position.checked_add(COMMAND_HEADER_SIZE as u64)? > messages_size {
         return None;
     }
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE];
     messages.read_exact_at(&mut header_bytes, position).ok()?;
-    SendMessages2Header::decode(&header_bytes).ok()
+    SendMessagesHeader::decode(&header_bytes).ok()
 }

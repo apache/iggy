@@ -71,7 +71,7 @@ pub mod version;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
-    CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusError, ConsensusHeader, DVC_HEADERS_MAX,
+    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusError, ConsensusHeader, DVC_HEADERS_MAX,
     DoViewChangeHeader, EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
     ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
@@ -83,7 +83,7 @@ pub use consensus::{
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
-pub use framing::{RequestFrame, RequestFrame2, ResponseFrame, ResponseFrame2, STATUS_OK};
+pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
 pub use message_view::{
     WireMessageIterator, WireMessageIteratorMut, WireMessageView, WireMessageViewMut,
 };

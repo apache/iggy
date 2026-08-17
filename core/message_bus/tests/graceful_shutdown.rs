@@ -71,7 +71,7 @@ async fn drains_all_clients_within_timeout() {
     assert!(bus.is_shutting_down());
 
     // Sends after shutdown must fail with the right variant.
-    let dummy = common::header_only(iggy_binary_protocol::Command2::Reply, 0, 0);
+    let dummy = common::header_only(iggy_binary_protocol::Command::Reply, 0, 0);
     let err = bus
         .send_to_client(1u128 << 112, dummy.into_frozen())
         .await

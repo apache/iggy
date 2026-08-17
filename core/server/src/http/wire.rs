@@ -19,11 +19,11 @@
 //! the control-plane [`Message<RoutedRequestHeader>`] builder shared by the write path.
 
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::consensus::{Command2, HEADER_SIZE};
+use iggy_binary_protocol::consensus::{Command, HEADER_SIZE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, GetConsumerOffsetRequest, StoreConsumerOffset2Request,
+    DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
     PollMessagesRequest, RawMessage, SendMessagesEncoder,
@@ -128,8 +128,8 @@ pub(in crate::http) fn consumer_offset_wire_request(
     })
 }
 
-/// Map a validated HTTP store-offset body onto the v2 wire request
-/// (`StoreConsumerOffset2Request`), `ack` pinned to `Quorum` so the route can
+/// Map a validated HTTP store-offset body onto the wire request
+/// (`StoreConsumerOffsetRequest`), `ack` pinned to `Quorum` so the route can
 /// await the committed reply. The body's consumer kind is structurally always
 /// `Consumer` (`Consumer::kind` is `#[serde(skip)]`), matching the legacy HTTP
 /// server; `partition_id` passes through as the wire `Option` (flag byte +
@@ -138,8 +138,8 @@ pub(in crate::http) fn store_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     command: &StoreConsumerOffset,
-) -> Result<StoreConsumerOffset2Request, IggyError> {
-    Ok(StoreConsumerOffset2Request {
+) -> Result<StoreConsumerOffsetRequest, IggyError> {
+    Ok(StoreConsumerOffsetRequest {
         consumer: consumer_to_wire(&command.consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
         topic_id: identifier_to_wire(topic_id)?,
@@ -149,16 +149,16 @@ pub(in crate::http) fn store_offset_wire_request(
     })
 }
 
-/// Map a validated HTTP delete-offset request onto the v2 wire request
-/// (`DeleteConsumerOffset2Request`), `ack` pinned to `Quorum` like
+/// Map a validated HTTP delete-offset request onto the wire request
+/// (`DeleteConsumerOffsetRequest`), `ack` pinned to `Quorum` like
 /// [`store_offset_wire_request`].
 pub(in crate::http) fn delete_offset_wire_request(
     stream_id: &Identifier,
     topic_id: &Identifier,
     consumer: &Consumer,
     partition_id: Option<u32>,
-) -> Result<DeleteConsumerOffset2Request, IggyError> {
-    Ok(DeleteConsumerOffset2Request {
+) -> Result<DeleteConsumerOffsetRequest, IggyError> {
+    Ok(DeleteConsumerOffsetRequest {
         consumer: consumer_to_wire(consumer)?,
         stream_id: identifier_to_wire(stream_id)?,
         topic_id: identifier_to_wire(topic_id)?,
@@ -197,7 +197,7 @@ pub(in crate::http) fn build_request_message(
         &mut message.as_mut_slice()[..HEADER_SIZE],
     )
     .expect("zeroed bytes form a valid RoutedRequestHeader");
-    header.command = Command2::Request;
+    header.command = Command::Request;
     header.operation = operation;
     header.client = client_id;
     header.session = session_id;
@@ -216,32 +216,31 @@ mod tests {
     use iggy_binary_protocol::WireEncode;
     use iggy_binary_protocol::WireMessageIterator;
     use iggy_binary_protocol::message_layout::WIRE_MESSAGE_INDEX_SIZE;
-    use iggy_binary_protocol::requests::messages::SendMessagesHeader;
     use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
     use iggy_common::{
-        Consumer, ConsumerKind, IggyMessage, IggyMessagesBatch, IggyTimestamp, Partitioning,
-        PartitioningKind, PollingKind, PollingStrategy, Validatable,
+        Consumer, ConsumerKind, IggyMessagesBatch, IggyTimestamp, Partitioning, PartitioningKind,
+        PollingKind, PollingStrategy, Validatable,
     };
     use partitions::{Fragment, PollFragments};
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Owned;
-    use server_common::send_messages2::{
-        COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Header,
-        SendMessages2Owned,
+    use server_common::send_messages::{
+        COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesHeader,
+        SendMessagesOwned,
     };
 
     use crate::http::error::{Consistency, ConsistencyQuery};
     use crate::responses::build_polled_messages_body;
 
     fn produce_command(partitioning: Partitioning) -> SendMessages {
-        let first = IggyMessage::builder()
+        let first = iggy_common::IggyMessage::builder()
             .id(7)
             .payload(Bytes::from_static(b"first"))
             .build()
             .expect("valid message");
         // Raw pre-encoded user headers, mirroring the HTTP deserializer's
         // base64 branch.
-        let mut second = IggyMessage::builder()
+        let mut second = iggy_common::IggyMessage::builder()
             .id(8)
             .payload(Bytes::from_static(b"second"))
             .build()
@@ -274,7 +273,10 @@ mod tests {
         let metadata_length =
             u32::from_le_bytes(bytes[..4].try_into().expect("length prefix")) as usize;
         let (header, consumed) =
-            SendMessagesHeader::decode(&bytes[4..4 + metadata_length]).expect("valid metadata");
+            iggy_binary_protocol::requests::messages::SendMessagesHeader::decode(
+                &bytes[4..4 + metadata_length],
+            )
+            .expect("valid metadata");
         assert_eq!(consumed, metadata_length);
         assert_eq!(header.stream_id, identifier_to_wire(&stream_id).unwrap());
         assert_eq!(header.topic_id, identifier_to_wire(&topic_id).unwrap());
@@ -402,7 +404,7 @@ mod tests {
         let bytes = request.to_bytes();
         assert_eq!(*bytes.last().expect("non-empty"), AckLevel::Quorum.as_u8());
         let (decoded, consumed) =
-            StoreConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+            StoreConsumerOffsetRequest::decode(&bytes).expect("decodes as the server does");
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, request);
         assert_eq!(decoded.consumer.kind, 1);
@@ -423,7 +425,7 @@ mod tests {
         let request = store_offset_wire_request(&stream_id, &topic_id, &command).expect("maps");
         let bytes = request.to_bytes();
         let (decoded, consumed) =
-            StoreConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+            StoreConsumerOffsetRequest::decode(&bytes).expect("decodes as the server does");
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded.partition_id, None);
         assert_eq!(decoded.offset, u64::MAX);
@@ -445,7 +447,7 @@ mod tests {
             let bytes = request.to_bytes();
             assert_eq!(*bytes.last().expect("non-empty"), AckLevel::Quorum.as_u8());
             let (decoded, consumed) =
-                DeleteConsumerOffset2Request::decode(&bytes).expect("decodes as the server does");
+                DeleteConsumerOffsetRequest::decode(&bytes).expect("decodes as the server does");
             assert_eq!(consumed, bytes.len());
             assert_eq!(decoded, request);
             assert_eq!(decoded.consumer.kind, 1);
@@ -464,10 +466,10 @@ mod tests {
         assert_eq!(query.partition_id, None);
     }
 
-    /// Wrap one stored `SendMessages2` batch (`[256B header][blob]`) as the
+    /// Wrap one stored `SendMessages` batch (`[256B header][blob]`) as the
     /// poll fragment the owning shard replies, the shape
     /// `build_polled_messages_body` consumes.
-    fn fragment_from_stored_batch(header: &SendMessages2Header, blob: &[u8]) -> PollFragments {
+    fn fragment_from_stored_batch(header: &SendMessagesHeader, blob: &[u8]) -> PollFragments {
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(COMMAND_HEADER_SIZE + blob.len());
         header.encode_into(buffer.as_mut_slice());
         buffer.as_mut_slice()[COMMAND_HEADER_SIZE..].copy_from_slice(blob);
@@ -477,14 +479,14 @@ mod tests {
     }
 
     /// Round-trip the poll route's encode/decode seam: the store's own batch
-    /// writer (`SendMessages2Owned::from_messages`) is the encoder oracle,
+    /// writer (`SendMessagesOwned::from_messages`) is the encoder oracle,
     /// `build_polled_messages_body` re-encodes to the legacy wire body, and
     /// the SDK's `PolledMessages::from_bytes` must read back every field.
     #[test]
     fn polled_messages_body_decodes_into_common_polled_messages() {
-        let mut messages = IggyMessages2::with_capacity(2);
-        messages.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        let mut messages = IggyMessages::with_capacity(2);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
                 id: 7,
                 origin_timestamp: 1_000,
                 ..Default::default()
@@ -492,8 +494,8 @@ mod tests {
             payload: Bytes::from_static(b"first"),
             user_headers: None,
         });
-        messages.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
                 id: 8,
                 origin_timestamp: 1_050,
                 ..Default::default()
@@ -503,7 +505,7 @@ mod tests {
         });
         let namespace = server_common::sharding::IggyNamespace::new(0, 0, 3);
         let stored =
-            SendMessages2Owned::from_messages(namespace, &messages).expect("encodes stored batch");
+            SendMessagesOwned::from_messages(namespace, &messages).expect("encodes stored batch");
         // The store stamps these on append; `from_messages` leaves them zero.
         let mut header = stored.header;
         header.base_offset = 41;

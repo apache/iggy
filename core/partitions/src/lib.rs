@@ -44,7 +44,7 @@ pub use offset_storage::delete_persisted_offset;
 pub use poll_plan::{AutoCommitApplied, PollPlan};
 pub use segment::Segment;
 use server_common::Message;
-pub use server_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
+pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use types::{
     AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
     PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,

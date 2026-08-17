@@ -33,7 +33,7 @@ const MESSAGE_COUNT_OFFSET: usize = 48;
 const MAX_TIMESTAMP_DELTA_MICROS: u64 = u32::MAX as u64;
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SendMessages2Header {
+pub struct SendMessagesHeader {
     pub partition_id: u64,
     pub base_offset: u64,
     pub base_timestamp: u64,
@@ -43,7 +43,7 @@ pub struct SendMessages2Header {
     pub message_count: u32,
 }
 
-impl SendMessages2Header {
+impl SendMessagesHeader {
     pub const fn new(
         partition_id: u64,
         origin_timestamp: u64,
@@ -122,15 +122,15 @@ impl SendMessages2Header {
 }
 
 #[derive(Debug, Clone)]
-pub struct SendMessages2Owned {
-    pub header: SendMessages2Header,
+pub struct SendMessagesOwned {
+    pub header: SendMessagesHeader,
     pub blob: Bytes,
 }
 
-impl SendMessages2Owned {
+impl SendMessagesOwned {
     pub fn from_messages(
         namespace: IggyNamespace,
-        messages: &IggyMessages2,
+        messages: &IggyMessages,
     ) -> Result<Self, IggyError> {
         let message_count = messages.count();
         let mut origin_timestamp = u64::MAX;
@@ -182,7 +182,7 @@ impl SendMessages2Owned {
         }
 
         let blob = blob.freeze();
-        let mut header = SendMessages2Header::new(
+        let mut header = SendMessagesHeader::new(
             namespace.partition_id() as u64,
             origin_timestamp,
             u64::try_from(COMMAND_HEADER_SIZE + blob.len())
@@ -219,7 +219,7 @@ impl SendMessages2Owned {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct IggyMessage2Header {
+pub struct IggyMessageHeader {
     pub checksum: u64,
     pub id: u128,
     pub offset: u64,
@@ -230,18 +230,18 @@ pub struct IggyMessage2Header {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IggyMessage2 {
-    pub header: IggyMessage2Header,
+pub struct IggyMessage {
+    pub header: IggyMessageHeader,
     pub payload: Bytes,
     pub user_headers: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct IggyMessages2 {
-    messages: Vec<IggyMessage2>,
+pub struct IggyMessages {
+    messages: Vec<IggyMessage>,
 }
 
-impl IggyMessages2 {
+impl IggyMessages {
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
@@ -254,7 +254,7 @@ impl IggyMessages2 {
         }
     }
 
-    pub fn push(&mut self, message: IggyMessage2) {
+    pub fn push(&mut self, message: IggyMessage) {
         self.messages.push(message);
     }
 
@@ -285,23 +285,23 @@ impl IggyMessages2 {
         Self { messages }
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, IggyMessage2> {
+    pub fn iter(&self) -> std::slice::Iter<'_, IggyMessage> {
         self.messages.iter()
     }
 }
 
-impl IntoIterator for IggyMessages2 {
-    type Item = IggyMessage2;
-    type IntoIter = std::vec::IntoIter<IggyMessage2>;
+impl IntoIterator for IggyMessages {
+    type Item = IggyMessage;
+    type IntoIter = std::vec::IntoIter<IggyMessage>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.messages.into_iter()
     }
 }
 
-impl<'a> IntoIterator for &'a IggyMessages2 {
-    type Item = &'a IggyMessage2;
-    type IntoIter = std::slice::Iter<'a, IggyMessage2>;
+impl<'a> IntoIterator for &'a IggyMessages {
+    type Item = &'a IggyMessage;
+    type IntoIter = std::slice::Iter<'a, IggyMessage>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.messages.iter()
@@ -309,22 +309,22 @@ impl<'a> IntoIterator for &'a IggyMessages2 {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SendMessages2Ref<'a> {
-    pub header: SendMessages2Header,
+pub struct SendMessagesRef<'a> {
+    pub header: SendMessagesHeader,
     blob: &'a [u8],
 }
 
 #[allow(dead_code)]
-impl<'a> SendMessages2Ref<'a> {
-    pub const fn iter(&self) -> SendMessages2Iterator<'a> {
-        SendMessages2Iterator {
+impl<'a> SendMessagesRef<'a> {
+    pub const fn iter(&self) -> SendMessagesIterator<'a> {
+        SendMessagesIterator {
             blob: self.blob,
             position: 0,
         }
     }
 
-    pub const fn iter_with_offsets(&self) -> SendMessages2IteratorWithOffsets<'a> {
-        SendMessages2IteratorWithOffsets {
+    pub const fn iter_with_offsets(&self) -> SendMessagesIteratorWithOffsets<'a> {
+        SendMessagesIteratorWithOffsets {
             blob: self.blob,
             position: 0,
         }
@@ -341,11 +341,11 @@ impl<'a> SendMessages2Ref<'a> {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-pub struct SendMessages2MessageHeader {
+pub struct SendMessagesMessageHeader {
     pub checksum: u64,
     pub id: u128,
     pub offset_delta: u32,
-    /// Microsecond delta from `SendMessages2Header::origin_timestamp`.
+    /// Microsecond delta from `SendMessagesHeader::origin_timestamp`.
     ///
     /// This is stored in `u32`, which limits a single batch to roughly
     /// 71.6 minutes of origin timestamp span.
@@ -354,7 +354,7 @@ pub struct SendMessages2MessageHeader {
     pub payload_length: u32,
 }
 
-impl SendMessages2MessageHeader {
+impl SendMessagesMessageHeader {
     fn decode(bytes: &[u8]) -> Result<Self, IggyError> {
         if bytes.len() < MESSAGE_HEADER_SIZE {
             return Err(IggyError::InvalidCommand);
@@ -382,34 +382,34 @@ impl SendMessages2MessageHeader {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-pub struct SendMessages2MessageView<'a> {
-    pub header: SendMessages2MessageHeader,
+pub struct SendMessagesMessageView<'a> {
+    pub header: SendMessagesMessageHeader,
     pub user_headers: &'a [u8],
     pub payload: &'a [u8],
 }
 
 #[allow(dead_code)]
-pub struct SendMessages2Iterator<'a> {
+pub struct SendMessagesIterator<'a> {
     blob: &'a [u8],
     position: usize,
 }
 
-impl<'a> Iterator for SendMessages2Iterator<'a> {
-    type Item = SendMessages2MessageView<'a>;
+impl<'a> Iterator for SendMessagesIterator<'a> {
+    type Item = SendMessagesMessageView<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.position >= self.blob.len() {
             return None;
         }
 
-        let header = SendMessages2MessageHeader::decode(&self.blob[self.position..]).ok()?;
+        let header = SendMessagesMessageHeader::decode(&self.blob[self.position..]).ok()?;
         let start = self.position + MESSAGE_HEADER_SIZE;
         let payload_end = start + header.payload_length as usize;
         let headers_end = payload_end + header.user_headers_length as usize;
         let payload = self.blob.get(start..payload_end)?;
         let user_headers = self.blob.get(payload_end..headers_end)?;
         self.position += header.total_size();
-        Some(SendMessages2MessageView {
+        Some(SendMessagesMessageView {
             header,
             user_headers,
             payload,
@@ -418,19 +418,19 @@ impl<'a> Iterator for SendMessages2Iterator<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SendMessages2MessageViewWithOffsets<'a> {
-    pub message: SendMessages2MessageView<'a>,
+pub struct SendMessagesMessageViewWithOffsets<'a> {
+    pub message: SendMessagesMessageView<'a>,
     pub start: usize,
     pub end: usize,
 }
 
-pub struct SendMessages2IteratorWithOffsets<'a> {
+pub struct SendMessagesIteratorWithOffsets<'a> {
     blob: &'a [u8],
     position: usize,
 }
 
-impl<'a> Iterator for SendMessages2IteratorWithOffsets<'a> {
-    type Item = SendMessages2MessageViewWithOffsets<'a>;
+impl<'a> Iterator for SendMessagesIteratorWithOffsets<'a> {
+    type Item = SendMessagesMessageViewWithOffsets<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.position >= self.blob.len() {
@@ -438,15 +438,15 @@ impl<'a> Iterator for SendMessages2IteratorWithOffsets<'a> {
         }
 
         let start = self.position;
-        let header = SendMessages2MessageHeader::decode(&self.blob[self.position..]).ok()?;
+        let header = SendMessagesMessageHeader::decode(&self.blob[self.position..]).ok()?;
         let message_start = self.position + MESSAGE_HEADER_SIZE;
         let payload_end = message_start + header.payload_length as usize;
         let headers_end = payload_end + header.user_headers_length as usize;
         let payload = self.blob.get(message_start..payload_end)?;
         let user_headers = self.blob.get(payload_end..headers_end)?;
         self.position += header.total_size();
-        Some(SendMessages2MessageViewWithOffsets {
-            message: SendMessages2MessageView {
+        Some(SendMessagesMessageViewWithOffsets {
+            message: SendMessagesMessageView {
                 header,
                 user_headers,
                 payload,
@@ -459,7 +459,7 @@ impl<'a> Iterator for SendMessages2IteratorWithOffsets<'a> {
 
 pub(crate) type FrozenBatchHeader = crate::iobuf::Frozen<MESSAGE_ALIGN>;
 
-/// Re-encode a canonical `SendMessages2` request with every message's payload
+/// Re-encode a canonical `SendMessages` request with every message's payload
 /// and user headers encrypted, per-message checksums and lengths recomputed,
 /// and the batch header (length + checksum) restamped.
 ///
@@ -515,7 +515,7 @@ pub fn encrypt_batch_request(
         u64::try_from(COMMAND_HEADER_SIZE + blob.len()).map_err(|_| IggyError::InvalidCommand)?;
     header.batch_checksum = calculate_batch_checksum(&header, &blob);
 
-    SendMessages2Owned { header, blob }.encode_request(request_header)
+    SendMessagesOwned { header, blob }.encode_request(request_header)
 }
 
 /// Whether the legacy transcode stamps a batch checksum onto its output.
@@ -557,7 +557,7 @@ pub fn convert_request_message(
 }
 
 /// Transcode a legacy `SendMessages` request body directly into the canonical
-/// `[RoutedRequestHeader][256B SendMessages2Header][blob]` form, writing each message
+/// `[RoutedRequestHeader][256B SendMessagesHeader][blob]` form, writing each message
 /// record straight into the final aligned buffer.
 ///
 /// Fused replacement for the `from_legacy_request(..).encode_request(..)`
@@ -657,7 +657,7 @@ fn transcode_legacy_request(
         bytes[msg_start..msg_start + 8].copy_from_slice(&checksum.to_le_bytes());
     }
 
-    let mut command = SendMessages2Header::new(
+    let mut command = SendMessagesHeader::new(
         namespace.partition_id() as u64,
         origin_timestamp,
         batch_length as u64,
@@ -681,7 +681,7 @@ fn transcode_legacy_request(
 /// `body` may extend past the batch: the poll disk walk hands in the rest of the
 /// chunk and steps by `batch_length`. Callers whose buffer is meant to BE the
 /// batch must reject the surplus themselves - see [`convert_request_message`].
-pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
+pub fn decode_batch_slice(body: &[u8]) -> Result<SendMessagesRef<'_>, IggyError> {
     decode_batch_slice_with(body, BatchIntegrity::Verify)
 }
 
@@ -712,19 +712,19 @@ pub enum BatchIntegrity {
 pub fn decode_batch_slice_with(
     body: &[u8],
     integrity: BatchIntegrity,
-) -> Result<SendMessages2Ref<'_>, IggyError> {
+) -> Result<SendMessagesRef<'_>, IggyError> {
     if body.len() < COMMAND_HEADER_SIZE {
         return Err(IggyError::InvalidCommand);
     }
 
-    let header = SendMessages2Header::decode(&body[..COMMAND_HEADER_SIZE])?;
+    let header = SendMessagesHeader::decode(&body[..COMMAND_HEADER_SIZE])?;
     let blob_len = header.blob_len()?;
     if body.len() < header.total_size() {
         return Err(IggyError::InvalidCommand);
     }
 
     let blob = &body[COMMAND_HEADER_SIZE..COMMAND_HEADER_SIZE + blob_len];
-    let batch = SendMessages2Ref { header, blob };
+    let batch = SendMessagesRef { header, blob };
     match integrity {
         BatchIntegrity::Verify => {
             let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
@@ -755,7 +755,7 @@ pub fn decode_batch_slice_with(
 /// outside `[header_size, bytes.len()]`, a `size` that does not describe the
 /// batch exactly, or frames that do not tile the batch;
 /// `InvalidBatchChecksum` / `InvalidMessageChecksum` on an integrity mismatch.
-pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
+pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessagesRef<'_>, IggyError> {
     decode_prepare_slice_inner(bytes, true)
 }
 
@@ -778,14 +778,14 @@ pub fn decode_prepare_slice(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyEr
 ///
 /// Same structural errors as [`decode_prepare_slice`], minus
 /// `InvalidBatchChecksum` and `InvalidMessageChecksum`.
-pub fn decode_prepare_slice_trusted(bytes: &[u8]) -> Result<SendMessages2Ref<'_>, IggyError> {
+pub fn decode_prepare_slice_trusted(bytes: &[u8]) -> Result<SendMessagesRef<'_>, IggyError> {
     decode_prepare_slice_inner(bytes, false)
 }
 
 fn decode_prepare_slice_inner(
     bytes: &[u8],
     validate_checksum: bool,
-) -> Result<SendMessages2Ref<'_>, IggyError> {
+) -> Result<SendMessagesRef<'_>, IggyError> {
     let header_size = std::mem::size_of::<PrepareHeader>();
     if bytes.len() < header_size {
         return Err(IggyError::InvalidCommand);
@@ -814,7 +814,7 @@ fn decode_prepare_slice_inner(
         return Err(IggyError::InvalidCommand);
     }
 
-    let header = SendMessages2Header::decode(&body[..COMMAND_HEADER_SIZE])?;
+    let header = SendMessagesHeader::decode(&body[..COMMAND_HEADER_SIZE])?;
     let blob_len = header.blob_len()?;
     // Exact, not a lower bound: a prepare frame IS one batch, so bytes past
     // `batch_length` belong to nobody - no checksum covers them, yet the flush
@@ -825,7 +825,7 @@ fn decode_prepare_slice_inner(
     }
 
     let blob = &body[COMMAND_HEADER_SIZE..COMMAND_HEADER_SIZE + blob_len];
-    let batch = SendMessages2Ref { header, blob };
+    let batch = SendMessagesRef { header, blob };
     if validate_checksum {
         let expected_checksum = verify_and_recompute_batch_checksum(&batch)?;
         if header.batch_checksum != expected_checksum {
@@ -844,7 +844,7 @@ pub fn stamp_prepare_for_persistence(
     mut message: Message<PrepareHeader>,
     base_offset: u64,
     base_timestamp: u64,
-) -> Result<(Message<PrepareHeader>, SendMessages2Header, u32), IggyError> {
+) -> Result<(Message<PrepareHeader>, SendMessagesHeader, u32), IggyError> {
     let total_size = message.header().size as usize;
     let bytes = message.as_mut_slice();
     if bytes.len() < PREPARE_SPLIT_POINT || total_size < PREPARE_SPLIT_POINT {
@@ -853,7 +853,7 @@ pub fn stamp_prepare_for_persistence(
 
     let header_offset = std::mem::size_of::<PrepareHeader>();
     let mut command =
-        SendMessages2Header::decode(&bytes[header_offset..header_offset + COMMAND_HEADER_SIZE])?;
+        SendMessagesHeader::decode(&bytes[header_offset..header_offset + COMMAND_HEADER_SIZE])?;
     command.base_offset = base_offset;
     command.base_timestamp = base_timestamp;
     let blob = &bytes[PREPARE_SPLIT_POINT..total_size];
@@ -943,10 +943,10 @@ impl<'a> LegacyMessageRef<'a> {
 ///
 /// Assumes a well-formed blob whose frames tile exactly; every compute site
 /// builds the blob and satisfies this.
-fn calculate_batch_checksum(header: &SendMessages2Header, blob: &[u8]) -> u64 {
+fn calculate_batch_checksum(header: &SendMessagesHeader, blob: &[u8]) -> u64 {
     let mut hasher = XxHash3_64::new();
     write_batch_header_fields(&mut hasher, header);
-    let batch = SendMessages2Ref {
+    let batch = SendMessagesRef {
         header: *header,
         blob,
     };
@@ -956,7 +956,7 @@ fn calculate_batch_checksum(header: &SendMessages2Header, blob: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn write_batch_header_fields(hasher: &mut XxHash3_64, header: &SendMessages2Header) {
+fn write_batch_header_fields(hasher: &mut XxHash3_64, header: &SendMessagesHeader) {
     hasher.write(&header.partition_id.to_le_bytes());
     hasher.write(&header.base_offset.to_le_bytes());
     hasher.write(&header.base_timestamp.to_le_bytes());
@@ -980,7 +980,7 @@ fn write_batch_header_fields(hasher: &mut XxHash3_64, header: &SendMessages2Head
 /// [`IggyError::InvalidMessageChecksum`] on the first per-message mismatch;
 /// [`IggyError::InvalidCommand`] if the frames do not tile `message_count`
 /// exactly.
-fn verify_and_recompute_batch_checksum(batch: &SendMessages2Ref<'_>) -> Result<u64, IggyError> {
+fn verify_and_recompute_batch_checksum(batch: &SendMessagesRef<'_>) -> Result<u64, IggyError> {
     let blob = batch.blob();
     let mut hasher = XxHash3_64::new();
     write_batch_header_fields(&mut hasher, &batch.header);
@@ -1014,7 +1014,7 @@ fn verify_and_recompute_batch_checksum(batch: &SendMessages2Ref<'_>) -> Result<u
 /// A caller that opts out of checksum verification still must not be handed a batch
 /// whose framing disagrees with its header, since it indexes by `batch_length` and
 /// would step into the next record. Walking the frames costs no hashing.
-fn validate_batch_layout(batch: &SendMessages2Ref<'_>) -> Result<(), IggyError> {
+fn validate_batch_layout(batch: &SendMessagesRef<'_>) -> Result<(), IggyError> {
     let mut framed = 0u32;
     let mut covered = 0usize;
     for message in batch.iter_with_offsets() {
@@ -1054,7 +1054,7 @@ fn read_u128(bytes: &[u8], offset: usize) -> Result<u128, IggyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, Operation};
+    use iggy_binary_protocol::{Command, Operation};
     use iggy_common::Aes256GcmEncryptor;
 
     fn aligned_prepare_bytes(size: u32) -> Owned<MESSAGE_ALIGN> {
@@ -1062,7 +1062,7 @@ mod tests {
         let header: &mut PrepareHeader =
             bytemuck::checked::try_from_bytes_mut(owned.as_mut_slice())
                 .expect("zeroed bytes form a valid PrepareHeader");
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.size = size;
         owned
     }
@@ -1070,7 +1070,7 @@ mod tests {
     /// Assemble an already-stamped batch into a `Prepare`:
     /// `[PrepareHeader][256B batch header][blob]`, copying `owned`'s header and
     /// blob verbatim. Shared by every real-batch fixture.
-    fn prepare_from_owned(owned: &SendMessages2Owned) -> Owned<MESSAGE_ALIGN> {
+    fn prepare_from_owned(owned: &SendMessagesOwned) -> Owned<MESSAGE_ALIGN> {
         let header_size = std::mem::size_of::<PrepareHeader>();
         let total = header_size + owned.header.total_size();
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
@@ -1078,7 +1078,7 @@ mod tests {
             let prepare: &mut PrepareHeader =
                 bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
                     .expect("zeroed bytes form a valid PrepareHeader");
-            prepare.command = Command2::Prepare;
+            prepare.command = Command::Prepare;
             prepare.size = u32::try_from(total).expect("prepare size fits u32");
         }
         let bytes = buffer.as_mut_slice();
@@ -1095,7 +1095,7 @@ mod tests {
     /// `batch_checksum` over the final header fields + per-message checksum fields.
     fn valid_prepare_bytes() -> Owned<MESSAGE_ALIGN> {
         let namespace = IggyNamespace::new(1, 1, 7);
-        let mut owned = SendMessages2Owned::from_messages(namespace, &sample_messages())
+        let mut owned = SendMessagesOwned::from_messages(namespace, &sample_messages())
             .expect("build send batch");
         owned.header.base_offset = 10;
         owned.header.base_timestamp = 20;
@@ -1182,10 +1182,10 @@ mod tests {
         let _ = decode_prepare_slice(misaligned);
     }
 
-    fn sample_messages() -> IggyMessages2 {
-        let mut messages = IggyMessages2::with_capacity(2);
-        messages.push(IggyMessage2 {
-            header: IggyMessage2Header {
+    fn sample_messages() -> IggyMessages {
+        let mut messages = IggyMessages::with_capacity(2);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
                 id: 7,
                 origin_timestamp: 1_000,
                 ..Default::default()
@@ -1193,8 +1193,8 @@ mod tests {
             payload: Bytes::from_static(b"first-payload"),
             user_headers: None,
         });
-        messages.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
                 id: 8,
                 origin_timestamp: 1_050,
                 ..Default::default()
@@ -1208,10 +1208,10 @@ mod tests {
     /// `[PrepareHeader][256B batch header][blob]` carrying real per-message
     /// records and checksums from the production encoder, with the initial zero
     /// base offset and timestamp.
-    fn prepare_with_messages(messages: &IggyMessages2) -> Owned<MESSAGE_ALIGN> {
+    fn prepare_with_messages(messages: &IggyMessages) -> Owned<MESSAGE_ALIGN> {
         let namespace = IggyNamespace::new(1, 1, 7);
         let owned =
-            SendMessages2Owned::from_messages(namespace, messages).expect("build send batch");
+            SendMessagesOwned::from_messages(namespace, messages).expect("build send batch");
         prepare_from_owned(&owned)
     }
 
@@ -1268,7 +1268,7 @@ mod tests {
         let namespace = IggyNamespace::new(1, 1, 7);
         let messages = sample_messages();
         let mut owned =
-            SendMessages2Owned::from_messages(namespace, &messages).expect("build batch");
+            SendMessagesOwned::from_messages(namespace, &messages).expect("build batch");
         owned.header.base_offset = 100;
         owned.header.base_timestamp = 200;
         owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
@@ -1308,7 +1308,7 @@ mod tests {
         // (the poll disk walk) decodes through here.
         let namespace = IggyNamespace::new(1, 1, 7);
         let owned =
-            SendMessages2Owned::from_messages(namespace, &sample_messages()).expect("build batch");
+            SendMessagesOwned::from_messages(namespace, &sample_messages()).expect("build batch");
         let mut body = vec![0u8; COMMAND_HEADER_SIZE + owned.blob.len()];
         owned.header.encode_into(&mut body[..COMMAND_HEADER_SIZE]);
         body[COMMAND_HEADER_SIZE..].copy_from_slice(&owned.blob);
@@ -1352,7 +1352,7 @@ mod tests {
 
     /// Legacy `SendMessages` request body: `[metadata_len=4][message_count]`
     /// then `count` skipped index slots, then the 64B-header legacy records.
-    fn legacy_send_messages_body(messages: &IggyMessages2) -> Vec<u8> {
+    fn legacy_send_messages_body(messages: &IggyMessages) -> Vec<u8> {
         let count = messages.count();
         let mut body = Vec::new();
         body.extend_from_slice(&4u32.to_le_bytes());
@@ -1380,7 +1380,7 @@ mod tests {
             let header: &mut RoutedRequestHeader =
                 bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
                     .expect("zeroed bytes form a valid RoutedRequestHeader");
-            header.command = Command2::Request;
+            header.command = Command::Request;
             header.operation = Operation::SendMessages;
             header.client = 1;
             header.session = 1;
@@ -1394,8 +1394,8 @@ mod tests {
     #[test]
     fn convert_request_message_rejects_empty_canonical_and_legacy_batches() {
         let namespace = IggyNamespace::new(1, 1, 3);
-        let messages = IggyMessages2::with_capacity(0);
-        let canonical = SendMessages2Owned::from_messages(namespace, &messages)
+        let messages = IggyMessages::with_capacity(0);
+        let canonical = SendMessagesOwned::from_messages(namespace, &messages)
             .expect("build empty canonical batch");
         let mut canonical_body = vec![0; canonical.header.total_size()];
         canonical
@@ -1424,7 +1424,7 @@ mod tests {
         let messages = sample_messages();
 
         let owned =
-            SendMessages2Owned::from_messages(namespace, &messages).expect("build canonical batch");
+            SendMessagesOwned::from_messages(namespace, &messages).expect("build canonical batch");
         let mut expected_body = vec![0u8; COMMAND_HEADER_SIZE + owned.blob.len()];
         owned
             .header
@@ -1476,7 +1476,7 @@ mod tests {
         let computed_body = &computed.as_slice()[header_size..computed.header().size as usize];
         let skipped_body = &skipped.as_slice()[header_size..skipped.header().size as usize];
 
-        let skipped_header = SendMessages2Header::decode(&skipped_body[..COMMAND_HEADER_SIZE])
+        let skipped_header = SendMessagesHeader::decode(&skipped_body[..COMMAND_HEADER_SIZE])
             .expect("decode skipped header");
         assert_eq!(
             skipped_header.batch_checksum, 0,
@@ -1542,7 +1542,7 @@ mod tests {
     fn canonical_request_with_trailing_bytes(junk: &[u8]) -> Message<RoutedRequestHeader> {
         let namespace = IggyNamespace::new(1, 1, 3);
         let owned =
-            SendMessages2Owned::from_messages(namespace, &sample_messages()).expect("build batch");
+            SendMessagesOwned::from_messages(namespace, &sample_messages()).expect("build batch");
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total = header_size + owned.header.total_size() + junk.len();
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
@@ -1550,7 +1550,7 @@ mod tests {
             let header: &mut RoutedRequestHeader =
                 bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
                     .expect("zeroed bytes form a valid RoutedRequestHeader");
-            header.command = Command2::Request;
+            header.command = Command::Request;
             header.operation = Operation::SendMessages;
             header.client = 1;
             header.session = 1;
@@ -1571,7 +1571,7 @@ mod tests {
     fn prepare_with_trailing_bytes(junk: &[u8]) -> Owned<MESSAGE_ALIGN> {
         let namespace = IggyNamespace::new(1, 1, 7);
         let owned =
-            SendMessages2Owned::from_messages(namespace, &sample_messages()).expect("build batch");
+            SendMessagesOwned::from_messages(namespace, &sample_messages()).expect("build batch");
         let header_size = std::mem::size_of::<PrepareHeader>();
         let total = header_size + owned.header.total_size() + junk.len();
         let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
@@ -1579,7 +1579,7 @@ mod tests {
             let prepare: &mut PrepareHeader =
                 bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
                     .expect("zeroed bytes form a valid PrepareHeader");
-            prepare.command = Command2::Prepare;
+            prepare.command = Command::Prepare;
             prepare.size = u32::try_from(total).expect("prepare size fits u32");
         }
         let bytes = buffer.as_mut_slice();

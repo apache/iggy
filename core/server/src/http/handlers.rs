@@ -1346,7 +1346,7 @@ pub(in crate::http) async fn send_messages(
 ///
 /// Data plane like a produce: the offset write is a replicated op on the
 /// partition group's own consensus, awaited through the session's in-process
-/// reply slot ([`partition_write_replicated`]). The v2 wire op is pinned to
+/// reply slot ([`partition_write_replicated`]). The wire op is pinned to
 /// `ack = Quorum` - `?ack=none` is a produce-only surface. The consumer
 /// identifier passes through on the wire; the dispatch resolvers hash named
 /// consumers and rewrite group ids server-side, identically to TCP.
@@ -1374,7 +1374,7 @@ pub(in crate::http) async fn store_consumer_offset(
     SendWrapper::new(partition_write_replicated(
         &state,
         &identity.session,
-        Operation::StoreConsumerOffset2,
+        Operation::StoreConsumerOffset,
         &body,
     ))
     .await?;
@@ -1417,7 +1417,7 @@ pub(in crate::http) async fn delete_consumer_offset(
     SendWrapper::new(partition_write_replicated(
         &state,
         &identity.session,
-        Operation::DeleteConsumerOffset2,
+        Operation::DeleteConsumerOffset,
         &body,
     ))
     .await?;

@@ -37,6 +37,9 @@ internal static class TcpContracts
     /// <summary>Frames wider than this are built on the heap instead of the stack.</summary>
     private const int MaxStackAllocBytes = 1024;
 
+    /// <summary>Offset mutations always request quorum acknowledgement.</summary>
+    private const byte AckQuorum = 1;
+
     internal static byte[] LoginWithPersonalAccessToken(string token)
     {
         var tokenLength = Encoding.UTF8.GetByteCount(token);
@@ -810,7 +813,7 @@ internal static class TcpContracts
         uint? partitionId)
     {
         Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 13 + 1 + 2 + consumer.ConsumerId.Length];
+            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 14 + 1 + 2 + consumer.ConsumerId.Length];
         bytes[0] = GetConsumerTypeByte(consumer.Type);
         bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
         var position = 1 + consumer.ConsumerId.Length + 2;
@@ -830,6 +833,7 @@ internal static class TcpContracts
         }
 
         BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 5)..(position + 13)], offset);
+        bytes[position + 13] = AckQuorum;
         return bytes.ToArray();
     }
 
@@ -933,7 +937,7 @@ internal static class TcpContracts
     internal static byte[] DeleteOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
         Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.ConsumerId.Length];
+            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 6 + 1 + 2 + consumer.ConsumerId.Length];
         bytes[0] = GetConsumerTypeByte(consumer.Type);
         bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
         var position = 1 + consumer.ConsumerId.Length + 2;
@@ -952,6 +956,7 @@ internal static class TcpContracts
             BinaryPrimitives.WriteUInt32LittleEndian(bytes[(position + 1)..(position + 5)], 0); // Padding
         }
 
+        bytes[position + 5] = AckQuorum;
         return bytes.ToArray();
     }
 }

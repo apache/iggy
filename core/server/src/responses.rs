@@ -42,8 +42,7 @@ use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::personal_access_tokens::GetPersonalAccessTokensRequest;
@@ -79,7 +78,7 @@ use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
+    Command, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
 use iggy_common::wire_conversions::{resource_options_to_wire, resource_options_to_wire_split};
@@ -92,7 +91,7 @@ use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::PollFragments;
 use server_common::Message;
-use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
+use server_common::send_messages::{self, COMMAND_HEADER_SIZE};
 use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
@@ -371,30 +370,6 @@ where
         }
         Operation::DeleteConsumerOffset => {
             let request = DeleteConsumerOffsetRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            fence_and_resolve_offset_namespace(
-                shard,
-                &request.consumer,
-                &request.stream_id,
-                &request.topic_id,
-                request.partition_id,
-                client_id,
-            )?
-        }
-        Operation::StoreConsumerOffset2 => {
-            let request = StoreConsumerOffset2Request::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            fence_and_resolve_offset_namespace(
-                shard,
-                &request.consumer,
-                &request.stream_id,
-                &request.topic_id,
-                request.partition_id,
-                client_id,
-            )?
-        }
-        Operation::DeleteConsumerOffset2 => {
-            let request = DeleteConsumerOffset2Request::decode_from(body)
                 .map_err(|_| IggyError::InvalidCommand)?;
             fence_and_resolve_offset_namespace(
                 shard,
@@ -1549,7 +1524,7 @@ pub(crate) fn build_raw_pat_reply(
     // both swallow the eviction and ship a raw token whose hash never
     // committed. Only rewrite a genuine committed `Reply`; pass anything else
     // (the eviction) through untouched so the client learns its session died.
-    if committed.header().command != Command2::Reply {
+    if committed.header().command != Command::Reply {
         return Ok(committed);
     }
     let header_len = std::mem::size_of::<ReplyHeader>();
@@ -1609,7 +1584,7 @@ pub(crate) fn build_reply_with_body(
         size: header_size,
         view: request_header.view,
         release: request_header.release,
-        command: Command2::Reply,
+        command: Command::Reply,
         replica: request_header.replica,
         request_checksum: request_header.request_checksum,
         client: client_id,
@@ -1640,17 +1615,17 @@ where
         .map_or(0, VsrConsensus::commit_max)
 }
 
-/// Size of the in-storage (`IggyMessage2`) per-message header inside a
-/// `SendMessages2` batch blob: `checksum`(8) + `id`(16) + `offset_delta`(4)
+/// Size of the in-storage (`IggyMessage`) per-message header inside a
+/// `SendMessages` batch blob: `checksum`(8) + `id`(16) + `offset_delta`(4)
 /// + `timestamp_delta`(4) + `user_headers_length`(4) + `payload_length`(4)
-/// + reserved(8). See `server_common::send_messages2::SendMessages2Owned::from_messages`.
+/// + reserved(8). See `server_common::send_messages::SendMessagesOwned::from_messages`.
 const STORED_MESSAGE_HEADER_SIZE: usize = 48;
 
 /// Build the `PolledMessages` reply body from the owning shard's poll
 /// fragments.
 ///
-/// Fragments carry the stored `SendMessages2` batches: a 256-byte command
-/// header followed by `IggyMessage2`-format messages
+/// Fragments carry the stored `SendMessages` batches: a 256-byte command
+/// header followed by `IggyMessage`-format messages
 /// (`[48B header][payload][user_headers]`, offsets/timestamps delta-encoded
 /// against the batch). The SDK decodes the legacy wire format
 /// (`[64B header][payload][user_headers]`, absolute offsets); the message
@@ -1686,7 +1661,7 @@ pub(crate) fn build_polled_messages_body(
     let mut count: u32 = 0;
     let mut position = 0usize;
     while position < stream.len() {
-        let batch = SendMessages2Header::decode(&stream[position..])?;
+        let batch = send_messages::SendMessagesHeader::decode(&stream[position..])?;
         let batch_end = position
             .checked_add(
                 usize::try_from(batch.batch_length).map_err(|_| IggyError::InvalidCommand)?,
@@ -1813,7 +1788,7 @@ mod tests {
         let zeroed = [0u8; std::mem::size_of::<RoutedRequestHeader>()];
         let mut header = *bytemuck::checked::try_from_bytes::<RoutedRequestHeader>(&zeroed)
             .expect("zeroed bytes form a valid RoutedRequestHeader");
-        header.command = Command2::Request;
+        header.command = Command::Request;
         header.operation = Operation::CreatePersonalAccessToken;
         header.client = 42;
         header.session = 7;
