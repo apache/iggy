@@ -64,8 +64,8 @@ export const EVICTION_OFFSET = {
   reason: 255
 } as const;
 
-/** `Command2` frame discriminants a client encounters. */
-export const Command2 = {
+/** `Command` frame discriminants a client encounters. */
+export const Command = {
   Request: 5,
   Reply: 8,
   Eviction: 13
@@ -120,7 +120,7 @@ const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32LE(fields.size, REQUEST_OFFSET.size);
-  header.writeUInt8(Command2.Request, REQUEST_OFFSET.command);
+  header.writeUInt8(Command.Request, REQUEST_OFFSET.command);
   // u128 client id: two little-endian u64 halves, low half first.
   header.writeBigUInt64LE(fields.client & U64_MASK, REQUEST_OFFSET.client);
   header.writeBigUInt64LE(fields.client >> 64n, REQUEST_OFFSET.client + 8);

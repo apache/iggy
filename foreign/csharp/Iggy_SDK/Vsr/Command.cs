@@ -15,5 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// `DeleteConsumerOffset2` response is empty.
-pub type DeleteConsumerOffset2Response = super::EmptyResponse;
+namespace Apache.Iggy.Vsr;
+
+/// <summary>
+///     VSR frame discriminant, byte 60 of every consensus header. Only the frames a client emits or
+///     receives are named; every other discriminant decodes as <see cref="Reserved" />.
+/// </summary>
+internal enum Command : byte
+{
+    Reserved = 0,
+    Request = 5,
+    Reply = 8,
+    Eviction = 13
+}

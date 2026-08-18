@@ -46,42 +46,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{error, info, warn};
 
-/// Validate that a namespace fits within the static caps declared in
-/// `config.extra.namespace`.
-///
-/// Bootstrap calls this for every recovered namespace; the reconciler
-/// calls this before materialising a freshly committed partition. Same
-/// error variant either way so operators see one root cause label.
-///
-/// # Errors
-///
-/// Returns [`ServerError::RecoveredNamespaceOutOfBounds`] if any of
-/// `stream_id`, `topic_id`, or `partition_id` exceed the configured
-/// maxima.
-pub const fn validate_namespace_bounds(
-    config: &ServerConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<(), ServerError> {
-    let namespace = &config.extra.namespace;
-    if stream_id < namespace.max_streams
-        && topic_id < namespace.max_topics
-        && partition_id < namespace.max_partitions
-    {
-        return Ok(());
-    }
-
-    Err(ServerError::RecoveredNamespaceOutOfBounds {
-        stream_id,
-        topic_id,
-        partition_id,
-        max_streams: namespace.max_streams,
-        max_topics: namespace.max_topics,
-        max_partitions: namespace.max_partitions,
-    })
-}
-
 /// Create the on-disk directory hierarchy for a partition.
 ///
 /// Builds the partition root, offsets, consumer offsets, and consumer
@@ -377,26 +341,18 @@ pub async fn ensure_initial_segment(
     // this with a stale `.index` at offset 0 on disk. The `partitions`-side
     // writers with the same names do NOT truncate, so opening them directly
     // instead would read index entries from a previous generation.
-    let storage = SegmentStorage::new(
-        &messages_path,
-        &index_path,
-        0,
-        0,
-        enforce_fsync,
-        enforce_fsync,
-        false,
-    )
-    .await
-    .map_err(|source| {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            error = %source,
-            "failed to create initial segment storage"
-        );
-        source
-    })?;
+    let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+        .await
+        .map_err(|source| {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                error = %source,
+                "failed to create initial segment storage"
+            );
+            source
+        })?;
     // Share the storage's size counters so reads observe persisted bytes;
     // a writer with a private counter grows the file invisibly to readers.
     let messages_size_counter = storage
@@ -574,11 +530,13 @@ pub(crate) fn restore_partition_view(
 /// the local shard has not yet materialised.
 ///
 /// Steps performed (all idempotent on retry after a partial failure):
-/// 1. Validate namespace fits within the configured caps.
-/// 2. Create directory hierarchy on disk.
-/// 3. Build per-partition VSR consensus group, resuming any superblock-recorded view.
-/// 4. Configure empty consumer-offset storage with the on-disk paths set.
-/// 5. Provision the initial segment + writers (offset 0).
+/// 1. Create directory hierarchy on disk.
+/// 2. Build per-partition VSR consensus group, resuming any superblock-recorded view.
+/// 3. Configure empty consumer-offset storage with the on-disk paths set.
+/// 4. Provision the initial segment + writers (offset 0).
+///
+/// The namespace arrives packed, so its components are in range by
+/// construction. Metadata admission is what bounds them.
 ///
 /// The returned partition's `offset` / `dirty_offset` are `0` and
 /// `should_increment_offset` is `false`, mirroring a clean append starting
@@ -586,8 +544,8 @@ pub(crate) fn restore_partition_view(
 ///
 /// # Errors
 ///
-/// Returns [`ServerError`] when bounds validation, directory creation,
-/// superblock recovery, or segment provisioning fails.
+/// Returns [`ServerError`] when directory creation, superblock recovery, or
+/// segment provisioning fails.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_partition_fresh(
     config: &ServerConfig,
@@ -604,7 +562,6 @@ pub async fn build_partition_fresh(
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
 
-    validate_namespace_bounds(config, stream_id, topic_id, partition_id)?;
     // Sampled BEFORE the hierarchy create: a pre-existing partition directory
     // is the marker of a prior life (the .log inside may legitimately be
     // empty -- committed-but-unflushed data dies with the journal), while a

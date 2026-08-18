@@ -95,8 +95,6 @@ pub enum Operation {
     SendMessages = 160,
     StoreConsumerOffset = 161,
     DeleteConsumerOffset = 162,
-    StoreConsumerOffset2 = 164,
-    DeleteConsumerOffset2 = 165,
 }
 
 impl Operation {
@@ -169,14 +167,7 @@ impl Operation {
     /// the SDK, the one place that sees Register replies.
     #[must_use]
     pub const fn is_result_framed(&self) -> bool {
-        self.is_metadata()
-            || matches!(
-                self,
-                Self::StoreConsumerOffset
-                    | Self::StoreConsumerOffset2
-                    | Self::DeleteConsumerOffset
-                    | Self::DeleteConsumerOffset2
-            )
+        self.is_metadata() || matches!(self, Self::StoreConsumerOffset | Self::DeleteConsumerOffset)
     }
 
     /// Data-plane operations routed to the shard owning the partition.
@@ -247,9 +238,7 @@ impl Operation {
             | Self::LeaveConsumerGroup
             | Self::SendMessages
             | Self::StoreConsumerOffset
-            | Self::DeleteConsumerOffset
-            | Self::StoreConsumerOffset2
-            | Self::DeleteConsumerOffset2 => match crate::dispatch::lookup_by_operation(*self) {
+            | Self::DeleteConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
                 Some(meta) => Some(meta.code),
                 None => None,
             },
@@ -300,8 +289,6 @@ mod tests {
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,
-            Operation::StoreConsumerOffset2,
-            Operation::DeleteConsumerOffset2,
         ];
         for op in ops {
             let code = op
@@ -367,8 +354,7 @@ mod tests {
         assert!(Operation::TruncatePartition.is_internal());
         assert!(Operation::TruncatePartition.is_metadata());
         assert!(!Operation::TruncatePartition.is_client_allowed());
+        assert!(Operation::StoreConsumerOffset.is_partition());
         assert!(Operation::DeleteConsumerOffset.is_partition());
-        assert!(Operation::StoreConsumerOffset2.is_partition());
-        assert!(Operation::DeleteConsumerOffset2.is_partition());
     }
 }

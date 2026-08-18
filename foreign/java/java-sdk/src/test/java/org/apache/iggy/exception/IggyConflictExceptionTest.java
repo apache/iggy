@@ -47,11 +47,10 @@ class IggyConflictExceptionTest {
             value = IggyErrorCode.class,
             names = {
                 "USER_ALREADY_EXISTS",
-                "CLIENT_ALREADY_EXISTS",
-                "STREAM_ALREADY_EXISTS",
-                "TOPIC_ALREADY_EXISTS",
-                "CONSUMER_GROUP_ALREADY_EXISTS",
-                "PAT_NAME_ALREADY_EXISTS"
+                "PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS",
+                "STREAM_NAME_ALREADY_EXISTS",
+                "TOPIC_NAME_ALREADY_EXISTS",
+                "CONSUMER_GROUP_NAME_ALREADY_EXISTS"
             })
     void matchesReturnsTrueForConflictRelatedCodes(IggyErrorCode code) {
         assertThat(IggyConflictException.matches(code)).isTrue();
@@ -62,11 +61,10 @@ class IggyConflictExceptionTest {
             value = IggyErrorCode.class,
             names = {
                 "USER_ALREADY_EXISTS",
-                "CLIENT_ALREADY_EXISTS",
-                "STREAM_ALREADY_EXISTS",
-                "TOPIC_ALREADY_EXISTS",
-                "CONSUMER_GROUP_ALREADY_EXISTS",
-                "PAT_NAME_ALREADY_EXISTS"
+                "PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS",
+                "STREAM_NAME_ALREADY_EXISTS",
+                "TOPIC_NAME_ALREADY_EXISTS",
+                "CONSUMER_GROUP_NAME_ALREADY_EXISTS"
             },
             mode = Mode.EXCLUDE)
     void matchesReturnsFalseForNonConflictRelatedCodes(IggyErrorCode code) {

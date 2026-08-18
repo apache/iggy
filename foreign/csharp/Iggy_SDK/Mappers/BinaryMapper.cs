@@ -33,8 +33,6 @@ namespace Apache.Iggy.Mappers;
 
 internal static class BinaryMapper
 {
-    private const int PropertiesSize = 64;
-
     internal static RawPersonalAccessToken MapRawPersonalAccessToken(ReadOnlySpan<byte> payload)
     {
         var tokenLength = payload[0];
@@ -376,87 +374,90 @@ internal static class BinaryMapper
                 }
             }
 
-            var maxMessages = (length - 16) / PropertiesSize;
+            var maxMessages = (length - 16) / BatchWireFormat.FRAME_HEADER_SIZE;
             var capacity = (int)Math.Min(messagesCount, (uint)maxMessages);
             List<RentedMessageResponse> messages = new(capacity);
 
             while (position < length)
             {
-                if (!TryReadFrameLengths(span, length, position, out var headersLength, out var payloadLength))
+                var batchEnd = ReadBatchExtent(span, length, position, out var baseOffset, out var baseTimestamp,
+                    out var batchOriginTimestamp);
+                // Broker append time is stamped once per batch record; the per-frame delta applies to the
+                // origin timestamp only.
+                var timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(baseTimestamp);
+                var cursor = position + BatchWireFormat.BATCH_HEADER_SIZE;
+                while (cursor < batchEnd)
                 {
-                    break;
-                }
+                    ReadFrameLengths(span, cursor, batchEnd, out var headersLength, out var payloadLength);
 
-                var checksum = BinaryPrimitives.ReadUInt64LittleEndian(span[position..(position + 8)]);
-                var id = BinaryPrimitives.ReadUInt128LittleEndian(span[(position + 8)..(position + 24)]);
-                var offset = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 24)..(position + 32)]);
-                var timestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 32)..(position + 40)]);
-                var originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 40)..(position + 48)]);
-                var reserved = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 56)..(position + 64)]);
+                    var checksum = BinaryPrimitives.ReadUInt64LittleEndian(span[cursor..(cursor + 8)]);
+                    var id = BinaryPrimitives.ReadUInt128LittleEndian(span[(cursor + 8)..(cursor + 24)]);
+                    var offsetDelta = BinaryPrimitives.ReadUInt32LittleEndian(span[(cursor + 24)..(cursor + 28)]);
+                    var timestampDelta = BinaryPrimitives.ReadUInt32LittleEndian(span[(cursor + 28)..(cursor + 32)]);
+                    var offset = baseOffset + offsetDelta;
 
-                var payloadRangeStart = position + 64;
-                var headersRangeStart = payloadRangeStart + payloadLength;
+                    var payloadRangeStart = cursor + BatchWireFormat.FRAME_HEADER_SIZE;
+                    var headersRangeStart = payloadRangeStart + payloadLength;
 
-                ReadOnlyMemory<byte> payloadSlice = payload.Slice(payloadRangeStart, payloadLength);
-                ReadOnlyMemory<byte> rawHeaders = headersLength > 0
-                    ? payload.Slice(headersRangeStart, headersLength)
-                    : ReadOnlyMemory<byte>.Empty;
+                    ReadOnlyMemory<byte> payloadSlice = payload.Slice(payloadRangeStart, payloadLength);
+                    ReadOnlyMemory<byte> rawHeaders = headersLength > 0
+                        ? payload.Slice(headersRangeStart, headersLength)
+                        : ReadOnlyMemory<byte>.Empty;
 
-                // Decrypt into the shared buffer so the message looks like plaintext downstream. Wire lengths
-                // still drive the cursor advance; only the decrypted lengths land on the header.
-                var storedPayloadLength = payloadLength;
-                var storedHeadersLength = headersLength;
-                if (encryptor is not null)
-                {
-                    try
+                    // Decrypt into the shared buffer so the message looks like plaintext downstream. Wire lengths
+                    // still drive the cursor advance; only the decrypted lengths land on the header.
+                    var storedPayloadLength = payloadLength;
+                    var storedHeadersLength = headersLength;
+                    if (encryptor is not null)
                     {
-                        // Bound each destination to this message's reserved slice so an encryptor that overruns
-                        // its contract fails fast here instead of corrupting the next message's region.
-                        Memory<byte> payloadDest =
-                            plaintext.Slice(plainCursor, encryptor.GetMaxDecryptedLength(payloadLength));
-                        var writtenPayload = encryptor.Decrypt(payloadSlice.Span, payloadDest.Span);
-                        payloadSlice = payloadDest.Slice(0, writtenPayload);
-                        storedPayloadLength = writtenPayload;
-                        plainCursor += writtenPayload;
-
-                        if (!rawHeaders.IsEmpty)
+                        try
                         {
-                            Memory<byte> headersDest =
-                                plaintext.Slice(plainCursor, encryptor.GetMaxDecryptedLength(headersLength));
-                            var writtenHeaders = encryptor.Decrypt(rawHeaders.Span, headersDest.Span);
-                            rawHeaders = headersDest.Slice(0, writtenHeaders);
-                            storedHeadersLength = writtenHeaders;
-                            plainCursor += writtenHeaders;
+                            // Bound each destination to this message's reserved slice so an encryptor that overruns
+                            // its contract fails fast here instead of corrupting the next message's region.
+                            Memory<byte> payloadDest =
+                                plaintext.Slice(plainCursor, encryptor.GetMaxDecryptedLength(payloadLength));
+                            var writtenPayload = encryptor.Decrypt(payloadSlice.Span, payloadDest.Span);
+                            payloadSlice = payloadDest.Slice(0, writtenPayload);
+                            storedPayloadLength = writtenPayload;
+                            plainCursor += writtenPayload;
+
+                            if (!rawHeaders.IsEmpty)
+                            {
+                                Memory<byte> headersDest =
+                                    plaintext.Slice(plainCursor, encryptor.GetMaxDecryptedLength(headersLength));
+                                var writtenHeaders = encryptor.Decrypt(rawHeaders.Span, headersDest.Span);
+                                rawHeaders = headersDest.Slice(0, writtenHeaders);
+                                storedHeadersLength = writtenHeaders;
+                                plainCursor += writtenHeaders;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            throw new MessageDecryptionException(offset, (uint)partitionId, ex);
                         }
                     }
-                    catch (Exception ex)
+
+                    messages.Add(new RentedMessageResponse
                     {
-                        throw new MessageDecryptionException(offset, (uint)partitionId, ex);
-                    }
+                        Header = new MessageHeader
+                        {
+                            Checksum = checksum,
+                            Id = id,
+                            Offset = offset,
+                            OriginTimestamp = batchOriginTimestamp + timestampDelta,
+                            PayloadLength = storedPayloadLength,
+                            Timestamp = timestamp,
+                            UserHeadersLength = storedHeadersLength,
+                            Reserved = 0
+                        },
+                        RawUserHeaders = rawHeaders,
+                        Payload = payloadSlice
+                    });
+
+                    cursor = headersRangeStart + headersLength;
                 }
 
-                messages.Add(new RentedMessageResponse
-                {
-                    Header = new MessageHeader
-                    {
-                        Checksum = checksum,
-                        Id = id,
-                        Offset = offset,
-                        OriginTimestamp = originTimestamp,
-                        PayloadLength = storedPayloadLength,
-                        Timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(timestamp),
-                        UserHeadersLength = storedHeadersLength,
-                        Reserved = reserved
-                    },
-                    RawUserHeaders = rawHeaders,
-                    Payload = payloadSlice
-                });
-
-                position += 64 + payloadLength + headersLength;
-                if (position + PropertiesSize >= length)
-                {
-                    break;
-                }
+                position = batchEnd;
             }
 
             return new PolledMessagesRental(payloadOwner, plaintextOwner)
@@ -474,60 +475,84 @@ internal static class BinaryMapper
     }
 
     // Shared by the decrypt sizing pre-pass and the main map loop so both agree on which frames are included;
-    // drift would mis-size the shared plaintext buffer. Returns false at buffer end or on a frame running past
-    // the buffer; throws on a negative length so a poison frame surfaces instead of being re-polled forever.
-    private static bool TryReadFrameLengths(ReadOnlySpan<byte> span, int length, int position,
-        out int headersLength, out int payloadLength)
+    // drift would mis-size the shared plaintext buffer.
+    private static int ReadBatchExtent(ReadOnlySpan<byte> span, int length, int position, out ulong baseOffset,
+        out ulong baseTimestamp, out ulong originTimestamp)
     {
-        headersLength = 0;
-        payloadLength = 0;
-        if (position + PropertiesSize > length)
+        if (position + BatchWireFormat.BATCH_HEADER_SIZE > length)
         {
-            return false;
+            throw new MalformedResponseException(
+                $"Malformed batch record at byte {position}: {length - position} bytes cannot hold a batch header.");
         }
 
-        headersLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 48)..(position + 52)]);
-        payloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(position + 52)..(position + 56)]);
+        baseOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 8)..(position + 16)]);
+        baseTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 16)..(position + 24)]);
+        originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 24)..(position + 32)]);
+        var batchLength = BinaryPrimitives.ReadUInt64LittleEndian(span[(position + 32)..(position + 40)]);
+        if (batchLength < BatchWireFormat.BATCH_HEADER_SIZE || (ulong)position + batchLength > (ulong)length)
+        {
+            throw new MalformedResponseException(
+                $"Malformed batch record at byte {position}: batch length {batchLength} does not fit the response.");
+        }
+
+        return position + (int)batchLength;
+    }
+
+    private static void ReadFrameLengths(ReadOnlySpan<byte> span, int cursor, int batchEnd,
+        out int headersLength, out int payloadLength)
+    {
+        if (cursor + BatchWireFormat.FRAME_HEADER_SIZE > batchEnd)
+        {
+            throw new MalformedResponseException(
+                $"Malformed message frame at byte {cursor}: {batchEnd - cursor} bytes cannot hold a frame header.");
+        }
+
+        headersLength = BinaryPrimitives.ReadInt32LittleEndian(span[(cursor + 32)..(cursor + 36)]);
+        payloadLength = BinaryPrimitives.ReadInt32LittleEndian(span[(cursor + 36)..(cursor + 40)]);
         if (headersLength < 0 || payloadLength < 0)
         {
             throw new MalformedResponseException(
-                $"Malformed message frame at byte {position}: negative payload ({payloadLength}) or header " +
+                $"Malformed message frame at byte {cursor}: negative payload ({payloadLength}) or header " +
                 $"({headersLength}) length.");
         }
 
-        // Overflow-safe: server-controlled lengths can approach int.MaxValue, so compute the bound in long.
-        if ((long)position + 64 + payloadLength + headersLength > length)
+        if (BinaryPrimitives.ReadUInt64LittleEndian(span[(cursor + 40)..(cursor + 48)]) != 0)
         {
-            return false;
+            throw new MalformedResponseException(
+                $"Malformed message frame at byte {cursor}: reserved bytes must be zero.");
         }
 
-        return true;
+        // Overflow-safe: server-controlled lengths can approach int.MaxValue, so compute the bound in long.
+        if ((long)cursor + BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength > batchEnd)
+        {
+            throw new MalformedResponseException(
+                $"Malformed message frame at byte {cursor}: frame runs past its batch record.");
+        }
     }
 
-    // Pre-pass summing upper-bound plaintext length so the shared buffer is rented exactly once. Same
-    // TryReadFrameLengths walk as the main loop, so both agree on which messages are included.
+    // Pre-pass summing upper-bound plaintext length so the shared buffer is rented exactly once. Same batch
+    // and frame walk as the main loop, so both agree on which messages are included.
     private static int SumMaxDecryptedLength(ReadOnlySpan<byte> span, int length, IMessageEncryptor encryptor)
     {
         var position = 16;
         var total = 0;
         while (position < length)
         {
-            if (!TryReadFrameLengths(span, length, position, out var headersLength, out var payloadLength))
+            var batchEnd = ReadBatchExtent(span, length, position, out _, out _, out _);
+            var cursor = position + BatchWireFormat.BATCH_HEADER_SIZE;
+            while (cursor < batchEnd)
             {
-                break;
+                ReadFrameLengths(span, cursor, batchEnd, out var headersLength, out var payloadLength);
+                total += encryptor.GetMaxDecryptedLength(payloadLength);
+                if (headersLength > 0)
+                {
+                    total += encryptor.GetMaxDecryptedLength(headersLength);
+                }
+
+                cursor += BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength;
             }
 
-            total += encryptor.GetMaxDecryptedLength(payloadLength);
-            if (headersLength > 0)
-            {
-                total += encryptor.GetMaxDecryptedLength(headersLength);
-            }
-
-            position += 64 + payloadLength + headersLength;
-            if (position + PropertiesSize >= length)
-            {
-                break;
-            }
+            position = batchEnd;
         }
 
         return total;

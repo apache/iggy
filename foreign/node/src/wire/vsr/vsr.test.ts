@@ -94,7 +94,7 @@ describe('VSR custom request framing', () => {
       serializeSendMessages(
         1,
         2,
-        [],
+        [{ payload: 'x' }],
         Partitioning.PartitionId(3)
       )
     );

@@ -949,14 +949,14 @@ impl ReplicaRegistry {
 mod tests {
     use super::*;
     use crate::lifecycle::Shutdown;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
     use server_common::Message;
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_bus_msg() -> BusMessage {
         Message::<GenericHeader>::new(HEADER_SIZE)
             .transmute_header(|_, h: &mut GenericHeader| {
-                h.command = Command2::Ping;
+                h.command = Command::Ping;
                 h.size = HEADER_SIZE as u32;
             })
             .into_frozen()

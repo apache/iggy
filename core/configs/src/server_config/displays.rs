@@ -26,7 +26,7 @@ use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
-use super::server::{ExtraConfig, NamespaceConfig, ServerConfig};
+use super::server::ServerConfig;
 use super::tcp::{TcpConfig, TcpTlsConfig};
 use std::fmt::{Display, Formatter};
 
@@ -34,12 +34,11 @@ impl Display for ServerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ consumer_group: {}, data_maintenance: {}, extra: {}, \
+            "{{ consumer_group: {}, data_maintenance: {}, \
              heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {}, \
              metadata: {}, message_bus: {}, partition: {} }}",
             self.consumer_group,
             self.data_maintenance,
-            self.extra,
             self.heartbeat,
             self.system,
             self.quic,
@@ -93,22 +92,6 @@ impl Display for MessageBusConfig {
             self.close_peer_timeout,
             self.close_grace,
             self.handshake_grace,
-        )
-    }
-}
-
-impl Display for ExtraConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ namespace: {} }}", self.namespace)
-    }
-}
-
-impl Display for NamespaceConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ max_streams: {}, max_topics: {}, max_partitions: {} }}",
-            self.max_streams, self.max_topics, self.max_partitions
         )
     }
 }

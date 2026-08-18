@@ -61,9 +61,7 @@ internal enum VsrOperation : byte
 
     SendMessages = 160,
     StoreConsumerOffset = 161,
-    DeleteConsumerOffset = 162,
-    StoreConsumerOffset2 = 164,
-    DeleteConsumerOffset2 = 165
+    DeleteConsumerOffset = 162
 }
 
 internal static class VsrOperations
@@ -128,8 +126,6 @@ internal static class VsrOperations
             CommandCodes.SEND_MESSAGES_CODE => VsrOperation.SendMessages,
             CommandCodes.STORE_CONSUMER_OFFSET_CODE => VsrOperation.StoreConsumerOffset,
             CommandCodes.DELETE_CONSUMER_OFFSET_CODE => VsrOperation.DeleteConsumerOffset,
-            CommandCodes.STORE_CONSUMER_OFFSET_2_CODE => VsrOperation.StoreConsumerOffset2,
-            CommandCodes.DELETE_CONSUMER_OFFSET_2_CODE => VsrOperation.DeleteConsumerOffset2,
             CommandCodes.CREATE_STREAM_CODE => VsrOperation.CreateStream,
             CommandCodes.DELETE_STREAM_CODE => VsrOperation.DeleteStream,
             CommandCodes.UPDATE_STREAM_CODE => VsrOperation.UpdateStream,
@@ -170,8 +166,7 @@ internal static class VsrOperations
         // overwrite, on a plane that keeps no client table to dedup against, so a replay lands on the same
         // value. Denying the retry here reports an unknown outcome for a blip on an offset commit, which
         // takes down the consume loop over a write that was safe to repeat.
-        if (operation is VsrOperation.StoreConsumerOffset or VsrOperation.StoreConsumerOffset2
-            or VsrOperation.DeleteConsumerOffset or VsrOperation.DeleteConsumerOffset2)
+        if (operation is VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset)
         {
             return true;
         }
@@ -206,8 +201,8 @@ internal static class VsrOperations
                 true,
             >= VsrOperation.CreateTopicWithAssignments and <= VsrOperation.TruncatePartition => true,
             >= VsrOperation.CreateStream and <= VsrOperation.LeaveConsumerGroup => true,
-            VsrOperation.SendMessages or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset
-                or VsrOperation.StoreConsumerOffset2 or VsrOperation.DeleteConsumerOffset2 => true,
+            VsrOperation.SendMessages or VsrOperation.StoreConsumerOffset or VsrOperation.DeleteConsumerOffset =>
+                true,
             _ => false
         };
     }
@@ -268,8 +263,6 @@ internal static class VsrOperations
     internal static bool IsResultFramed(this VsrOperation operation)
     {
         return operation.IsMetadata() || operation is VsrOperation.StoreConsumerOffset
-            or VsrOperation.StoreConsumerOffset2
-            or VsrOperation.DeleteConsumerOffset
-            or VsrOperation.DeleteConsumerOffset2;
+            or VsrOperation.DeleteConsumerOffset;
     }
 }

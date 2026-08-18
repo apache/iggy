@@ -15,5 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// `StoreConsumerOffset2` response is empty.
-pub type StoreConsumerOffset2Response = super::EmptyResponse;
+use std::io;
+
+/// Positional byte io over a durable backing store.
+pub trait Storage {
+    type Buffer;
+
+    fn write_at(&self, offset: usize, buf: Self::Buffer)
+    -> impl Future<Output = io::Result<usize>>;
+
+    fn read_at(
+        &self,
+        offset: usize,
+        buffer: Self::Buffer,
+    ) -> impl Future<Output = io::Result<Self::Buffer>>;
+}

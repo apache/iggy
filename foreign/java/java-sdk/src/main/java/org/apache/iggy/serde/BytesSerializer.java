@@ -19,6 +19,7 @@
 
 package org.apache.iggy.serde;
 
+import com.dynatrace.hash4j.hashing.Hashing;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.commons.lang3.ArrayUtils;
@@ -29,8 +30,10 @@ import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
+import org.apache.iggy.message.MessageId;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.message.UuidMessageId;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.StreamPermissions;
@@ -38,8 +41,11 @@ import org.apache.iggy.user.TopicPermissions;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 /**
  * Unified serializer for both blocking and async clients.
@@ -47,12 +53,21 @@ import java.util.Optional;
  */
 public final class BytesSerializer {
 
+    /** Size of the batch header on the wire; bytes past the stamped fields stay zero. */
+    static final int BATCH_HEADER_SIZE = 256;
+
     /**
      * Key and value length bound, in encoded bytes rather than characters. Belongs to the
      * header-field codec that both user headers and resource options ride, so the server refuses a
      * block carrying a field outside this range.
      */
     private static final int MAX_HEADER_FIELD_LENGTH = 255;
+
+    /** The timestamp delta is a u32 microsecond offset from the batch origin timestamp. */
+    private static final BigInteger MAX_TIMESTAMP_DELTA_MICROS = BigInteger.valueOf(0xFFFF_FFFFL);
+
+    /** Batch checksum input: five u64 header fields plus the u32 message count. */
+    private static final int BATCH_CHECKSUM_FIXED_INPUT_BYTES = 5 * Long.BYTES + Integer.BYTES;
 
     private BytesSerializer() {}
 
@@ -86,27 +101,6 @@ public final class BytesSerializer {
         buffer.writeByte(partitioning.kind().asCode());
         buffer.writeByte(partitioning.value().length);
         buffer.writeBytes(partitioning.value());
-        return buffer;
-    }
-
-    public static ByteBuf toBytes(Message message) {
-        var buffer = Unpooled.buffer(message.getSize());
-        buffer.writeBytes(toBytes(message.header()));
-        buffer.writeBytes(message.payload());
-        buffer.writeBytes(toBytes(message.userHeaders()));
-        return buffer;
-    }
-
-    public static ByteBuf toBytes(MessageHeader header) {
-        var buffer = Unpooled.buffer(MessageHeader.SIZE);
-        buffer.writeBytes(toBytesAsU64(header.checksum()));
-        buffer.writeBytes(header.id().toBytes());
-        buffer.writeBytes(toBytesAsU64(header.offset()));
-        buffer.writeBytes(toBytesAsU64(header.timestamp()));
-        buffer.writeBytes(toBytesAsU64(header.originTimestamp()));
-        buffer.writeIntLE(header.userHeadersLength().intValue());
-        buffer.writeIntLE(header.payloadLength().intValue());
-        buffer.writeBytes(toBytesAsU64(header.reserved()));
         return buffer;
     }
 
@@ -259,6 +253,114 @@ public final class BytesSerializer {
     }
 
     /**
+     * Encodes messages as one batch record: a batch header followed by per-message frames.
+     * The server stamps {@code partition_id}, {@code base_offset}, and {@code base_timestamp},
+     * so they are encoded as zero here.
+     */
+    public static ByteBuf toMessagesBatch(List<Message> messages) {
+        if (messages.isEmpty()) {
+            throw new IggyInvalidArgumentException("Cannot encode an empty message batch");
+        }
+        List<RawMessage> rawMessages = new ArrayList<>(messages.size());
+        for (Message message : messages) {
+            rawMessages.add(new RawMessage(
+                    encodedMessageId(message.header().id()),
+                    message.header().originTimestamp(),
+                    message.payload(),
+                    readAllBytes(toBytes(message.userHeaders()))));
+        }
+        return encodeBatch(rawMessages);
+    }
+
+    static ByteBuf encodeBatch(List<RawMessage> messages) {
+        var batchOriginTimestamp = messages.stream()
+                .map(RawMessage::originTimestamp)
+                .min(BigInteger::compareTo)
+                .orElseThrow(() -> new IggyInvalidArgumentException("Cannot encode an empty message batch"));
+        var blobLength = 0;
+        for (RawMessage message : messages) {
+            blobLength += MessageHeader.SIZE + message.payload().length + message.userHeaders().length;
+        }
+
+        var batch = Unpooled.buffer(BATCH_HEADER_SIZE + blobLength);
+        batch.writeZero(BATCH_HEADER_SIZE);
+        for (int index = 0; index < messages.size(); index++) {
+            RawMessage message = messages.get(index);
+            var timestampDelta = message.originTimestamp().subtract(batchOriginTimestamp);
+            if (timestampDelta.compareTo(MAX_TIMESTAMP_DELTA_MICROS) > 0) {
+                throw new IggyInvalidArgumentException("Message origin timestamp exceeds the batch origin by "
+                        + timestampDelta + " microseconds, more than the timestamp delta field can hold");
+            }
+            var frameStart = batch.writerIndex();
+            batch.writeLongLE(0); // checksum, backpatched below
+            batch.writeBytes(message.id());
+            batch.writeIntLE(index); // offset_delta
+            batch.writeIntLE(timestampDelta.intValue());
+            batch.writeIntLE(message.userHeaders().length);
+            batch.writeIntLE(message.payload().length);
+            batch.writeLongLE(0); // reserved
+            batch.writeBytes(message.payload());
+            batch.writeBytes(message.userHeaders());
+            batch.setLongLE(
+                    frameStart, xxHash3(batch, frameStart + Long.BYTES, batch.writerIndex() - frameStart - Long.BYTES));
+        }
+
+        long batchLength = BATCH_HEADER_SIZE + blobLength;
+        batch.setBytes(24, toBytesAsU64(batchOriginTimestamp));
+        batch.setLongLE(32, batchLength);
+        batch.setLongLE(40, batchChecksum(batch, batchOriginTimestamp, batchLength, messages));
+        batch.setIntLE(48, messages.size());
+        return batch;
+    }
+
+    /**
+     * The batch checksum covers the header meta fields and each frame's checksum field, not the
+     * message bodies; bodies are bound through the per-frame checksums.
+     */
+    private static long batchChecksum(
+            ByteBuf batch, BigInteger batchOriginTimestamp, long batchLength, List<RawMessage> messages) {
+        var input = Unpooled.buffer(BATCH_CHECKSUM_FIXED_INPUT_BYTES + Long.BYTES * messages.size());
+        input.writeLongLE(0); // partition_id
+        input.writeLongLE(0); // base_offset
+        input.writeLongLE(0); // base_timestamp
+        input.writeBytes(toBytesAsU64(batchOriginTimestamp));
+        input.writeLongLE(batchLength);
+        input.writeIntLE(messages.size());
+        var frameStart = BATCH_HEADER_SIZE;
+        for (RawMessage message : messages) {
+            input.writeLongLE(batch.getLongLE(frameStart));
+            frameStart += MessageHeader.SIZE + message.payload().length + message.userHeaders().length;
+        }
+        return xxHash3(input, 0, input.readableBytes());
+    }
+
+    /**
+     * The frame checksum covers the id, so a zero id is minted client-side before encoding
+     * rather than assigned by the server.
+     */
+    private static byte[] encodedMessageId(MessageId id) {
+        if (id.toBigInteger().signum() == 0) {
+            return readAllBytes(new UuidMessageId(UUID.randomUUID()).toBytes());
+        }
+        return readAllBytes(id.toBytes());
+    }
+
+    private static long xxHash3(ByteBuf buffer, int index, int length) {
+        if (buffer.hasArray()) {
+            return Hashing.xxh3_64().hashBytesToLong(buffer.array(), buffer.arrayOffset() + index, length);
+        }
+        var bytes = new byte[length];
+        buffer.getBytes(index, bytes);
+        return Hashing.xxh3_64().hashBytesToLong(bytes);
+    }
+
+    private static byte[] readAllBytes(ByteBuf buffer) {
+        var bytes = new byte[buffer.readableBytes()];
+        buffer.readBytes(bytes);
+        return bytes;
+    }
+
+    /**
      * Rejects a key or value the TLV codec cannot express.
      *
      * <p>The {@code HeaderKey} / {@code HeaderValue} factories bound what they build, but both are
@@ -270,6 +372,18 @@ public final class BytesSerializer {
         if (length < 1 || length > MAX_HEADER_FIELD_LENGTH) {
             throw new IggyInvalidArgumentException("Invalid header " + field + " length: " + length
                     + " bytes, must be between 1 and " + MAX_HEADER_FIELD_LENGTH);
+        }
+    }
+
+    /**
+     * One message as it enters the batch encoder: the id already encoded to its 16 wire bytes
+     * and the user headers already encoded to their opaque bytes.
+     */
+    record RawMessage(byte[] id, BigInteger originTimestamp, byte[] payload, byte[] userHeaders) {
+        RawMessage {
+            if (id.length != 16) {
+                throw new IggyInvalidArgumentException("Message id must have 16 bytes");
+            }
         }
     }
 }
