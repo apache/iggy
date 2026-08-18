@@ -86,7 +86,6 @@ pub trait Sequencer {
     fn current_sequence(&self) -> Self::Sequence;
 
     /// Allocate the next sequence number.
-    /// TODO Should this return a Future<Output = u64>? for async case?
     fn next_sequence(&self) -> Self::Sequence;
 
     /// Update the current sequence number.
@@ -1167,9 +1166,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             "VsrConsensus group must be METADATA_GROUP or a packable \
              IggyNamespace; got {group:#x}"
         );
-        // TODO: Verify that XOR-based seeding provides sufficient jitter diversity
-        // across groups. Consider using a proper hash (e.g., Murmur3) of
-        // (replica_id, group) for production.
+        // Jitter only has to desynchronize replicas of one group, whose ids
+        // differ, so the XOR cannot collide where it matters; `seed_from_u64`
+        // (SplitMix64) decorrelates the streams of nearby seeds.
         let timeout_seed = u128::from(replica) ^ u128::from(group);
         let prepare_queue_max = pipeline.prepare_queue_max();
         Self {
@@ -2059,7 +2058,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         pipeline.clear_request_queue();
     }
 
-    /// Process one tick. Call this periodically (e.g., every 10ms).
+    /// Process one tick. Call this every [`crate::TICK_INTERVAL`].
     ///
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
@@ -3227,9 +3226,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return CommitOutcome::Accepted;
         }
 
-        // TODO: Once connection-level peer verification is added promote
-        // this to an assert, the network layer would guarantee the sender
-        // matches header.replica.
+        // Tolerant skip, not an assert: the replica handshake proves cluster
+        // membership only, so nothing binds `header.replica` to the sender.
         if header.replica != self.primary_index(header.view) {
             return CommitOutcome::Accepted;
         }
@@ -3843,8 +3841,10 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     type MessageBus = B;
-    #[rustfmt::skip] // Scuffed formatter. TODO: Make the naming less ambiguous for `Message`.
-    type Message<H> = Message<H> where H: ConsensusHeader;
+    type Message<H>
+        = server_common::Message<H>
+    where
+        H: ConsensusHeader;
     type RoutedRequestHeader = RoutedRequestHeader;
     type ReplicateHeader = PrepareHeader;
     type AckHeader = PrepareOkHeader;

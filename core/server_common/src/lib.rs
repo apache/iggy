@@ -23,25 +23,13 @@ pub mod crypto;
 pub mod diagnostics;
 pub mod executor;
 pub mod fs_utils;
-// TODO(hubcio): iobuf was relocated verbatim from `core/binary_protocol/src/consensus/iobuf.rs`
-// during the sans-io split. Its implementation is intentionally untouched; the
-// lints below predate the move and are tracked as tech debt for a 0.9.x cleanup pass.
-#[allow(
-    private_interfaces,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate,
-    clippy::return_self_not_must_use,
-    clippy::missing_const_for_fn,
-    clippy::non_send_fields_in_send_ty,
-    clippy::use_self
-)]
 pub mod iobuf;
 pub mod log;
 mod memory_pool;
 mod segment_storage;
 pub mod send_messages;
 pub mod sharding;
+mod storage;
 
 pub use bootstrap::create_directories;
 pub use buffer::PooledBuffer;
@@ -55,3 +43,4 @@ pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_poo
 pub use segment_storage::{
     IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
 };
+pub use storage::Storage;

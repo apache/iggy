@@ -19,6 +19,8 @@ use std::io;
 use std::ops::{Deref, RangeInclusive};
 use std::rc::Rc;
 
+pub use server_common::Storage;
+
 pub mod file_storage;
 pub mod local_gate;
 pub mod prepare_journal;
@@ -96,20 +98,6 @@ where
     /// transfer uses this to mark pre-transfer residents superseded by the
     /// installed snapshot.
     fn set_snapshot_op(&self, op: u64);
-}
-
-// TODO: Move to other crate.
-pub trait Storage {
-    type Buffer;
-
-    fn write_at(&self, offset: usize, buf: Self::Buffer)
-    -> impl Future<Output = io::Result<usize>>;
-
-    fn read_at(
-        &self,
-        offset: usize,
-        buffer: Self::Buffer,
-    ) -> impl Future<Output = io::Result<Self::Buffer>>;
 }
 
 pub trait JournalHandle {

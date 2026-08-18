@@ -109,8 +109,9 @@ pub type AckMessage<C> = <C as Consensus>::Message<<C as Consensus>::AckHeader>;
 
 pub trait Consensus: Sized {
     type MessageBus: MessageBus;
-    #[rustfmt::skip] // Scuffed formatter.
-    type Message<H>: ConsensusMessage<H> where H: ConsensusHeader;
+    type Message<H>: ConsensusMessage<H>
+    where
+        H: ConsensusHeader;
 
     type RoutedRequestHeader: ConsensusHeader;
     type ReplicateHeader: ConsensusHeader;
@@ -199,4 +200,4 @@ pub use dvc_merge::*;
 mod vsr_state;
 pub use vsr_state::{VsrState, VsrStateError};
 mod vsr_timeout;
-pub use vsr_timeout::TimeoutManager;
+pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};
