@@ -114,5 +114,4 @@ services:
           raw_command)        export CUCUMBER_FILTER_TAGS='@raw-command' ;;
           stream_crud)        export CUCUMBER_FILTER_TAGS='@stream-crud' ;;
         esac
-        gradle --no-daemon test jacocoTestReport
-        cp build/reports/jacoco/test/jacocoTestReport.xml /reports/java-bdd-coverage.xml
+        gradle --no-daemon test jacocoTestReport && cp build/reports/jacoco/test/jacocoTestReport.xml /reports/java-bdd-coverage.xml
