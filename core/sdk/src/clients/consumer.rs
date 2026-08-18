@@ -109,7 +109,7 @@ unsafe impl Sync for IggyConsumer {}
 ///
 /// `IggyConsumer` handles all three. It fetches batches of messages from the server, keeps them in
 /// an in-memory buffer, decrypts them when the client is configured with an encryptor, and records
-/// how far it has read. It implements [`Stream`], so consuming is a loop over [`StreamExt::next`].
+/// how far it has read. **It implements [`Stream`], so consuming is a loop over [`StreamExt::next`].**
 ///
 /// You can use a consumer as a worker draining a topic, a reader that replays a
 /// partition from a chosen point, and a pool of consumers sharing a workload through a consumer
@@ -573,7 +573,7 @@ impl IggyConsumer {
     ///
     /// An offset that is not ahead of the last one this consumer stored for that partition is
     /// skipped and `Ok(())` is returned without a request.
-    /// If you want to move an offset backwards configure the consumer
+    /// If you to re-read messages again, e.g. want to move an offset backwards configure the consumer
     /// with [`allow_replay`](crate::clients::consumer_builder::IggyConsumerBuilder::allow_replay).
     ///
     /// # Errors
@@ -643,8 +643,7 @@ impl IggyConsumer {
     /// `None` if it has not stored one yet.
     ///
     /// The value is this consumer's own record of what it committed, kept in memory rather than
-    /// read back from the server, so it says nothing about offsets stored by other members of the
-    /// same consumer group.
+    /// read back from the server.
     pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         let offset = self.last_stored_offsets.get(&partition_id)?;
         Some(offset.load(ORDERING))
@@ -687,7 +686,7 @@ impl IggyConsumer {
     /// how many this consumer (or its consumer group) has consumed already.
     /// When this offset is stored at the server is configured in `auto_commit`, which defaults to
     /// [`AutoCommit::IntervalOrWhen`] equal to 1s and [`AutoCommitWhen::PollingMessages`].
-    /// - A interval background task is only spawned for the variants that carry an interval
+    /// - An interval background task is only spawned for the variants that carry an interval
     ///   ([`AutoCommit::Interval`], [`AutoCommit::IntervalOrWhen`], [`AutoCommit::IntervalOrAfter`]).
     /// - The offset store task is spawned in any case. It can be configured with [`AutoCommitWhen::ConsumingEachMessage`],
     ///   [`AutoCommitWhen::ConsumingEveryNthMessage`], [`AutoCommitWhen::ConsumingAllMessages`] and
@@ -699,7 +698,7 @@ impl IggyConsumer {
     /// covered yet. There is no double-work, since an offset that is not ahead of the one last stored
     /// for that partition is skipped instead of sent.
     /// Unless `allow_replay` is enabled an offset that is not past the last stored offset on the server
-    /// will not be committed. Consequently, setting `allow_replay` allows the caller to read messages multiple times.
+    /// will not be committed.
     ///
     /// The [`AutoCommitAfter`] variants only take effect when consuming through
     /// [`IggyConsumerMessageExt::consume_messages`](crate::consumer_ext::IggyConsumerMessageExt::consume_messages).
@@ -1414,7 +1413,8 @@ impl ReceivedMessage {
 }
 
 /// Yields messages one at a time.
-/// A new batch is fetched from the server whenever the buffer is empty.
+///
+/// Tries the buffer first, before a new batch is fetched from the server and stored in the buffer.
 ///
 /// The stream never yields `None`. So a `while let Some(..)` loop over it runs
 /// until the loop body breaks out. Errors are yielded as items and do not end the stream, polling
@@ -1424,7 +1424,7 @@ impl Stream for IggyConsumer {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let partition_id = self.current_partition_id.load(ORDERING);
-        // We first want to handle messages that are currently buffered.
+        // First handle messages that are currently buffered.
         if let Some(message) = self.buffered_messages.pop_front() {
             {
                 // Since a consumer can be standalone or a member of a consumer group, in which case
@@ -1451,7 +1451,7 @@ impl Stream for IggyConsumer {
             // The next turn will therefore poll messages from the server.
             // With `PollingStrategy` the user defines the starting point where to poll from.
             // After that, each poll must read the next sequential offset. Hence, strategy is
-            // set to `next` and the next offset to read from is the last consumed message + 1.
+            // set to `PollingKind::Offset` and the next offset to read from is the last consumed message + 1.
             if self.buffered_messages.is_empty() {
                 if self.polling_strategy.kind != PollingKind::Next {
                     self.polling_strategy = PollingStrategy::offset(message.header.offset + 1);
@@ -1478,6 +1478,8 @@ impl Stream for IggyConsumer {
             ))));
         }
 
+        // If the buffer is empty, messages are polled from the server, which itself is async.
+        // A previous used (and therefore invalid) future was dropped, thus create a fresh one.
         if self.poll_future.is_none() {
             let future = self.create_poll_messages_future();
             self.poll_future = Some(Box::pin(future));
@@ -1564,6 +1566,7 @@ impl Stream for IggyConsumer {
                             );
                         }
 
+                        // Drop future since it is [invalid after being ready](https://doc.rust-lang.org/std/future/trait.Future.html#panics)
                         self.poll_future = None;
                         return Poll::Ready(Some(Ok(ReceivedMessage::new(
                             message,
@@ -1642,9 +1645,9 @@ impl IggyConsumer {
             closed_sender,
         ));
 
-        // This task always exists, so no need to notify.
-        // If it still exists after closing the channel above, wait until drain timeout has passed
-        // and the force the task to abort.
+        // This task never sleeps, so no need to notify.
+        // If the task is working, wait until drain timeout has passed
+        // and then force to abort.
         if let Some(mut task) = self.store_offset_task.take()
             && time::timeout(self.offset_drain_timeout.get_duration(), &mut task)
                 .await
@@ -1724,7 +1727,7 @@ impl IggyConsumer {
 /// Stops the background tasks, nothing more.
 ///
 /// Dropping cannot await, so it neither commits pending offsets nor leaves the consumer group.
-/// Await [`IggyConsumer::shutdown`] for that.
+/// Await [`IggyConsumer::shutdown`] to finish background tasks.
 impl Drop for IggyConsumer {
     fn drop(&mut self) {
         self.shutdown.store(true, ORDERING);
