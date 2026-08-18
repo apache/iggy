@@ -119,4 +119,27 @@ impl MSSQLContainer {
             connection_string,
         })
     }
+
+	pub async fn create_connection(&self) -> Result<DBClient, TestBinaryError> {
+
+		let config = Config::from_jdbc_string(self.connection_string);
+		let tcp = TcpStream::connect(config.get_addr())
+			.await
+			.map_err(|e| TestBinaryError::FixtureSetup {
+			fixture_type: "MSSQLContainer".to_string(),
+			message: format!("Failed to connect: {e}")
+		})?;
+
+		if tcp.set_nodelay(true).is_ok() { } else {
+			warn!("Cannot set no delay on the TCP socket!");
+		}
+		let mut client = Client::connect(
+			config,
+			tcp.compat_write()
+		).await
+		.map_err(|e| TestBinaryError::FixtureSetup {
+			fixture_type: "MSSQLContainer".to_string(),
+			message: format!("Failed to connect: {e}"),
+		})
+	}
 }
