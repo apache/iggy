@@ -15,22 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
-use cucumber::World;
-use iggy::clients::client::IggyClient;
-use iggy::prelude::{IggyError, IggyMessage, PolledMessages};
+pub(crate) mod common;
+pub(crate) mod helpers;
+pub(crate) mod steps;
 
-#[derive(Debug, World, Default)]
-pub struct GlobalContext {
-    pub client: Option<IggyClient>,
-    pub server_addr: Option<String>,
-    pub last_stream_id: Option<u32>,
-    pub last_stream_name: Option<String>,
-    pub last_stream_was_found: bool,
-    pub last_topic_id: Option<u32>,
-    pub last_topic_name: Option<String>,
-    pub last_topic_partitions: Option<u32>,
-    pub last_polled_messages: Option<PolledMessages>,
-    pub last_sent_message: Option<IggyMessage>,
-    pub last_raw_result: Option<Result<Bytes, IggyError>>,
+use crate::common::global_context::GlobalContext;
+use cucumber::World;
+
+#[tokio::main]
+async fn main() {
+    GlobalContext::cucumber()
+        .fail_on_skipped()
+        .run_and_exit("../../bdd/scenarios/stream_crud.feature")
+        .await;
 }
