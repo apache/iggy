@@ -15,9 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-export { Client, SimpleClient, SingleClient } from './client.js'
-export * from './client.config.js';
-export { parseConnectionString } from './client.connection-string.js';
-export * from './client.utils.js';
-export * from './client.socket.js';
-export * from './client.type.js';
+/** Largest value representable by the Rust u32 type. */
+export const MAX_U32 = 4294967295;

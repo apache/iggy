@@ -16,20 +16,22 @@
 // under the License.
 
 import type { Readable } from 'stream';
-import { type TcpSocketConnectOpts } from 'node:net';
+import { type TcpNetConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
 
 /**
  * TCP socket connection options.
- * Alias for Node.js TcpSocketConnectOpts.
+ * Alias for Node.js TcpNetConnectOpts, what net.createConnection accepts.
  */
-export type TcpOption = TcpSocketConnectOpts;
+export type TcpOption = TcpNetConnectOpts;
 
 /**
  * TLS socket connection options.
- * Combines port number with Node.js TLS ConnectionOptions.
+ * Combines port number with Node.js TLS ConnectionOptions and the
+ * net.connect options tls.connect forwards at runtime. `caFile` is an SDK
+ * extension: a CA certificate path read when the TLS socket is created.
  */
-export type TlsOption = { port: number } & ConnectionOptions;
+export type TlsOption = { port: number } & ConnectionOptions & Partial<TcpNetConnectOpts> & { caFile?: string };
 
 /**
  * Response from a command sent to the Iggy server.
@@ -166,6 +168,12 @@ export type PoolSizeOption = {
 }
 
 /**
+ * Client configuration or a connection string such as
+ * `iggy://username:password@host:port`.
+ */
+export type ClientConfigOrString = ClientConfig | string;
+
+/**
  * Complete client configuration for connecting to the Iggy server.
  */
 export type ClientConfig = {
@@ -179,12 +187,7 @@ export type ClientConfig = {
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,
-  /**
-   * Interval for sending heartbeat pings in milliseconds, as an integer
-   * between 0 and Node's timer ceiling. Defaults to 5000. Set to 0 to disable
-   * client heartbeats; any other unusable value is rejected rather than
-   * silently disabling them.
-   */
+  /** Interval for sending heartbeat pings, in milliseconds */
   heartbeatInterval?: number,
   /** Maximum accepted response frame size in bytes */
   maxResponseFrameSize?: number

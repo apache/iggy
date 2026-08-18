@@ -18,6 +18,7 @@
 import { EventEmitter } from 'node:events';
 import type {
   ClientConfig,
+  ClientConfigOrString,
   ClientCredentials, CommandResponse,
   PasswordCredentials, RawClient, SendCommandOptions,
   TokenCredentials
@@ -165,7 +166,7 @@ export class CommandResponseStream extends EventEmitter {
    *
    * @param options - Client configuration
    */
-  constructor(options: ClientConfig) {
+  constructor(options: ClientConfigOrString) {
     super();
     const normalizedConfig = normalizeClientConfig(options);
     this.options = normalizedConfig;
@@ -950,7 +951,7 @@ export class CommandResponseStream extends EventEmitter {
  * @param options - Client configuration
  * @returns RawClient instance
  */
-export function getRawClient(options: ClientConfig): RawClient {
+export function getRawClient(options: ClientConfigOrString): RawClient {
   return new CommandResponseStream(options);
 }
 

@@ -17,8 +17,9 @@
 
 import { EventEmitter } from 'node:events';
 import type { Socket } from 'node:net';
-import { createConnection } from 'node:net';
+import { createConnection, isIP } from 'node:net';
 import { connect as TLSConnect } from 'node:tls';
+import { readFileSync } from 'node:fs';
 import type { ClientConfig, TlsOption, TcpOption, ReconnectOption } from "./client.type.js"
 import { debug } from './client.debug.js';
 import { DEFAULT_MAX_RESPONSE_FRAME_SIZE } from './client.config.js';
@@ -47,8 +48,26 @@ const createTcpSocket = (options: TcpOption): Socket => {
  * @returns TLS socket
  */
 const createTlsSocket = ({ port, ...options }: TlsOption): Socket => {
-  const socket = TLSConnect(port, options);
-  return socket;
+  const { caFile, ...tlsOptions } = options;
+  if (caFile !== undefined)
+    tlsOptions.ca = readCaCertificate(caFile);
+  // An SNI-routing terminator needs a server name in the ClientHello;
+  // IP literals are never sent as SNI, matching the Rust SDK's fallback.
+  if (typeof tlsOptions.host === 'string' &&
+      tlsOptions.servername === undefined &&
+      isIP(tlsOptions.host) === 0)
+    tlsOptions.servername = tlsOptions.host;
+  return TLSConnect(port, tlsOptions);
+};
+
+// A missing or unreadable CA file is a configuration error rather than a
+// transient I/O failure, hence the TypeError instead of the raw ENOENT.
+const readCaCertificate = (caFile: string): Buffer => {
+  try {
+    return readFileSync(caFile);
+  } catch {
+    throw new TypeError(`cannot read tls_ca_file "${caFile}"`);
+  }
 };
 
 /**
@@ -96,14 +115,16 @@ const DefaultReconnectOption: ReconnectOption = {
 /**
  * Waits before a reconnection attempt.
  *
- * @param timer - Delay in milliseconds before recreating
- * @returns Promise resolving after the delay
+ * The timer is unref'd: a queued command fails fast on 'disconnected', so
+ * the retry loop is background work that must not keep the process alive.
+ *
+ * @param interval - Delay in milliseconds before dialing again
  */
-function waitForReconnect(timer = 1000): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, timer);
+const waitForReconnect = (interval: number): Promise<void> =>
+  new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, interval);
+    (timeout as NodeJS.Timeout).unref();
   });
-}
 
 /** Socket error with optional error code */
 type SocketError = Error & { code?: string };
