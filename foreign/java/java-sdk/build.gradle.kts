@@ -43,6 +43,7 @@ dependencies {
     implementation(libs.httpclient5)
     implementation(libs.jackson.databind)
     implementation(libs.commons.lang3)
+    implementation(libs.hash4j)
     implementation(libs.slf4j.api)
     implementation(libs.spotbugs.annotations)
     implementation(libs.netty.buffer)

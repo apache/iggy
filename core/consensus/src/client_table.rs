@@ -1239,7 +1239,7 @@ impl ClientEntry {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, Operation};
+    use iggy_binary_protocol::{Command, Operation};
 
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
@@ -1259,7 +1259,7 @@ mod tests {
             commit,
             // Real size so codec-roundtripped replies re-parse.
             size: header_size as u32,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::Register,
             ..ReplyHeader::default()
         };
@@ -1290,7 +1290,7 @@ mod tests {
             request_checksum,
             // Real size so codec-roundtripped replies re-parse.
             size: header_size as u32,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::SendMessages,
             ..ReplyHeader::default()
         };

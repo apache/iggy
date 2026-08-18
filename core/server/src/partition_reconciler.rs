@@ -1084,9 +1084,10 @@ fn shards_table_has_epoch(ctx: &ReconcilerCtx, ns: IggyNamespace, epoch: u64) ->
 /// so a redundant pass triggered by an unrelated revision bump is harmless.
 /// A watermark whose enforcement is still incomplete (first local segment
 /// starts below it) counts as pending work: the pump may be blocked by a
-/// consumer barrier or by a rejoin whose offsets arrive via journal repair,
-/// and neither unblocking bumps `Streams::revision`, so the pass must keep
-/// the reconciler ticking until the layout converges.
+/// consumer barrier, by a rejoin whose offsets arrive via journal repair, or
+/// by the per-pass removal budget that keeps one trim from monopolising the
+/// pump, and no such unblocking bumps `Streams::revision`, so the pass must
+/// keep the reconciler ticking until the layout converges.
 fn reconcile_segment_truncations(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let partitions = ctx.shard.plane.partitions();
     let namespaces: Vec<_> = partitions.namespaces().copied().collect();
@@ -1182,7 +1183,7 @@ mod tests {
         PurgeTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command2, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireIdentifier,
+        Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireIdentifier,
         WireOptions,
     };
     use message_bus::IggyMessageBus;
@@ -1249,7 +1250,7 @@ mod tests {
             &mut msg.as_mut_slice()[..header_size],
         )
         .expect("zeroed bytes form a valid PrepareHeader");
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.size = u32::try_from(total_size).expect("prepare size fits u32");
         header.op = op;
         header.operation = operation;
@@ -1266,7 +1267,7 @@ mod tests {
             &mut msg.as_mut_slice()[..header_size],
         )
         .expect("zeroed bytes form a valid PrepareHeader");
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.size = u32::try_from(header_size).expect("prepare size fits u32");
         header.operation = Operation::SendMessages;
         header.group = namespace.inner();
@@ -1305,7 +1306,7 @@ mod tests {
             &mut msg.as_mut_slice()[..header_size],
         )
         .expect("zeroed bytes form a valid RoutedRequestHeader");
-        header.command = Command2::Request;
+        header.command = Command::Request;
         header.size = u32::try_from(total_size).expect("request size fits u32");
         header.operation = Operation::SendMessages;
         header.group = namespace.inner();

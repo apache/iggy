@@ -29,7 +29,12 @@ pub enum MaxTopicSize {
     #[default]
     /// Use the default size set by the server
     ServerDefault,
-    /// Use a custom size
+    /// Best-effort cap on the SEALED bytes a topic retains, enforced per
+    /// partition (the cap divided by the partition count) and raised to one
+    /// sealed segment when set below it, which the server logs. A sealed
+    /// segment can run one maximum message past the topic's `segment_size`, so
+    /// the cap is never a hard disk bound: the active segment is never trimmed
+    /// and a lagging committed consumer pins the sealed ones behind it.
     Custom(IggyByteSize),
     /// Use an unlimited size
     Unlimited,

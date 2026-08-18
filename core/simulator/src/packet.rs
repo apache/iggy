@@ -23,7 +23,7 @@
 //! - Automatic network partitioning with configurable lifecycle
 //! - Automatic path clogging with exponential duration
 //! - Link capacity limits with random eviction
-//! - Per-command link filtering via `LinkFilter` (`EnumSet<Command2>`)
+//! - Per-command link filtering via `LinkFilter` (`EnumSet<Command>`)
 //!
 //! Partitions are implemented via per-link `LinkFilter`s. When a link's
 //! filter is empty, all packets are silently dropped. When specific commands
@@ -40,18 +40,18 @@
 
 use crate::ready_queue::{Ready, ReadyQueue};
 use enumset::EnumSet;
-use iggy_binary_protocol::{Command2, GenericHeader};
+use iggy_binary_protocol::{Command, GenericHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
 use server_common::Message;
 use std::collections::HashMap;
 
-/// Per-link command filter. An `EnumSet<Command2>` where:
+/// Per-link command filter. An `EnumSet<Command>` where:
 /// - [`ALLOW_ALL`] = all commands pass (link fully enabled)
 /// - [`BLOCK_ALL`] = all commands blocked (link fully disabled/partitioned)
 /// - Custom sets = only matching commands pass through
-pub type LinkFilter = EnumSet<Command2>;
+pub type LinkFilter = EnumSet<Command>;
 
 /// Link filter that allows all commands through (link fully enabled).
 pub const ALLOW_ALL: LinkFilter = EnumSet::all();
@@ -432,7 +432,7 @@ impl PacketSimulator {
     }
 
     /// Returns a mutable reference to the link's filter.
-    /// This is the per-link command filter — `EnumSet<Command2>`.
+    /// This is the per-link command filter — `EnumSet<Command>`.
     /// Set to [`BLOCK_ALL`] to block all packets (partition).
     /// Set to [`ALLOW_ALL`] to allow all packets (default).
     /// Remove specific commands to selectively filter.
@@ -787,7 +787,7 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn create_test_message_with_command(command: Command2) -> Message<GenericHeader> {
+    fn create_test_message_with_command(command: Command) -> Message<GenericHeader> {
         let size = std::mem::size_of::<GenericHeader>();
         let mut buf = vec![0u8; size];
         let header: &mut GenericHeader =
@@ -1030,11 +1030,11 @@ mod tests {
 
         // Set filter to only allow Ping on link 0->1
         let filter = sim.link_filter(ProcessId::Replica(0), ProcessId::Replica(1));
-        *filter = EnumSet::only(Command2::Ping);
+        *filter = EnumSet::only(Command::Ping);
 
         // Submit a Ping message and a Prepare message
-        let ping_msg = create_test_message_with_command(Command2::Ping);
-        let prepare_msg = create_test_message_with_command(Command2::Prepare);
+        let ping_msg = create_test_message_with_command(Command::Ping);
+        let prepare_msg = create_test_message_with_command(Command::Prepare);
 
         sim.submit(ProcessId::Replica(0), ProcessId::Replica(1), ping_msg);
         sim.submit(ProcessId::Replica(0), ProcessId::Replica(1), prepare_msg);
@@ -1048,7 +1048,7 @@ mod tests {
 
         // Only the Ping should be delivered
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].message.header().command, Command2::Ping);
+        assert_eq!(delivered[0].message.header().command, Command::Ping);
 
         // Nothing left in flight
         assert_eq!(sim.packets_in_flight(), 0);

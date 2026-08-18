@@ -33,9 +33,10 @@ use server_common::{Message, MessageBag};
 /// How often the shard pump drives `VsrConsensus::tick`.
 ///
 /// Heartbeats, prepare retransmit, and view-change timeouts only advance
-/// when the tick runs ("call this periodically, e.g. every 10ms"). Public
-/// so the simulator can advance its virtual clock in whole tick intervals.
-pub const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+/// when the tick runs. Re-exported from `consensus` so the drive cadence and
+/// the tick counts it feeds share one unit; public so the simulator can
+/// advance its virtual clock in whole tick intervals.
+pub use consensus::TICK_INTERVAL as CONSENSUS_TICK_INTERVAL;
 
 /// Inter-shard dispatch logic.
 ///
@@ -545,10 +546,10 @@ where
                 // task already resolved the retention decision off-pump, so
                 // this only mutates, serialized with reads on the same loop.
                 if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    let (segments, messages) = partition
+                    let removal = partition
                         .clean_expired_segments(now, message_expiry, max_bytes)
                         .await;
-                    if segments > 0 {
+                    if removal.segments > 0 {
                         // Any unlink invalidates what this shard is SERVING:
                         // the offer names files that are gone and the payload
                         // cache can answer from RAM without touching disk, so a
@@ -560,10 +561,24 @@ where
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
-                            segments,
-                            messages,
+                            segments = removal.segments,
+                            messages = removal.messages,
                             "segment cleaner removed sealed segments"
                         );
+                    }
+                    if removal.budget_spent {
+                        // The pass stopped on its per-frame budget with more to
+                        // remove. Leaving the rest to the next interval tick
+                        // caps reclaim at one budget per interval, which a
+                        // producer outruns forever on small segments. Re-stage
+                        // as a frame rather than looping, so the pump keeps
+                        // interleaving consensus ticks between passes. This
+                        // terminates: a pass re-arms only when MORE than a full
+                        // budget was removable and it retires exactly the
+                        // budget, so the backlog strictly shrinks; a pass held
+                        // by the consumer barrier stops at or below the budget
+                        // and does not re-arm at all.
+                        self.request_clean_partition(namespace, now, message_expiry, max_bytes);
                     }
                 }
             }
@@ -575,9 +590,8 @@ where
                 // committed offset is identical on every replica, so the local
                 // deletion converges; idempotent if already trimmed past it.
                 if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    let (segments, messages) =
-                        partition.remove_sealed_segments_up_to(up_to_offset).await;
-                    if segments > 0 {
+                    let removal = partition.remove_sealed_segments_up_to(up_to_offset).await;
+                    if removal.segments > 0 {
                         // See the cleaner arm: a truncate commits on the
                         // METADATA plane, so this partition's commit_op never
                         // moves and the cached offer stays a hit over unlinked
@@ -586,8 +600,8 @@ where
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
-                            segments,
-                            messages,
+                            segments = removal.segments,
+                            messages = removal.messages,
                             up_to_offset,
                             "truncate-partition removed sealed segments"
                         );

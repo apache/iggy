@@ -19,10 +19,12 @@ package binaryserialization
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/batch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -167,22 +169,53 @@ func TestDeserializeConsumerGroupAssignment_DoesNotAllocateOnABogusCount(t *test
 	assert.Error(t, err)
 }
 
-// pollPayload builds a poll reply body carrying the given messages.
+// batchFrame is one message frame of a fabricated batch record. Frame
+// checksums stay zero: a poll decode passes them through unverified.
+type batchFrame struct {
+	offsetDelta    uint32
+	timestampDelta uint32
+	payload        []byte
+	userHeaders    []byte
+}
+
+// appendBatchRecord appends one batch record carrying the given frames.
+func appendBatchRecord(body []byte, baseOffset, baseTimestamp, originTimestamp uint64, frames ...batchFrame) []byte {
+	recordStart := len(body)
+	body = append(body, make([]byte, batch.HeaderSize)...)
+	for _, frame := range frames {
+		frameStart := len(body)
+		body = append(body, make([]byte, batch.MessageHeaderSize)...)
+		binary.LittleEndian.PutUint32(body[frameStart+24:], frame.offsetDelta)
+		binary.LittleEndian.PutUint32(body[frameStart+28:], frame.timestampDelta)
+		binary.LittleEndian.PutUint32(body[frameStart+32:], uint32(len(frame.userHeaders)))
+		binary.LittleEndian.PutUint32(body[frameStart+36:], uint32(len(frame.payload)))
+		body = append(body, frame.payload...)
+		body = append(body, frame.userHeaders...)
+	}
+	header := batch.Header{
+		BaseOffset:      baseOffset,
+		BaseTimestamp:   baseTimestamp,
+		OriginTimestamp: originTimestamp,
+		BatchLength:     uint64(len(body) - recordStart),
+		MessageCount:    uint32(len(frames)),
+	}
+	header.EncodeInto(body[recordStart:])
+	return body
+}
+
+// pollPayload builds a poll reply body carrying the given messages in one
+// batch record.
 func pollPayload(t *testing.T, partitionId uint32, payloads ...[]byte) []byte {
 	t.Helper()
 
 	body := binary.LittleEndian.AppendUint32(nil, partitionId)
 	body = binary.LittleEndian.AppendUint64(body, 42)
 	body = binary.LittleEndian.AppendUint32(body, uint32(len(payloads)))
-	for _, payload := range payloads {
-		message, err := iggcon.NewIggyMessage(payload)
-		require.NoError(t, err)
-		headerBytes, err := message.Header.AppendBinary(nil)
-		require.NoError(t, err)
-		body = append(body, headerBytes...)
-		body = append(body, message.Payload...)
+	frames := make([]batchFrame, 0, len(payloads))
+	for index, payload := range payloads {
+		frames = append(frames, batchFrame{offsetDelta: uint32(index), payload: payload})
 	}
-	return body
+	return appendBatchRecord(body, 0, 0, 0, frames...)
 }
 
 func TestDeserializeFetchMessagesResponse_DecodesABatch(t *testing.T) {
@@ -224,20 +257,72 @@ func TestDeserializeFetchMessagesResponse_RejectsACountAboveTheDecodedMessages(t
 }
 
 func TestDeserializeFetchMessagesResponse_RejectsOverrunningUserHeaders(t *testing.T) {
-	message, err := iggcon.NewIggyMessage([]byte("payload"))
-	require.NoError(t, err)
-	message.Header.UserHeaderLength = 64
+	body := pollPayload(t, 1, []byte("payload"))
+	// Claim 64 user-header bytes the batch record does not carry.
+	binary.LittleEndian.PutUint32(body[pollPrefixLength+batch.HeaderSize+32:], 64)
 
+	_, err := DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	assert.Error(t, err, "user headers past the batch record must not panic or pass")
+}
+
+func TestDeserializeFetchMessagesResponse_RejectsNonzeroReservedFrameBytes(t *testing.T) {
+	body := pollPayload(t, 1, []byte("payload"))
+	body[pollPrefixLength+batch.HeaderSize+40] = 1
+
+	_, err := DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	assert.Error(t, err, "a frame with nonzero reserved bytes must not decode")
+}
+
+func TestDeserializeFetchMessagesResponse_ResolvesASlicedRecordsLeadingDelta(t *testing.T) {
+	// A server-sliced record keeps the stored base offset; the first frame's
+	// delta positions it inside the original batch.
 	body := binary.LittleEndian.AppendUint32(nil, 1)
-	body = binary.LittleEndian.AppendUint64(body, 0)
+	body = binary.LittleEndian.AppendUint64(body, 53)
 	body = binary.LittleEndian.AppendUint32(body, 1)
-	headerBytes, err := message.Header.AppendBinary(nil)
-	require.NoError(t, err)
-	body = append(body, headerBytes...)
-	body = append(body, message.Payload...)
+	body = appendBatchRecord(body, 50, 9000, 0,
+		batchFrame{offsetDelta: 3, payload: []byte("tail")})
 
-	_, err = DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
-	assert.Error(t, err, "user headers past the body must not panic or pass")
+	polled, err := DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	require.NoError(t, err)
+	require.Len(t, polled.Messages, 1)
+	assert.Equal(t, uint64(53), polled.Messages[0].Header.Offset)
+	assert.Equal(t, uint64(9000), polled.Messages[0].Header.Timestamp)
+}
+
+// goldenPollBody is a poll reply generated by the Rust encoder: partition 3,
+// current offset 101, and one batch record stamped with base offset 100 and
+// base timestamp 5000 carrying two messages.
+const goldenPollBody = "03000000650000000000000002000000030000000000000064000000000000008813000000000000e8030000000000008c01000000000000c96826b38a8feed202000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bfd2b9205a759675070000000000000000000000000000000000000000000000000000000d000000000000000000000066697273742d7061796c6f6164d66b7e1c758eb7c0080000000000000000000000000000000100000032000000110000000e00000000000000000000007365636f6e642d7061796c6f6164757365722d6865616465722d6279746573"
+
+func TestDeserializeFetchMessagesResponse_DecodesTheGoldenVector(t *testing.T) {
+	body, err := hex.DecodeString(goldenPollBody)
+	require.NoError(t, err)
+
+	polled, err := DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(3), polled.PartitionId)
+	assert.Equal(t, uint64(101), polled.CurrentOffset)
+	assert.Equal(t, uint32(2), polled.MessageCount)
+	require.Len(t, polled.Messages, 2)
+
+	first := polled.Messages[0]
+	assert.Equal(t, iggcon.MessageID{7}, first.Header.Id)
+	assert.Equal(t, uint64(100), first.Header.Offset)
+	assert.Equal(t, uint64(5000), first.Header.Timestamp)
+	assert.Equal(t, uint64(1000), first.Header.OriginTimestamp)
+	assert.Equal(t, uint64(0x7596755a20b9d2bf), first.Header.Checksum)
+	assert.Equal(t, []byte("first-payload"), first.Payload)
+	assert.Empty(t, first.UserHeaders)
+
+	second := polled.Messages[1]
+	assert.Equal(t, iggcon.MessageID{8}, second.Header.Id)
+	assert.Equal(t, uint64(101), second.Header.Offset)
+	assert.Equal(t, uint64(5000), second.Header.Timestamp)
+	assert.Equal(t, uint64(1050), second.Header.OriginTimestamp)
+	assert.Equal(t, uint64(0xc0b78e751c7e6bd6), second.Header.Checksum)
+	assert.Equal(t, []byte("second-payload"), second.Payload)
+	assert.Equal(t, []byte("user-header-bytes"), second.UserHeaders)
 }
 
 func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {

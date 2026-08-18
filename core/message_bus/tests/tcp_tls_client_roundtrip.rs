@@ -23,7 +23,7 @@ use common::{
     install_replicas_locally, install_tls_clients_locally, loopback, set_replica_ctx,
 };
 use compio::net::TcpStream;
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::connector::DEFAULT_RECONNECT_PERIOD;
@@ -51,10 +51,10 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let bus_for_handler = Rc::clone(&bus);
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
-        assert_eq!(msg.header().command, Command2::Request);
+        assert_eq!(msg.header().command, Command::Request);
         let bus = Rc::clone(&bus_for_handler);
         compio::runtime::spawn(async move {
-            let reply = header_only(Command2::Reply, CLUSTER, 0).into_frozen();
+            let reply = header_only(Command::Reply, CLUSTER, 0).into_frozen();
             bus.send_to_client(client_id, reply)
                 .await
                 .expect("server send_to_client");
@@ -131,14 +131,14 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
     };
     let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
 
-    let request = header_only(Command2::Request, CLUSTER, 0).into_frozen();
+    let request = header_only(Command::Request, CLUSTER, 0).into_frozen();
     out_tx.send(request).await.expect("client send");
 
     let reply = compio::time::timeout(Duration::from_secs(5), in_rx.recv())
         .await
         .expect("client must receive reply within 5 s")
         .expect("reply frame");
-    assert_eq!(reply.header().command, Command2::Reply);
+    assert_eq!(reply.header().command, Command::Reply);
     assert_eq!(reply.header().cluster, CLUSTER);
 
     client_shutdown.trigger();

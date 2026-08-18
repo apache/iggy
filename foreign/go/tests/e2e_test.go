@@ -205,7 +205,7 @@ func TestE2E_RejectsSessionControlCodesOnTheRawPath(t *testing.T) {
 	assert.Error(t, err, "a login must go through LoginUser, not the raw path")
 }
 
-func TestE2E_ConsumerOffsetsV2OverTheRawPath(t *testing.T) {
+func TestE2E_ConsumerOffsetAckLevelsOverTheRawPath(t *testing.T) {
 	connected := connect(t)
 	ctx := context.Background()
 	streamId, topicId := scratchTopic(t, connected, 1)
@@ -223,11 +223,11 @@ func TestE2E_ConsumerOffsetsV2OverTheRawPath(t *testing.T) {
 			offset = 4
 		}
 
-		store := consumerOffsetV2Payload(t, consumer, streamId, topicId, partitionId)
+		store := consumerOffsetPayload(t, consumer, streamId, topicId, partitionId)
 		store = binary.LittleEndian.AppendUint64(store, offset)
 		store = append(store, ack)
 
-		_, err := connected.SendBinaryRequest(ctx, storeConsumerOffset2Code, store)
+		_, err := connected.SendBinaryRequest(ctx, storeConsumerOffsetCode, store)
 		require.NoError(t, err, "ack level %d", ack)
 
 		stored, err := connected.GetConsumerOffset(ctx, consumer, streamId, topicId, &partitionId)
@@ -236,9 +236,9 @@ func TestE2E_ConsumerOffsetsV2OverTheRawPath(t *testing.T) {
 		assert.Equal(t, offset, stored.StoredOffset, "ack level %d", ack)
 	}
 
-	remove := consumerOffsetV2Payload(t, consumer, streamId, topicId, partitionId)
+	remove := consumerOffsetPayload(t, consumer, streamId, topicId, partitionId)
 	remove = append(remove, ackQuorum)
-	_, err = connected.SendBinaryRequest(ctx, deleteConsumerOffset2Code, remove)
+	_, err = connected.SendBinaryRequest(ctx, deleteConsumerOffsetCode, remove)
 	require.NoError(t, err)
 }
 

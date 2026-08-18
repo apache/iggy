@@ -19,7 +19,6 @@
 //! [`system::SystemConfig`], the HTTP section, and the top-level sections
 //! that [`crate::server_config::server::ServerConfig`] composes.
 
-pub mod cache_indexes;
 pub mod defaults;
 pub mod displays;
 pub mod http;

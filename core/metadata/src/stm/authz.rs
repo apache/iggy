@@ -341,9 +341,7 @@ pub(crate) fn authorize(
         | Operation::DeletePersonalAccessToken
         | Operation::SendMessages
         | Operation::StoreConsumerOffset
-        | Operation::DeleteConsumerOffset
-        | Operation::StoreConsumerOffset2
-        | Operation::DeleteConsumerOffset2 => None,
+        | Operation::DeleteConsumerOffset => None,
     }
 }
 
@@ -409,7 +407,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_binary_protocol::requests::users::CreateUserRequest;
-    use iggy_binary_protocol::{Command2, WireEncode, WireName, WireOptions};
+    use iggy_binary_protocol::{Command, WireEncode, WireName, WireOptions};
     use iggy_common::UserStatus;
     use server_common::iobuf::Owned;
 
@@ -438,7 +436,7 @@ mod tests {
             let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
                 &mut buffer.as_mut_slice()[..HEADER_SIZE],
             );
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = operation;
             header.op = op;
             header.user_id = user_id;

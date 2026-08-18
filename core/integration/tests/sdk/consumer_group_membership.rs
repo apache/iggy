@@ -40,12 +40,22 @@ const TOPIC_ID_NOT_FOUND: u32 = 2010;
 const CONSUMER_GROUP_ID_NOT_FOUND: u32 = 5000;
 const CONSUMER_GROUP_MEMBER_NOT_FOUND: u32 = 5006;
 
+// Every spec here pins a 60s server heartbeat because harness clients never
+// ping on their own: the SDK pinger is spawned by `IggyClient::connect`, which
+// the harness builder does not call. At the shipped 30s interval a group member
+// that idles through another client's setup is reaped by the server's verifier,
+// and the failure surfaces as a short member count instead of anything about
+// the scenario under test.
+
 // A consumer-group member holding zero partitions has the same empty client-side
 // assignment as a non-member; only membership tells them apart. When the group
 // is deleted under such a member, the poll must surface an error (driving a
 // rejoin) rather than treating the empty assignment as "nothing to poll" and
 // hanging forever.
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
 async fn given_group_member_holds_no_partitions_when_group_deleted_should_surface_error_not_hang(
     harness: &TestHarness,
 ) {
@@ -152,7 +162,10 @@ async fn given_group_member_holds_no_partitions_when_group_deleted_should_surfac
 // codes the legacy server returns. Binary transports only: the HTTP client
 // has no join/leave (stateless sessions carry no member identity, the SDK
 // returns FeatureUnavailable client-side), so the ladder cannot run there.
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
 async fn given_join_and_leave_failures_when_sent_over_the_wire_should_return_legacy_error_codes(
     harness: &TestHarness,
 ) {

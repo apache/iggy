@@ -43,7 +43,7 @@ use iggy_binary_protocol::requests::partitions::CreatePartitionsWithAssignmentsR
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
+    Command, ConsensusHeader, EvictionReason, GenericHeader, Operation, PrepareHeader,
     PrepareOkHeader, ProtocolVersion, ReplyHeader, RoutedRequestHeader, WireDecode, WireEncode,
     WireName,
 };
@@ -1326,7 +1326,7 @@ where
     {
         assert!(matches!(
             message.header().command(),
-            Command2::Request | Command2::Prepare | Command2::PrepareOk
+            Command::Request | Command::Prepare | Command::PrepareOk
         ));
         message.header().operation().is_metadata_plane()
     }
@@ -2508,7 +2508,7 @@ where
         consensus.drain_loopback_into(&mut loopback);
         for message in loopback {
             match message.header().command {
-                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                Command::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
                     Ok(prepare_ok) => self.on_ack(prepare_ok).await,
                     Err(error) => warn!(
                         error = %error,
@@ -2614,7 +2614,7 @@ where
         }
         for message in loopback.drain(..) {
             match message.header().command {
-                Command2::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
+                Command::PrepareOk => match message.try_into_typed::<PrepareOkHeader>() {
                     Ok(prepare_ok) => self.on_ack(prepare_ok).await,
                     Err(error) => warn!(
                         error = %error,
@@ -2663,9 +2663,11 @@ where
         // else re-peeks and moves on to the next committable op.
         let mut wire_replies: Vec<(CommitLogEvent, Message<ReplyHeader>)> = Vec::new();
         while let Some(prepare_header) = peek_committable_head(consensus) {
-            // TODO(hubcio): should we replace this with graceful fallback (warn + return)?
-            // When journal compaction is implemented compaction could race
-            // with this lookup if it removes entries below the commit number.
+            // A committed prepare missing from the journal is divergence; a
+            // warn-and-return here would strand `commit_min` behind
+            // `commit_max` forever (nothing re-applies a skipped op), so
+            // panicking is the answer. Journal compaction, if ever added,
+            // must not remove entries at or above the commit floor.
             let prepare = journal
                 .handle()
                 .entry(&prepare_header)
@@ -3424,7 +3426,7 @@ where
         // TODO: calculate the index;
         #[allow(clippy::cast_possible_truncation)]
         let idx = header.op as usize;
-        assert_eq!(header.command, Command2::Prepare);
+        assert_eq!(header.command, Command::Prepare);
         assert!(
             journal.handle().header(idx).is_some(),
             "replicate: prepare must be durable in local journal before chain-forward"
@@ -3579,7 +3581,7 @@ where
     )
     .expect("zeroed bytes are a valid RoutedRequestHeader");
     *header = RoutedRequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::Register,
         size: u32::try_from(header_size).expect("RoutedRequestHeader size fits u32"),
         cluster: consensus.cluster(),
@@ -3617,7 +3619,7 @@ where
     )
     .expect("zeroed bytes are a valid RoutedRequestHeader");
     *header = RoutedRequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::Logout,
         size: u32::try_from(header_size).expect("RoutedRequestHeader size fits u32"),
         cluster: consensus.cluster(),
@@ -3653,7 +3655,7 @@ where
             bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size])
                 .expect("zeroed bytes are a valid RoutedRequestHeader");
         *header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::CompleteConsumerGroupRevocation,
             size: u32::try_from(total).expect("request size fits u32"),
             cluster: consensus.cluster(),
@@ -3744,7 +3746,7 @@ pub fn build_truncate_partition_client_message_with_identifiers(
             bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size])
                 .expect("zeroed bytes are a valid RoutedRequestHeader");
         *header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::TruncatePartition,
             size: u32::try_from(total).expect("request size fits u32"),
             cluster: template.cluster,
@@ -3797,7 +3799,7 @@ where
         size: u32::try_from(size).expect("prepare message size exceeds u32"),
         view: consensus.view(),
         release: request.release,
-        command: Command2::Prepare,
+        command: Command::Prepare,
         replica: consensus.replica(),
         client: request.client,
         parent: consensus.last_prepare_checksum(),
@@ -4165,7 +4167,7 @@ mod tests {
             client,
             request: 0,
             commit: session,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::Register,
             ..Default::default()
         };
@@ -4344,7 +4346,7 @@ mod tests {
             let header =
                 bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
             *header = RoutedRequestHeader {
-                command: Command2::Request,
+                command: Command::Request,
                 operation: Operation::CreateTopic,
                 size: u32::try_from(total).unwrap(),
                 client,
@@ -4578,7 +4580,7 @@ mod tests {
                 request,
                 commit: request,
                 size: u32::try_from(total).unwrap(),
-                command: Command2::Reply,
+                command: Command::Reply,
                 operation,
                 ..Default::default()
             };
@@ -4593,7 +4595,7 @@ mod tests {
             &mut message.as_mut_slice()[..header_size],
         );
         *header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::CreatePersonalAccessToken,
             size: u32::try_from(header_size).unwrap(),
             client,
@@ -4624,7 +4626,7 @@ mod tests {
             let header =
                 bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
             *header = RoutedRequestHeader {
-                command: Command2::Request,
+                command: Command::Request,
                 operation: Operation::CreateStream,
                 size: u32::try_from(total).unwrap(),
                 client,

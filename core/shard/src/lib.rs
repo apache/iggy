@@ -39,7 +39,7 @@ use crossfire::AsyncRxTrait;
 use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, CommitHeader, ConsensusHeader, DoViewChangeHeader,
+    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, DoViewChangeHeader,
     ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
     ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
     RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
@@ -1564,6 +1564,14 @@ where
         self.bus_max_message_size.set(max_message_size);
     }
 
+    /// The configured `[message_bus] max_message_size`. Also the largest batch
+    /// the bus will frame, and so the most a sealed segment can overshoot
+    /// `segment_size`: rotation fires after the append that crosses the cap.
+    #[must_use]
+    pub const fn bus_max_message_size(&self) -> usize {
+        self.bus_max_message_size.get()
+    }
+
     /// Mint a fresh, never-zero nonce for a register or logout forward.
     ///
     /// `replica` rides the high half, which separates the nonce spaces of
@@ -1955,14 +1963,30 @@ where
         max_bytes: Option<u64>,
     ) {
         let Some(sender) = self.senders.get(self.id as usize) else {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::metrics::frame_drop_reason::UNROUTABLE,
+            );
             return;
         };
-        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::CleanPartition {
+        // Fire-and-forget: a refused pass is picked up by the cleaner's next
+        // maintenance tick, so the drop only has to be visible, not recovered.
+        if let Err(error) = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::CleanPartition {
             namespace,
             now,
             message_expiry,
             max_bytes,
-        }));
+        })) {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::coordinator::classify_try_send_err(&error),
+            );
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                "segment cleaner pass refused by own inbox: {error:?}"
+            );
+        }
     }
 
     /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's
@@ -2285,7 +2309,7 @@ impl ParkedFrame {
 
     /// No client on this node: nothing to answer, nothing recovers it.
     fn is_replicated(&self) -> bool {
-        self.message.header().command != Command2::Request
+        self.message.header().command != Command::Request
     }
 }
 
@@ -2982,7 +3006,7 @@ where
     /// return is what makes callers bump
     /// `frame_drops_total{variant=partition,reason=park_dropped}`.
     fn deny_parked_client_request(&self, frame: ParkedFrame) -> bool {
-        if frame.message.header().command == Command2::Request
+        if frame.message.header().command == Command::Request
             && let Ok(request) = frame.message.try_into_typed::<RoutedRequestHeader>()
         {
             return self.stage_transient_deny(request.header());
@@ -3081,7 +3105,7 @@ where
             .streams()
             .created_revision_for_namespace(namespace);
         let frame_cost = parked_footprint(message.as_slice().len());
-        let replicated = message.header().command() != Command2::Request;
+        let replicated = message.header().command() != Command::Request;
         let mut pending = self.pending_partition_frames.borrow_mut();
         let parked_bytes = self.parked_partition_bytes.get();
         // Read the entry without `entry().or_default()`: inserting first would
@@ -4084,7 +4108,7 @@ where
                     cluster,
                     self_id,
                     target,
-                    Command2::RangeEvicted,
+                    Command::RangeEvicted,
                     header.nonce,
                     from_op,
                     header.group,
@@ -4094,7 +4118,7 @@ where
                     cluster,
                     self_id,
                     target,
-                    Command2::RepairDone,
+                    Command::RepairDone,
                     header.nonce,
                     header.from_op.saturating_sub(1),
                     header.group,
@@ -4107,7 +4131,7 @@ where
                     cluster,
                     self_id,
                     target,
-                    Command2::RangeEvicted,
+                    Command::RangeEvicted,
                     header.nonce,
                     from_op,
                     header.group,
@@ -4136,7 +4160,7 @@ where
                 cluster,
                 self_id,
                 target,
-                Command2::RepairDone,
+                Command::RepairDone,
                 header.nonce,
                 served_through,
                 header.group,
@@ -4215,7 +4239,7 @@ where
                 cluster,
                 self_id,
                 target,
-                Command2::RangeEvicted,
+                Command::RangeEvicted,
                 header.nonce,
                 retained_from,
                 header.group,
@@ -4238,7 +4262,7 @@ where
             cluster,
             self_id,
             target,
-            Command2::RepairDone,
+            Command::RepairDone,
             header.nonce,
             served_through,
             header.group,
@@ -4283,7 +4307,7 @@ where
         // run full prepare validation on it.
         let msg = msg.transmute_header(|old: RepairPrepareHeader, new: &mut PrepareHeader| {
             *new = old.0;
-            new.command = Command2::Prepare;
+            new.command = Command::Prepare;
         });
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -4457,7 +4481,7 @@ where
                 return;
             }
             match header.command {
-                Command2::RepairDone => {
+                Command::RepairDone => {
                     let before = consensus.commit_min();
                     planes.0.commit_journal().await;
                     // Completion is decided by the LOCAL walk, not the
@@ -4492,7 +4516,7 @@ where
                         .await;
                     }
                 }
-                Command2::RangeEvicted => {
+                Command::RangeEvicted => {
                     // Journal repair cannot close this gap: the serving peer
                     // compacted past it, so the ops this replica is missing no
                     // longer exist as WAL entries anywhere. This is the one
@@ -4593,12 +4617,12 @@ where
             return;
         }
         match header.command {
-            Command2::RangeEvicted => {
+            Command::RangeEvicted => {
                 if let Some(repair) = partition.repair.as_mut() {
                     repair.floor = Some(header.op.saturating_sub(1));
                 }
             }
-            Command2::RepairDone => {
+            Command::RepairDone => {
                 // `complete_repair` walks the window and clears the session
                 // only when the LOCAL commit frontier reached the requested
                 // op (the peer's served-through claim proves nothing about
@@ -4709,7 +4733,7 @@ where
     {
         let msg = Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
             .transmute_header(|_, h: &mut RequestPreparesHeader| {
-                h.command = Command2::RequestPrepares;
+                h.command = Command::RequestPrepares;
                 h.cluster = cluster;
                 h.replica = self_id;
                 h.nonce = nonce;
@@ -4755,7 +4779,7 @@ where
         const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
         let mut owned =
             server_common::iobuf::Owned::<MESSAGE_ALIGN>::copy_from_slice(entry.as_slice());
-        owned.as_mut_slice()[COMMAND_OFFSET] = Command2::RepairPrepare as u8;
+        owned.as_mut_slice()[COMMAND_OFFSET] = Command::RepairPrepare as u8;
         let Ok(message) = Message::<GenericHeader>::try_from(owned) else {
             tracing::warn!(
                 shard = self.id,
@@ -4776,7 +4800,7 @@ where
         cluster: u128,
         self_id: u8,
         target: u8,
-        command: Command2,
+        command: Command,
         nonce: u128,
         op: u64,
         namespace: u64,
@@ -5273,7 +5297,7 @@ where
         let msg =
             Message::<RequestStateTransferHeader>::new(size_of::<RequestStateTransferHeader>())
                 .transmute_header(|_, h: &mut RequestStateTransferHeader| {
-                    h.command = Command2::RequestStateTransfer;
+                    h.command = Command::RequestStateTransfer;
                     h.cluster = consensus.cluster();
                     h.replica = consensus.replica();
                     h.nonce = nonce;
@@ -5317,7 +5341,7 @@ where
             msg.as_mut_slice()[size_of::<StateTransferTargetHeader>()..].copy_from_slice(manifest);
         }
         let msg = msg.transmute_header(|_, h: &mut StateTransferTargetHeader| {
-            h.command = Command2::StateTransferTarget;
+            h.command = Command::StateTransferTarget;
             h.cluster = cluster;
             h.replica = self_id;
             h.nonce = nonce;
@@ -5361,7 +5385,7 @@ where
     {
         let msg = Message::<RequestStateChunkHeader>::new(size_of::<RequestStateChunkHeader>())
             .transmute_header(|_, h: &mut RequestStateChunkHeader| {
-                h.command = Command2::RequestStateChunk;
+                h.command = Command::RequestStateChunk;
                 h.cluster = cluster;
                 h.replica = self_id;
                 h.nonce = nonce;
@@ -5909,7 +5933,7 @@ where
                     chunk.as_mut_slice()[size_of::<StateChunkHeader>()..].copy_from_slice(payload);
                     Some(ChunkReply::Chunk(chunk.transmute_header(
                         |_, h: &mut StateChunkHeader| {
-                            h.command = Command2::StateChunk;
+                            h.command = Command::StateChunk;
                             h.cluster = cluster;
                             h.replica = self_id;
                             h.nonce = header.nonce;
@@ -6902,7 +6926,7 @@ where
                 chunk.as_mut_slice()[size_of::<StateChunkHeader>()..].copy_from_slice(payload);
                 ChunkAttempt::Reply(Some(ChunkReply::Chunk(chunk.transmute_header(
                     |_, h: &mut StateChunkHeader| {
-                        h.command = Command2::StateChunk;
+                        h.command = Command::StateChunk;
                         h.cluster = cluster;
                         h.replica = self_id;
                         h.nonce = header.nonce;
@@ -8964,7 +8988,7 @@ async fn dispatch_vsr_actions<B, P, J>(
             VsrAction::SendStartViewChange { view, group } => {
                 let msg = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
                     .transmute_header(|_, h: &mut StartViewChangeHeader| {
-                        h.command = Command2::StartViewChange;
+                        h.command = Command::StartViewChange;
                         h.cluster = cluster;
                         h.replica = self_id;
                         h.view = *view;
@@ -8993,7 +9017,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 let nack_bitset = suffix.nack_bitset();
                 let present_bitset = suffix.present_bitset();
                 let msg = msg.transmute_header(|_, h: &mut DoViewChangeHeader| {
-                    h.command = Command2::DoViewChange;
+                    h.command = Command::DoViewChange;
                     h.cluster = cluster;
                     h.replica = self_id;
                     h.view = *view;
@@ -9021,7 +9045,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 let msg =
                     Message::<RequestStartViewHeader>::new(size_of::<RequestStartViewHeader>())
                         .transmute_header(|_, h: &mut RequestStartViewHeader| {
-                            h.command = Command2::RequestStartView;
+                            h.command = Command::RequestStartView;
                             h.cluster = cluster;
                             h.replica = self_id;
                             h.view = *view;
@@ -9049,7 +9073,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                 let body_checksum = control_body_checksum(&msg.as_slice()[header_size..total_size]);
                 let msg = msg.transmute_header(|_, h: &mut StartViewHeader| {
                     h.checksum_body = body_checksum;
-                    h.command = Command2::StartView;
+                    h.command = Command::StartView;
                     h.cluster = cluster;
                     h.replica = self_id;
                     h.view = *view;
@@ -9087,7 +9111,7 @@ async fn dispatch_vsr_actions<B, P, J>(
                     let prepare_header = *prepare_header;
                     let msg = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
                         .transmute_header(|_, h: &mut PrepareOkHeader| {
-                            h.command = Command2::PrepareOk;
+                            h.command = Command::PrepareOk;
                             h.cluster = cluster;
                             h.replica = self_id;
                             h.view = *view;
@@ -9147,7 +9171,7 @@ async fn dispatch_vsr_actions<B, P, J>(
             } => {
                 let msg = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
                     |_, h: &mut CommitHeader| {
-                        h.command = Command2::Commit;
+                        h.command = Command::Commit;
                         h.cluster = cluster;
                         h.replica = self_id;
                         h.view = *view;
@@ -9221,7 +9245,7 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                     };
                     let msg = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
                         .transmute_header(|_, h: &mut PrepareOkHeader| {
-                            h.command = Command2::PrepareOk;
+                            h.command = Command::PrepareOk;
                             h.cluster = cluster;
                             h.replica = self_id;
                             h.view = *view;
@@ -9338,11 +9362,11 @@ mod repair_scope_tests {
     //! Who parked the log decides what it means.
 
     use super::{MergedLog, repair_op_in_scope, repair_serve_ceiling};
-    use iggy_binary_protocol::{Command2, PrepareHeader};
+    use iggy_binary_protocol::{Command, PrepareHeader};
 
     fn header(op: u64) -> PrepareHeader {
         PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             op,
             ..Default::default()
         }
@@ -9416,11 +9440,11 @@ mod view_coverage_tests {
     //! Holding an op is not holding the view's op.
 
     use super::{MergedLog, first_op_not_covered};
-    use iggy_binary_protocol::{Command2, Operation, PrepareHeader};
+    use iggy_binary_protocol::{Command, Operation, PrepareHeader};
 
     fn sealed(op: u64, request: u64) -> PrepareHeader {
         let mut header = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::CreateStream,
             op,
             request,
@@ -9487,13 +9511,13 @@ mod dvc_suffix_window_tests {
     //! that premise, so it cannot be quietly reintroduced.
 
     use super::{DVC_HEADERS_MAX, build_dvc_suffix};
-    use iggy_binary_protocol::{Command2, Operation, PrepareHeader};
+    use iggy_binary_protocol::{Command, Operation, PrepareHeader};
 
     /// A real prepare at `op`. The operation must not be `Reserved`: that is
     /// exactly `dvc_blank`, and `dvc_header_kind` classifies by equality with it.
     fn held(op: u64) -> PrepareHeader {
         PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::CreateStream,
             op,
             ..Default::default()
@@ -9671,7 +9695,7 @@ mod control_frame_tests {
     //! off. Keying on `checksum_body` looking sealed is bypassable by zeroing it.
 
     use super::{control_body_checksum, control_suffix_body_verified};
-    use iggy_binary_protocol::{Command2, DoViewChangeHeader, PrepareHeader};
+    use iggy_binary_protocol::{Command, DoViewChangeHeader, PrepareHeader};
     use server_common::Message;
     use std::mem::size_of;
 
@@ -9687,7 +9711,7 @@ mod control_frame_tests {
             *byte = u8::try_from(index % 251).expect("modulus fits u8");
         }
         msg.transmute_header(|_, header: &mut DoViewChangeHeader| {
-            header.command = Command2::DoViewChange;
+            header.command = Command::DoViewChange;
             header.checksum_body = checksum_body;
             header.size = u32::try_from(total).expect("frame fits u32");
         })

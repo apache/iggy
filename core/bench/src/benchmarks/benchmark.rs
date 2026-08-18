@@ -16,12 +16,11 @@
 // under the License.
 
 use crate::args::kind::BenchmarkKindCommand;
-use crate::utils::{ClientFactory, authenticate};
+use crate::utils::ClientFactory;
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
-use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -96,14 +95,7 @@ pub trait Benchmarkable: Send {
     async fn init_streams(&self) -> Result<(), IggyError> {
         let number_of_streams = self.args().streams();
         let partitions_count: u32 = self.args().number_of_partitions();
-        let client = self.client_factory().create_client().await;
-        let client = IggyClient::create(client, None, None);
-        authenticate(
-            &client,
-            self.client_factory().username(),
-            self.client_factory().password(),
-        )
-        .await;
+        let client = self.client_factory().create_authenticated_client().await?;
         let reuse_streams = self.args().reuse_streams();
         let streams = client.get_streams().await?;
         for i in 1..=number_of_streams {
@@ -158,14 +150,7 @@ pub trait Benchmarkable: Send {
 
     async fn check_streams(&self) -> Result<(), IggyError> {
         let number_of_streams = self.args().streams();
-        let client = self.client_factory().create_client().await;
-        let client = IggyClient::create(client, None, None);
-        authenticate(
-            &client,
-            self.client_factory().username(),
-            self.client_factory().password(),
-        )
-        .await;
+        let client = self.client_factory().create_authenticated_client().await?;
         let streams = client.get_streams().await?;
         for i in 1..=number_of_streams {
             let stream_name = format!("bench-stream-{i}");

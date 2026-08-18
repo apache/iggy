@@ -20,6 +20,7 @@ use crate::stm::consumer_group::{
     CompleteConsumerGroupRevocationRequest, ConsumerGroup, ConsumerGroupSnapshot,
     JoinConsumerGroupRequest, LeaveConsumerGroupRequest, RemoveConsumerGroupMemberRequest,
 };
+use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, CreatePartitionsResult, CreateStreamResult, CreateTopicResult,
     DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, PurgeStreamResult,
@@ -30,12 +31,10 @@ use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::{AHashMap, AHashSet};
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-// Only `seed_namespace` (below, sim/test-gated) uses these at module scope;
-// keep the imports under the same gate so a production build does not see them
-// as unused. The test module re-imports them independently.
+// Only `seed_namespace` (sim/test-gated) uses this at module scope, so keep the
+// import under the same gate. The test module re-imports it independently.
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::primitives::options::WireOptions;
-#[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -48,9 +47,13 @@ use iggy_binary_protocol::requests::partitions::{
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
 };
+// Only the slab-seeding helpers build a bare `CreateTopicRequest`; without
+// their cfg the import is dead and `-p <crate>` clippy (which skips the
+// simulator feature) rejects it.
+#[cfg(any(test, feature = "simulator"))]
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::topics::{
-    CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest,
-    UpdateTopicRequest,
+    CreateTopicWithAssignmentsRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
 };
 use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::{
@@ -66,8 +69,7 @@ use iggy_common::{
     ResourceOptions, StreamStats, TopicCreateOptions, TopicRuntimeOptions, TopicStats,
 };
 use serde::{Deserialize, Serialize};
-use server_common::sharding::IggyNamespace;
-use slab::Slab;
+use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -293,7 +295,7 @@ pub struct Stream {
     pub options: ResourceOptions,
 
     pub stats: Arc<StreamStats>,
-    pub topics: Slab<Topic>,
+    pub topics: IdSlab<Topic>,
     pub topic_index: AHashMap<Arc<str>, usize>,
 }
 
@@ -305,7 +307,7 @@ impl Default for Stream {
             created_at: IggyTimestamp::default(),
             options: ResourceOptions::default(),
             stats: Arc::new(StreamStats::default()),
-            topics: Slab::new(),
+            topics: IdSlab::new(),
             topic_index: AHashMap::default(),
         }
     }
@@ -334,7 +336,7 @@ impl Stream {
             created_at,
             options: ResourceOptions::new(),
             stats: Arc::new(StreamStats::default()),
-            topics: Slab::new(),
+            topics: IdSlab::new(),
             topic_index: AHashMap::default(),
         }
     }
@@ -347,7 +349,7 @@ impl Stream {
             created_at,
             options: ResourceOptions::new(),
             stats,
-            topics: Slab::new(),
+            topics: IdSlab::new(),
             topic_index: AHashMap::default(),
         }
     }
@@ -593,7 +595,7 @@ impl StatsRegistry {
 define_state! {
     Streams {
         index: AHashMap<Arc<str>, usize>,
-        items: Slab<Stream>,
+        items: IdSlab<Stream>,
         // Monotonic counter bumped on every partition-shaping commit
         // (create/delete topic, create/delete partitions, delete stream).
         // Reconciler uses it for a fast-skip when nothing changed and stamps
@@ -864,22 +866,51 @@ impl Streams {
     }
 
     /// Retention policy for a topic: `(message_expiry, max_topic_size,
-    /// partition_count)`, or `None` if the stream or topic is unknown. The
-    /// per-shard segment cleaner reads this off-pump to decide local segment
-    /// deletion; `partition_count` lets it derive a per-partition size budget.
+    /// partition_count, segment_size)`, or `None` if the stream or topic is
+    /// unknown. The per-shard segment cleaner reads this off-pump to decide
+    /// local segment deletion; `partition_count` lets it derive a
+    /// per-partition size budget and `segment_size` (`None` when the topic
+    /// left the key to the node default) the floor that budget cannot go
+    /// under.
     #[must_use]
     pub fn topic_retention_config(
         &self,
         stream_id: usize,
         topic_id: usize,
-    ) -> Option<(IggyExpiry, MaxTopicSize, usize)> {
+    ) -> Option<(IggyExpiry, MaxTopicSize, usize, Option<IggyByteSize>)> {
         self.inner.read(|inner| {
             let topic = inner.items.get(stream_id)?.topics.get(topic_id)?;
             Some((
                 topic.message_expiry,
                 topic.max_topic_size,
                 topic.partitions.len(),
+                TopicRuntimeOptions::from_resource_options(&topic.options).segment_size,
             ))
+        })
+    }
+
+    /// A topic's current partition count, or `None` if the stream or topic is
+    /// unknown. Update admission reads it to size the floor a `max_topic_size`
+    /// has to clear across the whole topic; the update request itself carries
+    /// no partitions count.
+    #[must_use]
+    pub fn topic_partitions_count(
+        &self,
+        stream_id: &WireIdentifier,
+        topic_id: &WireIdentifier,
+    ) -> Option<usize> {
+        self.inner.read(|inner| {
+            let stream_slab = inner.resolve_stream_id(stream_id)?;
+            let topic_slab = inner.resolve_topic_id(stream_slab, topic_id)?;
+            Some(
+                inner
+                    .items
+                    .get(stream_slab)?
+                    .topics
+                    .get(topic_slab)?
+                    .partitions
+                    .len(),
+            )
         })
     }
 
@@ -1519,6 +1550,45 @@ impl Streams {
     }
 }
 
+/// Whether the next insert's slab key still fits the packed namespace layout.
+///
+/// Takes `vacant_key()` rather than `len()` because the KEY is what gets packed
+/// and keys are recycled on delete. The two agree at the ceiling, but the key
+/// is the value whose width matters.
+///
+/// `ceiling` is always a compile-time `MAX_*` constant, never node config: an
+/// apply that branches on local config forks the state machine the moment two
+/// replicas disagree about their TOML.
+const fn admits_slab_key(vacant_key: usize, ceiling: usize) -> bool {
+    vacant_key < ceiling
+}
+
+/// Range and distinctness for the ABSOLUTE partition ids on a topic create,
+/// `None` when the vector is well formed.
+///
+/// Range is the weaker half: two in-range entries sharing an id pack to ONE
+/// namespace, landing both partitions on a single consensus group, shard,
+/// directory and authorization scope. That is the aliasing the range bound
+/// prevents, reached without exceeding it.
+///
+/// Unreachable from a well-behaved primary, which mints dense 0-based ids under
+/// `MAX_PARTITIONS_PER_REQUEST`. Apply is defensive because the prepare body is
+/// primary-minted, not client-minted.
+fn absolute_partition_ids_fault(
+    partitions: &[CreatedPartitionAssignment],
+) -> Option<CreateTopicResult> {
+    let mut seen = AHashSet::with_capacity(partitions.len());
+    for partition in partitions {
+        if partition.partition_id as usize >= MAX_PARTITIONS {
+            return Some(CreateTopicResult::PartitionIdSpaceExhausted);
+        }
+        if !seen.insert(partition.partition_id) {
+            return Some(CreateTopicResult::InvalidPartitionsCount);
+        }
+    }
+    None
+}
+
 impl StateHandler for CreateStreamRequest {
     type State = StreamsInner;
     #[allow(clippy::cast_possible_truncation)]
@@ -1535,6 +1605,9 @@ impl StateHandler for CreateStreamRequest {
         // registry (see `StatsRegistry`). The id the next insert will use is
         // deterministic, so both buffers resolve the same registry key.
         let id = state.items.vacant_key();
+        if !admits_slab_key(id, MAX_STREAMS) {
+            return ApplyReply::err(CreateStreamResult::TooManyStreams);
+        }
         let stream_stats = state.stats_registry.stream(id);
         let stream = Stream {
             id,
@@ -1542,7 +1615,7 @@ impl StateHandler for CreateStreamRequest {
             created_at: timestamp,
             options,
             stats: stream_stats,
-            topics: Slab::new(),
+            topics: IdSlab::new(),
             topic_index: AHashMap::default(),
         };
         let inserted = state.items.insert(stream);
@@ -1678,6 +1751,15 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
             };
             if stream.topic_index.contains_key(&name_arc) {
                 return ApplyReply::err(CreateTopicResult::NameAlreadyExists);
+            }
+            // Topic slabs are per stream, so this caps topics WITHIN one stream.
+            if !admits_slab_key(stream.topics.vacant_key(), MAX_TOPICS) {
+                return ApplyReply::err(CreateTopicResult::TooManyTopics);
+            }
+            // Checked before any mutation, so a rejected batch leaves no
+            // half-built topic.
+            if let Some(fault) = absolute_partition_ids_fault(&self.partitions) {
+                return ApplyReply::err(fault);
             }
         }
 
@@ -2016,6 +2098,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             };
 
             let mut resolved: Vec<usize> = Vec::with_capacity(self.partitions.len());
+            let mut seen = AHashSet::with_capacity(self.partitions.len());
             for partition in &self.partitions {
                 let Some(resolved_id_u32) = partition.partition_id.checked_add(base_partition_id)
                 else {
@@ -2024,6 +2107,19 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 let Ok(resolved_id_usize) = usize::try_from(resolved_id_u32) else {
                     return ApplyReply::err(CreatePartitionsResult::InvalidPartitionsCount);
                 };
+                // The `u32` guards above only catch overflow.
+                // `MAX_PARTITIONS_PER_REQUEST` bounds one call, not the running
+                // total, so without this a topic accumulates past the packed
+                // field across calls and its ids alias. Against `MAX_PARTITIONS`,
+                // never `PARTITION_MASK`, which is the looser bound.
+                if resolved_id_usize >= MAX_PARTITIONS {
+                    return ApplyReply::err(CreatePartitionsResult::PartitionIdSpaceExhausted);
+                }
+                // Two offsets resolving to one id alias onto a single namespace.
+                // Existing partitions cannot collide: `base` is one past the max.
+                if !seen.insert(resolved_id_usize) {
+                    return ApplyReply::err(CreatePartitionsResult::InvalidPartitionsCount);
+                }
                 resolved.push(resolved_id_usize);
             }
             resolved
@@ -2101,7 +2197,7 @@ impl StateHandler for DeletePartitionsRequest {
 ///
 /// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
 /// `items` and the nested `topics` / `consumer_groups` / `partitions` stay ordered
-/// `Vec`s even though the runtime holds them in `AHashMap`s and a `Slab`. Swapping
+/// `Vec`s even though the runtime holds them in `AHashMap`s and an [`IdSlab`]. Swapping
 /// any back to an unordered map reorders on a decode and re-encode, breaking the
 /// checkpoint checksum cross-check recovery relies on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2298,7 +2394,7 @@ impl StreamsInner {
                 topic_entries.push((topic_slab_key, topic));
             }
 
-            let topics: Slab<Topic> = topic_entries.into_iter().collect();
+            let topics: IdSlab<Topic> = topic_entries.into_iter().collect();
 
             let stream_name: Arc<str> = Arc::from(stream_snap.name.as_str());
             let stream = Stream {
@@ -2315,7 +2411,7 @@ impl StreamsInner {
             stream_entries.push((slab_key, stream));
         }
 
-        let items: Slab<Stream> = stream_entries.into_iter().collect();
+        let items: IdSlab<Stream> = stream_entries.into_iter().collect();
         let mut inner = Self {
             index,
             items,
@@ -3174,7 +3270,7 @@ mod tests {
         name: &str,
         op: u64,
     ) -> server_common::Message<iggy_binary_protocol::PrepareHeader> {
-        use iggy_binary_protocol::{Command2, Operation, PrepareHeader};
+        use iggy_binary_protocol::{Command, Operation, PrepareHeader};
         use server_common::Message;
         use server_common::iobuf::Owned;
         use std::mem::size_of;
@@ -3191,7 +3287,7 @@ mod tests {
             let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
                 &mut buffer.as_mut_slice()[..header_size],
             );
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = Operation::CreateStream;
             header.op = op;
             header.size = u32::try_from(total).unwrap();
@@ -3283,5 +3379,402 @@ mod tests {
             inner.stats_registry.partition_get(0, 0, 0).is_none(),
             "a partition the snapshot dropped must not keep its registry entry"
         );
+    }
+
+    /// Admission is all that stands between a client and a namespace collision.
+    /// `IggyNamespace::new` used to mask, so slab key `MAX_TOPICS` packed
+    /// byte-identically to key 0: same shard, consensus group, directory and
+    /// authorization scope, no error.
+    ///
+    /// Topics are the affordable ceiling to drive end to end. Streams and
+    /// partitions use the same guard but sit at `1 << 20` and 1,000,000, so
+    /// materialising either costs hundreds of megabytes for no extra coverage.
+    #[test]
+    fn given_the_topic_slab_ceiling_when_creating_one_more_should_reject() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        for index in 0..MAX_TOPICS {
+            let request = CreateTopicWithAssignmentsRequest {
+                request: make_topic_request(0, 0, &format!("t{index}")),
+                derived_options: WireOptions::empty(),
+                partitions: Vec::new(),
+            };
+            let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+            assert_eq!(reply.code, 0, "topic {index} must be admitted");
+        }
+
+        let overflow = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 0, "one-too-many"),
+            derived_options: WireOptions::empty(),
+            partitions: Vec::new(),
+        };
+        let reply = StateHandler::apply(&overflow, &mut inner, IggyTimestamp::now());
+        assert_eq!(reply.code, u32::from(CreateTopicResult::TooManyTopics));
+
+        let stream = inner.items.get(0).expect("stream survives the rejection");
+        assert_eq!(
+            stream.topics.len(),
+            MAX_TOPICS,
+            "a rejected create must not mutate the slab"
+        );
+        assert!(
+            !stream.topic_index.contains_key("one-too-many"),
+            "a rejected create must not leave a name-index entry"
+        );
+    }
+
+    /// `MAX_PARTITIONS_PER_REQUEST` bounds one call, not the running total, so
+    /// the additive path is where a topic walks past the packed field. Seeded at
+    /// the boundary rather than driven there, since the guard is on the resolved
+    /// absolute id.
+    #[test]
+    fn given_partition_ids_at_the_ceiling_when_adding_more_should_reject() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let seed = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 1, "t"),
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: u32::try_from(MAX_PARTITIONS - 2).unwrap(),
+                consensus_group_id: 1,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&seed, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        // Resolves to MAX_PARTITIONS - 1: the last legal id.
+        let last = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            },
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 2,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&last, &mut inner, IggyTimestamp::now()).code,
+            0,
+            "the final in-range id must still be admitted"
+        );
+
+        let overflow = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            },
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 3,
+            }],
+        };
+        let reply = StateHandler::apply(&overflow, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            reply.code,
+            u32::from(CreatePartitionsResult::PartitionIdSpaceExhausted)
+        );
+        let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
+        assert_eq!(
+            topic.partitions.len(),
+            2,
+            "a rejected batch must not append"
+        );
+    }
+
+    /// Topic create carries ABSOLUTE partition ids, so it needs its own bound.
+    /// The additive guard above never sees them.
+    #[test]
+    fn given_an_out_of_range_partition_id_on_topic_create_should_reject() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let request = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 1, "t"),
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: u32::try_from(MAX_PARTITIONS).unwrap(),
+                consensus_group_id: 1,
+            }],
+        };
+        let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            reply.code,
+            u32::from(CreateTopicResult::PartitionIdSpaceExhausted),
+            "a partition-id violation must not report a topic-count verdict"
+        );
+        assert_eq!(
+            inner.items.get(0).unwrap().topics.len(),
+            0,
+            "a rejected create must not leave a half-built topic"
+        );
+    }
+
+    fn delete_stream(inner: &mut StreamsInner, id: usize) {
+        let request = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(u32::try_from(id).unwrap()),
+        };
+        let reply = StateHandler::apply(&request, inner, IggyTimestamp::now());
+        assert_eq!(reply.code, 0, "stream {id} must delete");
+    }
+
+    /// `vacant_key()` is both the id handed to the next `CreateStream` and the
+    /// input to the `MAX_STREAMS` guard, so it must depend only on committed
+    /// state. `StreamsSnapshot` carries `items` and `revision` and nothing else,
+    /// which is why [`IdSlab`] derives the key from the occupied set instead of
+    /// from a free list: a divergence here forks the state machine, since a
+    /// restored replica would assign a different stream id for the same log
+    /// entry, hence a different packed namespace, shard owner, consensus group,
+    /// on-disk directory and authorization scope.
+    ///
+    /// Descending deletes are the case that catches it. `slab::Slab` recycled
+    /// keys LIFO and rebuilt that head by ascending scan, so this asserted
+    /// `1 == 0` before the swap.
+    #[test]
+    fn given_descending_deletes_when_round_tripping_a_snapshot_should_keep_vacant_key() {
+        let mut inner = StreamsInner::new();
+        for name in ["a", "b", "c"] {
+            create_stream(&mut inner, name);
+        }
+        delete_stream(&mut inner, 1);
+        delete_stream(&mut inner, 0);
+        let before = inner.items.vacant_key();
+
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
+        let restored =
+            StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default()));
+
+        assert_eq!(
+            restored.items.vacant_key(),
+            before,
+            "the id the next CreateStream is assigned must not depend on whether \
+             a snapshot was restored in between"
+        );
+    }
+
+    /// Topic ids come from the per-stream `topics` arena by the same
+    /// `vacant_key()` route, so they forked identically. Held separate from the
+    /// stream case because the two arenas are restored by different code paths.
+    #[test]
+    fn given_descending_topic_deletes_when_round_tripping_a_snapshot_should_keep_vacant_key() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+        for name in ["a", "b", "c"] {
+            let request = CreateTopicWithAssignmentsRequest {
+                request: make_topic_request(0, 0, name),
+                derived_options: WireOptions::empty(),
+                partitions: Vec::new(),
+            };
+            assert_eq!(
+                StateHandler::apply(&request, &mut inner, IggyTimestamp::now()).code,
+                0
+            );
+        }
+        for topic_id in [1, 0] {
+            let request = DeleteTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(topic_id),
+            };
+            assert_eq!(
+                StateHandler::apply(&request, &mut inner, IggyTimestamp::now()).code,
+                0,
+                "topic {topic_id} must delete"
+            );
+        }
+        let before = inner.items.get(0).unwrap().topics.vacant_key();
+
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
+        let restored =
+            StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default()));
+
+        assert_eq!(
+            restored.items.get(0).unwrap().topics.vacant_key(),
+            before,
+            "the id the next CreateTopic is assigned must not depend on whether \
+             a snapshot was restored in between"
+        );
+    }
+
+    /// The `CreateStream` ceiling cannot be driven end to end: `MAX_STREAMS`
+    /// live slab entries would cost hundreds of megabytes, and `slab` offers no
+    /// way to seed a high key (no `insert_at`, no key setter, and `FromIterator`
+    /// leaves `vacant_key()` on a hole rather than past the end). Testing the
+    /// comparison directly is what is available, so it is factored out.
+    #[test]
+    fn given_a_slab_key_at_the_ceiling_when_admitting_should_refuse() {
+        assert!(admits_slab_key(0, MAX_STREAMS));
+        assert!(admits_slab_key(MAX_STREAMS - 1, MAX_STREAMS));
+        assert!(!admits_slab_key(MAX_STREAMS, MAX_STREAMS));
+        assert!(!admits_slab_key(MAX_STREAMS + 1, MAX_STREAMS));
+
+        assert!(admits_slab_key(MAX_TOPICS - 1, MAX_TOPICS));
+        assert!(!admits_slab_key(MAX_TOPICS, MAX_TOPICS));
+    }
+
+    /// Two in-range entries sharing an id pack to ONE namespace, so the range
+    /// guard alone still admits the aliasing this module exists to prevent.
+    #[test]
+    fn given_duplicate_partition_ids_on_topic_create_should_reject() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let request = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 2, "t"),
+            derived_options: WireOptions::empty(),
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 7,
+                    consensus_group_id: 1,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 7,
+                    consensus_group_id: 2,
+                },
+            ],
+        };
+        let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            reply.code,
+            u32::from(CreateTopicResult::InvalidPartitionsCount),
+            "a duplicate id is a malformed batch, not a capacity verdict"
+        );
+        assert_eq!(
+            inner.items.get(0).unwrap().topics.len(),
+            0,
+            "a rejected create must not leave a half-built topic"
+        );
+    }
+
+    /// Same hole on the additive path: distinct offsets are what keep resolved
+    /// ids distinct, and nothing upstream guarantees it.
+    #[test]
+    fn given_duplicate_partition_offsets_when_adding_should_reject() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let seed = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 1, "t"),
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&seed, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        let duplicate = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 2,
+            },
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 2,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 3,
+                },
+            ],
+        };
+        let reply = StateHandler::apply(&duplicate, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            reply.code,
+            u32::from(CreatePartitionsResult::InvalidPartitionsCount)
+        );
+
+        let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
+        assert_eq!(
+            topic.partitions.len(),
+            1,
+            "a rejected batch must not append"
+        );
+    }
+
+    /// Distinct offsets in the same batch must still be admitted, so the
+    /// uniqueness guard above cannot be passing for the wrong reason.
+    #[test]
+    fn given_distinct_partition_offsets_when_adding_should_admit() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let seed = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 1, "t"),
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        assert_eq!(
+            StateHandler::apply(&seed, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        let distinct = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 2,
+            },
+            partitions: vec![
+                CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 2,
+                },
+                CreatedPartitionAssignment {
+                    partition_id: 1,
+                    consensus_group_id: 3,
+                },
+            ],
+        };
+        assert_eq!(
+            StateHandler::apply(&distinct, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
+        let ids: Vec<usize> = topic
+            .partitions
+            .iter()
+            .map(|partition| partition.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![0, 1, 2],
+            "resolved ids must stay dense and distinct"
+        );
+    }
+
+    /// Pins the asymmetry that hid the fork: ascending deletes leave a free-list
+    /// head the ascending rebuild happens to reproduce, so only the descending
+    /// order diverges. Without this, a fix that accidentally broke the agreeing
+    /// case would still look correct.
+    #[test]
+    fn given_ascending_deletes_when_round_tripping_a_snapshot_should_keep_vacant_key() {
+        let mut inner = StreamsInner::new();
+        for name in ["a", "b", "c"] {
+            create_stream(&mut inner, name);
+        }
+        delete_stream(&mut inner, 0);
+        delete_stream(&mut inner, 1);
+        let before = inner.items.vacant_key();
+
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
+        let restored =
+            StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default()));
+
+        assert_eq!(restored.items.vacant_key(), before);
     }
 }

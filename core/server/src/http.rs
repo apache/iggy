@@ -171,7 +171,7 @@ pub async fn start(
         state,
         max_request_size,
         cors,
-        metrics_endpoint,
+        metrics_endpoint.as_deref(),
         http_config.web_ui,
     );
 
@@ -255,14 +255,14 @@ const PING_PATH: &str = "/ping";
 /// the inner layer's `iggy-view`.
 ///
 /// `metrics_endpoint`, present only when `[http.metrics]` is enabled, mounts
-/// the public scrape route among the local routes (a scrape must describe the
-/// serving node, never a forwarded primary) and switches on the
+/// the auth-only scrape route among the local routes (a scrape must describe
+/// the serving node, never a forwarded primary) and switches on the
 /// request-counting layer.
 fn router(
     state: HttpState,
     max_request_size: usize,
     cors: Option<CorsLayer>,
-    metrics_endpoint: Option<String>,
+    metrics_endpoint: Option<&str>,
     web_ui: bool,
 ) -> Router {
     // Cloned for the response layer so `Iggy-View` reads the live view per
@@ -307,7 +307,7 @@ fn router(
         .route("/cluster/metadata", get(get_cluster_metadata))
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client));
-    let local = match &metrics_endpoint {
+    let local = match metrics_endpoint {
         Some(endpoint) => local.route(endpoint, get(metrics::get_metrics)),
         None => local,
     };
@@ -318,14 +318,13 @@ fn router(
         .layer(DefaultBodyLimit::max(max_request_size))
         .layer(from_fn(move |request: Request, next: Next| {
             let view_source = view_source.clone();
-            // `/ping` and the metrics scrape are the success routes reached
-            // without proving a credential, so they must not leak the
-            // cluster-internal view number (the anon-leak gate). Every other
-            // route authenticates before its handler, so a success/redirect
-            // there is an authed flow that may carry the header; the login
-            // routes prove credentials on success.
-            let suppress_view = request.uri().path() == PING_PATH
-                || metrics_endpoint.as_deref() == Some(request.uri().path());
+            // `/ping` is the one success route reached without proving a
+            // credential, so it must not leak the cluster-internal view number
+            // (the anon-leak gate). Every other route - the metrics scrape
+            // included - authenticates before its handler, so a success or
+            // redirect there is an authed flow that may carry the header; the
+            // login routes prove credentials on success.
+            let suppress_view = request.uri().path() == PING_PATH;
             async move {
                 let response = next.run(request).await;
                 if suppress_view {

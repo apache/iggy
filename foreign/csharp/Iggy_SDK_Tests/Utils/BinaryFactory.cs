@@ -42,25 +42,50 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    internal static byte[] CreateMessagePayload(ulong offset, ulong timestamp, int headersLength, uint checkSum,
-        Guid guid, ReadOnlySpan<byte> payload)
+    internal static byte[] CreateMessageFrame(ulong checksum, Guid guid, uint offsetDelta, uint timestampDelta,
+        ReadOnlySpan<byte> userHeaders, ReadOnlySpan<byte> payload)
     {
-        var messageLength = payload.Length;
-        var totalSize = 64 + payload.Length;
-        Span<byte> payloadBuffer = new byte[totalSize].AsSpan();
+        Span<byte> frame = new byte[48 + payload.Length + userHeaders.Length].AsSpan();
 
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[..8], checkSum);
-        BinaryPrimitives.WriteUInt128LittleEndian(payloadBuffer[8..24], guid.ToUInt128());
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[24..32], offset);
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[32..+40], timestamp);
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[40..48], timestamp);
-        BinaryPrimitives.WriteInt32LittleEndian(payloadBuffer[48..52], headersLength);
-        BinaryPrimitives.WriteInt32LittleEndian(payloadBuffer[52..56], payload.Length);
-        BinaryPrimitives.WriteUInt64LittleEndian(payloadBuffer[56..64], 0); // reserved
+        BinaryPrimitives.WriteUInt64LittleEndian(frame[..8], checksum);
+        BinaryPrimitives.WriteUInt128LittleEndian(frame[8..24], guid.ToUInt128());
+        BinaryPrimitives.WriteUInt32LittleEndian(frame[24..28], offsetDelta);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame[28..32], timestampDelta);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame[32..36], (uint)userHeaders.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame[36..40], (uint)payload.Length);
+        BinaryPrimitives.WriteUInt64LittleEndian(frame[40..48], 0); // reserved
 
-        payload.CopyTo(payloadBuffer[64..(64 + messageLength)]);
+        payload.CopyTo(frame[48..(48 + payload.Length)]);
+        userHeaders.CopyTo(frame[(48 + payload.Length)..]);
 
-        return payloadBuffer.ToArray();
+        return frame.ToArray();
+    }
+
+    /// <summary>
+    ///     One batch record: a 256-byte batch header followed by the given frames. The batch checksum is
+    ///     left zero; the poll decoder does not verify it.
+    /// </summary>
+    internal static byte[] CreateBatchRecord(ulong baseOffset, ulong baseTimestamp, ulong originTimestamp,
+        params byte[][] frames)
+    {
+        var blobLength = frames.Sum(frame => frame.Length);
+        var record = new byte[256 + blobLength];
+        Span<byte> header = record.AsSpan(0, 256);
+
+        BinaryPrimitives.WriteUInt64LittleEndian(header[8..16], baseOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[16..24], baseTimestamp);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[24..32], originTimestamp);
+        BinaryPrimitives.WriteUInt64LittleEndian(header[32..40], (ulong)record.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(header[48..52], (uint)frames.Length);
+
+        var position = 256;
+        foreach (var frame in frames)
+        {
+            frame.CopyTo(record.AsSpan(position));
+            position += frame.Length;
+        }
+
+        return record;
     }
 
     internal static byte[] CreateStreamPayload(uint id, int topicsCount, string name, ulong sizeBytes,

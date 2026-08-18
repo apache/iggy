@@ -72,6 +72,28 @@ public class IggyConsumerBuilderTests
     }
 
     [Fact]
+    public void Build_WithPersonalAccessToken_CreatesTheClient()
+    {
+        var consumer = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "token")
+            .Build();
+
+        Assert.NotNull(consumer);
+    }
+
+    [Fact]
+    public void Build_WithoutCredentials_Throws()
+    {
+        var builder = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", string.Empty);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => builder.Build());
+        Assert.Contains("PersonalAccessToken", ex.Message);
+    }
+
+    [Fact]
     public void TypedBuild_OverTcp_CreatesTheClient()
     {
         IggyConsumerBuilder<string> builder = IggyConsumerBuilder<string>

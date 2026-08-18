@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.Vsr;
+namespace Apache.Iggy.Messages;
 
 /// <summary>
-///     VSR frame discriminant, byte 60 of every consensus header. Only the frames a client emits or
-///     receives are named; every other discriminant decodes as <see cref="Reserved" />.
+///     Sizes of the canonical message batch record shared by send requests and poll responses:
+///     a 256-byte batch header followed by per-message frames of
+///     <c>[48-byte frame header][payload][user headers]</c>.
 /// </summary>
-internal enum Command2 : byte
+internal static class BatchWireFormat
 {
-    Reserved = 0,
-    Request = 5,
-    Reply = 8,
-    Eviction = 13
+    internal const int BATCH_HEADER_SIZE = 256;
+
+    internal const int FRAME_HEADER_SIZE = 48;
 }

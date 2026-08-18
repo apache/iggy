@@ -420,6 +420,40 @@ runs:
       run: cargo build --locked
       shell: bash
 
+    # macOS is build-only everywhere else in CI, so runtime regressions in the
+    # non-Linux driver path (kqueue instead of io_uring) would ship unnoticed.
+    # Boot the freshly built server and ping it over TCP; ping is pre-auth so
+    # no credentials are needed. The retry flags keep each attempt bounded
+    # regardless of CLI reconnection defaults, so a dead server fails the
+    # step fast instead of hanging until the job timeout.
+    - name: Smoke test iggy-server boot on macOS
+      if: inputs.task == 'build-macos-aarch64'
+      run: |
+        target/debug/iggy-server --fresh > server-boot.log 2>&1 &
+        SERVER_PID=$!
+        trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+        for _ in $(seq 1 30); do
+          if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "::error::iggy-server exited before answering ping"
+            cat server-boot.log
+            exit 1
+          fi
+          if target/debug/iggy \
+              --tcp-reconnection-max-retries 1 \
+              --tcp-reconnection-interval 500ms \
+              ping; then
+            echo "Server booted and answered ping"
+            exit 0
+          fi
+          sleep 2
+        done
+
+        echo "::error::iggy-server did not answer ping within 60s"
+        cat server-boot.log
+        exit 1
+      shell: bash
+
     # Windows builds (SDK and CLI only - iggy-server does not support Windows)
     - name: Build Windows SDK and CLI
       if: inputs.task == 'build-windows-sdk'
