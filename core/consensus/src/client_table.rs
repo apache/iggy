@@ -101,7 +101,7 @@ pub const CLIENTS_TABLE_SLOT_MAX: usize = 1 << 16;
 /// original bytes instead of a bare "already applied"; losing one
 /// degrades the answer, never correctness. In-memory only: ring contents are
 /// refcount bumps and are never persisted or transferred.
-const REPLY_RING_CAPACITY: usize = 5;
+pub const REPLY_RING_CAPACITY: usize = 5;
 
 /// Per-session entry: fence epoch + committed-request watermark + replies.
 ///

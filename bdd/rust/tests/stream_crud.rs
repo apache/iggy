@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod client_table_adversarial;
-mod client_table_restart;
-mod crash_durability;
-mod crash_offset_reuse;
-mod crash_recovery_corruption;
-mod failover_client_continuity;
-mod metadata_checkpoint_restart;
-mod metadata_state_transfer;
-mod multi_shard_partition_convergence;
-mod partition_state_transfer;
-mod register_forwarding;
+pub(crate) mod common;
+pub(crate) mod helpers;
+pub(crate) mod steps;
+
+use crate::common::global_context::GlobalContext;
+use cucumber::World;
+
+#[tokio::main]
+async fn main() {
+    GlobalContext::cucumber()
+        .fail_on_skipped()
+        .run_and_exit("../../bdd/scenarios/stream_crud.feature")
+        .await;
+}
