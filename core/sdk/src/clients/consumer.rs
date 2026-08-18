@@ -364,7 +364,7 @@ unsafe impl Sync for IggyConsumer {}
 /// When the [`IggyClient`] was created with an encryptor, payloads and user headers are decrypted
 /// before a message is yielded, which only works if the producer encrypted them with a matching
 /// key. This is guaranteed if you spawned both the [`IggyProducer`] and the [`IggyConsumer`] from the same [`IggyClient`].
-/// A message that cannot be decrypted is yielded as an error and the rest of its batch is
+/// A message that cannot be decrypted is yielded as an error and the whole batch is
 /// discarded.
 ///
 /// # Concurrency
@@ -651,6 +651,7 @@ impl IggyConsumer {
     ///
     /// The value is this consumer's own record of what it committed, kept in memory rather than
     /// read back from the server.
+    /// Under auto-commit-on-poll (the default) this can trail the server by up to one batch.
     pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         let offset = self.last_stored_offsets.get(&partition_id)?;
         Some(offset.load(ORDERING))
@@ -1707,8 +1708,9 @@ impl IggyConsumer {
             );
 
             let client = self.client.read().await;
+            // Cleared either way: this consumer is torn down regardless of
+            // whether the broker confirmed the leave.
             self.joined_consumer_group.store(false, ORDERING);
-            // Let the server know that the consumer left its group.
             if let Err(error) = client
                 .leave_consumer_group(&self.stream_id, &self.topic_id, &group_id)
                 .await
