@@ -505,7 +505,7 @@ public sealed class BinaryMapper
         record.CopyTo(combined.AsSpan(16));
 
         Assert.Throws<MalformedResponseException>(() =>
-            Mappers.BinaryMapper.MapRentedMessages(combined, TcpMessageStream.EmptyMemoryOwner.Instance));
+            Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance));
     }
 
     [Fact]

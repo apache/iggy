@@ -194,7 +194,7 @@ internal sealed class VsrConnection : IDisposable
         await ReadExactAsync(_replyHeaderBuffer, readCancellation.Token, token);
 
         var command = VsrHeader.PeekCommand(_replyHeaderBuffer);
-        if (command == Command2.Eviction)
+        if (command == Command.Eviction)
         {
             var eviction = VsrHeader.ReadEviction(_replyHeaderBuffer);
             _logger.LogWarning("Consensus session evicted by the server: {Reason}", eviction.Reason);
@@ -203,7 +203,7 @@ internal sealed class VsrConnection : IDisposable
             throw new VsrSessionEvictedException(VsrReplyDecoder.ToException(eviction));
         }
 
-        if (command != Command2.Reply)
+        if (command != Command.Reply)
         {
             // Neither a reply nor an eviction: this frame was never an answer to the outstanding request, so
             // whatever the peer does send for it would be read as the next request's reply and handed to the
