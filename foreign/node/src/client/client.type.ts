@@ -17,20 +17,21 @@
 //
 
 import type { Readable } from 'stream';
-import { type TcpSocketConnectOpts } from 'node:net';
+import { type TcpNetConnectOpts } from 'node:net';
 import { type ConnectionOptions } from 'node:tls';
 
 /**
  * TCP socket connection options.
- * Alias for Node.js TcpSocketConnectOpts.
+ * Alias for Node.js TcpNetConnectOpts, what net.createConnection accepts.
  */
-export type TcpOption = TcpSocketConnectOpts;
+export type TcpOption = TcpNetConnectOpts;
 
 /**
  * TLS socket connection options.
- * Combines port number with Node.js TLS ConnectionOptions.
+ * Combines port number with Node.js TLS ConnectionOptions and the
+ * net.connect options tls.connect forwards at runtime.
  */
-export type TlsOption = { port: number } & ConnectionOptions;
+export type TlsOption = { port: number } & ConnectionOptions & Partial<TcpNetConnectOpts>;
 
 /**
  * Response from a command sent to the Iggy server.
@@ -145,6 +146,12 @@ export type PoolSizeOption = {
   /** Maximum number of connections in the pool */
   max?: number
 }
+
+/**
+ * Client configuration or a connection string such as
+ * `iggy://username:password@host:port`.
+ */
+export type ClientConfigOrString = ClientConfig | string;
 
 /**
  * Complete client configuration for connecting to the Iggy server.

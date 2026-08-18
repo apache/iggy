@@ -17,7 +17,7 @@
 //
 
 import { createPool, type Pool } from 'generic-pool';
-import type { RawClient, ClientConfig } from "./client.type.js"
+import type { RawClient, ClientConfig, ClientConfigOrString } from "./client.type.js"
 import { getRawClient } from '../client/client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { debug } from './client.debug.js';
@@ -79,9 +79,9 @@ export class Client extends CommandAPI {
   /**
    * Creates a new pooled client.
    *
-  * @param config - Client configuration
+  * @param config - Client configuration or connection string
   */
-  constructor(config: ClientConfig) {
+  constructor(config: ClientConfigOrString) {
     const normalizedConfig = normalizeClientConfig(config);
     const { clientProvider, pool } =
       createPooledClientProvider(normalizedConfig);
@@ -125,11 +125,12 @@ export class SingleClient extends CommandAPI {
   /**
    * Creates a new single-connection client.
    *
-  * @param config - Client configuration
+  * @param config - Client configuration or connection string
   */
-  constructor(config: ClientConfig) {
-    super(createSingleClientProvider(config));
-    this._config = config;
+  constructor(config: ClientConfigOrString) {
+    const normalizedConfig = normalizeClientConfig(config);
+    super(createSingleClientProvider(normalizedConfig));
+    this._config = normalizedConfig;
   }
 
   /**
@@ -170,10 +171,10 @@ export class SimpleClient extends CommandAPI {
  * Creates a SimpleClient with the given configuration.
  * Convenience function for quickly creating a client.
  *
- * @param config - Client configuration
+ * @param config - Client configuration or connection string
  * @returns SimpleClient instance
  */
-export const getClient = async (config: ClientConfig) => {
+export const getClient = async (config: ClientConfigOrString) => {
   const client = getRawClient(config);
   return new SimpleClient(client);
 };

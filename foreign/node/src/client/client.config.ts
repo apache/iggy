@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { ClientConfig } from './client.type.js';
+import type { ClientConfig, ClientConfigOrString } from './client.type.js';
+import { parseConnectionString } from './client.connection-string.js';
 
 export const DEFAULT_MAX_RESPONSE_FRAME_SIZE = 64 * 1024 * 1024;
 
@@ -29,8 +30,11 @@ export const DEFAULT_HEARTBEAT_INTERVAL = 5 * 1000;
 export const MAX_HEARTBEAT_INTERVAL = 2_147_483_647;
 
 export const normalizeClientConfig = (
-  config: ClientConfig
+  config: ClientConfigOrString
 ): ClientConfig => {
+  if (typeof config === 'string')
+    config = parseConnectionString(config);
+
   const maxResponseFrameSize =
     config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE;
   if (!Number.isSafeInteger(maxResponseFrameSize) ||
