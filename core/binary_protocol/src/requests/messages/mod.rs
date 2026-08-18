@@ -21,6 +21,4 @@ pub mod send_messages;
 
 pub use flush_unsaved_buffer::FlushUnsavedBufferRequest;
 pub use poll_messages::PollMessagesRequest;
-pub use send_messages::{
-    RawMessage, SendMessagesEncoder, SendMessagesHeader, SendMessagesMetadataEncoder,
-};
+pub use send_messages::{RawMessage, SendMessagesEncoder, SendMessagesHeader};

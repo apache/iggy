@@ -30,5 +30,9 @@ public record MessageHeader(
         Long userHeadersLength,
         Long payloadLength,
         BigInteger reserved) {
-    public static final int SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4 + 8;
+    /**
+     * Size of a message's frame header inside a batch record. The frame carries offset and
+     * timestamp deltas as u32; this record resolves them to the absolute values.
+     */
+    public static final int SIZE = 8 + 16 + 4 + 4 + 4 + 4 + 8;
 }

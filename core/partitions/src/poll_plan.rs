@@ -39,7 +39,7 @@ use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
 };
 use server_common::iobuf::{Frozen, Owned};
-use server_common::send_messages2::{BatchIntegrity, COMMAND_HEADER_SIZE, decode_batch_slice_with};
+use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE, decode_batch_slice_with};
 use std::cell::{Cell, RefCell};
 use std::hash::Hash;
 use std::rc::Rc;
@@ -137,7 +137,7 @@ pub struct DiskSegment {
 /// Owned auto-commit input, applied off the partition borrow after a poll (see
 /// module docs). Only the in-memory apply happens here; durability is the
 /// replicated [`crate::iggy_partition::IggyPartition::apply_staged_consumer_offset_commit`]
-/// path's job on every node, driven by the `StoreConsumerOffset2` op the serving
+/// path's job on every node, driven by the `StoreConsumerOffset` op the serving
 /// shard submits from [`AutoCommitApplied`]. A poll-local disk write would be
 /// node-local only and diverge on failover.
 pub struct AutoCommitCtx {
@@ -148,7 +148,7 @@ pub struct AutoCommitCtx {
 ///
 /// The serving shard replicates it through the partition consensus (the only
 /// cross-node durable path); `kind` + `consumer_id` are the offset key the
-/// submitted `StoreConsumerOffset2` op must carry.
+/// submitted `StoreConsumerOffset` op must carry.
 pub struct AutoCommitApplied {
     pub kind: ConsumerKind,
     pub consumer_id: u32,
@@ -455,7 +455,7 @@ pub enum DiskReadOutcome {
 impl DiskReadPlan {
     /// Serve a poll from the on-disk segment files, off the partition borrow.
     /// Reads from owned descriptors so no partition reference is held across
-    /// the file IO. Walks stamped `[256B SendMessages2Header][blob]` batches in
+    /// the file IO. Walks stamped `[256B BatchHeader][blob]` batches in
     /// chunked reads, re-reading a batch split across a chunk boundary in the
     /// next chunk.
     #[allow(clippy::cast_possible_truncation)]
@@ -783,7 +783,7 @@ fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Optio
 
 impl AutoCommitCtx {
     /// The offset key (kind + numeric id) this auto-commit targets, for the
-    /// replicated `StoreConsumerOffset2` op the serving shard submits.
+    /// replicated `StoreConsumerOffset` op the serving shard submits.
     pub(crate) const fn kind_and_id(&self) -> (ConsumerKind, u32) {
         match &self.target {
             AutoCommitTarget::Consumer { consumer_id, .. } => {
@@ -901,7 +901,7 @@ pub fn upsert_offset_max<K>(
     }
 }
 
-/// Walk stamped `[256B SendMessages2Header][blob]` batches in one disk
+/// Walk stamped `[256B BatchHeader][blob]` batches in one disk
 /// chunk, pushing matching fragments. Returns bytes consumed: the start
 /// of the first batch that did not fully fit in the chunk (the caller
 /// re-reads from there), or the chunk end when everything decoded.

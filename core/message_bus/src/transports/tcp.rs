@@ -294,14 +294,14 @@ mod tests {
     use super::*;
     use crate::lifecycle::Shutdown;
     use async_channel::bounded;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
     use server_common::MESSAGE_ALIGN;
     use server_common::Message;
     use server_common::iobuf::Frozen;
     use std::time::Duration;
 
     #[allow(clippy::cast_possible_truncation)]
-    fn header_only(command: Command2) -> Frozen<MESSAGE_ALIGN> {
+    fn header_only(command: Command) -> Frozen<MESSAGE_ALIGN> {
         Message::<GenericHeader>::new(HEADER_SIZE)
             .transmute_header(|_, h: &mut GenericHeader| {
                 h.command = command;
@@ -369,7 +369,7 @@ mod tests {
         let (_server_out, server_in, server_shutdown, server_handle) =
             drive(TcpTransportConn::new(server));
 
-        for cmd in [Command2::Ping, Command2::Prepare, Command2::Request] {
+        for cmd in [Command::Ping, Command::Prepare, Command::Request] {
             client_out.send(header_only(cmd)).await.unwrap();
         }
 
@@ -385,9 +385,9 @@ mod tests {
         let a = recv_with_timeout(&server_in).await;
         let b = recv_with_timeout(&server_in).await;
         let c = recv_with_timeout(&server_in).await;
-        assert_eq!(a.header().command, Command2::Ping);
-        assert_eq!(b.header().command, Command2::Prepare);
-        assert_eq!(c.header().command, Command2::Request);
+        assert_eq!(a.header().command, Command::Ping);
+        assert_eq!(b.header().command, Command::Prepare);
+        assert_eq!(c.header().command, Command::Request);
 
         client_shutdown.trigger();
         server_shutdown.trigger();

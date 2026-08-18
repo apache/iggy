@@ -46,7 +46,7 @@ pub mod artifact_kind {
     /// Metadata plane: [`crate::ClientTable::encode`] bytes.
     pub const CLIENT_TABLE: u8 = 1;
     /// Partition plane: one retained segment's `.log` bytes verbatim
-    /// (prepare-stripped `SendMessages2` records); `frontier` = the
+    /// (prepare-stripped `SendMessages` records); `frontier` = the
     /// segment's base offset.
     pub const SEGMENT_LOG: u8 = 2;
     /// Partition plane: the encoded consumer + consumer-group offset table

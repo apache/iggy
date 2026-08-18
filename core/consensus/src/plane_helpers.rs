@@ -20,7 +20,7 @@ use crate::{
     Status, VsrConsensus,
 };
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    CHECKSUM_UNSEALED, Command, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     ReplyHeader, RoutedRequestHeader, frame_body,
 };
 use message_bus::{MessageBus, SendError};
@@ -35,7 +35,7 @@ use std::{error::Error, fmt, mem::size_of, ops::AsyncFnOnce};
 #[non_exhaustive]
 pub enum ChainReplicationError {
     MalformedPrepare,
-    UnexpectedCommand { command: Command2 },
+    UnexpectedCommand { command: Command },
     CommittedPrepare { op: u64, commit_min: u64 },
     SelfRoute { replica: u8 },
     Transport(SendError),
@@ -215,7 +215,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    if header.command != Command2::Prepare {
+    if header.command != Command::Prepare {
         return Err(ChainReplicationError::UnexpectedCommand {
             command: header.command,
         });
@@ -307,7 +307,7 @@ pub fn verify_prepare_integrity(header: &PrepareHeader, frame: &[u8]) -> Result<
 /// status, or the message's view differs from the replica's.
 ///
 /// # Panics
-/// If `header.command` is not `Command2::Prepare`.
+/// If `header.command` is not `Command::Prepare`.
 pub fn replicate_preflight<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
@@ -316,7 +316,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    assert_eq!(header.command, Command2::Prepare);
+    assert_eq!(header.command, Command::Prepare);
 
     if consensus.is_transferring() {
         return Err(IgnoreReason::StateTransfer);
@@ -534,7 +534,7 @@ where
 {
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + body_len;
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let header = ReplyHeader {
         checksum: 0,
@@ -544,7 +544,7 @@ where
         // Commit-time view
         view: prepare_header.view,
         release: prepare_header.release,
-        command: Command2::Reply,
+        command: Command::Reply,
         // Original primary's id
         replica: prepare_header.replica,
         reserved_frame: [0; 66],
@@ -560,15 +560,12 @@ where
         operation: prepare_header.operation,
         ..Default::default()
     };
-    // `BytesMut` makes no alignment guarantee, so never cast into it.
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    fill(&mut buffer[header_size..]);
+    fill(&mut bytes[header_size..]);
 
-    // TODO: drop this copy once replies stop round-tripping through `Bytes`
-    // and the binary protocol uses `Owned` end-to-end.
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("reply buffer must contain a valid reply message")
 }
 
 /// Builds a `Reply` carrying only a single-entry result section, no payload:
@@ -601,14 +598,14 @@ pub fn build_result_rejection_reply(
     const RESULT_BODY_LEN: usize = 12;
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + RESULT_BODY_LEN;
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let header = ReplyHeader {
         cluster: request_header.cluster,
         size: total_size as u32,
         view: request_header.view,
         release: request_header.release,
-        command: Command2::Reply,
+        command: Command::Reply,
         replica: request_header.replica,
         request_checksum: request_header.request_checksum,
         client: request_header.client,
@@ -622,15 +619,15 @@ pub fn build_result_rejection_reply(
         operation: request_header.operation,
         ..Default::default()
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    let body = &mut buffer[header_size..];
+    let body = &mut bytes[header_size..];
     body[0..4].copy_from_slice(&1u32.to_le_bytes());
     body[4..8].copy_from_slice(&0u32.to_le_bytes());
     body[8..12].copy_from_slice(&code.to_le_bytes());
 
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("transient reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("transient reply buffer must contain a valid reply message")
 }
 
 /// Reply for fast paths that skip the VSR pipeline (e.g. `AckLevel::NoAck`).
@@ -652,7 +649,7 @@ where
 {
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + body.len();
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let commit = consensus.commit_max();
     let header = ReplyHeader {
@@ -662,7 +659,7 @@ where
         size: total_size as u32,
         view: consensus.view(),
         release: 0,
-        command: Command2::Reply,
+        command: Command::Reply,
         replica: consensus.replica(),
         reserved_frame: [0; 66],
         request_checksum: request_header.request_checksum,
@@ -675,14 +672,14 @@ where
         operation: request_header.operation,
         ..Default::default()
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
     if !body.is_empty() {
-        buffer[header_size..].copy_from_slice(&body);
+        bytes[header_size..].copy_from_slice(&body);
     }
 
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("reply buffer must contain a valid reply message")
 }
 
 /// Reply that denies a request on the primary before it enters the VSR
@@ -734,14 +731,14 @@ pub fn build_deny_reply_from_request_header(
     status: u32,
 ) -> Message<ReplyHeader> {
     let header_size = std::mem::size_of::<ReplyHeader>();
-    let mut buffer = bytes::BytesMut::zeroed(header_size);
+    let mut buffer = Owned::<4096>::zeroed(header_size);
 
     let header = ReplyHeader {
         cluster: request_header.cluster,
         size: header_size as u32,
         view: request_header.view,
         release: request_header.release,
-        command: Command2::Reply,
+        command: Command::Reply,
         replica: request_header.replica,
         request_checksum: request_header.request_checksum,
         client: request_header.client,
@@ -751,10 +748,9 @@ pub fn build_deny_reply_from_request_header(
         operation: request_header.operation,
         ..Default::default()
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    buffer.as_mut_slice()[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("deny reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("deny reply buffer must contain a valid reply message")
 }
 
 /// Verify hash chain would not break if we add this header.
@@ -777,7 +773,7 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
 
 // TODO: Figure out how to make this check the journal if it contains the prepare.
 /// # Panics
-/// - If `header.command` is not `Command2::Prepare`.
+/// - If `header.command` is not `Command::Prepare`.
 /// - If `header.view > consensus.view()`.
 #[allow(clippy::cast_possible_truncation, clippy::future_not_send)]
 pub async fn send_prepare_ok<B, P>(
@@ -788,7 +784,7 @@ pub async fn send_prepare_ok<B, P>(
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
-    assert_eq!(header.command, Command2::Prepare);
+    assert_eq!(header.command, Command::Prepare);
 
     if consensus.status() != Status::Normal {
         return;
@@ -814,7 +810,7 @@ pub async fn send_prepare_ok<B, P>(
     }
 
     let prepare_ok_header = PrepareOkHeader {
-        command: Command2::PrepareOk,
+        command: Command::PrepareOk,
         cluster: consensus.cluster(),
         replica: consensus.replica(),
         view: consensus.view(),
@@ -892,7 +888,7 @@ mod tests {
         Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
             |_, new| {
                 *new = PrepareHeader {
-                    command: Command2::Prepare,
+                    command: Command::Prepare,
                     size: std::mem::size_of::<PrepareHeader>() as u32,
                     op,
                     parent,
@@ -914,7 +910,7 @@ mod tests {
             Message::<PrepareHeader>::new(std::mem::size_of::<PrepareHeader>()).transmute_header(
                 |_, new| {
                     *new = PrepareHeader {
-                        command: Command2::Prepare,
+                        command: Command::Prepare,
                         size: std::mem::size_of::<PrepareHeader>() as u32,
                         op: 1,
                         view,
@@ -966,7 +962,7 @@ mod tests {
         let svc =
             Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
                 .transmute_header(|_, new: &mut StartViewChangeHeader| {
-                    new.command = Command2::StartViewChange;
+                    new.command = Command::StartViewChange;
                     new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
                     new.view = 1;
                     new.replica = 0;
@@ -1006,7 +1002,7 @@ mod tests {
         let svc =
             Message::<StartViewChangeHeader>::new(std::mem::size_of::<StartViewChangeHeader>())
                 .transmute_header(|_, new: &mut StartViewChangeHeader| {
-                    new.command = Command2::StartViewChange;
+                    new.command = Command::StartViewChange;
                     new.size = std::mem::size_of::<StartViewChangeHeader>() as u32;
                     new.view = 1;
                     new.replica = 0;
@@ -1036,7 +1032,7 @@ mod tests {
             size: std::mem::size_of::<DoViewChangeHeader>() as u32,
             view: 1,
             release: 0,
-            command: Command2::DoViewChange,
+            command: Command::DoViewChange,
             replica: 1,
             reserved_frame: [0; 66],
             op: dvc_op,
@@ -1060,7 +1056,7 @@ mod tests {
         // moved with it, one op would carry different checksums per receiving view
         // and the merge would read them as competing prepares nacking each other.
         let base = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: iggy_binary_protocol::Operation::CreateStream,
             op: 9,
             view: 4,
@@ -1160,7 +1156,7 @@ mod tests {
         // The distinction the merge depends on: two prepares at one op number are
         // told apart, so a canonical header is distinguishable from a stale one.
         let first = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: iggy_binary_protocol::Operation::CreateStream,
             op: 5,
             client: 1,
@@ -1223,7 +1219,7 @@ mod tests {
         consensus.init();
 
         let prepare_header = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             cluster: 1,
             view: 0,
             op: 0,
@@ -1236,13 +1232,13 @@ mod tests {
         let mut buf = Vec::new();
         consensus.drain_loopback_into(&mut buf);
         assert_eq!(buf.len(), 1);
-        assert_eq!(buf[0].header().command, Command2::PrepareOk);
+        assert_eq!(buf[0].header().command, Command::PrepareOk);
 
         let typed: Message<PrepareOkHeader> = buf
             .remove(0)
             .try_into_typed()
             .expect("loopback message must be PrepareOk");
-        assert_eq!(typed.header().command, Command2::PrepareOk);
+        assert_eq!(typed.header().command, Command::PrepareOk);
     }
 
     /// A sender's suffix and matching body bytes for a replica that holds every op
@@ -1291,7 +1287,7 @@ mod tests {
                 .expect("synthetic DVC frame fits u32"),
             view,
             release: 0,
-            command: Command2::DoViewChange,
+            command: Command::DoViewChange,
             replica,
             reserved_frame: [0; 66],
             op,
@@ -1319,7 +1315,7 @@ mod tests {
         let mut ascending = Vec::new();
         for op in low.max(1)..=high {
             let mut header = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 operation: iggy_binary_protocol::Operation::CreateStream,
                 op,
                 view,
@@ -1349,7 +1345,7 @@ mod tests {
             .expect("header fits u32"),
             view,
             release: 0,
-            command: Command2::StartViewChange,
+            command: Command::StartViewChange,
             replica,
             reserved_frame: [0; 66],
             group: 0,
@@ -1414,7 +1410,7 @@ mod tests {
     fn given_a_sealed_prepare_when_verifying_integrity_should_accept() {
         let message = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = 7;
                 header.size = u32::try_from(size_of::<PrepareHeader>()).expect("header fits u32");
             },
@@ -1429,7 +1425,7 @@ mod tests {
         // corrupted in transit is journaled and then re-served to peers from the WAL.
         let message = Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = 7;
                 header.size = u32::try_from(size_of::<PrepareHeader>()).expect("header fits u32");
             },
@@ -1447,7 +1443,7 @@ mod tests {
         // The partition plane leaves `checksum` at `CHECKSUM_UNSEALED` and carries a
         // verified `batch_checksum` over the same bytes instead.
         let header = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             op: 7,
             ..Default::default()
         };
@@ -1470,7 +1466,7 @@ mod tests {
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut bytes[..size_of::<PrepareHeader>()],
         );
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = 7;
         header.size = u32::try_from(size).expect("fits u32");
         header.checksum_body = u128::from(calculate_checksum(body));
@@ -1642,7 +1638,7 @@ mod tests {
                 .expect("synthetic StartView fits u32"),
             view,
             release: 0,
-            command: Command2::StartView,
+            command: Command::StartView,
             replica,
             reserved_frame: [0; 66],
             op,
@@ -1870,7 +1866,7 @@ mod tests {
         consensus.init();
 
         let prepare_header = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             cluster: 1,
             view: 0,
             op: 0,
@@ -1995,8 +1991,8 @@ mod tests {
         consensus.advance_commit_max(4);
 
         let request = RoutedRequestHeader {
-            command: Command2::Request,
-            operation: Operation::DeleteConsumerOffset2,
+            command: Command::Request,
+            operation: Operation::DeleteConsumerOffset,
             client: 42,
             request: 7,
             ..Default::default()
@@ -2005,13 +2001,13 @@ mod tests {
         let reply = build_deny_reply_from_request(&consensus, &request, status);
 
         let header = reply.header();
-        assert_eq!(header.command, Command2::Reply);
+        assert_eq!(header.command, Command::Reply);
         assert_eq!(header.status, status);
         assert_eq!(header.op, 0, "a deny commits nothing");
         assert_eq!(header.commit, 4);
         assert_eq!(header.client, 42);
         assert_eq!(header.request, 7);
-        assert_eq!(header.operation, Operation::DeleteConsumerOffset2);
+        assert_eq!(header.operation, Operation::DeleteConsumerOffset);
         assert_eq!(
             header.size as usize,
             std::mem::size_of::<ReplyHeader>(),

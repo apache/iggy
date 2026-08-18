@@ -18,14 +18,18 @@
 use crate::WireError;
 use crate::WireIdentifier;
 use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
+use crate::primitives::ack_level::AckLevel;
 use crate::primitives::consumer::WireConsumer;
 use bytes::{BufMut, BytesMut};
 
 /// `StoreConsumerOffset` request.
 ///
+/// Adds an `ack` byte: `NoAck` = leader-local fast path, `Quorum` = VSR
+/// pipeline.
+///
 /// Wire format:
 /// ```text
-/// [consumer][stream_id][topic_id][partition_flag:1][partition_id:4 LE][offset:8 LE]
+/// [consumer][stream_id][topic_id][partition_flag:1][partition_id:4 LE][offset:8 LE][ack:1]
 /// ```
 ///
 /// `partition_id` encoding: a u8 flag (1=Some, 0=None) followed by 4 bytes
@@ -37,6 +41,7 @@ pub struct StoreConsumerOffsetRequest {
     pub topic_id: WireIdentifier,
     pub partition_id: Option<u32>,
     pub offset: u64,
+    pub ack: AckLevel,
 }
 
 impl WireEncode for StoreConsumerOffsetRequest {
@@ -47,6 +52,7 @@ impl WireEncode for StoreConsumerOffsetRequest {
             + 1
             + 4
             + 8
+            + 1
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -61,6 +67,7 @@ impl WireEncode for StoreConsumerOffsetRequest {
             buf.put_u32_le(0);
         }
         buf.put_u64_le(self.offset);
+        buf.put_u8(self.ack.as_u8());
     }
 }
 
@@ -84,6 +91,9 @@ impl WireDecode for StoreConsumerOffsetRequest {
         };
         let offset = read_u64_le(buf, pos)?;
         pos += 8;
+        let ack_code = read_u8(buf, pos)?;
+        pos += 1;
+        let ack = AckLevel::from_code(ack_code)?;
         Ok((
             Self {
                 consumer,
@@ -91,6 +101,7 @@ impl WireDecode for StoreConsumerOffsetRequest {
                 topic_id,
                 partition_id,
                 offset,
+                ack,
             },
             pos,
         ))
@@ -102,13 +113,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_with_partition() {
+    fn roundtrip_with_partition_quorum() {
         let req = StoreConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(10),
             topic_id: WireIdentifier::numeric(20),
             partition_id: Some(5),
             offset: 12345,
+            ack: AckLevel::Quorum,
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = StoreConsumerOffsetRequest::decode(&bytes).unwrap();
@@ -117,13 +129,14 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_without_partition() {
+    fn roundtrip_without_partition_no_ack() {
         let req = StoreConsumerOffsetRequest {
             consumer: WireConsumer::consumer_group(WireIdentifier::numeric(3)),
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(1),
             partition_id: None,
             offset: u64::MAX,
+            ack: AckLevel::NoAck,
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = StoreConsumerOffsetRequest::decode(&bytes).unwrap();
@@ -139,6 +152,7 @@ mod tests {
             topic_id: WireIdentifier::named("topic-1").unwrap(),
             partition_id: Some(0),
             offset: 0,
+            ack: AckLevel::Quorum,
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = StoreConsumerOffsetRequest::decode(&bytes).unwrap();
@@ -147,17 +161,33 @@ mod tests {
     }
 
     #[test]
-    fn offset_encoding() {
+    fn ack_byte_is_last() {
         let req = StoreConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(1),
             partition_id: Some(0),
-            offset: 0x0102_0304_0506_0708,
+            offset: 0,
+            ack: AckLevel::NoAck,
         };
         let bytes = req.to_bytes();
-        let (decoded, _) = StoreConsumerOffsetRequest::decode(&bytes).unwrap();
-        assert_eq!(decoded.offset, 0x0102_0304_0506_0708);
+        assert_eq!(*bytes.last().unwrap(), AckLevel::NoAck.as_u8());
+    }
+
+    #[test]
+    fn unknown_ack_rejected() {
+        let req = StoreConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(1),
+            partition_id: Some(0),
+            offset: 0,
+            ack: AckLevel::Quorum,
+        };
+        let mut bytes = req.to_bytes().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] = 0xFF;
+        assert!(StoreConsumerOffsetRequest::decode(&bytes).is_err());
     }
 
     #[test]
@@ -168,6 +198,7 @@ mod tests {
             topic_id: WireIdentifier::numeric(1),
             partition_id: Some(1),
             offset: 100,
+            ack: AckLevel::Quorum,
         };
         let bytes = req.to_bytes();
         for i in 0..bytes.len() {

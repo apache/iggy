@@ -200,11 +200,11 @@ hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
-iggy = { path = "core/sdk", version = "0.11.0-edge.3" }
-iggy-cli = { path = "core/cli", version = "0.14.0-edge.3" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.3" }
-iggy_common = { path = "core/common", version = "0.11.0-edge.3" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.2" }
+iggy = { path = "core/sdk", version = "0.11.0-edge.4" }
+iggy-cli = { path = "core/cli", version = "0.14.0-edge.4" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.4" }
+iggy_common = { path = "core/common", version = "0.11.0-edge.4" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.3" }
 indexmap = "2.14.0"
 integration = { path = "core/integration" }
 ipnet = "2.12.0"
@@ -214,7 +214,6 @@ jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 keyring-core = "1.0.0"
 lazy_static = "1.5.0"
 left-right = "0.11"
-lending-iterator = "0.1.7"
 libc = "0.2.188"
 log = "0.4.33"
 lz4_flex = "0.14.0"
@@ -299,7 +298,6 @@ server_common = { path = "core/server_common" }
 shard = { path = "core/shard" }
 shard_allocator = { path = "core/shard_allocator" }
 simd-json = { version = "0.17.3", features = ["serde_impl"] }
-slab = "0.4.12"
 smallvec = "1.15"
 socket2 = "0.6.5"
 sqlx = { version = "0.9.0", features = [

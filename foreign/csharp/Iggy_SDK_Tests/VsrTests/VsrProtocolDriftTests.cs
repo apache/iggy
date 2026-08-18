@@ -128,11 +128,11 @@ public sealed class VsrProtocolDriftTests
     }
 
     [Fact]
-    public void Command2Discriminants_MatchTheRustEnum()
+    public void CommandDiscriminants_MatchTheRustEnum()
     {
-        IReadOnlyDictionary<string, int> rust = RustEnum.Discriminants(ReadRustSource(CommandPath), "Command2");
+        IReadOnlyDictionary<string, int> rust = RustEnum.Discriminants(ReadRustSource(CommandPath), "Command");
 
-        AssertSubsetMatches<Command2>(rust);
+        AssertSubsetMatches<Command>(rust);
     }
 
     [Fact]
@@ -723,7 +723,7 @@ internal static class RustStruct
         ["u64"] = (8, 8),
         ["u128"] = (16, 16),
         // Every enum the headers embed is `#[repr(u8)]`.
-        ["Command2"] = (1, 1),
+        ["Command"] = (1, 1),
         ["Operation"] = (1, 1),
         ["EvictionReason"] = (1, 1)
     };

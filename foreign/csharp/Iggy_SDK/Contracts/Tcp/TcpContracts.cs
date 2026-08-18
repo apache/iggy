@@ -17,6 +17,7 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Apache.Iggy.Contracts.Auth;
@@ -36,6 +37,9 @@ internal static class TcpContracts
 
     /// <summary>Frames wider than this are built on the heap instead of the stack.</summary>
     private const int MaxStackAllocBytes = 1024;
+
+    /// <summary>Offset mutations always request quorum acknowledgement.</summary>
+    private const byte AckQuorum = 1;
 
     internal static byte[] LoginWithPersonalAccessToken(string token)
     {
@@ -400,9 +404,19 @@ internal static class TcpContracts
         bytes[position + 18] = autoCommit ? (byte)1 : (byte)0;
     }
 
+    /// <summary>
+    ///     Encodes a SendMessages body: routing metadata followed by one canonical batch record
+    ///     (a 256-byte batch header plus per-message frames). The server stamps
+    ///     <c>partition_id</c>, <c>base_offset</c>, and <c>base_timestamp</c>; they stay zero here.
+    /// </summary>
     internal static int CreateMessage(Span<byte> bytes, Identifier streamId, Identifier topicId,
         Partitioning partitioning, ReadOnlySpan<Message> messages, IMessageEncryptor? encryptor = null)
     {
+        if (messages.IsEmpty)
+        {
+            throw new ArgumentException("Batch must contain at least one message.", nameof(messages));
+        }
+
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length + 2 + partitioning.Length + 4;
         BinaryPrimitives.WriteInt32LittleEndian(bytes[..4], metadataLength);
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, 4);
@@ -412,10 +426,23 @@ internal static class TcpContracts
         BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], messages.Length);
         position += 4;
 
-        var indexPosition = position;
-        position += 16 * messages.Length;
+        // The producer owns message ids: a zero id is minted before the frame checksum covers it.
+        var originTimestamp = ulong.MaxValue;
+        foreach (var message in messages)
+        {
+            if (message.Header.Id == 0)
+            {
+                message.Header = message.Header with { Id = Guid.NewGuid().ToUInt128() };
+            }
 
-        var msgSize = 0;
+            originTimestamp = Math.Min(originTimestamp, message.Header.OriginTimestamp);
+        }
+
+        var batchStart = position;
+        bytes[batchStart..(batchStart + BatchWireFormat.BATCH_HEADER_SIZE)].Clear();
+        position += BatchWireFormat.BATCH_HEADER_SIZE;
+        var blobStart = position;
+        var offsetDelta = 0u;
 
         // One scratch buffer reused across the batch (grown on demand); holds plaintext headers, so it is
         // returned cleared on every path, including a mid-batch throw from the encryptor or header serialization.
@@ -425,7 +452,16 @@ internal static class TcpContracts
             foreach (var message in messages)
             {
                 var header = message.Header;
-                var payloadStart = position + 64;
+                var timestampDelta = header.OriginTimestamp - originTimestamp;
+                if (timestampDelta > uint.MaxValue)
+                {
+                    throw new ArgumentException(
+                        $"Message origin timestamp runs {timestampDelta} microseconds ahead of the batch's " +
+                        $"earliest one; the frame field holds at most {uint.MaxValue}.", nameof(messages));
+                }
+
+                var frameStart = position;
+                var payloadStart = frameStart + BatchWireFormat.FRAME_HEADER_SIZE;
 
                 int payloadLength;
                 if (encryptor is null)
@@ -489,26 +525,19 @@ internal static class TcpContracts
                     }
                 }
 
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)], 0);
-                BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], header.Id);
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], header.Offset);
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)],
-                    DateTimeOffsetUtils.ToUnixTimeMicroSeconds(header.Timestamp));
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)],
-                    header.OriginTimestamp);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersLength);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], payloadLength);
+                BinaryPrimitives.WriteUInt128LittleEndian(bytes[(frameStart + 8)..(frameStart + 24)], header.Id);
+                BinaryPrimitives.WriteUInt32LittleEndian(bytes[(frameStart + 24)..(frameStart + 28)], offsetDelta);
+                BinaryPrimitives.WriteUInt32LittleEndian(bytes[(frameStart + 28)..(frameStart + 32)],
+                    (uint)timestampDelta);
+                BinaryPrimitives.WriteInt32LittleEndian(bytes[(frameStart + 32)..(frameStart + 36)], headersLength);
+                BinaryPrimitives.WriteInt32LittleEndian(bytes[(frameStart + 36)..(frameStart + 40)], payloadLength);
                 // Reserved must be zero on the wire; the server rejects non-zero values.
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 56)..(position + 64)], 0);
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[(frameStart + 40)..(frameStart + 48)], 0);
 
-                position += 64 + payloadLength + headersLength;
-
-                msgSize += 64 + payloadLength + headersLength;
-
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[indexPosition..(indexPosition + 4)], 0);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition + 4)..(indexPosition + 8)], msgSize);
-                BinaryPrimitives.WriteInt64LittleEndian(bytes[(indexPosition + 8)..(indexPosition + 16)], 0);
-                indexPosition += 16;
+                position = headersStart + headersLength;
+                var frameChecksum = XxHash3.HashToUInt64(bytes[(frameStart + 8)..position]);
+                BinaryPrimitives.WriteUInt64LittleEndian(bytes[frameStart..(frameStart + 8)], frameChecksum);
+                offsetDelta++;
             }
         }
         finally
@@ -519,7 +548,36 @@ internal static class TcpContracts
             }
         }
 
+        var batchLength = (ulong)(BatchWireFormat.BATCH_HEADER_SIZE + (position - blobStart));
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(batchStart + 24)..(batchStart + 32)], originTimestamp);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(batchStart + 32)..(batchStart + 40)], batchLength);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[(batchStart + 48)..(batchStart + 52)], (uint)messages.Length);
+        var batchChecksum = CalculateBatchChecksum(bytes, batchStart, blobStart, position);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(batchStart + 40)..(batchStart + 48)], batchChecksum);
+
         return position;
+    }
+
+    /// <summary>
+    ///     Batch checksum: XXH3-64 over the batch header meta fields followed by each frame's stored
+    ///     8-byte checksum field in message order. Bodies are bound transitively through the
+    ///     per-frame checksums. The header fields must already be backpatched into <paramref name="bytes" />.
+    /// </summary>
+    private static ulong CalculateBatchChecksum(ReadOnlySpan<byte> bytes, int batchStart, int blobStart, int blobEnd)
+    {
+        var hasher = new XxHash3();
+        hasher.Append(bytes.Slice(batchStart, 40));
+        hasher.Append(bytes.Slice(batchStart + 48, 4));
+        var cursor = blobStart;
+        while (cursor < blobEnd)
+        {
+            hasher.Append(bytes.Slice(cursor, 8));
+            var headersLength = BinaryPrimitives.ReadInt32LittleEndian(bytes[(cursor + 32)..(cursor + 36)]);
+            var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(bytes[(cursor + 36)..(cursor + 40)]);
+            cursor += BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength;
+        }
+
+        return hasher.GetCurrentHashAsUInt64();
     }
 
     internal static int HeadersByteLength(Dictionary<HeaderKey, HeaderValue>? headers)
@@ -810,7 +868,7 @@ internal static class TcpContracts
         uint? partitionId)
     {
         Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 13 + 1 + 2 + consumer.ConsumerId.Length];
+            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 14 + 1 + 2 + consumer.ConsumerId.Length];
         bytes[0] = GetConsumerTypeByte(consumer.Type);
         bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
         var position = 1 + consumer.ConsumerId.Length + 2;
@@ -830,6 +888,7 @@ internal static class TcpContracts
         }
 
         BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 5)..(position + 13)], offset);
+        bytes[position + 13] = AckQuorum;
         return bytes.ToArray();
     }
 
@@ -933,7 +992,7 @@ internal static class TcpContracts
     internal static byte[] DeleteOffset(Identifier streamId, Identifier topicId, Consumer consumer, uint? partitionId)
     {
         Span<byte> bytes =
-            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 5 + 1 + 2 + consumer.ConsumerId.Length];
+            stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 6 + 1 + 2 + consumer.ConsumerId.Length];
         bytes[0] = GetConsumerTypeByte(consumer.Type);
         bytes.WriteBytesFromIdentifier(consumer.ConsumerId, 1);
         var position = 1 + consumer.ConsumerId.Length + 2;
@@ -952,6 +1011,7 @@ internal static class TcpContracts
             BinaryPrimitives.WriteUInt32LittleEndian(bytes[(position + 1)..(position + 5)], 0); // Padding
         }
 
+        bytes[position + 5] = AckQuorum;
         return bytes.ToArray();
     }
 }

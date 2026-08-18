@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_http_sink"
-version = "0.5.0-edge.3"
+version = "0.5.0-edge.4"
 description = "Iggy HTTP sink connector for delivering stream messages to any HTTP endpoint via webhooks, REST APIs, or serverless functions."
 edition = "2024"
 license = "Apache-2.0"

@@ -18,7 +18,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
-  Command2,
+  Command,
   encodeRequestHeader,
   HEADER_SIZE,
   REQUEST_OFFSET
@@ -38,7 +38,7 @@ describe('VSR request header', () => {
 
     assert.equal(header.length, HEADER_SIZE);
     assert.equal(header.readUInt32LE(REQUEST_OFFSET.size), HEADER_SIZE + 3);
-    assert.equal(header.readUInt8(REQUEST_OFFSET.command), Command2.Request);
+    assert.equal(header.readUInt8(REQUEST_OFFSET.command), Command.Request);
     assert.equal(
       header.readBigUInt64LE(REQUEST_OFFSET.client),
       0x99AABBCCDDEEFF00n
@@ -70,7 +70,7 @@ describe('VSR request header', () => {
     });
     const expected = Buffer.alloc(HEADER_SIZE);
     expected.writeUInt32LE(HEADER_SIZE, REQUEST_OFFSET.size);
-    expected.writeUInt8(Command2.Request, REQUEST_OFFSET.command);
+    expected.writeUInt8(Command.Request, REQUEST_OFFSET.command);
     expected.writeBigUInt64LE(1n, REQUEST_OFFSET.client);
     expected.writeUInt8(1, REQUEST_OFFSET.operation);
     assert.deepEqual(header, expected);
