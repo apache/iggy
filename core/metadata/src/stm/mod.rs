@@ -17,6 +17,7 @@
 
 pub mod authz;
 pub mod consumer_group;
+pub mod id_slab;
 pub mod mux;
 pub mod result;
 pub mod snapshot;
