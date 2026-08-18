@@ -196,7 +196,15 @@ async fn handle_messages<T: Source>(
                     }
                 };
 
-                callback(plugin_id, messages.as_ptr(), messages.len());
+                // The callback can block for backpressure (the runtime parks
+                // it while its bounded forwarding channel is full), and this
+                // task runs on the runtime shared by every instance loaded
+                // from this library. Hand the worker off so a saturated
+                // instance cannot pin it and stall a sibling's close, which
+                // waits on this task exiting.
+                tokio::task::block_in_place(|| {
+                    callback(plugin_id, messages.as_ptr(), messages.len());
+                });
             }
         }
     }
