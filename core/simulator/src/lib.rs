@@ -994,7 +994,7 @@ mod tests {
     /// heartbeat timeout and elect a new primary via view change.
     #[test]
     fn view_change_after_primary_crash() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1092,7 +1092,7 @@ mod tests {
     /// Impossible before the superblock, since a rebuilt consensus starts at view 0.
     #[test]
     fn given_advanced_view_when_metadata_replica_restarts_should_recover_view_from_superblock() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1202,7 +1202,7 @@ mod tests {
 
     #[test]
     fn given_committed_metadata_when_solo_replica_restarts_should_recover_from_own_wal() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn given_registered_client_when_solo_replica_restarts_should_recover_session_from_own_wal() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1367,7 +1367,7 @@ mod tests {
         // split-brain on its restart. The positive control is
         // `given_advanced_view_when_metadata_replica_restarts_...`, which elects a new
         // primary from the same crash with healthy superblocks.
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1456,7 +1456,7 @@ mod tests {
     /// dedup if they need at-most-once-per-payload.
     #[test]
     fn failover_retry_re_executes_under_at_least_once() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1571,7 +1571,7 @@ mod tests {
     /// `handle_commit_message_timeout` used to assert `commit_min == commit_max`.
     #[test]
     fn view_change_behind_backup_becomes_primary() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1639,7 +1639,7 @@ mod tests {
     /// and workload) produces an identical reply-header sequence.
     #[test]
     fn workload_replay_is_deterministic() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1696,7 +1696,7 @@ mod tests {
         };
         use strum::{EnumCount, IntoEnumIterator};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1766,7 +1766,7 @@ mod tests {
         };
         use strum::{EnumCount, IntoEnumIterator};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1832,7 +1832,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1905,7 +1905,7 @@ mod tests {
             oracle,
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1963,7 +1963,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
             oracle,
         };
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2029,7 +2029,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2119,7 +2119,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2212,7 +2212,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2394,7 +2394,7 @@ mod tests {
         use consensus::MetadataHandle;
         use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2445,7 +2445,7 @@ mod tests {
     fn peer_shard_resolves_namespace_via_shard0_read_handle() {
         use iggy_binary_protocol::WireIdentifier;
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2499,7 +2499,7 @@ mod tests {
     /// post-change send commits through the mesh.
     #[test]
     fn multi_shard_view_change_after_primary_crash() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2598,7 +2598,7 @@ mod tests {
     /// Schedule hash for `seed` after stepping the consensus plane with no
     /// client traffic, with the dispatch shell on or off.
     fn consensus_schedule_hash(seed: u64, shell: bool) -> u64 {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2650,7 +2650,7 @@ mod tests {
     /// plus its metadata, log a client in against root, produce one message,
     /// then poll. Returns the poll reply's raw bytes and the schedule hash.
     fn shell_produce_poll(seed: u64) -> (Vec<u8>, u64) {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2760,7 +2760,7 @@ mod tests {
         use consensus::PartitionsHandle;
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2859,7 +2859,7 @@ mod tests {
         use consensus::PartitionsHandle;
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2957,7 +2957,7 @@ mod tests {
         use consensus::MetadataHandle;
         use journal::{Journal, JournalHandle};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -3069,7 +3069,7 @@ mod tests {
             header.group == BLOCKED_NS.load(Ordering::Relaxed)
         }
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -3177,7 +3177,7 @@ mod tests {
             oracle,
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -3295,7 +3295,7 @@ mod view_change_data_loss_tests {
     #[test]
     fn given_committed_op_missing_on_next_primary_when_primary_crashes_should_survive_view_change()
     {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -3393,7 +3393,7 @@ mod view_change_data_loss_tests {
     #[test]
     fn given_a_register_inside_the_view_start_persist_when_the_pipeline_rebuilds_should_commit_once()
      {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,

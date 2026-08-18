@@ -27,7 +27,7 @@ use metadata::stm::mux::WithFactory;
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use metadata::{IggyMetadata, apply_committed_prepare};
-use partitions::{IggyPartitions, PartitionsConfig};
+use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
 use server::bootstrap::{ShellHandlers, ShellShardHandle, wire_shell_handlers};
 use server_common::crypto;
 use server_common::sharding::{METADATA_GROUP, ShardId};
@@ -287,6 +287,7 @@ pub fn new_shard(
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
         preallocate_segments: false,
         encryptor: None,
+        path_layout: PartitionPathLayout::default(),
     };
 
     // Shard id is the NODE-LOCAL shard index, never the replica id: the

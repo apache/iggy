@@ -299,6 +299,41 @@ pub struct ClusterConfig {
     /// Replica-to-replica TLS settings for the consensus (`tcp_replica`) port.
     #[serde(default)]
     pub tls: ClusterTlsConfig,
+    /// Shard-0 coordinator placement tunables.
+    #[serde(default)]
+    pub coordinator: ClusterCoordinatorConfig,
+}
+
+/// Placement tunables for the shard-0 coordinator, converted into the shard
+/// crate's `CoordinatorConfig` at bootstrap (the domain type lives there
+/// because `configs` and `shard` share no dependency edge).
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterCoordinatorConfig {
+    /// When `total_shards > 1`, exclude shard 0 from replica placement.
+    /// Shard 0 already hosts the coordinator, the metadata writer, and both
+    /// listeners; replicas are long-lived steady flows, so offload them to
+    /// peer shards by default.
+    #[serde(default = "default_skip_shard_zero_for_replicas")]
+    pub skip_shard_zero_for_replicas: bool,
+    /// When `total_shards > 1`, exclude shard 0 from client placement.
+    /// Default false: client connections are short-lived and benefit from
+    /// shard-0 parallelism more than replicas do.
+    #[serde(default)]
+    pub skip_shard_zero_for_clients: bool,
+}
+
+fn default_skip_shard_zero_for_replicas() -> bool {
+    true
+}
+
+impl Default for ClusterCoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            skip_shard_zero_for_replicas: default_skip_shard_zero_for_replicas(),
+            skip_shard_zero_for_clients: false,
+        }
+    }
 }
 
 /// Replica-to-replica authentication for the consensus (`tcp_replica`) port.
@@ -1451,6 +1486,7 @@ mod tests {
                 previous_shared_secret: "retiring-psk-MUST-NOT-be-persisted".to_owned(),
             },
             tls: ClusterTlsConfig::default(),
+            coordinator: ClusterCoordinatorConfig::default(),
         };
         let serialized = serde_json::to_string(&config).expect("serialize cluster config");
         assert!(
@@ -1783,6 +1819,7 @@ mod cluster_validate_tests {
             nodes,
             auth: ClusterAuthConfig::default(),
             tls: ClusterTlsConfig::default(),
+            coordinator: ClusterCoordinatorConfig::default(),
         }
     }
 
