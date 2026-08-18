@@ -534,7 +534,7 @@ where
 {
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + body_len;
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let header = ReplyHeader {
         checksum: 0,
@@ -560,15 +560,12 @@ where
         operation: prepare_header.operation,
         ..Default::default()
     };
-    // `BytesMut` makes no alignment guarantee, so never cast into it.
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    fill(&mut buffer[header_size..]);
+    fill(&mut bytes[header_size..]);
 
-    // TODO: drop this copy once replies stop round-tripping through `Bytes`
-    // and the binary protocol uses `Owned` end-to-end.
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("reply buffer must contain a valid reply message")
 }
 
 /// Builds a `Reply` carrying only a single-entry result section, no payload:
@@ -601,7 +598,7 @@ pub fn build_result_rejection_reply(
     const RESULT_BODY_LEN: usize = 12;
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + RESULT_BODY_LEN;
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let header = ReplyHeader {
         cluster: request_header.cluster,
@@ -622,15 +619,15 @@ pub fn build_result_rejection_reply(
         operation: request_header.operation,
         ..Default::default()
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    let body = &mut buffer[header_size..];
+    let body = &mut bytes[header_size..];
     body[0..4].copy_from_slice(&1u32.to_le_bytes());
     body[4..8].copy_from_slice(&0u32.to_le_bytes());
     body[8..12].copy_from_slice(&code.to_le_bytes());
 
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("transient reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("transient reply buffer must contain a valid reply message")
 }
 
 /// Reply for fast paths that skip the VSR pipeline (e.g. `AckLevel::NoAck`).
@@ -652,7 +649,7 @@ where
 {
     let header_size = std::mem::size_of::<ReplyHeader>();
     let total_size = header_size + body.len();
-    let mut buffer = bytes::BytesMut::zeroed(total_size);
+    let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let commit = consensus.commit_max();
     let header = ReplyHeader {
@@ -675,14 +672,14 @@ where
         operation: request_header.operation,
         ..Default::default()
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    let bytes = buffer.as_mut_slice();
+    bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
     if !body.is_empty() {
-        buffer[header_size..].copy_from_slice(&body);
+        bytes[header_size..].copy_from_slice(&body);
     }
 
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("reply buffer must contain a valid reply message")
 }
 
 /// Reply that denies a request on the primary before it enters the VSR
@@ -734,7 +731,7 @@ pub fn build_deny_reply_from_request_header(
     status: u32,
 ) -> Message<ReplyHeader> {
     let header_size = std::mem::size_of::<ReplyHeader>();
-    let mut buffer = bytes::BytesMut::zeroed(header_size);
+    let mut buffer = Owned::<4096>::zeroed(header_size);
 
     let header = ReplyHeader {
         cluster: request_header.cluster,
@@ -751,10 +748,9 @@ pub fn build_deny_reply_from_request_header(
         operation: request_header.operation,
         ..Default::default()
     };
-    buffer[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+    buffer.as_mut_slice()[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
-    Message::try_from(Owned::<4096>::copy_from_slice(buffer.as_ref()))
-        .expect("deny reply buffer must contain a valid reply message")
+    Message::try_from(buffer).expect("deny reply buffer must contain a valid reply message")
 }
 
 /// Verify hash chain would not break if we add this header.
