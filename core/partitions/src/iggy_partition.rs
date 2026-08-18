@@ -4832,8 +4832,8 @@ fn send_messages_reply_body(
     let namespace = IggyNamespace::from_raw(namespace);
     SendMessagesResponse {
         confirmations: vec![SendMessagesConfirmationResponse {
-            // `IggyNamespace` packs the ids into 12/12/20 bits, so each
-            // component fits a `u32` by construction.
+            // Every field is narrower than a `u32` (widths compile-asserted in
+            // `iggy_binary_protocol`), so each component fits by construction.
             stream_id: namespace.stream_id() as u32,
             topic_id: namespace.topic_id() as u32,
             partition_id: namespace.partition_id() as u32,

@@ -27,6 +27,7 @@
 //! offset -- making a metadata->offset purge unnecessary for correctness.
 
 use crate::stm::StateHandler;
+use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, CreateConsumerGroupResult, DeleteConsumerGroupResult, JoinConsumerGroupResult,
     LeaveConsumerGroupResult,
@@ -45,7 +46,6 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use serde::{Deserialize, Serialize};
-use slab::Slab;
 use std::sync::Arc;
 
 /// A partition being cooperatively handed off from this member to `target`.
@@ -120,7 +120,7 @@ pub struct ConsumerGroup {
     /// when it advances.
     pub generation: u64,
     pub name: Arc<str>,
-    pub members: Slab<ConsumerGroupMember>,
+    pub members: IdSlab<ConsumerGroupMember>,
 }
 
 impl ConsumerGroup {
@@ -130,7 +130,7 @@ impl ConsumerGroup {
             id,
             generation: 0,
             name,
-            members: Slab::new(),
+            members: IdSlab::new(),
         }
     }
 
@@ -910,7 +910,7 @@ impl ConsumerGroupSnapshot {
 
     #[must_use]
     pub fn into_group(self) -> ConsumerGroup {
-        let members: Slab<ConsumerGroupMember> = self
+        let members: IdSlab<ConsumerGroupMember> = self
             .members
             .into_iter()
             .map(|(member_key, member_snap)| {

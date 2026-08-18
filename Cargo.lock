@@ -8420,7 +8420,6 @@ dependencies = [
  "rmp-serde",
  "serde",
  "server_common",
- "slab",
  "tempfile",
  "tracing",
 ]
@@ -11802,7 +11801,6 @@ dependencies = [
  "server_common",
  "shard",
  "shard_allocator",
- "slab",
  "socket2 0.6.5",
  "strum 0.28.0",
  "sysinfo 0.39.6",

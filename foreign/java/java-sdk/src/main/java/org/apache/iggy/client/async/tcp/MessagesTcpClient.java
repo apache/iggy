@@ -236,8 +236,8 @@ public class MessagesTcpClient implements MessagesClient {
                     return CompletableFuture.completedFuture(emptyPolledMessages());
                 }
                 return CompletableFuture.failedFuture(new IggyResourceNotFoundException(
-                        IggyErrorCode.CONSUMER_GROUP_NOT_JOINED,
-                        IggyErrorCode.CONSUMER_GROUP_NOT_JOINED.getCode(),
+                        IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND,
+                        IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND.getCode(),
                         "Cannot poll consumer group " + consumer.id() + " for topic " + topicId + " in stream "
                                 + streamId + ": this client is not a member, join the group first",
                         Optional.empty(),
