@@ -230,11 +230,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         // Reused across every pump iteration; pre-size to skip the
@@ -272,7 +269,7 @@ where
                     // decoupled from the pump again without reintroducing the
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
-                    self.tick_partitions().await;
+                    self.tick_partitions(&mut namespace_scratch).await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -367,11 +364,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         match frame {

@@ -170,8 +170,42 @@ impl IggyIndexReader {
         entry_count: u64,
         offset: u64,
     ) -> Result<Option<IggyIndex>, IggyError> {
-        self.lower_bound_by(entry_count, |entry| entry.offset, offset)
-            .await
+        Ok(self
+            .lower_bound_by(entry_count, |entry| entry.offset, offset)
+            .await?
+            .map(|(entry, _)| entry))
+    }
+
+    /// [`Self::offset_lower_bound`] that also reports the successor entry's
+    /// offset (`None` when the match is the last entry), bounding the offset
+    /// interval the match resolves for. Costs one extra entry read; callers
+    /// memoizing the resolution use the bound to answer later in-interval
+    /// queries without reopening the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any probed entry cannot be read.
+    pub async fn offset_lower_bound_with_successor(
+        &self,
+        entry_count: u64,
+        offset: u64,
+    ) -> Result<Option<(IggyIndex, Option<u64>)>, IggyError> {
+        let Some((entry, successor_index)) = self
+            .lower_bound_by(entry_count, |entry| entry.offset, offset)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let successor_offset = if successor_index < entry_count {
+            Some(
+                self.read_entry_at(successor_index * IGGY_INDEX_SIZE as u64)
+                    .await?
+                    .offset,
+            )
+        } else {
+            None
+        };
+        Ok(Some((entry, successor_offset)))
     }
 
     /// Last entry with `timestamp` at or below the target; `None` semantics
@@ -185,16 +219,21 @@ impl IggyIndexReader {
         entry_count: u64,
         timestamp: u64,
     ) -> Result<Option<IggyIndex>, IggyError> {
-        self.lower_bound_by(entry_count, |entry| entry.timestamp, timestamp)
-            .await
+        Ok(self
+            .lower_bound_by(entry_count, |entry| entry.timestamp, timestamp)
+            .await?
+            .map(|(entry, _)| entry))
     }
 
+    /// Binary search for the last entry with `key` at or below `target`,
+    /// returning it with its successor's entry index (the standard
+    /// lower-bound exit: `low` lands on the first entry above the target).
     async fn lower_bound_by(
         &self,
         entry_count: u64,
         key: impl Fn(&IggyIndex) -> u64,
         target: u64,
-    ) -> Result<Option<IggyIndex>, IggyError> {
+    ) -> Result<Option<(IggyIndex, u64)>, IggyError> {
         let mut low = 0u64;
         let mut high = entry_count;
         let mut result = None;
@@ -208,7 +247,7 @@ impl IggyIndexReader {
                 high = middle;
             }
         }
-        Ok(result)
+        Ok(result.map(|entry| (entry, low)))
     }
 }
 
@@ -267,6 +306,37 @@ mod tests {
         assert!(below_range.is_none());
         let above_range = reader.offset_lower_bound(count, 35).await.expect("lookup");
         assert_eq!(at_or_below(above_range), Some(30));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn offset_lower_bound_with_successor_reports_the_interval_ceiling() {
+        let (dir, path) = write_index_file(&entries()).await;
+        let reader = IggyIndexReader::new(&path).await.expect("open index");
+        let count = reader.entry_count().await.expect("entry count");
+
+        let mid = reader
+            .offset_lower_bound_with_successor(count, 25)
+            .await
+            .expect("lookup")
+            .expect("in range");
+        assert_eq!((mid.0.offset, mid.1), (20, Some(30)));
+        let last = reader
+            .offset_lower_bound_with_successor(count, 35)
+            .await
+            .expect("lookup")
+            .expect("in range");
+        assert_eq!(
+            (last.0.offset, last.1),
+            (30, None),
+            "the last entry has no successor to bound its interval",
+        );
+        let below_range = reader
+            .offset_lower_bound_with_successor(count, 5)
+            .await
+            .expect("lookup");
+        assert!(below_range.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

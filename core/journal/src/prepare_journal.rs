@@ -741,7 +741,7 @@ impl PrepareJournal {
     clippy::cast_sign_loss,
     clippy::future_not_send
 )]
-impl Journal<FileStorage> for PrepareJournal {
+impl Journal for PrepareJournal {
     fn last_op(&self) -> Option<u64> {
         self.last_op.get()
     }
@@ -1162,7 +1162,6 @@ impl Journal<FileStorage> for PrepareJournal {
 }
 
 impl JournalHandle for PrepareJournal {
-    type Storage = FileStorage;
     type Target = Self;
 
     fn handle(&self) -> &Self::Target {

@@ -1808,9 +1808,11 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
-        // TODO(hubcio): crossfire's Flavor trait blocks unbounded channels
-        // with the current type setup; revisit when crossfire grows an
-        // unbounded variant or we replace it.
+        // Placeholder inbox: the simulator delivers frames straight to
+        // `on_message` (see the `shard_count` note below), so nothing ever
+        // sends here and capacity 1 exists only to satisfy the field. The
+        // real inbox is bounded on purpose (`inbox_capacity` is the shard's
+        // backpressure), so no unbounded variant is wanted here either.
         let (_tx, inbox) = channel(1);
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
@@ -2450,11 +2452,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3308,11 +3307,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3330,11 +3326,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3352,11 +3345,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3393,11 +3383,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3566,11 +3553,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -3616,11 +3600,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -3706,11 +3687,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -3914,11 +3892,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -4018,11 +3993,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -4070,11 +4042,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StreamsFrontend,
     {
         let header = *msg.header();
@@ -4309,11 +4278,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         tracing::debug!(
             shard = self.id,
@@ -4483,11 +4449,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -4854,11 +4817,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         let partitions = self.plane.partitions();
         let started = {
@@ -5027,11 +4987,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let metadata = self.plane.metadata();
@@ -5148,11 +5105,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let metadata = self.plane.metadata();
@@ -5429,11 +5383,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -5569,11 +5520,8 @@ where
         B: MessageBus + 'static,
         T: ShardsTable,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         /// Alloc cap per artifact: a corrupt length field must not OOM the
@@ -6014,11 +5962,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
         T: ShardsTable,
     {
@@ -6068,11 +6013,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         let planes = self.plane.inner();
@@ -6290,27 +6232,25 @@ where
     /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
     #[allow(clippy::future_not_send)]
     #[allow(clippy::too_many_lines)]
-    pub async fn tick_partitions(&self)
+    pub async fn tick_partitions(&self, namespace_scratch: &mut Vec<IggyNamespace>)
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
+        debug_assert!(
+            namespace_scratch.is_empty(),
+            "namespace_scratch must be empty on entry",
+        );
         let partitions = self.plane.partitions();
         let repair_retry_ticks = self.repair_retry_ticks.get();
         // Fan out over every group (each partition's heartbeat/retransmit timer
         // must advance), so the keyed single-namespace lookup the control-frame
         // handlers use does not apply here. The namespaces are snapshotted into
-        // an owned Vec so no partitions-plane borrow is held across the tick
-        // `.await`.
-        // TODO(hubcio): reuse the pump's `namespace_scratch` (as
-        // `process_loopback` does) to drop this per-tick alloc; a quiet cluster
-        // still pays one Vec per heartbeat.
-        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+        // the pump's owned scratch (as `process_loopback` does) so no
+        // partitions-plane borrow is held across the tick `.await`.
+        namespace_scratch.extend(partitions.namespaces().copied());
 
         // Pre-pass: issue every group's pending superblock persist
         // CONCURRENTLY. A cluster-wide view change makes every group on
@@ -6321,7 +6261,7 @@ where
         // its store, lock, and failure bookkeeping, all behind `&self`),
         // and the per-group loop below re-checks the gate on its lock-free
         // fast path, so gating semantics are unchanged.
-        let pending_persists: Vec<_> = namespaces
+        let pending_persists: Vec<_> = namespace_scratch
             .iter()
             .copied()
             .filter(|namespace| {
@@ -6362,7 +6302,7 @@ where
         // already accepts.
         let mut transfers_inflight: Option<usize> = None;
 
-        for namespace in namespaces {
+        for namespace in namespace_scratch.drain(..) {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
                 continue;
             };
@@ -8218,11 +8158,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -8348,11 +8285,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
     J: JournalHandle,
-    <J as JournalHandle>::Target: Journal<
-            <J as JournalHandle>::Storage,
-            Entry = Message<PrepareHeader>,
-            Header = PrepareHeader,
-        >,
+    <J as JournalHandle>::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
 {
     tracing::info!(
         view = consensus.view(),
@@ -8446,11 +8379,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
     MJ: JournalHandle,
-    <MJ as JournalHandle>::Target: Journal<
-            <MJ as JournalHandle>::Storage,
-            Entry = Message<PrepareHeader>,
-            Header = PrepareHeader,
-        >,
+    <MJ as JournalHandle>::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
 {
     if !consensus.local_dvc_suffix_stale() {
         return;
@@ -8649,11 +8578,7 @@ fn build_metadata_dvc_suffix<J>(
 ) -> DvcSuffix
 where
     J: JournalHandle,
-    <J as JournalHandle>::Target: Journal<
-            <J as JournalHandle>::Storage,
-            Entry = Message<PrepareHeader>,
-            Header = PrepareHeader,
-        >,
+    <J as JournalHandle>::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
 {
     let Some(journal) = journal else {
         return DvcSuffix::empty();
@@ -8954,11 +8879,7 @@ async fn dispatch_vsr_actions<B, P, J>(
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
     J: JournalHandle,
-    <J as JournalHandle>::Target: Journal<
-            <J as JournalHandle>::Storage,
-            Entry = Message<PrepareHeader>,
-            Header = PrepareHeader,
-        >,
+    <J as JournalHandle>::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
 {
     use std::mem::size_of;
 

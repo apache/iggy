@@ -204,7 +204,7 @@ pub fn wire_shell_handlers<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -790,6 +790,13 @@ pub fn bootstrap(
     // Shared metadata-group view: written by shard 0's publisher task, read by
     // every shard's cluster-metadata roster so leader marking works off-shard.
     let metadata_view = Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN));
+    // Every shard's metric handles, minted before the threads spawn: each
+    // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
+    // the whole set (counters are Arc-backed, so cross-thread reads see the
+    // owning shard's bumps).
+    let shard_metrics_all: Vec<ShardMetrics> = (0..shards_count)
+        .map(|_| ShardMetrics::for_shard())
+        .collect();
     for (idx, assignment) in assignments.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let shard_id = idx as u16;
@@ -820,6 +827,7 @@ pub fn bootstrap(
         };
 
         let metadata_view_for_shard = Arc::clone(&metadata_view);
+        let shard_metrics_for_shard = shard_metrics_all.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -836,6 +844,7 @@ pub fn bootstrap(
                     barrier_for_shard,
                     owner_table_for_shard,
                     metadata_view_for_shard,
+                    shard_metrics_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -899,6 +908,7 @@ fn run_shard_thread(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     metadata_view: Arc<AtomicU64>,
+    shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -940,6 +950,7 @@ fn run_shard_thread(
             barrier,
             owner_table,
             metadata_view,
+            shard_metrics_all,
         ))
         .await
     });
@@ -967,6 +978,7 @@ async fn shard_main(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     metadata_view: Arc<AtomicU64>,
+    shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -1142,7 +1154,7 @@ async fn shard_main(
     // margin (config validation keeps journal_slots >= 4x this).
     metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
 
-    let shard_metrics = ShardMetrics::for_shard();
+    let shard_metrics = shard_metrics_all[usize::from(shard_id)].clone();
     // Notifier install deferred until after tick handler wires below.
     let senders_for_notifier = senders.clone();
     let metrics_for_notifier = shard_metrics.clone();
@@ -1405,6 +1417,7 @@ async fn shard_main(
             accepted_replica,
             dialed_replica,
             accepted_client,
+            &shard_metrics_all,
         )
         .await
         {
@@ -2970,6 +2983,7 @@ async fn start_tcp_runtime(
     accepted_replica: AcceptedReplicaFn,
     dialed_replica: DialedReplicaFn,
     accepted_clients: LocalClientAcceptFns,
+    shard_metrics_all: &[ShardMetrics],
 ) -> Result<(), ServerError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
         start_via_replica_io(
@@ -3015,6 +3029,7 @@ async fn start_tcp_runtime(
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
+            shard_metrics_all,
         )
         .await?;
     }

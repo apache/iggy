@@ -945,7 +945,7 @@ where
     B: MessageBus,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -1313,7 +1313,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
 {
     fn is_applicable<H>(&self, message: &<VsrConsensus<B, P> as Consensus>::Message<H>) -> bool
@@ -1456,7 +1456,7 @@ where
     B: MessageBus,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -3090,7 +3090,7 @@ where
     P: Pipeline<Entry = PipelineEntry>,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
