@@ -3882,10 +3882,13 @@ where
                 .consensus()
                 .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
         let adopted = !actions.is_empty();
-        if adopted && let Some(pending) = partition.consensus().pending_view_log() {
+        if adopted {
             // Ahead of the local dispatch, which rebuilds the pipeline out of the
-            // journal this rewrites. Same position as the metadata arm's twin.
-            reconcile_partition_view_divergence(self.id, partition, &pending).await;
+            // journal this rewrites. Same position as the metadata arm's twin, and
+            // like it, pending-less adoptions (empty StartView suffix) still sweep
+            // the relics above the adopted head.
+            let pending = partition.consensus().pending_view_log();
+            reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
         }
         let consensus = partition.consensus();
         let (local_actions, wire_actions) = split_local_actions(actions);
@@ -4895,7 +4898,7 @@ where
             // already holds a header for, so the scan would report a gap nothing
             // fills. Backups reach this on StartView adoption; a primary-elect has no
             // adoption to hang it off.
-            reconcile_partition_view_divergence(self.id, partition, &pending).await;
+            reconcile_partition_view_divergence(self.id, partition, Some(&pending)).await;
             let consensus = partition.consensus();
             // Identity, not presence: see the metadata twin. The floor is the local
             // commit point, the partition twin of the metadata snapshot floor:
@@ -5030,6 +5033,13 @@ where
     /// `RebuildPipeline` reads the pipeline back out of it, and `CommitJournal`
     /// applies whatever sits at each op up to the merged commit point.
     ///
+    /// Runs on every adoption, parked suffix or not: an EMPTY `StartView` suffix
+    /// (`commit == op`, the steady case) parks no pending log, yet adoption still
+    /// drops the head under any journaled relics above it, and the primary's next
+    /// prepare would collide with them in `append` and poison the journal. With
+    /// no pending log the divergence scan has nothing to walk and only the
+    /// above-head sweep applies, with the head read off the adopted sequencer.
+    ///
     /// The split at the announced commit point is what matters. Above it a
     /// disagreement is ordinary, so the entry is dropped and the primary's
     /// retransmission refills the range. At or below it, this replica applied
@@ -5052,9 +5062,7 @@ where
         let Some(ref consensus) = metadata.consensus else {
             return;
         };
-        let Some(pending) = consensus.pending_view_log() else {
-            return;
-        };
+        let pending = consensus.pending_view_log();
         let Some(journal) = metadata.journal.as_ref() else {
             return;
         };
@@ -5063,10 +5071,11 @@ where
         // not the view's commit point: `pending.commit_max` is the new primary's
         // number and a backup can sit above it. Splitting on the view's number
         // would drop already-executed ops with no rollback, and silently.
-        let applied_floor = pending.commit_max.max(consensus.commit_min());
+        let announced_commit = pending.as_ref().map_or(0, |pending| pending.commit_max);
+        let applied_floor = announced_commit.max(consensus.commit_min());
 
         let mut repairable_from: Option<u64> = None;
-        for canonical in &pending.headers {
+        for canonical in pending.as_ref().map_or(&[][..], |pending| &pending.headers) {
             let Some(local) = usize::try_from(canonical.op)
                 .ok()
                 .and_then(|slot| journal.handle().header(slot))
@@ -5081,7 +5090,7 @@ where
                     shard = self.id,
                     op = canonical.op,
                     view = consensus.view(),
-                    commit_max = pending.commit_max,
+                    commit_max = announced_commit,
                     commit_min = consensus.commit_min(),
                     local_checksum = local.checksum,
                     canonical_checksum = canonical.checksum,
@@ -5100,7 +5109,12 @@ where
         // under it, and the next prepare at `op_head + 1` then collides in `append`,
         // which refuses the slot even when the ops match. Floored at the applied
         // point too: an executed op is not rollback-able whatever the head says.
-        let above_head = pending.op_head.max(applied_floor) + 1;
+        // With no parked suffix the adopted sequencer IS the announced head.
+        let op_head = pending.as_ref().map_or_else(
+            || consensus.sequencer().current_sequence(),
+            |pending| pending.op_head,
+        );
+        let above_head = op_head.max(applied_floor) + 1;
         if journal
             .handle()
             .last_op()
@@ -5128,7 +5142,7 @@ where
                     shard = self.id,
                     from_op,
                     removed,
-                    op_head = pending.op_head,
+                    op_head,
                     view = consensus.view(),
                     "dropped {removed} uncommitted entries from op {from_op} that disagreed with \
                      the view's log; the primary's retransmission refills the range"
@@ -8766,17 +8780,18 @@ fn build_dvc_suffix(
 async fn reconcile_partition_view_divergence<B, SB>(
     shard: u16,
     partition: &mut IggyPartition<B, SB>,
-    pending: &MergedLog,
+    pending: Option<&MergedLog>,
 ) where
     B: MessageBus,
     SB: journal::superblock::SuperblockStore,
 {
     // Truncation is safe only above what this replica has *applied*, which is not
     // the view's commit point: a backup can sit above it.
-    let applied_floor = pending.commit_max.max(partition.consensus().commit_min());
+    let announced_commit = pending.map_or(0, |pending| pending.commit_max);
+    let applied_floor = announced_commit.max(partition.consensus().commit_min());
 
     let mut repairable_from: Option<u64> = None;
-    for canonical in &pending.headers {
+    for canonical in pending.map_or(&[][..], |pending| &pending.headers) {
         let Some(local) = partition.log.journal().inner.header_by_op(canonical.op) else {
             continue;
         };
@@ -8789,7 +8804,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
                 namespace_raw = partition.consensus().group(),
                 op = canonical.op,
                 view = partition.consensus().view(),
-                commit_max = pending.commit_max,
+                commit_max = announced_commit,
                 commit_min = partition.consensus().commit_min(),
                 local_checksum = local.checksum,
                 canonical_checksum = canonical.checksum,
@@ -8803,8 +8818,13 @@ async fn reconcile_partition_view_divergence<B, SB>(
     }
 
     // The suffix above the announced head, which no canonical header names. As on
-    // the metadata twin, except here `append` pushes a duplicate rather than erroring.
-    let above_head = pending.op_head.max(applied_floor) + 1;
+    // the metadata twin, except here `append` pushes a duplicate rather than
+    // erroring. With no parked suffix the adopted sequencer IS the announced head.
+    let op_head = pending.map_or_else(
+        || partition.consensus().sequencer().current_sequence(),
+        |pending| pending.op_head,
+    );
+    let above_head = op_head.max(applied_floor) + 1;
     if partition
         .log
         .journal()
@@ -8825,7 +8845,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
                 namespace_raw = partition.consensus().group(),
                 from_op,
                 removed,
-                op_head = pending.op_head,
+                op_head,
                 view = partition.consensus().view(),
                 "dropped {removed} uncommitted partition entries from op {from_op} that \
                  disagreed with the view's log; the primary's retransmission refills the range"
