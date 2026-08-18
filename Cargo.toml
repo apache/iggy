@@ -323,7 +323,7 @@ tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.3.1"
 testcontainers = { version = "0.27.3", features = ["reusable-containers"] }
-testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wait"] }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wait", "mssql_server"] }
 thiserror = "2.0.19"
 tiberius = "0.12.3"
 tokio = { version = "1.53.1", features = ["full"] }
