@@ -118,6 +118,7 @@ pub fn new_shard(
     replica_count: u8,
     senders: Vec<shard::TaggedSender>,
     inbox: shard::Receiver<shard::ShardFrame>,
+    reply_inbox: shard::Receiver<shard::ShardFrame>,
     clock: ConsensusClock,
     shell: bool,
     reader_bundle: Option<SimMetadataBundle>,
@@ -339,6 +340,7 @@ pub fn new_shard(
             partitions,
             senders,
             inbox,
+            reply_inbox,
             PapayaShardsTable::new(),
             shard::PartitionConsensusConfig::with_clock(
                 CLUSTER_ID,

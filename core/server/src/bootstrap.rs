@@ -685,6 +685,13 @@ fn validate_sharding_runtime_knobs(
             max: INBOX_CAPACITY_MAX,
         });
     }
+    let reply_inbox_capacity = sharding.reply_inbox_capacity;
+    if reply_inbox_capacity == 0 || reply_inbox_capacity > INBOX_CAPACITY_MAX {
+        return Err(ServerError::InvalidReplyInboxCapacity {
+            value: reply_inbox_capacity,
+            max: INBOX_CAPACITY_MAX,
+        });
+    }
     let drain_timeout = sharding.shutdown_drain_timeout.get_duration();
     if drain_timeout.is_zero() || drain_timeout > SHUTDOWN_DRAIN_TIMEOUT_MAX {
         return Err(ServerError::InvalidShutdownDrainTimeout {
@@ -756,9 +763,11 @@ pub fn bootstrap(
     // busy-loop every shutdown watchdog on a zero poll cadence, or wedge
     // process exit on an unbounded drain budget.
     let inbox_capacity = config.system.sharding.inbox_capacity;
+    let reply_inbox_capacity = config.system.sharding.reply_inbox_capacity;
     validate_sharding_runtime_knobs(&config.system.sharding)?;
 
-    let (senders, mut inboxes) = shard_mesh_channels(total_shards, inbox_capacity);
+    let (senders, mut inboxes, mut reply_inboxes) =
+        shard_mesh_channels(total_shards, inbox_capacity, reply_inbox_capacity);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let config = Arc::new(config);
     // One owner table per server process, Arc-cloned into every shard's bus so
@@ -803,6 +812,9 @@ pub fn bootstrap(
         let inbox = inboxes[idx]
             .take()
             .expect("shard_mesh_channels populates every inbox slot exactly once");
+        let reply_inbox = reply_inboxes[idx]
+            .take()
+            .expect("shard_mesh_channels populates every reply-inbox slot exactly once");
         let senders_for_shard = senders.clone();
         let config_for_shard = Arc::clone(&config);
         let shutdown_flag_for_shard = Arc::clone(&shutdown_flag);
@@ -838,6 +850,7 @@ pub fn bootstrap(
                     assignment,
                     senders_for_shard,
                     inbox,
+                    reply_inbox,
                     config_for_shard,
                     shutdown_flag_for_shard,
                     metadata_handoff_for_shard,
@@ -902,6 +915,7 @@ fn run_shard_thread(
     assignment: ShardInfo,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     config: Arc<ServerConfig>,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
@@ -944,6 +958,7 @@ fn run_shard_thread(
             replica_id,
             senders,
             inbox,
+            reply_inbox,
             &config,
             shutdown_flag,
             metadata_handoff,
@@ -972,6 +987,7 @@ async fn shard_main(
     replica_id: Option<u8>,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     config: &ServerConfig,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
@@ -1170,6 +1186,7 @@ async fn shard_main(
         Rc::clone(&bus),
         senders,
         inbox,
+        reply_inbox,
         shard_metrics,
         Arc::clone(&metadata_view),
     ))
@@ -1769,6 +1786,7 @@ async fn build_shard_for_thread(
     bus: Rc<IggyMessageBus>,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     metadata_view: Arc<AtomicU64>,
 ) -> Result<(Rc<ServerShard>, Rc<RefCell<SessionManager>>), ServerError> {
@@ -2034,6 +2052,7 @@ async fn build_shard_for_thread(
         partitions,
         senders,
         inbox,
+        reply_inbox,
         shards_table,
         PartitionConsensusConfig::new(
             topology.cluster_id,

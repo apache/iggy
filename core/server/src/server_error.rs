@@ -87,6 +87,8 @@ pub enum ServerError {
     },
     #[error("system.sharding.inbox_capacity must be in 1..={max}; got {value}")]
     InvalidInboxCapacity { value: usize, max: usize },
+    #[error("system.sharding.reply_inbox_capacity must be in 1..={max}; got {value}")]
+    InvalidReplyInboxCapacity { value: usize, max: usize },
     #[error("system.sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,

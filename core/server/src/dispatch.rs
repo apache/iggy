@@ -4454,6 +4454,128 @@ mod tests {
         );
     }
 
+    /// A test shard wired to its own lanes (the held sender feeds them),
+    /// for the reply-lane pump tests below.
+    fn reply_lane_test_shard(name: &str) -> (SpyBus, shard::TaggedSender, Rc<TestShard>) {
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let (sender, inbox_rx, reply_inbox_rx) = shard_channel(0, 16, 16);
+        let lane_sender = sender.clone();
+        let shard = TestShard::new(
+            ShardIdentity::new(0, name.to_string()),
+            bus.clone(),
+            Rc::new(|_, _| {}),
+            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_, _, _| {}),
+            metadata,
+            partitions,
+            vec![sender],
+            inbox_rx,
+            reply_inbox_rx,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+            None,
+            ShardMetrics::for_shard(),
+        )
+        .expect("single-sender ring is canonically ordered");
+        (bus, lane_sender, Rc::new(shard))
+    }
+
+    fn reply_lane_forward(client_id: u128) -> ShardFrame {
+        ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
+            client_id,
+            msg: server_common::iobuf::Owned::<MESSAGE_ALIGN>::zeroed(64).into(),
+        })
+    }
+
+    /// A frame on the reply lane must reach the client through the RUNNING
+    /// pump's reply arm: the lane split moved `ForwardClientSend` off the
+    /// main inbox, so a pump that forgot to service the new lane would
+    /// strand every cross-shard reply while the send sites happily report
+    /// success.
+    #[compio::test]
+    async fn pump_live_arm_delivers_reply_lane_forwards() {
+        const TRANSPORT: u128 = 92;
+        let (bus, lane_sender, shard) = reply_lane_test_shard("reply-lane-live-arm-test");
+
+        let (stop_tx, stop_rx) = shard::channel::<()>(1);
+        let pump_shard = Rc::clone(&shard);
+        let pump = compio::runtime::spawn(async move {
+            pump_shard.run_message_pump(stop_rx).await;
+        });
+
+        lane_sender
+            .reply_sender()
+            .try_send(reply_lane_forward(TRANSPORT))
+            .expect("reply lane has capacity");
+
+        // The pump is idle on the main lane, so its bottom reply arm must
+        // serve the frame without any main-lane traffic or shutdown drain.
+        let mut delivered = false;
+        for _ in 0..500 {
+            if !bus.client_replies.borrow().is_empty() {
+                delivered = true;
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        stop_tx.try_send(()).expect("stop channel has capacity");
+        let _ = pump.await;
+
+        assert!(
+            delivered,
+            "the live reply arm must deliver a forward while the pump runs"
+        );
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies[0].0, TRANSPORT, "forward must reach its client");
+    }
+
+    /// The shutdown path must ALSO deliver reply-lane frames: a forward
+    /// already accepted by the lane when the stop signal wins the biased
+    /// select would otherwise be silently destroyed at teardown.
+    #[compio::test]
+    async fn pump_shutdown_drain_delivers_reply_lane_forwards() {
+        const TRANSPORT: u128 = 93;
+        let (bus, lane_sender, shard) = reply_lane_test_shard("reply-lane-drain-test");
+
+        lane_sender
+            .reply_sender()
+            .try_send(reply_lane_forward(TRANSPORT))
+            .expect("reply lane has capacity");
+
+        // Pre-armed stop: the pump exits through the biased stop arm and the
+        // post-loop drain must still deliver the reply-lane frame.
+        let (stop_tx, stop_rx) = shard::channel::<()>(1);
+        stop_tx.try_send(()).expect("stop channel has capacity");
+        shard.run_message_pump(stop_rx).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            1,
+            "the pump's reply-lane drain must deliver the forwarded reply"
+        );
+        assert_eq!(
+            replies[0].0, TRANSPORT,
+            "the forward must reach the client it was addressed to"
+        );
+    }
+
     /// A send parked for a namespace that is torn down before materialising
     /// (create -> delete before the reconciler's `InsertOwned`) is discarded
     /// on `ConfirmRemove`. The discard must stage the same retriable
@@ -4482,9 +4604,10 @@ mod tests {
             },
         );
         // Real sender ring so the staged deny is observable: the test holds
-        // the receiving end of this shard's own channel.
-        let (sender, pump_rx) = shard_channel(0, 16);
-        let (_inbox_tx, inbox_rx) = shard_channel(0, 1);
+        // the receiving ends of this shard's own lanes. The deny is a client
+        // Reply forward, so it lands on the REPLY lane.
+        let (sender, _pump_rx, reply_rx) = shard_channel(0, 16, 16);
+        let (_inbox_tx, inbox_rx, reply_inbox_rx) = shard_channel(0, 1, 1);
         let shard = TestShard::new(
             ShardIdentity::new(0, "discarded-parked-send-test".to_string()),
             bus.clone(),
@@ -4497,6 +4620,7 @@ mod tests {
             partitions,
             vec![sender],
             inbox_rx,
+            reply_inbox_rx,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
@@ -4517,7 +4641,7 @@ mod tests {
         shard.apply_reconcile_ops();
 
         let mut denies = Vec::new();
-        while let Ok(frame) = pump_rx.try_recv() {
+        while let Ok(frame) = reply_rx.try_recv() {
             if let ShardFrame::Lifecycle(LifecycleFrame::ForwardClientSend { client_id, msg }) =
                 frame
             {

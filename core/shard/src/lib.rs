@@ -400,44 +400,60 @@ where
     }
 }
 
-/// Create a bounded inter-shard channel whose sender is tagged with the
-/// owning shard.
+/// Create the bounded inter-shard channel pair (main lane + reply lane)
+/// whose sender is tagged with the owning shard.
 ///
 /// Bootstrap uses this to build the per-shard sender `Vec` such that
-/// `vec[i]` necessarily reaches shard `i`.
+/// `vec[i]` necessarily reaches shard `i`. The second receiver is the reply
+/// lane: cross-shard client `Reply` forwards, whose drops are terminal, ride
+/// a channel of their own so a consensus burst filling the main lane cannot
+/// evict them (see `[system.sharding] reply_inbox_capacity`).
 #[must_use]
-pub fn shard_channel(owner_shard: u16, capacity: usize) -> (TaggedSender, Receiver<ShardFrame>) {
+pub fn shard_channel(
+    owner_shard: u16,
+    capacity: usize,
+    reply_capacity: usize,
+) -> (TaggedSender, Receiver<ShardFrame>, Receiver<ShardFrame>) {
     let (tx, rx) = channel::<ShardFrame>(capacity);
-    (TaggedSender::new(owner_shard, tx), rx)
+    let (reply_tx, reply_rx) = channel::<ShardFrame>(reply_capacity);
+    (TaggedSender::new(owner_shard, tx, reply_tx), rx, reply_rx)
 }
 
-/// Build canonical-ordered `(senders, inboxes)` pair for an N-shard mesh.
+/// Build canonical-ordered `(senders, inboxes, reply_inboxes)` for an
+/// N-shard mesh.
 ///
-/// Each `inboxes[i]` drains exclusively on the runtime owning shard `i`. The
-/// returned `senders` Vec satisfies `senders[i].shard_id() == i` by
-/// construction; clone it into every shard before spawning so all shards
-/// share the same mesh.
+/// Each `inboxes[i]` / `reply_inboxes[i]` drains exclusively on the runtime
+/// owning shard `i`. The returned `senders` Vec satisfies
+/// `senders[i].shard_id() == i` by construction; clone it into every shard
+/// before spawning so all shards share the same mesh.
 ///
 /// Receivers are wrapped in `Option` because [`Receiver`] (crossfire
-/// `AsyncRx`) is non-cloneable on purpose; bootstrap takes the slot for
+/// `AsyncRx`) is non-cloneable on purpose; bootstrap takes the slots for
 /// shard `i` exactly once when spawning the owning thread.
 #[must_use]
-pub fn shard_mesh_channels(
-    total_shards: u16,
-    capacity: usize,
-) -> (Vec<TaggedSender>, Vec<Option<Receiver<ShardFrame>>>) {
+pub fn shard_mesh_channels(total_shards: u16, capacity: usize, reply_capacity: usize) -> ShardMesh {
     let mut senders = Vec::with_capacity(total_shards as usize);
     let mut inboxes = Vec::with_capacity(total_shards as usize);
+    let mut reply_inboxes = Vec::with_capacity(total_shards as usize);
     for shard_id in 0..total_shards {
-        let (tx, rx) = shard_channel(shard_id, capacity);
+        let (tx, rx, reply_rx) = shard_channel(shard_id, capacity, reply_capacity);
         senders.push(tx);
         inboxes.push(Some(rx));
+        reply_inboxes.push(Some(reply_rx));
     }
-    (senders, inboxes)
+    (senders, inboxes, reply_inboxes)
 }
 
-/// A [`Sender`] annotated with the id of the shard whose paired receiver it
-/// feeds.
+/// The canonical N-shard mesh: lane senders plus the per-shard receivers
+/// (`inboxes[i]` / `reply_inboxes[i]` drain on the runtime owning shard `i`).
+pub type ShardMesh = (
+    Vec<TaggedSender>,
+    Vec<Option<Receiver<ShardFrame>>>,
+    Vec<Option<Receiver<ShardFrame>>>,
+);
+
+/// The pair of lane [`Sender`]s annotated with the id of the shard whose
+/// paired receivers they feed.
 ///
 /// Inter-shard routing indexes `senders[i]` with `i == target_shard`. The
 /// plain `Sender` form has no way to verify that invariant at runtime, so a
@@ -446,24 +462,40 @@ pub fn shard_mesh_channels(
 /// [`TaggedSender::new`]) at the channel-creation site; the coordinator and
 /// [`IggyShard`] ctors then validate `senders[i].shard_id() == i`,
 /// returning [`ShardCtorError`] if violated.
+///
+/// `Deref` targets the main lane; [`Self::reply_sender`] exposes the reply
+/// lane (cross-shard client `Reply` forwards, terminal on drop).
 pub struct TaggedSender {
     shard_id: u16,
     inner: Sender<ShardFrame>,
+    reply: Sender<ShardFrame>,
 }
 
 impl TaggedSender {
-    /// Wrap an already-constructed sender with the id of the shard whose
-    /// paired receiver drains it. Prefer [`shard_channel`] unless an
-    /// existing sender is being re-tagged (e.g., tests that build senders
-    /// manually and know the ordering is correct).
+    /// Wrap already-constructed lane senders with the id of the shard whose
+    /// paired receivers drain them. Prefer [`shard_channel`] unless existing
+    /// senders are being re-tagged (e.g., tests that build senders manually
+    /// and know the ordering is correct).
     #[must_use]
-    pub const fn new(shard_id: u16, inner: Sender<ShardFrame>) -> Self {
-        Self { shard_id, inner }
+    pub const fn new(shard_id: u16, inner: Sender<ShardFrame>, reply: Sender<ShardFrame>) -> Self {
+        Self {
+            shard_id,
+            inner,
+            reply,
+        }
     }
 
     #[must_use]
     pub const fn shard_id(&self) -> u16 {
         self.shard_id
+    }
+
+    /// The reply lane's sender. Client `Reply` forwards go here so the main
+    /// lane's consensus traffic cannot evict them; everything else stays on
+    /// the main lane via `Deref`.
+    #[must_use]
+    pub const fn reply_sender(&self) -> &Sender<ShardFrame> {
+        &self.reply
     }
 }
 
@@ -472,6 +504,7 @@ impl Clone for TaggedSender {
         Self {
             shard_id: self.shard_id,
             inner: self.inner.clone(),
+            reply: self.reply.clone(),
         }
     }
 }
@@ -552,17 +585,19 @@ fn forward_nonce_seed<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64
 /// Lifecycle frame variants.
 ///
 /// Connection setup and cross-shard forwards: every frame the inter-shard
-/// channel carries that is NOT a consensus protocol message lives here.
+/// channels carry that is NOT a consensus protocol message lives here.
 /// Splitting these out from [`ShardFrame::Consensus`] keeps the consensus
-/// dispatch path hot and cache-tight while leaving lifecycle traffic on
-/// the same single channel (preserving relative ordering between consensus
-/// and lifecycle frames at near-zero cost).
+/// dispatch path hot and cache-tight.
 ///
-/// Trade-off: consensus and lifecycle traffic compete for one bounded
-/// inbox. A consensus burst or retransmit storm can fill it exactly when
-/// a terminal-drop [`LifecycleFrame::ForwardClientSend`] needs the space;
-/// `inbox_capacity` is a single knob and cannot isolate the two frame
-/// classes.
+/// Lane placement: every variant rides the main inbox EXCEPT
+/// [`LifecycleFrame::ForwardClientSend`], which rides the dedicated reply
+/// lane (`reply_inbox_capacity`) because its drops are terminal while every
+/// main-lane variant's loss is recovered by some retry (VSR retransmit,
+/// reconnect sweep, periodic tick). The two lanes are independent queues:
+/// there is NO relative ordering between a consensus frame and a client
+/// reply forward, which is safe because a reply forward never
+/// order-couples with consensus traffic (it requires a served request,
+/// and per-client reply order is preserved within the reply lane itself).
 #[non_exhaustive]
 pub enum LifecycleFrame {
     /// Shard 0 distributes an inbound replica TCP connection fd to the
@@ -1296,6 +1331,12 @@ where
     /// messages here via the corresponding sender.
     inbox: Receiver<ShardFrame>,
 
+    /// Receiver end of this shard's reply lane: cross-shard client `Reply`
+    /// forwards, split off the main inbox because their drops are terminal
+    /// (no in-protocol retransmit) while a consensus burst can legitimately
+    /// fill the main lane. Fed via [`TaggedSender::reply_sender`].
+    reply_inbox: Receiver<ShardFrame>,
+
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
 
@@ -1444,6 +1485,15 @@ where
         self.inbox.len()
     }
 
+    /// [`Self::inbox_len`] for the reply lane, so the simulator's lost-wakeup
+    /// tripwire covers both queues: a frame stranded in either lane at
+    /// quiescence is a missed wake.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn reply_inbox_len(&self) -> usize {
+        self.reply_inbox.len()
+    }
+
     /// Create a new shard with channel links and a shards table.
     ///
     /// * `bus` - shard-local bus handle (kept alongside the buses owned
@@ -1454,6 +1504,8 @@ where
     ///   construction time so every sender carries the id of the shard
     ///   whose receiver drains it.
     /// * `inbox` - the receiver that this shard drains in its message pump.
+    /// * `reply_inbox` - the reply lane's receiver, drained by the same
+    ///   pump (client `Reply` forwards only; see [`TaggedSender::reply_sender`]).
     /// * `shards_table` - namespace -> shard routing table.
     /// * `coordinator` - `Some` on shard 0 (supplied by the builder when
     ///   `is_shard_zero`), `None` everywhere else. Immutable post-ctor:
@@ -1483,6 +1535,7 @@ where
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
+        reply_inbox: Receiver<ShardFrame>,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
@@ -1509,6 +1562,7 @@ where
             senders,
             shard_count,
             inbox,
+            reply_inbox,
             shards_table,
             partition_consensus,
             coordinator,
@@ -1808,12 +1862,14 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
-        // Placeholder inbox: the simulator delivers frames straight to
+        // Placeholder lanes: the simulator delivers frames straight to
         // `on_message` (see the `shard_count` note below), so nothing ever
-        // sends here and capacity 1 exists only to satisfy the field. The
-        // real inbox is bounded on purpose (`inbox_capacity` is the shard's
-        // backpressure), so no unbounded variant is wanted here either.
+        // sends here and capacity 1 exists only to satisfy the fields. The
+        // real lanes are bounded on purpose (`inbox_capacity` /
+        // `reply_inbox_capacity` are the shard's backpressure), so no
+        // unbounded variant is wanted here either.
         let (_tx, inbox) = channel(1);
+        let (_reply_tx, reply_inbox) = channel(1);
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
@@ -1837,6 +1893,7 @@ where
             // through, while preserving single-shard routing semantics.
             shard_count: 1,
             inbox,
+            reply_inbox,
             shards_table,
             partition_consensus,
             metrics: crate::metrics::ShardMetrics::for_shard(),
@@ -3285,7 +3342,7 @@ where
         // Count only what was actually handed to the pump: crediting before the
         // send reports an answer to a client that never received one, which is
         // the opposite of what this counter is read for.
-        if let Err(error) = sender.try_send(frame) {
+        if let Err(error) = sender.reply_sender().try_send(frame) {
             self.metrics.record_frame_drop(
                 crate::metrics::frame_drop_variant::PARTITION,
                 crate::coordinator::classify_try_send_err(&error),
