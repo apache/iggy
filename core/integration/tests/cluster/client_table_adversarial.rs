@@ -41,7 +41,7 @@ use consensus::client_table::REPLY_RING_CAPACITY;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::consensus::{
-    Command2, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
+    Command, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
 };
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
@@ -211,7 +211,7 @@ fn create_stream_payload(name: &str) -> Bytes {
 
 fn request_header(client: u128, session: u64, request: u64, body_len: usize) -> RequestHeader {
     RequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::CreateStream,
         size: u32::try_from(HEADER_SIZE + body_len).unwrap(),
         client,
@@ -254,7 +254,7 @@ async fn login_on(stream: &mut TcpStream, client: u128) -> Option<u64> {
     }
     .to_bytes();
     let header = RequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::Register,
         size: u32::try_from(HEADER_SIZE + body.len()).unwrap(),
         client,
@@ -424,14 +424,14 @@ async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) 
     }
 
     let command_offset = offset_of!(RequestHeader, command);
-    if reply_header[command_offset] == Command2::Eviction as u8 {
+    if reply_header[command_offset] == Command::Eviction as u8 {
         return Exchange::Eviction {
             reason: reply_header[HEADER_SIZE - 1],
         };
     }
     assert_eq!(
         reply_header[command_offset],
-        Command2::Reply as u8,
+        Command::Reply as u8,
         "expected a Reply frame"
     );
 

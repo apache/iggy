@@ -769,7 +769,7 @@ enum ReplicaHandshakeOutcome {
 #[cfg(test)]
 mod tests {
     use iggy_binary_protocol::{
-        Command2, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader, frame_checksum_bytes,
+        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader, frame_checksum_bytes,
     };
     use server_common::iobuf::Owned;
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
@@ -805,7 +805,7 @@ mod tests {
             let size_offset = offset_of!(PrepareHeader, size);
             let frame_size = u32::try_from(HEADER_SIZE).expect("header size fits in u32");
             frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
-            frame[offset_of!(PrepareHeader, command)] = Command2::Prepare as u8;
+            frame[offset_of!(PrepareHeader, command)] = Command::Prepare as u8;
             let client_offset = offset_of!(PrepareHeader, client);
             frame[client_offset..client_offset + 16].copy_from_slice(&0xCAFE_u128.to_le_bytes());
             frame[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
