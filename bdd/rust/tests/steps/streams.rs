@@ -17,7 +17,7 @@
 
 use crate::common::global_context::GlobalContext;
 use cucumber::{given, then, when};
-use iggy::prelude::{Identifier, StreamClient};
+use iggy::prelude::{Identifier, StreamClient, StreamUpdateOptions};
 
 #[given("I have no streams in the system")]
 pub async fn given_no_streams(world: &mut GlobalContext) {
@@ -97,6 +97,7 @@ pub async fn when_update_stream_name(world: &mut GlobalContext, stream_name: Str
         .update_stream(
             &Identifier::numeric(stream_id).expect("Stream ID should be valid"),
             &stream_name,
+            &StreamUpdateOptions::default(),
         )
         .await
         .expect("Should be able to update stream");
