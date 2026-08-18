@@ -19,6 +19,7 @@
 
 plugins {
     id("iggy.java-library-conventions")
+    alias(libs.plugins.shadow)
 }
 
 dependencies {
@@ -43,18 +44,35 @@ dependencies {
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.bundles.testing)
     testImplementation(libs.pinot.spi) // Need Pinot SPI for tests
+    testImplementation(libs.testcontainers)
+    testImplementation(libs.testcontainers.junit)
     testRuntimeOnly(libs.slf4j.simple)
 }
 
-// Assemble connector plugin with all dependencies for Docker deployment
-tasks.register<Copy>("assemblePlugin") {
-    from(tasks.named("jar"))
-    from(configurations.runtimeClasspath)
+tasks.shadowJar {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    filesMatching("META-INF/services/**") {
+        duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
+    relocate("io.netty", "org.apache.iggy.connector.pinot.shaded.io.netty")
+    mergeServiceFiles()
+}
+
+// Assemble connector plugin with isolated dependencies for Docker deployment
+tasks.register<Sync>("assemblePlugin") {
+    from(tasks.named("shadowJar"))
     into(layout.buildDirectory.dir("plugin"))
 }
 
 tasks.named("jar") {
     finalizedBy("assemblePlugin")
+}
+
+tasks.named<Test>("test") {
+    dependsOn("assemblePlugin")
+    systemProperty("iggy.pinot.image", "apachepinot/pinot:${libs.versions.pinot.get()}")
+    systemProperty("iggy.pinot.plugin.dir", layout.buildDirectory.dir("plugin").get().asFile.absolutePath)
+    systemProperty("iggy.pinot.deployment.dir", layout.projectDirectory.dir("deployment").asFile.absolutePath)
 }
 
 publishing {
