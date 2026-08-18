@@ -15,8 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod container;
-mod source;
+mod mssql_source;
+mod restart;
 
-pub use container::{MSSQLOps, MSSQLSourceOps};
-pub use source::MSSQLSourceJsonFixture;
+use crate::connectors::TestMessage;
+use serde::Deserialize;
+
+const TEST_MESSAGE_COUNT: usize = 3;
+const POLL_ATTEMPTS: usize = 100;
+const POLL_INTERVAL_MS: u64 = 50;
+
+#[derive(Debug, Deserialize)]
+struct DatabaseRecord {
+    table_name: String,
+    operation_type: String,
+    data: TestMessage,
+}
