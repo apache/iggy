@@ -4717,7 +4717,9 @@ where
         // consumer-offset ops (via `apply_replicated_operation`) append
         // to that journal before `send_prepare_ok` fires, so every op
         // that reaches here is journal-backed and ACKs as durable.
-        send_prepare_ok_common(self.consensus(), header, Some(true)).await;
+        // (`header_by_op` is a linear scan, so re-proving that here would
+        // put O(journal) on every ack; the call-order invariant stands in.)
+        send_prepare_ok_common(self.consensus(), header, true).await;
     }
 }
 

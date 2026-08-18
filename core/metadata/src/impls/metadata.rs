@@ -3548,9 +3548,17 @@ where
         if !self.persist_superblock_if_needed(consensus).await {
             return;
         }
+        // Containment, not occupancy: after a refused append (slot collision,
+        // view-change race) the slot can hold a DIFFERENT prepare at this op,
+        // and acking it would vouch durability for bytes this replica never
+        // journaled. Checksum equality withholds the ack; the primary's
+        // retransmit re-drives it once the right prepare lands.
         let journal = self.journal.as_ref().unwrap();
-        let persisted = journal.handle().header(header.op as usize).is_some();
-        send_prepare_ok_common(consensus, header, Some(persisted)).await;
+        let persisted = journal
+            .handle()
+            .header(header.op as usize)
+            .is_some_and(|stored| stored.checksum == header.checksum);
+        send_prepare_ok_common(consensus, header, persisted).await;
     }
 }
 

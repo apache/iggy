@@ -29,10 +29,10 @@ pub use router::CONSENSUS_TICK_INTERVAL;
 use consensus::LocalPipeline;
 use consensus::{
     ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX, DvcHeaderKind,
-    DvcSuffix, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane, PlaneKind,
-    STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, Status,
-    VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank, dvc_header_kind,
-    encode_prepare_headers, restamp_prepare_view, verify_prepare_integrity,
+    DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
+    PlaneKind, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer,
+    Status, VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank,
+    dvc_header_kind, encode_prepare_headers, fatal, restamp_prepare_view, verify_prepare_integrity,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
@@ -1379,6 +1379,12 @@ where
     /// `[cluster] repair_retry_interval` at bootstrap.
     repair_retry_ticks: Cell<u32>,
 
+    /// Consecutive metadata superblock write failures tolerated before the
+    /// process fail-stops. Defaults to 0 (disabled) so the simulator and tests
+    /// keep a wedged-but-fenced replica alive; the server arms it from
+    /// `[cluster] superblock_wedged_fatal_timeout` at bootstrap.
+    superblock_wedged_fatal_failures: Cell<u64>,
+
     /// Live `[partition] transfer_served_cache_bytes_max`: the byte budget for
     /// segment payloads this shard keeps resident to serve chunk requests.
     /// Defaults to [`SERVED_SEGMENT_CACHE_BYTES_DEFAULT`]; the server
@@ -1525,6 +1531,7 @@ where
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
+            superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
             metadata_transfer_decode_failures: Cell::new(None),
@@ -1536,6 +1543,14 @@ where
     /// tests keep the compile-time [`partitions::REPAIR_RETRY_TICKS`] default.
     pub fn set_repair_retry_ticks(&self, ticks: u32) {
         self.repair_retry_ticks.set(ticks);
+    }
+
+    /// Arm the superblock fail-stop bound (consecutive write failures).
+    /// Called once per shard at bootstrap; the simulator and tests keep the
+    /// disabled default (0) so a wedged-but-fenced replica stays observable
+    /// in-process.
+    pub fn set_superblock_wedged_fatal_failures(&self, failures: u64) {
+        self.superblock_wedged_fatal_failures.set(failures);
     }
 
     /// Override the serving-side resident payload budget from configuration.
@@ -1841,6 +1856,7 @@ where
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
+            superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
             metadata_transfer_decode_failures: Cell::new(None),
@@ -2391,6 +2407,12 @@ const MAX_PARKED_BYTES_PER_NAMESPACE: usize = MAX_PARKED_BYTES / 4;
 /// resident per shard.
 const fn parked_footprint(len: usize) -> usize {
     len.next_multiple_of(MESSAGE_ALIGN)
+}
+
+/// Whether consecutive superblock write failures crossed the fail-stop bound.
+/// `fatal_after == 0` disables the fail-stop.
+const fn superblock_wedged(failures: u64, fatal_after: u64) -> bool {
+    fatal_after != 0 && failures >= fatal_after
 }
 
 /// Reconciler passes a frame may survive before it is answered rather than held.
@@ -8228,6 +8250,20 @@ where
         if metadata.persist_superblock_if_needed(consensus).await {
             dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &wire_actions).await;
         }
+        let superblock_failures = metadata.superblock_write_failures();
+        if superblock_wedged(
+            superblock_failures,
+            self.superblock_wedged_fatal_failures.get(),
+        ) {
+            fatal(
+                FatalReason::SuperblockWedged,
+                &format!(
+                    "metadata superblock persist failed {superblock_failures} consecutive times, \
+                     past the [cluster] superblock_wedged_fatal_timeout window; exiting so a \
+                     supervisor handles the wedge instead of the replica limping fenced"
+                ),
+            );
+        }
 
         // Repair a lost primary self-ack: `RetransmitPrepares` to self is a
         // no-op, so the timer-driven retransmit above cannot recover the
@@ -9767,5 +9803,25 @@ mod control_frame_tests {
         let body = control_suffix_body_verified(&msg, msg.header().checksum_body)
             .expect("a header-only frame has nothing to verify");
         assert!(body.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod superblock_fail_stop_tests {
+    //! The bound must stay disabled at 0: the simulator asserts a wedged
+    //! replica survives fenced in-process, and only the server arms it.
+
+    use super::superblock_wedged;
+
+    #[test]
+    fn zero_bound_never_fires() {
+        assert!(!superblock_wedged(u64::MAX, 0));
+    }
+
+    #[test]
+    fn bound_fires_at_and_past_the_threshold() {
+        assert!(!superblock_wedged(119, 120));
+        assert!(superblock_wedged(120, 120));
+        assert!(superblock_wedged(121, 120));
     }
 }
