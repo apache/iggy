@@ -57,6 +57,13 @@ server:
     path: /metrics
     # -- Timeout for scrape metrics request
     scrapeTimeout: 10s
+    # -- Authorization for the scrape request. The metrics endpoint requires a
+    # bearer credential (e.g. a personal access token stored in a Secret):
+    # authorization:
+    #   credentials:
+    #     name: iggy-metrics-token
+    #     key: token
+    authorization: {}
 
   users:
     root:

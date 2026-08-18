@@ -1564,6 +1564,14 @@ where
         self.bus_max_message_size.set(max_message_size);
     }
 
+    /// The configured `[message_bus] max_message_size`. Also the largest batch
+    /// the bus will frame, and so the most a sealed segment can overshoot
+    /// `segment_size`: rotation fires after the append that crosses the cap.
+    #[must_use]
+    pub const fn bus_max_message_size(&self) -> usize {
+        self.bus_max_message_size.get()
+    }
+
     /// Mint a fresh, never-zero nonce for a register or logout forward.
     ///
     /// `replica` rides the high half, which separates the nonce spaces of
@@ -1955,14 +1963,30 @@ where
         max_bytes: Option<u64>,
     ) {
         let Some(sender) = self.senders.get(self.id as usize) else {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::metrics::frame_drop_reason::UNROUTABLE,
+            );
             return;
         };
-        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::CleanPartition {
+        // Fire-and-forget: a refused pass is picked up by the cleaner's next
+        // maintenance tick, so the drop only has to be visible, not recovered.
+        if let Err(error) = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::CleanPartition {
             namespace,
             now,
             message_expiry,
             max_bytes,
-        }));
+        })) {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::coordinator::classify_try_send_err(&error),
+            );
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                "segment cleaner pass refused by own inbox: {error:?}"
+            );
+        }
     }
 
     /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's

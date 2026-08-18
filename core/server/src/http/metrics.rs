@@ -31,6 +31,7 @@ use prometheus_client::registry::Registry;
 use send_wrapper::SendWrapper;
 use tracing::error;
 
+use crate::http::extractor::Identity;
 use crate::http::state::HttpState;
 
 /// The legacy server's metric set, registered under the same names and help
@@ -134,8 +135,10 @@ pub(in crate::http) fn validated_endpoint(
 }
 
 /// `GET <http.metrics.endpoint>`: the metric set in prometheus text
-/// exposition. Public - reached without proving a credential, exactly like the
-/// legacy endpoint.
+/// exposition. Auth-only, like `/stats`: the `Identity` extractor rejects a
+/// missing or invalid bearer with 401, and any authenticated user may scrape
+/// (no RBAC rule guards it). Scrapers present a JWT or a raw PAT the same way
+/// every read route accepts them.
 ///
 /// The entity gauges sample the same reads `/stats` serves: the metadata STM
 /// stream and user maps plus the stats-registry rollups, whose partition-plane
@@ -143,7 +146,10 @@ pub(in crate::http) fn validated_endpoint(
 /// in flight. The clients count scatter-gathers the per-shard session managers
 /// exactly like `GET /clients` and turns partial when a shard misses the reply
 /// deadline.
-pub(in crate::http) async fn get_metrics(State(state): State<HttpState>) -> String {
+pub(in crate::http) async fn get_metrics(
+    State(state): State<HttpState>,
+    _identity: Identity,
+) -> String {
     let (streams_count, topics_count, partitions_count, segments_count, messages_count) = state
         .shard
         .plane

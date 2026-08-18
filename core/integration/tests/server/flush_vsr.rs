@@ -31,8 +31,7 @@ use integration::iggy_harness;
 const PARTITION_ID: u32 = 0;
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_valid_partition_when_flushing_should_reject_feature_unavailable(
     harness: &TestHarness,

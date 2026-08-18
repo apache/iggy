@@ -974,10 +974,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.non_docker_targets) }}
     env:
-      NEXUS_USER: ${{ secrets.NEXUS_USER }}
-      NEXUS_PW: ${{ secrets.NEXUS_PW }}
-      JAVA_GPG_SIGNING_KEY: ${{ secrets.JAVA_GPG_SIGNING_KEY }}
-      JAVA_GPG_PASSWORD: ${{ secrets.JAVA_GPG_PASSWORD }}
       DRY_RUN: ${{ inputs.dry_run }}
     outputs:
       status: ${{ steps.status.outputs.status }}
@@ -1083,6 +1079,14 @@ jobs:
           wheels_artifact: python-wheels-all
           wheels_path: dist
 
+      - name: Upload Python SDK to PyPI
+        if: matrix.type == 'python' && inputs.dry_run == false
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+          attestations: true
+
       # ─────────────────────────────────────────
       # Node SDK Publishing
       # ─────────────────────────────────────────
@@ -1099,6 +1103,11 @@ jobs:
       - name: Publish Java SDK
         if: matrix.type == 'java'
         uses: ./.github/actions/java-gradle/post-merge
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PW: ${{ secrets.NEXUS_PW }}
+          JAVA_GPG_SIGNING_KEY: ${{ secrets.JAVA_GPG_SIGNING_KEY }}
+          JAVA_GPG_PASSWORD: ${{ secrets.JAVA_GPG_PASSWORD }}
         with:
           version: ${{ steps.ver.outputs.version }}
           dry_run: ${{ inputs.dry_run }}
