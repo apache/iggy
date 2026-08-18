@@ -147,11 +147,23 @@ impl SourceManager {
             )
         };
 
-        // Order: close FFI (stops callbacks) -> drop sender (unblocks
-        // recv_async) -> await tasks. Reversing risks an abort mid-save.
+        // Order: signal shutdown (unwedges a callback stuck in its
+        // full-channel backoff, which iggy_source_close waits on) -> close
+        // FFI (stops callbacks) -> drop sender (unblocks recv) -> await
+        // tasks. Reversing risks a deadlocked close or an abort mid-save.
+        source::signal_shutdown(plugin_id);
         if let Some(container) = &container {
             info!("Closing source connector with ID: {plugin_id} for plugin: {key}");
-            (container.iggy_source_close)(plugin_id);
+            // The ordering above assumes close actually stopped the callbacks.
+            // The SDK returns non-zero when it could not join the polling task,
+            // and then a callback can outlive this and land on the
+            // removed-entry branch, which drops the batch without a metric.
+            let close_result = (container.iggy_source_close)(plugin_id);
+            if close_result != 0 {
+                warn!(
+                    "iggy_source_close returned {close_result} for source connector with ID: {plugin_id} ({key}); callbacks may outlive the close"
+                );
+            }
             info!("Closed source connector with ID: {plugin_id} for plugin: {key}");
         }
 
@@ -229,6 +241,7 @@ impl SourceManager {
             key,
             config.verbose,
             config.benchmark,
+            config.channel_capacity,
             producer,
             encoder,
             transforms,

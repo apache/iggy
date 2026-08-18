@@ -265,6 +265,11 @@ async fn main() -> Result<(), RuntimeError> {
         }
     }
 
+    // Unwedge every send callback before the sequential closes: instances of
+    // one plugin library share a tokio runtime, and a backpressured instance
+    // late in the list would otherwise hold a worker an earlier close needs.
+    source::signal_shutdown_all();
+
     let source_keys: Vec<String> = context
         .sources
         .get_all()
@@ -452,6 +457,7 @@ struct SourceConnectorPlugin {
     error: Option<String>,
     verbose: bool,
     benchmark: bool,
+    channel_capacity: Option<usize>,
 }
 
 struct SourceConnectorProducer {
