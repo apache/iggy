@@ -20,6 +20,9 @@ import type { ValueOf } from '../../type.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint8ToBuf } from '../number.utils.js';
 
+/** Offset mutations always request quorum acknowledgement. */
+const ACK_QUORUM = 1;
+
 /**
  * Consumer kind options for offset operations.
  */
@@ -145,11 +148,32 @@ export const serializeStoreOffset = (
   partitionId: number | null,
   offset: bigint
 ) => {
-  const b = Buffer.allocUnsafe(8);
+  const b = Buffer.allocUnsafe(9);
   b.writeBigUInt64LE(offset, 0);
+  b.writeUInt8(ACK_QUORUM, 8);
 
   return Buffer.concat([
     serializeGetOffset(streamId, topicId, consumer, partitionId),
     b
   ]);
 }
+
+/**
+ * Serializes parameters for delete offset operation.
+ *
+ * @param streamId - Stream identifier (ID or name)
+ * @param topicId - Topic identifier (ID or name)
+ * @param consumer - Consumer identifier (single or group)
+ * @param partitionId - Partition ID. VSR requires an explicit partition.
+ * @returns Buffer containing serialized delete offset request
+ */
+export const serializeDeleteOffset = (
+  streamId: Id,
+  topicId: Id,
+  consumer: Consumer,
+  partitionId: number | null
+) =>
+  Buffer.concat([
+    serializeGetOffset(streamId, topicId, consumer, partitionId),
+    uint8ToBuf(ACK_QUORUM)
+  ]);

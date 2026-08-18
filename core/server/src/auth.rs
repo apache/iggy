@@ -292,7 +292,7 @@ where
 /// Terminal auth errors (`InvalidCredentials` / `InvalidToken` /
 /// `UserInactive` / `Session`) fast-fail with a typed `Eviction` frame so the
 /// SDK surfaces the real reason (every frame transport decodes
-/// `Command2::Eviction`) instead of a decode error or a timeout.
+/// `Command::Eviction`) instead of a decode error or a timeout.
 #[allow(clippy::future_not_send)]
 pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,

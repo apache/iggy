@@ -313,10 +313,7 @@ interval = "1 m"
 # rebalance off it. Only a connection that still holds a group
 # membership is evicted; one that holds none is left alone and is
 # reaped when its socket closes.
-# TODO(hubcio): flip the default to true once every SDK heartbeats
-# automatically; today the blocking Java and C# SDKs never ping, so an
-# enabled default would evict their idle consumer-group members.
-enabled = false
+enabled = true
 # Interval for expected client heartbeats. The Rust, Go, Python, Node and
 # async Java SDKs ping automatically every 5 s, well inside the resulting 36 s
 # staleness window, but only from a connected high-level client: the Rust and
@@ -937,8 +934,3 @@ close_grace = "2 s"
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
 handshake_grace = "10 s"
-
-[extra.namespace]
-max_streams = 4096
-max_topics = 4096
-max_partitions = 1_000_000

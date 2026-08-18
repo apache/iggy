@@ -92,7 +92,8 @@ public class IggyPublisherBuilder<T> : IggyPublisherBuilder
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
                 ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
-                AutoLoginSettings = AutoLoginSettings.For(Config.Login, Config.Password),
+                HeartbeatInterval = Config.HeartbeatInterval,
+                AutoLoginSettings = AutoLogin(),
                 LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
                 MessageEncryptor = _encryptor
             });

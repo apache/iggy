@@ -148,6 +148,7 @@ macro_rules! result_enum {
 // Streams.
 result_enum!(CreateStreamResult {
     NameAlreadyExists = 1012,
+    TooManyStreams = 1020,
     InvalidOptionValue = 4042,
 });
 result_enum!(UpdateStreamResult {
@@ -162,6 +163,9 @@ result_enum!(PurgeStreamResult { StreamNotFound = 1009 });
 result_enum!(CreateTopicResult {
     StreamNotFound = 1009,
     NameAlreadyExists = 2013,
+    InvalidPartitionsCount = 2019,
+    TooManyTopics = 2021,
+    PartitionIdSpaceExhausted = 3013,
     InvalidOptionValue = 4042,
 });
 result_enum!(UpdateTopicResult {
@@ -179,12 +183,15 @@ result_enum!(PurgeTopicResult {
     TopicNotFound = 2010,
 });
 
-// Partitions. `InvalidPartitionsCount` also covers the partition-id overflow
-// guards in the apply handler.
+// `InvalidPartitionsCount` covers the `u32` overflow guards and non-distinct
+// ids. `PartitionIdSpaceExhausted` covers the packed-layout ceiling. Neither is
+// `TooManyPartitions`, which dispatch owns for an oversized single request: the
+// split is by REMEDY (smaller batch vs delete partitions), not by terminality.
 result_enum!(CreatePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     InvalidPartitionsCount = 2019,
+    PartitionIdSpaceExhausted = 3013,
 });
 result_enum!(DeletePartitionsResult {
     StreamNotFound = 1009,
@@ -514,6 +521,10 @@ mod tests {
             u32::from(CreatePartitionsResult::InvalidPartitionsCount),
             IggyError::InvalidPartitionsCount.as_code(),
         );
+        assert_eq!(
+            u32::from(CreateTopicResult::InvalidPartitionsCount),
+            IggyError::InvalidPartitionsCount.as_code(),
+        );
 
         // UserAlreadyExists (46) - also stands in for username-already-exists.
         let user_exists = IggyError::UserAlreadyExists.as_code();
@@ -638,6 +649,32 @@ mod tests {
         assert_eq!(
             u32::from(LeaveConsumerGroupResult::ConsumerGroupMemberNotFound),
             IggyError::ConsumerGroupMemberNotFound(0, id(), id()).as_code(),
+        );
+
+        // Namespace ceilings. 1020 and 2021 sit above gaps left by retired
+        // variants that shipped SDK tables still map, so a renumber here is the
+        // drift this test exists to catch.
+        assert_eq!(
+            u32::from(CreateStreamResult::TooManyStreams),
+            IggyError::TooManyStreams.as_code(),
+        );
+        assert_eq!(
+            u32::from(CreateTopicResult::TooManyTopics),
+            IggyError::TooManyTopics.as_code(),
+        );
+        let partition_id_space_exhausted = IggyError::PartitionIdSpaceExhausted.as_code();
+        assert_eq!(
+            u32::from(CreateTopicResult::PartitionIdSpaceExhausted),
+            partition_id_space_exhausted,
+        );
+        assert_eq!(
+            u32::from(CreatePartitionsResult::PartitionIdSpaceExhausted),
+            partition_id_space_exhausted,
+        );
+        // The per-topic ceiling must not collapse onto dispatch's per-request cap.
+        assert_ne!(
+            partition_id_space_exhausted,
+            IggyError::TooManyPartitions.as_code(),
         );
 
         // Unauthorized (41) - the global in-apply RBAC denial code.

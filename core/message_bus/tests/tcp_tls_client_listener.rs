@@ -20,7 +20,7 @@ mod common;
 use async_channel::bounded;
 use common::{header_only, install_tls_clients_locally, loopback};
 use compio::net::TcpStream;
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::tcp_tls::{bind, run};
@@ -46,10 +46,10 @@ async fn tcp_tls_client_listener_accepts_and_round_trips() {
     // take. Spawned because the handler signature is synchronous.
     let bus_for_handler = Rc::clone(&bus);
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
-        assert_eq!(msg.header().command, Command2::Request);
+        assert_eq!(msg.header().command, Command::Request);
         let bus = Rc::clone(&bus_for_handler);
         compio::runtime::spawn(async move {
-            let reply = header_only(Command2::Reply, 42, 0).into_frozen();
+            let reply = header_only(Command::Reply, 42, 0).into_frozen();
             bus.send_to_client(client_id, reply)
                 .await
                 .expect("server send_to_client");
@@ -98,14 +98,14 @@ async fn tcp_tls_client_listener_accepts_and_round_trips() {
     };
     let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
 
-    let request = header_only(Command2::Request, 42, 0).into_frozen();
+    let request = header_only(Command::Request, 42, 0).into_frozen();
     out_tx.send(request).await.expect("client send");
 
     let reply = compio::time::timeout(Duration::from_secs(5), in_rx.recv())
         .await
         .expect("client must receive reply within 5 s")
         .expect("reply frame");
-    assert_eq!(reply.header().command, Command2::Reply);
+    assert_eq!(reply.header().command, Command::Reply);
     assert_eq!(reply.header().cluster, 42);
 
     client_shutdown.trigger();

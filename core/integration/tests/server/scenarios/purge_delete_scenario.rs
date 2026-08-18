@@ -37,11 +37,11 @@ const INDEX_EXTENSION: &str = "index";
 /// volume carries what a 5 KiB segment used to.
 const SEGMENT_SIZE: u64 = 1024 * 1024;
 
-/// The server persists the actual `SendMessages2` batch framing: a 256-byte
+/// The server persists the actual `SendMessages` batch framing: a 256-byte
 /// command header per append (each send below is a single-message batch) plus
 /// a 48-byte per-message header, and a 24-byte sparse index entry per flush
 /// (one per message with messages_required_to_save = 1). See
-/// `server_common::send_messages2` and `stream_size_validation_scenario`.
+/// `server_common::send_messages` and `stream_size_validation_scenario`.
 ///
 /// Sized so five messages seal a [`SEGMENT_SIZE`] segment and four do not:
 /// 4 * 220304 = 881216 < 1 MiB <= 5 * 220304 = 1101520. Must stay a multiple

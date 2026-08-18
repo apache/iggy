@@ -27,7 +27,7 @@ use common::{header_only, install_quic_clients_locally, loopback};
 use compio::BufResult;
 use compio::io::AsyncWriteExt;
 use compio_quic::{ClientBuilder, Endpoint};
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use message_bus::QuicTuning;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::quic::{bind, run};
@@ -68,10 +68,10 @@ async fn request_reply_round_trip() {
 
     let bus_for_handler = bus.clone();
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
-        assert_eq!(msg.header().command, Command2::Request);
+        assert_eq!(msg.header().command, Command::Request);
         let bus = bus_for_handler.clone();
         compio::runtime::spawn(async move {
-            let reply = header_only(Command2::Reply, 42, 0);
+            let reply = header_only(Command::Reply, 42, 0);
             bus.send_to_client(client_id, reply.into_frozen())
                 .await
                 .expect("send_to_client should succeed");
@@ -103,7 +103,7 @@ async fn request_reply_round_trip() {
     // pattern; the server's accept_bi loop accepts the bidi, dispatches
     // the request, writes the Reply, `finish()`-es the send half.
     let (mut send, mut recv) = connection.open_bi_wait().await.expect("open_bi");
-    let request = header_only(Command2::Request, 42, 0).into_frozen();
+    let request = header_only(Command::Request, 42, 0).into_frozen();
     let BufResult(result, _) = send.write_all(request).await;
     result.expect("client write request");
     send.finish().expect("client finish");
@@ -115,7 +115,7 @@ async fn request_reply_round_trip() {
     .await
     .expect("client must receive reply within 5 s")
     .expect("reply frame");
-    assert_eq!(reply.header().command, Command2::Reply);
+    assert_eq!(reply.header().command, Command::Reply);
     assert_eq!(reply.header().cluster, 42);
 
     let outcome = bus.shutdown(Duration::from_secs(2)).await;
@@ -143,7 +143,7 @@ async fn slow_handshake_does_not_block_subsequent_accept() {
     let (request_tx, request_rx) = bounded::<()>(8);
     let request_tx = Rc::new(request_tx);
     let on_request: RequestHandler = Rc::new(move |_client_id, msg| {
-        assert_eq!(msg.header().command, Command2::Request);
+        assert_eq!(msg.header().command, Command::Request);
         let _ = request_tx.try_send(());
     });
 
@@ -189,7 +189,7 @@ async fn slow_handshake_does_not_block_subsequent_accept() {
             .expect("fast client open_bi within 2 s")
             .expect("open_bi");
 
-    let request = header_only(Command2::Request, 1, 0).into_frozen();
+    let request = header_only(Command::Request, 1, 0).into_frozen();
     let BufResult(result, _) = send.write_all(request).await;
     result.expect("fast client write request");
     send.finish().expect("fast client finish");

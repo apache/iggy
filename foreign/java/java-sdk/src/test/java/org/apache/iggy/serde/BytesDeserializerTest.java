@@ -53,8 +53,6 @@ import static org.apache.iggy.serde.BytesDeserializer.readGlobalPermissions;
 import static org.apache.iggy.serde.BytesDeserializer.readPartition;
 import static org.apache.iggy.serde.BytesDeserializer.readPermissions;
 import static org.apache.iggy.serde.BytesDeserializer.readPersonalAccessTokenInfo;
-import static org.apache.iggy.serde.BytesDeserializer.readPolledMessage;
-import static org.apache.iggy.serde.BytesDeserializer.readPolledMessages;
 import static org.apache.iggy.serde.BytesDeserializer.readRawPersonalAccessToken;
 import static org.apache.iggy.serde.BytesDeserializer.readSendMessagesResponse;
 import static org.apache.iggy.serde.BytesDeserializer.readStats;
@@ -441,96 +439,6 @@ class BytesDeserializerTest {
             assertThat(offsetInfo.partitionId()).isEqualTo(5L);
             assertThat(offsetInfo.currentOffset()).isEqualTo(BigInteger.valueOf(100));
             assertThat(offsetInfo.storedOffset()).isEqualTo(BigInteger.valueOf(95));
-        }
-    }
-
-    @Nested
-    class MessageDeserialization {
-
-        @Test
-        void shouldDeserializePolledMessageWithoutUserHeaders() {
-            // given
-            ByteBuf buffer = Unpooled.buffer();
-            writeU64(buffer, BigInteger.valueOf(123)); // checksum
-            buffer.writeBytes(new byte[16]); // message ID
-            writeU64(buffer, BigInteger.ZERO); // offset
-            writeU64(buffer, BigInteger.valueOf(1000)); // timestamp
-            writeU64(buffer, BigInteger.valueOf(1000)); // origin timestamp
-            buffer.writeIntLE(0); // user headers length
-            buffer.writeIntLE(5); // payload length
-            writeU64(buffer, BigInteger.ZERO); // reserved
-            buffer.writeBytes("hello".getBytes()); // payload
-
-            // when
-            var message = readPolledMessage(buffer);
-
-            // then
-            assertThat(message.header().checksum()).isEqualTo(BigInteger.valueOf(123));
-            assertThat(message.header().payloadLength()).isEqualTo(5L);
-            assertThat(message.payload()).isEqualTo("hello".getBytes());
-            assertThat(message.userHeaders()).isEmpty();
-        }
-
-        @Test
-        void shouldDeserializePolledMessageWithUserHeaders() {
-            // given
-            ByteBuf buffer = Unpooled.buffer();
-            writeU64(buffer, BigInteger.ZERO);
-            buffer.writeBytes(new byte[16]);
-            writeU64(buffer, BigInteger.ZERO);
-            writeU64(buffer, BigInteger.valueOf(1000));
-            writeU64(buffer, BigInteger.valueOf(1000));
-
-            // Calculate and write user headers
-            ByteBuf headersBuffer = Unpooled.buffer();
-            headersBuffer.writeByte(HeaderKind.String.asCode());
-            headersBuffer.writeIntLE(3);
-            headersBuffer.writeBytes("key".getBytes());
-            headersBuffer.writeByte(HeaderKind.Raw.asCode());
-            headersBuffer.writeIntLE(3);
-            headersBuffer.writeBytes("val".getBytes());
-
-            buffer.writeIntLE(headersBuffer.readableBytes()); // user headers length
-            buffer.writeIntLE(3); // payload length
-            writeU64(buffer, BigInteger.ZERO); // reserved
-            buffer.writeBytes("abc".getBytes()); // payload
-            buffer.writeBytes(headersBuffer); // user headers
-
-            // when
-            var message = readPolledMessage(buffer);
-
-            // then
-            assertThat(message.userHeaders()).hasSize(1);
-            assertThat(message.userHeaders().get(HeaderKey.fromString("key")).asRaw())
-                    .isEqualTo("val".getBytes());
-        }
-
-        @Test
-        void shouldDeserializePolledMessages() {
-            // given
-            ByteBuf buffer = Unpooled.buffer();
-            buffer.writeIntLE(1); // partition ID
-            writeU64(buffer, BigInteger.valueOf(10)); // current offset
-            buffer.writeIntLE(1); // messages count
-            // Write one message
-            writeU64(buffer, BigInteger.ZERO);
-            buffer.writeBytes(new byte[16]);
-            writeU64(buffer, BigInteger.ZERO);
-            writeU64(buffer, BigInteger.valueOf(1000));
-            writeU64(buffer, BigInteger.valueOf(1000));
-            buffer.writeIntLE(0);
-            buffer.writeIntLE(2);
-            writeU64(buffer, BigInteger.ZERO); // reserved
-            buffer.writeBytes("hi".getBytes());
-
-            // when
-            var polledMessages = readPolledMessages(buffer);
-
-            // then
-            assertThat(polledMessages.partitionId()).isEqualTo(1L);
-            assertThat(polledMessages.currentOffset()).isEqualTo(BigInteger.valueOf(10));
-            assertThat(polledMessages.count()).isEqualTo(1L);
-            assertThat(polledMessages.messages()).hasSize(1);
         }
     }
 

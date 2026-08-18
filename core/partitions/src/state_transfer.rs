@@ -42,7 +42,7 @@ use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::SegmentStorage;
-use server_common::send_messages2::decode_batch_slice;
+use server_common::send_messages::decode_batch_slice;
 use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;
@@ -2263,18 +2263,8 @@ where
             // sweep itself is right (a chain the live state does not know
             // about would resurrect at boot), so one retry against a
             // transient open failure is the only cheap save available.
-            let enforce_fsync = self.effective_enforce_fsync(config);
-            let open = || {
-                SegmentStorage::new(
-                    &log_final,
-                    &index_final,
-                    meta.size,
-                    meta.index_size,
-                    enforce_fsync,
-                    enforce_fsync,
-                    true,
-                )
-            };
+            let open =
+                || SegmentStorage::new(&log_final, &index_final, meta.size, meta.index_size, true);
             let storage = match open().await {
                 Ok(storage) => storage,
                 Err(_) => open()

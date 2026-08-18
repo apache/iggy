@@ -49,9 +49,10 @@ pub fn sample(
         Outcome::NameAlreadyExists => Some(Input {
             name: shadow.pick_stream_name(prng)?,
         }),
-        // Not a targeted outcome (absent from `OUTCOMES`); the sim client
-        // never sends an options block.
-        Outcome::InvalidOptionValue => None,
+        // Not targeted (absent from `OUTCOMES`): the sim client sends no options
+        // block, and the slab ceiling needs `MAX_STREAMS` surviving creates in
+        // one run, far past any workload length.
+        Outcome::InvalidOptionValue | Outcome::TooManyStreams => None,
     }
 }
 
@@ -75,6 +76,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::AddStream {
             name: input.name.clone(),
         },
-        Outcome::NameAlreadyExists | Outcome::InvalidOptionValue => Effect::None,
+        Outcome::NameAlreadyExists | Outcome::InvalidOptionValue | Outcome::TooManyStreams => {
+            Effect::None
+        }
     }
 }

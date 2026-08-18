@@ -87,13 +87,13 @@ where
                 Operation::SendMessages => {
                     permissioner.append_messages(user_id, stream_id, topic_id)
                 }
-                Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+                Operation::StoreConsumerOffset => {
                     permissioner.store_consumer_offset(user_id, stream_id, topic_id)
                 }
-                Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                Operation::DeleteConsumerOffset => {
                     permissioner.delete_consumer_offset(user_id, stream_id, topic_id)
                 }
-                // The caller only routes the five partition ops above here. The
+                // The caller only routes the three partition ops above here. The
                 // rest are listed exhaustively (no `_`) so a newly added op
                 // forces a gate decision at compile time instead of silently
                 // slipping through ungated.

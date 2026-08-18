@@ -29,7 +29,7 @@
 
 use iggy_binary_protocol::HEADER_SIZE;
 use iggy_binary_protocol::codes::{LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE};
-use iggy_binary_protocol::consensus::{Command2, Operation, RequestHeader};
+use iggy_binary_protocol::consensus::{Command, Operation, RequestHeader};
 use integration::harness::TestHarness;
 use integration::iggy_harness;
 use std::mem::offset_of;
@@ -61,7 +61,7 @@ async fn given_legacy_pat_login_code_when_sent_raw_should_evict_malformed_login(
 /// exercises the same path a bound connection would.
 async fn assert_legacy_login_code_evicted(harness: &TestHarness, code: u32) {
     let mut header = RequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::NonReplicated,
         size: u32::try_from(HEADER_SIZE).unwrap(),
         // NonReplicated leaves session / request unchecked, but the header
@@ -93,7 +93,7 @@ async fn assert_legacy_login_code_evicted(harness: &TestHarness, code: u32) {
     let command_offset = offset_of!(RequestHeader, command);
     assert_eq!(
         reply[command_offset],
-        Command2::Eviction as u8,
+        Command::Eviction as u8,
         "expected an Eviction frame for legacy login code {code}, not a Reply"
     );
     assert_eq!(

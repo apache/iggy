@@ -25,13 +25,12 @@
 use super::COMPONENT;
 use super::cluster::STATE_CHUNK_HEADER_LEN;
 use super::partition::{CONCURRENT_SERVED_SEGMENTS, SEGMENT_SIZE_OVERSHOOT_BYTES};
-use super::server::{ExtraConfig, NamespaceConfig, ServerConfig};
+use super::server::ServerConfig;
 use crate::ConfigurationError;
 use crate::common::http::HMAC_JWT_ALGORITHMS;
 use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, Validatable};
-use server_common::sharding::IggyNamespace;
 
 /// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
 /// evaluate the `max_write_buffer_size > write_buffer_size` invariant
@@ -59,9 +58,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
                     "{COMPONENT} (error: {e}) - failed to validate personal access token config"
                 )
             })?;
-        self.extra.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate extra config")
-        })?;
         self.system
             .segment
             .validate()
@@ -399,26 +395,6 @@ fn reject_unsupported(config: &ServerConfig) -> Result<(), ConfigurationError> {
     }
 
     Ok(())
-}
-
-impl Validatable<ConfigurationError> for ExtraConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        self.namespace.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate namespace config")
-        })?;
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for NamespaceConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        IggyNamespace::validate_capacity(self.max_streams, self.max_topics, self.max_partitions)
-            .map_err(|error| {
-                eprintln!("extra.namespace is invalid: {error}");
-                ConfigurationError::InvalidConfigurationValue
-            })?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]

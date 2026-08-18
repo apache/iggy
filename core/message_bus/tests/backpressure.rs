@@ -28,7 +28,7 @@ use common::{
     header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
     set_replica_ctx,
 };
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
@@ -82,7 +82,7 @@ async fn try_send_returns_backpressure_when_queue_full() {
     // the exact threshold, only that it is finite and reachable.
     let mut hit_backpressure = false;
     for _ in 0..100_000 {
-        let msg = header_only(Command2::Prepare, CLUSTER, 0);
+        let msg = header_only(Command::Prepare, CLUSTER, 0);
         match bus0.send_to_replica(1, msg.into_frozen()).await {
             Ok(()) => {}
             Err(SendError::Backpressure) => {

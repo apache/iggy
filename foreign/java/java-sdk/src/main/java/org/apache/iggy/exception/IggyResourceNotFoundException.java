@@ -33,7 +33,6 @@ public class IggyResourceNotFoundException extends IggyServerException {
 
     private static final Set<IggyErrorCode> CODES = EnumSet.of(
             IggyErrorCode.RESOURCE_NOT_FOUND,
-            IggyErrorCode.CANNOT_LOAD_RESOURCE,
             IggyErrorCode.STREAM_ID_NOT_FOUND,
             IggyErrorCode.STREAM_NAME_NOT_FOUND,
             IggyErrorCode.TOPIC_ID_NOT_FOUND,
@@ -43,8 +42,7 @@ public class IggyResourceNotFoundException extends IggyServerException {
             IggyErrorCode.CLIENT_NOT_FOUND,
             IggyErrorCode.CONSUMER_GROUP_ID_NOT_FOUND,
             IggyErrorCode.CONSUMER_GROUP_NAME_NOT_FOUND,
-            IggyErrorCode.CONSUMER_GROUP_NOT_JOINED,
-            IggyErrorCode.MESSAGE_NOT_FOUND);
+            IggyErrorCode.CONSUMER_GROUP_MEMBER_NOT_FOUND);
 
     /**
      * Constructs a new IggyResourceNotFoundException.
