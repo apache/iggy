@@ -42,9 +42,9 @@ internal static class VsrReplyDecoder
 
         switch (VsrHeader.PeekCommand(header))
         {
-            case Command2.Eviction:
+            case Command.Eviction:
                 throw ToException(VsrHeader.ReadEviction(header));
-            case Command2.Reply:
+            case Command.Reply:
                 break;
             default:
                 throw VsrError.Exception(VsrError.INVALID_COMMAND,

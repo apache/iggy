@@ -60,11 +60,9 @@ const (
 	OperationJoinConsumerGroup         Operation = 148
 	OperationLeaveConsumerGroup        Operation = 149
 
-	OperationSendMessages          Operation = 160
-	OperationStoreConsumerOffset   Operation = 161
-	OperationDeleteConsumerOffset  Operation = 162
-	OperationStoreConsumerOffset2  Operation = 164
-	OperationDeleteConsumerOffset2 Operation = 165
+	OperationSendMessages         Operation = 160
+	OperationStoreConsumerOffset  Operation = 161
+	OperationDeleteConsumerOffset Operation = 162
 )
 
 // Band boundaries. The internal band is never client-sent.
@@ -111,8 +109,6 @@ var allOperations = []Operation{
 	OperationSendMessages,
 	OperationStoreConsumerOffset,
 	OperationDeleteConsumerOffset,
-	OperationStoreConsumerOffset2,
-	OperationDeleteConsumerOffset2,
 }
 
 var knownOperations = newOperationSet(allOperations)
@@ -122,33 +118,31 @@ var knownOperations = newOperationSet(allOperations)
 // header field, leaving the server authoritative for commands this SDK build
 // does not know.
 var replicatedOperation = map[uint32]Operation{
-	uint32(command.CreateUserCode):            OperationCreateUser,
-	uint32(command.DeleteUserCode):            OperationDeleteUser,
-	uint32(command.UpdateUserCode):            OperationUpdateUser,
-	uint32(command.UpdatePermissionsCode):     OperationUpdatePermissions,
-	uint32(command.ChangePasswordCode):        OperationChangePassword,
-	uint32(command.CreateAccessTokenCode):     OperationCreatePersonalAccessToken,
-	uint32(command.DeleteAccessTokenCode):     OperationDeletePersonalAccessToken,
-	uint32(command.SendMessagesCode):          OperationSendMessages,
-	uint32(command.StoreOffsetCode):           OperationStoreConsumerOffset,
-	uint32(command.DeleteConsumerOffsetCode):  OperationDeleteConsumerOffset,
-	uint32(command.StoreOffset2Code):          OperationStoreConsumerOffset2,
-	uint32(command.DeleteConsumerOffset2Code): OperationDeleteConsumerOffset2,
-	uint32(command.CreateStreamCode):          OperationCreateStream,
-	uint32(command.DeleteStreamCode):          OperationDeleteStream,
-	uint32(command.UpdateStreamCode):          OperationUpdateStream,
-	uint32(command.PurgeStreamCode):           OperationPurgeStream,
-	uint32(command.CreateTopicCode):           OperationCreateTopic,
-	uint32(command.DeleteTopicCode):           OperationDeleteTopic,
-	uint32(command.UpdateTopicCode):           OperationUpdateTopic,
-	uint32(command.PurgeTopicCode):            OperationPurgeTopic,
-	uint32(command.CreatePartitionsCode):      OperationCreatePartitions,
-	uint32(command.DeletePartitionsCode):      OperationDeletePartitions,
-	uint32(command.DeleteSegmentsCode):        OperationDeleteSegments,
-	uint32(command.CreateGroupCode):           OperationCreateConsumerGroup,
-	uint32(command.DeleteGroupCode):           OperationDeleteConsumerGroup,
-	uint32(command.JoinGroupCode):             OperationJoinConsumerGroup,
-	uint32(command.LeaveGroupCode):            OperationLeaveConsumerGroup,
+	uint32(command.CreateUserCode):           OperationCreateUser,
+	uint32(command.DeleteUserCode):           OperationDeleteUser,
+	uint32(command.UpdateUserCode):           OperationUpdateUser,
+	uint32(command.UpdatePermissionsCode):    OperationUpdatePermissions,
+	uint32(command.ChangePasswordCode):       OperationChangePassword,
+	uint32(command.CreateAccessTokenCode):    OperationCreatePersonalAccessToken,
+	uint32(command.DeleteAccessTokenCode):    OperationDeletePersonalAccessToken,
+	uint32(command.SendMessagesCode):         OperationSendMessages,
+	uint32(command.StoreOffsetCode):          OperationStoreConsumerOffset,
+	uint32(command.DeleteConsumerOffsetCode): OperationDeleteConsumerOffset,
+	uint32(command.CreateStreamCode):         OperationCreateStream,
+	uint32(command.DeleteStreamCode):         OperationDeleteStream,
+	uint32(command.UpdateStreamCode):         OperationUpdateStream,
+	uint32(command.PurgeStreamCode):          OperationPurgeStream,
+	uint32(command.CreateTopicCode):          OperationCreateTopic,
+	uint32(command.DeleteTopicCode):          OperationDeleteTopic,
+	uint32(command.UpdateTopicCode):          OperationUpdateTopic,
+	uint32(command.PurgeTopicCode):           OperationPurgeTopic,
+	uint32(command.CreatePartitionsCode):     OperationCreatePartitions,
+	uint32(command.DeletePartitionsCode):     OperationDeletePartitions,
+	uint32(command.DeleteSegmentsCode):       OperationDeleteSegments,
+	uint32(command.CreateGroupCode):          OperationCreateConsumerGroup,
+	uint32(command.DeleteGroupCode):          OperationDeleteConsumerGroup,
+	uint32(command.JoinGroupCode):            OperationJoinConsumerGroup,
+	uint32(command.LeaveGroupCode):           OperationLeaveConsumerGroup,
 }
 
 func newOperationSet(operations []Operation) map[Operation]struct{} {
@@ -227,8 +221,7 @@ func IsResultFramed(operation Operation) bool {
 		return true
 	}
 	switch operation {
-	case OperationStoreConsumerOffset, OperationStoreConsumerOffset2,
-		OperationDeleteConsumerOffset, OperationDeleteConsumerOffset2:
+	case OperationStoreConsumerOffset, OperationDeleteConsumerOffset:
 		return true
 	default:
 		return false

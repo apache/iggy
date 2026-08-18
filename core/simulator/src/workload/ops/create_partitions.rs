@@ -19,8 +19,9 @@
 //!
 //! Targets `Ok` (live topic), `StreamNotFound` (fabricated parent stream), or
 //! `TopicNotFound` (live stream, fabricated topic). `InvalidPartitionsCount`
-//! not targeted (only reachable through partition-id overflow). A committed
-//! `Ok` grows the shadow's per-topic partition count, which
+//! not targeted (only reachable through partition-id overflow), and
+//! `PartitionIdSpaceExhausted` needs `MAX_PARTITIONS` ids consumed under one
+//! topic. A committed `Ok` grows the shadow's per-topic partition count, which
 //! `delete_partitions` samples against.
 
 use iggy_binary_protocol::RoutedRequestHeader;
@@ -82,6 +83,9 @@ pub fn sample(
         }
         Outcome::InvalidPartitionsCount => {
             unreachable!("create_partitions does not target InvalidPartitionsCount")
+        }
+        Outcome::PartitionIdSpaceExhausted => {
+            unreachable!("create_partitions does not target PartitionIdSpaceExhausted")
         }
     }
 }

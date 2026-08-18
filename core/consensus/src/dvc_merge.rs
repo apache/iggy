@@ -530,7 +530,7 @@ mod tests {
     use super::*;
     use crate::DVC_HEADERS_MAX;
     use crate::view_change_quorum::{dvc_blank, dvc_quorum_array_empty, dvc_record};
-    use iggy_binary_protocol::{Command2, Operation};
+    use iggy_binary_protocol::{Command, Operation};
 
     /// Three replicas: replication 2, view-change 2, nack 2.
     fn quorums_r3() -> MergeQuorums {
@@ -545,7 +545,7 @@ mod tests {
     /// A prepare whose checksum derives from its op, so the hash chain connects.
     fn prepare(op: u64, view: u32) -> PrepareHeader {
         PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::CreateStream,
             op,
             view,

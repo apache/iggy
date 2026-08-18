@@ -8,7 +8,7 @@ exclude-newer-span = "P7D"
 
 [[package]]
 name = "apache-iggy"
-version = "0.9.0.dev3"
+version = "0.9.0.dev4"
 source = { directory = "../../foreign/python" }
 
 [package.metadata]

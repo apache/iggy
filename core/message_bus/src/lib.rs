@@ -1418,7 +1418,7 @@ pub const fn client_id_owning_shard(client_id: u128) -> u16 {
 }
 
 /// Reserved client id stamped on server-generated auto-commit
-/// `StoreConsumerOffset2` ops (a poll's `auto_commit` replicated for failover).
+/// `StoreConsumerOffset` ops (a poll's `auto_commit` replicated for failover).
 ///
 /// Never belongs to a live connection: `mint_client_id` produces
 /// `(shard << 112) | seq` and no real shard is `u16::MAX`, so `u128::MAX` is
@@ -1463,13 +1463,13 @@ fn reply_request_id(reply: &Frozen<MESSAGE_ALIGN>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, HEADER_SIZE};
+    use iggy_binary_protocol::{Command, HEADER_SIZE};
     use std::cell::RefCell;
 
     #[allow(clippy::cast_possible_truncation)]
     fn dummy_message() -> Message<GenericHeader> {
         Message::<GenericHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut GenericHeader| {
-            h.command = Command2::Prepare;
+            h.command = Command::Prepare;
             h.size = HEADER_SIZE as u32;
         })
     }
@@ -1513,7 +1513,7 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn reply_message(request: u64) -> Message<ReplyHeader> {
         Message::<ReplyHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut ReplyHeader| {
-            h.command = Command2::Reply;
+            h.command = Command::Reply;
             h.size = HEADER_SIZE as u32;
             h.request = request;
         })

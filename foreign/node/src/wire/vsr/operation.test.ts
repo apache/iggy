@@ -53,9 +53,7 @@ const replicated = new Map<number, number>([
   [COMMAND_CODE.LeaveGroup, Operation.LeaveConsumerGroup],
   [COMMAND_CODE.SendMessages, Operation.SendMessages],
   [COMMAND_CODE.StoreOffset, Operation.StoreConsumerOffset],
-  [COMMAND_CODE.DeleteConsumerOffset, Operation.DeleteConsumerOffset],
-  [COMMAND_CODE.StoreOffset2, Operation.StoreConsumerOffset2],
-  [COMMAND_CODE.DeleteConsumerOffset2, Operation.DeleteConsumerOffset2]
+  [COMMAND_CODE.DeleteConsumerOffset, Operation.DeleteConsumerOffset]
 ]);
 
 describe('VSR operation classification', () => {
@@ -92,16 +90,14 @@ describe('VSR operation classification', () => {
     assert.equal(isPartition(Operation.SendMessages), true);
     assert.equal(isPartition(159), false);
     assert.equal(isResultFramed(Operation.StoreConsumerOffset), true);
-    assert.equal(isResultFramed(Operation.StoreConsumerOffset2), true);
     assert.equal(isResultFramed(Operation.DeleteConsumerOffset), true);
-    assert.equal(isResultFramed(Operation.DeleteConsumerOffset2), true);
     assert.equal(isResultFramed(Operation.SendMessages), false);
   });
 
   it('recognizes only declared operation discriminants', () => {
     assert.equal(isKnownOperation(Operation.Register), true);
     assert.equal(isKnownOperation(Operation.SendMessages), true);
-    for (const undeclared of [69, 127, 150, 159, 163, 166, 255])
+    for (const undeclared of [69, 127, 150, 159, 163, 164, 165, 166, 255])
       assert.equal(isKnownOperation(undeclared), false);
   });
 });

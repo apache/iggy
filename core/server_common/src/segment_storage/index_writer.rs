@@ -15,12 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::PooledBuffer;
 use compio::fs::File;
 use compio::fs::OpenOptions;
-use compio::io::AsyncWriteAtExt;
 use err_trail::ErrContext;
-use iggy_common::INDEX_SIZE;
 use iggy_common::IggyError;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,7 +29,6 @@ pub struct IndexWriter {
     file_path: String,
     file: File,
     index_size_bytes: Rc<AtomicU64>,
-    fsync: bool,
 }
 
 // Safety: We are guaranteeing that IndexWriter will never be used from multiple threads
@@ -43,7 +39,6 @@ impl IndexWriter {
     pub async fn new(
         file_path: &str,
         index_size_bytes: Rc<AtomicU64>,
-        fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
@@ -82,46 +77,7 @@ impl IndexWriter {
             file_path: file_path.to_string(),
             file,
             index_size_bytes,
-            fsync,
         })
-    }
-
-    /// Appends multiple index buffer to the index file in a single operation.
-    pub async fn save_indexes(&self, indexes: PooledBuffer) -> Result<(), IggyError> {
-        if indexes.is_empty() {
-            return Ok(());
-        }
-
-        let count = indexes.len() / INDEX_SIZE;
-        let len = indexes.len();
-
-        let position = self.index_size_bytes.load(Ordering::Relaxed);
-        let file = &self.file;
-        (&*file)
-            .write_all_at(indexes, position)
-            .await
-            .0
-            .error(|e: &std::io::Error| {
-                format!(
-                    "Failed to write {} indexes to file: {}. {e}",
-                    count, self.file_path
-                )
-            })
-            .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
-
-        self.index_size_bytes
-            .fetch_add(len as u64, Ordering::Release);
-
-        if self.fsync {
-            let _ = self.fsync().await;
-        }
-        trace!(
-            "Saved {count} indexes of size {} to file: {}",
-            INDEX_SIZE * count,
-            self.file_path
-        );
-
-        Ok(())
     }
 
     pub fn size_counter(&self) -> Rc<AtomicU64> {

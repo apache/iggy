@@ -23,8 +23,6 @@ pub mod crypto;
 pub mod diagnostics;
 pub mod executor;
 pub mod fs_utils;
-mod in_flight;
-mod indexes_mut;
 // TODO(hubcio): iobuf was relocated verbatim from `core/binary_protocol/src/consensus/iobuf.rs`
 // during the sans-io split. Its implementation is intentionally untouched; the
 // lints below predate the move and are tracked as tech debt for a 0.9.x cleanup pass.
@@ -41,10 +39,8 @@ mod indexes_mut;
 pub mod iobuf;
 pub mod log;
 mod memory_pool;
-mod messages_batch_mut;
-mod messages_batch_set;
 mod segment_storage;
-pub mod send_messages2;
+pub mod send_messages;
 pub mod sharding;
 
 pub use bootstrap::create_directories;
@@ -55,11 +51,7 @@ pub use consensus_message::{
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
 };
 pub use executor::create_shard_executor;
-pub use in_flight::IggyMessagesBatchSetInFlight;
-pub use indexes_mut::IggyIndexesMut;
 pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
-pub use messages_batch_mut::IggyMessagesBatchMut;
-pub use messages_batch_set::IggyMessagesBatchSet;
 pub use segment_storage::{
     IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
 };

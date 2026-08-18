@@ -23,11 +23,11 @@ use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
+    Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
 };
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
-use server_common::send_messages2::{ChecksumMode, convert_request_message, encrypt_batch_request};
+use server_common::send_messages::{ChecksumMode, convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
@@ -643,7 +643,7 @@ where
     {
         assert!(matches!(
             message.header().command(),
-            Command2::Request | Command2::Prepare | Command2::PrepareOk
+            Command::Request | Command::Prepare | Command::PrepareOk
         ));
         message.header().operation().is_partition()
     }
@@ -659,8 +659,8 @@ mod tests {
     use iggy_common::{IggyByteSize, PartitionStats};
     use journal::Journal as _;
     use message_bus::IggyMessageBus;
-    use server_common::send_messages2::{
-        IggyMessage2, IggyMessage2Header, IggyMessages2, PREPARE_SPLIT_POINT, SendMessages2Owned,
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, PREPARE_SPLIT_POINT, SendMessagesOwned,
         stamp_prepare_for_persistence,
     };
     use server_common::{Message, iobuf::Frozen};
@@ -718,22 +718,22 @@ mod tests {
         op: u64,
         base_offset: u64,
     ) -> Frozen<4096> {
-        let mut batch = IggyMessages2::with_capacity(1);
-        batch.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        let mut batch = IggyMessages::with_capacity(1);
+        batch.push(IggyMessage {
+            header: IggyMessageHeader {
                 payload_length: 8,
                 ..Default::default()
             },
             payload: Bytes::from_static(b"abcdefgh"),
             user_headers: None,
         });
-        let owned = SendMessages2Owned::from_messages(namespace, &batch)
-            .expect("build send_messages batch");
+        let owned =
+            SendMessagesOwned::from_messages(namespace, &batch).expect("build send_messages batch");
 
         let total_size = PREPARE_SPLIT_POINT + owned.blob.len();
         let prepare = Message::<PrepareHeader>::new(total_size).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.operation = Operation::SendMessages;
                 header.op = op;
                 header.size = u32::try_from(total_size).expect("size fits u32");

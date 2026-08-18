@@ -17,7 +17,7 @@
 
 use crate::REPLICAS_MAX;
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command2, ConsensusHeader, DVC_HEADERS_MAX, Operation, PrepareHeader,
+    CHECKSUM_UNSEALED, Command, ConsensusHeader, DVC_HEADERS_MAX, Operation, PrepareHeader,
 };
 
 /// Write prepare headers into a control-message body, high-to-low op.
@@ -50,7 +50,7 @@ pub fn encode_prepare_headers(headers: &[PrepareHeader], dst: &mut [u8]) {
 #[must_use]
 pub fn dvc_blank(op: u64) -> PrepareHeader {
     PrepareHeader {
-        command: Command2::Prepare,
+        command: Command::Prepare,
         operation: Operation::Reserved,
         op,
         ..Default::default()

@@ -15,5 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// `DeleteConsumerOffset2` response is empty.
-pub type DeleteConsumerOffset2Response = super::EmptyResponse;
+namespace Apache.Iggy.Messages;
+
+/// <summary>
+///     Sizes of the canonical message batch record shared by send requests and poll responses:
+///     a 256-byte batch header followed by per-message frames of
+///     <c>[48-byte frame header][payload][user headers]</c>.
+/// </summary>
+internal static class BatchWireFormat
+{
+    internal const int BATCH_HEADER_SIZE = 256;
+
+    internal const int FRAME_HEADER_SIZE = 48;
+}

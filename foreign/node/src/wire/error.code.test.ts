@@ -20,21 +20,36 @@ import { it } from 'node:test';
 import { translateErrorCode } from './error.code.js';
 
 it('translates the consumer-group error range', () => {
-  assert.equal(translateErrorCode(5000), 'Consumer group ID not found');
+  assert.equal(
+    translateErrorCode(5000),
+    'Consumer group with ID: {0} for topic with ID: {1} was not found.'
+  );
   assert.equal(translateErrorCode(5001), 'error');
   assert.equal(translateErrorCode(5002), 'Invalid consumer group ID');
-  assert.equal(translateErrorCode(5003), 'Consumer group name not found');
+  assert.equal(
+    translateErrorCode(5003),
+    'Consumer group with name: {0} for topic with ID: {1} was not found.'
+  );
   assert.equal(
     translateErrorCode(5004),
-    'Consumer group name already exists'
+    'Consumer group with name: {0} for topic with ID: {1} already exists.'
   );
   assert.equal(translateErrorCode(5005), 'Invalid consumer group name');
-  assert.equal(translateErrorCode(5006), 'Consumer group member not found');
-  assert.equal(translateErrorCode(5007), 'Cannot create consumer group info');
-  assert.equal(translateErrorCode(5008), 'Cannot delete consumer group info');
+  assert.equal(
+    translateErrorCode(5006),
+    'Consumer group member with client ID: {0} for group with ID: {1} for topic with ID: {2} was not found.'
+  );
+  assert.equal(
+    translateErrorCode(5007),
+    'Failed to create consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}.'
+  );
+  assert.equal(
+    translateErrorCode(5008),
+    'Failed to delete consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}.'
+  );
   assert.equal(
     translateErrorCode(5009),
-    'Consumer group partition not owned'
+    'Consumer group member with client ID: {0} does not own partition: {1} at the current generation (rebalance in progress).'
   );
   assert.equal(translateErrorCode(5010), 'error');
 });

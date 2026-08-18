@@ -30,8 +30,8 @@ use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
+use super::server::ServerConfig;
 use super::server::ServerSystemConfig;
-use super::server::{ExtraConfig, ServerConfig};
 use super::tcp::{TcpConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
@@ -50,7 +50,6 @@ impl Default for ServerConfig {
         ServerConfig {
             consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
-            extra: ExtraConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
             system: Arc::new(ServerSystemConfig::default()),

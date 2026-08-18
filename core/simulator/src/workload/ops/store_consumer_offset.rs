@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `StoreConsumerOffset` op. Pre-`AckLevel` manual encoding. Live
-//! namespace via shadow, fabricated consumer kind/id. Samples Success.
+//! `StoreConsumerOffset` op. Samples only `Success`. PRNG draw order:
+//!
+//! 1. namespace pick
+//! 2. `consumer_kind` boolean draw
+//! 3. `consumer_id` range draw
+//! 4. `offset` range draw
+//! 5. `ack` ratio draw
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -35,6 +40,7 @@ pub struct Input {
     pub consumer_kind: u8,
     pub consumer_id: u32,
     pub offset: u64,
+    pub ack: AckLevel,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -62,11 +68,18 @@ pub fn sample(
             let raw: u64 = prng.random_range(0..options.max_offset.max(1));
             let high = shadow.sends_committed(ns).max(1);
             let offset = raw % high;
+            let f: f32 = prng.random();
+            let ack = if f < options.ack_quorum_ratio {
+                AckLevel::Quorum
+            } else {
+                AckLevel::NoAck
+            };
             Some(Input {
                 ns,
                 consumer_kind,
                 consumer_id,
                 offset,
+                ack,
             })
         }
     }
@@ -79,6 +92,7 @@ pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequest
         input.consumer_kind,
         input.consumer_id,
         input.offset,
+        input.ack,
     )
 }
 

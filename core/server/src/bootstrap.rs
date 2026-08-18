@@ -26,7 +26,7 @@ use crate::dispatch::{
 use crate::http;
 use crate::partition_helpers::{
     build_partition_fresh, configure_consumer_offsets, ensure_initial_segment,
-    open_partition_superblock, restore_partition_view, validate_namespace_bounds,
+    open_partition_superblock, restore_partition_view,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
@@ -1839,7 +1839,6 @@ async fn build_shard_for_thread(
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
-        validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = match load_partition(
             config,
@@ -2437,16 +2436,12 @@ async fn recover_partition_segments(
     let segment_size = runtime_options
         .segment_size
         .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
-    let enforce_fsync = runtime_options
-        .enforce_fsync
-        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     load_persisted_segments(
         config,
         stream_id,
         topic_id,
         partition_id,
         segment_size,
-        enforce_fsync,
         stats,
     )
     .await
