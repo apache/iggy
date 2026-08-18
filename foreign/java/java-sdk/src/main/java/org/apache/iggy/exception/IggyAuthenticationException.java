@@ -36,9 +36,9 @@ public class IggyAuthenticationException extends IggyServerException {
             IggyErrorCode.INVALID_CREDENTIALS,
             IggyErrorCode.INVALID_USERNAME,
             IggyErrorCode.INVALID_PASSWORD,
-            IggyErrorCode.INVALID_PAT_TOKEN,
-            IggyErrorCode.PASSWORD_DOES_NOT_MATCH,
-            IggyErrorCode.PASSWORD_HASH_INTERNAL_ERROR);
+            IggyErrorCode.INVALID_PERSONAL_ACCESS_TOKEN,
+            IggyErrorCode.ACCESS_TOKEN_MISSING,
+            IggyErrorCode.INVALID_ACCESS_TOKEN);
 
     /**
      * Constructs a new IggyAuthenticationException.
