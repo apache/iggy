@@ -50,6 +50,10 @@ const MIN_HEARTBEAT_TO_COMMIT_BROADCAST_RATIO: u32 = 4;
 /// than escalating a progressing view change into a fresh cluster-wide election.
 const MIN_STATUS_TO_RETRANSMIT_RATIO: u32 = 4;
 
+/// Floor for a nonzero `superblock_wedged_fatal_timeout`: a shorter window
+/// would fail-stop the process on a transient disk hiccup instead of a wedge.
+const MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default recovering-replica probe-attempt ceiling. Duplicated here rather
 /// than imported so `core/configs` keeps off a build-time edge onto
 /// `core/consensus` (mirroring [`super::partition`]); `core/server`'s
@@ -172,6 +176,16 @@ fn default_repair_chunk_max() -> usize {
     SERVER_CONFIG.cluster.repair_chunk_max as usize
 }
 
+/// serde fallback for configs written before the field existed; the value
+/// itself lives in `core/server/config.toml` like every other default.
+fn default_superblock_wedged_fatal_timeout() -> IggyDuration {
+    SERVER_CONFIG
+        .cluster
+        .superblock_wedged_fatal_timeout
+        .parse()
+        .unwrap()
+}
+
 #[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(deny_unknown_fields)]
@@ -262,6 +276,17 @@ pub struct ClusterConfig {
     /// be > 0 and <= `MAX_REPAIR_CHUNK_MAX`.
     #[serde(default = "default_repair_chunk_max")]
     pub repair_chunk_max: usize,
+    /// How long the metadata superblock may stay unwritable before the replica
+    /// fail-stops. While wedged the replica is already fenced quorum-invisible
+    /// and peers elect around it; this converts the log-only limp into a
+    /// distinct exit status a supervisor can act on. Zero (and the `0` /
+    /// `disabled` / `unlimited` sentinels, which all parse to zero) disables
+    /// the fail-stop; nonzero values below
+    /// `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are rejected at boot.
+    #[serde(default = "default_superblock_wedged_fatal_timeout")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub superblock_wedged_fatal_timeout: IggyDuration,
     /// Full roster of cluster members. Intended to be byte-identical across
     /// every node so operators ship one config. The running node's identity
     /// is supplied out-of-band via the `--replica-id` CLI flag, which
@@ -743,6 +768,22 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 "Invalid cluster configuration: cluster.repair_chunk_max ({}) exceeds the maximum \
                  ({MAX_REPAIR_CHUNK_MAX})",
                 self.repair_chunk_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // Also ahead of the enabled gate: a solo replica persists the
+        // superblock too, so the fail-stop window applies regardless.
+        let superblock_fatal_window = self.superblock_wedged_fatal_timeout.get_duration();
+        if !superblock_fatal_window.is_zero()
+            && superblock_fatal_window < MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT
+        {
+            eprintln!(
+                "Invalid cluster configuration: cluster.superblock_wedged_fatal_timeout '{}' must \
+                 be zero (disabled) or at least {}s (a shorter window fail-stops the process on a \
+                 transient disk hiccup)",
+                self.superblock_wedged_fatal_timeout,
+                MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT.as_secs()
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -1402,6 +1443,7 @@ mod tests {
             view_probe_attempts_max: default_view_probe_attempts_max(),
             repair_retry_interval: default_repair_retry_interval(),
             repair_chunk_max: default_repair_chunk_max(),
+            superblock_wedged_fatal_timeout: default_superblock_wedged_fatal_timeout(),
             nodes: Vec::new(),
             auth: ClusterAuthConfig {
                 enabled: true,
@@ -1737,6 +1779,7 @@ mod cluster_validate_tests {
             view_probe_attempts_max: default_view_probe_attempts_max(),
             repair_retry_interval: default_repair_retry_interval(),
             repair_chunk_max: default_repair_chunk_max(),
+            superblock_wedged_fatal_timeout: default_superblock_wedged_fatal_timeout(),
             nodes,
             auth: ClusterAuthConfig::default(),
             tls: ClusterTlsConfig::default(),

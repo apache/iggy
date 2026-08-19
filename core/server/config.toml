@@ -559,6 +559,15 @@ repair_retry_interval = "1s"
 # the queue and drops frames. Must be > 0 and <= 1024.
 repair_chunk_max = 128
 
+# How long the metadata superblock may stay unwritable before the replica
+# fail-stops (duration). A replica that cannot persist its view is already
+# fenced quorum-invisible and retries with capped backoff; past this window the
+# process exits with a distinct status so a supervisor restarts or replaces it
+# instead of an operator finding the wedge in logs. "0" disables the fail-stop
+# and leaves the replica fenced indefinitely. Nonzero values must be at least
+# 30s so a transient disk hiccup cannot kill the process.
+superblock_wedged_fatal_timeout = "2m"
+
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
 # When true, every replica peer must complete the authenticated handshake or be

@@ -1113,6 +1113,49 @@ where
     clock: ConsensusClock,
 }
 
+/// Boot-time timer set for a consensus group, one struct so every plane's
+/// restore path applies the same values in the same place.
+#[derive(Debug, Clone, Copy)]
+pub struct ConsensusTimers {
+    pub normal_heartbeat_ticks: u64,
+    pub commit_message_ticks: u64,
+    pub prepare_ticks: u64,
+    pub view_change_retransmit_ticks: u64,
+    pub view_change_status_ticks: u64,
+    pub request_start_view_ticks: u64,
+    pub probe_attempts_max: u32,
+}
+
+/// How a restored replica joins its group.
+#[derive(Debug, Clone, Copy)]
+pub enum JoinMode {
+    /// Fresh group or solo replica: plain init; the group needs its view-0
+    /// primary to exist.
+    Init,
+    /// Prior life detected: join quorum-invisible and probe for the current
+    /// view (`RequestStartView`) instead of resuming a role the cluster may
+    /// have elected past.
+    ProbeAsBackup {
+        /// Also await a state-transfer offer before serving, replacing
+        /// snapshot-shaped state from the live primary.
+        await_state_transfer: bool,
+    },
+}
+
+/// Restored state handed to [`VsrConsensus::restored`].
+#[derive(Debug, Clone, Copy)]
+pub struct VsrRestore<'a> {
+    pub timers: &'a ConsensusTimers,
+    /// `(view, log_view)` read back from the group's durable superblock.
+    pub durable_view: Option<(u32, u32)>,
+    /// View inferred from the last journaled prepare, consulted only when no
+    /// durable record exists; `log_view` cannot be inferred and stays 0.
+    pub view_fallback: Option<u32>,
+    /// Non-zero boot incarnation; `None` keeps the default.
+    pub incarnation: Option<u128>,
+    pub join: JoinMode,
+}
+
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// # Panics
     /// - If `replica >= replica_count`.
@@ -1134,6 +1177,73 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             pipeline,
             ConsensusClock::system(),
         )
+    }
+
+    /// Restore constructor: the one ordered boot path for every plane, so the
+    /// metadata and partition planes cannot diverge in restore order. Timers
+    /// first, then the durable view, then role selection - a probe must never
+    /// advertise a view older than the recorded one.
+    ///
+    /// # Panics
+    /// - If `replica >= replica_count`.
+    /// - If `replica_count < 1`.
+    pub fn restored(
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        group: u64,
+        message_bus: B,
+        pipeline: P,
+        restore: VsrRestore<'_>,
+    ) -> Self {
+        let mut consensus = Self::new(
+            cluster,
+            replica,
+            replica_count,
+            group,
+            message_bus,
+            pipeline,
+        );
+        let timers = restore.timers;
+        consensus.set_normal_heartbeat_ticks(timers.normal_heartbeat_ticks);
+        consensus.set_commit_message_ticks(timers.commit_message_ticks);
+        consensus.set_prepare_ticks(timers.prepare_ticks);
+        consensus.set_view_change_retransmit_ticks(timers.view_change_retransmit_ticks);
+        consensus.set_view_change_status_ticks(timers.view_change_status_ticks);
+        consensus.set_request_start_view_ticks(timers.request_start_view_ticks);
+        consensus.set_probe_attempts_max(timers.probe_attempts_max);
+        if let Some(incarnation) = restore.incarnation {
+            consensus.set_incarnation(incarnation);
+        }
+        if let Some((view, log_view)) = restore.durable_view {
+            // The one line proving the durable record was READ BACK, not merely
+            // written: a replica that came back at view 0 is otherwise
+            // indistinguishable from one that resumed correctly until it votes.
+            tracing::info!(
+                group,
+                view,
+                log_view,
+                "restored group view from its superblock"
+            );
+            consensus.set_view(view);
+            consensus.set_log_view(log_view);
+            consensus.mark_superblock_durable(view, log_view);
+        } else if let Some(view) = restore.view_fallback {
+            consensus.set_view(view);
+        }
+        match restore.join {
+            JoinMode::Init => consensus.init(),
+            JoinMode::ProbeAsBackup {
+                await_state_transfer,
+            } => {
+                consensus.init_as_backup();
+                consensus.begin_view_probe();
+                if await_state_transfer {
+                    consensus.begin_state_transfer_await();
+                }
+            }
+        }
+        consensus
     }
 
     /// [`Self::new`] with an explicit time source. Simulator and clock
