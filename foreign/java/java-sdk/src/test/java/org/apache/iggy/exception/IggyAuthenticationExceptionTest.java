@@ -50,9 +50,9 @@ class IggyAuthenticationExceptionTest {
                 "INVALID_CREDENTIALS",
                 "INVALID_USERNAME",
                 "INVALID_PASSWORD",
-                "INVALID_PAT_TOKEN",
-                "PASSWORD_DOES_NOT_MATCH",
-                "PASSWORD_HASH_INTERNAL_ERROR"
+                "INVALID_PERSONAL_ACCESS_TOKEN",
+                "ACCESS_TOKEN_MISSING",
+                "INVALID_ACCESS_TOKEN"
             })
     void matchesReturnsTrueForAuthenticationRelatedCodes(IggyErrorCode code) {
         assertThat(IggyAuthenticationException.matches(code)).isTrue();
@@ -66,9 +66,9 @@ class IggyAuthenticationExceptionTest {
                 "INVALID_CREDENTIALS",
                 "INVALID_USERNAME",
                 "INVALID_PASSWORD",
-                "INVALID_PAT_TOKEN",
-                "PASSWORD_DOES_NOT_MATCH",
-                "PASSWORD_HASH_INTERNAL_ERROR"
+                "INVALID_PERSONAL_ACCESS_TOKEN",
+                "ACCESS_TOKEN_MISSING",
+                "INVALID_ACCESS_TOKEN"
             },
             mode = Mode.EXCLUDE)
     void matchesReturnsFalseForNonAuthenticationRelatedCodes(IggyErrorCode code) {

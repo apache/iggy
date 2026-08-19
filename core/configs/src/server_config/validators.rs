@@ -19,18 +19,18 @@
 //!
 //! Delegates section by section, including
 //! [`super::message_bus::MessageBusConfig::validate`], then applies the
-//! cross-section invariants: topic vs segment sizing, JWT gating when
-//! HTTP is enabled, and server-default expiry sanity.
+//! cross-section invariants: JWT gating when HTTP is enabled and
+//! server-default expiry sanity.
 
 use super::COMPONENT;
 use super::cluster::STATE_CHUNK_HEADER_LEN;
-use super::server::{ExtraConfig, NamespaceConfig, ServerConfig};
+use super::partition::{CONCURRENT_SERVED_SEGMENTS, SEGMENT_SIZE_OVERSHOOT_BYTES};
+use super::server::ServerConfig;
 use crate::ConfigurationError;
+use crate::common::http::HMAC_JWT_ALGORITHMS;
 use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, Validatable};
-use server_common::sharding::IggyNamespace;
-use tracing::warn;
 
 /// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
 /// evaluate the `max_write_buffer_size > write_buffer_size` invariant
@@ -58,20 +58,11 @@ impl Validatable<ConfigurationError> for ServerConfig {
                     "{COMPONENT} (error: {e}) - failed to validate personal access token config"
                 )
             })?;
-        self.extra.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate extra config")
-        })?;
         self.system
             .segment
             .validate()
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate segment config")
-            })?;
-        self.system
-            .compression
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate compression config")
             })?;
         self.telemetry.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate telemetry config")
@@ -97,16 +88,29 @@ impl Validatable<ConfigurationError> for ServerConfig {
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate logging config")
             })?;
-        self.message_saver
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate message saver config")
-            })?;
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
         {
             eprintln!("http.jwt.access_token_expiry cannot be ServerDefault when HTTP is enabled");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // The signing key is always HMAC (built from a shared secret; there is
+        // no PEM loading path), and jsonwebtoken refuses a header algorithm
+        // whose family does not match the key. An asymmetric algorithm builds
+        // the manager fine and then fails every login at token generation, so
+        // the server would serve HTTP that nobody can authenticate against.
+        if self.http.enabled && self.http.jwt.get_algorithm().is_err() {
+            let supported = HMAC_JWT_ALGORITHMS.map(|(name, _)| name).join(", ");
+            eprintln!(
+                "http.jwt.algorithm '{}' is not supported: the server signs with a shared \
+                 secret, so only {supported} can be used. This field governs self-issued \
+                 tokens only; [[http.jwt.trusted_issuers]] is unaffected, because an issuer's \
+                 token is verified with the algorithm named in its own header and the matching \
+                 JWKS key, never with this field",
+                self.http.jwt.algorithm
+            );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
@@ -170,6 +174,32 @@ impl Validatable<ConfigurationError> for ServerConfig {
                 self.message_bus.max_message_size.as_bytes_u64(),
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // Raising the artifact ceiling (or the segment size) without raising the
+        // served-payload budget silently serialises rejoins: a whole-node rejoin
+        // then walks its partitions one at a time. Warn rather than reject,
+        // because running under the budget costs re-reads, not failures, and an
+        // operator deliberately trading serving concurrency for memory still
+        // boots.
+        let (resident_len, served_slots) = served_transfer_slots(self);
+        if served_slots < CONCURRENT_SERVED_SEGMENTS {
+            let served_cache = self
+                .partition
+                .transfer_served_cache_bytes_max
+                .as_bytes_u64();
+            eprintln!(
+                "{COMPONENT} partition.transfer_served_cache_bytes_max ({served_cache} B) holds \
+                 only {served_slots} state-transfer slot(s) of {resident_len} B (the larger of \
+                 partition.transfer_artifact_bytes_max and the built-in segment ceiling of \
+                 {SEGMENT_MAX_SIZE_BYTES} B + {SEGMENT_SIZE_OVERSHOOT_BYTES} B of overshoot), \
+                 below the {CONCURRENT_SERVED_SEGMENTS} this shard is sized to serve at once, so \
+                 rejoins serialise and every cache miss re-reads and re-hashes a whole segment to \
+                 serve one chunk. The segment ceiling is a compile-time constant, so the only \
+                 knobs here are these two: raise transfer_served_cache_bytes_max to {} B, or \
+                 lower transfer_artifact_bytes_max",
+                resident_len.saturating_mul(CONCURRENT_SERVED_SEGMENTS)
+            );
         }
 
         self.message_bus
@@ -313,20 +343,48 @@ impl Validatable<ConfigurationError> for ServerConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        reject_unsupported_and_warn_inert(self)?;
+        reject_unsupported(self)?;
 
         Ok(())
     }
 }
 
+/// `(resident_len, slots)`: the size a SEALED segment actually reaches, and how
+/// many of them the served-payload budget holds at once.
+///
+/// Reproduces what `IggyShard::partition_transfer_admission_cap` computes at the
+/// shipped defaults, which is what really decides how many rejoins one shard
+/// serves concurrently. The shard divides by the CONFIGURED segment size plus
+/// overshoot; this divides by the compile-time segment ceiling, and the two
+/// coincide only because bootstrap pins the deployed segment size to
+/// `DEFAULT_SEGMENT_SIZE`. Where they diverge this side is the conservative one,
+/// so the warning it drives can over-fire but never under-fire.
+///
+/// The divisor is the sealed size rather than the configured target because
+/// rotation checks the cap after appending. Segment size is per topic now, so
+/// the sealed bound is the LARGEST segment any topic may legally declare, not a
+/// configured value. The `max` floor is never zero, so the division always
+/// holds, and the quotient carries the shard's own one-slot clamp so the warning
+/// never claims a slot count the runtime would not admit.
+fn served_transfer_slots(config: &ServerConfig) -> (u64, u64) {
+    let resident_len = config
+        .partition
+        .transfer_artifact_bytes_max
+        .as_bytes_u64()
+        .max(SEGMENT_MAX_SIZE_BYTES.saturating_add(SEGMENT_SIZE_OVERSHOOT_BYTES));
+    let slots = (config
+        .partition
+        .transfer_served_cache_bytes_max
+        .as_bytes_u64()
+        / resident_len)
+        .max(1);
+    (resident_len, slots)
+}
+
 /// The server parses the whole config surface but does not yet honor every
-/// knob. Make the still-inert ones loud at boot: reject the unsupported
-/// features (all off by default, so only a deliberate opt-in trips this) and
-/// warn once for tuning knobs the server silently ignores. Warnings fire only
-/// when a knob deviates from its [`ServerConfig::default`] baseline, so a
-/// pristine config.toml boots without noise. The guard test below pins the
-/// compared knobs against drift.
-fn reject_unsupported_and_warn_inert(config: &ServerConfig) -> Result<(), ConfigurationError> {
+/// knob. Make the still-inert ones loud at boot rather than silently ignored.
+/// All are off by default, so only a deliberate opt-in trips this.
+fn reject_unsupported(config: &ServerConfig) -> Result<(), ConfigurationError> {
     if config.system.segment.archive_expired {
         eprintln!("system.segment.archive_expired is not supported");
         return Err(ConfigurationError::InvalidConfigurationValue);
@@ -336,83 +394,7 @@ fn reject_unsupported_and_warn_inert(config: &ServerConfig) -> Result<(), Config
         return Err(ConfigurationError::InvalidConfigurationValue);
     }
 
-    let defaults = ServerConfig::default();
-
-    if config.tcp.socket.override_defaults {
-        warn!("tcp.socket tuning is set but not applied");
-    }
-    if config.quic.socket.override_defaults {
-        warn!("quic.socket tuning is set but not applied");
-    }
-    if config.tcp.ipv6 {
-        warn!("tcp.ipv6 is ignored; IPv4 vs IPv6 is decided by the tcp.address string");
-    }
-    if config.tcp.socket_migration != defaults.tcp.socket_migration {
-        warn!("tcp.socket_migration is not implemented");
-    }
-    if config.system.segment.cache_indexes != defaults.system.segment.cache_indexes {
-        warn!("system.segment.cache_indexes is not applied");
-    }
-    if config.system.logging.sysinfo_print_interval
-        != defaults.system.logging.sysinfo_print_interval
-    {
-        warn!("system.logging.sysinfo_print_interval is not applied");
-    }
-    if config.system.backup.path != defaults.system.backup.path
-        || config.system.backup.compatibility.path != defaults.system.backup.compatibility.path
-    {
-        warn!("backup is not supported");
-    }
-    // default_algorithm deviation is already warned by the delegated legacy
-    // CompressionConfig::validate; only allow_override needs a signal here.
-    if config.system.compression.allow_override != defaults.system.compression.allow_override {
-        warn!(
-            "system.compression.allow_override is inert; live compression is per-topic from the request"
-        );
-    }
-    if config.system.state.enforce_fsync != defaults.system.state.enforce_fsync
-        || config.system.state.max_file_operation_retries
-            != defaults.system.state.max_file_operation_retries
-        || config.system.state.retry_delay != defaults.system.state.retry_delay
-    {
-        warn!(
-            "system.state tuning (enforce_fsync, max_file_operation_retries, retry_delay) is not applied"
-        );
-    }
-    if config.consumer_group.rebalancing_check_interval
-        != defaults.consumer_group.rebalancing_check_interval
-    {
-        warn!(
-            "consumer_group.rebalancing_check_interval is not applied; rebalancing cadence uses system.sharding.reconcile_periodic_interval"
-        );
-    }
-    if config.message_saver.interval != defaults.message_saver.interval
-        || config.message_saver.enforce_fsync != defaults.message_saver.enforce_fsync
-    {
-        warn!("periodic message_saver is not implemented; only shutdown-flush is active");
-    }
-
     Ok(())
-}
-
-impl Validatable<ConfigurationError> for ExtraConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        self.namespace.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate namespace config")
-        })?;
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for NamespaceConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        IggyNamespace::validate_capacity(self.max_streams, self.max_topics, self.max_partitions)
-            .map_err(|error| {
-                eprintln!("extra.namespace is invalid: {error}");
-                ConfigurationError::InvalidConfigurationValue
-            })?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -488,6 +470,74 @@ mod tests {
     fn given_recreate_missing_state_enabled_when_validating_should_reject() {
         let config = config_with_override("[system.recovery]\nrecreate_missing_state = true\n");
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_asymmetric_jwt_algorithm_when_validating_should_reject() {
+        // Boots clean today and then fails every login: the key is HMAC and
+        // jsonwebtoken refuses a mismatched algorithm family at sign time.
+        for algorithm in ["RS256", "RS384", "RS512", "ES256", "not-an-algorithm"] {
+            let config =
+                config_with_override(&format!("[http.jwt]\nalgorithm = \"{algorithm}\"\n"));
+            assert!(
+                config.validate().is_err(),
+                "{algorithm} has no key material and must not boot"
+            );
+        }
+    }
+
+    #[test]
+    fn given_hmac_jwt_algorithm_when_validating_should_pass() {
+        for (algorithm, _) in HMAC_JWT_ALGORITHMS {
+            let config =
+                config_with_override(&format!("[http.jwt]\nalgorithm = \"{algorithm}\"\n"));
+            config
+                .validate()
+                .unwrap_or_else(|_| panic!("{algorithm} is signable and must validate"));
+        }
+    }
+
+    #[test]
+    fn given_asymmetric_jwt_algorithm_when_http_disabled_should_pass() {
+        // No listener means no token is ever issued, so a stale algorithm is
+        // inert rather than a broken deployment.
+        let config =
+            config_with_override("[http]\nenabled = false\n\n[http.jwt]\nalgorithm = \"RS256\"\n");
+        config
+            .validate()
+            .expect("a disabled HTTP listener never signs a token");
+    }
+
+    // The shipped budget is exactly two artifact ceilings, so the pristine
+    // config sits on the boundary and a single MiB past it starves a slot.
+    #[test]
+    fn given_artifact_ceiling_starving_transfer_slots_when_validating_should_warn_only() {
+        let config =
+            config_with_override("[partition]\ntransfer_artifact_bytes_max = \"1089 MiB\"\n");
+        assert_eq!(served_transfer_slots(&config).1, 1);
+        config
+            .validate()
+            .expect("a starved served cache warns but still boots");
+    }
+
+    #[test]
+    fn given_artifact_ceiling_at_transfer_slot_boundary_when_sizing_should_keep_full_slot_count() {
+        let config = config_with_override("");
+        assert_eq!(
+            served_transfer_slots(&config).1,
+            CONCURRENT_SERVED_SEGMENTS,
+            "the shipped defaults must serve the concurrency they are sized for"
+        );
+    }
+
+    #[test]
+    fn given_served_cache_raised_with_artifact_ceiling_when_validating_should_keep_transfer_slots()
+    {
+        let config = config_with_override(
+            "[partition]\ntransfer_artifact_bytes_max = \"2 GiB\"\ntransfer_served_cache_bytes_max = \"4 GiB\"\n",
+        );
+        assert_eq!(served_transfer_slots(&config).1, CONCURRENT_SERVED_SEGMENTS);
+        config.validate().expect("budget raised in step must boot");
     }
 
     #[test]
@@ -639,62 +689,6 @@ mod tests {
         config
             .validate()
             .expect("a disabled heartbeat never reads its interval");
-    }
-
-    /// The warn-helper baseline is [`ServerConfig::default`], but the reused
-    /// legacy sections source that default from the legacy server config.toml,
-    /// not this NG file. Pin the knobs the helper compares so any drift between
-    /// the two config.toml files fails here instead of as a spurious boot warn.
-    #[test]
-    fn given_shipped_ng_config_when_compared_to_default_should_match_warned_knobs() {
-        let shipped: ServerConfig = Figment::new()
-            .merge(Toml::string(DEFAULT_CONFIG))
-            .extract()
-            .expect("default config deserializes");
-        let defaults = ServerConfig::default();
-
-        assert_eq!(shipped.tcp.socket_migration, defaults.tcp.socket_migration);
-        assert_eq!(
-            shipped.system.segment.cache_indexes,
-            defaults.system.segment.cache_indexes
-        );
-        assert_eq!(
-            shipped.system.logging.sysinfo_print_interval,
-            defaults.system.logging.sysinfo_print_interval
-        );
-        assert_eq!(shipped.system.backup.path, defaults.system.backup.path);
-        assert_eq!(
-            shipped.system.backup.compatibility.path,
-            defaults.system.backup.compatibility.path
-        );
-        assert_eq!(
-            shipped.system.compression.allow_override,
-            defaults.system.compression.allow_override
-        );
-        assert_eq!(
-            shipped.system.state.enforce_fsync,
-            defaults.system.state.enforce_fsync
-        );
-        assert_eq!(
-            shipped.system.state.max_file_operation_retries,
-            defaults.system.state.max_file_operation_retries
-        );
-        assert_eq!(
-            shipped.system.state.retry_delay,
-            defaults.system.state.retry_delay
-        );
-        assert_eq!(
-            shipped.consumer_group.rebalancing_check_interval,
-            defaults.consumer_group.rebalancing_check_interval
-        );
-        assert_eq!(
-            shipped.message_saver.interval,
-            defaults.message_saver.interval
-        );
-        assert_eq!(
-            shipped.message_saver.enforce_fsync,
-            defaults.message_saver.enforce_fsync
-        );
     }
 
     // http.enabled needs a non-ServerDefault JWT expiry to clear the sibling

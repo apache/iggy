@@ -46,7 +46,7 @@ internal static class TcpMessageStreamHelpers
 
     internal static int CalculateMessageBytesCount(ReadOnlySpan<Message> messages, IMessageEncryptor? encryptor)
     {
-        var bytesCount = 0;
+        var bytesCount = BatchWireFormat.BATCH_HEADER_SIZE;
         foreach (var message in messages)
         {
             var payloadLength = message.Payload.Length;
@@ -63,7 +63,7 @@ internal static class TcpMessageStreamHelpers
                 }
             }
 
-            bytesCount += 16 + 64 + payloadLength + headersLength;
+            bytesCount += BatchWireFormat.FRAME_HEADER_SIZE + payloadLength + headersLength;
         }
 
         return bytesCount;

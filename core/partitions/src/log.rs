@@ -20,10 +20,10 @@ use crate::iggy_index_writer::IggyIndexWriter;
 use crate::messages_writer::MessagesWriter;
 use crate::poll_plan::SealedSegmentHandle;
 use crate::segment::Segment;
-use iggy_common::{IggyByteSize, IggyMessagesBatch};
+use iggy_common::IggyByteSize;
 use journal::{Journal, Storage};
 use ringbuffer::AllocRingBuffer;
-use server_common::{IggyMessagesBatchSetInFlight, SegmentStorage};
+use server_common::SegmentStorage;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::rc::Rc;
@@ -166,7 +166,6 @@ where
     // `SEALED_READ_STATE_CAP`. Keyed by offset (stable), not slot index (which
     // shifts on retire). See `touch_sealed_read_state`.
     sealed_lru: VecDeque<u64>,
-    in_flight: IggyMessagesBatchSetInFlight,
 }
 
 impl<J, S> Default for SegmentedLog<J, S>
@@ -187,7 +186,6 @@ where
             index_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
             sealed_read_state: Vec::with_capacity(SEGMENTS_CAPACITY),
             sealed_lru: VecDeque::with_capacity(SEALED_READ_STATE_CAP + 1),
-            in_flight: IggyMessagesBatchSetInFlight::default(),
         }
     }
 }
@@ -430,22 +428,6 @@ where
         if let Some(segment_indexes) = self.indexes.get_mut(segment_index) {
             *segment_indexes = Some(indexes);
         }
-    }
-
-    pub const fn in_flight(&self) -> &IggyMessagesBatchSetInFlight {
-        &self.in_flight
-    }
-
-    pub const fn in_flight_mut(&mut self) -> &mut IggyMessagesBatchSetInFlight {
-        &mut self.in_flight
-    }
-
-    pub fn set_in_flight(&mut self, batches: Vec<IggyMessagesBatch>) {
-        self.in_flight.set(batches);
-    }
-
-    pub fn clear_in_flight(&mut self) {
-        self.in_flight.clear();
     }
 }
 

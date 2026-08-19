@@ -17,7 +17,7 @@
 
 [package]
 name = "server"
-version = "0.9.0-edge.3"
+version = "0.9.0-edge.5"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -66,7 +66,6 @@ ignored = [
     "rustls-pemfile",
     "send_wrapper",
     "serde",
-    "slab",
     "socket2",
     "strum",
     "sysinfo",
@@ -153,7 +152,6 @@ serde_json = { workspace = true }
 server_common = { workspace = true }
 shard = { workspace = true }
 shard_allocator = { workspace = true }
-slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
 sysinfo = { workspace = true }

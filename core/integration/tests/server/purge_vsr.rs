@@ -51,8 +51,7 @@ async fn given_journal_resident_messages_when_purged_should_not_resurface(
 // read has to happen in the replicated apply. A retry loop here would pass
 // against the pre-apply behavior too.
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_purged_topic_when_getting_topic_immediately_should_report_zero_stats(
     harness: &TestHarness,

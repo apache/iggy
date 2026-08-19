@@ -18,12 +18,15 @@
 
 import { type Id } from "../identifier.utils.js";
 import { type ValueOf, reverseRecord } from "../../type.utils.js";
+import { toDate } from "../serialize.utils.js";
 import { serializeGetOffset, type Consumer } from "../offset/offset.utils.js";
 import { deserializeHeaders, type ParsedHeaderEntry } from "./header.utils.js";
 import { Transform, type TransformCallback } from "node:stream";
 import {
-  deserializeIggyMessageHeaders,
-  IGGY_MESSAGE_HEADER_SIZE,
+  BATCH_HEADER_SIZE,
+  FRAME_HEADER_SIZE,
+  deserializeBatchHeader,
+  deserializeFrameHeader,
   type IggyMessageHeader,
 } from "./iggy-header.utils.js";
 
@@ -237,42 +240,106 @@ export type PollMessagesResponse = {
 };
 
 /**
- * Deserializes an array of messages from a buffer.
- *
- * @param b - Buffer containing serialized messages
- * @returns Array of deserialized messages
+ * A message frame decoded from a batch record, with absolute values
+ * resolved against the record header.
  */
-export const deserializeMessages = (b: Buffer) => {
-  const messages: Message[] = [];
-  let pos = 0;
+export type BatchMessage = {
+  /** Frame checksum, passed through unverified */
+  checksum: bigint;
+  /** Unique message identifier */
+  id: bigint;
+  /** Absolute message offset within the partition */
+  offset: bigint;
+  /** Server timestamp of the record in microseconds */
+  timestamp: bigint;
+  /** Message origin timestamp in microseconds */
+  originTimestamp: bigint;
+  /** Message payload data */
+  payload: Buffer;
+  /** Raw user header bytes */
+  userHeaders: Buffer;
+};
+
+/**
+ * Deserializes batch records into message frames with absolute values.
+ * Each record is [batch header][frames], walked by the record's batch
+ * length. Records may be server-sliced, so the first frame of a record
+ * can carry a non-zero offset delta.
+ *
+ * @param b - Buffer containing serialized batch records
+ * @param pos - Starting position in the buffer
+ * @returns Array of decoded message frames
+ * @throws Error if a record or frame is malformed
+ */
+export const deserializeBatchMessages = (
+  b: Buffer,
+  pos = 0,
+): BatchMessage[] => {
+  const messages: BatchMessage[] = [];
   const len = b.length;
   while (pos < len) {
-    if (pos + IGGY_MESSAGE_HEADER_SIZE > len) break;
-    const bHead = b.subarray(pos, pos + IGGY_MESSAGE_HEADER_SIZE);
-    const headers = deserializeIggyMessageHeaders(bHead);
-    pos += IGGY_MESSAGE_HEADER_SIZE;
-    const plEnd = pos + headers.payloadLength;
-    if (plEnd > len) break;
-    const payload = b.subarray(pos, plEnd);
-    pos += headers.payloadLength;
-    let userHeaders: ParsedHeaderEntry[] = [];
-    if (
-      headers.userHeadersLength > 0 &&
-      plEnd + headers.userHeadersLength <= len
-    ) {
-      userHeaders = deserializeHeaders(
-        b.subarray(plEnd, plEnd + headers.userHeadersLength),
+    if (pos + BATCH_HEADER_SIZE > len)
+      throw new Error("truncated batch header in poll response");
+    const batch = deserializeBatchHeader(b, pos);
+    const recordEnd = pos + Number(batch.batchLength);
+    if (Number(batch.batchLength) < BATCH_HEADER_SIZE || recordEnd > len)
+      throw new Error(
+        `invalid batch length ${batch.batchLength} in poll response`,
       );
-      pos += headers.userHeadersLength;
+    pos += BATCH_HEADER_SIZE;
+    while (pos < recordEnd) {
+      if (pos + FRAME_HEADER_SIZE > recordEnd)
+        throw new Error("truncated message frame in poll response");
+      const frame = deserializeFrameHeader(b, pos);
+      if (frame.reserved !== 0n)
+        throw new Error(
+          `non-zero reserved field ${frame.reserved} in message frame`,
+        );
+      const payloadEnd = pos + FRAME_HEADER_SIZE + frame.payloadLength;
+      const frameEnd = payloadEnd + frame.userHeadersLength;
+      if (frameEnd > recordEnd)
+        throw new Error("truncated message frame in poll response");
+      messages.push({
+        checksum: frame.checksum,
+        id: frame.id,
+        offset: batch.baseOffset + BigInt(frame.offsetDelta),
+        timestamp: batch.baseTimestamp,
+        originTimestamp:
+          batch.originTimestamp + BigInt(frame.timestampDelta),
+        payload: b.subarray(pos + FRAME_HEADER_SIZE, payloadEnd),
+        userHeaders: b.subarray(payloadEnd, frameEnd),
+      });
+      pos = frameEnd;
     }
-    messages.push({
-      headers,
-      payload,
-      userHeaders,
-    });
   }
   return messages;
 };
+
+/**
+ * Deserializes an array of messages from a buffer of batch records.
+ *
+ * @param b - Buffer containing serialized batch records
+ * @param pos - Starting position in the buffer
+ * @returns Array of deserialized messages
+ */
+export const deserializeMessages = (b: Buffer, pos = 0): Message[] =>
+  deserializeBatchMessages(b, pos).map((message) => ({
+    headers: {
+      checksum: message.checksum,
+      id: message.id,
+      offset: message.offset,
+      timestamp: toDate(message.timestamp),
+      originTimestamp: toDate(message.originTimestamp),
+      userHeadersLength: message.userHeaders.length,
+      payloadLength: message.payload.length,
+      reserved: 0n,
+    },
+    payload: message.payload,
+    userHeaders:
+      message.userHeaders.length > 0
+        ? deserializeHeaders(message.userHeaders)
+        : ([] as ParsedHeaderEntry[]),
+  }));
 
 /**
  * Deserializes a poll messages response from a buffer.
@@ -285,7 +352,7 @@ export const deserializePollMessages = (r: Buffer, pos = 0) => {
   const partitionId = r.readUInt32LE(pos);
   const currentOffset = r.readBigUInt64LE(pos + 4);
   const count = r.readUInt32LE(pos + 12);
-  const messages = deserializeMessages(r.subarray(16));
+  const messages = deserializeMessages(r, pos + 16);
 
   return {
     partitionId,

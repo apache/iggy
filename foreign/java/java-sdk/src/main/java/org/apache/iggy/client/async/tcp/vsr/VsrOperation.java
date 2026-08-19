@@ -66,8 +66,6 @@ public final class VsrOperation {
     public static final int SEND_MESSAGES = 160;
     public static final int STORE_CONSUMER_OFFSET = 161;
     public static final int DELETE_CONSUMER_OFFSET = 162;
-    public static final int STORE_CONSUMER_OFFSET_2 = 164;
-    public static final int DELETE_CONSUMER_OFFSET_2 = 165;
 
     private static final int INTERNAL_START = 64;
     private static final int METADATA_START = 128;
@@ -90,8 +88,6 @@ public final class VsrOperation {
             Map.entry(101, SEND_MESSAGES),
             Map.entry(121, STORE_CONSUMER_OFFSET),
             Map.entry(122, DELETE_CONSUMER_OFFSET),
-            Map.entry(123, STORE_CONSUMER_OFFSET_2),
-            Map.entry(124, DELETE_CONSUMER_OFFSET_2),
             Map.entry(202, CREATE_STREAM),
             Map.entry(203, DELETE_STREAM),
             Map.entry(204, UPDATE_STREAM),
@@ -119,8 +115,6 @@ public final class VsrOperation {
         KNOWN_OPERATIONS.set(SEND_MESSAGES);
         KNOWN_OPERATIONS.set(STORE_CONSUMER_OFFSET);
         KNOWN_OPERATIONS.set(DELETE_CONSUMER_OFFSET);
-        KNOWN_OPERATIONS.set(STORE_CONSUMER_OFFSET_2);
-        KNOWN_OPERATIONS.set(DELETE_CONSUMER_OFFSET_2);
     }
 
     private VsrOperation() {}
@@ -158,11 +152,7 @@ public final class VsrOperation {
      * section ({@code [count:u32][{index,result} x count]}).
      */
     static boolean isResultFramed(int operation) {
-        return isMetadata(operation)
-                || operation == STORE_CONSUMER_OFFSET
-                || operation == DELETE_CONSUMER_OFFSET
-                || operation == STORE_CONSUMER_OFFSET_2
-                || operation == DELETE_CONSUMER_OFFSET_2;
+        return isMetadata(operation) || operation == STORE_CONSUMER_OFFSET || operation == DELETE_CONSUMER_OFFSET;
     }
 
     /**

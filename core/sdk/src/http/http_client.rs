@@ -36,7 +36,6 @@ use std::sync::Arc;
 
 const PUBLIC_PATHS: &[&str] = &[
     "/",
-    "/metrics",
     "/ping",
     "/users/login",
     "/users/refresh-token",

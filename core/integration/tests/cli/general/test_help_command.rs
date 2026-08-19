@@ -93,7 +93,7 @@ Options:
       --tcp-reconnection-max-retries <TCP_RECONNECTION_MAX_RETRIES>
           The optional number of max reconnect retries for the TCP transport
 {CLAP_INDENT}
-          [default: 3]
+          [default: 10]
 
       --tcp-reconnection-interval <TCP_RECONNECTION_INTERVAL>
           The optional reconnect interval for the TCP transport
@@ -126,7 +126,7 @@ Options:
       --quic-reconnection-max-retries <QUIC_RECONNECTION_MAX_RETRIES>
           The optional number of max reconnect retries for the QUIC transport
 {CLAP_INDENT}
-          [default: 3]
+          [default: 10]
 
       --quic-reconnection-interval <QUIC_RECONNECTION_INTERVAL>
           The optional reconnect interval for the QUIC transport
@@ -184,7 +184,7 @@ Options:
       --websocket-reconnection-max-retries <WEBSOCKET_RECONNECTION_MAX_RETRIES>
           The optional number of max reconnect retries for the WebSocket transport
 {CLAP_INDENT}
-          [default: 3]
+          [default: 10]
 
       --websocket-reconnection-interval <WEBSOCKET_RECONNECTION_INTERVAL>
           The optional reconnect interval for the WebSocket transport

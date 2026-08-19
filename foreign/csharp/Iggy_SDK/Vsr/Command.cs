@@ -21,7 +21,7 @@ namespace Apache.Iggy.Vsr;
 ///     VSR frame discriminant, byte 60 of every consensus header. Only the frames a client emits or
 ///     receives are named; every other discriminant decodes as <see cref="Reserved" />.
 /// </summary>
-internal enum Command2 : byte
+internal enum Command : byte
 {
     Reserved = 0,
     Request = 5,

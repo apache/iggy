@@ -18,7 +18,7 @@
 use super::client_builder::{ClientBuilder, ServerConnection};
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
-use crate::harness::config::{ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig};
+use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
@@ -296,12 +296,6 @@ impl ServerHandle {
         self.envs
             .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
-
-        if self.config.ip_kind == IpAddrKind::V6 {
-            self.envs
-                .entry("IGGY_TCP_IPV6".to_string())
-                .or_insert_with(|| "true".to_string());
-        }
 
         self.envs
             .entry("IGGY_ROOT_USERNAME".to_string())
@@ -1025,6 +1019,32 @@ impl ServerHandle {
         }
 
         self.start()
+    }
+
+    /// Kill the server with SIGKILL: no shutdown hook runs, nothing buffered
+    /// in process memory is flushed. Models a real crash, unlike
+    /// [`TestBinary::stop`] whose graceful shutdown flushes state before exit.
+    ///
+    /// Restart afterwards with [`TestBinary::start`]. Taking `child_handle`
+    /// makes the eventual `Drop -> stop()` a no-op.
+    pub fn kill(&mut self) -> Result<(), TestBinaryError> {
+        // Watchdog must stop BEFORE the signal lands: it polls liveness every
+        // 100ms and panics on unexpected process death.
+        self.stop_watchdog();
+        if let Some(mut child) = self.child_handle.take() {
+            // SAFETY: plain syscall. The watchdog is already joined, so its
+            // unexpected-death path (a raw waitpid) can no longer reap this
+            // pid, and `Child` has not waited yet; the worst case is a signal
+            // to an already-dead but unreaped zombie, which is harmless. The
+            // result is deliberately discarded for the same reason.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            // Reap via the owned Child, not reap_exit_status: a raw waitpid
+            // would race Child's own bookkeeping.
+            let _ = child.wait();
+        }
+        Ok(())
     }
 }
 

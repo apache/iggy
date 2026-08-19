@@ -27,6 +27,8 @@ use reqwest::{Method, StatusCode, header};
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use simd_json::{OwnedValue, StaticNode};
+use std::io::Write as _;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -74,6 +76,32 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 const MAX_RETRIES_WARNING_THRESHOLD: u32 = 10;
 const DEFAULT_RETRY_DELAY: &str = "200ms";
 const DEFAULT_MAX_RETRY_DELAY: &str = "5s";
+// Doris CSV framing. Control-char separators keep field/row boundaries
+// collision-improbable; `enclose`+`escape` protect any value that still contains
+// them. Doris escapes with a prefix char (`\"`), NOT RFC-4180 quote-doubling,
+// which is why we hand-roll the encoder instead of using the `csv` crate. The
+// four bytes are sent to Doris as the header forms below (it decodes the `\xNN`
+// prefix); all are visible ASCII so `validated_header` accepts them.
+const CSV_COLUMN_SEPARATOR: u8 = 0x01; // SOH
+const CSV_LINE_DELIMITER: u8 = 0x02; // STX
+const CSV_ENCLOSE: u8 = b'"';
+const CSV_ESCAPE: u8 = b'\\';
+const CSV_NULL_MARKER: &[u8] = b"\\N";
+const CSV_COLUMN_SEPARATOR_HEADER: &str = "\\x01";
+const CSV_LINE_DELIMITER_HEADER: &str = "\\x02";
+const CSV_ENCLOSE_HEADER: &str = "\"";
+const CSV_ESCAPE_HEADER: &str = "\\";
+
+/// Stream Load output serialization. `Json` (default) is name-mapped and handles
+/// embedded separators/quotes/newlines natively; `Csv` is opt-in for throughput
+/// and is positional, so it requires the `columns` config to pin column order.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    #[default]
+    Json,
+    Csv,
+}
 
 #[derive(Debug)]
 pub struct DorisSink {
@@ -106,6 +134,11 @@ struct Connected {
     max_retries: u32,
     retry_delay: Duration,
     max_retry_delay: Duration,
+    // Output format resolved once at `open()`. For `Csv`, `csv_columns` holds the
+    // positional column order (the leading bare names from the `columns` config);
+    // it is empty for `Json`.
+    format: Format,
+    csv_columns: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +153,13 @@ pub struct DorisSinkConfig {
     pub columns: Option<String>,
     #[serde(rename = "where")]
     pub where_clause: Option<String>,
+    /// Stream Load output format: `"json"` (default) or `"csv"`. CSV is opt-in
+    /// for throughput; because Doris CSV is positional (JSON is name-mapped), it
+    /// requires `columns` to pin the column order, else `open()` fails. Named
+    /// `output_format` (not `format`) so the env override
+    /// `..._PLUGIN_CONFIG_OUTPUT_FORMAT` doesn't collide with the runtime's
+    /// top-level `plugin_config_format` (both would flatten to `..._FORMAT`).
+    pub output_format: Option<Format>,
     /// Total per-request HTTP timeout as a human-readable duration, e.g. "30s"
     /// (default 30s). Matches the `timeout` field on the http/influxdb sinks.
     pub timeout: Option<String>,
@@ -230,10 +270,23 @@ impl DorisSink {
                 .request(Method::PUT, url.clone())
                 .header(header::AUTHORIZATION, self.auth_header.clone())
                 .header(header::EXPECT, "100-continue")
-                .header("format", "json")
-                .header("strip_outer_array", "true")
                 .header("label", label)
                 .body(body.clone());
+
+            // Format-specific Stream Load headers. JSON is name-mapped and uses
+            // `strip_outer_array` (the body is a JSON array); CSV is positional
+            // with control-char framing + enclose/escape (no strip_outer_array).
+            request = match connected.format {
+                Format::Json => request
+                    .header("format", "json")
+                    .header("strip_outer_array", "true"),
+                Format::Csv => request
+                    .header("format", "csv")
+                    .header("column_separator", CSV_COLUMN_SEPARATOR_HEADER)
+                    .header("line_delimiter", CSV_LINE_DELIMITER_HEADER)
+                    .header("enclose", CSV_ENCLOSE_HEADER)
+                    .header("escape", CSV_ESCAPE_HEADER),
+            };
 
             // Headers were validated and built once in `open()`.
             if let Some(value) = &connected.max_filter_ratio_header {
@@ -579,6 +632,97 @@ fn should_warn_for_retry_count(max_retries: u32) -> bool {
     max_retries > MAX_RETRIES_WARNING_THRESHOLD
 }
 
+/// The leading positional column names from a Doris `columns` header: bare names
+/// in order, stopping at the first derived `name = expr` entry (Doris computes
+/// those server-side and they consume no CSV field). Empty if there are none.
+fn csv_column_names(columns: &str) -> Vec<String> {
+    columns
+        .split(',')
+        .map(str::trim)
+        .take_while(|name| !name.is_empty() && !name.contains('='))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Serialize a chunk into the request body for the configured Stream Load format.
+fn build_request_body(
+    format: Format,
+    rows: &[&OwnedValue],
+    csv_columns: &[String],
+) -> Result<Bytes, Error> {
+    match format {
+        Format::Json => serialize_json_batch(rows),
+        Format::Csv => build_csv_body(rows, csv_columns).map(Bytes::from),
+    }
+}
+
+/// Serialize JSON object rows into Doris CSV: one `enclose`-quoted/escaped field
+/// per column in `columns` order, control-char separated. A missing key or JSON
+/// `null` becomes the unenclosed `\N` NULL marker; an empty string becomes the
+/// enclosed `""` (the distinction Doris draws between NULL and empty). Numbers
+/// and bools are emitted bare; nested values are compact-JSON-stringified.
+fn build_csv_body(rows: &[&OwnedValue], columns: &[String]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(rows.len() * columns.len() * 16);
+    for &row in rows {
+        let OwnedValue::Object(object) = row else {
+            return Err(Error::InvalidRecordValue(
+                "Doris CSV format requires each message to be a JSON object".to_string(),
+            ));
+        };
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                out.push(CSV_COLUMN_SEPARATOR);
+            }
+            match object.get(column.as_str()) {
+                None => out.extend_from_slice(CSV_NULL_MARKER),
+                Some(value) => encode_csv_field(value, &mut out),
+            }
+        }
+        out.push(CSV_LINE_DELIMITER);
+    }
+    Ok(out)
+}
+
+/// Append one JSON value as a Doris CSV field (see `build_csv_body`).
+fn encode_csv_field(value: &OwnedValue, out: &mut Vec<u8>) {
+    match value {
+        OwnedValue::Static(StaticNode::Null) => out.extend_from_slice(CSV_NULL_MARKER),
+        OwnedValue::Static(StaticNode::Bool(flag)) => {
+            out.extend_from_slice(if *flag { b"true" } else { b"false" });
+        }
+        OwnedValue::Static(StaticNode::I64(number)) => {
+            let _ = write!(out, "{number}");
+        }
+        OwnedValue::Static(StaticNode::U64(number)) => {
+            let _ = write!(out, "{number}");
+        }
+        OwnedValue::Static(StaticNode::F64(number)) => {
+            let _ = write!(out, "{number}");
+        }
+        OwnedValue::String(text) => encode_csv_enclosed(text.as_bytes(), out),
+        // Nested array/object: stringify to compact JSON and enclose as text. The
+        // target Doris column must accept it (STRING/JSON/VARIANT).
+        nested => match simd_json::to_string(nested) {
+            Ok(json) => encode_csv_enclosed(json.as_bytes(), out),
+            Err(_) => out.extend_from_slice(CSV_NULL_MARKER),
+        },
+    }
+}
+
+/// Append `bytes` as an `enclose`-quoted CSV field, prefix-escaping any embedded
+/// escape or enclose byte. The escape char is handled by the same branch, so a
+/// trailing backslash cannot leak past the closing quote.
+fn encode_csv_enclosed(bytes: &[u8], out: &mut Vec<u8>) {
+    out.push(CSV_ENCLOSE);
+    for &byte in bytes {
+        if byte == CSV_ESCAPE || byte == CSV_ENCLOSE {
+            out.push(CSV_ESCAPE);
+        }
+        out.push(byte);
+    }
+    out.push(CSV_ENCLOSE);
+}
+
 /// Build a validated Stream Load header value, surfacing a bad byte (CR/LF,
 /// non-visible-ASCII) as a startup-time `InvalidConfigValue` instead of a
 /// per-batch `HttpRequestFailed` (reqwest defers `HeaderValue::try_from` to
@@ -879,6 +1023,29 @@ impl Sink for DorisSink {
             (retry_delay, max_retry_delay)
         };
 
+        let format = self.config.output_format.unwrap_or_default();
+        // CSV is positional, so it needs the explicit column order; JSON is
+        // name-mapped and ignores it. Resolve (and validate) once at open().
+        let csv_columns = match format {
+            Format::Json => Vec::new(),
+            Format::Csv => {
+                let columns = self
+                    .config
+                    .columns
+                    .as_deref()
+                    .map(csv_column_names)
+                    .unwrap_or_default();
+                if columns.is_empty() {
+                    return Err(Error::InvalidConfigValue(format!(
+                        "Doris sink ID {}: format=\"csv\" requires a non-empty `columns` listing \
+                         the source columns in order (CSV is positional, unlike name-mapped JSON)",
+                        self.id
+                    )));
+                }
+                columns
+            }
+        };
+
         self.connected = Some(Connected {
             client: self.build_client()?,
             base_url,
@@ -890,6 +1057,8 @@ impl Sink for DorisSink {
             max_retries,
             retry_delay,
             max_retry_delay,
+            format,
+            csv_columns,
         });
 
         info!(
@@ -921,6 +1090,7 @@ impl Sink for DorisSink {
             .label_prefix
             .as_deref()
             .unwrap_or(DEFAULT_LABEL_PREFIX);
+        let connected = self.connected.as_ref();
         let mut first_error: Option<Error> = None;
 
         // Best-effort across chunks: on a per-chunk serialize/HTTP/status failure
@@ -959,17 +1129,24 @@ impl Sink for DorisSink {
                 continue;
             };
 
-            let body = match serialize_json_batch(&json_values) {
-                Ok(body) => body,
-                Err(error) => {
-                    error!(
-                        "Doris sink ID {} failed to serialize batch: {error}",
-                        self.id
-                    );
-                    first_error.get_or_insert(error);
-                    continue;
-                }
-            };
+            let connected = connected.ok_or_else(|| {
+                Error::InitError(format!(
+                    "Doris sink ID {} called before open() — not connected",
+                    self.id
+                ))
+            })?;
+            let body =
+                match build_request_body(connected.format, &json_values, &connected.csv_columns) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        error!(
+                            "Doris sink ID {} failed to serialize batch: {error}",
+                            self.id
+                        );
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                };
 
             let label = build_label(
                 label_prefix,
@@ -1042,6 +1219,7 @@ mod tests {
             max_filter_ratio: None,
             columns: None,
             where_clause: None,
+            output_format: None,
             timeout: None,
             connect_timeout: None,
             batch_size: None,
@@ -1456,6 +1634,8 @@ mod tests {
             max_retries: DEFAULT_MAX_RETRIES,
             retry_delay: Duration::from_millis(1),
             max_retry_delay: Duration::from_millis(5),
+            format: Format::Json,
+            csv_columns: Vec::new(),
         }
     }
 
@@ -2137,5 +2317,163 @@ mod tests {
             matches!(&result, Err(Error::PermanentHttpError(_))),
             "expected PermanentHttpError with no retry, got {result:?}",
         );
+    }
+
+    fn owned(json: &str) -> OwnedValue {
+        let mut bytes = json.as_bytes().to_vec();
+        simd_json::to_owned_value(&mut bytes).expect("valid JSON")
+    }
+
+    #[test]
+    fn format_deserializes_from_lowercase() {
+        assert_eq!(
+            serde_json::from_str::<Format>("\"json\"").unwrap(),
+            Format::Json
+        );
+        assert_eq!(
+            serde_json::from_str::<Format>("\"csv\"").unwrap(),
+            Format::Csv
+        );
+        assert!(serde_json::from_str::<Format>("\"xml\"").is_err());
+        assert_eq!(Format::default(), Format::Json);
+    }
+
+    #[test]
+    fn csv_column_names_takes_leading_bare_names() {
+        assert_eq!(csv_column_names("id, name, count"), ["id", "name", "count"]);
+        // A derived `name = expr` column (and anything after) is server-side.
+        assert_eq!(
+            csv_column_names("id, name, calc = count + 1"),
+            ["id", "name"]
+        );
+        assert_eq!(csv_column_names(" a ,b, c "), ["a", "b", "c"]);
+        assert!(csv_column_names("").is_empty());
+        assert!(csv_column_names("calc = x").is_empty());
+    }
+
+    #[test]
+    fn build_csv_body_encodes_scalars_nulls_and_missing() {
+        let row = owned(r#"{"i":-5,"u":10,"f":2.5,"b":false,"nul":null,"empty":""}"#);
+        let columns = ["i", "u", "f", "b", "nul", "missing", "empty"].map(String::from);
+        let body = build_csv_body(&[&row], &columns).unwrap();
+        assert_eq!(*body.last().unwrap(), CSV_LINE_DELIMITER);
+        let fields: Vec<&[u8]> = body[..body.len() - 1]
+            .split(|&byte| byte == CSV_COLUMN_SEPARATOR)
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                &b"-5"[..],  // i64
+                &b"10"[..],  // u64
+                &b"2.5"[..], // f64
+                &b"false"[..],
+                &b"\\N"[..],  // json null
+                &b"\\N"[..],  // missing key
+                &b"\"\""[..], // empty string -> enclosed empty (distinct from null)
+            ],
+        );
+    }
+
+    #[test]
+    fn build_csv_body_prefix_escapes_enclose_and_escape_bytes() {
+        // The value contains a quote and a backslash; both must be prefix-escaped
+        // inside the enclosure (escape the escape char too, in one left-to-right
+        // pass, so a trailing backslash can't leak past the closing quote).
+        let row = owned(r#"{"v":"a\"b\\c"}"#);
+        let columns = ["v"].map(String::from);
+        let body = build_csv_body(&[&row], &columns).unwrap();
+        let expected: &[u8] = &[
+            b'"',
+            b'a',
+            b'\\',
+            b'"',
+            b'b',
+            b'\\',
+            b'\\',
+            b'c',
+            b'"',
+            CSV_LINE_DELIMITER,
+        ];
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_csv_body_keeps_embedded_separator_and_newline_inside_enclosure() {
+        // Raw separator (0x01), line delimiter (0x02), and a newline live inside
+        // the value; the enclosure protects them, so they are emitted literally
+        // (Doris reads them as data, not structure) and are NOT escaped.
+        let row = owned("{\"v\":\"a\\u0001b\\u0002c\\nd\"}");
+        let columns = ["v"].map(String::from);
+        let body = build_csv_body(&[&row], &columns).unwrap();
+        let expected: &[u8] = &[
+            b'"',
+            b'a',
+            0x01,
+            b'b',
+            0x02,
+            b'c',
+            b'\n',
+            b'd',
+            b'"',
+            CSV_LINE_DELIMITER,
+        ];
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_csv_body_stringifies_nested_values() {
+        let row = owned(r#"{"o":{"k":1}}"#);
+        let columns = ["o"].map(String::from);
+        let body = build_csv_body(&[&row], &columns).unwrap();
+        // {"k":1} enclosed, with its inner quotes prefix-escaped.
+        let expected: &[u8] = &[
+            b'"',
+            b'{',
+            b'\\',
+            b'"',
+            b'k',
+            b'\\',
+            b'"',
+            b':',
+            b'1',
+            b'}',
+            b'"',
+            CSV_LINE_DELIMITER,
+        ];
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_csv_body_rejects_non_object_row() {
+        let row = owned("[1, 2, 3]");
+        let columns = ["v"].map(String::from);
+        assert!(matches!(
+            build_csv_body(&[&row], &columns),
+            Err(Error::InvalidRecordValue(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_rejects_csv_format_without_columns() {
+        let mut cfg = make_config();
+        cfg.output_format = Some(Format::Csv);
+        cfg.columns = None;
+        let mut sink = DorisSink::new(1, cfg);
+        assert!(matches!(
+            sink.open().await,
+            Err(Error::InvalidConfigValue(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_resolves_csv_columns_dropping_derived() {
+        let mut cfg = make_config();
+        cfg.output_format = Some(Format::Csv);
+        cfg.columns = Some("id, name, calc = id + 1".into());
+        let mut sink = DorisSink::new(1, cfg);
+        sink.open().await.expect("open should succeed");
+        let connected = sink.connected.as_ref().unwrap();
+        assert_eq!(connected.format, Format::Csv);
+        assert_eq!(connected.csv_columns, ["id", "name"]);
     }
 }

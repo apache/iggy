@@ -35,7 +35,7 @@ use common::{header_only, install_ws_clients_locally, loopback};
 use compio::net::TcpStream;
 use compio_ws::WebSocketStream;
 use compio_ws::tungstenite::Message as WsMessage;
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use iggy_binary_protocol::GenericHeader;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::ws::{bind, run};
@@ -77,10 +77,10 @@ async fn handshake_succeeds_and_round_trip_completes() {
     // completes within the same runtime tick.
     let bus_for_handler = Rc::clone(&bus);
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
-        assert_eq!(msg.header().command, Command2::Request);
+        assert_eq!(msg.header().command, Command::Request);
         let bus = Rc::clone(&bus_for_handler);
         compio::runtime::spawn(async move {
-            let reply = header_only(Command2::Reply, 42, 0).into_frozen();
+            let reply = header_only(Command::Reply, 42, 0).into_frozen();
             bus.send_to_client(client_id, reply)
                 .await
                 .expect("server send_to_client");
@@ -105,7 +105,7 @@ async fn handshake_succeeds_and_round_trip_completes() {
         .await
         .expect("ws handshake");
 
-    let request = header_only(Command2::Request, 42, 0).into_frozen();
+    let request = header_only(Command::Request, 42, 0).into_frozen();
     ws_client
         .send(WsMessage::Binary(Bytes::from_owner(request)))
         .await
@@ -114,7 +114,7 @@ async fn handshake_succeeds_and_round_trip_completes() {
     let reply = compio::time::timeout(Duration::from_secs(2), raw_recv(&mut ws_client))
         .await
         .expect("client must receive reply within 2 s");
-    assert_eq!(reply.header().command, Command2::Reply);
+    assert_eq!(reply.header().command, Command::Reply);
 
     bus.shutdown(Duration::from_secs(2)).await;
 }

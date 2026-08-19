@@ -78,7 +78,7 @@ pub struct ArgsOptional {
 
     /// The optional number of max reconnect retries for the TCP transport
     ///
-    /// [default: 3]
+    /// [default: 10]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_reconnection_max_retries: Option<u32>,
@@ -125,7 +125,7 @@ pub struct ArgsOptional {
 
     /// The optional number of max reconnect retries for the QUIC transport
     ///
-    /// [default: 3]
+    /// [default: 10]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quic_reconnection_max_retries: Option<u32>,
@@ -207,7 +207,7 @@ pub struct ArgsOptional {
 
     /// The optional number of max reconnect retries for the WebSocket transport
     ///
-    /// [default: 3]
+    /// [default: 10]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_reconnection_max_retries: Option<u32>,
@@ -381,7 +381,7 @@ impl Default for Args {
             password: DEFAULT_ROOT_PASSWORD.to_string(),
             tcp_server_address: "127.0.0.1:8090".to_string(),
             tcp_reconnection_enabled: true,
-            tcp_reconnection_max_retries: None,
+            tcp_reconnection_max_retries: Some(10),
             tcp_reconnection_interval: "1s".to_string(),
             tcp_reconnection_reestablish_after: "5s".to_string(),
             tcp_heartbeat_interval: "5s".to_string(),
@@ -393,7 +393,7 @@ impl Default for Args {
             quic_server_address: "127.0.0.1:8080".to_string(),
             quic_server_name: "localhost".to_string(),
             quic_reconnection_enabled: true,
-            quic_reconnection_max_retries: None,
+            quic_reconnection_max_retries: Some(10),
             quic_reconnection_interval: "1s".to_string(),
             quic_reconnection_reestablish_after: "5s".to_string(),
             quic_max_concurrent_bidi_streams: 10000,
@@ -408,7 +408,7 @@ impl Default for Args {
             quic_heartbeat_interval: "5s".to_string(),
             websocket_server_address: "127.0.0.1:8092".to_string(),
             websocket_reconnection_enabled: true,
-            websocket_reconnection_max_retries: None,
+            websocket_reconnection_max_retries: Some(10),
             websocket_reconnection_interval: "1s".to_string(),
             websocket_reconnection_reestablish_after: "5s".to_string(),
             websocket_heartbeat_interval: "5s".to_string(),

@@ -465,13 +465,11 @@ impl<const ALIGN: usize> Clone for Extent<ALIGN> {
     }
 }
 
-pub(crate) fn freeze_extent<const ALIGN: usize>(extent: Extent<ALIGN>) -> Frozen<ALIGN> {
+fn freeze_extent<const ALIGN: usize>(extent: Extent<ALIGN>) -> Frozen<ALIGN> {
     Frozen { inner: extent }
 }
 
-pub(crate) fn extent_from_aligned_vec<const ALIGN: usize>(
-    vec: AVec<u8, ConstAlign<ALIGN>>,
-) -> Extent<ALIGN> {
+fn extent_from_aligned_vec<const ALIGN: usize>(vec: AVec<u8, ConstAlign<ALIGN>>) -> Extent<ALIGN> {
     let (ptr, _, len, capacity) = vec.into_raw_parts();
     let guard = AVecRawGuard::<ALIGN>::new(ptr, len, capacity);
     let data = unsafe { NonNull::new_unchecked(ptr) };
@@ -485,7 +483,7 @@ pub(crate) fn extent_from_aligned_vec<const ALIGN: usize>(
     }
 }
 
-pub(crate) fn extent_offset_from_base<const ALIGN: usize>(extent: &Extent<ALIGN>) -> usize {
+fn extent_offset_from_base<const ALIGN: usize>(extent: &Extent<ALIGN>) -> usize {
     // SAFETY: the extent points into the control block allocation while it is alive.
     let offset = unsafe {
         extent
@@ -598,7 +596,7 @@ unsafe fn try_merge_extents<const ALIGN: usize>(
     }
 }
 
-pub(crate) fn try_coalesce_prefix_with_tail<const ALIGN: usize>(
+fn try_coalesce_prefix_with_tail<const ALIGN: usize>(
     prefix: Extent<ALIGN>,
     tail: Frozen<ALIGN>,
 ) -> Result<Frozen<ALIGN>, (Extent<ALIGN>, Frozen<ALIGN>)> {

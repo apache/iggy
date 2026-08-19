@@ -21,12 +21,7 @@ use test_case::test_matrix;
 
 // Restart scenarios run single-node: restarting a node in a multi-node cluster
 // trips a known partitions-plane view-change stall, tracked separately.
-#[iggy_harness(
-    cluster_nodes = 1,
-    server(
-        segment.cache_indexes = ["all", "none", "open_segment"],
-    )
-)]
+#[iggy_harness(cluster_nodes = 1)]
 #[test_matrix([restart_off(), restart_on()])]
 async fn should_delete_segments_and_validate_filesystem(
     harness: &mut TestHarness,
@@ -35,20 +30,13 @@ async fn should_delete_segments_and_validate_filesystem(
     purge_delete_scenario::run(harness, restart_server).await;
 }
 
-#[iggy_harness(
-    cluster_nodes = 1,
-    server(
-        segment.cache_indexes = ["all", "none", "open_segment"],
-    )
-)]
+#[iggy_harness(cluster_nodes = 1)]
 #[test_matrix([restart_off(), restart_on()])]
 async fn should_delete_segments_without_consumers(harness: &mut TestHarness, restart_server: bool) {
     purge_delete_scenario::run_no_consumers(harness, restart_server).await;
 }
 
-#[iggy_harness(server(
-    segment.cache_indexes = ["all", "none", "open_segment"],
-))]
+#[iggy_harness]
 async fn should_delete_segments_with_consumer_group_barrier(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.unwrap();
     let data_path = harness.server().data_path();
@@ -56,12 +44,7 @@ async fn should_delete_segments_with_consumer_group_barrier(harness: &TestHarnes
     purge_delete_scenario::run_consumer_group_barrier(&client, &data_path).await;
 }
 
-#[iggy_harness(
-    cluster_nodes = 1,
-    server(
-        segment.cache_indexes = ["all", "none", "open_segment"],
-    )
-)]
+#[iggy_harness(cluster_nodes = 1)]
 #[test_matrix([restart_off(), restart_on()])]
 async fn should_block_deletion_until_all_consumers_pass_segment(
     harness: &mut TestHarness,
@@ -70,12 +53,7 @@ async fn should_block_deletion_until_all_consumers_pass_segment(
     purge_delete_scenario::run_multi_consumer_barrier(harness, restart_server).await;
 }
 
-#[iggy_harness(
-    cluster_nodes = 1,
-    server(
-        segment.cache_indexes = ["all", "none", "open_segment"],
-    )
-)]
+#[iggy_harness(cluster_nodes = 1)]
 // The scenario asserts the exact [0, 5, 10, 15, 20, 25] layout only on the legacy path;
 // under vsr it verifies the framing-agnostic purge outcome (offsets cleared,
 // files deleted, partition reset to a single segment at offset 0).

@@ -19,9 +19,9 @@
 //! `quic`, `cluster`, `metadata`, `partition`, `message_bus`), sourced
 //! from `core/server/config.toml` via [`SERVER_CONFIG`]. Sections drawn
 //! from [`crate::common`] (`http`, `system`, `telemetry`,
-//! `consumer_group`, `data_maintenance`, `message_saver`,
-//! `personal_access_token`, `heartbeat`) delegate to the `Default` impls
-//! in [`crate::common::defaults`].
+//! `consumer_group`, `data_maintenance`, `personal_access_token`,
+//! `heartbeat`) delegate to the `Default` impls in
+//! [`crate::common::defaults`].
 
 use super::cluster::{
     ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
@@ -29,15 +29,15 @@ use super::cluster::{
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
-use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
+use super::quic::{QuicCertificateConfig, QuicConfig};
+use super::server::ServerConfig;
 use super::server::ServerSystemConfig;
-use super::server::{ExtraConfig, ServerConfig};
-use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
+use super::tcp::{TcpConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
 use crate::common::server::{
-    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
-    PersonalAccessTokenConfig, TelemetryConfig,
+    ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, PersonalAccessTokenConfig,
+    TelemetryConfig,
 };
 use std::sync::Arc;
 
@@ -50,9 +50,7 @@ impl Default for ServerConfig {
         ServerConfig {
             consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
-            extra: ExtraConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            message_saver: MessageSaverConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
             system: Arc::new(ServerSystemConfig::default()),
             quic: QuicConfig::default(),
@@ -92,6 +90,11 @@ impl Default for ClusterConfig {
             view_change_status_timeout: SERVER_CONFIG
                 .cluster
                 .view_change_status_timeout
+                .parse()
+                .unwrap(),
+            superblock_wedged_fatal_timeout: SERVER_CONFIG
+                .cluster
+                .superblock_wedged_fatal_timeout
                 .parse()
                 .unwrap(),
             request_start_view_retransmit_interval: SERVER_CONFIG
@@ -186,29 +189,13 @@ impl Default for QuicConfig {
             enabled: SERVER_CONFIG.quic.enabled,
             address: SERVER_CONFIG.quic.address.parse().unwrap(),
             max_concurrent_bidi_streams: SERVER_CONFIG.quic.max_concurrent_bidi_streams as u64,
-            datagram_send_buffer_size: SERVER_CONFIG
-                .quic
-                .datagram_send_buffer_size
-                .parse()
-                .unwrap(),
             initial_mtu: SERVER_CONFIG.quic.initial_mtu.parse().unwrap(),
             send_window: SERVER_CONFIG.quic.send_window.parse().unwrap(),
             receive_window: SERVER_CONFIG.quic.receive_window.parse().unwrap(),
+            stream_receive_window: SERVER_CONFIG.quic.stream_receive_window.parse().unwrap(),
             keep_alive_interval: SERVER_CONFIG.quic.keep_alive_interval.parse().unwrap(),
             max_idle_timeout: SERVER_CONFIG.quic.max_idle_timeout.parse().unwrap(),
             certificate: QuicCertificateConfig::default(),
-            socket: QuicSocketConfig::default(),
-        }
-    }
-}
-
-impl Default for QuicSocketConfig {
-    fn default() -> QuicSocketConfig {
-        QuicSocketConfig {
-            override_defaults: SERVER_CONFIG.quic.socket.override_defaults,
-            recv_buffer_size: SERVER_CONFIG.quic.socket.recv_buffer_size.parse().unwrap(),
-            send_buffer_size: SERVER_CONFIG.quic.socket.send_buffer_size.parse().unwrap(),
-            keepalive: SERVER_CONFIG.quic.socket.keepalive,
         }
     }
 }
@@ -228,10 +215,7 @@ impl Default for TcpConfig {
         TcpConfig {
             enabled: SERVER_CONFIG.tcp.enabled,
             address: SERVER_CONFIG.tcp.address.parse().unwrap(),
-            ipv6: SERVER_CONFIG.tcp.ipv_6,
             tls: TcpTlsConfig::default(),
-            socket: TcpSocketConfig::default(),
-            socket_migration: SERVER_CONFIG.tcp.socket_migration,
         }
     }
 }
@@ -243,19 +227,6 @@ impl Default for TcpTlsConfig {
             self_signed: SERVER_CONFIG.tcp.tls.self_signed,
             cert_file: SERVER_CONFIG.tcp.tls.cert_file.parse().unwrap(),
             key_file: SERVER_CONFIG.tcp.tls.key_file.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for TcpSocketConfig {
-    fn default() -> TcpSocketConfig {
-        TcpSocketConfig {
-            override_defaults: SERVER_CONFIG.tcp.socket.override_defaults,
-            recv_buffer_size: SERVER_CONFIG.tcp.socket.recv_buffer_size.parse().unwrap(),
-            send_buffer_size: SERVER_CONFIG.tcp.socket.send_buffer_size.parse().unwrap(),
-            keepalive: SERVER_CONFIG.tcp.socket.keepalive,
-            nodelay: SERVER_CONFIG.tcp.socket.nodelay,
-            linger: SERVER_CONFIG.tcp.socket.linger.parse().unwrap(),
         }
     }
 }

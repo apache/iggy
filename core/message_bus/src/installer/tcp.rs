@@ -30,7 +30,7 @@ use crate::transports::{ActorContext, TransportConn};
 use async_channel::Receiver;
 use compio::net::TcpStream;
 use futures::FutureExt;
-use iggy_binary_protocol::{Command2, GenericHeader};
+use iggy_binary_protocol::{Command, GenericHeader};
 use server_common::Message;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -275,7 +275,7 @@ async fn client_dispatch_loop(
                     return;
                 }
                 let cmd = msg.header().command;
-                if cmd != Command2::Request {
+                if cmd != Command::Request {
                     warn!(
                         client = client_id,
                         ?cmd,

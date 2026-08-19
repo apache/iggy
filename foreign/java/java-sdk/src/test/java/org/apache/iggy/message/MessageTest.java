@@ -145,14 +145,14 @@ class MessageTest {
     void getSizeReturnsExpectedSizeWhenThereAreNoUserHeaders() {
         var message = Message.of("foo");
 
-        assertThat(message.getSize()).isEqualTo(67);
+        assertThat(message.getSize()).isEqualTo(51);
     }
 
     @Test
     void getSizeReturnsExpectedSizeWhenThereAreUserHeaders() {
         var message = Message.of("foo", Map.of(HeaderKey.fromString("k1"), HeaderValue.fromInt32(123)));
 
-        assertThat(message.getSize()).isEqualTo(83);
+        assertThat(message.getSize()).isEqualTo(67);
     }
 
     private void assertDefaultMessageHeaderValues(MessageHeader header) {

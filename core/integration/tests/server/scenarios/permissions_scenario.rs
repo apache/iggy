@@ -235,6 +235,24 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
         "snapshot must be rejected as unauthorized without read_servers, got {snapshot_result:?}"
     );
 
+    // Self-read skips read_users, matching the legacy server: a user can
+    // always fetch its own account, by name or by numeric id, while any
+    // other target stays gated.
+    let own_details = client
+        .get_user(&Identifier::named(USER).unwrap())
+        .await
+        .expect("get_user: self by name should work without read_users")
+        .expect("self user should exist");
+    client
+        .get_user(&Identifier::numeric(own_details.id).unwrap())
+        .await
+        .expect("get_user: self by id should work without read_users")
+        .expect("self user should exist");
+    assert_unauthorized(
+        client.get_user(&Identifier::numeric(0).unwrap()).await,
+        "get_user: other user",
+    );
+
     delete_test_user(root_client, USER).await;
 }
 

@@ -26,7 +26,7 @@ use crate::dispatch::{
 use crate::http;
 use crate::partition_helpers::{
     build_partition_fresh, configure_consumer_offsets, ensure_initial_segment,
-    open_partition_superblock, restore_partition_view, validate_namespace_bounds,
+    open_partition_superblock,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
@@ -37,8 +37,8 @@ use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
 use consensus::{
-    ClientTable, LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer,
-    VsrConsensus,
+    ClientTable, ConsensusTimers, JoinMode, LocalPipeline, MetadataHandle, PartitionsHandle,
+    PipelineEntry, Sequencer, VsrConsensus, VsrRestore,
 };
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
@@ -1016,6 +1016,11 @@ async fn shard_main(
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
+                |mux_stm, client, timestamp| {
+                    mux_stm
+                        .streams()
+                        .remove_consumer_group_member(client, timestamp);
+                },
             )
             .await
             .map_err(ServerError::MetadataRecovery)?;
@@ -1839,7 +1844,6 @@ async fn build_shard_for_thread(
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
-        validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = match load_partition(
             config,
@@ -2013,6 +2017,7 @@ async fn build_shard_for_thread(
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_superblock_wedged_fatal_failures(superblock_wedged_fatal_failures(config));
     shard.set_served_segment_cache_bytes_max(
         config
             .partition
@@ -2092,6 +2097,28 @@ const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
 fn duration_to_ticks(interval: Duration) -> u64 {
     let ticks = interval.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis();
     u64::try_from(ticks.max(1)).unwrap_or(u64::MAX)
+}
+
+/// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count.
+/// Retries pin at the backoff cap after warmup, so the window divided by
+/// [`journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS`] bounds how
+/// long a wedged replica may limp before it fail-stops. Zero stays zero
+/// (fail-stop disabled).
+pub(crate) fn superblock_wedged_fatal_failures(config: &ServerConfig) -> u64 {
+    superblock_window_to_failures(
+        config
+            .cluster
+            .superblock_wedged_fatal_timeout
+            .get_duration(),
+    )
+}
+
+fn superblock_window_to_failures(window: Duration) -> u64 {
+    if window.is_zero() {
+        return 0;
+    }
+    let cap_micros = u128::from(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
+    u64::try_from((window.as_micros() / cap_micros).max(1)).unwrap_or(u64::MAX)
 }
 
 /// `[cluster] heartbeat_timeout` in consensus ticks. Every consensus group
@@ -2182,6 +2209,20 @@ pub(crate) fn request_start_view_ticks(config: &ServerConfig) -> u64 {
     )
 }
 
+/// The full `[cluster]` timer set every consensus group boots with, built
+/// once so the planes cannot diverge in what they apply.
+pub(crate) fn consensus_timers(config: &ServerConfig) -> ConsensusTimers {
+    ConsensusTimers {
+        normal_heartbeat_ticks: cluster_heartbeat_ticks(config),
+        commit_message_ticks: commit_broadcast_ticks(config),
+        prepare_ticks: prepare_retransmit_ticks(config),
+        view_change_retransmit_ticks: view_change_retransmit_ticks(config),
+        view_change_status_ticks: view_change_status_ticks(config),
+        request_start_view_ticks: request_start_view_ticks(config),
+        probe_attempts_max: config.cluster.view_probe_attempts_max,
+    }
+}
+
 /// `[cluster] repair_retry_interval` in consensus ticks: how long a stalled
 /// journal-repair stream waits before re-requesting its window. Both planes'
 /// repair loops share it, so it is applied once per shard (not per consensus
@@ -2236,50 +2277,10 @@ fn restore_metadata_consensus(
     );
     let prepare_queue_depth = config.metadata.prepare_queue_depth;
 
-    let mut consensus = VsrConsensus::new(
-        topology.cluster_id,
-        topology.self_replica_id,
-        replica_count,
-        server_common::sharding::METADATA_GROUP,
-        bus,
-        // Request queue keeps the stock 2x ratio over the prepare queue
-        // (32 -> 64 at defaults): buffered requests are cheap relative to
-        // in-flight prepares and drain as prepares commit.
-        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
-    );
-    consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
-    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
-    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
-    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
-    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
-    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
-    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
-    // Fresh random incarnation each boot, so a StartView addressed to a previous
-    // incarnation still in flight is ignored (`handle_start_view` guard). `| 1`
-    // guarantees the non-zero the guard treats as set. The deterministic simulator
-    // overrides this with a seed-derived value bumped per restart.
-    consensus.set_incarnation(rand::random::<u128>() | 1);
-
     let last_header = journal
         .last_op()
         .and_then(|op| usize::try_from(op).ok())
         .and_then(|op| journal.header(op).map(|header| *header));
-    // View and log_view come from the durable superblock when present. A present but
-    // unreadable superblock already refused boot in `recover()`, so reaching the
-    // `else` means it is genuinely absent: a fresh node, or one that took writes but
-    // never checkpointed or changed view. There, inferring the view from the last WAL
-    // prepare is safe, since the persist-before-send gate guarantees this replica
-    // never externalized a view beyond what a re-probe re-derives, and it re-probes
-    // as a backup below. log_view cannot be inferred and stays 0 until the next
-    // superblock write.
-    if let Some(state) = recovered_state {
-        consensus.set_view(state.view);
-        consensus.set_log_view(state.log_view);
-        consensus.mark_superblock_durable(state.view, state.log_view);
-    } else if let Some(header) = last_header {
-        consensus.set_view(header.view);
-    }
-
     // On a RESTART in a cluster, rejoin as a quorum-invisible backup and
     // probe for the current view (`RequestStartView`): the view's primary
     // answers with a `StartView`, the replica adopts it as a backup, and
@@ -2296,18 +2297,51 @@ fn restore_metadata_consensus(
     // and an empty journal; gating on the WAL alone would `init()` it into
     // `Status::Normal` as primary for a view the cluster may have moved past,
     // with `ceded_primaryship` false and no probe to correct it.
-    if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
-        consensus.init_as_backup();
-        consensus.begin_view_probe();
-        // Restart in a cluster: replace snapshot-shaped metadata state
-        // (snapshot + client table) from the live primary the probe finds,
-        // then journal-repair the tail. If the probe exhausts instead --
-        // full-cluster bootstrap, nobody live to fetch from -- the election
-        // fallback clears the stage and this local recovery stands.
-        consensus.begin_state_transfer_await();
+    //
+    // The rejoin also awaits a state transfer: snapshot-shaped metadata state
+    // (snapshot + client table) is replaced from the live primary the probe
+    // finds, then journal repair fills the tail. If the probe exhausts
+    // instead -- full-cluster bootstrap, nobody live to fetch from -- the
+    // election fallback clears the stage and this local recovery stands.
+    let join = if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
+        JoinMode::ProbeAsBackup {
+            await_state_transfer: true,
+        }
     } else {
-        consensus.init();
-    }
+        JoinMode::Init
+    };
+    let timers = consensus_timers(config);
+    let consensus = VsrConsensus::restored(
+        topology.cluster_id,
+        topology.self_replica_id,
+        replica_count,
+        server_common::sharding::METADATA_GROUP,
+        bus,
+        // Request queue keeps the stock 2x ratio over the prepare queue
+        // (32 -> 64 at defaults): buffered requests are cheap relative to
+        // in-flight prepares and drain as prepares commit.
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
+        VsrRestore {
+            timers: &timers,
+            // View and log_view come from the durable superblock when present.
+            // A present but unreadable superblock already refused boot in
+            // `recover()`, so no durable record means genuinely absent: a
+            // fresh node, or one that took writes but never checkpointed or
+            // changed view. There, inferring the view from the last WAL
+            // prepare is safe, since the persist-before-send gate guarantees
+            // this replica never externalized a view beyond what a re-probe
+            // re-derives, and it re-probes as a backup.
+            durable_view: recovered_state.map(|state| (state.view, state.log_view)),
+            view_fallback: last_header.map(|header| header.view),
+            // Fresh random incarnation each boot, so a StartView addressed to
+            // a previous incarnation still in flight is ignored
+            // (`handle_start_view` guard). `| 1` guarantees the non-zero the
+            // guard treats as set. The deterministic simulator overrides this
+            // with a seed-derived value bumped per restart.
+            incarnation: Some(rand::random::<u128>() | 1),
+            join,
+        },
+    );
     consensus.sequencer().set_sequence(restored_op);
     // A SOLO replica's durable journal head IS its commit point: quorum is
     // 1-of-1, so an entry commits the instant it is durable, and the acks
@@ -2389,39 +2423,6 @@ fn restore_metadata_consensus(
     consensus
 }
 
-#[allow(clippy::too_many_arguments)]
-/// Build the ticked-and-bounded consensus a loaded partition group joins
-/// with; the fresh-create path configures its own inside
-/// `build_partition_fresh`.
-fn loaded_partition_consensus(
-    config: &ServerConfig,
-    namespace: IggyNamespace,
-    cluster_id: u128,
-    self_replica_id: u8,
-    replica_count: u8,
-    bus: Rc<IggyMessageBus>,
-) -> VsrConsensus<Rc<IggyMessageBus>> {
-    // Request queue holds 2x the prepare depth (buffered requests drain as
-    // prepares commit); depth is the per-partition `[partition]` knob.
-    let prepare_queue_depth = config.partition.prepare_queue_depth;
-    let consensus = VsrConsensus::new(
-        cluster_id,
-        self_replica_id,
-        replica_count,
-        namespace.inner(),
-        bus,
-        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
-    );
-    consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
-    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
-    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
-    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
-    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
-    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
-    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
-    consensus
-}
-
 /// Recover this partition's persisted segment chain, stamping each segment
 /// with the topic's effective segment size (the per-topic value when the
 /// topic was created with one, else the shard-wide configured size).
@@ -2437,16 +2438,12 @@ async fn recover_partition_segments(
     let segment_size = runtime_options
         .segment_size
         .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
-    let enforce_fsync = runtime_options
-        .enforce_fsync
-        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     load_persisted_segments(
         config,
         stream_id,
         topic_id,
         partition_id,
         segment_size,
-        enforce_fsync,
         stats,
     )
     .await
@@ -2477,20 +2474,9 @@ async fn load_partition(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
-    let mut consensus = loaded_partition_consensus(
-        config,
-        namespace,
-        cluster_id,
-        self_replica_id,
-        replica_count,
-        bus,
-    );
-
     // (view, log_view) come from the group's durable superblock when present;
     // a present but unverifiable record already refused boot inside
-    // `open_partition_superblock`. Restored BEFORE choosing how to join, so
-    // the backup probe below never advertises a view older than the recorded
-    // one.
+    // `open_partition_superblock`.
     let partition_dir = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
@@ -2503,9 +2489,6 @@ async fn load_partition(
         },
     )
     .await?;
-    if let Some(state) = recovered_state.as_ref() {
-        restore_partition_view(&mut consensus, state);
-    }
 
     // A recovered partition lost its journal state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
@@ -2517,12 +2500,34 @@ async fn load_partition(
     // at the serving peer's retention point. The probe re-broadcasts on its
     // timeout, so it needs no live mesh at boot. Single-replica groups
     // have no peer to ask and keep the plain init.
-    if replica_count > 1 {
-        consensus.init_as_backup();
-        consensus.begin_view_probe();
+    let join = if replica_count > 1 {
+        JoinMode::ProbeAsBackup {
+            await_state_transfer: false,
+        }
     } else {
-        consensus.init();
-    }
+        JoinMode::Init
+    };
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
+    let timers = consensus_timers(config);
+    let consensus = VsrConsensus::restored(
+        cluster_id,
+        self_replica_id,
+        replica_count,
+        namespace.inner(),
+        bus,
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
+        VsrRestore {
+            timers: &timers,
+            durable_view: recovered_state
+                .as_ref()
+                .map(|state| (state.view, state.log_view)),
+            view_fallback: None,
+            incarnation: None,
+            join,
+        },
+    );
 
     // No prepare-timestamp floor is restored here: the partition consensus
     // journal is non-durable today, so there is no persisted head to observe
@@ -3649,6 +3654,7 @@ fn load_replica_tls_ctx(
     };
 
     let credentials = if tls.self_signed {
+        warn_ignored_certificate_files("cluster.tls", &tls.cert_file, &tls.key_file);
         let san = config
             .cluster
             .nodes
@@ -3729,7 +3735,7 @@ fn load_tcp_tls_server_credentials(
     config: &ServerConfig,
 ) -> Result<TlsServerCredentials, ServerError> {
     let tls = &config.tcp.tls;
-    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+    if ephemeral_certificate("tcp.tls", tls.self_signed, &tls.cert_file) {
         return Ok(self_signed_for_loopback());
     }
 
@@ -3783,7 +3789,7 @@ async fn start_websocket_listener(
 
 fn load_wss_server_credentials(config: &ServerConfig) -> Result<TlsServerCredentials, ServerError> {
     let tls = &config.websocket.tls;
-    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+    if ephemeral_certificate("websocket.tls", tls.self_signed, &tls.cert_file) {
         return Ok(self_signed_for_loopback());
     }
 
@@ -3800,6 +3806,11 @@ fn load_quic_server_credentials(
 ) -> Result<replica_io::QuicServerCredentials, ServerError> {
     let certificate = &config.quic.certificate;
     if certificate.self_signed {
+        warn_ignored_certificate_files(
+            "quic.certificate",
+            &certificate.cert_file,
+            &certificate.key_file,
+        );
         let (cert_chain, key_der) = server_common::generate_self_signed_certificate("localhost")
             .map_err(|error| ServerError::ListenerCredentials {
                 transport: "quic",
@@ -3823,6 +3834,44 @@ fn load_quic_server_credentials(
         cert_chain: credentials.cert_chain,
         key_der: credentials.key_der,
     })
+}
+
+/// Client-listener certificate precedence: `self_signed = true` mints an
+/// ephemeral loopback certificate only while `cert_file` is absent from disk.
+/// An existing PEM pair wins, so a deployment that lays certificates down
+/// serves them without also having to unset the flag - the contract every
+/// SDK test lane relies on when it points the server at `core/certs/`.
+fn ephemeral_certificate(section: &str, self_signed: bool, cert_file: &str) -> bool {
+    if !self_signed {
+        return false;
+    }
+    if Path::new(cert_file).exists() {
+        info!(
+            "{section}.self_signed = true but cert_file = {cert_file} exists on disk; loading it - remove the file or clear the path to serve an ephemeral certificate"
+        );
+        return false;
+    }
+    true
+}
+
+/// `self_signed = true` never reads the PEM pair (cluster and QUIC keep the
+/// flag authoritative: their generated certificates carry non-loopback SANs),
+/// so a cert path resolving on disk looks active to an operator who never
+/// asked for it.
+fn warn_ignored_certificate_files(section: &str, cert_file: &str, key_file: &str) {
+    let found: Vec<String> = [("cert_file", cert_file), ("key_file", key_file)]
+        .into_iter()
+        .filter(|(_, path)| Path::new(path).exists())
+        .map(|(field, path)| format!("{field} = {path}"))
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+
+    warn!(
+        "{section}.self_signed = true, ignoring certificate files found on disk ({}); set {section}.self_signed = false to load them",
+        found.join(", ")
+    );
 }
 
 fn parse_socket_addr(context: &'static str, address: &str) -> Result<SocketAddr, ServerError> {
@@ -3925,6 +3974,25 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superblock_fatal_window_converts_to_capped_backoff_retries() {
+        assert_eq!(
+            superblock_window_to_failures(Duration::ZERO),
+            0,
+            "zero window must stay the disabled sentinel"
+        );
+        assert_eq!(
+            superblock_window_to_failures(Duration::from_mins(2)),
+            120,
+            "past warmup one retry rides each 1s backoff cap"
+        );
+        assert_eq!(
+            superblock_window_to_failures(Duration::from_micros(500)),
+            1,
+            "a sub-cap window still needs one failure to fire"
+        );
+    }
 
     #[test]
     fn fresh_cluster_bootstrap_requires_explicit_root_credentials() {

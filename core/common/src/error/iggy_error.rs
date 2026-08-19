@@ -22,6 +22,11 @@ use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
 
+// A gap in the discriminants is a RETIRED code, not free space. Shipped SDKs
+// keep their own code tables (foreign/go/errors/errors.yaml,
+// foreign/node/src/wire/error.code.ts) that still map the old meaning, and
+// Go's is a typed error matched by errors.Is, so refilling a gap reroutes
+// caller control flow. Allocate above the highest code in its range.
 #[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr, Default)]
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
@@ -236,6 +241,8 @@ pub enum IggyError {
         "Max topic size cannot be lower than segment size. Max topic size: {0} < segment size: {1}."
     )]
     InvalidTopicSize(MaxTopicSize, IggyByteSize) = 1019,
+    #[error("Too many streams")]
+    TooManyStreams = 1020,
     #[error("Cannot create topics directory for stream with ID: {0}, Path: {1}")]
     CannotCreateTopicsDirectory(Identifier, String) = 2000,
     #[error("Failed to create directory for topic with ID: {0} for stream with ID: {1}, Path: {2}")]
@@ -276,6 +283,8 @@ pub enum IggyError {
     InvalidPartitionsCount = 2019,
     #[error("Topic directory: {0} not found")]
     TopicDirectoryNotFound(String) = 2020,
+    #[error("Too many topics")]
+    TooManyTopics = 2021,
     #[error("Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}")]
     CannotCreatePartition(usize, usize, usize) = 3000,
     #[error(
@@ -310,6 +319,12 @@ pub enum IggyError {
     CannotDeleteConsumerOffsetFile(String) = 3011,
     #[error("Failed to create consumer offsets directory for path: {0}")]
     CannotCreateConsumerOffsetsDirectory(String) = 3012,
+    /// Distinct from [`Self::TooManyPartitions`] by remedy: that one is cleared
+    /// by a smaller batch, this one by deleting partitions. Ids are minted one
+    /// past the highest LIVE id, and deletion truncates from the tail, so the
+    /// range frees again.
+    #[error("Partition id space exhausted for this topic")]
+    PartitionIdSpaceExhausted = 3013,
     #[error("Failed to read consumers offsets from path: {0}")]
     CannotReadConsumerOffsets(String) = 3020,
     #[error("Consumer offset for consumer with ID: {0} was not found.")]
