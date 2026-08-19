@@ -18,7 +18,9 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
 use iggy_common::locking::IggyRwLock;
-use iggy_common::{Consumer, EncryptorKind, Identifier, IggyDuration, PollingStrategy};
+use iggy_common::{
+    Consumer, EncryptorKind, Identifier, IggyDuration, NonZeroIggyDuration, PollingStrategy,
+};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -36,9 +38,9 @@ pub struct IggyConsumerBuilder {
     auto_join_consumer_group: bool,
     create_consumer_group_if_not_exists: bool,
     encryptor: Option<Arc<EncryptorKind>>,
-    polling_retry_interval: IggyDuration,
+    polling_retry_interval: NonZeroIggyDuration,
     init_retries: Option<u32>,
-    init_retry_interval: IggyDuration,
+    init_retry_interval: NonZeroIggyDuration,
     allow_replay: bool,
     offset_drain_timeout: IggyDuration,
 }
@@ -72,9 +74,9 @@ impl IggyConsumerBuilder {
             create_consumer_group_if_not_exists: true,
             encryptor,
             polling_interval,
-            polling_retry_interval: IggyDuration::ONE_SECOND,
+            polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: None,
-            init_retry_interval: IggyDuration::ONE_SECOND,
+            init_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             allow_replay: false,
             offset_drain_timeout: IggyDuration::new_from_secs(5),
         }
@@ -191,7 +193,7 @@ impl IggyConsumerBuilder {
     }
 
     /// Sets the polling retry interval in case of server disconnection.
-    pub fn polling_retry_interval(self, interval: IggyDuration) -> Self {
+    pub fn polling_retry_interval(self, interval: NonZeroIggyDuration) -> Self {
         Self {
             polling_retry_interval: interval,
             ..self
@@ -201,7 +203,7 @@ impl IggyConsumerBuilder {
     /// Sets the number of retries and the interval when initializing the consumer if the stream or topic is not found.
     /// Might be useful when the stream or topic is created dynamically by the producer.
     /// By default, the consumer will not retry.
-    pub fn init_retries(self, retries: u32, interval: IggyDuration) -> Self {
+    pub fn init_retries(self, retries: u32, interval: NonZeroIggyDuration) -> Self {
         Self {
             init_retries: Some(retries),
             init_retry_interval: interval,

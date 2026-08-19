@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::http::http_transport::HttpTransport;
-use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
+use crate::prelude::{Client, HttpClientConfig, IggyError, NonZeroIggyDuration};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -48,7 +48,7 @@ const PUBLIC_PATHS: &[&str] = &[
 pub struct HttpClient {
     /// The URL of the Iggy API.
     pub api_url: Url,
-    pub(crate) heartbeat_interval: IggyDuration,
+    pub(crate) heartbeat_interval: NonZeroIggyDuration,
     client: ClientWithMiddleware,
     access_token: IggyRwLock<String>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
@@ -279,7 +279,7 @@ impl HttpClient {
         Ok(Self {
             api_url,
             client,
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             access_token: IggyRwLock::new(access_token),
             events: broadcast(1000),
         })
@@ -528,7 +528,7 @@ mod tests {
         );
         assert_eq!(
             http_client.as_ref().unwrap().heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
     }
 
@@ -570,7 +570,7 @@ mod tests {
         );
         assert_eq!(
             http_client.as_ref().unwrap().heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
     }
 
