@@ -26,7 +26,7 @@ use crate::dispatch::{
 use crate::http;
 use crate::partition_helpers::{
     build_partition_fresh, configure_consumer_offsets, ensure_initial_segment,
-    open_partition_superblock, restore_partition_view, validate_namespace_bounds,
+    open_partition_superblock, restore_partition_view,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
@@ -1839,7 +1839,6 @@ async fn build_shard_for_thread(
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
-        validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = match load_partition(
             config,
@@ -2437,16 +2436,12 @@ async fn recover_partition_segments(
     let segment_size = runtime_options
         .segment_size
         .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
-    let enforce_fsync = runtime_options
-        .enforce_fsync
-        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     load_persisted_segments(
         config,
         stream_id,
         topic_id,
         partition_id,
         segment_size,
-        enforce_fsync,
         stats,
     )
     .await
@@ -3649,6 +3644,7 @@ fn load_replica_tls_ctx(
     };
 
     let credentials = if tls.self_signed {
+        warn_ignored_certificate_files("cluster.tls", &tls.cert_file, &tls.key_file);
         let san = config
             .cluster
             .nodes
@@ -3729,7 +3725,7 @@ fn load_tcp_tls_server_credentials(
     config: &ServerConfig,
 ) -> Result<TlsServerCredentials, ServerError> {
     let tls = &config.tcp.tls;
-    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+    if ephemeral_certificate("tcp.tls", tls.self_signed, &tls.cert_file) {
         return Ok(self_signed_for_loopback());
     }
 
@@ -3783,7 +3779,7 @@ async fn start_websocket_listener(
 
 fn load_wss_server_credentials(config: &ServerConfig) -> Result<TlsServerCredentials, ServerError> {
     let tls = &config.websocket.tls;
-    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+    if ephemeral_certificate("websocket.tls", tls.self_signed, &tls.cert_file) {
         return Ok(self_signed_for_loopback());
     }
 
@@ -3800,6 +3796,11 @@ fn load_quic_server_credentials(
 ) -> Result<replica_io::QuicServerCredentials, ServerError> {
     let certificate = &config.quic.certificate;
     if certificate.self_signed {
+        warn_ignored_certificate_files(
+            "quic.certificate",
+            &certificate.cert_file,
+            &certificate.key_file,
+        );
         let (cert_chain, key_der) = server_common::generate_self_signed_certificate("localhost")
             .map_err(|error| ServerError::ListenerCredentials {
                 transport: "quic",
@@ -3823,6 +3824,44 @@ fn load_quic_server_credentials(
         cert_chain: credentials.cert_chain,
         key_der: credentials.key_der,
     })
+}
+
+/// Client-listener certificate precedence: `self_signed = true` mints an
+/// ephemeral loopback certificate only while `cert_file` is absent from disk.
+/// An existing PEM pair wins, so a deployment that lays certificates down
+/// serves them without also having to unset the flag - the contract every
+/// SDK test lane relies on when it points the server at `core/certs/`.
+fn ephemeral_certificate(section: &str, self_signed: bool, cert_file: &str) -> bool {
+    if !self_signed {
+        return false;
+    }
+    if Path::new(cert_file).exists() {
+        info!(
+            "{section}.self_signed = true but cert_file = {cert_file} exists on disk; loading it - remove the file or clear the path to serve an ephemeral certificate"
+        );
+        return false;
+    }
+    true
+}
+
+/// `self_signed = true` never reads the PEM pair (cluster and QUIC keep the
+/// flag authoritative: their generated certificates carry non-loopback SANs),
+/// so a cert path resolving on disk looks active to an operator who never
+/// asked for it.
+fn warn_ignored_certificate_files(section: &str, cert_file: &str, key_file: &str) {
+    let found: Vec<String> = [("cert_file", cert_file), ("key_file", key_file)]
+        .into_iter()
+        .filter(|(_, path)| Path::new(path).exists())
+        .map(|(field, path)| format!("{field} = {path}"))
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+
+    warn!(
+        "{section}.self_signed = true, ignoring certificate files found on disk ({}); set {section}.self_signed = false to load them",
+        found.join(", ")
+    );
 }
 
 fn parse_socket_addr(context: &'static str, address: &str) -> Result<SocketAddr, ServerError> {

@@ -59,16 +59,6 @@ pub struct MessagesMaintenanceConfig {
     pub interval: IggyDuration,
 }
 
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct MessageSaverConfig {
-    pub enabled: bool,
-    pub enforce_fsync: bool,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub interval: IggyDuration,
-}
-
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct PersonalAccessTokenConfig {
     pub max_tokens_per_user: u32,
@@ -99,9 +89,6 @@ pub struct ConsumerGroupConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub rebalancing_timeout: IggyDuration,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub rebalancing_check_interval: IggyDuration,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]

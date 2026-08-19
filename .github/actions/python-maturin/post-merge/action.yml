@@ -165,11 +165,3 @@ runs:
         echo ""
         echo "View on PyPI: https://pypi.org/project/apache-iggy/$VERSION/"
       shell: bash
-
-    - name: Publish to PyPI
-      if: inputs.dry_run == 'false'
-      uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-      with:
-        packages-dir: ${{ inputs.wheels_path }}
-        skip-existing: true
-        attestations: true

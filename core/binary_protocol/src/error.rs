@@ -49,4 +49,23 @@ pub enum WireError {
 
     #[error("validation failed: {0}")]
     Validation(Cow<'static, str>),
+
+    #[error(
+        "invalid batch checksum: stored {stored}, computed {computed}, base offset {base_offset}"
+    )]
+    InvalidBatchChecksum {
+        stored: u64,
+        computed: u64,
+        base_offset: u64,
+    },
+
+    #[error("invalid message checksum: stored {stored}, computed {computed}, offset {offset}")]
+    InvalidMessageChecksum {
+        stored: u64,
+        computed: u64,
+        offset: u64,
+    },
+
+    #[error("message timestamp delta {0} exceeds the batch maximum")]
+    InvalidMessageTimestampDelta(u64),
 }

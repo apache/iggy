@@ -19,29 +19,7 @@ use iggy::prelude::*;
 use integration::bench_utils::run_bench_and_wait_for_finish;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
-use std::{collections::HashMap, str::FromStr};
-use test_case::test_matrix;
-
-fn cache_open_segment() -> &'static str {
-    "open_segment"
-}
-
-fn cache_all() -> &'static str {
-    "all"
-}
-
-fn cache_none() -> &'static str {
-    "none"
-}
-
-fn build_server_config(cache_setting: &str) -> TestServerConfig {
-    let mut extra_envs = HashMap::new();
-    extra_envs.insert(
-        "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
-        cache_setting.to_string(),
-    );
-    TestServerConfig::builder().extra_envs(extra_envs).build()
-}
+use std::str::FromStr;
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 //
@@ -53,18 +31,15 @@ fn build_server_config(cache_setting: &str) -> TestServerConfig {
 // `iggy-bench` must be freshly built: the harness spawns the prebuilt binary,
 // and a stale one never completes a frame against the server, tripping the
 // bench timeout in `run_bench_and_wait_for_finish`.
-#[test_matrix(
-    [cache_all(), cache_open_segment(), cache_none()]
-)]
 #[tokio::test]
 #[parallel]
-async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) {
+async fn should_fill_data_and_verify_after_restart() {
     // Restart scenarios run single-node: restarting a node in a multi-node
     // cluster trips a known partitions-plane view-change stall, tracked
     // separately.
     let mut harness = TestHarness::builder()
         .cluster_nodes(1)
-        .server(build_server_config(cache_setting))
+        .server(TestServerConfig::default())
         .build()
         .unwrap();
 

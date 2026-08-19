@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use consensus::MetadataHandle;
 use futures::channel::oneshot;
-use iggy_binary_protocol::consensus::Command2;
+use iggy_binary_protocol::consensus::Command;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
 use message_bus::BusMessage;
@@ -247,7 +247,7 @@ async fn submit_gated(
         let Some(reply) = submit_client_request_on_owner(shard, request).await else {
             return Err(WriteError::Unavailable);
         };
-        let transient = (reply.header().command == Command2::Reply)
+        let transient = (reply.header().command == Command::Reply)
             .then(|| transient_code(&reply))
             .flatten();
         let Some(transient) = transient else {
@@ -283,13 +283,13 @@ async fn submit_gated(
     };
 
     match reply.header().command {
-        Command2::Reply => {
+        Command::Reply => {
             // Already burned at stamp time; release the gate so the next
             // write on this session can take its turn.
             drop(next_request_id);
             Ok((request_header, reply, raw_token))
         }
-        Command2::Eviction => Err(WriteError::Evicted(eviction_error(&reply))),
+        Command::Eviction => Err(WriteError::Evicted(eviction_error(&reply))),
         _ => Err(WriteError::Rejected(IggyError::InvalidCommand)),
     }
 }

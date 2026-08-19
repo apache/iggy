@@ -27,17 +27,10 @@ import (
 )
 
 func buildFetchPayload(payloadBody []byte) []byte {
-	header := iggcon.NewMessageHeader(iggcon.MessageID{}, uint32(len(payloadBody)), 0)
-	headerBytes := header.ToBytes()
-
-	// 4 (partitionId) + 8 (currentOffset) + 4 (messagesCount) + header + body
-	buf := make([]byte, 16+len(headerBytes)+len(payloadBody))
-	binary.LittleEndian.PutUint32(buf[0:4], 1)
-	binary.LittleEndian.PutUint64(buf[4:12], 0)
-	binary.LittleEndian.PutUint32(buf[12:16], 1)
-	copy(buf[16:], headerBytes)
-	copy(buf[16+len(headerBytes):], payloadBody)
-	return buf
+	buf := binary.LittleEndian.AppendUint32(nil, 1)
+	buf = binary.LittleEndian.AppendUint64(buf, 0)
+	buf = binary.LittleEndian.AppendUint32(buf, 1)
+	return appendBatchRecord(buf, 0, 0, 0, batchFrame{payload: payloadBody})
 }
 
 func TestDeserializeFetchMessages_MalformedS2ReturnsError(t *testing.T) {

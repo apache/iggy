@@ -26,7 +26,7 @@
 
 #![allow(dead_code)] // each test binary uses a subset
 
-use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
 use message_bus::ConnectionInstaller;
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::auth::ReplicaAuth;
@@ -67,7 +67,7 @@ pub fn loopback() -> SocketAddr {
 /// Used by tests to fabricate `Request`, `Reply`, `Ping`, etc. directly.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub fn header_only(command: Command2, cluster: u128, replica: u8) -> Message<GenericHeader> {
+pub fn header_only(command: Command, cluster: u128, replica: u8) -> Message<GenericHeader> {
     Message::<GenericHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut GenericHeader| {
         h.command = command;
         h.cluster = cluster;

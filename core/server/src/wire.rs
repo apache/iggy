@@ -100,7 +100,7 @@ pub(crate) fn rewrite_request_body(
 mod tests {
     use super::{request_body, rewrite_request_body};
     use bytes::Bytes;
-    use iggy_binary_protocol::{Command2, Operation, RoutedRequestHeader};
+    use iggy_binary_protocol::{Command, Operation, RoutedRequestHeader};
     use server_common::Message;
     use std::mem::size_of;
 
@@ -108,7 +108,7 @@ mod tests {
         let total_size = size_of::<RoutedRequestHeader>() + body.len();
         let mut message = Message::<RoutedRequestHeader>::new(total_size).transmute_header(
             |_, header: &mut RoutedRequestHeader| {
-                header.command = Command2::Request;
+                header.command = Command::Request;
                 header.operation = Operation::CreateStream;
                 header.client = 1;
                 header.session = 1;

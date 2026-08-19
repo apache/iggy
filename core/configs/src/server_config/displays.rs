@@ -25,22 +25,20 @@
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
-use super::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
-use super::server::{ExtraConfig, NamespaceConfig, ServerConfig};
-use super::tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig};
+use super::quic::{QuicCertificateConfig, QuicConfig};
+use super::server::ServerConfig;
+use super::tcp::{TcpConfig, TcpTlsConfig};
 use std::fmt::{Display, Formatter};
 
 impl Display for ServerConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ consumer_group: {}, data_maintenance: {}, extra: {}, message_saver: {}, \
+            "{{ consumer_group: {}, data_maintenance: {}, \
              heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {}, \
              metadata: {}, message_bus: {}, partition: {} }}",
             self.consumer_group,
             self.data_maintenance,
-            self.extra,
-            self.message_saver,
             self.heartbeat,
             self.system,
             self.quic,
@@ -98,28 +96,12 @@ impl Display for MessageBusConfig {
     }
 }
 
-impl Display for ExtraConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ namespace: {} }}", self.namespace)
-    }
-}
-
-impl Display for NamespaceConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ max_streams: {}, max_topics: {}, max_partitions: {} }}",
-            self.max_streams, self.max_topics, self.max_partitions
-        )
-    }
-}
-
 impl Display for TcpConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, address: {}, ipv6: {}, tls: {}, socket: {}, socket_migration: {} }}",
-            self.enabled, self.address, self.ipv6, self.tls, self.socket, self.socket_migration
+            "{{ enabled: {}, address: {}, tls: {} }}",
+            self.enabled, self.address, self.tls
         )
     }
 }
@@ -134,33 +116,18 @@ impl Display for TcpTlsConfig {
     }
 }
 
-impl Display for TcpSocketConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ override_defaults: {}, recv_buffer_size: {}, send_buffer_size: {}, keepalive: {}, nodelay: {}, linger: {} }}",
-            self.override_defaults,
-            self.recv_buffer_size,
-            self.send_buffer_size,
-            self.keepalive,
-            self.nodelay,
-            self.linger,
-        )
-    }
-}
-
 impl Display for QuicConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, address: {}, max_concurrent_bidi_streams: {}, datagram_send_buffer_size: {}, initial_mtu: {}, send_window: {}, receive_window: {}, keep_alive_interval: {}, max_idle_timeout: {}, certificate: {} }}",
+            "{{ enabled: {}, address: {}, max_concurrent_bidi_streams: {}, initial_mtu: {}, send_window: {}, receive_window: {}, stream_receive_window: {}, keep_alive_interval: {}, max_idle_timeout: {}, certificate: {} }}",
             self.enabled,
             self.address,
             self.max_concurrent_bidi_streams,
-            self.datagram_send_buffer_size,
             self.initial_mtu,
             self.send_window,
             self.receive_window,
+            self.stream_receive_window,
             self.keep_alive_interval,
             self.max_idle_timeout,
             self.certificate
@@ -174,16 +141,6 @@ impl Display for QuicCertificateConfig {
             f,
             "{{ self_signed: {}, cert_file: {}, key_file: {} }}",
             self.self_signed, self.cert_file, self.key_file
-        )
-    }
-}
-
-impl Display for QuicSocketConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{{ override_defaults: {}, recv_buffer_size: {}, send_buffer_size: {}, keepalive: {} }}",
-            self.override_defaults, self.recv_buffer_size, self.send_buffer_size, self.keepalive
         )
     }
 }

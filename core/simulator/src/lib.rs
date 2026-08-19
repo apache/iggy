@@ -1674,14 +1674,16 @@ mod tests {
         // correctly because `hash % 1 == 0` at one shard per replica.
         // Re-locked again when replies stopped echoing a group id (the
         // client wire lost its namespace field): the reply-hash tuple
-        // dropped that component.
+        // dropped that component. Re-locked when the v1 consumer-offset ops
+        // were removed and the v2 pair became the only store/delete actions:
+        // `Action` lost two variants, shifting discriminants and draw order.
         assert_eq!(
-            h1, 0xCF1F_BC79_B44A_65F7,
+            h1, 0x14BF_3C3F_41D4_F69D,
             "workload reply hash drifted from locked baseline"
         );
     }
 
-    /// Drive workload with uniform weights across all 25 `Action` variants.
+    /// Drive workload with near-uniform weights across all 23 `Action` variants.
     /// Assert it runs without panic and observes at least one reply.
     /// Per-op coverage not asserted: some ops can starve the in-flight slot
     /// at single-client / 1-slot pipeline limits.
@@ -1720,9 +1722,12 @@ mod tests {
         sim.init_partition(ns_b);
         sim.register_client_with_primary(&client);
 
-        // 25 variants × 4 = 100.
-        assert_eq!(Action::COUNT, 25, "Action::COUNT changed; adjust weights");
-        let entries: Vec<(Action, u8)> = Action::iter().map(|a| (a, 4)).collect();
+        // 23 variants: 8 x 5 + 15 x 4 = 100 (weights must sum to 100).
+        assert_eq!(Action::COUNT, 23, "Action::COUNT changed; adjust weights");
+        let entries: Vec<(Action, u8)> = Action::iter()
+            .enumerate()
+            .map(|(index, action)| (action, if index < 8 { 5 } else { 4 }))
+            .collect();
         let weights = ActionWeights::new(&entries);
 
         let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a, ns_b]);
@@ -1787,8 +1792,11 @@ mod tests {
         sim.init_partition(ns_b);
         sim.register_client_with_primary(&client);
 
-        assert_eq!(Action::COUNT, 25, "Action::COUNT changed; adjust weights");
-        let entries: Vec<(Action, u8)> = Action::iter().map(|a| (a, 4)).collect();
+        assert_eq!(Action::COUNT, 23, "Action::COUNT changed; adjust weights");
+        let entries: Vec<(Action, u8)> = Action::iter()
+            .enumerate()
+            .map(|(index, action)| (action, if index < 8 { 5 } else { 4 }))
+            .collect();
         let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a, ns_b]);
         options.weights = ActionWeights::new(&entries);
         let mut wl = Workload::new(options);
@@ -2148,7 +2156,7 @@ mod tests {
         options.weights = ActionWeights::new(&[
             (Action::CreateStream, 5),
             (Action::SendMessages, 70),
-            (Action::StoreConsumerOffset2, 25),
+            (Action::StoreConsumerOffset, 25),
         ]);
         let mut wl = Workload::new(options);
 
@@ -2305,7 +2313,7 @@ mod tests {
         options.weights = ActionWeights::new(&[
             (Action::CreateStream, 5),
             (Action::SendMessages, 70),
-            (Action::StoreConsumerOffset2, 25),
+            (Action::StoreConsumerOffset, 25),
         ]);
 
         let mut wl = Workload::new(options);
@@ -3042,7 +3050,7 @@ mod tests {
     #[test]
     fn per_partition_consensus_independence() {
         use consensus::PIPELINE_PREPARE_QUEUE_MAX;
-        use iggy_binary_protocol::{Command2, PrepareOkHeader};
+        use iggy_binary_protocol::{Command, PrepareOkHeader};
         use packet::Packet;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3052,7 +3060,7 @@ mod tests {
         static BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
 
         fn drop_blocked_prepare_ok(packet: &Packet) -> bool {
-            if packet.message.header().command != Command2::PrepareOk {
+            if packet.message.header().command != Command::PrepareOk {
                 return false;
             }
             let header: &PrepareOkHeader = bytemuck::checked::from_bytes(

@@ -47,7 +47,6 @@ class IggyResourceNotFoundExceptionTest {
             value = IggyErrorCode.class,
             names = {
                 "RESOURCE_NOT_FOUND",
-                "CANNOT_LOAD_RESOURCE",
                 "STREAM_ID_NOT_FOUND",
                 "STREAM_NAME_NOT_FOUND",
                 "TOPIC_ID_NOT_FOUND",
@@ -57,8 +56,7 @@ class IggyResourceNotFoundExceptionTest {
                 "CLIENT_NOT_FOUND",
                 "CONSUMER_GROUP_ID_NOT_FOUND",
                 "CONSUMER_GROUP_NAME_NOT_FOUND",
-                "CONSUMER_GROUP_NOT_JOINED",
-                "MESSAGE_NOT_FOUND"
+                "CONSUMER_GROUP_MEMBER_NOT_FOUND",
             })
     void matchesReturnsTrueForResourceNotFoundRelatedCodes(IggyErrorCode code) {
         assertThat(IggyResourceNotFoundException.matches(code)).isTrue();
@@ -69,7 +67,6 @@ class IggyResourceNotFoundExceptionTest {
             value = IggyErrorCode.class,
             names = {
                 "RESOURCE_NOT_FOUND",
-                "CANNOT_LOAD_RESOURCE",
                 "STREAM_ID_NOT_FOUND",
                 "STREAM_NAME_NOT_FOUND",
                 "TOPIC_ID_NOT_FOUND",
@@ -79,8 +76,7 @@ class IggyResourceNotFoundExceptionTest {
                 "CLIENT_NOT_FOUND",
                 "CONSUMER_GROUP_ID_NOT_FOUND",
                 "CONSUMER_GROUP_NAME_NOT_FOUND",
-                "CONSUMER_GROUP_NOT_JOINED",
-                "MESSAGE_NOT_FOUND"
+                "CONSUMER_GROUP_MEMBER_NOT_FOUND",
             },
             mode = Mode.EXCLUDE)
     void matchesReturnsFalseForNonResourceNotFoundRelatedCodes(IggyErrorCode code) {

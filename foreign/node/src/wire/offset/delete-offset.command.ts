@@ -19,7 +19,7 @@
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import type { GetOffset } from './get-offset.command.js';
 import { wrapCommand } from '../command.utils.js';
-import { serializeGetOffset } from './offset.utils.js';
+import { serializeDeleteOffset } from './offset.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
 
@@ -37,7 +37,7 @@ export const DELETE_OFFSET = {
   code: COMMAND_CODE.DeleteConsumerOffset,
 
   serialize: ({ streamId, topicId, consumer, partitionId = 0 }: DeleteOffset) => {
-    return serializeGetOffset(streamId, topicId, consumer, partitionId);
+    return serializeDeleteOffset(streamId, topicId, consumer, partitionId);
   },
 
   deserialize: deserializeVoidResponse

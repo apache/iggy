@@ -52,7 +52,6 @@ rmp = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 server_common = { workspace = true }
-slab = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

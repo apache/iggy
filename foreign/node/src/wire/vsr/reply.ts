@@ -26,7 +26,7 @@
 
 import { ResponseError, responseError } from '../error.utils.js';
 import {
-  Command2, EvictionReason, HEADER_SIZE,
+  Command, EvictionReason, HEADER_SIZE,
   peekCommand, readEviction, readReplyOperation, readSize, readStatus
 } from './header.js';
 import { Operation, isKnownOperation, isResultFramed } from './operation.js';
@@ -65,9 +65,9 @@ export const decodeResponse = (
     throw responseError(commandCode, EMPTY_RESPONSE);
 
   switch (peekCommand(frame)) {
-    case Command2.Eviction:
+    case Command.Eviction:
       throw evictionError(frame);
-    case Command2.Reply:
+    case Command.Reply:
       break;
     default:
       throw responseError(commandCode, INVALID_COMMAND);

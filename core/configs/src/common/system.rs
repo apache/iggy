@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::cache_indexes::CacheIndexesConfig;
 use super::server::MemoryPoolConfig;
 use configs::{ConfigEnv, ConfigEnvMappings};
 use iggy_common::IggyByteSize;
-use iggy_common::{CompressionAlgorithm, IggyDuration};
+use iggy_common::IggyDuration;
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
@@ -35,8 +34,6 @@ pub const LOG_EXTENSION: &str = "log";
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct SystemConfig<S: ConfigEnvMappings> {
     pub path: String,
-    pub backup: BackupConfig,
-    pub state: StateConfig,
     pub runtime: RuntimeConfig,
     pub logging: LoggingConfig,
     pub stream: StreamConfig,
@@ -44,38 +41,14 @@ pub struct SystemConfig<S: ConfigEnvMappings> {
     pub partition: PartitionConfig,
     pub segment: SegmentConfig,
     pub encryption: EncryptionConfig,
-    pub compression: CompressionConfig,
     pub recovery: RecoveryConfig,
     pub memory_pool: MemoryPoolConfig,
     pub sharding: S,
 }
 
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct BackupConfig {
-    pub path: String,
-    pub compatibility: CompatibilityConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct CompatibilityConfig {
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct DatabaseConfig {
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct RuntimeConfig {
     pub path: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct CompressionConfig {
-    pub allow_override: bool,
-    #[config_env(leaf)]
-    pub default_algorithm: CompressionAlgorithm,
 }
 
 #[serde_as]
@@ -94,9 +67,6 @@ pub struct LoggingConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub retention: IggyDuration,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub sysinfo_print_interval: IggyDuration,
 }
 
 impl From<&LoggingConfig> for LoggingSettings {
@@ -156,19 +126,7 @@ pub struct RecoveryConfig {
 /// `iggy_common::DEFAULT_SEGMENT_SIZE` / `DEFAULT_PREALLOCATE_SEGMENTS`.
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct SegmentConfig {
-    #[config_env(leaf)]
-    pub cache_indexes: CacheIndexesConfig,
     pub archive_expired: bool,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, ConfigEnv)]
-pub struct StateConfig {
-    pub enforce_fsync: bool,
-    pub max_file_operation_retries: u32,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub retry_delay: IggyDuration,
 }
 
 impl<S: ConfigEnvMappings> SystemConfig<S> {
@@ -189,10 +147,6 @@ impl<S: ConfigEnvMappings> SystemConfig<S> {
     }
     pub fn get_state_tokens_path(&self) -> String {
         format!("{}/tokens", self.get_state_path())
-    }
-
-    pub fn get_backup_path(&self) -> String {
-        format!("{}/{}", self.get_system_path(), self.backup.path)
     }
 
     pub fn get_runtime_path(&self) -> String {

@@ -265,17 +265,6 @@ pub enum ServerError {
         #[source]
         source: Box<iggy_common::IggyError>,
     },
-    #[error(
-        "recovered namespace stream {stream_id}, topic {topic_id}, partition {partition_id} exceeds configured limits (max_streams={max_streams}, max_topics={max_topics}, max_partitions={max_partitions})"
-    )]
-    RecoveredNamespaceOutOfBounds {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        max_streams: usize,
-        max_topics: usize,
-        max_partitions: usize,
-    },
     #[error("failed to load {transport} listener credentials")]
     ListenerCredentials {
         transport: &'static str,

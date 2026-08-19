@@ -24,7 +24,7 @@ use common::{
     header_only, install_dialed_replicas_locally, install_replicas_locally, loopback,
     set_replica_ctx,
 };
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus};
@@ -73,7 +73,7 @@ async fn writer_batches_pipelined_sends_in_order() {
     // Pipeline N sends back-to-back without yielding. The writer task
     // should drain many of them in single writev calls.
     for i in 0..N {
-        let msg = header_only(Command2::Prepare, i as u128, 0);
+        let msg = header_only(Command::Prepare, i as u128, 0);
         bus0.send_to_replica(1, msg.into_frozen())
             .await
             .expect("send should succeed - queue capacity is 256");

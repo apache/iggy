@@ -42,7 +42,7 @@ mod header;
 mod operation;
 mod reply_result;
 
-pub use command::Command2;
+pub use command::Command;
 pub use error::ConsensusError;
 pub use header::{
     CHECKSUM_UNSEALED, CommitHeader, ConsensusHeader, DVC_HEADERS_MAX, DoViewChangeHeader,

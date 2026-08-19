@@ -796,7 +796,7 @@ mod tests {
     use crate::impls::metadata::checkpoint_checksum;
     use crate::stm::snapshot::SNAPSHOT_FORMAT_VERSION;
     use consensus::CLIENTS_TABLE_MAX;
-    use iggy_binary_protocol::consensus::{Command2, Operation};
+    use iggy_binary_protocol::consensus::{Command, Operation};
     use journal::Journal;
     use server_common::iobuf::Owned;
     use tempfile::tempdir;
@@ -910,7 +910,7 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.commit = commit;
         header.operation = Operation::CreateStream;
@@ -936,7 +936,7 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.commit = op.saturating_sub(1);
         header.operation = operation;
