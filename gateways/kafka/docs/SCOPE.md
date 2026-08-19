@@ -10,12 +10,12 @@ Foundation layer only: a TCP listener on the Kafka wire port that decodes reques
 | ------------- | -------- | ---------- |
 | TCP listener on `127.0.0.1:9093` (configurable) | Done | `src/server.rs`, `src/main.rs` |
 | Length-prefixed frame read/write with `max_frame_size` cap | Done | `src/server.rs` |
-| Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` |
+| Request header v1/v2 auto-detection | Done | `src/protocol/header.rs` (delegates to `kafka_protocol::messages::ApiKey`) |
 | Version negotiation firewall (`SUPPORTED_RANGES`) | Done | `src/protocol/api.rs` |
-| Request decode + stub encode for 6 API keys | Done | `src/protocol/requests.rs`, `responses.rs`, `api.rs` |
-| Produce hot path: RecordBatch as opaque `Bytes` | Done | `src/protocol/requests.rs` |
-| Graceful errors (`UNSUPPORTED_VERSION`, corrupt decode, invalid header) | Done | `src/protocol/api.rs`, `src/server.rs` |
-| Adversarial decode safety tests | Done | `tests/decode_safety_tests.rs` |
+| Request decode + stub encode for 6 API keys | Done | `src/protocol/api.rs`, `responses.rs` (via the `kafka_protocol` crate) |
+| Produce hot path: RecordBatch as opaque `Bytes` | Done | `src/protocol/responses.rs` |
+| Pre-decode bounds guard against unbounded allocation | Done | `src/protocol/bounds_guard.rs` |
+| Graceful errors (corrupt decode, invalid header) | Done | `src/protocol/api.rs`, `src/server.rs` |
 | Regression test suite | Done | `tests/` — see [`TEST_SUITE.md`](TEST_SUITE.md) |
 | Manual testing procedure | Done | [`MANUAL_TESTING.md`](MANUAL_TESTING.md) |
 | Wire fixture tool for manual/integration testing | Done | `tools/kafka-tool/` |
@@ -24,7 +24,17 @@ Source of truth for supported ranges: `SUPPORTED_RANGES` in [`src/protocol/api.r
 
 ### Governance model
 
-Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiVersions advertises exactly what the firewall allows. Versions below an API's min (but still encodable) receive `UNSUPPORTED_VERSION` (35) in a version-correct body; versions above the encoder max close the connection (a clamped body would be unparsable at the client's version). ApiVersions is the KIP-511 exception: out-of-range still answers with a v0 error body.
+Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiVersions advertises exactly what the firewall allows.
+
+**Every unsupported-version case closes the connection, for every listed key** - not just above
+the encoder max. `kafka_protocol`'s schema floor for each of the six supported messages happens
+to equal `SUPPORTED_RANGES`' own min today (Produce 3, Fetch 4, ListOffsets 1, Metadata 0,
+ApiVersions 0, CreateTopics 2), so there is no version below an API's min that the crate can
+actually encode a response for either - `unsupported_version_response` still tries, but the
+encode attempt fails and the connection closes rather than sending a malformed body.
+**ApiVersions is the sole exception** (KIP-511): out of range still answers with a v0 error body,
+because a client probing an unknown server must be able to parse the discovery response before
+it knows the server supports flexible encoding.
 
 ---
 
@@ -39,7 +49,7 @@ Expand `SUPPORTED_RANGES` only after a key/version pair is manually tested. ApiV
 | 2 | ListOffsets | 1 | 6 | 1, 2, 3, 4, 5, 6 | Decode request; stub response |
 | 19 | CreateTopics | 2 | 5 | 2, 3, 4, 5 | Decode request; stub returns `NOT_CONTROLLER` (41); `-1` partitions/RF = broker default on v4+ |
 
-A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key, or any unlisted API key, receives `UNSUPPORTED_VERSION` (35).
+A request is accepted when `min_version ≤ api_version ≤ max_version` for that API key. Any other version for a listed key closes the connection (ApiVersions excepted - see Governance model above). Any unlisted API key also closes the connection: no api-specific response schema exists for it, so any body this gateway could send would be misparsed by the client against the schema it expected.
 
 ### Valid versions reference (by API key)
 
@@ -58,7 +68,7 @@ Use this table when configuring clients or generating wire fixtures with `kafka-
 
 ## Unsupported API keys (foundation)
 
-All API keys not listed above receive an error-only response with `UNSUPPORTED_VERSION` (35). Examples not in this foundation scope:
+All API keys not listed above close the connection (see Governance model above) - none receives an `UNSUPPORTED_VERSION` response. Examples not in this foundation scope:
 
 | API key | Name | Notes |
 | --------- | ------ | ------- |
@@ -77,8 +87,8 @@ Full reference for future phases: [`kafka_api_keys_reference.md`](kafka_api_keys
 
 | Layer | #3421 | Description |
 | ------- | ------- | ------------- |
-| **1 — Wire framing** | In scope | `server.rs`, `codec.rs`, `header.rs` — keep custom, zero-copy frame I/O |
-| **2 — Request/response codecs** | Partial | Custom minimal-parse codecs for 6 hot-path keys; stub responses only |
+| **1 — Wire framing** | In scope | `server.rs` — custom, zero-copy frame I/O; `header.rs` delegates version selection to `kafka_protocol::messages::ApiKey` |
+| **2 — Request/response codecs** | Partial | Decode/encode via the `kafka_protocol` crate (broker feature only) for 6 hot-path keys; `bounds_guard.rs` pre-validates against unbounded allocation before handing a frame to the crate; stub responses only |
 | **3 — Iggy bridge** | Out of scope | Produce/Fetch → Iggy SDK; deferred to a follow-on issue |
 
 ---
@@ -97,11 +107,18 @@ Items from the [hybrid architecture review](https://github.com/apache/iggy/discu
 - [ ] Idempotent `ensure_stream_and_topic()` (create-if-not-exists)
 - [ ] Real Metadata topology (brokers, partitions, leaders) backed by Iggy state
 
-### Phase 2 — Selective `kafka-protocol` crate (feature-gated)
+### `kafka-protocol` crate adoption — superseded, done differently
 
-- [ ] Add optional `kafka-protocol-cold` feature to `iggy_gateway_kafka` — **not** wholesale replace of `requests.rs`/`responses.rs`
-- [ ] Use crate for: RecordBatch decode (compression, CRC), consumer-group API keys (8–14, 10), complex Metadata/FindCoordinator responses
-- [ ] **Keep custom codecs** for Produce/Fetch hot paths (opaque RecordBatch bytes)
+This TODO originally proposed a selective, feature-gated adoption (`kafka-protocol-cold`)
+alongside the hand-rolled `requests.rs`/`responses.rs` codecs, keeping custom code for the
+Produce/Fetch hot paths. That hybrid approach was not taken: `kafka_protocol` (broker feature
+only) now decodes/encodes all six supported message types wholesale, and the hand-rolled
+`codec.rs`/`requests.rs` were deleted. RecordBatch bytes stay opaque (`Option<Bytes>`, never
+decoded) on the Produce/Fetch hot paths, preserving the one property this TODO was protecting.
+`bounds_guard.rs` covers the DoS-bound gap the crate itself leaves open (see Governance model
+above).
+
+- [ ] Consumer-group API keys (8–14, 10) and complex Metadata/FindCoordinator responses remain unimplemented (see Phase 3 below) - the crate can decode them when that phase starts
 
 ### Phase 3 — Consumer groups (~7 API keys)
 

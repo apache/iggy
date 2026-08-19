@@ -30,9 +30,9 @@ Default bind: `127.0.0.1:9093`. Environment variables:
 cargo test -p iggy-gateway-kafka
 ```
 
-259 regression tests across 12 suites — see [docs/TEST_SUITE.md](docs/TEST_SUITE.md) for the full catalog.
+See [docs/TEST_SUITE.md](docs/TEST_SUITE.md) for the full suite catalog (`cargo test -p iggy-gateway-kafka -- --list` for the exact current test names - the count has drifted out of sync with the actual suites before, so it isn't pinned here).
 
-`decode_validation_tests` require wire fixtures under `tools/kafka-tool/kafka_messages/` (gitignored locally; CI generates them via `scripts/ci-wire-fixtures.sh`):
+Some `api_handler_tests`, `server_e2e_tests`, and `version_firewall_tests` cases require wire fixtures under `tools/kafka-tool/kafka_messages/` (gitignored locally; CI generates them via `scripts/ci-wire-fixtures.sh`):
 
 ```bash
 ./gateways/kafka/scripts/ci-wire-fixtures.sh generate

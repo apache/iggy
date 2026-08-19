@@ -38,6 +38,7 @@ bytes = { workspace = true }
 # client-role codec paths and compression codecs (gzip/lz4/snappy/zstd) this gateway never
 # uses, since RecordBatch payloads stay opaque `Bytes` here.
 kafka-protocol = { version = "0.17", default-features = false, features = ["broker"] }
+libc = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
@@ -51,6 +52,7 @@ tokio = { workspace = true, features = [
 ] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
+tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]

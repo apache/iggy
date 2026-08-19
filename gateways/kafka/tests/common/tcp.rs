@@ -221,9 +221,16 @@ pub async fn read_byte_with_timeout(stream: &mut TcpStream, timeout: Duration) -
     }
 }
 
-/// Scan a response body for a big-endian `i16` error code at any 2-byte-aligned
-/// offset. Used by corrupt-body / unsupported-version tests that assert an error
-/// code is present somewhere in the response without fully decoding its shape.
+/// Scan a response body for a big-endian `i16` error code at any byte offset (a sliding
+/// 2-byte window, not one stepped by 2 - it does not skip odd offsets). Used by corrupt-body /
+/// unsupported-version tests that assert an error code is present somewhere in the response
+/// without fully decoding its shape.
+///
+/// This is inherently approximate: it can false-positive if the two bytes of `code` happen to
+/// straddle an unrelated field. Callers that `||` two `scan_for_error_code` calls together widen
+/// that risk further, since either match alone satisfies the assertion - accepted here because
+/// these tests assert "some protocol error surfaced," not which one, and a full structural decode
+/// per corrupt-input case would be disproportionate to what's being checked.
 pub fn scan_for_error_code(body: &Bytes, code: i16) -> bool {
     body.windows(2)
         .any(|w| i16::from_be_bytes([w[0], w[1]]) == code)

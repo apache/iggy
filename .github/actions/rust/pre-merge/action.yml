@@ -279,10 +279,10 @@ runs:
         compile_duration=$((compile_end - compile_start))
         echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
 
-        # decode_validation_tests need gitignored wire fixtures. Generate when
-        # iggy-gateway-kafka is in the DAG test scope, or (on a full-workspace run)
-        # when gateways/** changed vs origin/master — avoid building kafka-message-gen
-        # / kafka-protocol when the gateway was not touched.
+        # api_handler_tests, version_firewall_tests, and server_e2e_tests need gitignored
+        # wire fixtures. Generate when iggy-gateway-kafka is in the DAG test scope, or (on
+        # a full-workspace run) when gateways/** changed vs origin/master — avoid building
+        # kafka-message-gen / kafka-protocol when the gateway was not touched.
         NEEDS_KAFKA_FIXTURES=false
         if grep -q 'package(iggy-gateway-kafka)' <<< "$NEXTEST_FILTER"; then
           NEEDS_KAFKA_FIXTURES=true

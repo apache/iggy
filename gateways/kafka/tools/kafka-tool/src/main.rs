@@ -35,6 +35,7 @@ use kafka_protocol::protocol::{Encodable, StrBytes};
 use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -605,6 +606,11 @@ async fn cmd_generate(
 ) -> Result<()> {
     tokio::fs::create_dir_all(&out).await?;
     let (mut n, mut corr) = (0usize, 1i32);
+    // Zero out up front so a requested key that never matches an `API_REGISTRY` row at all (a
+    // typo, e.g. `--api-key 999`) is caught by the same zero-files check below as a key whose
+    // every version failed to build - both silently produced nothing before this fix.
+    let mut files_per_requested_key: HashMap<i16, usize> =
+        filter_keys.iter().map(|&k| (k, 0)).collect();
     for &(ak, name, min, max) in API_REGISTRY {
         if !filter_keys.is_empty() && !filter_keys.contains(&ak) {
             continue;
@@ -626,11 +632,29 @@ async fn cmd_generate(
                     }
                     n += 1;
                     corr += 1;
+                    *files_per_requested_key.entry(ak).or_insert(0) += 1;
                 }
                 Err(e) => warn!("SKIP {} v{}: {e}", name, v),
             }
         }
     }
+
+    // A per-version build failure is a legitimate skip (some versions have no encodable
+    // representation) - but a *requested* key producing zero files across every one of its
+    // versions means CI's fixture generation step silently did nothing for that key, which
+    // `ci-wire-fixtures.sh`'s callers would only discover later as an unrelated test failure.
+    let empty_keys: Vec<i16> = filter_keys
+        .iter()
+        .copied()
+        .filter(|k| files_per_requested_key.get(k).copied().unwrap_or(0) == 0)
+        .collect();
+    if !empty_keys.is_empty() {
+        anyhow::bail!(
+            "--api-key {empty_keys:?} produced zero fixture files (unknown API key, or every \
+             version failed to build - see SKIP lines above)"
+        );
+    }
+
     println!("\n✓ Generated {n} messages → {}/", out.display());
     println!(
         "  Quick test: cat {}/018_ApiVersions_v3.bin | nc 127.0.0.1 9092 | xxd",

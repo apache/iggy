@@ -23,7 +23,7 @@ set -euo pipefail
 
 FIXTURES_DIR="gateways/kafka/tools/kafka-tool/kafka_messages"
 
-# API keys exercised by decode_validation_tests and handler_regression_tests.
+# API keys requested by api_handler_tests, version_firewall_tests, and server_e2e_tests.
 FIXTURE_API_KEYS=(0 1 2 19)
 
 usage() {
@@ -33,11 +33,15 @@ usage() {
 
 generate() {
   mkdir -p "$FIXTURES_DIR"
+  # --api-key is repeatable (clap ArgAction::Append) - one invocation covers every key instead
+  # of one `cargo run` per key, per partition job.
+  local api_key_args=()
   for key in "${FIXTURE_API_KEYS[@]}"; do
-    cargo run --locked -p kafka-message-gen -- generate \
-      --output "$FIXTURES_DIR" \
-      --api-key "$key"
+    api_key_args+=(--api-key "$key")
   done
+  cargo run --locked -p kafka-message-gen -- generate \
+    --output "$FIXTURES_DIR" \
+    "${api_key_args[@]}"
   echo "Generated wire fixtures under ${FIXTURES_DIR}/"
 }
 

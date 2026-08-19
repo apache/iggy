@@ -20,8 +20,8 @@ mod codec;
 
 use std::time::Duration;
 
-use bytes::{Buf, BufMut, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use bytes::{BufMut, BytesMut};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use codec::Encoder;
@@ -34,23 +34,6 @@ async fn tcp_pair() -> (TcpStream, TcpStream) {
     let (server, _) = listener.accept().await.unwrap();
     let client = client.await.unwrap();
     (client, server)
-}
-
-/// Raw length-prefixed write (no Kafka response header) - mirrors `server::write_frame`.
-async fn write_length_prefixed(
-    stream: &mut TcpStream,
-    payload: &[u8],
-    write_timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let len = payload.len();
-    assert!(i32::try_from(len).is_ok());
-    let mut frame = BytesMut::with_capacity(4 + len);
-    frame.put_i32(i32::try_from(len).expect("len fits i32"));
-    frame.extend_from_slice(payload);
-    tokio::time::timeout(write_timeout, stream.write_all(&frame))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))??;
-    Ok(())
 }
 
 #[tokio::test]
@@ -85,24 +68,6 @@ async fn read_frame_reads_valid_payload() {
 }
 
 #[tokio::test]
-async fn write_frame_writes_length_prefixed_payload() {
-    let (mut client, mut server) = tcp_pair().await;
-    let payload = b"abc123";
-    write_length_prefixed(&mut server, payload, Duration::from_secs(1))
-        .await
-        .unwrap();
-
-    let mut len = [0u8; 4];
-    client.read_exact(&mut len).await.unwrap();
-    let len = usize::try_from(i32::from_be_bytes(len)).expect("positive frame length");
-    assert_eq!(len, payload.len());
-
-    let mut body = vec![0u8; len];
-    client.read_exact(&mut body).await.unwrap();
-    assert_eq!(body, payload);
-}
-
-#[tokio::test]
 async fn read_frame_rejects_invalid_lengths() {
     let (mut client, mut server) = tcp_pair().await;
 
@@ -131,21 +96,6 @@ async fn read_frame_rejects_invalid_lengths() {
     .await
     .expect_err("large frame must fail");
     assert!(err.to_string().contains("exceeds max frame size"));
-}
-
-#[tokio::test]
-async fn write_frame_length_prefix_is_big_endian() {
-    let (mut client, mut server) = tcp_pair().await;
-    write_length_prefixed(&mut server, &[1, 2, 3, 4], Duration::from_secs(1))
-        .await
-        .unwrap();
-
-    let mut len_and_data = [0u8; 8];
-    client.read_exact(&mut len_and_data).await.unwrap();
-    let mut buf = &len_and_data[..];
-    let len = buf.get_i32();
-    assert_eq!(len, 4);
-    assert_eq!(&len_and_data[4..], &[1, 2, 3, 4]);
 }
 
 #[tokio::test]

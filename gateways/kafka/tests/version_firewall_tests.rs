@@ -44,7 +44,7 @@ use iggy_gateway_kafka::protocol::api::{
 };
 
 use codec::Decoder;
-use fixtures::{fixture_exists, load_fixture_body, load_fixture_body_or_skip};
+use fixtures::load_fixture_body_or_skip;
 use scope::{SCOPED_API_KEYS, default_broker};
 use server::spawn_test_server;
 use tcp::{
@@ -88,6 +88,18 @@ fn is_supported_version_matches_scope_table() {
     }
 }
 
+/// Checked against `SCOPED_API_KEYS` - a hand-maintained table mirroring `SCOPE.md`'s published
+/// contract, not `supported_api_ranges()` (the function under test). Comparing the wire response
+/// against `supported_api_ranges()` would only prove the encoder faithfully serializes whatever
+/// `SUPPORTED_RANGES` happens to hold today, even if that table itself regressed. The one
+/// deliberate min-version override (Produce advertises 0, not its real firewall floor of 3, per
+/// KIP-511 compatibility) is hardcoded here rather than obtained by calling
+/// `advertised_min_version` - the same reasoning applies to it as the function under test.
+///
+/// Relies on `SUPPORTED_RANGES` (src) and `SCOPED_API_KEYS` (test) sharing declaration order
+/// (Produce, Fetch, `ListOffsets`, Metadata, `ApiVersions`, `CreateTopics`) -
+/// `supported_ranges_table_has_six_entries` plus `is_supported_version_matches_scope_table`
+/// already pin that both tables cover the same six keys.
 #[test]
 fn apiversions_advertises_exact_supported_ranges_v1() {
     let body = handle_request(API_KEY_API_VERSIONS, 1, Bytes::new(), &default_broker())
@@ -95,23 +107,27 @@ fn apiversions_advertises_exact_supported_ranges_v1() {
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_i32().unwrap()).expect("api count fits usize");
-    assert_eq!(count, supported_api_ranges().len());
+    assert_eq!(count, SCOPED_API_KEYS.len());
 
-    for expected in supported_api_ranges() {
+    for &(api_key, name, min_ver, max_ver) in SCOPED_API_KEYS {
         let key = d.read_i16().unwrap();
         let min = d.read_i16().unwrap();
         let max = d.read_i16().unwrap();
-        assert_eq!(key, expected.api_key);
-        assert_eq!(
-            min,
-            advertised_min_version(expected.api_key, expected.min_version)
-        );
-        assert_eq!(max, expected.max_version);
+        assert_eq!(key, api_key, "{name}");
+        let expected_min = if api_key == API_KEY_PRODUCE {
+            0
+        } else {
+            min_ver
+        };
+        assert_eq!(min, expected_min, "{name} advertised min");
+        assert_eq!(max, max_ver, "{name} advertised max");
     }
     assert_eq!(d.read_i32().unwrap(), 0); // throttle
     assert_eq!(d.remaining(), 0);
 }
 
+/// See `apiversions_advertises_exact_supported_ranges_v1` for why this checks against
+/// `SCOPED_API_KEYS`, not `supported_api_ranges()`.
 #[test]
 fn apiversions_advertises_exact_supported_ranges_v3_flexible() {
     let body = handle_request(
@@ -124,38 +140,31 @@ fn apiversions_advertises_exact_supported_ranges_v3_flexible() {
     let mut d = Decoder::new(body);
     assert_eq!(d.read_i16().unwrap(), 0);
     let count = usize::try_from(d.read_varint().unwrap() - 1).expect("api count fits usize");
-    assert_eq!(count, supported_api_ranges().len());
+    assert_eq!(count, SCOPED_API_KEYS.len());
 
-    for expected in supported_api_ranges() {
+    for &(api_key, name, min_ver, max_ver) in SCOPED_API_KEYS {
         let key = d.read_i16().unwrap();
         let min = d.read_i16().unwrap();
         let max = d.read_i16().unwrap();
         d.read_tagged_fields().unwrap();
-        assert_eq!(key, expected.api_key);
-        assert_eq!(
-            min,
-            advertised_min_version(expected.api_key, expected.min_version)
-        );
-        assert_eq!(max, expected.max_version);
+        assert_eq!(key, api_key, "{name}");
+        let expected_min = if api_key == API_KEY_PRODUCE {
+            0
+        } else {
+            min_ver
+        };
+        assert_eq!(min, expected_min, "{name} advertised min");
+        assert_eq!(max, max_ver, "{name} advertised max");
     }
     assert_eq!(d.read_i32().unwrap(), 0);
     d.read_tagged_fields().unwrap();
     assert_eq!(d.remaining(), 0);
 }
 
-#[test]
-fn apiversions_advertises_produce_min_zero_while_firewall_stays_three() {
-    let range = supported_api_ranges()
-        .iter()
-        .find(|r| r.api_key == API_KEY_PRODUCE)
-        .expect("produce range");
-    assert_eq!(range.min_version, 3);
-    assert_eq!(
-        advertised_min_version(API_KEY_PRODUCE, range.min_version),
-        0
-    );
-    assert!(!is_supported_version(API_KEY_PRODUCE, 0));
-}
+// Produce-advertises-min-zero-but-firewall-stays-three coverage lives in
+// `produce_advertises_min_zero_but_firewall_rejects_below_v3` below - checked against
+// `SCOPED_API_KEYS` (independent of `supported_api_ranges()`, the function under test) plus the
+// acks=0/acks!=0 behavioral split this shorter version never covered.
 
 #[test]
 fn apiversions_all_versions_return_success() {
@@ -325,29 +334,9 @@ fn unsupported_api_keys_close_connection() {
     }
 }
 
-#[test]
-fn supported_produce_versions_accept_valid_fixture() {
-    for version in 3i16..=9 {
-        let Some(body) = load_fixture_body_or_skip(0, "Produce", version) else {
-            continue;
-        };
-        let resp = handle_request(API_KEY_PRODUCE, version, body, &default_broker())
-            .expect_response("test request has acks != 0 and expects a response");
-        assert!(!resp.is_empty(), "Produce v{version} response empty");
-    }
-}
-
-#[test]
-fn supported_fetch_versions_accept_valid_fixture() {
-    for version in 4i16..=12 {
-        let Some(body) = load_fixture_body_or_skip(1, "Fetch", version) else {
-            continue;
-        };
-        let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
-            .expect_response("test request has acks != 0 and expects a response");
-        assert!(!resp.is_empty(), "Fetch v{version} response empty");
-    }
-}
+// Produce/Fetch fixture-driven "supported version returns non-empty response" coverage lives in
+// `api_handler_tests.rs::handle_request_succeeds_for_every_supported_version_with_fixture` -
+// that generic per-scoped-API loop already exercises the exact same fixtures and version ranges.
 
 #[test]
 fn corrupt_produce_body_with_acks_stays_silent() {
@@ -423,30 +412,23 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
             }
         }
         API_KEY_PRODUCE => {
-            if fixture_exists(api_key, name, version) {
-                load_fixture_body(api_key, name, version)
-            } else if version >= 9 {
-                build_produce_flexible_body(1, 0)
-            } else if version >= 3 {
-                build_produce_v3_body(1, 0)
-            } else {
-                build_produce_v2_body(1, 0)
-            }
+            // `_or_skip` (not bare `load_fixture_body`) so `KAFKA_FIXTURES_REQUIRED=1` panics on
+            // a missing fixture instead of this falling through to a synthetic body and CI
+            // silently never exercising the real generated fixture.
+            load_fixture_body_or_skip(api_key, name, version).unwrap_or_else(|| {
+                if version >= 9 {
+                    build_produce_flexible_body(1, 0)
+                } else if version >= 3 {
+                    build_produce_v3_body(1, 0)
+                } else {
+                    build_produce_v2_body(1, 0)
+                }
+            })
         }
-        API_KEY_FETCH => {
-            if fixture_exists(api_key, name, version) {
-                load_fixture_body(api_key, name, version)
-            } else {
-                build_fetch_empty_topics_request(version)
-            }
-        }
-        API_KEY_LIST_OFFSETS => {
-            if fixture_exists(api_key, name, version) {
-                load_fixture_body(api_key, name, version)
-            } else {
-                build_list_offsets_request(version, "scope-topic", 0)
-            }
-        }
+        API_KEY_FETCH => load_fixture_body_or_skip(api_key, name, version)
+            .unwrap_or_else(|| build_fetch_empty_topics_request(version)),
+        API_KEY_LIST_OFFSETS => load_fixture_body_or_skip(api_key, name, version)
+            .unwrap_or_else(|| build_list_offsets_request(version, "scope-topic", 0)),
         API_KEY_CREATE_TOPICS => build_create_topics_empty_request(version),
         _ => Bytes::new(),
     }

@@ -23,9 +23,10 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
+use iggy_gateway_kafka::server::bind_listener;
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
-/// Bind an ephemeral port, start `KafkaServer`, return address + shutdown sender.
+/// Bind an ephemeral port, start `KafkaGateway`, return address + shutdown sender.
 pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
     spawn_test_server_with_config(GatewayConfig {
         bind_addr: String::new(),
@@ -41,13 +42,19 @@ pub async fn spawn_test_server() -> (SocketAddr, broadcast::Sender<()>) {
     .await
 }
 
-/// Start `KafkaServer` with explicit config (`bind_addr` overwritten with ephemeral port).
+/// Start `KafkaGateway` with explicit config (`bind_addr` overwritten with ephemeral port).
+///
+/// `bind_listener` is synchronous, so this function's own body has no `.await` left - kept
+/// `async` anyway (with the lint silenced) rather than churning every one of this suite's ~20
+/// call sites from `spawn_test_server_with_config(...).await` to a sync call for a test helper
+/// whose whole purpose is spawning an async task.
+#[allow(clippy::unused_async)]
 pub async fn spawn_test_server_with_config(
     mut config: GatewayConfig,
 ) -> (SocketAddr, broadcast::Sender<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
+    // Routed through the same tuned bind path as `main` (deep accept backlog via socket2), not a
+    // bare `TcpListener::bind`, so integration tests actually exercise it.
+    let listener = bind_listener("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
 
     config.bind_addr = addr.to_string();

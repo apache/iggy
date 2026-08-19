@@ -29,7 +29,7 @@ mod tcp;
 mod wire;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use iggy_gateway_kafka::protocol::api::{
@@ -140,23 +140,10 @@ async fn e2e_sequential_requests_on_one_connection() {
     }
 }
 
-// Negative-frame-length-closes-connection coverage lives in listener_robustness_tests.rs
-// (uses a timeout-guarded read helper, so a regression fails fast instead of hanging).
-
-#[tokio::test]
-async fn e2e_oversized_frame_is_rejected() {
-    let (addr, _shutdown) = spawn_test_server().await;
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-
-    let mut frame = BytesMut::new();
-    frame.put_i32(10_000_000); // exceeds default 8 MiB cap
-    frame.resize(4 + 100, 0);
-    stream.write_all(&frame).await.unwrap();
-
-    let mut buf = [0u8; 1];
-    let n = stream.read(&mut buf).await.unwrap_or(0);
-    assert_eq!(n, 0, "server should close after oversized frame");
-}
+// Negative-frame-length-closes-connection and oversized-frame-closes-connection coverage both
+// live in listener_robustness_tests.rs (uses a timeout-guarded read helper, so a regression
+// fails fast instead of hanging - the unbounded `stream.read` this file used to do here could
+// only hang, never fail, if the server stopped closing oversized frames).
 
 // ── Produce acks=0 (broker must stay silent) ────────────────────────────────
 
@@ -204,6 +191,18 @@ async fn e2e_produce_v3_acks_zero_malformed_topics_sends_no_response() {
         response.is_none(),
         "Produce with acks=0 must stay silent even when the body is malformed; got {} bytes",
         response.as_ref().map_or(0, Bytes::len)
+    );
+
+    // A silence assertion alone cannot distinguish "stayed open and correctly silent" from "the
+    // server dropped the connection" - both look like no bytes arrive. Probe with a request that
+    // must answer, so a regression that closes on decode failure fails here instead of passing.
+    let follow_up = build_request_frame(API_KEY_API_VERSIONS, 1, 100, Some("review-test"), &[]);
+    stream.write_all(&follow_up).await.expect("follow-up");
+    let payload = read_response_frame(&mut stream, 8 * 1024 * 1024).await;
+    assert_eq!(
+        parse_response_payload(API_KEY_API_VERSIONS, 1, payload).0,
+        100,
+        "connection must stay usable after the silent malformed acks=0 Produce"
     );
 }
 
@@ -262,40 +261,57 @@ async fn e2e_list_offsets_v0_closes_connection() {
 
 // ── Metadata topic name echo (must not hardcode a placeholder topic name) ──
 
+/// Reads just enough of a Metadata v1 response (`kafka_protocol`'s `Decodable` for response
+/// types needs the `client` feature this broker-only gateway deliberately excludes - see
+/// `Cargo.toml` - so this walks the wire layout by hand, same as `Decoder`'s other callers in
+/// this file) to recover the topic names: brokers array, `controller_id`, then per-topic
+/// `error_code`/`name`/`is_internal`/partitions.
+fn read_metadata_v1_topic_names(body: Bytes) -> Vec<Option<String>> {
+    let mut d = Decoder::new(body);
+    for _ in 0..d.read_i32().expect("broker count") {
+        d.read_i32().expect("node_id");
+        d.read_nullable_string().expect("host");
+        d.read_i32().expect("port");
+        d.read_nullable_string().expect("rack"); // v1+
+    }
+    d.read_i32().expect("controller_id"); // v1+
+
+    let mut names = Vec::new();
+    for _ in 0..d.read_i32().expect("topic count") {
+        d.read_i16().expect("topic error_code");
+        names.push(d.read_nullable_string().expect("topic name"));
+        d.read_bool().expect("is_internal"); // v1+
+        for _ in 0..d.read_i32().expect("partition count") {
+            d.read_i16().expect("partition error_code");
+            d.read_i32().expect("partition_index");
+            d.read_i32().expect("leader_id");
+            for _ in 0..d.read_i32().expect("replica_nodes count") {
+                d.read_i32().expect("replica node id");
+            }
+            for _ in 0..d.read_i32().expect("isr_nodes count") {
+                d.read_i32().expect("isr node id");
+            }
+        }
+    }
+    names
+}
+
 #[tokio::test]
 async fn e2e_metadata_v1_response_contains_requested_topic_name() {
+    // Structural decode (`read_metadata_v1_topic_names`), not a byte-substring scan: a substring
+    // match can't distinguish "topic name in the `name` field" from "topic name anywhere in the
+    // response" (e.g. leaked into an unrelated field, or byte-coincidentally matching padding),
+    // and can't assert the *absence* of a wrong name without that same false-positive risk.
     let (addr, _shutdown) = spawn_test_server().await;
     let topic = "orders";
     let request_body = build_metadata_legacy_request(&[topic]);
-    let frame = build_request_frame(API_KEY_METADATA, 1, 9, Some("review-test"), &request_body);
+    let (corr, body) = round_trip(addr, API_KEY_METADATA, 1, 9, &request_body).await;
+    assert_eq!(corr, 9);
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
-    stream.write_all(&frame).await.expect("write metadata v1");
-
-    let payload =
-        read_response_frame_with_timeout(&mut stream, 8 * 1024 * 1024, Duration::from_secs(2))
-            .await
-            .expect("metadata response");
-
-    let full_response = {
-        let mut framed = BytesMut::with_capacity(4 + payload.len());
-        framed.put_i32(i32::try_from(payload.len()).expect("metadata response fits i32"));
-        framed.extend_from_slice(&payload);
-        framed.freeze()
-    };
-
-    assert!(
-        full_response
-            .windows(topic.len())
-            .any(|window| window == topic.as_bytes()),
-        "metadata response must contain requested topic name {topic:?}; \
-         placeholder-only responses break client topic matching"
-    );
-    assert!(
-        !full_response
-            .windows(b"unknown-topic".len())
-            .any(|window| window == b"unknown-topic"),
-        "metadata response must not substitute unknown-topic for requested names"
+    assert_eq!(
+        read_metadata_v1_topic_names(body),
+        vec![Some(topic.to_string())],
+        "metadata response must echo exactly the requested topic name, not a placeholder"
     );
 }
 

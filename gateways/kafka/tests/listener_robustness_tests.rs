@@ -212,6 +212,11 @@ async fn e2e_client_disconnect_mid_frame_allows_new_connection() {
 
 #[tokio::test]
 async fn e2e_response_frames_have_positive_big_endian_length_prefix() {
+    // Reading the length prefix as big-endian and using it verbatim as `read_exact`'s byte count
+    // means a server that switched to little-endian could only ever hang here (the swapped value
+    // is still `> 0`, and the peer waits for a byte count that never arrives) - never fail. Route
+    // through `tcp::read_response_frame`, which bounds the whole read in a timeout and turns a
+    // dropped/malformed response into a bounded panic instead of an indefinite hang.
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
@@ -219,16 +224,7 @@ async fn e2e_response_frames_have_positive_big_endian_length_prefix() {
     let frame = build_request_frame(API_KEY_API_VERSIONS, 3, 200, Some("len-test"), &request);
     stream.write_all(&frame).await.expect("write");
 
-    let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .expect("length prefix");
-    let len = i32::from_be_bytes(len_buf);
-    assert!(len > 0, "response length prefix must be positive");
-    let body_len = usize::try_from(len).expect("positive length");
-    let mut body = vec![0u8; body_len];
-    stream.read_exact(&mut body).await.expect("response body");
+    let body = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
     assert!(!body.is_empty());
 }
 
@@ -468,7 +464,10 @@ async fn e2e_quiet_connection_survives_beyond_read_timeout_idle_cap() {
         advertised_port: None,
         max_frame_size: 8 * 1024 * 1024,
         max_connections: 1024,
-        idle_timeout: Duration::from_secs(5),
+        // 30s, not the 5s every other test in this file uses: this test's own sleep (4s) must
+        // clear read_timeout (3s) without approaching idle_timeout, or CI scheduler jitter could
+        // push the 5s-vs-4s 1s margin negative and flake. 30s leaves 26s of slack instead.
+        idle_timeout: Duration::from_secs(30),
         read_timeout: Duration::from_secs(3),
         write_timeout: Duration::from_secs(5),
         shutdown_drain_timeout: Duration::from_secs(5),

@@ -13,7 +13,7 @@ Each output `.bin` file is a complete, TCP-ready Kafka request:
 [payload: bytes]       ← API-specific encoded body
 ```
 
-The tool covers **65 API keys** and **~280 versioned messages**, sourced directly from the official [Apache Kafka JSON schema files](https://github.com/apache/kafka/tree/trunk/clients/src/main/resources/common/message) (Kafka 4.1.0).
+The tool covers **64 API keys** and **~259 versioned messages**, sourced directly from the official [Apache Kafka JSON schema files](https://github.com/apache/kafka/tree/trunk/clients/src/main/resources/common/message) (Kafka 4.1.0).
 
 ---
 
@@ -43,7 +43,7 @@ cargo build --release
 # Binary is at: ./target/release/kafka-message-gen
 ```
 
-**Requirements:** Rust 1.75+ (MSRV follows `kafka-protocol` crate)
+**Requirements:** Rust 1.97.1+ (MSRV follows `kafka-protocol` crate)
 
 ---
 
@@ -67,7 +67,7 @@ Key    Name                                       MinVer     MaxVer     Count
 8      OffsetCommit                               2          10         9
 ...
 ──────────────────────────────────────────────────────────────────────────────
-Total: 65 API keys  |  ~280 versioned messages
+Total: 64 API keys  |  ~259 versioned messages
 ```
 
 ---
@@ -117,7 +117,7 @@ cargo run -- generate --api-key 18 --version 3 --hex
 ### Send messages to a live server
 
 ```bash
-# Start Iggy with Kafka compat listener on port 9092, then:
+# Start Iggy with Kafka compat listener on port 9093, then:
 cargo run -- send --host 127.0.0.1:9092
 ```
 
@@ -230,8 +230,8 @@ Kafka introduced "flexible" encoding (compact ULEB128 strings/arrays) starting a
 
 ### API Key Coverage
 
-- **Explicit builders (23 API keys):** Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups, SaslHandshake, ApiVersions, CreateTopics, DeleteTopics, DeleteRecords, InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit, DescribeConfigs, SaslAuthenticate
-- **Header-framing test (42 API keys):** All remaining API keys are framed correctly with an empty payload — useful for testing that your server returns a proper error response rather than crashing
+- **Explicit builders (25 API keys):** Produce, Fetch, ListOffsets, Metadata, OffsetCommit, OffsetFetch, FindCoordinator, JoinGroup, Heartbeat, LeaveGroup, SyncGroup, DescribeGroups, ListGroups, SaslHandshake, ApiVersions, CreateTopics, DeleteTopics, DeleteRecords, InitProducerId, AddPartitionsToTxn, AddOffsetsToTxn, EndTxn, TxnOffsetCommit, DescribeConfigs, SaslAuthenticate
+- **Header-framing test (39 API keys):** All remaining API keys are framed correctly with an empty payload — useful for testing that your server returns a proper error response rather than crashing
 
 ---
 

@@ -25,6 +25,10 @@ use kafka_protocol::messages::{
 use kafka_protocol::protocol::{Decodable, StrBytes};
 
 use crate::error::{KafkaProtocolError, Result};
+use crate::protocol::bounds_guard::{
+    validate_api_versions_shape, validate_create_topics_shape, validate_fetch_shape,
+    validate_list_offsets_shape, validate_metadata_shape, validate_produce_shape,
+};
 use crate::protocol::responses::{
     encode_create_topics_error_response, encode_create_topics_response,
     encode_fetch_error_response, encode_fetch_response, encode_list_offsets_error_response,
@@ -178,6 +182,22 @@ fn decode_exhaustive<T: Decodable>(version: i16, mut body: Bytes) -> Result<T> {
     Ok(value)
 }
 
+/// Runs `validate` (see [`crate::protocol::bounds_guard`]) before [`decode_exhaustive`].
+///
+/// `kafka_protocol` validates wire-declared array/string lengths as non-negative but never
+/// against the bytes actually remaining in the frame, so a tiny frame declaring a huge count
+/// drives an allocation attempt that aborts the whole process (`handle_alloc_error`, not a
+/// panic - uncatchable, and it kills every connection, not just the offending one). `validate`
+/// rejects that class of frame first, on a walk that never allocates a collection.
+fn decode_guarded<T: Decodable>(
+    version: i16,
+    body: Bytes,
+    validate: impl FnOnce(i16, &Bytes) -> Result<()>,
+) -> Result<T> {
+    validate(version, &body)?;
+    decode_exhaustive(version, body)
+}
+
 /// Turn an encode [`Result`] into a [`HandleOutcome`], closing the connection when encoding
 /// fails rather than propagating - there is no parseable response to send in that case.
 fn respond_or_close(result: Result<Bytes>, api_name: &str) -> HandleOutcome {
@@ -200,8 +220,13 @@ fn respond_or_close(result: Result<Bytes>, api_name: &str) -> HandleOutcome {
 /// desyncing the next correlation id it reads.
 fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
     // Above the encoder max there is no response parseable at the client's version, so close
-    // rather than decode (same policy the other APIs apply).
-    if api_version > supported_max_version(API_KEY_PRODUCE).unwrap_or(i16::MAX) {
+    // rather than decode (same policy the other APIs apply). Fail-closed on a missing row
+    // (i16::MIN, not i16::MAX): `handle_request` dispatches Produce on a hard-coded `api_key ==`
+    // check, not from this table, so if a future edit ever drops the Produce row to disable the
+    // API, a fail-open default here would leave Produce v0-2 acks=0 silently accepted on an API
+    // the operator believes is off - unwrap_or(i16::MAX) is not the sound default the sibling
+    // lookup at `unsupported_version_response` uses (`map_or(0, ...)`, i.e. fail-closed).
+    if api_version > supported_max_version(API_KEY_PRODUCE).unwrap_or(i16::MIN) {
         return HandleOutcome::Close;
     }
     // `kafka_protocol`'s ProduceRequest/ProduceResponse schemas only go back to v3, so v0-2
@@ -222,18 +247,14 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
             }),
         };
     }
-    match decode_exhaustive::<ProduceRequest>(api_version, body) {
+    match decode_guarded::<ProduceRequest>(api_version, body, validate_produce_shape) {
         // acks=0 is fire-and-forget: the client isn't reading a response, so
         // sending one desyncs the next correlation id it expects.
         Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
-        Ok(req) => {
-            if !is_supported_version(API_KEY_PRODUCE, api_version) {
-                return unsupported_version_response(API_KEY_PRODUCE, api_version, |v| {
-                    encode_produce_error_response(v, ERROR_UNSUPPORTED_VERSION)
-                });
-            }
-            respond_or_close(encode_produce_response(api_version, &req), "Produce")
-        }
+        // `api_version` is always in `[3, supported_max]` here: the `< 3` case returned above,
+        // and the `> max` case returned at the top of this function - so it is always within
+        // `SUPPORTED_RANGES`' Produce row and an `is_supported_version` re-check can never fail.
+        Ok(req) => respond_or_close(encode_produce_response(api_version, &req), "Produce"),
         Err(error) => {
             // `kafka_protocol` decodes the whole request in one shot; a failure anywhere gives
             // no partial-field access, so `acks` is unknowable here (unlike the pre-migration
@@ -242,7 +263,10 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
             // so every Produce decode failure now stays silent - a behavior change from the
             // hand-rolled decoder, which answered with INVALID_REQUEST when `acks` was known and
             // nonzero.
-            tracing::warn!(%error, "failed to decode Produce request (no response)");
+            // debug!, not warn!: the body is attacker-controlled, not operator-actionable, and
+            // a client looping malformed bodies on one connection (never disconnected - this
+            // arm returns NoResponse) has no rate limit here.
+            tracing::debug!(%error, "failed to decode Produce request (no response)");
             HandleOutcome::NoResponse
         }
     }
@@ -261,7 +285,7 @@ fn handle_other_request(
             API_KEY_FETCH,
             api_version,
             body,
-            decode_exhaustive::<FetchRequest>,
+            |v, b| decode_guarded::<FetchRequest>(v, b, validate_fetch_shape),
             encode_fetch_response,
             encode_fetch_error_response,
             "Fetch",
@@ -270,7 +294,7 @@ fn handle_other_request(
             API_KEY_LIST_OFFSETS,
             api_version,
             body,
-            decode_exhaustive::<ListOffsetsRequest>,
+            |v, b| decode_guarded::<ListOffsetsRequest>(v, b, validate_list_offsets_shape),
             encode_list_offsets_response,
             encode_list_offsets_error_response,
             "ListOffsets",
@@ -279,7 +303,7 @@ fn handle_other_request(
             API_KEY_CREATE_TOPICS,
             api_version,
             body,
-            decode_exhaustive::<CreateTopicsRequest>,
+            |v, b| decode_guarded::<CreateTopicsRequest>(v, b, validate_create_topics_shape),
             encode_create_topics_response,
             encode_create_topics_error_response,
             "CreateTopics",
@@ -298,13 +322,15 @@ fn handle_api_versions(api_version: i16, body: Bytes) -> HandleOutcome {
             "ApiVersions",
         );
     }
-    match decode_exhaustive::<ApiVersionsRequest>(api_version, body) {
+    match decode_guarded::<ApiVersionsRequest>(api_version, body, validate_api_versions_shape) {
         Ok(_) => respond_or_close(
             encode_api_versions_response(api_version, ERROR_NONE),
             "ApiVersions",
         ),
         Err(error) => {
-            tracing::warn!(%error, "failed to decode ApiVersions request");
+            // debug!, not warn!: attacker-controlled, not operator-actionable (see the same
+            // note on the Produce decode-failure arm above).
+            tracing::debug!(%error, "failed to decode ApiVersions request");
             respond_or_close(
                 encode_api_versions_response(api_version, ERROR_INVALID_REQUEST),
                 "ApiVersions",
@@ -333,7 +359,8 @@ fn handle_metadata(api_version: i16, body: Bytes, broker: &BrokerAdvertise) -> H
         Err(error) => {
             // Metadata has no top-level error field; a malformed body cannot carry
             // INVALID_REQUEST in a version-correct way for every client. Close.
-            tracing::warn!(
+            // debug!, not warn!: attacker-controlled, not operator-actionable.
+            tracing::debug!(
                 %error,
                 api_version,
                 "Failed to decode Metadata request; closing connection"
@@ -356,7 +383,8 @@ fn handle_versioned_request<T>(
         match decode(api_version, body) {
             Ok(req) => respond_or_close(encode_ok(api_version, &req), api_name),
             Err(error) => {
-                tracing::warn!(%error, "Failed to decode {api_name} request");
+                // debug!, not warn!: attacker-controlled, not operator-actionable.
+                tracing::debug!(%error, "Failed to decode {api_name} request");
                 respond_or_close(encode_err(api_version, ERROR_INVALID_REQUEST), api_name)
             }
         }
@@ -489,7 +517,7 @@ fn encode_metadata_response(
 /// empty list for this stub. A null per-topic `name` (v10+ allows topic-id-only lookups) has no
 /// name to echo, so it errors rather than silently dropping the topic from the response.
 fn decode_metadata_topics(api_version: i16, body: Bytes) -> Result<Vec<StrBytes>> {
-    let req = decode_exhaustive::<MetadataRequest>(api_version, body)?;
+    let req = decode_guarded::<MetadataRequest>(api_version, body, validate_metadata_shape)?;
     req.topics
         .unwrap_or_default()
         .into_iter()

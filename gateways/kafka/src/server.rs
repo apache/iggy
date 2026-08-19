@@ -29,6 +29,7 @@ use tokio::time::{timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::error::{KafkaProtocolError, Result};
 use crate::protocol::api::{BrokerAdvertise, DEFAULT_KAFKA_PORT, HandleOutcome, handle_request};
@@ -120,6 +121,43 @@ impl BrokerAdvertise {
     }
 }
 
+/// Binds the gateway's TCP listener with a deep accept backlog.
+///
+/// `tokio::net::TcpListener::bind` delegates to mio, which hardcodes `listen(fd, 128)`
+/// (`mio-*/src/net/tcp/listener.rs`) on every non-Horizon/Haiku target, independent of how high
+/// `max_connections` is configured. A burst larger than 128 simultaneous connects - a
+/// consumer-group rebalance, a deployment rollout, a load-balancer failover - overflows the
+/// kernel's accept queue; with the Linux default `net.ipv4.tcp_abort_on_overflow=0` the SYNs are
+/// silently dropped and clients retry on exponential SYN backoff (1s, 3s, 7s), which reads as a
+/// network fault rather than a server limit. Bind through `socket2` instead and request
+/// `SOMAXCONN` (4096 on Linux >= 5.4), matching `core/message_bus/src/socket_opts.rs`'s
+/// precedent for the identical problem.
+///
+/// Deliberately synchronous and callable from both `main` and the test harness
+/// (`tests/common/server.rs`) so the tuned bind path is what integration tests actually exercise,
+/// not a bare `TcpListener::bind`.
+///
+/// # Errors
+///
+/// Returns an error if `addr` does not parse as `host:port`, or if bind/listen/conversion to a
+/// Tokio listener fails.
+pub fn bind_listener(addr: &str) -> Result<TcpListener> {
+    let socket_addr: SocketAddr = addr.parse().map_err(|e| {
+        KafkaProtocolError::InvalidConfig(format!("invalid bind address '{addr}': {e}"))
+    })?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(socket_addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&socket_addr.into())?;
+    socket.listen(libc::SOMAXCONN)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    Ok(TcpListener::from_std(std_listener)?)
+}
+
 pub struct KafkaGateway {
     config: Arc<GatewayConfig>,
 }
@@ -205,7 +243,14 @@ impl KafkaGateway {
                                 if let Err(err) =
                                     handle_connection(stream, cfg, peer, broker, conn_cancel).await
                                 {
-                                    warn!(%peer, "connection closed with error: {err}");
+                                    // debug!, not warn!: every `KafkaProtocolError` that can
+                                    // reach here is either a malformed/oversized frame from the
+                                    // client (attacker-controlled, not operator-actionable) or a
+                                    // plain TCP reset/EOF - never an internal gateway fault. A
+                                    // flood of either at warn! would drown real signal in logs
+                                    // under adversarial load (same reasoning as the decode-
+                                    // failure downgrades in `protocol/api.rs`).
+                                    debug!(%peer, "connection closed with error: {err}");
                                 }
                             });
                         }
@@ -356,7 +401,15 @@ async fn dispatch_outcome(
             Ok(false)
         }
         HandleOutcome::Close => {
-            warn!(
+            // debug!, not warn!: this fires for every `Close` outcome regardless of cause -
+            // unsupported API key, out-of-range version, no encodable response shape at the
+            // requested version - all client/attacker-chosen, not operator-actionable, and a
+            // version-probing client (or a port scanner) can trigger this once per attempt. The
+            // few close reasons worth surfacing distinctly already have their own warn! closer
+            // to the decision (`unsupported_version_response`'s "above encoder max" and the
+            // Metadata version-firewall log in `protocol/api.rs`); this generic handler doesn't
+            // need to double-log every one of those on top of its own record.
+            debug!(
                 %peer,
                 api_key = req.request_api_key,
                 api_version = req.request_api_version,
@@ -480,13 +533,28 @@ pub async fn read_frame(
     Ok(data.freeze())
 }
 
-pub fn init_tracing() {
+/// Initializes the global tracing subscriber with a non-blocking stdout writer.
+///
+/// The default `tracing_subscriber::fmt()` writer is `io::Stdout`, a `LineWriter` behind a
+/// `ReentrantLock` - one global lock acquisition and one blocking `write(2)` per log line,
+/// serialized across every worker in the runtime. A client looping malformed request bodies on
+/// one connection that stays open (decode failures never disconnect) has no rate limit on how
+/// often that write happens; at scale it becomes the throughput ceiling for the whole gateway,
+/// including well-behaved connections. `tracing_appender::non_blocking` moves the write onto a
+/// dedicated thread behind a bounded queue (same pattern as `core/server_common/src/log/logger.rs`).
+///
+/// Returns the [`WorkerGuard`]; it must be held for the lifetime of `main` (dropping it stops the
+/// worker thread and any buffered-but-unflushed log lines are lost) - see `main.rs`.
+pub fn init_tracing() -> WorkerGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (non_blocking_stdout, guard) = tracing_appender::non_blocking(io::stdout());
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_writer(non_blocking_stdout)
         .try_init()
         .map_err(|e| error!("failed to initialize tracing: {e}"));
+    guard
 }
 
 #[cfg(test)]
@@ -804,7 +872,7 @@ mod tests {
 
     #[test]
     fn init_tracing_is_idempotent() {
-        init_tracing();
-        init_tracing();
+        let _first_guard = init_tracing();
+        let _second_guard = init_tracing();
     }
 }

@@ -6804,11 +6804,13 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "kafka-protocol",
+ "libc",
  "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
 ]
 

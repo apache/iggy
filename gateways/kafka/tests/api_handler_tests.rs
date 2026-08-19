@@ -410,6 +410,41 @@ fn fetch_stub_response_returns_retriable_not_leader() {
     }
 }
 
+/// Exercises the optional Fetch fields (`forgotten_topics`, `rack_id`) that
+/// `fetch_stub_response_returns_retriable_not_leader`'s fixture-derived bodies leave empty:
+/// v9 legacy encoding with a populated forgotten-topics list, and v12 flexible encoding adding a
+/// rack id (introduced at v11) on top of that. Both must decode and reach the same stub outcome
+/// as an empty-topics request.
+#[test]
+fn fetch_decodes_request_with_forgotten_topics_and_rack_id() {
+    for (version, rack_id) in [(9i16, None), (12i16, Some("rack-a"))] {
+        let body =
+            wire::build_fetch_request_with_sections(version, "orders", 2, Some("stale"), rack_id);
+        let resp = handle_request(API_KEY_FETCH, version, body, &default_broker())
+            .expect_response("test request has acks != 0 and expects a response");
+        let flexible = version >= 12;
+        let mut d = Decoder::new(resp);
+        let _throttle = d.read_i32().unwrap();
+        assert_eq!(d.read_i16().unwrap(), ERROR_NONE, "Fetch v{version}");
+        let _session = d.read_i32().unwrap();
+        if flexible {
+            let _topics = d.read_varint().unwrap();
+            let _topic = d.read_compact_nullable_string().unwrap();
+            let _parts = d.read_varint().unwrap();
+        } else {
+            let _topics = d.read_i32().unwrap();
+            let _topic = d.read_nullable_string().unwrap();
+            let _parts = d.read_i32().unwrap();
+        }
+        let _partition = d.read_i32().unwrap();
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_NOT_LEADER_OR_FOLLOWER,
+            "Fetch v{version} partition error"
+        );
+    }
+}
+
 #[test]
 fn list_offsets_stub_response_returns_retriable_not_leader() {
     for version in 1i16..=6 {
@@ -734,7 +769,11 @@ fn read_metadata_v1_topics(d: &mut Decoder, expected_count: i32) -> Vec<String> 
     assert_eq!(d.read_i32().unwrap(), expected_count);
     let mut names = Vec::with_capacity(usize::try_from(expected_count).unwrap_or(0));
     for _ in 0..expected_count {
-        d.read_i16().unwrap(); // topic_error
+        assert_eq!(
+            d.read_i16().unwrap(),
+            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            "stub has no topic catalog; unknown topic must surface error 3"
+        );
         names.push(d.read_nullable_string().unwrap().expect("topic name"));
         d.read_bool().unwrap(); // is_internal (v1+)
         assert_eq!(d.read_i32().unwrap(), 0, "empty partitions array");
@@ -750,37 +789,15 @@ fn metadata_v1_echoes_requested_topic_name_in_response() {
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
+    // `read_metadata_v1_topics` asserts the per-topic error code (unknown-topic-or-partition, the
+    // stub's only topic outcome) as it walks the response; the name check below is on top of that.
     let names = read_metadata_v1_topics(&mut d, 1);
-    assert_eq!(names, vec![topic.to_string()]);
-    assert_eq!(d.remaining(), 0);
-}
-
-#[test]
-fn metadata_v1_unknown_topic_returns_error_with_requested_name() {
-    let topic = "orders";
-    let request = build_metadata_legacy_request(&[topic]);
-    let body = handle_request(API_KEY_METADATA, 1, request, &default_broker())
-        .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-
-    let _brokers_count = d.read_i32().unwrap();
-    d.read_i32().unwrap();
-    d.read_nullable_string().unwrap();
-    d.read_i32().unwrap();
-    d.read_nullable_string().unwrap();
-    d.read_i32().unwrap();
-
-    assert_eq!(d.read_i32().unwrap(), 1);
     assert_eq!(
-        d.read_i16().unwrap(),
-        ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-        "unknown topic should surface error 3"
-    );
-    assert_eq!(
-        d.read_nullable_string().unwrap().as_deref(),
-        Some(topic),
+        names,
+        vec![topic.to_string()],
         "response must echo requested topic name, not a placeholder"
     );
+    assert_eq!(d.remaining(), 0);
 }
 
 // ── Metadata (spec + SCOPE.md coverage) ─────────────────────────────────────
@@ -942,40 +959,7 @@ fn metadata_v1_legacy_multiple_topics_echo_names() {
     }
 }
 
-fn skip_metadata_v9_prefix(d: &mut Decoder) {
-    let broker_count = usize::try_from(d.read_varint().unwrap())
-        .unwrap()
-        .saturating_sub(1);
-    for _ in 0..broker_count {
-        d.read_i32().unwrap();
-        d.read_compact_nullable_string().unwrap();
-        d.read_i32().unwrap();
-        d.read_compact_nullable_string().unwrap();
-        d.read_tagged_fields().unwrap();
-    }
-    d.read_compact_nullable_string().unwrap();
-    d.read_i32().unwrap();
-}
-
-#[test]
-fn metadata_v9_request_with_three_topics_yields_three_response_slots() {
-    let topics = ["a", "b", "c"];
-    let body = handle_request(
-        API_KEY_METADATA,
-        9,
-        build_metadata_flexible_request(&topics),
-        &default_broker(),
-    )
-    .expect_response("test request has acks != 0 and expects a response");
-    let mut d = Decoder::new(body);
-    d.read_i32().unwrap();
-    skip_metadata_v9_prefix(&mut d);
-    let topic_count = usize::try_from(d.read_varint().unwrap())
-        .unwrap()
-        .saturating_sub(1);
-    assert_eq!(
-        topic_count,
-        topics.len(),
-        "response topic count must mirror request topic count"
-    );
-}
+// `metadata_v9_flexible_echoes_each_requested_topic_name` above already sends a 3-topic v9
+// request through this exact decode path and asserts response topic_count == request topic
+// count, plus per-topic name/error-code/partition-count - a strict superset of what a
+// response-slot-count-only test here would add.

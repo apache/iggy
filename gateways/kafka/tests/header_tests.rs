@@ -114,26 +114,34 @@ const API_KEY_FLEXIBLE_FROM: &[(i16, i16)] = &[
     (80, 0),
 ];
 
+/// `request_header_version(api_key, version)` is exactly
+/// `ApiKey::try_from(api_key).map_or(1, |key| key.request_header_version(version))` - so for
+/// any `api_key` where `try_from` succeeds, this expands to `external.request_header_version
+/// (version) == external.request_header_version(version)`. That is true by construction, not by
+/// anything this test checks; it would pass unchanged if `header.rs` swapped `map_or(1, ...)`
+/// for `map_or(2, ...)`, or if `kafka_protocol` itself shipped a wrong threshold. There is no
+/// independent source of the right answer to compare against without hand-maintaining the same
+/// threshold table the migration to `kafka_protocol` deliberately eliminated (see
+/// `src/protocol/header.rs`'s module doc).
+///
+/// The one place this wrapper adds real (non-tautological) behavior is the `map_or` **fallback**
+/// - what happens when `try_from` fails. That's the only assertion worth writing here.
 #[test]
-fn request_header_version_matches_independent_kafka_protocol_crate() {
-    // API_KEY_FLEXIBLE_FROM is hand-transcribed from header.rs's threshold table, so comparing
-    // request_header_version only against that same mirror can't catch a value wrong in both
-    // places (the same transcription mistake copied twice). Cross-check against the third-party
-    // `kafka-protocol` crate's own per-key header-version logic instead, over every version that
-    // crate considers actually valid for the key - outside that range a version never appeared
-    // on the real wire, so there's no independently-meaningful answer to compare against.
-    for &(api_key, _) in API_KEY_FLEXIBLE_FROM {
-        let Ok(external) = ApiKey::try_from(api_key) else {
-            continue;
-        };
-        let range = external.valid_versions();
-        for version in range.min..=range.max {
-            assert_eq!(
-                request_header_version(api_key, version),
-                external.request_header_version(version),
-                "api_key={api_key} version={version}: gateway vs kafka-protocol header version"
-            );
-        }
+fn request_header_version_falls_back_to_v1_when_kafka_protocol_does_not_recognize_the_key() {
+    // Keys 4-7 (LeaderAndIsr/StopReplica/UpdateMetadata/ControlledShutdown) are the only ones in
+    // API_KEY_FLEXIBLE_FROM where `ApiKey::try_from` genuinely fails in kafka-protocol 0.17 -
+    // verified directly against the crate's `ApiKey` enum, not inferred from this table. Keys
+    // 17 and 47 (SaslHandshake, OffsetDelete) are recognized by the crate; they're marked
+    // `i16::MAX` here because the crate's own `request_header_version` never returns 2 for them,
+    // which `request_header_version_never_flexible_keys_stay_v1` already covers.
+    for key in [4, 5, 6, 7] {
+        assert!(
+            ApiKey::try_from(key).is_err(),
+            "api_key {key} must be one kafka_protocol::messages::ApiKey does not recognize, \
+             for this test to exercise the fallback"
+        );
+        assert_eq!(request_header_version(key, 0), 1, "api_key {key}");
+        assert_eq!(request_header_version(key, i16::MAX), 1, "api_key {key}");
     }
 }
 
@@ -165,25 +173,15 @@ fn request_header_version_hits_every_api_key_match_arm() {
     }
 }
 
+/// The ApiVersions-always-v0 special case is already independently covered by
+/// `response_header_version_apiversions_always_zero` below. Deleted from here: a loop that
+/// derived its own "expected" value by calling `request_header_version` (i.e. compared the
+/// wrapper against itself, not against the gateway's actual policy) - the same tautology as
+/// `request_header_version_falls_back_to_v1_when_kafka_protocol_does_not_recognize_the_key`
+/// above, and it would still pass if `response_header_version` and `request_header_version`
+/// both drifted together.
 #[test]
-fn response_header_version_hits_every_api_key_match_arm() {
-    for &(api_key, _) in API_KEY_FLEXIBLE_FROM {
-        if api_key == 18 {
-            assert_eq!(response_header_version(api_key, 0), 0);
-            assert_eq!(response_header_version(api_key, 99), 0);
-            continue;
-        }
-        let req_hdr_at_v0 = request_header_version(api_key, 0);
-        let expected_at_v0 = i16::from(req_hdr_at_v0 >= 2);
-        assert_eq!(response_header_version(api_key, 0), expected_at_v0);
-
-        let req_hdr_at_max = request_header_version(api_key, i16::MAX - 1);
-        let expected_at_max = i16::from(req_hdr_at_max >= 2);
-        assert_eq!(
-            response_header_version(api_key, i16::MAX - 1),
-            expected_at_max
-        );
-    }
+fn response_header_version_unknown_api_defaults_to_v0() {
     assert_eq!(response_header_version(999, 0), 0);
 }
 

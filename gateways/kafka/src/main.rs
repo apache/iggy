@@ -19,21 +19,22 @@ use std::fmt::Display;
 use std::str::FromStr;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{Semaphore, broadcast};
 
-use iggy_gateway_kafka::server::init_tracing;
+use iggy_gateway_kafka::server::{bind_listener, init_tracing};
 use iggy_gateway_kafka::{GatewayConfig, KafkaGateway};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
+    // Held for the lifetime of main: dropping it stops the non-blocking log writer's worker
+    // thread, and any buffered-but-unflushed log lines are lost. Binding to `_` instead of a
+    // named variable would drop it immediately.
+    let _tracing_guard = init_tracing();
 
     let config = load_config()?;
 
-    let listener = TcpListener::bind(&config.bind_addr)
-        .await
+    let listener = bind_listener(&config.bind_addr)
         .map_err(|e| format!("failed to bind {}: {e}", config.bind_addr))?;
     let server = KafkaGateway::new(config);
 
