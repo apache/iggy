@@ -50,7 +50,7 @@ use server::spawn_test_server;
 use tcp::{
     ByteRead, build_list_offsets_v0_request_with_topic_t, build_metadata_legacy_request,
     build_produce_flexible_body, build_produce_v2_body, build_produce_v3_body, build_request_frame,
-    parse_response_payload, read_byte_with_timeout, round_trip, scan_for_error_code,
+    parse_response_payload, read_byte_with_timeout, round_trip,
 };
 use wire::{
     OUT_OF_SCOPE_API_KEYS, build_api_versions_flexible_request, build_create_topics_empty_request,
@@ -698,27 +698,36 @@ async fn create_topics_v1_unsupported_e2e_closes_connection() {
 
 // ── Corrupt decode paths for remaining scoped APIs ──────────────────────────
 
+/// v1 (legacy, non-flexible) - the shape `api_handler_tests.rs:216`/`:234`'s structural decodes
+/// don't cover (those exercise Fetch v12 and `ListOffsets` v6, both flexible). A version that's
+/// `is_supported_version` (v1 is, `ListOffsets`' firewall floor) always decode-fails to
+/// `ERROR_INVALID_REQUEST` specifically - never `ERROR_UNSUPPORTED_VERSION`, which
+/// `handle_versioned_request` only reaches on the *unsupported-version* branch, not a decode
+/// failure - so this is a precise decode, not a scan for either.
 #[test]
 fn corrupt_list_offsets_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
     let resp = handle_request(API_KEY_LIST_OFFSETS, 1, body, &default_broker())
         .expect_response("test request has acks != 0 and expects a response");
-    assert!(!resp.is_empty());
-    assert!(
-        scan_for_error_code(&resp, ERROR_INVALID_REQUEST)
-            || scan_for_error_code(&resp, ERROR_UNSUPPORTED_VERSION),
-        "corrupt ListOffsets must surface protocol error"
-    );
+    let mut d = Decoder::new(resp);
+    // v1 has no throttle_time_ms (added v2+).
+    assert_eq!(d.read_i32().unwrap(), 1, "topics len");
+    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
+    assert_eq!(d.read_i32().unwrap(), 1, "partitions len");
+    assert_eq!(d.read_i32().unwrap(), 0, "partition_index");
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }
 
+/// v2 (legacy, non-flexible) - see `corrupt_list_offsets_body_returns_invalid_request_error`
+/// above for why this is a precise decode of `ERROR_INVALID_REQUEST`, not a scan for either code.
 #[test]
 fn corrupt_create_topics_body_returns_invalid_request_error() {
     let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
     let resp = handle_request(API_KEY_CREATE_TOPICS, 2, body, &default_broker())
         .expect_response("test request has acks != 0 and expects a response");
-    assert!(!resp.is_empty());
-    assert!(
-        scan_for_error_code(&resp, ERROR_INVALID_REQUEST)
-            || scan_for_error_code(&resp, ERROR_UNSUPPORTED_VERSION)
-    );
+    let mut d = Decoder::new(resp);
+    assert_eq!(d.read_i32().unwrap(), 0, "throttle");
+    assert_eq!(d.read_i32().unwrap(), 1, "topics len");
+    assert_eq!(d.read_nullable_string().unwrap(), Some(String::new()));
+    assert_eq!(d.read_i16().unwrap(), ERROR_INVALID_REQUEST);
 }

@@ -35,8 +35,10 @@ use tokio::time;
 
 use iggy_gateway_kafka::GatewayConfig;
 use iggy_gateway_kafka::protocol::api::{
-    API_KEY_API_VERSIONS, API_KEY_FETCH, API_KEY_METADATA, API_KEY_PRODUCE, ERROR_INVALID_REQUEST,
+    API_KEY_API_VERSIONS, API_KEY_FETCH, API_KEY_METADATA, API_KEY_PRODUCE, BrokerAdvertise,
+    ERROR_INVALID_REQUEST, handle_request,
 };
+use iggy_gateway_kafka::protocol::header::response_header_version;
 
 use codec::Decoder;
 use server::{spawn_test_server, spawn_test_server_with_config};
@@ -212,20 +214,56 @@ async fn e2e_client_disconnect_mid_frame_allows_new_connection() {
 
 #[tokio::test]
 async fn e2e_response_frames_have_positive_big_endian_length_prefix() {
-    // Reading the length prefix as big-endian and using it verbatim as `read_exact`'s byte count
-    // means a server that switched to little-endian could only ever hang here (the swapped value
-    // is still `> 0`, and the peer waits for a byte count that never arrives) - never fail. Route
-    // through `tcp::read_response_frame`, which bounds the whole read in a timeout and turns a
-    // dropped/malformed response into a bounded panic instead of an indefinite hang.
+    // Reads the raw 4-byte prefix directly (not via `tcp::read_response_frame`, which sizes its
+    // own `read_exact` off that same prefix - using it to size the read AND to prove it's
+    // correct would be circular: a wrong prefix can only make the read hang or fail, never
+    // produce a value to assert against). The independently-known expected length comes from
+    // calling `handle_request` in-process with the identical input - same production encoder,
+    // different code path from the TCP server under test - so a length-prefix endianness bug is
+    // caught by direct value comparison instead of by timeout side effect.
     let (addr, _shutdown) = spawn_test_server().await;
     let mut stream = TcpStream::connect(addr).await.expect("connect");
 
     let request = wire::build_api_versions_flexible_request("iggy-test", "0.1.0");
+    let body_len = handle_request(
+        API_KEY_API_VERSIONS,
+        3,
+        request.clone(),
+        &BrokerAdvertise::default(),
+    )
+    .expect_response("test request has acks != 0 and expects a response")
+    .len();
+    // The wire frame also carries the response header `handle_request`'s return value doesn't
+    // include: correlation_id (4 bytes) plus an empty tagged-fields byte at header v1+. Kept
+    // inline rather than importing `server.rs`'s private `response_header_size` - it's two lines.
+    let header_len = if response_header_version(API_KEY_API_VERSIONS, 3) >= 1 {
+        5
+    } else {
+        4
+    };
+    let expected_len = body_len + header_len;
+
     let frame = build_request_frame(API_KEY_API_VERSIONS, 3, 200, Some("len-test"), &request);
     stream.write_all(&frame).await.expect("write");
 
-    let body = tcp::read_response_frame(&mut stream, 8 * 1024 * 1024).await;
-    assert!(!body.is_empty());
+    let mut len_buf = [0u8; 4];
+    time::timeout(Duration::from_secs(5), stream.read_exact(&mut len_buf))
+        .await
+        .expect("length prefix within timeout")
+        .expect("length prefix");
+    assert_eq!(
+        len_buf,
+        i32::try_from(expected_len)
+            .expect("response fits i32")
+            .to_be_bytes(),
+        "length prefix must be the exact big-endian response length"
+    );
+
+    let mut body = vec![0u8; expected_len];
+    time::timeout(Duration::from_secs(5), stream.read_exact(&mut body))
+        .await
+        .expect("body within timeout")
+        .expect("body");
 }
 
 #[tokio::test]
@@ -578,7 +616,9 @@ async fn e2e_client_eof_after_valid_frame_closes_connection_cleanly() {
     stream.shutdown().await.expect("client shutdown");
     time::sleep(Duration::from_millis(100)).await;
 
-    let mut buf = [0u8; 1];
-    let n = stream.read(&mut buf).await.expect("read after shutdown");
-    assert_eq!(n, 0, "server should close after client EOF");
+    assert_eq!(
+        read_byte_with_timeout(&mut stream, Duration::from_secs(2)).await,
+        ByteRead::Closed,
+        "server should close after client EOF"
+    );
 }

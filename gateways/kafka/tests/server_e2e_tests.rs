@@ -35,6 +35,7 @@ use tokio::net::TcpStream;
 use iggy_gateway_kafka::protocol::api::{
     API_KEY_API_VERSIONS, API_KEY_CREATE_TOPICS, API_KEY_FETCH, API_KEY_LIST_OFFSETS,
     API_KEY_METADATA, API_KEY_PRODUCE, ERROR_NOT_LEADER_OR_FOLLOWER,
+    ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 
 use codec::Decoder;
@@ -261,56 +262,24 @@ async fn e2e_list_offsets_v0_closes_connection() {
 
 // ── Metadata topic name echo (must not hardcode a placeholder topic name) ──
 
-/// Reads just enough of a Metadata v1 response (`kafka_protocol`'s `Decodable` for response
-/// types needs the `client` feature this broker-only gateway deliberately excludes - see
-/// `Cargo.toml` - so this walks the wire layout by hand, same as `Decoder`'s other callers in
-/// this file) to recover the topic names: brokers array, `controller_id`, then per-topic
-/// `error_code`/`name`/`is_internal`/partitions.
-fn read_metadata_v1_topic_names(body: Bytes) -> Vec<Option<String>> {
-    let mut d = Decoder::new(body);
-    for _ in 0..d.read_i32().expect("broker count") {
-        d.read_i32().expect("node_id");
-        d.read_nullable_string().expect("host");
-        d.read_i32().expect("port");
-        d.read_nullable_string().expect("rack"); // v1+
-    }
-    d.read_i32().expect("controller_id"); // v1+
-
-    let mut names = Vec::new();
-    for _ in 0..d.read_i32().expect("topic count") {
-        d.read_i16().expect("topic error_code");
-        names.push(d.read_nullable_string().expect("topic name"));
-        d.read_bool().expect("is_internal"); // v1+
-        for _ in 0..d.read_i32().expect("partition count") {
-            d.read_i16().expect("partition error_code");
-            d.read_i32().expect("partition_index");
-            d.read_i32().expect("leader_id");
-            for _ in 0..d.read_i32().expect("replica_nodes count") {
-                d.read_i32().expect("replica node id");
-            }
-            for _ in 0..d.read_i32().expect("isr_nodes count") {
-                d.read_i32().expect("isr node id");
-            }
-        }
-    }
-    names
-}
-
 #[tokio::test]
 async fn e2e_metadata_v1_response_contains_requested_topic_name() {
-    // Structural decode (`read_metadata_v1_topic_names`), not a byte-substring scan: a substring
-    // match can't distinguish "topic name in the `name` field" from "topic name anywhere in the
-    // response" (e.g. leaked into an unrelated field, or byte-coincidentally matching padding),
-    // and can't assert the *absence* of a wrong name without that same false-positive risk.
+    // Structural decode (`Decoder::read_metadata_v1_topics`, shared with `api_handler_tests.rs`
+    // so the in-process and e2e layers can't silently drift apart), not a byte-substring scan: a
+    // substring match can't distinguish "topic name in the `name` field" from "topic name
+    // anywhere in the response" (e.g. leaked into an unrelated field, or byte-coincidentally
+    // matching padding), and can't assert the *absence* of a wrong name without that same
+    // false-positive risk.
     let (addr, _shutdown) = spawn_test_server().await;
     let topic = "orders";
     let request_body = build_metadata_legacy_request(&[topic]);
     let (corr, body) = round_trip(addr, API_KEY_METADATA, 1, 9, &request_body).await;
     assert_eq!(corr, 9);
 
+    let mut d = Decoder::new(body);
     assert_eq!(
-        read_metadata_v1_topic_names(body),
-        vec![Some(topic.to_string())],
+        d.read_metadata_v1_topics(1, ERROR_UNKNOWN_TOPIC_OR_PARTITION),
+        vec![topic.to_string()],
         "metadata response must echo exactly the requested topic name, not a placeholder"
     );
 }

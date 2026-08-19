@@ -570,6 +570,16 @@ mod tests {
         (client, server)
     }
 
+    /// `listener_robustness_tests.rs::e2e_frame_exceeding_max_frame_size_closes_connection`
+    /// exercises the oversized-frame-rejection *mechanism* with a small custom `max_frame_size`
+    /// (sending an 8 MiB+ frame just to hit the real default would be slow for no extra
+    /// coverage) - this pins the default's *value* independently, so a change to the default
+    /// cap doesn't slip through untested.
+    #[test]
+    fn default_max_frame_size_is_eight_mebibytes() {
+        assert_eq!(GatewayConfig::default().max_frame_size, 8 * 1024 * 1024);
+    }
+
     #[test]
     fn transient_accept_error_classification_covers_all_branches() {
         for kind in [

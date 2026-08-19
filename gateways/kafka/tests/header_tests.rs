@@ -29,8 +29,10 @@ use iggy_gateway_kafka::protocol::api::{
 };
 use iggy_gateway_kafka::protocol::header::{request_header_version, response_header_version};
 
-/// Flexible-encoding threshold per API key (mirrors `protocol/header.rs`; cross-checked against
-/// the independent `kafka-protocol` crate below rather than trusted on its own).
+/// Flexible-encoding threshold per API key, hand-transcribed from the Kafka protocol spec and
+/// cross-checked against the independent `kafka-protocol` crate below rather than trusted on its
+/// own. There is no table in `protocol/header.rs` to mirror - that module is two
+/// `ApiKey::try_from(...).map_or(...)` wrappers, not a lookup table (see its own module doc).
 ///
 /// Keys 4-7 (LeaderAndIsr/StopReplica/UpdateMetadata/ControlledShutdown) are inter-broker-only
 /// APIs `kafka_protocol` 0.17 does not implement (`ApiKey::try_from` fails for them), so this

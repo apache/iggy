@@ -17,6 +17,8 @@
 
 #[path = "common/codec.rs"]
 mod codec;
+#[path = "common/wire.rs"]
+mod wire;
 
 use bytes::Bytes;
 
@@ -25,6 +27,41 @@ use iggy_gateway_kafka::protocol::api::{
 };
 
 use codec::Encoder;
+use wire::build_api_versions_flexible_request;
+
+#[test]
+fn golden_apiversions_v3_flexible_response_fixture() {
+    // Field-by-field structural tests (`version_firewall_tests.rs`'s `apiversions_advertises_
+    // exact_supported_ranges_v3_flexible`) check values against `SCOPED_API_KEYS`, but only this
+    // exact-byte pin catches a wrong tagged-fields byte, wrong varint encoding, or misordered
+    // field - the class of bug a value-only decode reads straight past.
+    let broker = BrokerAdvertise::default();
+    let request = build_api_versions_flexible_request("iggy-test", "0.1.0");
+    let actual = handle_request(API_KEY_API_VERSIONS, 3, request, &broker)
+        .expect_response("test request has acks != 0 and expects a response");
+
+    // error_code=0, api_count=6 (compact array: N+1=7)
+    // key 0  (Produce)      min=0  max=9  (advertised)
+    // key 1  (Fetch)        min=4  max=12
+    // key 2  (ListOffsets)  min=1  max=6
+    // key 3  (Metadata)     min=0  max=9
+    // key 18 (ApiVersions)  min=0  max=3
+    // key 19 (CreateTopics) min=2  max=5
+    // each entry followed by an empty tagged-fields byte; throttle_ms=0; top-level tagged fields
+    let expected: [u8; 50] = [
+        0x00, 0x00, // error_code
+        0x07, // compact array count (6+1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, // key 0:  Produce      0-9 (advertised)
+        0x00, 0x01, 0x00, 0x04, 0x00, 0x0C, 0x00, // key 1:  Fetch        4-12
+        0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x00, // key 2:  ListOffsets  1-6
+        0x00, 0x03, 0x00, 0x00, 0x00, 0x09, 0x00, // key 3:  Metadata     0-9
+        0x00, 0x12, 0x00, 0x00, 0x00, 0x03, 0x00, // key 18: ApiVersions  0-3
+        0x00, 0x13, 0x00, 0x02, 0x00, 0x05, 0x00, // key 19: CreateTopics 2-5
+        0x00, 0x00, 0x00, 0x00, // throttle_ms
+        0x00, // top-level tagged fields
+    ];
+    assert_eq!(actual.as_ref(), &expected);
+}
 
 #[test]
 fn golden_apiversions_v1_response_fixture() {

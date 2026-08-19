@@ -45,16 +45,6 @@ pub const OUT_OF_SCOPE_API_KEYS: &[(i16, &str)] = &[
     (20, "DeleteTopics"),
 ];
 
-/// Flexible-encoding boundary per SCOPE.md valid-versions table.
-pub const FLEXIBLE_FROM_VERSION: &[(i16, i16)] = &[
-    (0, 9),  // Produce
-    (1, 12), // Fetch
-    (2, 6),  // ListOffsets
-    (3, 9),  // Metadata
-    (18, 3), // ApiVersions
-    (19, 5), // CreateTopics
-];
-
 /// Append Metadata request fields that follow the topics array for `version`.
 fn write_metadata_request_trailer(enc: &mut Encoder, version: i16) {
     if version >= 4 {
@@ -82,7 +72,7 @@ pub fn build_metadata_flexible_request(topic_names: &[&str]) -> Bytes {
 }
 
 /// Metadata flexible request for a specific version (v9+).
-pub fn build_metadata_flexible_request_for_version(version: i16, topic_names: &[&str]) -> Bytes {
+fn build_metadata_flexible_request_for_version(version: i16, topic_names: &[&str]) -> Bytes {
     let mut enc = Encoder::with_capacity(96);
     enc.write_varint((topic_names.len() + 1) as u64);
     for name in topic_names {
@@ -354,6 +344,101 @@ pub fn build_fetch_request_with_sections(
         }
     }
 
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
+/// `ListOffsets` request covering legacy v0 `max_num_offsets` and newer leader-epoch branches.
+pub fn build_list_offsets_branch_request(version: i16, topic: &str, partition: i32) -> Bytes {
+    let flexible = version >= 6;
+    let mut enc = Encoder::with_capacity(128);
+    enc.write_i32(-1); // replica_id
+    if version >= 2 {
+        enc.write_i8(1); // isolation_level
+    }
+
+    if flexible {
+        enc.write_varint(2); // one topic
+        enc.write_compact_nullable_string(Some(topic));
+        enc.write_varint(2); // one partition
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some(topic)).expect("topic fits");
+        enc.write_i32(1);
+    }
+
+    enc.write_i32(partition);
+    if version >= 4 {
+        enc.write_i32(-1); // current_leader_epoch
+    }
+    enc.write_i64(-2); // earliest
+    if version == 0 {
+        enc.write_i32(1); // max_num_offsets
+    }
+    if flexible {
+        enc.write_empty_tagged_fields();
+        enc.write_empty_tagged_fields();
+        enc.write_empty_tagged_fields();
+    }
+
+    enc.freeze()
+}
+
+/// `CreateTopics` request with one topic, one assignment, and one config.
+pub fn build_create_topics_request_with_sections(version: i16, topic: &str) -> Bytes {
+    let flexible = version >= 5;
+    let mut enc = Encoder::with_capacity(256);
+
+    if flexible {
+        enc.write_varint(2); // one topic
+        enc.write_compact_nullable_string(Some(topic));
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some(topic)).expect("topic fits");
+    }
+    enc.write_i32(3); // num_partitions
+    enc.write_i16(1); // replication_factor
+
+    if flexible {
+        enc.write_varint(2); // one assignment
+    } else {
+        enc.write_i32(1);
+    }
+    enc.write_i32(0); // partition_index
+    if flexible {
+        enc.write_varint(2); // one replica
+    } else {
+        enc.write_i32(1);
+    }
+    enc.write_i32(1); // broker_id
+    if flexible {
+        enc.write_empty_tagged_fields();
+    }
+
+    if flexible {
+        enc.write_varint(2); // one config
+        enc.write_compact_nullable_string(Some("cleanup.policy"));
+        enc.write_compact_nullable_string(Some("delete"));
+        enc.write_empty_tagged_fields();
+    } else {
+        enc.write_i32(1);
+        enc.write_nullable_string(Some("cleanup.policy"))
+            .expect("config key fits");
+        enc.write_nullable_string(Some("delete"))
+            .expect("config value fits");
+    }
+
+    if flexible {
+        enc.write_empty_tagged_fields(); // topic tagged fields
+    }
+
+    enc.write_i32(5_000); // timeout_ms
+    if version >= 1 {
+        enc.write_bool(true); // validate_only
+    }
     if flexible {
         enc.write_empty_tagged_fields();
     }

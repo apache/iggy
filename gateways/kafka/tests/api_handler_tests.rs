@@ -476,6 +476,33 @@ fn list_offsets_stub_response_returns_retriable_not_leader() {
     }
 }
 
+/// `list_offsets_stub_response_returns_retriable_not_leader` above is fixture-driven; this
+/// exercises `encode_list_offsets_response`'s per-partition echo loop with a hand-built request
+/// carrying a real (non-empty) topic/partition, independent of any `.bin` fixture.
+#[test]
+fn list_offsets_decodes_request_with_real_topic_and_partition() {
+    let body = wire::build_list_offsets_branch_request(6, "orders", 2);
+    let resp = handle_request(API_KEY_LIST_OFFSETS, 6, body, &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(resp);
+    let _throttle = d.read_i32().unwrap();
+    let topics_plus_one = d.read_varint().unwrap();
+    assert_eq!(topics_plus_one, 2, "one topic"); // N+1
+    assert_eq!(
+        d.read_compact_nullable_string().unwrap(),
+        Some("orders".to_string()),
+        "topic name must echo the request"
+    );
+    let parts_plus_one = d.read_varint().unwrap();
+    assert_eq!(parts_plus_one, 2, "one partition"); // N+1
+    assert_eq!(
+        d.read_i32().unwrap(),
+        2,
+        "partition_index must echo the requested partition"
+    );
+    assert_eq!(d.read_i16().unwrap(), ERROR_NOT_LEADER_OR_FOLLOWER);
+}
+
 // ── Metadata regression - all supported versions, broker advertise, topic counts ──
 
 /// Topic name assigned to slot `i` by [`metadata_request_legacy`] / [`metadata_request_flexible`].
@@ -727,6 +754,26 @@ fn create_topics_stub_response_returns_not_controller() {
     }
 }
 
+/// `create_topics_stub_response_returns_not_controller` above is fixture-driven; this exercises
+/// `encode_create_topics_response`'s per-topic echo with a hand-built request carrying a real
+/// topic, replica assignment, and config entry, independent of any `.bin` fixture.
+#[test]
+fn create_topics_decodes_request_with_real_topic_and_assignment() {
+    let body = wire::build_create_topics_request_with_sections(5, "orders");
+    let resp = handle_request(API_KEY_CREATE_TOPICS, 5, body, &default_broker())
+        .expect_response("test request has acks != 0 and expects a response");
+    let mut d = Decoder::new(resp);
+    let _throttle = d.read_i32().unwrap();
+    let topics_plus_one = d.read_varint().unwrap();
+    assert_eq!(topics_plus_one, 2, "one topic"); // N+1
+    assert_eq!(
+        d.read_compact_nullable_string().unwrap(),
+        Some("orders".to_string()),
+        "topic name must echo the request"
+    );
+    assert_eq!(d.read_i16().unwrap(), ERROR_NOT_CONTROLLER);
+}
+
 // ── Produce acks=0 (broker must stay silent even on a malformed body) ──────
 
 #[test]
@@ -758,29 +805,6 @@ fn produce_acks_zero_stays_silent_on_advertised_but_unsupported_version() {
 
 // ── Metadata topic name echo (must not hardcode a placeholder topic name) ──
 
-fn read_metadata_v1_topics(d: &mut Decoder, expected_count: i32) -> Vec<String> {
-    let _brokers_count = d.read_i32().unwrap();
-    d.read_i32().unwrap(); // node_id
-    d.read_nullable_string().unwrap(); // host
-    d.read_i32().unwrap(); // port
-    d.read_nullable_string().unwrap(); // rack (v1+)
-    d.read_i32().unwrap(); // controller_id (v1+)
-
-    assert_eq!(d.read_i32().unwrap(), expected_count);
-    let mut names = Vec::with_capacity(usize::try_from(expected_count).unwrap_or(0));
-    for _ in 0..expected_count {
-        assert_eq!(
-            d.read_i16().unwrap(),
-            ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-            "stub has no topic catalog; unknown topic must surface error 3"
-        );
-        names.push(d.read_nullable_string().unwrap().expect("topic name"));
-        d.read_bool().unwrap(); // is_internal (v1+)
-        assert_eq!(d.read_i32().unwrap(), 0, "empty partitions array");
-    }
-    names
-}
-
 #[test]
 fn metadata_v1_echoes_requested_topic_name_in_response() {
     let topic = "orders";
@@ -789,9 +813,9 @@ fn metadata_v1_echoes_requested_topic_name_in_response() {
         .expect_response("test request has acks != 0 and expects a response");
     let mut d = Decoder::new(body);
 
-    // `read_metadata_v1_topics` asserts the per-topic error code (unknown-topic-or-partition, the
-    // stub's only topic outcome) as it walks the response; the name check below is on top of that.
-    let names = read_metadata_v1_topics(&mut d, 1);
+    // `Decoder::read_metadata_v1_topics` (shared with `server_e2e_tests.rs`) asserts the
+    // per-topic error code as it walks the response; the name check below is on top of that.
+    let names = d.read_metadata_v1_topics(1, ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     assert_eq!(
         names,
         vec![topic.to_string()],

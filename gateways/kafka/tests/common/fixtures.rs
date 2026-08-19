@@ -83,7 +83,7 @@ pub fn load_fixture_body_or_skip(api_key: i16, api_name: &str, version: i16) -> 
 }
 
 /// Strip the 4-byte length prefix and Kafka request header from a framed message.
-pub fn extract_body_from_framed_message(api_key: i16, api_version: i16, data: &[u8]) -> Bytes {
+fn extract_body_from_framed_message(api_key: i16, api_version: i16, data: &[u8]) -> Bytes {
     let mut frame = Bytes::copy_from_slice(&data[4..]);
     let hdr_ver = request_header_version(api_key, api_version);
     RequestHeader::decode(&mut frame, hdr_ver).expect("fixture request header must decode");

@@ -146,6 +146,40 @@ impl Decoder {
         }
         Ok(())
     }
+
+    /// Decode a Metadata v1 (legacy, non-flexible) response's broker/controller prefix followed
+    /// by `expected_count` topics, asserting each topic's error code against `expected_error`
+    /// and an empty partitions array, and returning the echoed topic names in order.
+    ///
+    /// Shared by `api_handler_tests.rs` (in-process) and `server_e2e_tests.rs` (TCP e2e) so the
+    /// two layers decode Metadata v1 identically instead of maintaining separate hand-rolled
+    /// copies that could silently drift apart.
+    pub fn read_metadata_v1_topics(
+        &mut self,
+        expected_count: i32,
+        expected_error: i16,
+    ) -> Vec<String> {
+        let _brokers_count = self.read_i32().unwrap();
+        self.read_i32().unwrap(); // node_id
+        self.read_nullable_string().unwrap(); // host
+        self.read_i32().unwrap(); // port
+        self.read_nullable_string().unwrap(); // rack (v1+)
+        self.read_i32().unwrap(); // controller_id (v1+)
+
+        assert_eq!(self.read_i32().unwrap(), expected_count);
+        let mut names = Vec::with_capacity(usize::try_from(expected_count).unwrap_or(0));
+        for _ in 0..expected_count {
+            assert_eq!(
+                self.read_i16().unwrap(),
+                expected_error,
+                "unexpected topic error code"
+            );
+            names.push(self.read_nullable_string().unwrap().expect("topic name"));
+            self.read_bool().unwrap(); // is_internal (v1+)
+            assert_eq!(self.read_i32().unwrap(), 0, "empty partitions array");
+        }
+        names
+    }
 }
 
 pub struct Encoder {

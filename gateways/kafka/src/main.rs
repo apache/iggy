@@ -54,10 +54,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The complete set of `IGGY_KAFKA_*` vars `load_config` reads. `IGGY_KAFKA_` is a
+/// `DELEGATED_ENV_VAR_PREFIXES` entry in `core/configs` (see that file's comment), which trades
+/// away the central provider's typo-detection for this whole namespace - a misspelled key here
+/// would otherwise silently no-op instead of surfacing anywhere. `reject_unknown_kafka_env_vars`
+/// is this crate's own replacement for that lost check.
+const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
+    "IGGY_KAFKA_BIND_ADDR",
+    "IGGY_KAFKA_ADVERTISED_HOST",
+    "IGGY_KAFKA_ADVERTISED_PORT",
+    "IGGY_KAFKA_MAX_CONNECTIONS",
+    "IGGY_KAFKA_MAX_FRAME_SIZE",
+    "IGGY_KAFKA_IDLE_TIMEOUT_SECS",
+    "IGGY_KAFKA_READ_TIMEOUT_SECS",
+    "IGGY_KAFKA_WRITE_TIMEOUT_SECS",
+    "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
+];
+
+/// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] - a typo (e.g.
+/// `IGGY_KAFKA_BIN_ADDR`) would otherwise be silently ignored: `core/configs`' central provider
+/// skips the whole `IGGY_KAFKA_` prefix, and this crate's own `env_var()` only ever looks up
+/// exact known names, so nothing reads the misspelled var and nothing warns either.
+fn reject_unknown_kafka_env_vars() -> Result<(), String> {
+    for (key, _) in std::env::vars() {
+        if key.starts_with("IGGY_KAFKA_") && !KNOWN_KAFKA_ENV_VARS.contains(&key.as_str()) {
+            return Err(format!(
+                "unknown Kafka gateway env var '{key}' (not in the recognized IGGY_KAFKA_* set - \
+                 check for a typo; it would otherwise be silently ignored)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build [`GatewayConfig`] from `IGGY_KAFKA_*` env vars, rejecting values that would silently
 /// break the listener (a zero connection cap serves nothing, a zero timeout drops every
 /// connection, a connection cap above `Semaphore::MAX_PERMITS` panics at startup).
 fn load_config() -> Result<GatewayConfig, String> {
+    reject_unknown_kafka_env_vars()?;
     let mut config = GatewayConfig::default();
 
     if let Some(bind_addr) = env_var("IGGY_KAFKA_BIND_ADDR") {
@@ -152,7 +186,40 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_positive;
+    use super::{parse_positive, reject_unknown_kafka_env_vars};
+
+    /// Sequential (not two separate `#[test]` fns) so the two env-var mutations can't race
+    /// against each other under the test harness's default parallel execution - env vars are
+    /// process-global state.
+    ///
+    /// # Safety
+    /// Single-threaded within this function; no other test in this crate touches `IGGY_KAFKA_*`.
+    #[test]
+    fn reject_unknown_kafka_env_vars_flags_typo_but_accepts_known_keys() {
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_BIN_ADDR", "127.0.0.1:9093"); // typo: missing D
+        }
+        let typo_result = reject_unknown_kafka_env_vars();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_BIN_ADDR");
+        }
+        assert!(
+            typo_result.is_err(),
+            "typo'd IGGY_KAFKA_ var must be rejected, not silently ignored"
+        );
+
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_BIND_ADDR", "127.0.0.1:9093");
+        }
+        let known_result = reject_unknown_kafka_env_vars();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_BIND_ADDR");
+        }
+        assert!(
+            known_result.is_ok(),
+            "known IGGY_KAFKA_ var must be accepted"
+        );
+    }
 
     #[test]
     fn parse_positive_rejects_zero() {
