@@ -26,6 +26,10 @@ pub enum FatalReason {
     /// back. The durable log is intact up to the previous op, so recovery re-derives
     /// the frontier and restarting is the repair.
     UnreconcilableLogFrontier = 2,
+    /// The superblock stayed unwritable past the configured fail-stop window.
+    /// The replica was already fenced quorum-invisible, so exiting hands the
+    /// wedge to a supervisor instead of a log reader.
+    SuperblockWedged = 3,
 }
 
 impl FatalReason {
