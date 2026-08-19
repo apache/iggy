@@ -1822,7 +1822,7 @@ where
     /// entry are swept.
     ///
     /// A scan against a segment set this partition already scanned short-
-    /// circuits through [`ReuseScanMemo`]: rotating to another peer would
+    /// circuits through `ReuseScanMemo`: rotating to another peer would
     /// otherwise re-read and re-walk every staged file, up to 2 GiB each,
     /// sequentially, on the pump.
     pub async fn reuse_staged_segments(
@@ -2885,7 +2885,7 @@ async fn hash_segment_range(
 }
 
 /// Read the first `entry.len` bytes of a served segment file and re-verify them
-/// against the manifest entry, chunked through [`hash_segment_range`] with one
+/// against the manifest entry, chunked through `hash_segment_range` with one
 /// reactor yield per chunk.
 ///
 /// The serving side runs this on the pump to answer a single chunk request, so

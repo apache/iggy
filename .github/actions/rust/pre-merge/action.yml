@@ -180,6 +180,8 @@ runs:
 
     - name: Doc test
       if: inputs.task == 'doctest'
+      env:
+        RUSTDOCFLAGS: -D warnings
       run: |
         cargo test --locked --doc
         cargo doc --no-deps --all-features --quiet

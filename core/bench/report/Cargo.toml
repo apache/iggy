@@ -37,3 +37,6 @@ sysinfo = { workspace = true }
 terminal_size = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[lints]
+workspace = true
