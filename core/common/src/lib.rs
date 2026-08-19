@@ -131,6 +131,7 @@ pub use utils::expiry::IggyExpiry;
 pub use utils::hash::*;
 pub use utils::net::validate_api_url;
 pub use utils::net::validate_server_address;
+pub use utils::non_zero_duration::{NonZeroDurationError, NonZeroIggyDuration};
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::random_id;
 pub use utils::serde_secret;
