@@ -29,7 +29,7 @@ use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     api::ConnectorStatus,
     sink::ConsumeCallback,
-    source::{HandleCallback, SendCallback},
+    source::{BatchResultCallback, HandleCallback, SendCallback},
     transforms::Transform,
 };
 use mimalloc::MiMalloc;
@@ -80,7 +80,8 @@ pub(crate) struct SourceApi {
         state_len: usize,
         log_callback: iggy_connector_sdk::LogCallback,
     ) -> i32,
-    iggy_source_handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
+    iggy_source_handle_v2: extern "C" fn(id: u32, callback: SendCallback) -> i32,
+    iggy_source_batch_result: extern "C" fn(plugin_id: u32, batch_id: u64, result: u8) -> i32,
     iggy_source_close: extern "C" fn(id: u32) -> i32,
     iggy_source_version: extern "C" fn() -> *const std::ffi::c_char,
 }
@@ -185,12 +186,14 @@ async fn main() -> Result<(), RuntimeError> {
     let mut source_containers_by_key: HashMap<String, Arc<Container<SourceApi>>> = HashMap::new();
     for (_path, source) in sources {
         let container = Arc::new(source.container);
-        let callback = container.iggy_source_handle;
+        let handle_callback = container.iggy_source_handle_v2;
+        let batch_result_callback = container.iggy_source_batch_result;
         for plugin in &source.plugins {
             source_containers_by_key.insert(plugin.key.clone(), container.clone());
         }
         source_wrappers.push(SourceConnectorWrapper {
-            callback,
+            handle_callback,
+            batch_result_callback,
             plugins: source.plugins,
         });
     }
@@ -460,7 +463,8 @@ struct SourceConnectorProducer {
 }
 
 struct SourceConnectorWrapper {
-    callback: HandleCallback,
+    handle_callback: HandleCallback,
+    batch_result_callback: BatchResultCallback,
     plugins: Vec<SourceConnectorPlugin>,
 }
 

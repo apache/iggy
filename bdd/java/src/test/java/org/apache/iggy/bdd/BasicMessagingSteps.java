@@ -98,6 +98,56 @@ public class BasicMessagingSteps {
         assertEquals(streamName, stream.get().name(), "Stream should have expected name");
     }
 
+    @Given("a stream with name {string} exists")
+    public void streamExists(String streamName) {
+        createStream(streamName);
+    }
+
+    @When("I get the stream by its numeric ID")
+    public void getStreamByNumericId() {
+        Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
+        context.lastStreamName = stream.map(StreamDetails::name).orElse(null);
+    }
+
+    @Then("the returned stream should have name {string}")
+    public void returnedStreamHasName(String streamName) {
+        assertEquals(streamName, context.lastStreamName, "Stream should have expected name");
+    }
+
+    @When("I list all streams")
+    public void listAllStreams() {
+        List<StreamBase> streams = getClient().streams().getStreams();
+        context.lastStreamWasFound =
+                streams.stream().anyMatch(stream -> stream.id().equals(context.lastStreamId));
+    }
+
+    @Then("the stream list should contain the created stream")
+    public void streamListContainsCreatedStream() {
+        assertTrue(context.lastStreamWasFound, "Stream list should contain the created stream");
+    }
+
+    @When("I update the stream name to {string}")
+    public void updateStreamName(String streamName) {
+        getClient().streams().updateStream(context.lastStreamId, streamName);
+    }
+
+    @Then("getting the stream by its numeric ID should return name {string}")
+    public void getStreamReturnsName(String streamName) {
+        getStreamByNumericId();
+        returnedStreamHasName(streamName);
+    }
+
+    @When("I delete the stream by its numeric ID")
+    public void deleteStreamByNumericId() {
+        getClient().streams().deleteStream(context.lastStreamId);
+    }
+
+    @Then("getting the stream by its numeric ID should return no stream")
+    public void getStreamReturnsNoStream() {
+        Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
+        assertTrue(stream.isEmpty(), "Deleted stream should not be returned");
+    }
+
     @When("I create a topic with name {string} in stream {int} with {int} partitions")
     public void createTopic(String topicName, int streamId, int partitions) {
         TopicDetails topic = getClient()
