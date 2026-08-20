@@ -1,0 +1,113 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Cloud Run runner pilot
+
+on:
+  push:
+    branches:
+      - ci/self-hosted-gcp-runners
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-run-runner-pilot
+  cancel-in-progress: false
+
+jobs:
+  cloud-run:
+    name: Cloud Run / Rust format and dependency fetch
+    if: >-
+      vars.IGGY_CLOUD_RUNNER_PILOT_ENABLED == 'true' &&
+      github.repository == 'apache/iggy' &&
+      github.ref == 'refs/heads/ci/self-hosted-gcp-runners'
+    runs-on:
+      group: iggy-cloud-run-pilot
+      labels: iggy-cloud-run-x64
+    timeout-minutes: 20
+    steps:
+      - name: Verify trusted invocation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "apache/iggy"
+          test "$GITHUB_REF" = "refs/heads/ci/self-hosted-gcp-runners"
+          test -z "${RUNNER_REGISTRATION_TOKEN:-}"
+          test -z "${RUNNER_JIT_CONFIG_BROKER_URL:-}"
+
+      - name: Record runner capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          rustc --version
+          cargo --version
+          rustfmt --version
+          df -h "$GITHUB_WORKSPACE"
+          free -h
+
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify checkout revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Verify image toolchain matches repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" = "1.97.1"
+
+      - name: Check Rust formatting
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Fetch locked Rust dependencies
+        shell: bash
+        run: cargo fetch --locked
+
+  github-hosted-baseline:
+    name: GitHub-hosted / Rust format and dependency fetch
+    if: >-
+      vars.IGGY_CLOUD_RUNNER_PILOT_ENABLED == 'true' &&
+      github.repository == 'apache/iggy' &&
+      github.ref == 'refs/heads/ci/self-hosted-gcp-runners'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify checkout revision
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Check Rust formatting
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Fetch locked Rust dependencies
+        shell: bash
+        run: cargo fetch --locked
