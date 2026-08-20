@@ -39,6 +39,7 @@ use crate::consumer::{
 use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
 use crate::options::OptionSpec as PyOptionSpec;
+use crate::partitioning::PyPartitioning;
 use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
@@ -1000,13 +1001,18 @@ impl IggyClient {
     /// confirmations, or a PyRuntimeError on failure. The confirmation list is
     /// empty when the server reports no offsets, and the legacy server never
     /// reports any.
+    ///
+    /// `partitioning` is required. Pass `Partitioning.balanced()`,
+    /// `Partitioning.partition_id(id)`, or `Partitioning.messages_key(key)`.
+    /// An integer remains supported as shorthand for `partition_id`.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
         py: Python<'a>,
         stream: PyIdentifier,
         topic: PyIdentifier,
-        partitioning: u32,
+        #[gen_stub(override_type(type_repr = "Partitioning | builtins.int"))]
+        partitioning: PyPartitioning,
         #[gen_stub(override_type(type_repr = "list[SendMessage]"))] messages: &Bound<'_, PyList>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let messages: Vec<SendMessage> = messages
@@ -1023,7 +1029,7 @@ impl IggyClient {
 
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
-        let partitioning = Partitioning::partition_id(partitioning);
+        let partitioning = partitioning.into();
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
