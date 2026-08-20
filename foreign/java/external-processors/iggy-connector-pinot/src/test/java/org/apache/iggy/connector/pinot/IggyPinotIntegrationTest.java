@@ -21,6 +21,7 @@ package org.apache.iggy.connector.pinot;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Ulimit;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
@@ -29,14 +30,15 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.topic.CompressionAlgorithm;
+import org.apache.pinot.spi.exception.QueryErrorCode;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.testcontainers.Testcontainers;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.Network;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.images.PullPolicy;
-import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 import org.testcontainers.utility.MountableFile;
 
@@ -59,7 +61,6 @@ import java.util.function.Predicate;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
 
-@Testcontainers
 class IggyPinotIntegrationTest {
 
     // The Java SDK speaks VSR, so use the same VSR-capable image as its integration tests.
@@ -73,8 +74,11 @@ class IggyPinotIntegrationTest {
     private static final int PINOT_CONTROLLER_PORT = 9000;
     private static final int PINOT_BROKER_PORT = 8099;
     private static final int PINOT_SERVER_ADMIN_PORT = 8097;
+    private static final String EXTERNAL_SERVER_HOST = "127.0.0.1";
+    private static final String TESTCONTAINERS_HOST = "host.testcontainers.internal";
+    private static final boolean USE_EXTERNAL_SERVER = System.getenv("USE_EXTERNAL_SERVER") != null;
 
-    private static final String STREAM_NAME = "test-stream";
+    private static final String STREAM_NAME = "pinot-test-stream-" + UUID.randomUUID();
     private static final String TOPIC_NAME = "test-events";
     private static final String CONSUMER_GROUP_NAME = "pinot-integration-test";
     private static final String TABLE_NAME = "test_events_REALTIME";
@@ -102,17 +106,22 @@ class IggyPinotIntegrationTest {
         Path pluginDirectory = requiredDirectory("iggy.pinot.plugin.dir");
         Path deploymentDirectory = requiredDirectory("iggy.pinot.deployment.dir");
 
+        if (USE_EXTERNAL_SERVER) {
+            Testcontainers.exposeHostPorts(externalTcpPort());
+        }
         network = Network.newNetwork();
         try {
             startZookeeper();
-            startIggy();
+            if (!USE_EXTERNAL_SERVER) {
+                startIggy();
+            }
             startPinotController(pluginDirectory);
             startPinotBroker();
             startPinotServer(pluginDirectory);
 
             iggyClient = IggyTcpClient.builder()
-                    .host(iggy.getHost())
-                    .port(iggy.getMappedPort(IGGY_TCP_PORT))
+                    .host(iggyHost())
+                    .port(iggyPort())
                     .credentials("iggy", "iggy")
                     .connectionTimeout(Duration.ofSeconds(10))
                     .requestTimeout(Duration.ofSeconds(10))
@@ -120,7 +129,7 @@ class IggyPinotIntegrationTest {
             createIggyResources();
 
             postControllerResource("/schemas", Files.readString(deploymentDirectory.resolve("schema.json")));
-            postControllerResource("/tables", Files.readString(deploymentDirectory.resolve("table.json")));
+            postControllerResource("/tables", tableConfiguration(deploymentDirectory.resolve("table.json")));
             awaitQuery("SELECT COUNT(*) FROM " + TABLE_NAME, IggyPinotIntegrationTest::hasResultRow);
         } catch (IOException | RuntimeException e) {
             throw new IllegalStateException("Failed to start the Iggy-Pinot test environment\n" + diagnostics(), e);
@@ -132,7 +141,16 @@ class IggyPinotIntegrationTest {
 
     @AfterAll
     static void stopEnvironment() {
+        stop(pinotServer);
+        stop(pinotBroker);
+        stop(pinotController);
+
         if (iggyClient != null) {
+            try {
+                iggyClient.streams().deleteStream(StreamId.of(STREAM_NAME));
+            } catch (RuntimeException ignored) {
+                // Startup may have failed before the stream was created.
+            }
             try {
                 iggyClient.close();
             } catch (RuntimeException ignored) {
@@ -140,9 +158,6 @@ class IggyPinotIntegrationTest {
             }
         }
 
-        stop(pinotServer);
-        stop(pinotBroker);
-        stop(pinotController);
         stop(iggy);
         stop(zookeeper);
         if (network != null) {
@@ -227,6 +242,19 @@ class IggyPinotIntegrationTest {
         iggy.start();
     }
 
+    private static String iggyHost() {
+        return USE_EXTERNAL_SERVER ? EXTERNAL_SERVER_HOST : iggy.getHost();
+    }
+
+    private static int iggyPort() {
+        return USE_EXTERNAL_SERVER ? externalTcpPort() : iggy.getMappedPort(IGGY_TCP_PORT);
+    }
+
+    private static int externalTcpPort() {
+        String configured = System.getenv("EXTERNAL_TCP_PORT");
+        return configured != null ? Integer.parseInt(configured) : IGGY_TCP_PORT;
+    }
+
     private static void startPinotController(Path pluginDirectory) {
         pinotController = pinotContainer(pluginDirectory)
                 .withNetworkAliases("pinot-controller")
@@ -294,6 +322,18 @@ class IggyPinotIntegrationTest {
                 .put("timestamp", timestamp));
     }
 
+    private static String tableConfiguration(Path tableConfigurationPath) throws IOException {
+        JsonNode tableConfiguration = OBJECT_MAPPER.readTree(Files.readString(tableConfigurationPath));
+        ObjectNode streamConfigs =
+                (ObjectNode) tableConfiguration.required("tableIndexConfig").required("streamConfigs");
+        streamConfigs.put("stream.iggy.stream.id", STREAM_NAME);
+        if (USE_EXTERNAL_SERVER) {
+            streamConfigs.put("stream.iggy.host", TESTCONTAINERS_HOST);
+            streamConfigs.put("stream.iggy.port", Integer.toString(externalTcpPort()));
+        }
+        return OBJECT_MAPPER.writeValueAsString(tableConfiguration);
+    }
+
     private static void postControllerResource(String path, String body) throws IOException, InterruptedException {
         HttpResponse<String> response = post(pinotController, PINOT_CONTROLLER_PORT, path, body);
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
@@ -316,7 +356,7 @@ class IggyPinotIntegrationTest {
                 lastResponse = "HTTP " + response.statusCode() + ": " + response.body();
                 if (response.statusCode() >= 200 && response.statusCode() < 300) {
                     JsonNode json = OBJECT_MAPPER.readTree(response.body());
-                    if (hasExceptionCode(json, 150)) {
+                    if (hasExceptionCode(json, QueryErrorCode.SQL_PARSING.getId())) {
                         return fail("Pinot rejected SQL query: %s%nResponse: %s".formatted(sql, response.body()));
                     }
                     if (json.path("exceptions").isEmpty() && success.test(json)) {
@@ -401,10 +441,17 @@ class IggyPinotIntegrationTest {
     private static String diagnostics() {
         return String.join(
                 "\n",
-                logs("Iggy", iggy),
+                iggyDiagnostics(),
                 logs("Pinot controller", pinotController),
                 logs("Pinot broker", pinotBroker),
                 logs("Pinot server", pinotServer));
+    }
+
+    private static String iggyDiagnostics() {
+        if (USE_EXTERNAL_SERVER) {
+            return "Iggy uses external server at " + iggyHost() + ":" + iggyPort() + ".";
+        }
+        return logs("Iggy", iggy);
     }
 
     private static String logs(String name, GenericContainer<?> container) {

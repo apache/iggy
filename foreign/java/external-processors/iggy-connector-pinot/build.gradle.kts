@@ -45,15 +45,11 @@ dependencies {
     testImplementation(libs.bundles.testing)
     testImplementation(libs.pinot.spi) // Need Pinot SPI for tests
     testImplementation(libs.testcontainers)
-    testImplementation(libs.testcontainers.junit)
     testRuntimeOnly(libs.slf4j.simple)
 }
 
 tasks.shadowJar {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    filesMatching("META-INF/services/**") {
-        duplicatesStrategy = DuplicatesStrategy.INCLUDE
-    }
     relocate("io.netty", "org.apache.iggy.connector.pinot.shaded.io.netty")
     mergeServiceFiles()
 }
@@ -70,6 +66,9 @@ tasks.named("jar") {
 
 tasks.named<Test>("test") {
     dependsOn("assemblePlugin")
+    inputs.dir(layout.projectDirectory.dir("deployment"))
+    inputs.property("useExternalServer", providers.environmentVariable("USE_EXTERNAL_SERVER").isPresent)
+    inputs.property("externalTcpPort", providers.environmentVariable("EXTERNAL_TCP_PORT").orElse("8090"))
     systemProperty("iggy.pinot.image", "apachepinot/pinot:${libs.versions.pinot.get()}")
     systemProperty("iggy.pinot.plugin.dir", layout.buildDirectory.dir("plugin").get().asFile.absolutePath)
     systemProperty("iggy.pinot.deployment.dir", layout.projectDirectory.dir("deployment").asFile.absolutePath)
