@@ -232,8 +232,8 @@ impl TryFrom<&Consumer> for RustConsumer {
 
     fn try_from(value: &Consumer) -> PyResult<RustConsumer> {
         Ok(match value {
-            Consumer::Single { id } => RustConsumer::new(Identifier::try_from(id.clone())?),
-            Consumer::Group { id } => RustConsumer::group(Identifier::try_from(id.clone())?),
+            Consumer::Single { id } => RustConsumer::new(Identifier::try_from(id)?),
+            Consumer::Group { id } => RustConsumer::group(Identifier::try_from(id)?),
         })
     }
 }

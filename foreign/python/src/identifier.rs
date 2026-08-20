@@ -33,18 +33,26 @@ pub enum PyIdentifier {
 }
 impl_stub_type!(PyIdentifier = String | isize);
 
+impl TryFrom<&PyIdentifier> for Identifier {
+    type Error = PyErr;
+
+    fn try_from(py_identifier: &PyIdentifier) -> Result<Self, Self::Error> {
+        match py_identifier {
+            PyIdentifier::String(s) => {
+                Identifier::from_str(s).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))
+            }
+            PyIdentifier::Int(i) => {
+                Identifier::numeric(*i).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))
+            }
+        }
+    }
+}
+
 impl TryFrom<PyIdentifier> for Identifier {
     type Error = PyErr;
 
     fn try_from(py_identifier: PyIdentifier) -> Result<Self, Self::Error> {
-        match py_identifier {
-            PyIdentifier::String(s) => {
-                Identifier::from_str(&s).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))
-            }
-            PyIdentifier::Int(i) => {
-                Identifier::numeric(i).map_err(|e| PyErr::new::<PyValueError, _>(e.to_string()))
-            }
-        }
+        Identifier::try_from(&py_identifier)
     }
 }
 
