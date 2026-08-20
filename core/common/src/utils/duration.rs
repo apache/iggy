@@ -267,6 +267,10 @@ impl NonZeroIggyDuration {
         duration: IggyDuration::ONE_SECOND,
     };
 
+    pub fn new(duration: Duration) -> Result<Self, NonZeroDurationError> {
+        IggyDuration::new(duration).try_into()
+    }
+
     pub fn get(&self) -> IggyDuration {
         self.duration
     }
@@ -283,8 +287,18 @@ impl NonZeroIggyDuration {
         self.duration.as_secs()
     }
 
+    pub fn as_secs_f64(&self) -> f64 {
+        self.duration.as_secs_f64()
+    }
+
     pub fn as_micros(&self) -> u64 {
         self.duration.as_micros()
+    }
+
+    /// The gap between two non-zero durations is zero when they are equal, so the
+    /// result is an `IggyDuration`.
+    pub fn abs_diff(&self, other: NonZeroIggyDuration) -> IggyDuration {
+        self.duration.abs_diff(other.duration)
     }
 }
 
@@ -332,6 +346,22 @@ impl TryFrom<u64> for NonZeroIggyDuration {
     }
 }
 
+impl TryFrom<Duration> for NonZeroIggyDuration {
+    type Error = NonZeroDurationError;
+
+    fn try_from(duration: Duration) -> Result<Self, Self::Error> {
+        IggyDuration::from(duration).try_into()
+    }
+}
+
+impl TryFrom<HumanDuration> for NonZeroIggyDuration {
+    type Error = NonZeroDurationError;
+
+    fn try_from(duration: HumanDuration) -> Result<Self, Self::Error> {
+        IggyDuration::from(duration).try_into()
+    }
+}
+
 impl From<NonZeroIggyDuration> for IggyDuration {
     fn from(duration: NonZeroIggyDuration) -> Self {
         duration.duration
@@ -349,6 +379,16 @@ impl FromStr for NonZeroIggyDuration {
 impl Display for NonZeroIggyDuration {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.duration)
+    }
+}
+
+impl Add for NonZeroIggyDuration {
+    type Output = NonZeroIggyDuration;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        NonZeroIggyDuration {
+            duration: self.duration + rhs.duration,
+        }
     }
 }
 
@@ -481,6 +521,54 @@ mod tests {
         let error = NonZeroIggyDuration::try_from(IggyDuration::default()).unwrap_err();
 
         assert_eq!(NonZeroDurationError::Zero, error);
+    }
+
+    #[test]
+    fn given_a_positive_std_duration_should_build() {
+        let duration = NonZeroIggyDuration::new(Duration::from_millis(1500)).unwrap();
+
+        assert_eq!(1.5, duration.as_secs_f64());
+    }
+
+    #[test]
+    fn given_a_zero_std_duration_should_fail_to_build() {
+        assert_eq!(
+            Err(NonZeroDurationError::Zero),
+            NonZeroIggyDuration::new(Duration::ZERO)
+        );
+        assert_eq!(
+            Err(NonZeroDurationError::Zero),
+            NonZeroIggyDuration::try_from(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn given_a_human_duration_should_convert() {
+        let human_duration = HumanDuration::from_str("1m").unwrap();
+
+        let duration = NonZeroIggyDuration::try_from(human_duration).unwrap();
+
+        assert_eq!(60, duration.as_secs());
+    }
+
+    #[test]
+    fn given_two_durations_should_report_their_gap() {
+        let one_minute = NonZeroIggyDuration::from_str("1m").unwrap();
+        let six_seconds = NonZeroIggyDuration::from_str("6s").unwrap();
+
+        assert_eq!(
+            IggyDuration::new_from_secs(54),
+            one_minute.abs_diff(six_seconds)
+        );
+        assert_eq!(IggyDuration::default(), one_minute.abs_diff(one_minute));
+    }
+
+    #[test]
+    fn given_two_durations_should_add_up() {
+        let sum = NonZeroIggyDuration::from_str("6s").unwrap()
+            + NonZeroIggyDuration::from_str("1m").unwrap();
+
+        assert_eq!(66, sum.as_secs());
     }
 
     #[test]
