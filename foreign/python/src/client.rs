@@ -1035,7 +1035,7 @@ impl IggyClient {
         })
     }
 
-    /// Polls for messages from the specified topic and partition.
+    /// Polls for messages from the specified topic on behalf of the given consumer.
     /// Omitting `partition_id` reads partition 0 for a regular consumer, and
     /// polls the member's assigned partitions for a consumer group.
     /// Returns a list of received messages or a RuntimeError on failure.
