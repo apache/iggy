@@ -92,6 +92,11 @@ impl Default for ClusterConfig {
                 .view_change_status_timeout
                 .parse()
                 .unwrap(),
+            superblock_wedged_fatal_timeout: SERVER_CONFIG
+                .cluster
+                .superblock_wedged_fatal_timeout
+                .parse()
+                .unwrap(),
             request_start_view_retransmit_interval: SERVER_CONFIG
                 .cluster
                 .request_start_view_retransmit_interval

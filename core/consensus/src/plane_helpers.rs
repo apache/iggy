@@ -771,7 +771,14 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
     }
 }
 
-// TODO: Figure out how to make this check the journal if it contains the prepare.
+/// Ack a prepare back to its primary once the owning plane vouches for it.
+///
+/// `is_persisted` is the caller's journal-containment verdict for `header`:
+/// consensus is sans-io and cannot consult the journal itself, so the plane
+/// that owns the journal must vouch that this exact prepare is durable before
+/// the ack leaves. `false` withholds the ack; the primary's retransmit
+/// re-drives it once a later persist succeeds.
+///
 /// # Panics
 /// - If `header.command` is not `Command::Prepare`.
 /// - If `header.view > consensus.view()`.
@@ -779,7 +786,7 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
 pub async fn send_prepare_ok<B, P>(
     consensus: &VsrConsensus<B, P>,
     header: &PrepareHeader,
-    is_persisted: Option<bool>,
+    is_persisted: bool,
 ) where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
@@ -794,7 +801,7 @@ pub async fn send_prepare_ok<B, P>(
         return;
     }
 
-    if is_persisted == Some(false) {
+    if !is_persisted {
         return;
     }
 
@@ -1227,7 +1234,7 @@ mod tests {
             ..Default::default()
         };
 
-        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, Some(true)));
+        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, true));
 
         let mut buf = Vec::new();
         consensus.drain_loopback_into(&mut buf);
@@ -1874,7 +1881,7 @@ mod tests {
             ..Default::default()
         };
 
-        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, Some(true)));
+        futures::executor::block_on(send_prepare_ok(&consensus, &prepare_header, true));
 
         let mut buf = Vec::new();
         consensus.drain_loopback_into(&mut buf);
