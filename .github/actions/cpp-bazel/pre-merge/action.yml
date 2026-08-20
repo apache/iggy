@@ -41,8 +41,7 @@ runs:
           clang-format-18 --version
           exit 0
         fi
-        sudo apt-get update --yes
-        sudo apt-get install --yes clang-format-18
+        ./scripts/ci/apt-install.sh clang-format-18
         clang-format-18 --version
 
     - name: Lint (clang-format)
