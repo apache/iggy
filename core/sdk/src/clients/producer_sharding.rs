@@ -113,6 +113,11 @@ impl Sizeable for ShardMessage {
     }
 }
 
+// Represents a [`ShardMessage`] that is allowed to be send.
+//
+// There is a limit on how many (message) bytes can be send concurrently.
+// Before a message can be send, it needs to acquire the proper byte budget
+// from a tokio semaphore of size `max_buffer_size`.
 pub struct ShardMessageWithPermit {
     pub inner: ShardMessage,
     size_bytes: u64,
@@ -141,6 +146,36 @@ impl ShardMessageWithPermit {
     }
 }
 
+/// Represents one background worker of a
+/// [`ProducerDispatcher`](crate::clients::producer_dispatcher::ProducerDispatcher),
+/// together with the channel (queue) that feeds it.
+///
+/// Shards are owned and handled by the [`ProducerDispatcher`]. If the dispatcher can do everything
+/// you want, there is no need to handle them directly.
+///
+/// Each shard owns a task that builds the batches from messages routed to it, merges adjacent batches that share a
+/// destination, and writes them out through [`ProducerCoreBackend::send_internal`].
+///
+/// Batches are enqueued with [`Shard::send`], which returns once the batch is on the
+/// channel. Shards are created and owned by the dispatcher, so they are rarely handled
+/// directly.
+///
+/// # Worker loop
+///
+/// The task selects over three sources:
+///
+/// - **An enqueued batch.** [`ShardMessageWithPermit`]s are appended to the buffer,
+///   which is then flushed if it has reached [`batch_length`](BackgroundConfig::batch_length) messages or
+///   [`batch_size`](BackgroundConfig::batch_size) bytes. Either limit is disabled (unlimited) when
+///   configured as `0`.
+/// - **The linger deadline**, [`linger_time`](BackgroundConfig::linger_time) after the
+///   last flush. If this deadline is met, a buffer is flushed regardless of whether it is full or not.
+///   This sets an upper bound on the time a batch waits to be filled up, before flushing.
+/// - **The stop broadcast** sent by the dispatcher on shutdown. Marks the shard closed
+///   so later sends fail with [`IggyError::ProducerClosed`], drains what is still
+///   queued, flushes once, then ends the loop.
+///   Note, should the [`ProducerDispatcher`] be dropped instead of gracefully shutdown, already enqueued messages
+///   will be dropped and lost.
 pub struct Shard {
     tx: flume::Sender<ShardMessageWithPermit>,
     closed: Arc<AtomicBool>,
@@ -148,6 +183,7 @@ pub struct Shard {
 }
 
 impl Shard {
+    /// Spawns the worker task described in the [type docs](Shard).
     pub fn new(
         core: Arc<impl ProducerCoreBackend>,
         config: Arc<BackgroundConfig>,
@@ -269,6 +305,10 @@ impl Shard {
                 )
                 .await;
 
+            // Asynchronous error callback for users running background
+            // writes for messages.
+            // If the send failed the Shard needs to notify the
+            // user who is listening on the error channel.
             if let Err(error) = result {
                 if let IggyError::ProducerSendFailed {
                     failed,
@@ -294,9 +334,15 @@ impl Shard {
                 }
             }
         }
+        // The buffer was drained above.
+        // buffer_bytes needs to be reset as well.
         *buffer_bytes = 0;
     }
 
+    /// Sends a single [`ShardMessageWithPermit`].
+    ///
+    /// Only sends if the [`Shard`] is not closed.
+    /// Sends the message to this `Shard`s worker to be enqueued.
     pub(crate) async fn send(&self, message: ShardMessageWithPermit) -> Result<(), IggyError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(IggyError::ProducerClosed);
