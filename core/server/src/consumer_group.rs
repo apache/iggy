@@ -67,7 +67,7 @@ pub(crate) async fn maybe_rewrite_consumer_group_request<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -122,7 +122,7 @@ async fn gather_in_flight<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -212,7 +212,7 @@ pub(crate) fn maybe_rewrite_consumer_offset_request<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -266,7 +266,7 @@ fn resolve_group_offset_id<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {

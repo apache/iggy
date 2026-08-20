@@ -12,12 +12,6 @@
 
 Common types and traits shared across the [Apache Iggy](https://iggy.apache.org) ecosystem (server, SDK, CLI, tooling). This crate is an internal building block. Most users should depend on the [`iggy`](https://crates.io/crates/iggy) SDK crate instead.
 
-> Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
->
-> Incubation is required of all newly accepted projects until a further review indicates that the infrastructure, communications, and decision making process have stabilized in a manner consistent with other successful ASF projects.
->
-> While incubation status is not necessarily a reflection of the completeness or stability of the code, it does indicate that the project has yet to be fully endorsed by the ASF.
-
 ## Links
 
 - [Project website](https://iggy.apache.org)

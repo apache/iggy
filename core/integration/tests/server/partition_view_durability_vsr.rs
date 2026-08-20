@@ -52,9 +52,11 @@ const MESSAGES_COUNT: u32 = 10;
 /// then the restarted node's probe and repair), and CI runners are slow. 60s bounds
 /// the worst case without hanging the suite.
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(60);
-/// Boot line reporting the `(view, log_view)` a partition group restored from its
-/// superblock: the recovered replica's own account of what it read back.
-const RESTORED_VIEW_MARKER: &str = "restored partition view from its superblock";
+/// Boot line reporting the `(view, log_view)` a consensus group restored from
+/// its superblock: the recovered replica's own account of what it read back.
+/// One line per group since the unified restore constructor, so the parser
+/// filters the metadata group's line out by its `group` field.
+const RESTORED_VIEW_MARKER: &str = "restored group view from its superblock";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
@@ -200,17 +202,23 @@ fn restored_partition_view(harness: &TestHarness, node: usize) -> Option<(u32, u
     }
     log.lines()
         .filter(|line| line.contains(RESTORED_VIEW_MARKER))
+        // The metadata group logs the same restore line; its view advances
+        // independently of the partition group under test, so folding it into
+        // the max would let a metadata view change satisfy a partition assert.
+        .filter(|line| {
+            field(line, " group=") != Some(iggy_binary_protocol::namespace::METADATA_GROUP)
+        })
         .filter_map(|line| {
             // Leading space so the `view` key cannot match inside `log_view`.
-            let view = field(line, " view=")?;
-            let log_view = field(line, " log_view=")?;
+            let view = u32::try_from(field(line, " view=")?).ok()?;
+            let log_view = u32::try_from(field(line, " log_view=")?).ok()?;
             Some((view, log_view))
         })
         .max()
 }
 
-/// Value of a space-prefixed `key=<u32>` tracing field.
-fn field(line: &str, key: &str) -> Option<u32> {
+/// Value of a space-prefixed `key=<u64>` tracing field.
+fn field(line: &str, key: &str) -> Option<u64> {
     let start = line.find(key)? + key.len();
     line[start..]
         .split(|character: char| !character.is_ascii_digit())

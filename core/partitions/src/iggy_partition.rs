@@ -96,7 +96,7 @@ where
     B: MessageBus,
 {
     consensus: VsrConsensus<B>,
-    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
+    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>,
     /// Highest durably persisted offset.
     pub offset: Arc<AtomicU64>,
     /// Highest offset assigned to prepares that may still only live in the in-memory journal.
@@ -3704,10 +3704,10 @@ where
         let enforce_fsync = self.effective_enforce_fsync(config);
         let preallocate_segments = self.effective_preallocate_segments(config);
         let segment = Segment::new(start_offset, segment_size);
-        // `PartitionsConfig::get_messages_path` is a stub (`/tmp/iggy_stub`);
-        // the partition's real directory is only known to the server config
-        // that created the initial segment, so derive the rotated paths from
-        // the active writer's location.
+        // Prefer the active writer's location: a per-topic path override or a
+        // config change after the initial segment was created must not scatter
+        // one partition's segments across two directories. The config layout
+        // only decides for a partition with no writer yet.
         let (messages_path, index_path) = self.partition_dir().map_or_else(
             || {
                 (
@@ -4717,7 +4717,9 @@ where
         // consumer-offset ops (via `apply_replicated_operation`) append
         // to that journal before `send_prepare_ok` fires, so every op
         // that reaches here is journal-backed and ACKs as durable.
-        send_prepare_ok_common(self.consensus(), header, Some(true)).await;
+        // (`header_by_op` is a linear scan, so re-proving that here would
+        // put O(journal) on every ack; the call-order invariant stands in.)
+        send_prepare_ok_common(self.consensus(), header, true).await;
     }
 }
 
@@ -6529,6 +6531,7 @@ mod tests {
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,
             encryptor: None,
+            path_layout: crate::PartitionPathLayout::default(),
         }
     }
 

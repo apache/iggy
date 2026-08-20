@@ -20,7 +20,7 @@ use iggy_common::{IggyByteSize, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
-use server_common::MemoryPoolConfigOther;
+use server_common::MemoryPoolSettings;
 use server_common::log::{TelemetryEndpointSettings, TelemetrySettings};
 
 pub use server_common::log::TelemetryTransport;
@@ -34,12 +34,12 @@ pub struct MemoryPoolConfig {
     pub bucket_capacity: u32,
 }
 
-impl MemoryPoolConfig {
-    pub fn into_other(&self) -> MemoryPoolConfigOther {
-        MemoryPoolConfigOther {
-            enabled: self.enabled,
-            size: self.size,
-            bucket_capacity: self.bucket_capacity,
+impl From<&MemoryPoolConfig> for MemoryPoolSettings {
+    fn from(config: &MemoryPoolConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            size: config.size,
+            bucket_capacity: config.bucket_capacity,
         }
     }
 }

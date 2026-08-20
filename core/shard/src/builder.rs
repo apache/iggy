@@ -73,6 +73,7 @@ where
     partitions: IggyPartitions<B, SB>,
     senders: Vec<TaggedSender>,
     inbox: Receiver<ShardFrame>,
+    reply_inbox: Receiver<ShardFrame>,
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
@@ -103,6 +104,7 @@ where
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
+        reply_inbox: Receiver<ShardFrame>,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coord_config: CoordinatorConfig,
@@ -120,6 +122,7 @@ where
             partitions,
             senders,
             inbox,
+            reply_inbox,
             shards_table,
             partition_consensus,
             coord_config,
@@ -190,7 +193,10 @@ where
                             client_id,
                             msg,
                         });
-                        sender.try_send(frame).map_err(|err| {
+                        // Reply lane: a forwarded client reply is terminal on
+                        // drop, so it must not compete with consensus frames
+                        // for main-lane capacity.
+                        sender.reply_sender().try_send(frame).map_err(|err| {
                             metrics_for_client.record_frame_drop(
                                 frame_drop_variant::FORWARD_CLIENT_SEND,
                                 classify_try_send_err(&err),
@@ -227,6 +233,7 @@ where
             self.partitions,
             self.senders,
             self.inbox,
+            self.reply_inbox,
             self.shards_table,
             self.partition_consensus,
             coordinator,
