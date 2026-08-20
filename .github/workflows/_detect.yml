@@ -79,9 +79,12 @@ jobs:
 
       - name: Get changed files (PR or push)
         id: changed
-        uses: Ana06/get-changed-files@25f79e676e7ea1868813e21465014798211fad8c
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         with:
-          format: json
+          filters: |
+            all:
+              - '**'
+          list-files: json
 
       - name: Load components config
         id: config
@@ -102,7 +105,7 @@ jobs:
         with:
           script: |
             const componentsJson = `${{ steps.config.outputs.components }}`;
-            const changedFilesJson = `${{ steps.changed.outputs.all || '[]' }}`;
+            const changedFilesJson = `${{ steps.changed.outputs.all_files || '[]' }}`;
 
             let componentsCfg = { components: {} };
             try { componentsCfg = JSON.parse(componentsJson); } catch {}

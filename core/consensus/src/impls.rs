@@ -3194,11 +3194,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // outranks the real primary's and pushes ops that view already discarded back
         // over committed bodies.
         //
-        // TODO(suffix-truncation): re-adoption drops the head again, but the WAL
-        // still holds the discarded suffix, so the primary's next prepare lands on an
-        // op that suffix already occupies and fails `append`'s slot-collision check,
-        // poisoning the journal. Loud beats the silent divergence above; a durable
-        // truncate-from-op primitive is what actually closes it.
+        // Re-adoption drops the head again while the WAL still holds the discarded
+        // suffix. Consensus is sans-io and cannot truncate it; the plane sweeps it
+        // on every adoption (`reconcile_{metadata,partition}_view_divergence`,
+        // above-head branch) before the primary's next prepare can collide with a
+        // relic in `append`'s slot-collision check.
         if msg_view == self.log_view.get() && msg_op < self.commit_min() {
             return Vec::new();
         }

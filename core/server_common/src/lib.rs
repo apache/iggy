@@ -39,7 +39,7 @@ pub use consensus_message::{
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
 };
 pub use executor::create_shard_executor;
-pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
+pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};
 pub use segment_storage::{
     IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
 };
