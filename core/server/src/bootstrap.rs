@@ -204,7 +204,7 @@ pub fn wire_shell_handlers<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -685,6 +685,13 @@ fn validate_sharding_runtime_knobs(
             max: INBOX_CAPACITY_MAX,
         });
     }
+    let reply_inbox_capacity = sharding.reply_inbox_capacity;
+    if reply_inbox_capacity == 0 || reply_inbox_capacity > INBOX_CAPACITY_MAX {
+        return Err(ServerError::InvalidReplyInboxCapacity {
+            value: reply_inbox_capacity,
+            max: INBOX_CAPACITY_MAX,
+        });
+    }
     let drain_timeout = sharding.shutdown_drain_timeout.get_duration();
     if drain_timeout.is_zero() || drain_timeout > SHUTDOWN_DRAIN_TIMEOUT_MAX {
         return Err(ServerError::InvalidShutdownDrainTimeout {
@@ -756,9 +763,11 @@ pub fn bootstrap(
     // busy-loop every shutdown watchdog on a zero poll cadence, or wedge
     // process exit on an unbounded drain budget.
     let inbox_capacity = config.system.sharding.inbox_capacity;
+    let reply_inbox_capacity = config.system.sharding.reply_inbox_capacity;
     validate_sharding_runtime_knobs(&config.system.sharding)?;
 
-    let (senders, mut inboxes) = shard_mesh_channels(total_shards, inbox_capacity);
+    let (senders, mut inboxes, mut reply_inboxes) =
+        shard_mesh_channels(total_shards, inbox_capacity, reply_inbox_capacity);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let config = Arc::new(config);
     // One owner table per server process, Arc-cloned into every shard's bus so
@@ -790,12 +799,22 @@ pub fn bootstrap(
     // Shared metadata-group view: written by shard 0's publisher task, read by
     // every shard's cluster-metadata roster so leader marking works off-shard.
     let metadata_view = Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN));
+    // Every shard's metric handles, minted before the threads spawn: each
+    // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
+    // the whole set (counters are Arc-backed, so cross-thread reads see the
+    // owning shard's bumps).
+    let shard_metrics_all: Vec<ShardMetrics> = (0..shards_count)
+        .map(|_| ShardMetrics::for_shard())
+        .collect();
     for (idx, assignment) in assignments.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let shard_id = idx as u16;
         let inbox = inboxes[idx]
             .take()
             .expect("shard_mesh_channels populates every inbox slot exactly once");
+        let reply_inbox = reply_inboxes[idx]
+            .take()
+            .expect("shard_mesh_channels populates every reply-inbox slot exactly once");
         let senders_for_shard = senders.clone();
         let config_for_shard = Arc::clone(&config);
         let shutdown_flag_for_shard = Arc::clone(&shutdown_flag);
@@ -820,6 +839,7 @@ pub fn bootstrap(
         };
 
         let metadata_view_for_shard = Arc::clone(&metadata_view);
+        let shard_metrics_for_shard = shard_metrics_all.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -830,12 +850,14 @@ pub fn bootstrap(
                     assignment,
                     senders_for_shard,
                     inbox,
+                    reply_inbox,
                     config_for_shard,
                     shutdown_flag_for_shard,
                     metadata_handoff_for_shard,
                     barrier_for_shard,
                     owner_table_for_shard,
                     metadata_view_for_shard,
+                    shard_metrics_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -893,12 +915,14 @@ fn run_shard_thread(
     assignment: ShardInfo,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     config: Arc<ServerConfig>,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     metadata_view: Arc<AtomicU64>,
+    shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -934,12 +958,14 @@ fn run_shard_thread(
             replica_id,
             senders,
             inbox,
+            reply_inbox,
             &config,
             shutdown_flag,
             metadata_handoff,
             barrier,
             owner_table,
             metadata_view,
+            shard_metrics_all,
         ))
         .await
     });
@@ -961,12 +987,14 @@ async fn shard_main(
     replica_id: Option<u8>,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     config: &ServerConfig,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     metadata_view: Arc<AtomicU64>,
+    shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -989,7 +1017,12 @@ async fn shard_main(
     let poll_interval = config.system.sharding.shutdown_poll_interval.get_duration();
 
     let shutdown_flag_for_handoff = Arc::clone(&shutdown_flag);
-    spawn_shutdown_watchdog(Rc::clone(&bus), shutdown_flag, drain_timeout, poll_interval);
+    let mut shutdown_watchdog = Some(spawn_shutdown_watchdog(
+        Rc::clone(&bus),
+        shutdown_flag,
+        drain_timeout,
+        poll_interval,
+    ));
 
     // Metadata bootstrap is single-writer: shard 0 owns the WAL and the
     // only `WriteHandle`-bearing `MuxStateMachine`. Peer shards receive
@@ -1137,7 +1170,7 @@ async fn shard_main(
     // margin (config validation keeps journal_slots >= 4x this).
     metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
 
-    let shard_metrics = ShardMetrics::for_shard();
+    let shard_metrics = shard_metrics_all[usize::from(shard_id)].clone();
     // Notifier install deferred until after tick handler wires below.
     let senders_for_notifier = senders.clone();
     let metrics_for_notifier = shard_metrics.clone();
@@ -1153,6 +1186,7 @@ async fn shard_main(
         Rc::clone(&bus),
         senders,
         inbox,
+        reply_inbox,
         shard_metrics,
         Arc::clone(&metadata_view),
     ))
@@ -1194,20 +1228,17 @@ async fn shard_main(
     );
 
     // Re-check the cross-thread shutdown flag here, *before* spawning the
-    // message pump. A sibling shard may have failed in the window between
-    // the metadata broadcast and this point; gating before spawn keeps the
-    // bus' `background_tasks` vec empty on the shutdown path. Spawn-then-
-    // check would leave `bus.track_background(pump_handle)` registering a
-    // `JoinHandle` that only `bus.shutdown()` drains, but the watchdog
-    // driving `bus.shutdown()` is `.detach()`'d (see TODO at
-    // `spawn_shutdown_watchdog`) and may not be scheduled before this
-    // function returns `Ok(())` and the compio runtime drops, cancelling
-    // the pump mid-`write_vectored_all`.
-    //
-    // Without this gate shard 0 would also still open TCP/QUIC/WS
+    // message pump: it keeps the bus' `background_tasks` vec empty on the
+    // shutdown path, and shard 0 would otherwise still open TCP/QUIC/WS
     // listeners for a server that is already tearing down, briefly
     // accepting connections that immediately get torn by the watchdog.
+    //
+    // The flag is set, so the watchdog is (about to be) driving
+    // `bus.shutdown()`; await it so the runtime does not drop mid-drain.
     if shutdown_flag_for_handoff.load(Ordering::Relaxed) {
+        if let Some(watchdog) = shutdown_watchdog.take() {
+            let _ = watchdog.await;
+        }
         return Ok(());
     }
 
@@ -1403,6 +1434,7 @@ async fn shard_main(
             accepted_replica,
             dialed_replica,
             accepted_client,
+            &shard_metrics_all,
         )
         .await
         {
@@ -1420,6 +1452,12 @@ async fn shard_main(
             // The bind failure is the primary fault; the drain verdict only
             // matters for the log it emits.
             let _ = await_pump_drain(pump_handle.take(), config, shard_id).await;
+            // Neither the flag nor the bus token has fired yet on this path,
+            // so the watchdog is still idle-looping; awaiting it would hang.
+            // Detach and let `run_shard_thread`'s unwind flip the flag.
+            if let Some(watchdog) = shutdown_watchdog.take() {
+                watchdog.detach();
+            }
             return Err(error);
         }
 
@@ -1446,7 +1484,15 @@ async fn shard_main(
         let _ = tx.try_send(());
     }
 
-    await_pump_drain(pump_handle.take(), config, shard_id).await?;
+    // Await the watchdog even when the drain verdict is an error: the token
+    // has fired, so it either stands down within one poll interval or is
+    // mid-`bus.shutdown()`, and dropping it there truncates in-flight
+    // `ClientForwardFailed` replies.
+    let pump_verdict = await_pump_drain(pump_handle.take(), config, shard_id).await;
+    if let Some(watchdog) = shutdown_watchdog.take() {
+        let _ = watchdog.await;
+    }
+    pump_verdict?;
 
     info!(shard = shard_id, "server shard exited cleanly");
     Ok(())
@@ -1662,16 +1708,27 @@ async fn await_bootstrap_complete(
 /// is the only Send signal we have; the bus' shutdown machinery is
 /// `!Send` (`Rc<Cell<bool>>` + per-shard `async_channel`), so it must be
 /// triggered from within the runtime that owns the bus.
+///
+/// The caller owns the returned handle and must await it on the exit paths
+/// where shutdown is in progress (flag set or bus token triggered):
+/// dropping it there cancels the watchdog mid-`bus.shutdown()`, truncating
+/// in-flight `ClientForwardFailed` replies (terminal per `SendError` docs).
+/// It cannot go through `bus.track_background` instead: the watchdog itself
+/// drives `bus.shutdown()`, and the bg-drain loop in `shutdown()` would
+/// re-enter awaiting the watchdog's own pending shutdown call
+/// (self-deadlock). The await is bounded: once the token fires the loop
+/// stands down within one poll interval, and the shutdown call itself is
+/// capped by `drain_timeout`.
 #[allow(clippy::needless_pass_by_value)]
 fn spawn_shutdown_watchdog(
     bus: Rc<IggyMessageBus>,
     shutdown_flag: Arc<AtomicBool>,
     drain_timeout: Duration,
     poll_interval: Duration,
-) {
+) -> compio::runtime::JoinHandle<()> {
     let bus_for_task = Rc::clone(&bus);
     let bus_token = bus.token();
-    let watchdog = compio::runtime::spawn(async move {
+    compio::runtime::spawn(async move {
         loop {
             if shutdown_flag.load(Ordering::Relaxed) {
                 break;
@@ -1684,19 +1741,7 @@ fn spawn_shutdown_watchdog(
             compio::time::sleep(poll_interval).await;
         }
         let _ = bus_for_task.shutdown(drain_timeout).await;
-    });
-    // TODO(hubcio): `.detach()` races bus shutdown: when `bus.token()` is
-    // triggered, `shard_main` returns and the runtime drops the watchdog
-    // mid-`bus.shutdown()`, truncating in-flight `ClientForwardFailed`
-    // replies (terminal per `SendError` docs). Cannot use
-    // `bus.track_background(watchdog)` here because the watchdog itself
-    // drives `bus.shutdown()`, and the bg-drain loop in `shutdown()`
-    // would re-enter awaiting the watchdog's own pending shutdown call
-    // (self-deadlock). Fix: extract a `core/task_registry` crate mirroring
-    // `core/server`'s task-tracking mechanism, share it between the bus
-    // and server so background tasks can be reaped without coupling
-    // to the bus shutdown order.
-    watchdog.detach();
+    })
 }
 
 /// Copy the configured cluster roster plus this node's own client ports into
@@ -1741,6 +1786,7 @@ async fn build_shard_for_thread(
     bus: Rc<IggyMessageBus>,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     metadata_view: Arc<AtomicU64>,
 ) -> Result<(Rc<ServerShard>, Rc<RefCell<SessionManager>>), ServerError> {
@@ -1790,6 +1836,11 @@ async fn build_shard_for_thread(
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
             encryptor,
+            path_layout: partitions::PartitionPathLayout {
+                streams_root: config.system.get_streams_path(),
+                topics_dir: config.system.topic.path.clone(),
+                partitions_dir: config.system.partition.path.clone(),
+            },
         },
         owned_partitions_capacity,
     );
@@ -2001,13 +2052,17 @@ async fn build_shard_for_thread(
         partitions,
         senders,
         inbox,
+        reply_inbox,
         shards_table,
         PartitionConsensusConfig::new(
             topology.cluster_id,
             shard::ReplicaTopology::new(topology.self_replica_id, topology.replica_count),
             Rc::clone(&bus),
         ),
-        CoordinatorConfig::default(),
+        CoordinatorConfig {
+            skip_shard_zero_for_replicas: config.cluster.coordinator.skip_shard_zero_for_replicas,
+            skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
+        },
         metrics,
     )
     .build()
@@ -2947,6 +3002,7 @@ async fn start_tcp_runtime(
     accepted_replica: AcceptedReplicaFn,
     dialed_replica: DialedReplicaFn,
     accepted_clients: LocalClientAcceptFns,
+    shard_metrics_all: &[ShardMetrics],
 ) -> Result<(), ServerError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
         start_via_replica_io(
@@ -2992,6 +3048,7 @@ async fn start_tcp_runtime(
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
+            shard_metrics_all,
         )
         .await?;
     }

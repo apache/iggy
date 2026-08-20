@@ -104,6 +104,27 @@ pub struct SealedSegmentReadState {
     /// `SEALED_READ_STATE_CAP` budget never counts. Set on touch, cleared on
     /// evict; plain `Cell`, all access is same-thread (`Rc` handle).
     pub(crate) tracked: Cell<bool>,
+    /// One-slot memo of the last file-backed offset resolution, so a
+    /// sequentially advancing consumer re-polling the same segment resolves
+    /// inside `[offset, valid_until)` with zero index-file reads. Only the
+    /// too-large-to-materialize index path consults it (a resident
+    /// [`Self::index`] already resolves in memory). Sealed segments are
+    /// immutable, so the memo cannot go stale; the one exception is a purge
+    /// recreating the same paths, which wipes this slot with the others.
+    /// Timestamp polls bypass it.
+    pub(crate) offset_cursor: Cell<Option<SealedOffsetCursor>>,
+}
+
+/// See [`SealedSegmentReadState::offset_cursor`].
+#[derive(Debug, Clone, Copy)]
+pub struct SealedOffsetCursor {
+    /// Offset of the resolved index entry (interval floor, inclusive).
+    pub(crate) offset: u64,
+    /// The successor index entry's offset (interval ceiling, exclusive);
+    /// `u64::MAX` when the resolved entry is the segment's last.
+    pub(crate) valid_until: u64,
+    /// Start byte the whole interval resolves to.
+    pub(crate) position: u64,
 }
 
 pub type SealedSegmentHandle = Rc<SealedSegmentReadState>;
@@ -640,9 +661,6 @@ impl DiskReadPlan {
         query: MessageLookup,
         partition_dir: &str,
     ) -> Option<u64> {
-        // TODO: a per-consumer cursor hint (the previous sealed poll's resolved
-        // position) could seed this so a sequentially advancing consumer skips
-        // the sparse-index lookup on repeated polls of the same segment.
         let handle = segment.read_state.as_ref()?;
         // Cache hit: resolve under a short borrow, never across the await.
         let cached = handle
@@ -652,6 +670,16 @@ impl DiskReadPlan {
             .map(|index| resolve_index_position(index, query));
         if let Some(resolved) = cached {
             return resolved;
+        }
+        // No resident index, so this is the file-backed path a sequential
+        // consumer would otherwise binary-search on disk every poll: answer
+        // from the memoized interval when the query lands inside it.
+        if let (MessageLookup::Offset { offset, .. }, Some(cursor)) =
+            (query, handle.offset_cursor.get())
+            && offset >= cursor.offset
+            && offset < cursor.valid_until
+        {
+            return Some(cursor.position);
         }
         let path = format!("{partition_dir}/{:0>20}.index", segment.start_offset);
         let reader = match IggyIndexReader::new(&path).await {
@@ -682,7 +710,20 @@ impl DiskReadPlan {
         }
         let looked_up = match query {
             MessageLookup::Offset { offset, .. } => {
-                reader.offset_lower_bound(entry_count, offset).await
+                match reader
+                    .offset_lower_bound_with_successor(entry_count, offset)
+                    .await
+                {
+                    Ok(resolved) => Ok(resolved.map(|(entry, successor_offset)| {
+                        handle.offset_cursor.set(Some(SealedOffsetCursor {
+                            offset: entry.offset,
+                            valid_until: successor_offset.unwrap_or(u64::MAX),
+                            position: entry.position,
+                        }));
+                        entry
+                    })),
+                    Err(error) => Err(error),
+                }
             }
             MessageLookup::Timestamp { timestamp, .. } => {
                 reader.timestamp_lower_bound(entry_count, timestamp).await
@@ -980,7 +1021,96 @@ struct ChunkWalk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iggy_index::IggyIndex;
+    use compio::io::AsyncWriteAtExt;
     use server_common::iobuf::Owned;
+
+    /// Write a sealed-segment index file too large to materialize
+    /// (`entry_count * IGGY_INDEX_SIZE > SEALED_INDEX_RESIDENT_MAX_BYTES`), so
+    /// `resolve_sealed_start` takes the file-backed lookup path the offset
+    /// cursor memoizes. Entry `i` maps offset `i * 10` to position `i * 100`.
+    async fn write_oversized_index(dir: &std::path::Path, start_offset: u64) -> u64 {
+        let entry_count =
+            SEALED_INDEX_RESIDENT_MAX_BYTES / crate::iggy_index::IGGY_INDEX_SIZE as u64 + 1;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(entry_count).unwrap() * crate::iggy_index::IGGY_INDEX_SIZE,
+        );
+        for i in 0..entry_count {
+            bytes.extend_from_slice(&crate::iggy_index::IggyIndexCache::serialize(
+                &IggyIndex::new(i * 10, i + 1, i * 100),
+            ));
+        }
+        let path = format!("{}/{:0>20}.index", dir.display(), start_offset);
+        let mut file = compio::fs::File::create(&path).await.expect("create index");
+        let (written, _) = file.write_all_at(bytes, 0).await.into();
+        written.expect("write index");
+        file.sync_all().await.expect("sync index");
+        entry_count
+    }
+
+    fn offset_query(offset: u64) -> MessageLookup {
+        MessageLookup::Offset {
+            offset,
+            count: 1,
+            ceiling: u64::MAX,
+        }
+    }
+
+    #[compio::test]
+    async fn sealed_offset_cursor_answers_in_interval_polls_without_the_index_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-poll-cursor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir).await.expect("create dir");
+        write_oversized_index(&dir, 0).await;
+
+        let handle: SealedSegmentHandle = Rc::new(SealedSegmentReadState::default());
+        let segment = DiskSegment {
+            start_offset: 0,
+            persisted: u64::MAX,
+            read_state: Some(Rc::clone(&handle)),
+        };
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(dir.display().to_string()),
+            segments: Vec::new(),
+            start_position: 0,
+            namespace_raw: 0,
+            validate_checksum: false,
+        };
+        let partition_dir = dir.display().to_string();
+
+        // First poll pays the on-file lookup and memoizes entry 2's interval
+        // [20, 30): offset 25 resolves to entry 2 (offset 20 -> position 200).
+        let first = plan
+            .resolve_sealed_start(&segment, offset_query(25), &partition_dir)
+            .await;
+        assert_eq!(first, Some(200));
+        let cursor = handle.offset_cursor.get().expect("cursor memoized");
+        assert_eq!(
+            (cursor.offset, cursor.valid_until, cursor.position),
+            (20, 30, 200),
+        );
+
+        // Delete the index file: an in-interval re-poll must still resolve
+        // (proof the cursor answered with zero index-file reads)...
+        std::fs::remove_dir_all(&dir).expect("remove dir");
+        let in_interval = plan
+            .resolve_sealed_start(&segment, offset_query(29), &partition_dir)
+            .await;
+        assert_eq!(in_interval, Some(200));
+
+        // ...while an offset past the interval misses the cursor, reaches for
+        // the (now gone) file, and falls back to the byte-0 scan.
+        let past_interval = plan
+            .resolve_sealed_start(&segment, offset_query(30), &partition_dir)
+            .await;
+        assert_eq!(past_interval, None);
+    }
 
     fn non_empty_fragments() -> PollFragments<4096> {
         let mut fragments = PollFragments::new();

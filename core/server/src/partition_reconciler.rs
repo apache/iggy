@@ -1183,8 +1183,8 @@ mod tests {
         PurgeTopicRequest,
     };
     use iggy_binary_protocol::{
-        Command, Operation, PrepareHeader, ReplyHeader, RoutedRequestHeader, WireIdentifier,
-        WireOptions,
+        Command, Operation, PrepareHeader, RepairRangeReplyHeader, ReplyHeader,
+        RequestPreparesHeader, RoutedRequestHeader, WireIdentifier, WireOptions,
     };
     use message_bus::IggyMessageBus;
     use metadata::IggyMetadata;
@@ -1193,7 +1193,7 @@ mod tests {
     use metadata::stm::StateMachine;
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
-    use partitions::{IggyPartitions, PartitionsConfig};
+    use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig, RepairSession};
     use server_common::sharding::{IggyNamespace, ShardId};
     use server_common::{Message, MessageBag};
     use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
@@ -1316,6 +1316,54 @@ mod tests {
         header.request = TEST_REQUEST_ID;
         header.client = TEST_CLIENT_ID;
         MessageBag::Request(msg)
+    }
+
+    /// Build a partition-plane `RepairRangeReply` as the serving peer would
+    /// send it. Only the fields the receive path reads are stamped: routing
+    /// (`group`), session (`nonce`), and the verdict (`command`, `op`).
+    fn build_repair_range_reply(
+        namespace: IggyNamespace,
+        command: Command,
+        nonce: u128,
+        op: u64,
+    ) -> MessageBag {
+        let header_size = size_of::<RepairRangeReplyHeader>();
+        let mut msg = Message::<RepairRangeReplyHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<RepairRangeReplyHeader>(
+            &mut msg.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes form a valid RepairRangeReplyHeader");
+        header.command = command;
+        header.size = u32::try_from(header_size).expect("header size fits u32");
+        header.nonce = nonce;
+        header.op = op;
+        header.group = namespace.inner();
+        MessageBag::RepairRangeReply(msg)
+    }
+
+    /// Build a partition-plane `RequestPrepares` as a rejoining peer would
+    /// send it. `replica` is the requester the serve path replies to.
+    fn build_request_prepares(
+        namespace: IggyNamespace,
+        replica: u8,
+        nonce: u128,
+        from_op: u64,
+        to_op: u64,
+    ) -> MessageBag {
+        let header_size = size_of::<RequestPreparesHeader>();
+        let mut msg = Message::<RequestPreparesHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<RequestPreparesHeader>(
+            &mut msg.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes form a valid RequestPreparesHeader");
+        header.command = Command::RequestPrepares;
+        header.size = u32::try_from(header_size).expect("header size fits u32");
+        header.replica = replica;
+        header.nonce = nonce;
+        header.from_op = from_op;
+        header.to_op = to_op;
+        header.group = namespace.inner();
+        MessageBag::RequestPrepares(msg)
     }
 
     fn assignment(partition_id: u32, consensus_group_id: u64) -> CreatedPartitionAssignment {
@@ -1468,6 +1516,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         let shards_table = PapayaShardsTable::new();
@@ -1495,19 +1544,30 @@ mod tests {
     /// Mesh covers `0..=shard_id` since consumers index `senders[shard_id]`.
     /// Peer receivers are dropped, so a misroute fails loudly instead of landing
     /// in this shard's inbox and reading as success.
+    /// Both receiving ends of a test shard's own sender-ring slot: parked
+    /// frames re-dispatch onto the main lane, staged client answers onto the
+    /// reply lane.
+    struct TestLanes {
+        main: shard::Receiver<shard::ShardFrame>,
+        reply: shard::Receiver<shard::ShardFrame>,
+    }
+
     fn build_test_shard_with_inbox(
         shard_id: u16,
         config: &ServerConfig,
         mux: TestMux,
         capacity: usize,
-    ) -> (Rc<TestShard>, shard::Receiver<shard::ShardFrame>) {
+    ) -> (Rc<TestShard>, TestLanes) {
         let mut senders = Vec::with_capacity(usize::from(shard_id) + 1);
         let mut own_rx = None;
         for peer in 0..=shard_id {
-            let (tx, rx) = shard::shard_channel(peer, capacity);
+            let (tx, rx, reply_rx) = shard::shard_channel(peer, capacity, capacity);
             senders.push(tx);
             if peer == shard_id {
-                own_rx = Some(rx);
+                own_rx = Some(TestLanes {
+                    main: rx,
+                    reply: reply_rx,
+                });
             }
         }
         let mut shard = Rc::into_inner(build_test_shard(shard_id, config, mux))
@@ -1519,27 +1579,32 @@ mod tests {
         )
     }
 
-    /// Drain a test shard's inbox into `(re-dispatched frames, staged client
+    /// Drain a test shard's lanes into `(re-dispatched frames, staged client
     /// sends)`: served parked frames vs answers headed for a client.
-    fn drain_inbox(rx: &shard::Receiver<shard::ShardFrame>) -> (usize, usize) {
+    fn drain_inbox(lanes: &TestLanes) -> (usize, usize) {
         let mut served = 0;
+        while let Ok(frame) = lanes.main.try_recv() {
+            if matches!(frame, shard::ShardFrame::Consensus { .. }) {
+                served += 1;
+            }
+        }
         let mut answered = 0;
-        while let Ok(frame) = rx.try_recv() {
-            match frame {
-                shard::ShardFrame::Consensus { .. } => served += 1,
-                shard::ShardFrame::Lifecycle(shard::LifecycleFrame::ForwardClientSend {
-                    ..
-                }) => answered += 1,
-                _ => {}
+        while let Ok(frame) = lanes.reply.try_recv() {
+            if matches!(
+                frame,
+                shard::ShardFrame::Lifecycle(shard::LifecycleFrame::ForwardClientSend { .. })
+            ) {
+                answered += 1;
             }
         }
         (served, answered)
     }
 
-    /// Count the `ForwardClientSend` frames sitting in a test shard's inbox: the
-    /// staged transient denies, which is what actually reaches a client.
-    fn drain_staged_client_sends(rx: &shard::Receiver<shard::ShardFrame>) -> usize {
-        drain_inbox(rx).1
+    /// Count the `ForwardClientSend` frames sitting in a test shard's reply
+    /// lane: the staged transient denies, which is what actually reaches a
+    /// client.
+    fn drain_staged_client_sends(lanes: &TestLanes) -> usize {
+        drain_inbox(lanes).1
     }
 
     fn make_ctx(
@@ -2282,6 +2347,184 @@ mod tests {
         assert!(
             !reconcile_once(&ctx).await,
             "once applied, the reconciler re-converges and fast-skips again"
+        );
+    }
+
+    /// Receive half of the purge gate in `on_repair_range_reply`: while a
+    /// committed purge has not applied locally, a repair verdict must be
+    /// deferred wholesale -- installing the peer's floor against pre-purge
+    /// segments silently loses the post-purge batches (offsets restarting at
+    /// 0 flush-skip below the stale durable line).
+    #[compio::test]
+    async fn repair_completion_defers_until_committed_purge_applies() {
+        const NONCE: u128 = 7;
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-repair-gate");
+        seed_topic(&mux, 2, 0, "topic-repair-gate", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        let ns = IggyNamespace::new(0, 0, 0);
+        shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&ns)
+            .expect("partition is materialised")
+            .repair = Some(RepairSession {
+            nonce: NONCE,
+            to_op: 5,
+            floor: None,
+            peer: 1,
+            first_batch_offset: None,
+            idle_ticks: 0,
+        });
+
+        // Committed purge: generation 1 > applied 0.
+        let purge = PurgeTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::PurgeTopic, &purge))
+            .expect("PurgeTopic apply succeeds");
+
+        let deferred_before = shard
+            .metrics()
+            .partition_repair_serves_deferred_purge_value();
+        shard
+            .on_message(build_repair_range_reply(
+                ns,
+                Command::RangeEvicted,
+                NONCE,
+                4,
+            ))
+            .await;
+        let session = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&ns)
+            .expect("partition survives the deferral")
+            .repair
+            .expect("deferral must leave the repair session armed");
+        assert_eq!(
+            session.floor, None,
+            "a deferred RangeEvicted must not install the peer's floor"
+        );
+        assert_eq!(
+            shard
+                .metrics()
+                .partition_repair_serves_deferred_purge_value(),
+            deferred_before + 1,
+            "the deferral must be visible on the purge-deferred counter"
+        );
+
+        // Apply the purge; the same frame now lands.
+        let partitions_config = shard.plane.partitions().config().clone();
+        shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&ns)
+            .expect("purged partition is materialised")
+            .purge(&partitions_config, 1)
+            .await
+            .expect("apply staged purge");
+        shard
+            .on_message(build_repair_range_reply(
+                ns,
+                Command::RangeEvicted,
+                NONCE,
+                4,
+            ))
+            .await;
+        let session = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&ns)
+            .expect("partition survives the retry")
+            .repair
+            .expect("RangeEvicted records the floor but keeps the session");
+        assert_eq!(
+            session.floor,
+            Some(3),
+            "after the purge applies, the retried frame must install the floor"
+        );
+        assert_eq!(
+            shard
+                .metrics()
+                .partition_repair_serves_deferred_purge_value(),
+            deferred_before + 1,
+            "the retried frame must pass the gate without another deferral"
+        );
+    }
+
+    /// Serve half of the purge gate in `on_request_prepares`: while a
+    /// committed purge has not applied locally, the journal still holds
+    /// pre-purge entries with no floor to fence them, so serving a rejoiner
+    /// must be deferred (no reply; the requester's stall retry re-asks).
+    #[compio::test]
+    async fn repair_serve_defers_until_committed_purge_applies() {
+        const NONCE: u128 = 11;
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-serve-gate");
+        seed_topic(&mux, 2, 0, "topic-serve-gate", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+
+        let ns = IggyNamespace::new(0, 0, 0);
+        let purge = PurgeTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::PurgeTopic, &purge))
+            .expect("PurgeTopic apply succeeds");
+
+        let deferred_before = shard
+            .metrics()
+            .partition_repair_serves_deferred_purge_value();
+        shard
+            .on_message(build_request_prepares(ns, 1, NONCE, 1, 5))
+            .await;
+        assert_eq!(
+            shard
+                .metrics()
+                .partition_repair_serves_deferred_purge_value(),
+            deferred_before + 1,
+            "an unapplied purge must defer the serve"
+        );
+
+        let partitions_config = shard.plane.partitions().config().clone();
+        shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&ns)
+            .expect("purged partition is materialised")
+            .purge(&partitions_config, 1)
+            .await
+            .expect("apply staged purge");
+        shard
+            .on_message(build_request_prepares(ns, 1, NONCE, 1, 5))
+            .await;
+        assert_eq!(
+            shard
+                .metrics()
+                .partition_repair_serves_deferred_purge_value(),
+            deferred_before + 1,
+            "once the purge applies, the retried request must be served, not deferred"
         );
     }
 
