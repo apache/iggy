@@ -71,6 +71,19 @@ python basic/consumer.py
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
 
+### Message Partitioning
+
+Shows how to route message batches to a fixed partition, use server-side
+balanced routing, or keep the same message key on the same partition.
+
+```bash
+# Using uv
+uv run partitioning/producer.py
+
+# Without using uv
+python partitioning/producer.py
+```
+
 ### Message Headers
 
 Shows how to attach and read Python SDK user headers with `str`, `bytes`, `bool`, `int`, and `float` values. Two variants share their logic through `message-headers/common.py`:

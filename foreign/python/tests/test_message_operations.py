@@ -24,10 +24,51 @@ from apache_iggy import (
     HeaderKey,
     HeaderValue,
     IggyClient,
+    Partitioning,
     PollingStrategy,
     UserHeaders,
 )
 from apache_iggy import SendMessage as Message
+
+
+class TestPartitioning:
+    """Test message partitioning strategy construction."""
+
+    @pytest.mark.unit
+    def test_balanced_and_partition_id_strategies(self):
+        assert isinstance(Partitioning.balanced(), Partitioning)
+        assert isinstance(Partitioning.partition_id(1), Partitioning)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("key", [b"customer-42", "customer-42", "客户-42"])
+    def test_messages_key_accepts_bytes_and_strings(self, key):
+        assert isinstance(Partitioning.messages_key(key), Partitioning)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("key", [b"a" * 255, "a" * 255])
+    def test_messages_key_accepts_255_bytes(self, key):
+        assert isinstance(Partitioning.messages_key(key), Partitioning)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("key", [b"", "", b"a" * 256, "a" * 256, "界" * 86])
+    def test_messages_key_rejects_invalid_encoded_length(self, key):
+        with pytest.raises(ValueError):
+            Partitioning.messages_key(key)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("partition_id", [-1, 2**32])
+    def test_partition_id_rejects_values_outside_u32(self, partition_id):
+        with pytest.raises(OverflowError):
+            Partitioning.partition_id(partition_id)
+
+    @pytest.mark.unit
+    def test_partitioning_rejects_invalid_types(self):
+        with pytest.raises(TypeError):
+            # pyrefly: ignore  # bad-argument-type
+            Partitioning.partition_id("0")
+        with pytest.raises(TypeError):
+            # pyrefly: ignore  # bad-argument-type
+            Partitioning.messages_key(1)
 
 
 class TestMessageOperations:
@@ -108,6 +149,87 @@ class TestMessageOperations:
         confirmation = response.confirmations[0]
         assert confirmation.partition_id == partition_id
         assert confirmation.base_offset == polled_messages[0].offset()
+
+    @pytest.mark.asyncio
+    async def test_send_messages_with_partition_id_strategy(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 2
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=3
+        )
+
+        response = await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=Partitioning.partition_id(partition_id),
+            messages=[Message("fixed partition")],
+        )
+
+        assert len(response.confirmations) == 1
+        assert response.confirmations[0].partition_id == partition_id
+
+    @pytest.mark.asyncio
+    async def test_send_messages_with_balanced_strategy(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partitions_count = 3
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=partitions_count,
+        )
+
+        response = await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=Partitioning.balanced(),
+            messages=[Message("balanced")],
+        )
+
+        assert len(response.confirmations) == 1
+        assert response.confirmations[0].partition_id < partitions_count
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", [b"customer-42", "customer-42"])
+    async def test_send_messages_with_same_key_uses_same_partition(
+        self, iggy_client: IggyClient, unique_name, key
+    ):
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=3
+        )
+        partitioning = Partitioning.messages_key(key)
+
+        first = await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partitioning,
+            messages=[Message("first")],
+        )
+        second = await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partitioning,
+            messages=[Message("second")],
+        )
+
+        assert len(first.confirmations) == 1
+        assert len(second.confirmations) == 1
+        assert (
+            first.confirmations[0].partition_id == second.confirmations[0].partition_id
+        )
 
     @pytest.mark.asyncio
     async def test_send_and_poll_messages_as_bytes(
