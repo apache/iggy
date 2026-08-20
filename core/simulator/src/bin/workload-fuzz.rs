@@ -38,7 +38,7 @@
 use clap::Parser;
 use iggy_common::IggyByteSize;
 use server_common::sharding::IggyNamespace;
-use server_common::{MemoryPool, MemoryPoolConfigOther};
+use server_common::{MemoryPool, MemoryPoolSettings};
 use simulator::Simulator;
 use simulator::client::SimClient;
 use simulator::packet::PacketSimulatorOptions;
@@ -102,7 +102,7 @@ fn main() {
 
     // poll_messages / reply paths panic without an initialized pool; disabled
     // pooling falls through to the system allocator.
-    MemoryPool::init_pool(&MemoryPoolConfigOther {
+    MemoryPool::init_pool(&MemoryPoolSettings {
         enabled: false,
         size: IggyByteSize::from(0u64),
         bucket_capacity: 1,

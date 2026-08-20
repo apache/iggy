@@ -1138,10 +1138,6 @@ where
             return;
         }
 
-        // TODO add assertions for valid state here.
-
-        // TODO handle gap in ops.
-
         // Verify hash chain integrity BEFORE checkpoint. `checkpoint_if_needed`
         // can drain WAL entries, making previous_header return None.
         if let Some(previous) = journal.handle().previous_header(&header) {
@@ -3423,12 +3419,11 @@ where
 
         let header = *message.header();
 
-        // TODO: calculate the index;
         #[allow(clippy::cast_possible_truncation)]
-        let idx = header.op as usize;
+        let op = header.op as usize;
         assert_eq!(header.command, Command::Prepare);
         assert!(
-            journal.handle().header(idx).is_some(),
+            journal.handle().header(op).is_some(),
             "replicate: prepare must be durable in local journal before chain-forward"
         );
         if let Err(e) = replicate_to_next_in_chain(consensus, message).await {

@@ -622,6 +622,19 @@ key_file = ""
 # use hostnames in the roster if the certificates only have DNS SANs.
 ca_file = ""
 
+# Shard-0 coordinator placement.
+[cluster.coordinator]
+# When the server runs more than one shard, exclude shard 0 from replica
+# placement. Shard 0 already hosts the coordinator, the metadata writer, and
+# both listeners; replica connections are long-lived steady flows, so they are
+# offloaded to peer shards by default.
+skip_shard_zero_for_replicas = true
+
+# When the server runs more than one shard, exclude shard 0 from client
+# placement. Off by default: client connections are short-lived and benefit
+# from shard-0 parallelism more than replicas do.
+skip_shard_zero_for_clients = false
+
 # Full roster of cluster members. Byte-identical on every node. The running
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
 # flag, which selects the entry in this list that describes the current

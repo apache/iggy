@@ -989,7 +989,12 @@ async fn shard_main(
     let poll_interval = config.system.sharding.shutdown_poll_interval.get_duration();
 
     let shutdown_flag_for_handoff = Arc::clone(&shutdown_flag);
-    spawn_shutdown_watchdog(Rc::clone(&bus), shutdown_flag, drain_timeout, poll_interval);
+    let mut shutdown_watchdog = Some(spawn_shutdown_watchdog(
+        Rc::clone(&bus),
+        shutdown_flag,
+        drain_timeout,
+        poll_interval,
+    ));
 
     // Metadata bootstrap is single-writer: shard 0 owns the WAL and the
     // only `WriteHandle`-bearing `MuxStateMachine`. Peer shards receive
@@ -1194,20 +1199,17 @@ async fn shard_main(
     );
 
     // Re-check the cross-thread shutdown flag here, *before* spawning the
-    // message pump. A sibling shard may have failed in the window between
-    // the metadata broadcast and this point; gating before spawn keeps the
-    // bus' `background_tasks` vec empty on the shutdown path. Spawn-then-
-    // check would leave `bus.track_background(pump_handle)` registering a
-    // `JoinHandle` that only `bus.shutdown()` drains, but the watchdog
-    // driving `bus.shutdown()` is `.detach()`'d (see TODO at
-    // `spawn_shutdown_watchdog`) and may not be scheduled before this
-    // function returns `Ok(())` and the compio runtime drops, cancelling
-    // the pump mid-`write_vectored_all`.
-    //
-    // Without this gate shard 0 would also still open TCP/QUIC/WS
+    // message pump: it keeps the bus' `background_tasks` vec empty on the
+    // shutdown path, and shard 0 would otherwise still open TCP/QUIC/WS
     // listeners for a server that is already tearing down, briefly
     // accepting connections that immediately get torn by the watchdog.
+    //
+    // The flag is set, so the watchdog is (about to be) driving
+    // `bus.shutdown()`; await it so the runtime does not drop mid-drain.
     if shutdown_flag_for_handoff.load(Ordering::Relaxed) {
+        if let Some(watchdog) = shutdown_watchdog.take() {
+            let _ = watchdog.await;
+        }
         return Ok(());
     }
 
@@ -1420,6 +1422,12 @@ async fn shard_main(
             // The bind failure is the primary fault; the drain verdict only
             // matters for the log it emits.
             let _ = await_pump_drain(pump_handle.take(), config, shard_id).await;
+            // Neither the flag nor the bus token has fired yet on this path,
+            // so the watchdog is still idle-looping; awaiting it would hang.
+            // Detach and let `run_shard_thread`'s unwind flip the flag.
+            if let Some(watchdog) = shutdown_watchdog.take() {
+                watchdog.detach();
+            }
             return Err(error);
         }
 
@@ -1446,7 +1454,15 @@ async fn shard_main(
         let _ = tx.try_send(());
     }
 
-    await_pump_drain(pump_handle.take(), config, shard_id).await?;
+    // Await the watchdog even when the drain verdict is an error: the token
+    // has fired, so it either stands down within one poll interval or is
+    // mid-`bus.shutdown()`, and dropping it there truncates in-flight
+    // `ClientForwardFailed` replies.
+    let pump_verdict = await_pump_drain(pump_handle.take(), config, shard_id).await;
+    if let Some(watchdog) = shutdown_watchdog.take() {
+        let _ = watchdog.await;
+    }
+    pump_verdict?;
 
     info!(shard = shard_id, "server shard exited cleanly");
     Ok(())
@@ -1662,16 +1678,27 @@ async fn await_bootstrap_complete(
 /// is the only Send signal we have; the bus' shutdown machinery is
 /// `!Send` (`Rc<Cell<bool>>` + per-shard `async_channel`), so it must be
 /// triggered from within the runtime that owns the bus.
+///
+/// The caller owns the returned handle and must await it on the exit paths
+/// where shutdown is in progress (flag set or bus token triggered):
+/// dropping it there cancels the watchdog mid-`bus.shutdown()`, truncating
+/// in-flight `ClientForwardFailed` replies (terminal per `SendError` docs).
+/// It cannot go through `bus.track_background` instead: the watchdog itself
+/// drives `bus.shutdown()`, and the bg-drain loop in `shutdown()` would
+/// re-enter awaiting the watchdog's own pending shutdown call
+/// (self-deadlock). The await is bounded: once the token fires the loop
+/// stands down within one poll interval, and the shutdown call itself is
+/// capped by `drain_timeout`.
 #[allow(clippy::needless_pass_by_value)]
 fn spawn_shutdown_watchdog(
     bus: Rc<IggyMessageBus>,
     shutdown_flag: Arc<AtomicBool>,
     drain_timeout: Duration,
     poll_interval: Duration,
-) {
+) -> compio::runtime::JoinHandle<()> {
     let bus_for_task = Rc::clone(&bus);
     let bus_token = bus.token();
-    let watchdog = compio::runtime::spawn(async move {
+    compio::runtime::spawn(async move {
         loop {
             if shutdown_flag.load(Ordering::Relaxed) {
                 break;
@@ -1684,19 +1711,7 @@ fn spawn_shutdown_watchdog(
             compio::time::sleep(poll_interval).await;
         }
         let _ = bus_for_task.shutdown(drain_timeout).await;
-    });
-    // TODO(hubcio): `.detach()` races bus shutdown: when `bus.token()` is
-    // triggered, `shard_main` returns and the runtime drops the watchdog
-    // mid-`bus.shutdown()`, truncating in-flight `ClientForwardFailed`
-    // replies (terminal per `SendError` docs). Cannot use
-    // `bus.track_background(watchdog)` here because the watchdog itself
-    // drives `bus.shutdown()`, and the bg-drain loop in `shutdown()`
-    // would re-enter awaiting the watchdog's own pending shutdown call
-    // (self-deadlock). Fix: extract a `core/task_registry` crate mirroring
-    // `core/server`'s task-tracking mechanism, share it between the bus
-    // and server so background tasks can be reaped without coupling
-    // to the bus shutdown order.
-    watchdog.detach();
+    })
 }
 
 /// Copy the configured cluster roster plus this node's own client ports into
@@ -1790,6 +1805,11 @@ async fn build_shard_for_thread(
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
             encryptor,
+            path_layout: partitions::PartitionPathLayout {
+                streams_root: config.system.get_streams_path(),
+                topics_dir: config.system.topic.path.clone(),
+                partitions_dir: config.system.partition.path.clone(),
+            },
         },
         owned_partitions_capacity,
     );
@@ -2007,7 +2027,10 @@ async fn build_shard_for_thread(
             shard::ReplicaTopology::new(topology.self_replica_id, topology.replica_count),
             Rc::clone(&bus),
         ),
-        CoordinatorConfig::default(),
+        CoordinatorConfig {
+            skip_shard_zero_for_replicas: config.cluster.coordinator.skip_shard_zero_for_replicas,
+            skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
+        },
         metrics,
     )
     .build()

@@ -3842,7 +3842,7 @@ mod tests {
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
     use metadata::{IggyMetadata, MuxStateMachine};
-    use partitions::{IggyPartitions, PartitionsConfig};
+    use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::iobuf::Frozen;
     use server_common::sharding::ShardId;
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
@@ -3999,6 +3999,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         TestShard::without_inbox(
@@ -4165,6 +4166,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         let shard = Rc::new(TestShard::without_inbox(
@@ -4286,6 +4288,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         let shard = Rc::new(TestShard::without_inbox(
@@ -4410,6 +4413,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         let shard = Rc::new(TestShard::without_inbox(
@@ -4474,6 +4478,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         // Real sender ring so the staged deny is observable: the test holds
