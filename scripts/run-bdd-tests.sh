@@ -36,7 +36,7 @@ usage(){
   log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
-  log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
+  log "  feature: basic_messaging | leader_redirection | raw_command | stream_crud | all  (default: all)"
   log ""
   log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
   log "  (default: target/debug/iggy-server) with an iggy CLI at IGGY_CLI_PATH."
@@ -49,7 +49,7 @@ usage(){
 }
 
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|all) ;;
+  basic_messaging|leader_redirection|raw_command|stream_crud|all) ;;
   *)
     log "Unknown feature: ${FEATURE}"
     usage
@@ -69,7 +69,7 @@ ALL_COMPOSE_FILES=(
 
 COMPOSE_FILES=(-f docker-compose.yml)
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|all)
+  basic_messaging|leader_redirection|raw_command|stream_crud|all)
     COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
 esac
 case "$FEATURE" in
@@ -94,20 +94,34 @@ if [ "$COVERAGE" = "1" ]; then
   log "📊 Coverage collection enabled → reports will be in ./reports/"
 fi
 
+unsupported(){
+  local feature="$1" svc="$2"
+  if [ "$SDK" = "all" ]; then
+    log "⚠️ skipping ${svc%-bdd} (does not support ${feature})"
+    return 0
+  else
+    log "❌ ${SDK} does not support feature '${feature}'"
+    return 1
+  fi
+}
+
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
   if [ "$FEATURE" = "leader_redirection" ]; then
     case "$svc" in
       rust-bdd|go-bdd|csharp-bdd|java-bdd) ;;
       *)
-        if [ "$SDK" = "all" ]; then
-          log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"
-          return 0
-        else
-          log "❌ ${SDK} does not support feature '${FEATURE}'"
-          return 1
-        fi
-        ;;
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
+    esac
+  fi
+
+  if [ "$FEATURE" = "stream_crud" ]; then
+    case "$svc" in
+      rust-bdd|java-bdd) ;;
+      *)
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
     esac
   fi
 

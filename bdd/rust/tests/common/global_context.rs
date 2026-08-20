@@ -26,6 +26,7 @@ pub struct GlobalContext {
     pub server_addr: Option<String>,
     pub last_stream_id: Option<u32>,
     pub last_stream_name: Option<String>,
+    pub last_stream_was_found: bool,
     pub last_topic_id: Option<u32>,
     pub last_topic_name: Option<String>,
     pub last_topic_partitions: Option<u32>,
