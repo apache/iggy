@@ -270,8 +270,11 @@ impl Simulator {
 
             // One crossfire mesh per replica; every shard gets a clone of
             // the canonical senders vec and exclusively takes its inbox.
-            let (senders, mut inboxes) =
-                shard::shard_mesh_channels(shards_per_replica, SIM_INBOX_CAPACITY);
+            let (senders, mut inboxes, mut reply_inboxes) = shard::shard_mesh_channels(
+                shards_per_replica,
+                SIM_INBOX_CAPACITY,
+                SIM_INBOX_CAPACITY,
+            );
 
             let mut shards = Vec::with_capacity(usize::from(shards_per_replica));
             let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
@@ -286,6 +289,9 @@ impl Simulator {
                 let inbox = inboxes[usize::from(shard_idx)]
                     .take()
                     .expect("mesh yields exactly one inbox per shard");
+                let reply_inbox = reply_inboxes[usize::from(shard_idx)]
+                    .take()
+                    .expect("mesh yields exactly one reply inbox per shard");
                 // Only shard 0 owns metadata consensus, so only it carries the
                 // superblock. Peer shards persist nothing.
                 let shard_superblock = if shard_idx == 0 {
@@ -302,6 +308,7 @@ impl Simulator {
                     rc,
                     senders.clone(),
                     inbox,
+                    reply_inbox,
                     consensus_clock.clone(),
                     shell,
                     metadata_bundle.clone(),
@@ -609,6 +616,16 @@ impl Simulator {
                     self.seed,
                     self.executor.schedule_hash(),
                 );
+                let pending_replies = shard.reply_inbox_len();
+                assert_eq!(
+                    pending_replies,
+                    0,
+                    "lost wakeup: replica {replica_id} shard {} reply lane holds \
+                     {pending_replies} frame(s) at quiescence (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
             }
         }
     }
@@ -755,8 +772,8 @@ impl Simulator {
 
         let consensus_clock = ConsensusClock::new(Rc::new(SimClock::new(self.executor.timer())));
         let outbox = Rc::clone(&self.outboxes[idx]);
-        let (senders, mut inboxes) =
-            shard::shard_mesh_channels(shards_per_replica, SIM_INBOX_CAPACITY);
+        let (senders, mut inboxes, mut reply_inboxes) =
+            shard::shard_mesh_channels(shards_per_replica, SIM_INBOX_CAPACITY, SIM_INBOX_CAPACITY);
 
         let mut shards = Vec::with_capacity(usize::from(shards_per_replica));
         let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
@@ -766,6 +783,9 @@ impl Simulator {
             let inbox = inboxes[usize::from(shard_idx)]
                 .take()
                 .expect("mesh yields exactly one inbox per shard");
+            let reply_inbox = reply_inboxes[usize::from(shard_idx)]
+                .take()
+                .expect("mesh yields exactly one reply inbox per shard");
             let shard_superblock = if shard_idx == 0 {
                 Some(superblock.clone())
             } else {
@@ -780,6 +800,7 @@ impl Simulator {
                 self.replica_count,
                 senders.clone(),
                 inbox,
+                reply_inbox,
                 consensus_clock.clone(),
                 self.shell,
                 metadata_bundle.clone(),

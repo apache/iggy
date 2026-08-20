@@ -400,44 +400,60 @@ where
     }
 }
 
-/// Create a bounded inter-shard channel whose sender is tagged with the
-/// owning shard.
+/// Create the bounded inter-shard channel pair (main lane + reply lane)
+/// whose sender is tagged with the owning shard.
 ///
 /// Bootstrap uses this to build the per-shard sender `Vec` such that
-/// `vec[i]` necessarily reaches shard `i`.
+/// `vec[i]` necessarily reaches shard `i`. The second receiver is the reply
+/// lane: cross-shard client `Reply` forwards, whose drops are terminal, ride
+/// a channel of their own so a consensus burst filling the main lane cannot
+/// evict them (see `[system.sharding] reply_inbox_capacity`).
 #[must_use]
-pub fn shard_channel(owner_shard: u16, capacity: usize) -> (TaggedSender, Receiver<ShardFrame>) {
+pub fn shard_channel(
+    owner_shard: u16,
+    capacity: usize,
+    reply_capacity: usize,
+) -> (TaggedSender, Receiver<ShardFrame>, Receiver<ShardFrame>) {
     let (tx, rx) = channel::<ShardFrame>(capacity);
-    (TaggedSender::new(owner_shard, tx), rx)
+    let (reply_tx, reply_rx) = channel::<ShardFrame>(reply_capacity);
+    (TaggedSender::new(owner_shard, tx, reply_tx), rx, reply_rx)
 }
 
-/// Build canonical-ordered `(senders, inboxes)` pair for an N-shard mesh.
+/// Build canonical-ordered `(senders, inboxes, reply_inboxes)` for an
+/// N-shard mesh.
 ///
-/// Each `inboxes[i]` drains exclusively on the runtime owning shard `i`. The
-/// returned `senders` Vec satisfies `senders[i].shard_id() == i` by
-/// construction; clone it into every shard before spawning so all shards
-/// share the same mesh.
+/// Each `inboxes[i]` / `reply_inboxes[i]` drains exclusively on the runtime
+/// owning shard `i`. The returned `senders` Vec satisfies
+/// `senders[i].shard_id() == i` by construction; clone it into every shard
+/// before spawning so all shards share the same mesh.
 ///
 /// Receivers are wrapped in `Option` because [`Receiver`] (crossfire
-/// `AsyncRx`) is non-cloneable on purpose; bootstrap takes the slot for
+/// `AsyncRx`) is non-cloneable on purpose; bootstrap takes the slots for
 /// shard `i` exactly once when spawning the owning thread.
 #[must_use]
-pub fn shard_mesh_channels(
-    total_shards: u16,
-    capacity: usize,
-) -> (Vec<TaggedSender>, Vec<Option<Receiver<ShardFrame>>>) {
+pub fn shard_mesh_channels(total_shards: u16, capacity: usize, reply_capacity: usize) -> ShardMesh {
     let mut senders = Vec::with_capacity(total_shards as usize);
     let mut inboxes = Vec::with_capacity(total_shards as usize);
+    let mut reply_inboxes = Vec::with_capacity(total_shards as usize);
     for shard_id in 0..total_shards {
-        let (tx, rx) = shard_channel(shard_id, capacity);
+        let (tx, rx, reply_rx) = shard_channel(shard_id, capacity, reply_capacity);
         senders.push(tx);
         inboxes.push(Some(rx));
+        reply_inboxes.push(Some(reply_rx));
     }
-    (senders, inboxes)
+    (senders, inboxes, reply_inboxes)
 }
 
-/// A [`Sender`] annotated with the id of the shard whose paired receiver it
-/// feeds.
+/// The canonical N-shard mesh: lane senders plus the per-shard receivers
+/// (`inboxes[i]` / `reply_inboxes[i]` drain on the runtime owning shard `i`).
+pub type ShardMesh = (
+    Vec<TaggedSender>,
+    Vec<Option<Receiver<ShardFrame>>>,
+    Vec<Option<Receiver<ShardFrame>>>,
+);
+
+/// The pair of lane [`Sender`]s annotated with the id of the shard whose
+/// paired receivers they feed.
 ///
 /// Inter-shard routing indexes `senders[i]` with `i == target_shard`. The
 /// plain `Sender` form has no way to verify that invariant at runtime, so a
@@ -446,24 +462,40 @@ pub fn shard_mesh_channels(
 /// [`TaggedSender::new`]) at the channel-creation site; the coordinator and
 /// [`IggyShard`] ctors then validate `senders[i].shard_id() == i`,
 /// returning [`ShardCtorError`] if violated.
+///
+/// `Deref` targets the main lane; [`Self::reply_sender`] exposes the reply
+/// lane (cross-shard client `Reply` forwards, terminal on drop).
 pub struct TaggedSender {
     shard_id: u16,
     inner: Sender<ShardFrame>,
+    reply: Sender<ShardFrame>,
 }
 
 impl TaggedSender {
-    /// Wrap an already-constructed sender with the id of the shard whose
-    /// paired receiver drains it. Prefer [`shard_channel`] unless an
-    /// existing sender is being re-tagged (e.g., tests that build senders
-    /// manually and know the ordering is correct).
+    /// Wrap already-constructed lane senders with the id of the shard whose
+    /// paired receivers drain them. Prefer [`shard_channel`] unless existing
+    /// senders are being re-tagged (e.g., tests that build senders manually
+    /// and know the ordering is correct).
     #[must_use]
-    pub const fn new(shard_id: u16, inner: Sender<ShardFrame>) -> Self {
-        Self { shard_id, inner }
+    pub const fn new(shard_id: u16, inner: Sender<ShardFrame>, reply: Sender<ShardFrame>) -> Self {
+        Self {
+            shard_id,
+            inner,
+            reply,
+        }
     }
 
     #[must_use]
     pub const fn shard_id(&self) -> u16 {
         self.shard_id
+    }
+
+    /// The reply lane's sender. Client `Reply` forwards go here so the main
+    /// lane's consensus traffic cannot evict them; everything else stays on
+    /// the main lane via `Deref`.
+    #[must_use]
+    pub const fn reply_sender(&self) -> &Sender<ShardFrame> {
+        &self.reply
     }
 }
 
@@ -472,6 +504,7 @@ impl Clone for TaggedSender {
         Self {
             shard_id: self.shard_id,
             inner: self.inner.clone(),
+            reply: self.reply.clone(),
         }
     }
 }
@@ -552,17 +585,19 @@ fn forward_nonce_seed<B: MessageBus>(consensus: Option<&VsrConsensus<B>>) -> u64
 /// Lifecycle frame variants.
 ///
 /// Connection setup and cross-shard forwards: every frame the inter-shard
-/// channel carries that is NOT a consensus protocol message lives here.
+/// channels carry that is NOT a consensus protocol message lives here.
 /// Splitting these out from [`ShardFrame::Consensus`] keeps the consensus
-/// dispatch path hot and cache-tight while leaving lifecycle traffic on
-/// the same single channel (preserving relative ordering between consensus
-/// and lifecycle frames at near-zero cost).
+/// dispatch path hot and cache-tight.
 ///
-/// Trade-off: consensus and lifecycle traffic compete for one bounded
-/// inbox. A consensus burst or retransmit storm can fill it exactly when
-/// a terminal-drop [`LifecycleFrame::ForwardClientSend`] needs the space;
-/// `inbox_capacity` is a single knob and cannot isolate the two frame
-/// classes.
+/// Lane placement: every variant rides the main inbox EXCEPT
+/// [`LifecycleFrame::ForwardClientSend`], which rides the dedicated reply
+/// lane (`reply_inbox_capacity`) because its drops are terminal while every
+/// main-lane variant's loss is recovered by some retry (VSR retransmit,
+/// reconnect sweep, periodic tick). The two lanes are independent queues:
+/// there is NO relative ordering between a consensus frame and a client
+/// reply forward, which is safe because a reply forward never
+/// order-couples with consensus traffic (it requires a served request,
+/// and per-client reply order is preserved within the reply lane itself).
 #[non_exhaustive]
 pub enum LifecycleFrame {
     /// Shard 0 distributes an inbound replica TCP connection fd to the
@@ -1296,6 +1331,12 @@ where
     /// messages here via the corresponding sender.
     inbox: Receiver<ShardFrame>,
 
+    /// Receiver end of this shard's reply lane: cross-shard client `Reply`
+    /// forwards, split off the main inbox because their drops are terminal
+    /// (no in-protocol retransmit) while a consensus burst can legitimately
+    /// fill the main lane. Fed via [`TaggedSender::reply_sender`].
+    reply_inbox: Receiver<ShardFrame>,
+
     /// Partition namespace -> owning shard lookup.
     shards_table: T,
 
@@ -1444,6 +1485,15 @@ where
         self.inbox.len()
     }
 
+    /// [`Self::inbox_len`] for the reply lane, so the simulator's lost-wakeup
+    /// tripwire covers both queues: a frame stranded in either lane at
+    /// quiescence is a missed wake.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn reply_inbox_len(&self) -> usize {
+        self.reply_inbox.len()
+    }
+
     /// Create a new shard with channel links and a shards table.
     ///
     /// * `bus` - shard-local bus handle (kept alongside the buses owned
@@ -1454,6 +1504,8 @@ where
     ///   construction time so every sender carries the id of the shard
     ///   whose receiver drains it.
     /// * `inbox` - the receiver that this shard drains in its message pump.
+    /// * `reply_inbox` - the reply lane's receiver, drained by the same
+    ///   pump (client `Reply` forwards only; see [`TaggedSender::reply_sender`]).
     /// * `shards_table` - namespace -> shard routing table.
     /// * `coordinator` - `Some` on shard 0 (supplied by the builder when
     ///   `is_shard_zero`), `None` everywhere else. Immutable post-ctor:
@@ -1483,6 +1535,7 @@ where
         partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
+        reply_inbox: Receiver<ShardFrame>,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
@@ -1509,6 +1562,7 @@ where
             senders,
             shard_count,
             inbox,
+            reply_inbox,
             shards_table,
             partition_consensus,
             coordinator,
@@ -1808,10 +1862,14 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
     ) -> Self {
-        // TODO(hubcio): crossfire's Flavor trait blocks unbounded channels
-        // with the current type setup; revisit when crossfire grows an
-        // unbounded variant or we replace it.
+        // Placeholder lanes: the simulator delivers frames straight to
+        // `on_message` (see the `shard_count` note below), so nothing ever
+        // sends here and capacity 1 exists only to satisfy the fields. The
+        // real lanes are bounded on purpose (`inbox_capacity` /
+        // `reply_inbox_capacity` are the shard's backpressure), so no
+        // unbounded variant is wanted here either.
         let (_tx, inbox) = channel(1);
+        let (_reply_tx, reply_inbox) = channel(1);
         let nonce_seed = forward_nonce_seed(metadata.consensus.as_ref());
         let plane = MuxPlane::new(variadic!(metadata, partitions));
         let ShardIdentity { id, name } = identity;
@@ -1835,6 +1893,7 @@ where
             // through, while preserving single-shard routing semantics.
             shard_count: 1,
             inbox,
+            reply_inbox,
             shards_table,
             partition_consensus,
             metrics: crate::metrics::ShardMetrics::for_shard(),
@@ -2450,11 +2509,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3286,7 +3342,7 @@ where
         // Count only what was actually handed to the pump: crediting before the
         // send reports an answer to a client that never received one, which is
         // the opposite of what this counter is read for.
-        if let Err(error) = sender.try_send(frame) {
+        if let Err(error) = sender.reply_sender().try_send(frame) {
             self.metrics.record_frame_drop(
                 crate::metrics::frame_drop_variant::PARTITION,
                 crate::coordinator::classify_try_send_err(&error),
@@ -3308,11 +3364,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3330,11 +3383,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3352,11 +3402,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3393,11 +3440,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -3566,11 +3610,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -3616,11 +3657,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -3706,11 +3744,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -3847,10 +3882,13 @@ where
                 .consensus()
                 .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
         let adopted = !actions.is_empty();
-        if adopted && let Some(pending) = partition.consensus().pending_view_log() {
+        if adopted {
             // Ahead of the local dispatch, which rebuilds the pipeline out of the
-            // journal this rewrites. Same position as the metadata arm's twin.
-            reconcile_partition_view_divergence(self.id, partition, &pending).await;
+            // journal this rewrites. Same position as the metadata arm's twin, and
+            // like it, pending-less adoptions (empty StartView suffix) still sweep
+            // the relics above the adopted head.
+            let pending = partition.consensus().pending_view_log();
+            reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
         }
         let consensus = partition.consensus();
         let (local_actions, wire_actions) = split_local_actions(actions);
@@ -3914,11 +3952,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -4018,11 +4053,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -4070,11 +4102,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StreamsFrontend,
     {
         let header = *msg.header();
@@ -4309,11 +4338,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         tracing::debug!(
             shard = self.id,
@@ -4483,11 +4509,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -4854,11 +4877,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         let partitions = self.plane.partitions();
         let started = {
@@ -4878,7 +4898,7 @@ where
             // already holds a header for, so the scan would report a gap nothing
             // fills. Backups reach this on StartView adoption; a primary-elect has no
             // adoption to hang it off.
-            reconcile_partition_view_divergence(self.id, partition, &pending).await;
+            reconcile_partition_view_divergence(self.id, partition, Some(&pending)).await;
             let consensus = partition.consensus();
             // Identity, not presence: see the metadata twin. The floor is the local
             // commit point, the partition twin of the metadata snapshot floor:
@@ -5013,6 +5033,13 @@ where
     /// `RebuildPipeline` reads the pipeline back out of it, and `CommitJournal`
     /// applies whatever sits at each op up to the merged commit point.
     ///
+    /// Runs on every adoption, parked suffix or not: an EMPTY `StartView` suffix
+    /// (`commit == op`, the steady case) parks no pending log, yet adoption still
+    /// drops the head under any journaled relics above it, and the primary's next
+    /// prepare would collide with them in `append` and poison the journal. With
+    /// no pending log the divergence scan has nothing to walk and only the
+    /// above-head sweep applies, with the head read off the adopted sequencer.
+    ///
     /// The split at the announced commit point is what matters. Above it a
     /// disagreement is ordinary, so the entry is dropped and the primary's
     /// retransmission refills the range. At or below it, this replica applied
@@ -5027,20 +5054,15 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let metadata = self.plane.metadata();
         let Some(ref consensus) = metadata.consensus else {
             return;
         };
-        let Some(pending) = consensus.pending_view_log() else {
-            return;
-        };
+        let pending = consensus.pending_view_log();
         let Some(journal) = metadata.journal.as_ref() else {
             return;
         };
@@ -5049,10 +5071,11 @@ where
         // not the view's commit point: `pending.commit_max` is the new primary's
         // number and a backup can sit above it. Splitting on the view's number
         // would drop already-executed ops with no rollback, and silently.
-        let applied_floor = pending.commit_max.max(consensus.commit_min());
+        let announced_commit = pending.as_ref().map_or(0, |pending| pending.commit_max);
+        let applied_floor = announced_commit.max(consensus.commit_min());
 
         let mut repairable_from: Option<u64> = None;
-        for canonical in &pending.headers {
+        for canonical in pending.as_ref().map_or(&[][..], |pending| &pending.headers) {
             let Some(local) = usize::try_from(canonical.op)
                 .ok()
                 .and_then(|slot| journal.handle().header(slot))
@@ -5067,7 +5090,7 @@ where
                     shard = self.id,
                     op = canonical.op,
                     view = consensus.view(),
-                    commit_max = pending.commit_max,
+                    commit_max = announced_commit,
                     commit_min = consensus.commit_min(),
                     local_checksum = local.checksum,
                     canonical_checksum = canonical.checksum,
@@ -5086,7 +5109,12 @@ where
         // under it, and the next prepare at `op_head + 1` then collides in `append`,
         // which refuses the slot even when the ops match. Floored at the applied
         // point too: an executed op is not rollback-able whatever the head says.
-        let above_head = pending.op_head.max(applied_floor) + 1;
+        // With no parked suffix the adopted sequencer IS the announced head.
+        let op_head = pending.as_ref().map_or_else(
+            || consensus.sequencer().current_sequence(),
+            |pending| pending.op_head,
+        );
+        let above_head = op_head.max(applied_floor) + 1;
         if journal
             .handle()
             .last_op()
@@ -5114,7 +5142,7 @@ where
                     shard = self.id,
                     from_op,
                     removed,
-                    op_head = pending.op_head,
+                    op_head,
                     view = consensus.view(),
                     "dropped {removed} uncommitted entries from op {from_op} that disagreed with \
                      the view's log; the primary's retransmission refills the range"
@@ -5148,11 +5176,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let metadata = self.plane.metadata();
@@ -5429,11 +5454,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: MetadataStm,
     {
         let header = *msg.header();
@@ -5569,11 +5591,8 @@ where
         B: MessageBus + 'static,
         T: ShardsTable,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         /// Alloc cap per artifact: a corrupt length field must not OOM the
@@ -6014,11 +6033,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
         T: ShardsTable,
     {
@@ -6068,11 +6084,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         let planes = self.plane.inner();
@@ -6290,27 +6303,25 @@ where
     /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
     #[allow(clippy::future_not_send)]
     #[allow(clippy::too_many_lines)]
-    pub async fn tick_partitions(&self)
+    pub async fn tick_partitions(&self, namespace_scratch: &mut Vec<IggyNamespace>)
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
+        debug_assert!(
+            namespace_scratch.is_empty(),
+            "namespace_scratch must be empty on entry",
+        );
         let partitions = self.plane.partitions();
         let repair_retry_ticks = self.repair_retry_ticks.get();
         // Fan out over every group (each partition's heartbeat/retransmit timer
         // must advance), so the keyed single-namespace lookup the control-frame
         // handlers use does not apply here. The namespaces are snapshotted into
-        // an owned Vec so no partitions-plane borrow is held across the tick
-        // `.await`.
-        // TODO(hubcio): reuse the pump's `namespace_scratch` (as
-        // `process_loopback` does) to drop this per-tick alloc; a quiet cluster
-        // still pays one Vec per heartbeat.
-        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+        // the pump's owned scratch (as `process_loopback` does) so no
+        // partitions-plane borrow is held across the tick `.await`.
+        namespace_scratch.extend(partitions.namespaces().copied());
 
         // Pre-pass: issue every group's pending superblock persist
         // CONCURRENTLY. A cluster-wide view change makes every group on
@@ -6321,7 +6332,7 @@ where
         // its store, lock, and failure bookkeeping, all behind `&self`),
         // and the per-group loop below re-checks the gate on its lock-free
         // fast path, so gating semantics are unchanged.
-        let pending_persists: Vec<_> = namespaces
+        let pending_persists: Vec<_> = namespace_scratch
             .iter()
             .copied()
             .filter(|namespace| {
@@ -6362,7 +6373,7 @@ where
         // already accepts.
         let mut transfers_inflight: Option<usize> = None;
 
-        for namespace in namespaces {
+        for namespace in namespace_scratch.drain(..) {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
                 continue;
             };
@@ -8218,11 +8229,8 @@ where
     where
         B: MessageBus,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: StateMachine<
                 Input = Message<PrepareHeader>,
                 Output = metadata::stm::result::ApplyReply,
@@ -8348,11 +8356,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
     J: JournalHandle,
-    <J as JournalHandle>::Target: Journal<
-            <J as JournalHandle>::Storage,
-            Entry = Message<PrepareHeader>,
-            Header = PrepareHeader,
-        >,
+    <J as JournalHandle>::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
 {
     tracing::info!(
         view = consensus.view(),
@@ -8446,11 +8450,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
     MJ: JournalHandle,
-    <MJ as JournalHandle>::Target: Journal<
-            <MJ as JournalHandle>::Storage,
-            Entry = Message<PrepareHeader>,
-            Header = PrepareHeader,
-        >,
+    <MJ as JournalHandle>::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
 {
     if !consensus.local_dvc_suffix_stale() {
         return;
@@ -8649,11 +8649,7 @@ fn build_metadata_dvc_suffix<J>(
 ) -> DvcSuffix
 where
     J: JournalHandle,
-    <J as JournalHandle>::Target: Journal<
-            <J as JournalHandle>::Storage,
-            Entry = Message<PrepareHeader>,
-            Header = PrepareHeader,
-        >,
+    <J as JournalHandle>::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
 {
     let Some(journal) = journal else {
         return DvcSuffix::empty();
@@ -8784,17 +8780,18 @@ fn build_dvc_suffix(
 async fn reconcile_partition_view_divergence<B, SB>(
     shard: u16,
     partition: &mut IggyPartition<B, SB>,
-    pending: &MergedLog,
+    pending: Option<&MergedLog>,
 ) where
     B: MessageBus,
     SB: journal::superblock::SuperblockStore,
 {
     // Truncation is safe only above what this replica has *applied*, which is not
     // the view's commit point: a backup can sit above it.
-    let applied_floor = pending.commit_max.max(partition.consensus().commit_min());
+    let announced_commit = pending.map_or(0, |pending| pending.commit_max);
+    let applied_floor = announced_commit.max(partition.consensus().commit_min());
 
     let mut repairable_from: Option<u64> = None;
-    for canonical in &pending.headers {
+    for canonical in pending.map_or(&[][..], |pending| &pending.headers) {
         let Some(local) = partition.log.journal().inner.header_by_op(canonical.op) else {
             continue;
         };
@@ -8807,7 +8804,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
                 namespace_raw = partition.consensus().group(),
                 op = canonical.op,
                 view = partition.consensus().view(),
-                commit_max = pending.commit_max,
+                commit_max = announced_commit,
                 commit_min = partition.consensus().commit_min(),
                 local_checksum = local.checksum,
                 canonical_checksum = canonical.checksum,
@@ -8821,8 +8818,13 @@ async fn reconcile_partition_view_divergence<B, SB>(
     }
 
     // The suffix above the announced head, which no canonical header names. As on
-    // the metadata twin, except here `append` pushes a duplicate rather than erroring.
-    let above_head = pending.op_head.max(applied_floor) + 1;
+    // the metadata twin, except here `append` pushes a duplicate rather than
+    // erroring. With no parked suffix the adopted sequencer IS the announced head.
+    let op_head = pending.map_or_else(
+        || partition.consensus().sequencer().current_sequence(),
+        |pending| pending.op_head,
+    );
+    let above_head = op_head.max(applied_floor) + 1;
     if partition
         .log
         .journal()
@@ -8843,7 +8845,7 @@ async fn reconcile_partition_view_divergence<B, SB>(
                 namespace_raw = partition.consensus().group(),
                 from_op,
                 removed,
-                op_head = pending.op_head,
+                op_head,
                 view = partition.consensus().view(),
                 "dropped {removed} uncommitted partition entries from op {from_op} that \
                  disagreed with the view's log; the primary's retransmission refills the range"
@@ -8954,11 +8956,7 @@ async fn dispatch_vsr_actions<B, P, J>(
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
     J: JournalHandle,
-    <J as JournalHandle>::Target: Journal<
-            <J as JournalHandle>::Storage,
-            Entry = Message<PrepareHeader>,
-            Header = PrepareHeader,
-        >,
+    <J as JournalHandle>::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
 {
     use std::mem::size_of;
 
