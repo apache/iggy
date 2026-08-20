@@ -1544,19 +1544,30 @@ mod tests {
     /// Mesh covers `0..=shard_id` since consumers index `senders[shard_id]`.
     /// Peer receivers are dropped, so a misroute fails loudly instead of landing
     /// in this shard's inbox and reading as success.
+    /// Both receiving ends of a test shard's own sender-ring slot: parked
+    /// frames re-dispatch onto the main lane, staged client answers onto the
+    /// reply lane.
+    struct TestLanes {
+        main: shard::Receiver<shard::ShardFrame>,
+        reply: shard::Receiver<shard::ShardFrame>,
+    }
+
     fn build_test_shard_with_inbox(
         shard_id: u16,
         config: &ServerConfig,
         mux: TestMux,
         capacity: usize,
-    ) -> (Rc<TestShard>, shard::Receiver<shard::ShardFrame>) {
+    ) -> (Rc<TestShard>, TestLanes) {
         let mut senders = Vec::with_capacity(usize::from(shard_id) + 1);
         let mut own_rx = None;
         for peer in 0..=shard_id {
-            let (tx, rx) = shard::shard_channel(peer, capacity);
+            let (tx, rx, reply_rx) = shard::shard_channel(peer, capacity, capacity);
             senders.push(tx);
             if peer == shard_id {
-                own_rx = Some(rx);
+                own_rx = Some(TestLanes {
+                    main: rx,
+                    reply: reply_rx,
+                });
             }
         }
         let mut shard = Rc::into_inner(build_test_shard(shard_id, config, mux))
@@ -1568,27 +1579,32 @@ mod tests {
         )
     }
 
-    /// Drain a test shard's inbox into `(re-dispatched frames, staged client
+    /// Drain a test shard's lanes into `(re-dispatched frames, staged client
     /// sends)`: served parked frames vs answers headed for a client.
-    fn drain_inbox(rx: &shard::Receiver<shard::ShardFrame>) -> (usize, usize) {
+    fn drain_inbox(lanes: &TestLanes) -> (usize, usize) {
         let mut served = 0;
+        while let Ok(frame) = lanes.main.try_recv() {
+            if matches!(frame, shard::ShardFrame::Consensus { .. }) {
+                served += 1;
+            }
+        }
         let mut answered = 0;
-        while let Ok(frame) = rx.try_recv() {
-            match frame {
-                shard::ShardFrame::Consensus { .. } => served += 1,
-                shard::ShardFrame::Lifecycle(shard::LifecycleFrame::ForwardClientSend {
-                    ..
-                }) => answered += 1,
-                _ => {}
+        while let Ok(frame) = lanes.reply.try_recv() {
+            if matches!(
+                frame,
+                shard::ShardFrame::Lifecycle(shard::LifecycleFrame::ForwardClientSend { .. })
+            ) {
+                answered += 1;
             }
         }
         (served, answered)
     }
 
-    /// Count the `ForwardClientSend` frames sitting in a test shard's inbox: the
-    /// staged transient denies, which is what actually reaches a client.
-    fn drain_staged_client_sends(rx: &shard::Receiver<shard::ShardFrame>) -> usize {
-        drain_inbox(rx).1
+    /// Count the `ForwardClientSend` frames sitting in a test shard's reply
+    /// lane: the staged transient denies, which is what actually reaches a
+    /// client.
+    fn drain_staged_client_sends(lanes: &TestLanes) -> usize {
+        drain_inbox(lanes).1
     }
 
     fn make_ctx(

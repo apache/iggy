@@ -945,7 +945,7 @@ where
     B: MessageBus,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -1313,7 +1313,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
 {
     fn is_applicable<H>(&self, message: &<VsrConsensus<B, P> as Consensus>::Message<H>) -> bool
@@ -1456,7 +1456,7 @@ where
     B: MessageBus,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -1694,6 +1694,40 @@ where
         let local_applied = consensus.commit_min();
         let snapshot_ahead = snapshot_seq > local_applied;
 
+        if snapshot_ahead && let Some(journal) = &self.journal {
+            // Discard the WAL suffix above the incoming floor BEFORE anything
+            // installs: the commit walk matches entries by op number alone, so
+            // a pre-crash suffix a view change has since reassigned would be
+            // applied as committed once the floor jump below pulls the walk
+            // past it. Ahead of the snapshot restore so a failed truncate
+            // aborts a not-yet-started install (the transfer retries) instead
+            // of stranding a restored state machine without its floor jump,
+            // which would double-apply the snapshot's ops on the next walk.
+            // Committed ops the range covered come back through the
+            // post-install tail repair; uncommitted ones were decided away by
+            // the view change that made this replica a transfer receiver.
+            // Serialization against appends holds as in
+            // `reconcile_metadata_view_divergence`: the pump is
+            // single-threaded and `replicate_preflight` refuses prepares
+            // while `is_transferring`.
+            let removed = journal
+                .handle()
+                .truncate_from(snapshot_seq + 1)
+                .await
+                .map_err(SnapshotError::Io)?;
+            if removed > 0 {
+                // The DVC snapshot's `(op, commit)` tag does not move when
+                // entries are removed under it; left stale it would advertise
+                // headers this replica can no longer serve.
+                consensus.invalidate_local_dvc_suffix();
+                tracing::warn!(
+                    snapshot_seq,
+                    removed,
+                    "state transfer dropped {removed} journal entries above the incoming floor"
+                );
+            }
+        }
+
         if snapshot_ahead {
             if let Some(coordinator) = &self.coordinator {
                 // The transferred snapshot REPLACES the one the superblock's
@@ -1760,26 +1794,9 @@ where
             // The snapshot IS ops `..=snapshot_seq` applied: jump the applied
             // frontier (this is the op-jump the tail repair resumes from) and
             // let the announced commit point pull the walk target forward.
-            //
-            // TODO(suffix-truncation): this hands the commit walk a floor it never
-            // verified. `set_snapshot_op` above only marks entries at or below the
-            // floor EVICTABLE -- everything above it stays resident -- and the walk
-            // matches WAL entries by op number alone, with no view or hash-chain
-            // check. A node carrying a pre-crash prepared-but-uncommitted suffix that
-            // a view change has since reassigned cluster-side will therefore apply
-            // those stale bodies as committed. The client table is shielded (the
-            // `client_table_frontier` fence skips table effects at or below the
-            // transferred frontier); the state machine is not.
-            //
-            // Same root cause as the `TODO(suffix-truncation)` in
-            // `VsrConsensus::handle_start_view`, and the same missing piece closes
-            // both: a durable truncate-from-op primitive on the journal, so a floor
-            // jump can discard the suffix above it instead of leaving it to be
-            // matched by op number. The floor jump does not create the hole, but it
-            // widens exposure to it precisely on the nodes guaranteed to have a stale
-            // log -- every state-transfer receiver is one. Deliberately out of scope
-            // here (flagged in review as follow-up): the primitive is a journal
-            // durability change, not a state-transfer one.
+            // The walk matches WAL entries by op number alone, so this floor
+            // is only safe because the truncate at the top of this install
+            // already discarded every journal entry above it.
             consensus.set_commit_floor(snapshot_seq);
             if snapshot_seq > consensus.sequencer().current_sequence() {
                 consensus.sequencer().set_sequence(snapshot_seq);
@@ -3090,7 +3107,7 @@ where
     P: Pipeline<Entry = PipelineEntry>,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -5297,6 +5314,99 @@ mod tests {
     /// `resume_stranded_commits` (wired into the shard pump tick) is the
     /// backstop: it re-enters the commit path, applies the stranded prefix,
     /// and promotes the queued register, whose awaiter then resolves.
+    /// A state-transfer receiver's WAL can hold a pre-crash suffix above the
+    /// incoming floor. The commit walk matches entries by op number alone, so
+    /// installing without discarding that suffix would later apply its stale
+    /// bodies as committed. The install must truncate the WAL above
+    /// `snapshot_seq` and keep everything at or below it, which tail repair
+    /// resumes from.
+    #[compio::test]
+    async fn state_transfer_install_truncates_the_wal_above_the_incoming_floor() {
+        const CLIENT: u128 = 9;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        const SNAPSHOT_SEQ: u64 = 2;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        // Journal ops 1..=3 directly (no acks, so `commit_min` stays 0 and the
+        // transfer is "ahead"): 1 and 2 sit at or below the incoming floor, 3 is
+        // the relic suffix a view change has since reassigned.
+        for (request_id, name) in [(1, "s1"), (2, "s2"), (3, "s3")] {
+            let projected = md
+                .prepare_request(create_stream_request(CLIENT, request_id, name))
+                .expect("CreateStream is client-allowed");
+            consensus.pipeline_message(PlaneKind::Metadata, &projected);
+            md.journal
+                .as_ref()
+                .unwrap()
+                .handle()
+                .append(projected)
+                .await
+                .expect("seeding the WAL succeeds");
+        }
+        let journal_handle = md.journal.as_ref().unwrap().handle();
+        assert_eq!(journal_handle.last_op(), Some(3));
+
+        // A donor mux fills the snapshot the way a serving primary would, so
+        // the restore path sees populated sections rather than a bare envelope.
+        let snapshot_bytes =
+            <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
+                .expect("donor snapshot builds")
+                .encode()
+                .expect("donor snapshot encodes");
+        md.install_state_transfer(
+            &snapshot_bytes,
+            ClientTable::new(CLIENTS_TABLE_MAX),
+            0,
+            SNAPSHOT_SEQ,
+        )
+        .await
+        .expect("install succeeds");
+
+        assert_eq!(
+            journal_handle.last_op(),
+            Some(SNAPSHOT_SEQ),
+            "the relic above the incoming floor must be gone"
+        );
+        assert!(
+            journal_handle.header(3).is_none(),
+            "op 3 was above the floor; the commit walk must never see it again"
+        );
+        assert!(
+            journal_handle.header(1).is_some() && journal_handle.header(2).is_some(),
+            "ops at or below the floor stay for the walk and tail repair"
+        );
+    }
+
     #[compio::test]
     async fn tick_backstop_must_resume_stranded_commits_and_promotions() {
         use std::future::Future;

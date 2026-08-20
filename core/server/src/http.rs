@@ -104,6 +104,7 @@ pub async fn start(
     cluster: &ClusterConfig,
     system_config: Arc<ServerSystemConfig>,
     self_ports: TransportPorts,
+    shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
     // from the cluster PSK, so a bearer minted on any node verifies on every
@@ -165,7 +166,7 @@ pub async fn start(
         max_tokens_per_user,
         in_flight_writes: Cell::new(0),
         forward,
-        metrics: metrics::HttpMetrics::init(),
+        metrics: metrics::HttpMetrics::init(shard_metrics_all),
     }));
     let router = router(
         state,

@@ -747,14 +747,20 @@ cpu_allocation = "numa:auto"
 # process onto the same low-numbered cores.
 pin_cores = true
 
-# Per-shard inter-shard inbox capacity. Bounded by design: consensus-frame
-# drops recover via VSR retransmit, but cross-shard client-reply drops are
-# terminal. Size for the worst-case sum of both: the consensus working set
-# (~ the prepare queue depth of the planes the shard hosts - [metadata] on
-# shard 0, [partition] elsewhere - times replica_count times directions) plus
-# peak client-reply fan-out per shard. Both depths are tunable, so raising
-# either raises the capacity needed here.
+# Per-shard inter-shard inbox capacity (the main lane: consensus frames,
+# connection setup, reconcile wakes). Bounded by design; consensus-frame
+# drops recover via VSR retransmit. Size for the consensus working set:
+# ~ the prepare queue depth of the planes the shard hosts ([metadata] on
+# shard 0, [partition] elsewhere) times replica_count times directions.
+# Both depths are tunable, so raising either raises the capacity needed here.
 inbox_capacity = 1024
+
+# Capacity of the reply lane: a separate bounded channel for cross-shard
+# client-reply forwards, whose drops are terminal (no in-protocol
+# retransmit - the client never receives the reply). Split from
+# inbox_capacity so a consensus burst cannot evict reply forwards; size for
+# peak client-reply fan-out per shard.
+reply_inbox_capacity = 1024
 
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
 # the per-shard watchdog and the parallel-join survivor path; sized

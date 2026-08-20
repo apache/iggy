@@ -63,7 +63,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
-#[command(author = "Apache Iggy (Incubating)", version)]
+#[command(author = "Apache Iggy", version)]
 struct Args {}
 
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);

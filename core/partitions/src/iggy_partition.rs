@@ -96,7 +96,7 @@ where
     B: MessageBus,
 {
     consensus: VsrConsensus<B>,
-    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
+    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>,
     /// Highest durably persisted offset.
     pub offset: Arc<AtomicU64>,
     /// Highest offset assigned to prepares that may still only live in the in-memory journal.

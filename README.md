@@ -41,7 +41,7 @@
 
 ---
 
-## What is Apache Iggy (Incubating)?
+## What is Apache Iggy?
 
 **Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, WebSocket, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
