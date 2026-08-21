@@ -18,7 +18,7 @@
 [package]
 name = "bench-dashboard-frontend"
 license = "Apache-2.0"
-version = "0.8.0-edge.1"
+version = "0.8.0-edge.3"
 edition = "2024"
 publish = false
 
@@ -40,3 +40,6 @@ wasm-bindgen = { workspace = true }
 web-sys = { workspace = true }
 yew = { workspace = true }
 yew-router = { workspace = true }
+
+[lints]
+workspace = true

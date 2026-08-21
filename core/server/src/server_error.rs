@@ -87,6 +87,8 @@ pub enum ServerError {
     },
     #[error("system.sharding.inbox_capacity must be in 1..={max}; got {value}")]
     InvalidInboxCapacity { value: usize, max: usize },
+    #[error("system.sharding.reply_inbox_capacity must be in 1..={max}; got {value}")]
+    InvalidReplyInboxCapacity { value: usize, max: usize },
     #[error("system.sharding.shutdown_drain_timeout must be in (0, {max:?}]; got {value:?}")]
     InvalidShutdownDrainTimeout {
         value: std::time::Duration,
@@ -264,17 +266,6 @@ pub enum ServerError {
         path: String,
         #[source]
         source: Box<iggy_common::IggyError>,
-    },
-    #[error(
-        "recovered namespace stream {stream_id}, topic {topic_id}, partition {partition_id} exceeds configured limits (max_streams={max_streams}, max_topics={max_topics}, max_partitions={max_partitions})"
-    )]
-    RecoveredNamespaceOutOfBounds {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        max_streams: usize,
-        max_topics: usize,
-        max_partitions: usize,
     },
     #[error("failed to load {transport} listener credentials")]
     ListenerCredentials {

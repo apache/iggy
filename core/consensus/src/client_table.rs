@@ -101,7 +101,7 @@ pub const CLIENTS_TABLE_SLOT_MAX: usize = 1 << 16;
 /// original bytes instead of a bare "already applied"; losing one
 /// degrades the answer, never correctness. In-memory only: ring contents are
 /// refcount bumps and are never persisted or transferred.
-const REPLY_RING_CAPACITY: usize = 5;
+pub const REPLY_RING_CAPACITY: usize = 5;
 
 /// Per-session entry: fence epoch + committed-request watermark + replies.
 ///
@@ -166,7 +166,7 @@ pub struct ClientEntrySnapshot {
     pub watermark: u64,
     pub watermark_checksum: u128,
     /// Wire bytes of the entry's latest committed reply, round-tripped through
-    /// [`CachedReply::from_message`]. Never empty: registration seeds the ring.
+    /// `CachedReply::from_message`. Never empty: registration seeds the ring.
     ///
     /// Serialized as a msgpack `bin` blob, not the integer array a plain `Vec<u8>`
     /// produces, which spends 2 bytes on every byte >= 0x80 and runs a checkpoint's
@@ -192,8 +192,13 @@ pub struct ClientTableSnapshot {
 }
 
 /// Serializes reply bytes as a msgpack `bin` blob. See [`ClientEntrySnapshot::reply`].
+///
+/// `bin` is the only accepted encoding; the `visit_seq` arm that also took the older
+/// integer-array form is gone. `SNAPSHOT_FORMAT_VERSION` decides readability in one
+/// place, and a second decoder quietly accepting a retired layout makes that stamp a
+/// lie.
 mod reply_bytes {
-    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::de::{Error, Visitor};
     use serde::{Deserializer, Serializer};
     use std::fmt;
 
@@ -207,7 +212,7 @@ mod reply_bytes {
 
     struct BytesVisitor;
 
-    impl<'de> Visitor<'de> for BytesVisitor {
+    impl Visitor<'_> for BytesVisitor {
         type Value = Vec<u8>;
 
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -219,17 +224,6 @@ mod reply_bytes {
         }
 
         fn visit_byte_buf<E: Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
-            Ok(bytes)
-        }
-
-        /// A checkpoint written before the `bin` encoding holds an integer array.
-        /// Accepting it keeps this a read-compatible change rather than one that
-        /// refuses a checkpoint it could decode.
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or_default());
-            while let Some(byte) = seq.next_element()? {
-                bytes.push(byte);
-            }
             Ok(bytes)
         }
     }
@@ -658,7 +652,7 @@ impl ClientTable {
     /// previous register reply is dropped), and preserves the watermark -
     /// session resume keeps dedup history.
     ///
-    /// Full table evicts the oldest commit, see [`Self::evict_oldest`].
+    /// Full table evicts the oldest commit, see `Self::evict_oldest`.
     ///
     /// # Panics
     /// If `client_id == 0` or `client_id != reply.header().client`.
@@ -1245,7 +1239,7 @@ impl ClientEntry {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, Operation};
+    use iggy_binary_protocol::{Command, Operation};
 
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
@@ -1265,7 +1259,7 @@ mod tests {
             commit,
             // Real size so codec-roundtripped replies re-parse.
             size: header_size as u32,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::Register,
             ..ReplyHeader::default()
         };
@@ -1296,7 +1290,7 @@ mod tests {
             request_checksum,
             // Real size so codec-roundtripped replies re-parse.
             size: header_size as u32,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::SendMessages,
             ..ReplyHeader::default()
         };

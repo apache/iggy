@@ -31,17 +31,15 @@ use std::path::PathBuf;
 async fn validate_config_env_override() {
     let expected_http = true;
     let expected_tcp = true;
-    let expected_message_saver = true;
-    let expected_message_expiry = "1s";
+    let expected_validate_checksum = false;
 
     unsafe {
         env::set_var("IGGY_HTTP_ENABLED", expected_http.to_string());
         env::set_var("IGGY_TCP_ENABLED", expected_tcp.to_string());
         env::set_var(
-            "IGGY_MESSAGE_SAVER_ENABLED",
-            expected_message_saver.to_string(),
+            "IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM",
+            expected_validate_checksum.to_string(),
         );
-        env::set_var("IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY", expected_message_expiry);
     }
 
     let config_path = get_root_path().join("../server/config.toml");
@@ -54,35 +52,30 @@ async fn validate_config_env_override() {
 
     assert_eq!(config.http.enabled, expected_http);
     assert_eq!(config.tcp.enabled, expected_tcp);
-    assert_eq!(config.message_saver.enabled, expected_message_saver);
     assert_eq!(
-        config.system.topic.message_expiry.to_string(),
-        expected_message_expiry
+        config.system.partition.validate_checksum,
+        expected_validate_checksum
     );
 
     unsafe {
         env::remove_var("IGGY_HTTP_ENABLED");
         env::remove_var("IGGY_TCP_ENABLED");
-        env::remove_var("IGGY_MESSAGE_SAVER_ENABLED");
-        env::remove_var("IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY");
+        env::remove_var("IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM");
     }
 }
 
 #[serial]
 #[tokio::test]
-async fn validate_socket_override() {
-    // Environment variables are set as raw byte counts
-    let send_buffer_bytes = 666666_u64;
-    let recv_buffer_bytes = 777777_u64;
+async fn validate_byte_size_leaf_override() {
+    // A non-primitive `#[config_env(leaf)]` field reads one env var rather than
+    // expanding into member variables. Dropping the attribute would not compile
+    // for `IggyByteSize`, so what needs pinning is the value format: the
+    // environment carries a raw byte count, not a formatted size string.
+    let stream_receive_window_bytes = 8_388_608_u64;
     unsafe {
-        env::set_var("IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS", "true");
         env::set_var(
-            "IGGY_TCP_SOCKET_SEND_BUFFER_SIZE",
-            send_buffer_bytes.to_string(),
-        );
-        env::set_var(
-            "IGGY_TCP_SOCKET_RECV_BUFFER_SIZE",
-            recv_buffer_bytes.to_string(),
+            "IGGY_QUIC_STREAM_RECEIVE_WINDOW",
+            stream_receive_window_bytes.to_string(),
         );
     }
 
@@ -92,38 +85,16 @@ async fn validate_socket_override() {
     let config: ServerConfig = file_config_provider
         .load_config()
         .await
-        .expect("Failed to load config.toml config with socket override");
+        .expect("Failed to load config.toml config with byte size leaf override");
 
-    assert!(config.tcp.socket.override_defaults);
-    // Verify the buffer sizes match the expected byte counts
     assert_eq!(
-        config.tcp.socket.send_buffer_size.as_bytes_u64(),
-        send_buffer_bytes
-    );
-    assert_eq!(
-        config.tcp.socket.recv_buffer_size.as_bytes_u64(),
-        recv_buffer_bytes
+        config.quic.stream_receive_window.as_bytes_u64(),
+        stream_receive_window_bytes
     );
 
     unsafe {
-        env::remove_var("IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS");
-        env::remove_var("IGGY_TCP_SOCKET_SEND_BUFFER_SIZE");
-        env::remove_var("IGGY_TCP_SOCKET_RECV_BUFFER_SIZE");
+        env::remove_var("IGGY_QUIC_STREAM_RECEIVE_WINDOW");
     }
-}
-
-#[serial]
-#[tokio::test]
-async fn validate_socket_no_override() {
-    let config_path = get_root_path().join("../server/config.toml");
-    let file_config_provider =
-        ServerConfig::config_provider(&config_path.as_path().display().to_string());
-    let config: ServerConfig = file_config_provider
-        .load_config()
-        .await
-        .expect("Failed to load config.toml config without socket override");
-
-    assert!(!config.tcp.socket.override_defaults);
 }
 
 #[serial]

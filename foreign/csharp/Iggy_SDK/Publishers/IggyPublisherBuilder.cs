@@ -128,6 +128,29 @@ public class IggyPublisherBuilder
     }
 
     /// <summary>
+    ///     Configures the connection settings using a personal access token instead of a username and password.
+    /// </summary>
+    /// <param name="protocol">The protocol to use for the connection (e.g., TCP, UDP).</param>
+    /// <param name="address">The address of the server to connect to.</param>
+    /// <param name="personalAccessToken">The personal access token to authenticate with.</param>
+    /// <param name="receiveBufferSize">The size of the receive buffer.</param>
+    /// <param name="sendBufferSize">The size of the send buffer.</param>
+    /// <param name="reconnectionSettings">Reconnection settings for the client.</param>
+    /// <returns>The current instance of <see cref="IggyPublisherBuilder" /> to allow method chaining.</returns>
+    public IggyPublisherBuilder WithConnection(Protocol protocol, string address, string personalAccessToken,
+        int receiveBufferSize = 4096, int sendBufferSize = 4096, ReconnectionSettings? reconnectionSettings = null)
+    {
+        Config.Protocol = protocol;
+        Config.Address = address;
+        Config.PersonalAccessToken = personalAccessToken;
+        Config.ReceiveBufferSize = receiveBufferSize;
+        Config.SendBufferSize = sendBufferSize;
+        Config.ReconnectionSettings = reconnectionSettings;
+
+        return this;
+    }
+
+    /// <summary>
     ///     Configures the partitioning strategy for messages sent by the publisher.
     ///     Determines how messages are distributed across topic partitions.
     /// </summary>
@@ -162,7 +185,6 @@ public class IggyPublisherBuilder
     /// <param name="name">The name to use when creating the topic.</param>
     /// <param name="topicPartitionsCount">The number of partitions for the topic. Default is 1.</param>
     /// <param name="compressionAlgorithm">The compression algorithm to use for messages in the topic. Default is None.</param>
-    /// <param name="replicationFactor">The replication factor for the topic. Null means server default.</param>
     /// <param name="messageExpiry">
     ///     The message expiry time. TimeSpan.Zero uses the server default, TimeSpan.MaxValue never
     ///     expires. Default is TimeSpan.Zero.
@@ -170,14 +192,13 @@ public class IggyPublisherBuilder
     /// <param name="maxTopicSize">The maximum size of the topic in bytes (0 for unlimited). Default is 0.</param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder CreateTopicIfNotExists(string name, uint topicPartitionsCount = 1,
-        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         TimeSpan messageExpiry = default, ulong maxTopicSize = 0)
     {
         Config.CreateTopic = true;
         Config.TopicName = name;
         Config.TopicPartitionsCount = topicPartitionsCount;
         Config.TopicCompressionAlgorithm = compressionAlgorithm;
-        Config.TopicReplicationFactor = replicationFactor;
         Config.TopicMessageExpiry = messageExpiry;
         Config.TopicMaxTopicSize = maxTopicSize;
 
@@ -305,7 +326,8 @@ public class IggyPublisherBuilder
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
                 ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
-                AutoLoginSettings = AutoLoginSettings.For(Config.Login, Config.Password),
+                HeartbeatInterval = Config.HeartbeatInterval,
+                AutoLoginSettings = AutoLogin(),
                 LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
                 MessageEncryptor = _encryptor
             });
@@ -329,6 +351,18 @@ public class IggyPublisherBuilder
     }
 
     /// <summary>
+    ///     The credentials given to WithConnection must reach the client and not only the explicit login
+    ///     performed at startup: a reconnect or a leader redirect drops the session, and without them the
+    ///     client would come back unauthenticated.
+    /// </summary>
+    private protected AutoLoginSettings AutoLogin()
+    {
+        return string.IsNullOrEmpty(Config.PersonalAccessToken)
+            ? AutoLoginSettings.For(Config.Login, Config.Password)
+            : AutoLoginSettings.ForPersonalAccessToken(Config.PersonalAccessToken);
+    }
+
+    /// <summary>
     ///     Validates the publisher configuration and throws if invalid.
     /// </summary>
     /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
@@ -341,14 +375,18 @@ public class IggyPublisherBuilder
                 throw new InvalidOperationException("Address must be provided when CreateIggyClient is true.");
             }
 
-            if (string.IsNullOrWhiteSpace(Config.Login))
+            if (string.IsNullOrWhiteSpace(Config.PersonalAccessToken))
             {
-                throw new InvalidOperationException("Login must be provided when CreateIggyClient is true.");
-            }
+                if (string.IsNullOrWhiteSpace(Config.Login))
+                {
+                    throw new InvalidOperationException(
+                        "Login or PersonalAccessToken must be provided when CreateIggyClient is true.");
+                }
 
-            if (string.IsNullOrWhiteSpace(Config.Password))
-            {
-                throw new InvalidOperationException("Password must be provided when CreateIggyClient is true.");
+                if (string.IsNullOrWhiteSpace(Config.Password))
+                {
+                    throw new InvalidOperationException("Password must be provided when CreateIggyClient is true.");
+                }
             }
         }
         else

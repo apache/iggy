@@ -21,7 +21,7 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::prelude::{Client, IggyExpiry, MaxTopicSize};
+use iggy::prelude::{Client, IggyExpiry, TopicCreateOptions};
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -94,11 +94,11 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
             .create_topic(
                 &self.stream_id.try_into().unwrap(),
                 &self.topic_name,
-                1,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());

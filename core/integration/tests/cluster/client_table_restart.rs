@@ -75,13 +75,15 @@ use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::consensus::{
-    Command2, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
+    Command, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
 };
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use iggy_binary_protocol::{ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireName};
+use iggy_binary_protocol::{
+    ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireName, WireOptions,
+};
 use integration::harness::TestHarness;
 use integration::iggy_harness;
 use secrecy::SecretString;
@@ -258,6 +260,7 @@ pub(super) fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
 pub(super) fn create_stream_payload(name: &str) -> Bytes {
     CreateStreamRequest {
         name: WireName::new(name).unwrap(),
+        options: WireOptions::empty(),
     }
     .to_bytes()
 }
@@ -269,7 +272,7 @@ fn request_header(
     body_len: usize,
 ) -> RequestHeader {
     RequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation,
         size: u32::try_from(HEADER_SIZE + body_len).unwrap(),
         client: CLIENT_ID,
@@ -569,14 +572,14 @@ async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) 
     }
 
     let command_offset = offset_of!(RequestHeader, command);
-    if reply_header[command_offset] == Command2::Eviction as u8 {
+    if reply_header[command_offset] == Command::Eviction as u8 {
         return Exchange::Eviction {
             reason: reply_header[HEADER_SIZE - 1],
         };
     }
     assert_eq!(
         reply_header[command_offset],
-        Command2::Reply as u8,
+        Command::Reply as u8,
         "expected a Reply frame"
     );
 

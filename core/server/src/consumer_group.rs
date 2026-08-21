@@ -37,8 +37,7 @@ use iggy_binary_protocol::requests::consumer_groups::{
     LeaveConsumerGroupRequest as WireLeaveConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::{KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireIdentifier};
 use iggy_common::IggyError;
@@ -68,7 +67,7 @@ pub(crate) async fn maybe_rewrite_consumer_group_request<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -123,7 +122,7 @@ async fn gather_in_flight<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -213,25 +212,22 @@ pub(crate) fn maybe_rewrite_consumer_offset_request<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
     let operation = request.header().operation;
     if !matches!(
         operation,
-        Operation::StoreConsumerOffset
-            | Operation::StoreConsumerOffset2
-            | Operation::DeleteConsumerOffset
-            | Operation::DeleteConsumerOffset2
+        Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
     ) {
         return Ok(request);
     }
     let body = request_body(&request);
-    // The 4 store/delete (v1 + v2) ops differ only in the decode type; this
-    // collapses their identical decode -> resolve group id -> rewrite consumer
-    // id -> re-encode bodies. A non-group consumer or unresolved group returns
-    // the request untouched (the apply/read path handles the miss).
+    // The store/delete ops differ only in the decode type; this collapses
+    // their identical decode -> resolve group id -> rewrite consumer id ->
+    // re-encode bodies. A non-group consumer or unresolved group returns the
+    // request untouched (the apply/read path handles the miss).
     macro_rules! rewrite_group_offset {
         ($ty:ty) => {{
             let mut wire = <$ty>::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
@@ -250,10 +246,8 @@ where
     }
     let rewritten = match operation {
         Operation::StoreConsumerOffset => rewrite_group_offset!(StoreConsumerOffsetRequest),
-        Operation::StoreConsumerOffset2 => rewrite_group_offset!(StoreConsumerOffset2Request),
         Operation::DeleteConsumerOffset => rewrite_group_offset!(DeleteConsumerOffsetRequest),
-        Operation::DeleteConsumerOffset2 => rewrite_group_offset!(DeleteConsumerOffset2Request),
-        // The outer `matches!` already filtered to the 4 ops above, but the
+        // The outer `matches!` already filtered to the 2 ops above, but the
         // match is over the 37-variant `Operation`, so a catch-all is required.
         _ => return Ok(request),
     };
@@ -272,7 +266,7 @@ fn resolve_group_offset_id<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {

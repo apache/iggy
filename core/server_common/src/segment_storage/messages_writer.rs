@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::write_batch_frozen;
 use compio::fs::{File, OpenOptions};
 use err_trail::ErrContext;
-use iggy_common::{IggyByteSize, IggyError, IggyMessagesBatch};
+use iggy_common::IggyError;
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
@@ -31,7 +30,6 @@ pub struct MessagesWriter {
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
-    fsync: bool,
 }
 
 // Safety: We are guaranteeing that MessagesWriter will never be used from multiple threads
@@ -46,7 +44,6 @@ impl MessagesWriter {
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
-        fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
@@ -90,38 +87,9 @@ impl MessagesWriter {
             file_path: file_path.to_string(),
             file,
             messages_size_bytes,
-            fsync,
         })
     }
 
-    /// Append frozen (immutable) batches to the messages file.
-    /// The caller retains the batches (for use in in-flight buffer) while disk I/O proceeds.
-    pub async fn save_frozen_batches(
-        &self,
-        batches: &[IggyMessagesBatch],
-    ) -> Result<IggyByteSize, IggyError> {
-        let messages_size: u64 = batches.iter().map(|b| b.size() as u64).sum();
-
-        let position = self.messages_size_bytes.load(Ordering::Relaxed);
-        let file = &self.file;
-        write_batch_frozen(file, position, batches)
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "Failed to write frozen batch to messages file: {}. {e}",
-                    self.file_path
-                )
-            })?;
-
-        if self.fsync {
-            let _ = self.fsync().await;
-        }
-
-        self.messages_size_bytes
-            .fetch_add(messages_size, Ordering::Release);
-
-        Ok(IggyByteSize::from(messages_size))
-    }
     pub fn path(&self) -> String {
         self.file_path.clone()
     }

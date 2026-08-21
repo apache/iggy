@@ -58,7 +58,7 @@ impl Default for ActionWeights {
         Self::new(&[
             (Action::CreateStream, 5),
             (Action::SendMessages, 70),
-            (Action::StoreConsumerOffset2, 25),
+            (Action::StoreConsumerOffset, 25),
         ])
     }
 }
@@ -80,7 +80,7 @@ pub struct WorkloadOptions {
     /// Send-batch size = `batch_size_min + prng.range(batch_size_span)`.
     pub batch_size_min: u32,
     pub batch_size_span: u32,
-    /// Probability a `StoreConsumerOffset2` request uses `Quorum` vs `NoAck`.
+    /// Probability a `StoreConsumerOffset` request uses `Quorum` vs `NoAck`.
     pub ack_quorum_ratio: f32,
     /// Probability a request targets a non-primary replica (exercises the
     /// redirect / forward path).
@@ -88,9 +88,9 @@ pub struct WorkloadOptions {
     /// Probability that a request is intentionally constructed to fail
     /// validation. Currently unused; reserved.
     pub invalid_request_ratio: f32,
-    /// Distinct consumer ids round-robined in `StoreConsumerOffset2`.
+    /// Distinct consumer ids round-robined in `StoreConsumerOffset`.
     pub consumer_pool_size: u32,
-    /// Upper bound on offset carried by `StoreConsumerOffset2`.
+    /// Upper bound on offset carried by `StoreConsumerOffset`.
     pub max_offset: u64,
     /// Probability per tick that the driver crashes one live non-primary
     /// replica (crash-only, no restart). `0.0` disables injection: the fault

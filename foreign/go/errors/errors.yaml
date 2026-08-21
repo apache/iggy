@@ -107,6 +107,10 @@
   fields:
     - name: Key
       type: string
+- name: CannotCloseWebSocketConnection
+  code: 21
+  format: "cannot close websocket connection"
+  fields: []
 - name: StaleClient
   code: 30
   format: "stale client"
@@ -134,6 +138,18 @@
     - name: IP
       type: string
     - name: Port
+      type: string
+- name: HttpError
+  code: 36
+  format: "http error %s"
+  fields:
+    - name: Message
+      type: string
+- name: InvalidApiUrl
+  code: 37
+  format: "invalid api url: %s"
+  fields:
+    - name: Url
       type: string
 - name: Unauthenticated
   code: 40
@@ -215,6 +231,10 @@
   code: 55
   format: "users limit reached."
   fields: []
+- name: InvalidPersonalAccessTokenExpiry
+  code: 56
+  format: "invalid personal access token expiry"
+  fields: []
 - name: TransientNotCommitted
   code: 57
   format: "request transiently not committed; retry"
@@ -222,6 +242,10 @@
 - name: TransientNotAccepted
   code: 58
   format: "request transiently not accepted; retry, on any replica"
+  fields: []
+- name: RequestAlreadyApplied
+  code: 59
+  format: "request already applied; its reply is no longer available"
   fields: []
 - name: NotConnected
   code: 61
@@ -285,6 +309,12 @@
   code: 78
   format: "invalid access token"
   fields: []
+- name: CannotFetchJwks
+  code: 79
+  format: "cannot fetch jwks from url: %s"
+  fields:
+    - name: Url
+      type: string
 - name: InvalidSizeBytes
   code: 80
   format: "invalid size bytes"
@@ -357,6 +387,26 @@
   code: 306
   format: "cannot parse url"
   fields: []
+- name: WebSocketError
+  code: 400
+  format: "websocket error"
+  fields: []
+- name: WebSocketConnectionError
+  code: 401
+  format: "websocket connection error"
+  fields: []
+- name: WebSocketCloseError
+  code: 402
+  format: "websocket close error"
+  fields: []
+- name: WebSocketReceiveError
+  code: 403
+  format: "websocket receive error"
+  fields: []
+- name: WebSocketSendError
+  code: 404
+  format: "websocket send error"
+  fields: []
 - name: CannotCreateStreamsDirectory
   code: 1000
   format: "cannot create streams directory, path: %s"
@@ -425,12 +475,12 @@
   fields:
     - name: Name
       type: string
-- name: StreamIdAlreadyExists
+- name: StreamDirectoryNotFound
   code: 1011
-  format: "stream with id: %d already exists."
+  format: "stream with directory %s was not found."
   fields:
-    - name: ID
-      type: uint32
+    - name: Path
+      type: string
 - name: StreamNameAlreadyExists
   code: 1012
   format: "stream with name: %s already exists."
@@ -457,6 +507,10 @@
       type: uint64
     - name: SegmentSize
       type: uint64
+- name: TooManyStreams
+  code: 1020
+  format: "too many streams"
+  fields: []
 - name: CannotCreateTopicsDirectory
   code: 2000
   format: "cannot create topics directory for stream with id: %d, path: %s"
@@ -553,14 +607,6 @@
       type: string
     - name: StreamId
       type: string
-- name: TopicIdAlreadyExists
-  code: 2012
-  format: "topic with id: %d for stream with id: %d already exists."
-  fields:
-    - name: TopicId
-      type: uint32
-    - name: StreamId
-      type: uint32
 - name: TopicNameAlreadyExists
   code: 2013
   format: "topic with name: %s for stream with id: %d already exists."
@@ -590,6 +636,20 @@
 - name: InvalidReplicationFactor
   code: 2018
   format: "invalid replication factor"
+  fields: []
+- name: InvalidPartitionsCount
+  code: 2019
+  format: "invalid partitions count"
+  fields: []
+- name: TopicDirectoryNotFound
+  code: 2020
+  format: "topic directory: %s not found"
+  fields:
+    - name: Path
+      type: string
+- name: TooManyTopics
+  code: 2021
+  format: "too many topics"
   fields: []
 - name: CannotCreatePartition
   code: 3000
@@ -703,6 +763,22 @@
   fields:
     - name: ID
       type: uint32
+- name: NotResolvedConsumer
+  code: 3022
+  format: "failed to resolve consumer with id: %d"
+  fields:
+    - name: ID
+      type: uint32
+- name: CannotOpenConsumerOffsetsFile
+  code: 3023
+  format: "cannot open consumer offsets file for path: %s"
+  fields:
+    - name: Path
+      type: string
+- name: PartitionIdSpaceExhausted
+  code: 3013
+  format: "partition id space exhausted for this topic"
+  fields: []
 - name: SegmentNotFound
   code: 4000
   format: "segment not found"
@@ -901,6 +977,46 @@
       type: uint32
     - name: Expected
       type: uint32
+- name: InvalidMessageTimestampDelta
+  code: 4038
+  format: "invalid message timestamp delta: %d microseconds exceeds the per-batch limit"
+  fields:
+    - name: Delta
+      type: uint64
+- name: InvalidBatchChecksum
+  code: 4039
+  format: "invalid batch checksum: %d, expected: %d, for base offset: %d"
+  fields:
+    - name: Stored
+      type: uint64
+    - name: Computed
+      type: uint64
+    - name: BaseOffset
+      type: uint64
+- name: InvalidHeaderKind
+  code: 4040
+  format: "invalid header kind code: %d"
+  fields:
+    - name: Kind
+      type: uint8
+- name: UnsupportedOptionKey
+  code: 4041
+  format: "unsupported option key: %s"
+  fields:
+    - name: Key
+      type: string
+- name: InvalidOptionValue
+  code: 4042
+  format: "invalid option value for key: %s"
+  fields:
+    - name: Key
+      type: string
+- name: OptionsBlockTooLarge
+  code: 4043
+  format: "options block exceeds its limits: %s"
+  fields:
+    - name: Details
+      type: string
 - name: CannotSendMessagesDueToClientDisconnection
   code: 4050
   format: "cannot sed messages due to client disconnection"
@@ -925,18 +1041,6 @@
   code: 4055
   format: "background send buffer overflow"
   fields: []
-- name: ProducerSendFailed
-  code: 4056
-  format: "producer send failed"
-  fields:
-    - name: Cause
-      type: error
-    - name: Failed
-      type: string
-    - name: StreamName
-      type: string
-    - name: TopicName
-      type: string
 - name: ProducerClosed
   code: 4057
   format: "producer closed"
@@ -947,17 +1051,15 @@
   fields:
     - name: Offset
       type: uint64
+- name: InvalidReservedField
+  code: 4101
+  format: "invalid reserved field value: %d, expected: 0"
+  fields:
+    - name: Value
+      type: uint64
 - name: ConsumerGroupIdNotFound
   code: 5000
   format: "consumer group with id: %d for topic with id: %d was not found."
-  fields:
-    - name: GroupId
-      type: uint32
-    - name: TopicId
-      type: uint32
-- name: ConsumerGroupIdAlreadyExists
-  code: 5001
-  format: "consumer group with id: %d for topic with id: %d already exists."
   fields:
     - name: GroupId
       type: uint32
@@ -1125,6 +1227,52 @@
   code: 10012
   format: "cannot read index timestamp"
   fields: []
+- name: TimestampOutOfRange
+  code: 10013
+  format: "timestamp out of range: %d"
+  fields:
+    - name: Timestamp
+      type: uint64
+- name: ShardNotFound
+  code: 11000
+  format: "shard not found for stream id: %d, topic id: %d, partition id: %d"
+  fields:
+    - name: StreamId
+      type: uint32
+    - name: TopicId
+      type: uint32
+    - name: PartitionId
+      type: uint32
+- name: ShardCommunicationError
+  code: 11001
+  format: "shard communication error"
+  fields: []
+- name: CannotBindToSocket
+  code: 12000
+  format: "cannot bind to socket with addr: %s"
+  fields:
+    - name: Addr
+      type: string
+- name: TaskTimeout
+  code: 12001
+  format: "task execution timeout"
+  fields: []
+- name: IoError
+  code: 13000
+  format: "io error: %s"
+  fields:
+    - name: Message
+      type: string
+- name: AlreadyAuthenticated
+  code: 14000
+  format: "vsr session already bound; reset before re-binding"
+  fields: []
+- name: InvalidSession
+  code: 14001
+  format: "vsr session value %d is invalid (must be non-zero)"
+  fields:
+    - name: Session
+      type: uint64
 - name: IncompatibleProtocolVersion
   code: 14003
   format: "incompatible binary protocol version: client %d, server accepts [%d, %d]"

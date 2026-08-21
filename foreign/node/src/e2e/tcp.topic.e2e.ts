@@ -35,8 +35,7 @@ describe('e2e -> topic', async () => {
       name: topicName,
       partitionCount: 0,
       compressionAlgorithm: 1,
-      messageExpiry: 0n,
-      replicationFactor: 1
+      messageExpiry: 0n
     });
     assert.ok(TOPIC);
   });

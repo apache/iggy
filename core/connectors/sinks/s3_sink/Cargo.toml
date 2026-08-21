@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_s3_sink"
-version = "0.5.0-edge.2"
+version = "0.5.0-edge.4"
 description = "Iggy S3 sink connector for writing stream messages to Amazon S3 and S3-compatible stores"
 edition = "2024"
 license = "Apache-2.0"
@@ -56,3 +56,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 simd-json = { workspace = true }
+
+[lints]
+workspace = true

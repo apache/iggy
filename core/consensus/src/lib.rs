@@ -34,6 +34,13 @@ pub trait Pipeline {
 
     fn pop(&mut self) -> Option<Self::Entry>;
 
+    /// Drop the newest entry when it is exactly `(op, checksum)`, returning it;
+    /// `None` and no mutation otherwise. Unwinds a push that proved not to be durable.
+    ///
+    /// The checksum is not redundant: op numbers repeat across views, so matching on
+    /// `op` alone can pop a live entry belonging to a later one.
+    fn remove_tail(&mut self, op: u64, checksum: u128) -> Option<Self::Entry>;
+
     fn clear(&mut self);
 
     fn entry_by_op(&self, op: u64) -> Option<&Self::Entry>;
@@ -51,6 +58,9 @@ pub trait Pipeline {
     fn is_empty(&self) -> bool;
 
     fn len(&self) -> usize;
+
+    /// Requests parked waiting for a prepare slot (the second queue).
+    fn request_queue_len(&self) -> usize;
 
     /// In-flight prepare-queue capacity. `VsrConsensus` snapshots it at
     /// construction to size the loopback queue and to bound the uncommitted
@@ -99,8 +109,9 @@ pub type AckMessage<C> = <C as Consensus>::Message<<C as Consensus>::AckHeader>;
 
 pub trait Consensus: Sized {
     type MessageBus: MessageBus;
-    #[rustfmt::skip] // Scuffed formatter.
-    type Message<H>: ConsensusMessage<H> where H: ConsensusHeader;
+    type Message<H>: ConsensusMessage<H>
+    where
+        H: ConsensusHeader;
 
     type RoutedRequestHeader: ConsensusHeader;
     type ReplicateHeader: ConsensusHeader;
@@ -167,6 +178,9 @@ pub use state_transfer::{
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver};
 
+mod fatal;
+pub use fatal::{FatalReason, fatal};
+
 mod impls;
 pub use impls::*;
 mod plane_mux;
@@ -186,4 +200,4 @@ pub use dvc_merge::*;
 mod vsr_state;
 pub use vsr_state::{VsrState, VsrStateError};
 mod vsr_timeout;
-pub use vsr_timeout::TimeoutManager;
+pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};

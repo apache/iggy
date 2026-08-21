@@ -180,6 +180,8 @@ runs:
 
     - name: Doc test
       if: inputs.task == 'doctest'
+      env:
+        RUSTDOCFLAGS: -D warnings
       run: |
         cargo test --locked --doc
         cargo doc --no-deps --all-features --quiet
@@ -195,7 +197,7 @@ runs:
     - name: Install dependencies for Rust tests
       if: startsWith(inputs.task, 'test-') && runner.os == 'Linux'
       run: |
-        sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
+        ./scripts/ci/apt-install.sh musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
         rm -f $HOME/.local/share/keyrings/*
       shell: bash
 
@@ -293,7 +295,12 @@ runs:
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
           if [[ -n "$NEXTEST_FILTER" ]]; then
-            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
+            # Every test target in the `bdd` crate is `required-features =
+            # ["bdd"]`, so the `cargo test --no-run` above builds no binaries
+            # for it. A PR touching only that crate then produces a valid
+            # filter that matches zero tests, and nextest's default
+            # `--no-tests=fail` turns that into exit 4 on a green PR.
+            cargo nextest run --locked --no-fail-fast --no-tests=warn --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
           else
             cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG
           fi
@@ -370,7 +377,7 @@ runs:
     - name: Install musl tools for aarch64-musl
       if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
       run: |
-        sudo apt-get update && sudo apt-get install -y musl-tools
+        ./scripts/ci/apt-install.sh musl-tools
         rustup target add aarch64-unknown-linux-musl
       shell: bash
 
@@ -392,6 +399,40 @@ runs:
     - name: Build macOS aarch64
       if: inputs.task == 'build-macos-aarch64'
       run: cargo build --locked
+      shell: bash
+
+    # macOS is build-only everywhere else in CI, so runtime regressions in the
+    # non-Linux driver path (kqueue instead of io_uring) would ship unnoticed.
+    # Boot the freshly built server and ping it over TCP; ping is pre-auth so
+    # no credentials are needed. The retry flags keep each attempt bounded
+    # regardless of CLI reconnection defaults, so a dead server fails the
+    # step fast instead of hanging until the job timeout.
+    - name: Smoke test iggy-server boot on macOS
+      if: inputs.task == 'build-macos-aarch64'
+      run: |
+        target/debug/iggy-server --fresh > server-boot.log 2>&1 &
+        SERVER_PID=$!
+        trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+        for _ in $(seq 1 30); do
+          if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "::error::iggy-server exited before answering ping"
+            cat server-boot.log
+            exit 1
+          fi
+          if target/debug/iggy \
+              --tcp-reconnection-max-retries 1 \
+              --tcp-reconnection-interval 500ms \
+              ping; then
+            echo "Server booted and answered ping"
+            exit 0
+          fi
+          sleep 2
+        done
+
+        echo "::error::iggy-server did not answer ping within 60s"
+        cat server-boot.log
+        exit 1
       shell: bash
 
     # Windows builds (SDK and CLI only - iggy-server does not support Windows)

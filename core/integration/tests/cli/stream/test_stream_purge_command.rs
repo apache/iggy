@@ -61,11 +61,11 @@ impl IggyCmdTestCase for TestStreamPurgeCmd {
             .create_topic(
                 &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
-                10,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(10),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());

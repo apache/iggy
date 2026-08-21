@@ -1,6 +1,6 @@
 # Apache Iggy Agent Guidelines
 
-**Apache Iggy (Incubating)** is a persistent message streaming platform
+**Apache Iggy** is a persistent message streaming platform
 in Rust. Thread-per-core shared-nothing, `io_uring` + `compio`.
 Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
 Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem

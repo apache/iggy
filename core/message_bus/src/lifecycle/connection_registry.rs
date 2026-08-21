@@ -155,7 +155,7 @@ impl ReplyTarget {
     }
 }
 
-/// Outcome of routing a client reply through an [`Entry`]'s reply target.
+/// Outcome of routing a client reply through an `Entry`'s reply target.
 ///
 /// `Delivered` is the socket fast path: `try_send` was attempted and its
 /// result is carried through unchanged. `InProcess` hands the message back
@@ -949,14 +949,14 @@ impl ReplicaRegistry {
 mod tests {
     use super::*;
     use crate::lifecycle::Shutdown;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
     use server_common::Message;
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_bus_msg() -> BusMessage {
         Message::<GenericHeader>::new(HEADER_SIZE)
             .transmute_header(|_, h: &mut GenericHeader| {
-                h.command = Command2::Ping;
+                h.command = Command::Ping;
                 h.size = HEADER_SIZE as u32;
             })
             .into_frozen()

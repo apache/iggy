@@ -40,6 +40,7 @@
 
 use super::COMPONENT;
 use crate::ConfigurationError;
+use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use configs::ConfigEnv;
 use iggy_common::{IggyByteSize, Validatable};
 use serde::{Deserialize, Serialize};
@@ -61,16 +62,35 @@ pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
 /// batches) still holds and is looser, so the wire is what decides.
 pub const MAX_PARTITION_PREPARE_QUEUE_DEPTH: usize = 127;
 
+/// Most one segment can overshoot its size cap: rotation checks the cap AFTER
+/// appending, so a sealed segment runs up to one maximum batch past the
+/// per-topic `segment_size`, whose own ceiling is the compile-time
+/// [`SEGMENT_MAX_SIZE_BYTES`]. Tracks the shipped
+/// `message_bus.max_message_size`, which is what actually bounds an appendable
+/// batch.
+///
+/// Mirrors `shard::SEGMENT_SIZE_OVERSHOOT_BYTES`, which the serving side uses as
+/// the floor of its admission divisor.
+pub const SEGMENT_SIZE_OVERSHOOT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Distinct max-size segments the served-payload budget is sized to hold at
+/// once, and so the concurrent state transfers a shard admits.
+///
+/// Mirrors `shard::CONCURRENT_SERVED_SEGMENTS`.
+pub const CONCURRENT_SERVED_SEGMENTS: u64 = 2;
+
 /// Mirrors the free const `shard::PARTITION_ARTIFACT_LEN_DEFAULT` (segment
 /// ceiling plus the one whole batch a segment may close past it).
-pub const DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX: u64 = 1024 * 1024 * 1024 + 64 * 1024 * 1024;
+pub const DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX: u64 =
+    SEGMENT_MAX_SIZE_BYTES + SEGMENT_SIZE_OVERSHOOT_BYTES;
 
 /// Mirrors the free const `shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT`: room for
-/// two concurrently served segments at the size a SEALED one actually reaches,
-/// which is the artifact ceiling above, not the configured segment target. Sized
-/// off the target instead, two admitted pulls would not both fit and would evict
-/// each other on every chunk.
-pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 = 2 * DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX;
+/// [`CONCURRENT_SERVED_SEGMENTS`] served segments at the size a SEALED one
+/// actually reaches, which is the artifact ceiling above, not the configured
+/// segment target. Sized off the target instead, two admitted pulls would not
+/// both fit and would evict each other on every chunk.
+pub const DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX: u64 =
+    CONCURRENT_SERVED_SEGMENTS * DEFAULT_TRANSFER_ARTIFACT_BYTES_MAX;
 
 /// Upper bound on the two state-transfer byte knobs. A typo guard, not a sizing
 /// endorsement: both are PER SHARD, so a slipped digit multiplies by the core

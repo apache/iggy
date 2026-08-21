@@ -57,11 +57,11 @@ async fn create_stream_and_topic(client: &IggyClient, partitions_count: u32) -> 
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            partitions_count,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create_topic");

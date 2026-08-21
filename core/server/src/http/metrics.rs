@@ -31,6 +31,7 @@ use prometheus_client::registry::Registry;
 use send_wrapper::SendWrapper;
 use tracing::error;
 
+use crate::http::extractor::Identity;
 use crate::http::state::HttpState;
 
 /// The legacy server's metric set, registered under the same names and help
@@ -52,7 +53,7 @@ pub(in crate::http) struct HttpMetrics {
 }
 
 impl HttpMetrics {
-    pub(in crate::http) fn init() -> Self {
+    pub(in crate::http) fn init(shard_metrics_all: &[shard::metrics::ShardMetrics]) -> Self {
         let mut registry = Registry::default();
         let http_requests = Counter::default();
         let streams = Gauge::default();
@@ -78,6 +79,19 @@ impl HttpMetrics {
         registry.register("messages", "total count of messages", messages.clone());
         registry.register("users", "total count of users", users.clone());
         registry.register("clients", "total count of clients", clients.clone());
+        // Every shard's drop / reconcile / partition counters, one
+        // `shard`-labelled sub-registry per shard so series stay per-shard
+        // without a `shard_id` label in the counter label sets (see
+        // `shard::metrics::FrameDropLabel`). The counters are Arc-backed:
+        // each shard bumps its own handle on its own thread, and the scrape
+        // on shard 0 reads the shared atomics.
+        for (shard_id, shard_metrics) in shard_metrics_all.iter().enumerate() {
+            let sub_registry = registry.sub_registry_with_label((
+                std::borrow::Cow::Borrowed("shard"),
+                std::borrow::Cow::Owned(shard_id.to_string()),
+            ));
+            shard_metrics.register(sub_registry);
+        }
         Self {
             registry,
             http_requests,
@@ -134,8 +148,10 @@ pub(in crate::http) fn validated_endpoint(
 }
 
 /// `GET <http.metrics.endpoint>`: the metric set in prometheus text
-/// exposition. Public - reached without proving a credential, exactly like the
-/// legacy endpoint.
+/// exposition. Auth-only, like `/stats`: the `Identity` extractor rejects a
+/// missing or invalid bearer with 401, and any authenticated user may scrape
+/// (no RBAC rule guards it). Scrapers present a JWT or a raw PAT the same way
+/// every read route accepts them.
 ///
 /// The entity gauges sample the same reads `/stats` serves: the metadata STM
 /// stream and user maps plus the stats-registry rollups, whose partition-plane
@@ -143,7 +159,10 @@ pub(in crate::http) fn validated_endpoint(
 /// in flight. The clients count scatter-gathers the per-shard session managers
 /// exactly like `GET /clients` and turns partial when a shard misses the reply
 /// deadline.
-pub(in crate::http) async fn get_metrics(State(state): State<HttpState>) -> String {
+pub(in crate::http) async fn get_metrics(
+    State(state): State<HttpState>,
+    _identity: Identity,
+) -> String {
     let (streams_count, topics_count, partitions_count, segments_count, messages_count) = state
         .shard
         .plane
@@ -203,6 +222,23 @@ fn gauge_value(count: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+
+    #[test]
+    fn shard_metrics_land_in_the_exposition_under_a_shard_label() {
+        let shard_metrics = ShardMetrics::for_shard();
+        shard_metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
+        let metrics = HttpMetrics::init(&[shard_metrics]);
+        let output = metrics.formatted_output();
+        assert!(
+            output.contains("frame_drops_total"),
+            "shard frame-drop counter missing from exposition:\n{output}"
+        );
+        assert!(
+            output.contains(r#"shard="0""#),
+            "shard label missing from exposition:\n{output}"
+        );
+    }
 
     const PARITY_METRIC_NAMES: [&str; 8] = [
         "http_requests",
@@ -224,7 +260,7 @@ mod tests {
 
     #[test]
     fn formatted_output_exposes_every_parity_metric() {
-        let metrics = HttpMetrics::init();
+        let metrics = HttpMetrics::init(&[]);
         let output = metrics.formatted_output();
         for name in PARITY_METRIC_NAMES {
             assert!(
@@ -240,7 +276,7 @@ mod tests {
 
     #[test]
     fn scraped_values_land_in_the_exposition() {
-        let metrics = HttpMetrics::init();
+        let metrics = HttpMetrics::init(&[]);
         metrics.streams.set(1);
         metrics.topics.set(2);
         metrics.partitions.set(3);

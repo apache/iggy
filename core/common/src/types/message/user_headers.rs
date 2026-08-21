@@ -616,6 +616,28 @@ impl<T> HeaderField<T> {
             _marker: PhantomData,
         }
     }
+
+    /// Wrap raw wire bytes as a field of `kind`.
+    ///
+    /// The option catalog hands out each key's default as a kind plus bytes, so
+    /// anything rendering a catalog entry needs a way back to a typed field.
+    ///
+    /// # Errors
+    ///
+    /// `IggyError::InvalidHeaderValue` when a fixed-size kind's payload is the
+    /// wrong length, or the payload exceeds the field length limit.
+    pub fn from_raw(kind: HeaderKind, value: &[u8]) -> Result<Self, IggyError> {
+        // 255 is the field length the TLV codec's own `TryFrom` impls enforce.
+        if value.is_empty() || value.len() > 255 {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+        if let Some(expected) = kind.expected_size()
+            && value.len() != expected
+        {
+            return Err(IggyError::InvalidHeaderValue);
+        }
+        Ok(Self::new_unchecked(kind, value))
+    }
 }
 
 impl<T: Eq> Ord for HeaderField<T> {

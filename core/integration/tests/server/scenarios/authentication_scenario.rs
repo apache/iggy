@@ -144,17 +144,6 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
         ) {
             continue;
         }
-        // v2 consumer-offset ops are registered in the dispatch table for the
-        // consensus/simulator pathway but are not wired into the legacy binary
-        // server's dispatch. They'll move into the server alongside the rest of
-        // the v2 surface; re-enable these codes here once that lands.
-        if matches!(
-            code,
-            STORE_CONSUMER_OFFSET_2_CODE | DELETE_CONSUMER_OFFSET_2_CODE
-        ) {
-            continue;
-        }
-
         // ================================================================
         // REQUIRES AUTH
         // ================================================================
@@ -166,6 +155,10 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             GET_CLIENTS_CODE => client.get_clients().await.map(|_| ()),
 
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
+            DESCRIBE_OPTIONS_CODE => client
+                .describe_options(OptionsScope::Topic)
+                .await
+                .map(|_| ()),
 
             // Users
             GET_USER_CODE => client.get_user(&ctx.user_id).await.map(|_| ()),
@@ -175,7 +168,11 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 .await
                 .map(|_| ()),
             DELETE_USER_CODE => client.delete_user(&ctx.user_id).await,
-            UPDATE_USER_CODE => client.update_user(&ctx.user_id, Some("x"), None).await,
+            UPDATE_USER_CODE => {
+                client
+                    .update_user(&ctx.user_id, Some("x"), None, &UserUpdateOptions::default())
+                    .await
+            }
             UPDATE_PERMISSIONS_CODE => client.update_permissions(&ctx.user_id, None).await,
             CHANGE_PASSWORD_CODE => client.change_password(&ctx.user_id, "old", "new").await,
 
@@ -194,7 +191,11 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
             GET_STREAMS_CODE => client.get_streams().await.map(|_| ()),
             CREATE_STREAM_CODE => client.create_stream("x").await.map(|_| ()),
             DELETE_STREAM_CODE => client.delete_stream(&ctx.stream_id).await,
-            UPDATE_STREAM_CODE => client.update_stream(&ctx.stream_id, "x").await,
+            UPDATE_STREAM_CODE => {
+                client
+                    .update_stream(&ctx.stream_id, "x", &StreamUpdateOptions::default())
+                    .await
+            }
             PURGE_STREAM_CODE => client.purge_stream(&ctx.stream_id).await,
 
             // Topics
@@ -207,11 +208,11 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                 .create_topic(
                     &ctx.stream_id,
                     "x",
-                    1,
-                    CompressionAlgorithm::None,
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::ServerDefault,
+                    &TopicCreateOptions {
+                        partitions_count: Some(1),
+                        message_expiry: Some(IggyExpiry::NeverExpire),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await
                 .map(|_| ()),
@@ -222,10 +223,7 @@ async fn test_all_commands_require_auth(client: &IggyClient) {
                         &ctx.stream_id,
                         &ctx.topic_id,
                         "x",
-                        CompressionAlgorithm::None,
-                        None,
-                        IggyExpiry::NeverExpire,
-                        MaxTopicSize::ServerDefault,
+                        &TopicUpdateOptions::default(),
                     )
                     .await
             }
@@ -400,11 +398,11 @@ async fn setup_test_resources(client: &IggyClient) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic");

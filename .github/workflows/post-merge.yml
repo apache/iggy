@@ -26,9 +26,8 @@ on:
     branches: [master]
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
+  actions: write
+  contents: read
 
 concurrency:
   group: post-merge-${{ github.ref }}
@@ -66,7 +65,7 @@ jobs:
       # preinstalled cargo (rust-toolchain.toml pins 1.97.1) and skips the
       # heavyweight build-cache restore.
       - name: Install cargo-rail
-        uses: taiki-e/install-action@v2.85.8
+        uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-rail
 
@@ -145,22 +144,66 @@ jobs:
           echo "sdks_to_publish=$SDKS_TO_PUBLISH" >> "$GITHUB_OUTPUT"
           echo "SDKs to publish: ${SDKS_TO_PUBLISH:-<none>}"
 
-  call-publish:
-    name: Publish components
+  dispatch-publish:
+    name: Dispatch publisher
     needs: check-auto-publish
     if: >-
       needs.check-auto-publish.outputs.crates_to_publish != '' ||
       needs.check-auto-publish.outputs.docker_components != '' ||
       needs.check-auto-publish.outputs.sdks_to_publish != ''
-    uses: ./.github/workflows/publish.yml
-    with:
-      commit: ${{ github.sha }}
-      dry_run: false
-      use_latest_ci: false
-      skip_tag_creation: false
-      publish_crates: ${{ needs.check-auto-publish.outputs.crates_to_publish }}
-      publish_dockerhub: ${{ needs.check-auto-publish.outputs.docker_components }}
-      publish_other: ${{ needs.check-auto-publish.outputs.sdks_to_publish }}
-      create_edge_docker_tag: true
-    secrets: inherit
+    runs-on: ubuntu-latest
+    steps:
+      # Trusted publishers validate the top-level workflow identity. Dispatching
+      # publish.yml keeps automatic and manual releases on the same identity.
+      - name: Dispatch and wait for publish workflow
+        uses: actions/github-script@v9
+        env:
+          COMMIT: ${{ github.sha }}
+          PUBLISH_CRATES: ${{ needs.check-auto-publish.outputs.crates_to_publish }}
+          PUBLISH_DOCKERHUB: ${{ needs.check-auto-publish.outputs.docker_components }}
+          PUBLISH_OTHER: ${{ needs.check-auto-publish.outputs.sdks_to_publish }}
+        with:
+          script: |
+            const dispatch = await github.request('POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'publish.yml',
+              ref: 'master',
+              inputs: {
+                commit: process.env.COMMIT,
+                dry_run: 'false',
+                use_latest_ci: 'false',
+                skip_tag_creation: 'false',
+                publish_crates: process.env.PUBLISH_CRATES,
+                publish_dockerhub: process.env.PUBLISH_DOCKERHUB,
+                publish_other: process.env.PUBLISH_OTHER,
+                create_edge_docker_tag: 'true'
+              },
+              headers: {
+                'X-GitHub-Api-Version': '2026-03-10'
+              }
+            });
 
+            const runId = dispatch.data.workflow_run_id;
+            if (!runId) {
+              throw new Error('Workflow dispatch did not return a run ID');
+            }
+
+            core.info(`Publish run: ${dispatch.data.html_url}`);
+            while (true) {
+              const { data: run } = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId
+              });
+
+              if (run.status === 'completed') {
+                if (run.conclusion !== 'success') {
+                  throw new Error(`Publish workflow concluded with ${run.conclusion}: ${run.html_url}`);
+                }
+                core.info(`Publish workflow succeeded: ${run.html_url}`);
+                break;
+              }
+
+              await new Promise(resolve => setTimeout(resolve, 30000));
+            }

@@ -23,6 +23,7 @@ export const COMMAND_CODE = {
   GetStats: 10,
   GetSnapshot: 11,                    // @TODO GET_SNAPSHOT_FILE_CODE: u32 = 11
   GetClusterMetadata: 12,
+  DescribeOptions: 13,
   GetMe: 20,
   GetClient: 21,
   GetClients: 22,
@@ -47,8 +48,6 @@ export const COMMAND_CODE = {
   GetOffset: 120,
   StoreOffset: 121,
   DeleteConsumerOffset: 122,
-  StoreOffset2: 123,
-  DeleteConsumerOffset2: 124,
   GetStream: 200,
   GetStreams: 201,
   CreateStream: 202,

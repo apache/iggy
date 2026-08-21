@@ -44,7 +44,7 @@ runs:
 
     - name: Install netcat
       if: inputs.task == 'e2e'
-      run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
+      run: ./scripts/ci/apt-install.sh netcat-openbsd
       shell: bash
 
     - name: Install dependencies

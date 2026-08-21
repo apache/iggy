@@ -48,10 +48,10 @@ journal = { workspace = true }
 left-right = { workspace = true }
 message_bus = { workspace = true }
 paste = { workspace = true }
+rmp = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 server_common = { workspace = true }
-slab = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -64,3 +64,6 @@ tempfile = { workspace = true }
 enum_glob_use = "deny"
 pedantic = "deny"
 nursery = "warn"
+
+[lints.rust]
+warnings = "deny"

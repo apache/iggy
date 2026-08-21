@@ -54,6 +54,15 @@ public sealed class IggyClientConfigurator
     public int SendBufferSize { get; set; } = 4096;
 
     /// <summary>
+    ///     Interval between the pings the <see cref="Enums.Protocol.Tcp" /> client sends on its own while
+    ///     connected, so an idle session survives the server's heartbeat verification and consumer-group
+    ///     assignments stay fresh. Default is 5 seconds; must be between 1 millisecond and about 49 days.
+    ///     Init-only: the client validates the interval once and hands it to a timer that would fault on an
+    ///     out-of-range value.
+    /// </summary>
+    public TimeSpan HeartbeatInterval { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     ///     TLS settings
     /// </summary>
     public TlsSettings TlsSettings { get; set; } = new();

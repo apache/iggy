@@ -120,7 +120,7 @@ describe('VSR consumer-group polling', () => {
       (error: unknown) =>
         error instanceof ResponseError &&
         error.errorCode === 5006 &&
-        error.message.includes('message: Consumer group member not found')
+        error.message.includes('message: Consumer group member with client ID:')
     );
   });
 

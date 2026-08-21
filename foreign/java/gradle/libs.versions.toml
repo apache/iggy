@@ -29,6 +29,9 @@ jackson2 = "2.22.1"
 # Apache Commons
 commons-lang3 = "3.20.0"
 
+# Hashing
+hash4j = "0.22.0"
+
 # HTTP Client
 httpclient5 = "5.6.3"
 
@@ -70,6 +73,9 @@ httpclient5 = { module = "org.apache.httpcomponents.client5:httpclient5", versio
 
 # Apache Commons
 commons-lang3 = { module = "org.apache.commons:commons-lang3", version.ref = "commons-lang3" }
+
+# Hashing
+hash4j = { module = "com.dynatrace.hash4j:hash4j", version.ref = "hash4j" }
 
 # Logging
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
