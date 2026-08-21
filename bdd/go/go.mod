@@ -8,7 +8,7 @@ require (
 	github.com/apache/iggy/foreign/go v0.0.0-00010101000000-000000000000
 	github.com/cucumber/godog v0.16.0
 	github.com/google/uuid v1.6.0
-	github.com/onsi/ginkgo/v2 v2.32.0
+	github.com/onsi/ginkgo/v2 v2.32.1
 	github.com/onsi/gomega v1.42.1
 )
 
