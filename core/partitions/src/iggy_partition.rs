@@ -779,6 +779,65 @@ where
         self.should_increment_offset = true;
     }
 
+    /// Whether this partition ever stamped an offset, i.e. whether its offset
+    /// counters describe a real offset space rather than an untouched zero. The
+    /// one bit separating a partition holding one message at offset 0 from one
+    /// that never took a write: both report `(0, 0)`.
+    #[cfg(any(test, feature = "simulator"))]
+    pub const fn offset_space_used(&self) -> bool {
+        self.should_increment_offset
+    }
+
+    /// Adopt a log carried over from a previous incarnation of this partition,
+    /// standing in for what segment recovery reads off disk at boot.
+    ///
+    /// A real server loses nothing across the rebuild: its messages are in segment
+    /// files and boot recovers the offset counter from them. The simulator's
+    /// partitions are in-memory, so without this the rebuilt partition comes back
+    /// empty and its `commit_offset` regresses to zero, which reads as a consensus
+    /// regression rather than the harness having thrown the data away.
+    ///
+    /// `durable_offset` and `write_offset` are what the caller recovered, as
+    /// `segment_recovery` derives them from segments. Applied as a MAX against
+    /// whatever the superblock frontier already proved, for the same reason
+    /// [`Self::restore_offset_frontier`] maxes: a recovered value behind the
+    /// frontier must not lower it.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn adopt_retained_log(&mut self, state: crate::RetainedPartitionState) {
+        let crate::RetainedPartitionState {
+            log,
+            durable_offset,
+            write_offset,
+            offset_space_used,
+        } = state;
+        self.log = log;
+        // Empty carry-over: the previous incarnation never took a write, so there
+        // is no offset space to restore and claiming one would make the next
+        // prepare mint from a base no peer agrees on.
+        //
+        // Keyed on the RETIRED incarnation's flag, never on `(0, 0)` or on this
+        // partition's own `should_increment_offset`. One message at offset 0 reports
+        // the same two zeroes as an empty partition, and this instance is freshly
+        // built so its own flag is always false. The arithmetic test would therefore
+        // adopt the log, skip the counters, and let the next write stamp
+        // `base_offset = 0` where peers stamp 1, with `batch_checksum` over it: two
+        // logs, different bytes at the same op, silently.
+        if !offset_space_used {
+            return;
+        }
+        let durable = durable_offset.max(self.offset.load(Ordering::Acquire));
+        let dirty = write_offset
+            .max(durable)
+            .max(self.dirty_offset.load(Ordering::Relaxed));
+        self.offset.store(durable, Ordering::Release);
+        self.dirty_offset.store(dirty, Ordering::Relaxed);
+        self.should_increment_offset = true;
+        // Everything carried over is already persisted as far as this replica is
+        // concerned, so the flush and commit paths must not re-persist or re-count
+        // it, the same contract boot gives a partition recovered from segments.
+        self.recovered_durable_offset = Some(durable);
+    }
+
     /// Copy this incarnation's offset counter into the shared
     /// [`PartitionStats`], making it the value readers (offset validation,
     /// `get_topic`, `get_stats`) see.
@@ -2269,7 +2328,16 @@ where
         }
 
         // Backup gap check; primary sequencer pre-advanced by
-        // push_prepare_entry. See metadata::on_replicate.
+        // push_prepare_entry.
+        //
+        // The sequencer, deliberately, where `metadata::on_replicate` gates on its
+        // journal. The two frontiers cannot drift apart on this plane:
+        // `install_state_transfer` rewinds the sequencer to the offer's `commit_op`
+        // (where the metadata install moves a durable snapshot floor and leaves the
+        // WAL head behind it), and the repair ingest advances it by walking the
+        // journal. Reading the journal here would answer 0 after every restart,
+        // since this plane's journal is memory-only and starts empty however much
+        // data sits on disk.
         let is_backup = self.consensus().is_follower();
         if is_backup {
             if header.op != current_op + 1 {

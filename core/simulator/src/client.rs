@@ -30,6 +30,10 @@ use iggy_binary_protocol::requests::messages::{
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
+use iggy_binary_protocol::requests::personal_access_tokens::{
+    CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest,
+    DeletePersonalAccessTokenRequest as WireDeletePersonalAccessTokenRequest,
+};
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
@@ -77,6 +81,17 @@ pub struct SimClient {
     /// a pure function of the seed. See [`SimClient::next_message_id`].
     message_counter: Cell<u64>,
     session: Cell<u64>,
+    /// Whether this client talks to the server's real dispatch layer, which
+    /// changes what a PAT request must contain.
+    ///
+    /// A real client sends `[name][expiry]` and the server mints the token and its
+    /// hash in `maybe_rewrite_pat_request`, rewriting the request into the
+    /// replicated form before consensus sees it. The raw path has no dispatch layer
+    /// and so no rewrite, so a request submitted there must arrive already
+    /// replicated. Sessions split the same way (`register` raw, `login` shell);
+    /// this is the one op family whose BODY differs rather than its envelope. Set
+    /// by `Simulator::shell_login_via`, so it follows the path the client took.
+    shell_wire: Cell<bool>,
 }
 
 impl SimClient {
@@ -88,7 +103,31 @@ impl SimClient {
             partition_counter: Cell::new(0),
             message_counter: Cell::new(0),
             session: Cell::new(0),
+            shell_wire: Cell::new(false),
         }
+    }
+
+    /// Mark this client as talking to the real dispatch layer, so PAT requests
+    /// carry the client wire shape rather than the replicated one. See
+    /// [`SimClient::shell_wire`].
+    pub fn set_shell_wire(&self) {
+        self.shell_wire.set(true);
+    }
+
+    /// Put this client back on the replicated wire shape.
+    ///
+    /// The inverse exists because the flip is otherwise permanent and silent: a
+    /// client moved to the client wire shape by mistake stops covering the
+    /// replicated PAT path for the rest of the run, with nothing failing.
+    pub fn clear_shell_wire(&self) {
+        self.shell_wire.set(false);
+    }
+
+    /// Whether this client talks the client wire shape (see
+    /// [`SimClient::set_shell_wire`]).
+    #[must_use]
+    pub const fn shell_wire(&self) -> bool {
+        self.shell_wire.get()
     }
 
     #[must_use]
@@ -227,6 +266,18 @@ impl SimClient {
         buffer.extend_from_slice(&body);
         Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("login request must be valid")
+    }
+
+    /// Tear down this client's bound session.
+    ///
+    /// Replicates through the metadata plane like any other session op, so it
+    /// carries the bound session and a metadata request id and needs no body. A
+    /// logout to a BACKUP is what produces `ForwardLogout`: the backup owns the
+    /// connection but not the log, so it asks the primary to commit the teardown
+    /// and answers once `ForwardLogoutResult` returns.
+    #[must_use]
+    pub fn logout(&self) -> Message<RoutedRequestHeader> {
+        self.build_request(Operation::Logout, &[])
     }
 
     /// # Panics
@@ -487,14 +538,22 @@ impl SimClient {
         name: &str,
         expiry: u64,
     ) -> Message<RoutedRequestHeader> {
+        let name = WireName::new(name).expect("PAT name must be valid");
+        // Through dispatch, send what a real client sends: the server resolves the
+        // acting user from the session and mints the token and its hash in
+        // `maybe_rewrite_pat_request`, rewriting this into the replicated form
+        // before consensus sees it. A client cannot produce that form, not knowing
+        // the hash, so sending it here made every PAT request fail to decode.
+        if self.shell_wire.get() {
+            let wire = WireCreatePersonalAccessTokenRequest { name, expiry };
+            return self.build_request(Operation::CreatePersonalAccessToken, &wire.to_bytes());
+        }
+        // Raw path: no dispatch layer, so no rewrite ever happens and the request
+        // has to arrive already replicated.
         let wire = CreatePersonalAccessTokenRequest {
             user_id: 0,
-            name: WireName::new(name).expect("PAT name must be valid"),
+            name,
             expiry,
-            // Deterministic stub for the simulator. Production servers mint
-            // this in `maybe_rewrite_pat_request` on the primary; the
-            // simulator drives the wire path directly without that rewrite
-            // step.
             token_hash: [b'a'; 64],
         };
         self.build_request(Operation::CreatePersonalAccessToken, &wire.to_bytes())
@@ -503,9 +562,15 @@ impl SimClient {
     /// # Panics
     /// Panics if `name` is not a valid `WireName`.
     pub fn delete_personal_access_token(&self, name: &str) -> Message<RoutedRequestHeader> {
+        let name = WireName::new(name).expect("PAT name must be valid");
+        // See `create_personal_access_token` for why the shape depends on the path.
+        if self.shell_wire.get() {
+            let wire = WireDeletePersonalAccessTokenRequest { name };
+            return self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes());
+        }
         let wire = DeletePersonalAccessTokenRequest {
             user_id: 0,
-            name: WireName::new(name).expect("PAT name must be valid"),
+            name,
             only_if_expired: false,
         };
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())

@@ -34,7 +34,7 @@ pub mod time;
 
 use futures::task::ArcWake;
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -46,12 +46,6 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 pub use time::{SimInstant, TimerHandle};
-
-/// Salt for deriving the executor's PRNG stream from the simulation seed.
-///
-/// Sibling of the workload fault salt (`0x5A1A_F0E5_FACE_0001`): independent
-/// streams keep scheduling draws from perturbing network or workload traces.
-pub const EXECUTOR_SEED_SALT: u64 = 0x5A1A_F0E5_FACE_0002;
 
 /// Ready on the second poll; the first re-queues the task behind every other
 /// ready task, exactly like a wake arriving mid-await. Lets a task give the
@@ -107,7 +101,7 @@ pub struct DetExecutor {
     /// Ready queue in insertion order; the next victim is a seeded uniform
     /// pick, so the schedule is a pure function of (seed, wake history).
     ready: Vec<TaskId>,
-    rng: Xoshiro256Plus,
+    rng: Xoshiro256PlusPlus,
     wake: Arc<WakeQueue>,
     timer: TimerHandle,
     /// Futures staged by task code through `MessageBus::spawn` (the sim's
@@ -130,7 +124,7 @@ impl DetExecutor {
             tasks: Vec::new(),
             free: Vec::new(),
             ready: Vec::new(),
-            rng: Xoshiro256Plus::seed_from_u64(seed ^ EXECUTOR_SEED_SALT),
+            rng: Xoshiro256PlusPlus::seed_from_u64(crate::seeds::SimSeeds::derive(seed).executor),
             wake: Arc::new(WakeQueue {
                 woken: Mutex::new(Vec::new()),
             }),
