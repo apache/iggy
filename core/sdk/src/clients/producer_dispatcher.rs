@@ -26,6 +26,123 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Semaphore, broadcast};
 use tokio::task::JoinHandle;
 
+/// The background machinery of an [`IggyProducer`](crate::clients::producer::IggyProducer), built from a
+/// [`BackgroundConfig`] when the producer is configured with
+/// [`IggyProducerBuilder::background`](crate::clients::producer_builder::IggyProducerBuilder::background).
+///
+/// The dispatcher owns the background workers responsible for writing messages (the [`Shard`]s)
+/// and coordinates the memory budget that puts an upper bound on the number of message bytes (`max_bytes_size`)
+/// it handles simultaneously and the limit on the number of requests that are allowed to be in-flight per `Shard` (`max_in_flight`).
+/// todo(haubur): link both to the BackgroundConfig.
+///
+/// A background send is a dispatch of messages to a [`Shard`]. Dispatching means, that the messages are send down the
+/// sending end of a channel, where the receiver is listened on a [`Shard`] worker.
+/// So a batch is queued and the write happens later, on one of the [`Shard`] workers this type owns.
+/// Consequently, errors from writes surface on `Shard`s which channel those errors back to the dispatcher's callback
+/// (comp. [`Self::new()`]. These errors are logged with the default [`LogErrorCallback`], but other implementations are possible through
+/// todo(haubur): link to ErrorCallback trait.
+///
+/// Which worker a batch lands on, and what that means for ordering, is described on
+/// [`IggyProducer`](crate::clients::producer::IggyProducer).
+///
+/// # Examples
+///
+/// Configuring background send through the producer builder:
+///
+/// ```rust,no_run
+/// use iggy::prelude::*;
+/// use std::str::FromStr;
+///
+/// # async fn example() -> Result<(), IggyError> {
+/// let client = IggyClient::from_connection_string("iggy://iggy:iggy@localhost:8090")?;
+/// client.connect().await?;
+///
+/// let producer = client
+///     .producer("my-stream", "my-topic")?
+///     .background(BackgroundConfig::builder().num_shards(4).build())
+///     .build();
+/// producer.init().await?;
+///
+/// producer.send_one(IggyMessage::from_str("hello")?).await?;
+/// producer.shutdown().await;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// You can implement your own backend/ logic on how to send and wrap the dispatcher around that.
+/// Here, just print instead of sending anything to a server for illustration.
+///
+/// ```rust,no_run
+/// use iggy::clients::producer::ProducerCoreBackend;
+/// use iggy::clients::producer_dispatcher::ProducerDispatcher;
+/// use iggy::prelude::*;
+/// use std::str::FromStr;
+/// use std::sync::Arc;
+///
+/// #[derive(Debug)]
+/// struct CountingBackend;
+///
+/// impl ProducerCoreBackend for CountingBackend {
+///     async fn send_internal(
+///         &self,
+///         stream: &Identifier,
+///         topic: &Identifier,
+///         messages: Vec<IggyMessage>,
+///         _partitioning: Option<Arc<Partitioning>>,
+///     ) -> Result<SendMessagesResponse, IggyError> {
+///         println!("{} messages to {stream}/{topic}", messages.len());
+///         Ok(SendMessagesResponse { confirmations: Vec::new() })
+///     }
+/// }
+///
+/// # async fn example() -> Result<(), IggyError> {
+/// let dispatcher = ProducerDispatcher::new(
+///     Arc::new(CountingBackend),
+///     BackgroundConfig::builder().num_shards(2).build(),
+/// );
+///
+/// let stream = Arc::new(Identifier::named("my-stream")?);
+/// let topic = Arc::new(Identifier::named("my-topic")?);
+///
+/// // Returns once the batch is queued, not once it is written.
+/// dispatcher
+///     .dispatch(vec![IggyMessage::from_str("hello")?], stream, topic, None)
+///     .await?;
+///
+/// // Writes what is still queued. Dropping the dispatcher instead discards it.
+/// dispatcher.shutdown().await;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Write constraints
+///
+/// ## Memory budget
+///
+/// [`dispatch()`](Self::dispatch) charges a batch against a budget of
+/// [`BackgroundConfig::max_buffer_size`] bytes before queueing it, and the charge is released once a
+/// worker has written the batch, so the budget covers what is waiting in the queues as well as what
+/// is on the wire. What gets charged is the size [`ShardMessage`] reports, which counts the stream
+/// and topic identifiers alongside the messages rather than the payloads alone.
+///
+/// This budget is the only backpressure a background send can observe, and
+/// [`BackgroundConfig::failure_mode`] decides what exhausting it does to the caller. The second
+/// limit, [`BackgroundConfig::max_in_flight`], is shared by the workers rather than the callers: a
+/// worker takes one of its permits for the batch it is about to write, so it bounds concurrent
+/// writes across all workers, not queued bytes.
+///
+/// ## In-flight Limit
+///
+/// You can configure the `ProducerDispatcher` with a maximum number of requests that are allowed to be handled
+/// concurrently per `Shard` through [`max_in_flight`]. The default equals to one. Note, that you risk losing the ordering of batches
+/// if you increase that number. For adjacent messages split in two batches sending of the first batch might fail and trigger a retry.
+/// However, that batch might be raced by the second batch should it succeed immediately.
+///
+/// # Shutdown
+///
+/// [`shutdown()`](Self::shutdown) is what makes the queued batches observable. It stops the workers,
+/// waits for their last flush, and only then returns. Dropping the dispatcher instead ends the
+/// workers wherever they are and discards whatever they still hold.
 pub struct ProducerDispatcher {
     shards: Vec<Shard>,
     config: Arc<BackgroundConfig>,
@@ -36,6 +153,90 @@ pub struct ProducerDispatcher {
 }
 
 impl ProducerDispatcher {
+    /// Spawns the [`Shards`], i.e. the workers that can write messages to the server.
+    ///
+    /// The `ProducerDispatcher` spawns and owns the `Shards` on which the write load
+    /// is distributed. Which of the `num_shards` is picked to write is decided
+    /// by the sharding strategy. todo(haubur): add link to sharding config.
+    ///
+    /// Additionally, a dispatcher starts a task that listens for error callbacks. So should a `Shard` fail
+    /// to write some messages (including retries), that failure is not received on the same task,
+    /// but hits the error callback. todo(haubur): add link to ErrorCallback trait.
+    ///
+    /// To cap the amount of data a dispatcher handles two limits are initialized: the
+    /// [`BackgroundConfig::max_in_flight`] and [`BackgroundConfig::max_buffer_size`] semaphores.
+    /// Both are passed to the `Shard`s and therefore hold for the entire producer, rather than per worker.
+    /// todo(haubur): how do they relate?
+    ///
+    /// # Examples
+    ///
+    /// Four workers writing in parallel, fed round-robin, with a budget of 64 MiB in queued bytes:
+    ///
+    /// ```rust,no_run
+    /// # use iggy::clients::producer::ProducerCoreBackend;
+    /// use iggy::clients::producer_dispatcher::ProducerDispatcher;
+    /// use iggy::prelude::*;
+    /// use std::sync::Arc;
+    ///
+    /// # #[derive(Debug)]
+    /// # struct Backend;
+    /// # impl ProducerCoreBackend for Backend {
+    /// #     async fn send_internal(
+    /// #         &self,
+    /// #         _stream: &Identifier,
+    /// #         _topic: &Identifier,
+    /// #         _messages: Vec<IggyMessage>,
+    /// #         _partitioning: Option<Arc<Partitioning>>,
+    /// #     ) -> Result<SendMessagesResponse, IggyError> {
+    /// #         Ok(SendMessagesResponse { confirmations: Vec::new() })
+    /// #     }
+    /// # }
+    /// # fn example(backend: Arc<Backend>) {
+    /// let dispatcher = ProducerDispatcher::new(
+    ///     backend,
+    ///     BackgroundConfig::builder()
+    ///         .num_shards(4)
+    ///         // Ordering is given up for throughput: a batch can land on any of the four workers.
+    ///         .sharding(Box::new(BalancedSharding::default()))
+    ///         .max_buffer_size(IggyByteSize::from(64 * 1024 * 1024))
+    ///         .build(),
+    /// );
+    /// # }
+    /// ```
+    ///
+    /// `num_shards(0)` is read as one worker, and both limits read `0` as unbounded, so this
+    /// dispatcher writes from a single worker and never refuses a batch for lack of budget:
+    ///
+    /// ```rust,no_run
+    /// # use iggy::clients::producer::ProducerCoreBackend;
+    /// use iggy::clients::producer_dispatcher::ProducerDispatcher;
+    /// use iggy::prelude::*;
+    /// use std::sync::Arc;
+    ///
+    /// # #[derive(Debug)]
+    /// # struct Backend;
+    /// # impl ProducerCoreBackend for Backend {
+    /// #     async fn send_internal(
+    /// #         &self,
+    /// #         _stream: &Identifier,
+    /// #         _topic: &Identifier,
+    /// #         _messages: Vec<IggyMessage>,
+    /// #         _partitioning: Option<Arc<Partitioning>>,
+    /// #     ) -> Result<SendMessagesResponse, IggyError> {
+    /// #         Ok(SendMessagesResponse { confirmations: Vec::new() })
+    /// #     }
+    /// # }
+    /// # fn example(backend: Arc<Backend>) {
+    /// let dispatcher = ProducerDispatcher::new(
+    ///     backend,
+    ///     BackgroundConfig::builder()
+    ///         .num_shards(0)
+    ///         .max_buffer_size(IggyByteSize::from(0))
+    ///         .max_in_flight(0)
+    ///         .build(),
+    /// );
+    /// # }
+    /// ```
     pub fn new(core: Arc<impl ProducerCoreBackend>, config: BackgroundConfig) -> Self {
         let num_shards = if config.num_shards == 0 {
             1
@@ -96,6 +297,122 @@ impl ProducerDispatcher {
         }
     }
 
+    /// Queues a batch on one of the worker [`Shard`]s and returns without waiting for it to be written.
+    ///
+    /// The batch is charged against the [`BackgroundConfig::max_buffer_size`] budget before it is
+    /// queued (a semaphore), and the permit travels with it so those bytes stay charged until a worker has written
+    /// them. A batch larger than the entire budget can never be charged and fails with
+    /// [`IggyError::BackgroundSendBufferOverflow`].
+    ///
+    /// When the budget is exhausted, [`BackgroundConfig::failure_mode`] decides what happens to the
+    /// caller. [`BackpressureMode::FailImmediately`] gives up with
+    /// [`IggyError::BackgroundSendBufferOverflow`], [`BackpressureMode::Block`] waits for as long as
+    /// it takes to acquire the message bytes from the budget, and [`BackpressureMode::BlockWithTimeout`] waits
+    /// for its duration before failing with [`IggyError::BackgroundSendTimeout`]. None of the three retries.
+    ///
+    /// [`BackgroundConfig::sharding`] then picks the worker based on the configured strategy, and the batch is handed to its queue.
+    /// That queue is bounded (=256), exceeding that limit can force the caller to wait.
+    ///
+    /// # Errors
+    ///
+    /// [`IggyError::ProducerClosed`] once [`shutdown()`](Self::shutdown) has begun, and
+    /// [`IggyError::BackgroundSendError`] if the picked worker is already gone, which leaves the
+    /// batch unqueued and unsent in both cases. The budget can additionally fail the call with
+    /// [`IggyError::BackgroundSendBufferOverflow`] or [`IggyError::BackgroundSendTimeout`] as
+    /// described above.
+    ///
+    /// # Examples
+    ///
+    /// Dispatching with a strategy for partitioning.
+    ///
+    /// ```rust,no_run
+    /// # use iggy::clients::producer::ProducerCoreBackend;
+    /// use iggy::clients::producer_dispatcher::ProducerDispatcher;
+    /// use iggy::prelude::*;
+    /// use std::str::FromStr;
+    /// use std::sync::Arc;
+    ///
+    /// # #[derive(Debug)]
+    /// # struct Backend;
+    /// # impl ProducerCoreBackend for Backend {
+    /// #     async fn send_internal(
+    /// #         &self,
+    /// #         _stream: &Identifier,
+    /// #         _topic: &Identifier,
+    /// #         _messages: Vec<IggyMessage>,
+    /// #         _partitioning: Option<Arc<Partitioning>>,
+    /// #     ) -> Result<SendMessagesResponse, IggyError> {
+    /// #         Ok(SendMessagesResponse { confirmations: Vec::new() })
+    /// #     }
+    /// # }
+    /// # async fn example(dispatcher: ProducerDispatcher) -> Result<(), IggyError> {
+    /// let stream = Arc::new(Identifier::named("orders")?);
+    /// let topic = Arc::new(Identifier::named("created")?);
+    /// let partitioning = Arc::new(Partitioning::messages_key_str("order-42")?);
+    ///
+    /// dispatcher
+    ///     .dispatch(
+    ///         vec![IggyMessage::from_str("order created")?],
+    ///         stream.clone(),
+    ///         topic.clone(),
+    ///         Some(partitioning),
+    ///     )
+    ///     .await?;
+    ///
+    /// // Nothing is written yet. Both batches are queued, and a worker writes them later.
+    /// dispatcher
+    ///     .dispatch(vec![IggyMessage::from_str("order updated")?], stream, topic, None)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Fail immediately if the `max_buffer_size` is exceeded.
+    ///
+    /// ```rust,no_run
+    /// # use iggy::clients::producer::ProducerCoreBackend;
+    /// use iggy::clients::producer_config::BackpressureMode;
+    /// use iggy::clients::producer_dispatcher::ProducerDispatcher;
+    /// use iggy::prelude::*;
+    /// use std::str::FromStr;
+    /// use std::sync::Arc;
+    ///
+    /// # #[derive(Debug)]
+    /// # struct Backend;
+    /// # impl ProducerCoreBackend for Backend {
+    /// #     async fn send_internal(
+    /// #         &self,
+    /// #         _stream: &Identifier,
+    /// #         _topic: &Identifier,
+    /// #         _messages: Vec<IggyMessage>,
+    /// #         _partitioning: Option<Arc<Partitioning>>,
+    /// #     ) -> Result<SendMessagesResponse, IggyError> {
+    /// #         Ok(SendMessagesResponse { confirmations: Vec::new() })
+    /// #     }
+    /// # }
+    /// # async fn example(backend: Arc<Backend>) -> Result<(), IggyError> {
+    /// let dispatcher = ProducerDispatcher::new(
+    ///     backend,
+    ///     BackgroundConfig::builder()
+    ///         .max_buffer_size(IggyByteSize::from(1024 * 1024))
+    ///         .failure_mode(BackpressureMode::FailImmediately)
+    ///         .build(),
+    /// );
+    ///
+    /// let messages = vec![IggyMessage::from_str("hello")?];
+    /// let stream = Arc::new(Identifier::named("orders")?);
+    /// let topic = Arc::new(Identifier::named("created")?);
+    ///
+    /// match dispatcher.dispatch(messages, stream, topic, None).await {
+    ///     Ok(()) => println!("queued"),
+    ///     // The workers are behind, or this single batch is larger than the whole budget.
+    ///     Err(IggyError::BackgroundSendBufferOverflow) => println!("dropped, budget is full"),
+    ///     Err(IggyError::ProducerClosed) => println!("dropped, dispatcher is shutting down"),
+    ///     Err(error) => return Err(error),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn dispatch(
         &self,
         messages: Vec<IggyMessage>,
@@ -162,7 +479,7 @@ impl ProducerDispatcher {
             &shard_message.stream,
             &shard_message.topic,
         );
-        debug_assert!(shard_ix < self.shards.len());
+
         let shard = &self.shards[shard_ix];
 
         shard
