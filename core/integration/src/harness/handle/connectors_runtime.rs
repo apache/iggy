@@ -243,19 +243,41 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
     }
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
-        let http_address = self.http_url();
-        let client = reqwest::Client::new();
+        // Prefer /health over `/` so readiness means the connectors API is up,
+        // not some other listener that happened to bind the reserved port.
+        let health_url = format!("{}/health", self.http_url());
+        // Bound each probe so a black-holed TCP accept (no HTTP response) cannot
+        // stall send() past the pid-crash / retry budget. Localhost dead process
+        // usually ECONNREFUSED, but a short timeout keeps both guards effective.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!("Failed to build connectors health client: {error}"),
+            })?;
 
         for retry in 0..common::DEFAULT_HEALTH_CHECK_RETRIES {
-            match client.get(&http_address).send().await {
-                Ok(_) => {
+            if let Some(pid) = self.pid()
+                && !common::is_process_alive(pid)
+            {
+                let (stdout, stderr) = self.collect_logs();
+                return Err(TestBinaryError::ProcessCrashed {
+                    binary: "iggy-connectors".to_string(),
+                    exit_code: None,
+                    stdout,
+                    stderr,
+                });
+            }
+
+            match client.get(&health_url).send().await {
+                Ok(response) if response.status().is_success() => {
                     return Ok(());
                 }
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     if retry == common::DEFAULT_HEALTH_CHECK_RETRIES - 1 {
                         return Err(TestBinaryError::HealthCheckFailed {
                             binary: "iggy-connectors".to_string(),
-                            address: http_address,
+                            address: health_url,
                             retries: common::DEFAULT_HEALTH_CHECK_RETRIES,
                         });
                     }
