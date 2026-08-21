@@ -213,7 +213,6 @@ export const translateErrorCode = (code: number): string => {
     case '4041': return "Unsupported option key: {0}";
     case '4042': return "Invalid option value for key: {0}";
     case '4043': return "Options block exceeds its limits: {0}";
-    case '4044': return "Segment file size on disk: {0} does not match expected size: {1}";
     case '4050': return "Cannot sed messages due to client disconnection";
     case '4051': return "Background send error";
     case '4052': return "Background send timeout";
@@ -223,6 +222,7 @@ export const translateErrorCode = (code: number): string => {
     case '4057': return "Producer closed";
     case '4100': return "Invalid offset: {0}";
     case '4101': return "Invalid reserved field value: {0}, expected: 0";
+    case '4102': return "Segment file size on disk: {0} does not match expected size: {1}";
 
     // CONSUMER GROUP
     case '5000': return "Consumer group with ID: {0} for topic with ID: {1} was not found.";

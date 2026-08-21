@@ -1017,14 +1017,6 @@
   fields:
     - name: Details
       type: string
-- name: SegmentSizeMismatchAtOpen
-  code: 4044
-  format: "segment file size on disk: %d does not match expected size: %d"
-  fields:
-    - name: OnDisk
-      type: uint64
-    - name: Expected
-      type: uint64
 - name: CannotSendMessagesDueToClientDisconnection
   code: 4050
   format: "cannot sed messages due to client disconnection"
@@ -1064,6 +1056,14 @@
   format: "invalid reserved field value: %d, expected: 0"
   fields:
     - name: Value
+      type: uint64
+- name: SegmentSizeMismatchAtOpen
+  code: 4102
+  format: "segment file size on disk: %d does not match expected size: %d"
+  fields:
+    - name: OnDisk
+      type: uint64
+    - name: Expected
       type: uint64
 - name: ConsumerGroupIdNotFound
   code: 5000
