@@ -21,7 +21,7 @@ use err_trail::ErrContext;
 use iggy_common::IggyError;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::trace;
+use tracing::{error, trace};
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]
@@ -54,10 +54,6 @@ impl IndexWriter {
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await.error(|e: &std::io::Error| {
-                format!("Failed to fsync index file after creation: {file_path}. {e}",)
-            });
-
             let actual_index_size = file
                 .metadata()
                 .await
@@ -67,7 +63,17 @@ impl IndexWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            index_size_bytes.store(actual_index_size, Ordering::Relaxed);
+            // Refusal rationale documented on `IggyError::SegmentSizeMismatchAtOpen`.
+            let expected_index_size = index_size_bytes.load(Ordering::Relaxed);
+            if actual_index_size != expected_index_size {
+                error!(
+                    "Index file size on disk: {actual_index_size} does not match expected size: {expected_index_size}, file: {file_path}"
+                );
+                return Err(IggyError::SegmentSizeMismatchAtOpen(
+                    actual_index_size,
+                    expected_index_size,
+                ));
+            }
         }
 
         let size = index_size_bytes.load(Ordering::Relaxed);

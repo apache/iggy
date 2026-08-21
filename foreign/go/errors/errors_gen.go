@@ -2081,6 +2081,20 @@ func (e OptionsBlockTooLarge) Is(target error) bool {
 	return ok
 }
 
+type SegmentSizeMismatchAtOpen struct {
+	OnDisk   uint64
+	Expected uint64
+}
+
+func (e SegmentSizeMismatchAtOpen) Error() string {
+	return fmt.Sprintf("segment file size on disk: %d does not match expected size: %d", e.OnDisk, e.Expected)
+}
+func (e SegmentSizeMismatchAtOpen) Code() Code { return 4044 }
+func (e SegmentSizeMismatchAtOpen) Is(target error) bool {
+	_, ok := target.(SegmentSizeMismatchAtOpen)
+	return ok
+}
+
 type CannotSendMessagesDueToClientDisconnection struct{}
 
 func (e CannotSendMessagesDueToClientDisconnection) Error() string {
@@ -2815,6 +2829,7 @@ var (
 	ErrUnsupportedOptionKey                       = UnsupportedOptionKey{}
 	ErrInvalidOptionValue                         = InvalidOptionValue{}
 	ErrOptionsBlockTooLarge                       = OptionsBlockTooLarge{}
+	ErrSegmentSizeMismatchAtOpen                  = SegmentSizeMismatchAtOpen{}
 	ErrCannotSendMessagesDueToClientDisconnection = CannotSendMessagesDueToClientDisconnection{}
 	ErrBackgroundSendError                        = BackgroundSendError{}
 	ErrBackgroundSendTimeout                      = BackgroundSendTimeout{}
@@ -3057,6 +3072,7 @@ const (
 	UnsupportedOptionKeyCode                       Code = 4041
 	InvalidOptionValueCode                         Code = 4042
 	OptionsBlockTooLargeCode                       Code = 4043
+	SegmentSizeMismatchAtOpenCode                  Code = 4044
 	CannotSendMessagesDueToClientDisconnectionCode Code = 4050
 	BackgroundSendErrorCode                        Code = 4051
 	BackgroundSendTimeoutCode                      Code = 4052
@@ -3483,6 +3499,8 @@ func (c Code) String() string {
 		return "InvalidOptionValue"
 	case OptionsBlockTooLargeCode:
 		return "OptionsBlockTooLarge"
+	case SegmentSizeMismatchAtOpenCode:
+		return "SegmentSizeMismatchAtOpen"
 	case CannotSendMessagesDueToClientDisconnectionCode:
 		return "CannotSendMessagesDueToClientDisconnection"
 	case BackgroundSendErrorCode:
@@ -3964,6 +3982,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidOptionValue
 	case OptionsBlockTooLargeCode:
 		return ErrOptionsBlockTooLarge
+	case SegmentSizeMismatchAtOpenCode:
+		return ErrSegmentSizeMismatchAtOpen
 	case CannotSendMessagesDueToClientDisconnectionCode:
 		return ErrCannotSendMessagesDueToClientDisconnection
 	case BackgroundSendErrorCode:

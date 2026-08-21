@@ -29,7 +29,9 @@ use crate::partition_helpers::{
     open_partition_superblock,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
-use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
+use crate::server_error::{
+    PartitionRecoveryRefusal, ServerError, ShardJoinFailure, ShardJoinFailureKind,
+};
 use crate::session_manager::SessionManager;
 use compio::runtime::ResumeUnwind;
 use configs::server::{ServerConfig, ServerSystemConfig};
@@ -51,7 +53,8 @@ use iggy_common::defaults::{
     MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use iggy_common::{
-    Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, TopicRuntimeOptions, variadic,
+    Aes256GcmEncryptor, EncryptorKind, IggyByteSize, IggyError, PartitionStats,
+    TopicRuntimeOptions, variadic,
 };
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
@@ -1911,13 +1914,16 @@ async fn build_shard_for_thread(
         {
             Ok(partition) => partition,
             // ONE damaged local chain must not take the node down. The shapes
-            // this refuses are exactly what a failed state-transfer quarantine
-            // leaves behind, so fence that group the same way the runtime path
-            // does -- move its segment files aside, keeping the superblock so it
-            // cannot re-enter view 0 -- and materialise it fresh. The ordinary
-            // rejoin path (repair, then state transfer on a refused floor)
-            // recovers its data from a peer.
-            Err(ServerError::PartitionChainRefused { dir, reason, .. }) => {
+            // this refuses are structural -- what a failed state-transfer
+            // quarantine leaves behind, or damage the recovery walk proved
+            // inside a segment -- so fence that group the same way the runtime
+            // path does -- move its segment files aside, keeping the superblock
+            // so it cannot re-enter view 0 -- and materialise it fresh. The
+            // ordinary rejoin path (repair, then state transfer on a refused
+            // floor) recovers its data from a peer; a single-replica group has
+            // no peer, so it comes back EMPTY while every refused byte stays
+            // in the quarantine directory for the operator.
+            Err(ServerError::PartitionRecoveryRefused { dir, reason, .. }) => {
                 let partition_dir = dir.to_string_lossy().into_owned();
                 error!(
                     stream_id,
@@ -1963,7 +1969,9 @@ async fn build_shard_for_thread(
                         continue;
                     }
                 }
-                // The refused load already folded its segment counts in.
+                // A pass-A refusal folded nothing into the stats (recovery
+                // counts only accepted chains), but the hydrate-reopen refusal
+                // arrives after a fully counted load, so clear them either way.
                 partition_stats.zero_out_all();
                 build_partition_fresh(
                     config,
@@ -2605,13 +2613,14 @@ async fn load_partition(
         config.partition.evicted_ring_capacity,
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
-    partition.set_partition_dir(partition_dir);
+    partition.set_partition_dir(partition_dir.clone());
     // Before the hydrate: the durable record is keyed by incarnation, so a
     // `purge.gen` left behind by a previous life of this namespace reads 0.
     partition.set_created_revision(partition_metadata.created_revision);
     partition.hydrate_applied_purge_generation().await?;
     hydrate_partition_log(
         &mut partition,
+        &partition_dir,
         stream_id,
         topic_id,
         partition_id,
@@ -2677,6 +2686,7 @@ async fn load_partition(
 /// resolved topic option now, which is the whole point of the per-topic move.
 async fn hydrate_partition_log(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    partition_dir: &str,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -2716,9 +2726,10 @@ async fn hydrate_partition_log(
             storage.index_writer.as_ref(),
         ) {
             let index_path = index_reader.path();
-            // Share the storage's size counters: the readers bound reads by
-            // these atomics, so a writer with a private counter persists bytes
-            // the readers never learn about.
+            let start_offset = partition.log.segments()[active_index].start_offset;
+            // Share the storage's size counters: they are the write cursors.
+            // A private counter would let the append position diverge from the
+            // segment bookkeeping that index entries and poll bounds rely on.
             let messages_size_counter = storage_messages_writer.size_counter();
             let index_size_counter = storage_index_writer.size_counter();
             partition.log.messages_writers_mut()[active_index] = Some(Rc::new(
@@ -2739,7 +2750,14 @@ async fn hydrate_partition_log(
                         error = %source,
                         "failed to initialize persisted messages writer"
                     );
-                    source
+                    hydrate_reopen_error(
+                        source,
+                        partition_dir,
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        start_offset,
+                    )
                 })?,
             ));
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
@@ -2754,13 +2772,54 @@ async fn hydrate_partition_log(
                             error = %source,
                             "failed to initialize persisted sparse index writer"
                         );
-                        source
+                        hydrate_reopen_error(
+                            source,
+                            partition_dir,
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            start_offset,
+                        )
                     })?,
             ));
         }
     }
 
     Ok(())
+}
+
+/// Routes a hydrate-reopen writer failure. The seed-vs-stat divergence guard
+/// (`SegmentSizeMismatchAtOpen`) is the same structural contradiction the
+/// recovery walk refuses on -- and the heal path for data directories an
+/// earlier size-counter bug left with resurrected tails -- so it fences this
+/// one partition. Every other failure here (open, stat, sync) is transient
+/// I/O and stays node-fatal: a retried boot can still serve the partition,
+/// while fencing would quarantine healthy data (and at `replica_count = 1`
+/// destroy its availability outright).
+fn hydrate_reopen_error(
+    source: IggyError,
+    partition_dir: &str,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+    start_offset: u64,
+) -> ServerError {
+    match source {
+        IggyError::SegmentSizeMismatchAtOpen(on_disk_bytes, expected_bytes) => {
+            ServerError::PartitionRecoveryRefused {
+                dir: PathBuf::from(partition_dir),
+                stream_id,
+                topic_id,
+                partition_id,
+                reason: PartitionRecoveryRefusal::StorageSizeMismatch {
+                    start_offset,
+                    on_disk_bytes,
+                    expected_bytes,
+                },
+            }
+        }
+        transient => transient.into(),
+    }
 }
 
 fn resolve_tcp_topology(
