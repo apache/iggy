@@ -313,15 +313,19 @@ pub enum PartitionRecoveryRefusal {
         survivor_position: u64,
     },
     /// Bytes past the walked prefix that the damage probe could not
-    /// classify: the residue is wider than the largest record a torn append
-    /// can leave, or the probe ran out of scan budget before proving or
-    /// disproving a survivor. Truncation is only ever sound for a proven
-    /// torn tail, so giving up keeps the bytes.
+    /// classify: it ran out of work budget before proving or disproving a
+    /// survivor. The budget is sized so a front-to-back scan of every
+    /// residue in the load always fits, so exhaustion means candidate
+    /// offsets were re-examined -- a probe defect, not an at-rest shape.
+    /// Truncation is only ever sound for a proven torn tail, so giving up
+    /// keeps the bytes. The residue width is diagnostic only; it is not a
+    /// gate.
     UnverifiedResidue {
         start_offset: u64,
         damage_position: u64,
         residue_bytes: u64,
-        scan_limit_bytes: u64,
+        candidates_examined: u64,
+        budget_units: u64,
     },
     /// A batch does not continue the offset chain, so offsets are not
     /// contiguous inside one segment file. The cause is not necessarily
@@ -399,12 +403,14 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 start_offset,
                 damage_position,
                 residue_bytes,
-                scan_limit_bytes,
+                candidates_examined,
+                budget_units,
             } => write!(
                 f,
                 "segment {start_offset} holds {residue_bytes} bytes past the walked \
                  prefix at {damage_position} that the damage probe could not \
-                 classify within its {scan_limit_bytes}-byte limit; truncating \
+                 classify before exhausting its work budget ({candidates_examined} \
+                 candidate offsets examined of {budget_units} allowed); truncating \
                  unproven bytes could destroy durable batches"
             ),
             Self::OffsetDiscontinuity {

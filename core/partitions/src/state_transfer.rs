@@ -41,8 +41,8 @@ use consensus::{ArtifactProgress, Sequencer as _, StateArtifactHasher, state_art
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use server_common::SegmentStorage;
 use server_common::send_messages::decode_batch_slice;
+use server_common::{SegmentStorage, yield_to_reactor};
 use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;
@@ -2797,22 +2797,6 @@ impl std::error::Error for SpillError {}
 /// a transferred segment caches its index like any other instead of taking the
 /// per-poll binary-search fallback.
 const INDEX_STRIDE_BYTES: usize = 64 * 1024;
-
-/// Hand the core back to the reactor mid-CPU-pass.
-///
-/// Reactor only: the consensus tick shares this task as a sibling
-/// `select_biased!` arm, and arms are not polled while one arm's body awaits, so
-/// yielding here does not unfreeze ticks or heartbeats.
-///
-/// A zero-duration timer, NOT a bare self-waking yield: this runtime does not
-/// reliably re-poll a task that woke itself from inside its own poll, and a
-/// pump that suspends that way stops driving consensus entirely (the frame
-/// handler never resumes, ticks stop, the node goes quiet until something else
-/// wakes it). Registering with the reactor is what every other yield on these
-/// paths does -- the serving side yields through real file reads.
-async fn yield_to_reactor() {
-    compio::time::sleep(std::time::Duration::ZERO).await;
-}
 
 /// Chunk size for the offer build's streaming checksum pass. Large enough
 /// that per-chunk overhead is noise, small enough that the pump yields to

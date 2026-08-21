@@ -29,16 +29,15 @@
 
 use crate::server_error::{PartitionRecoveryRefusal, ServerError};
 use configs::server::ServerConfig;
-use iggy_common::{IggyByteSize, IggyError, PartitionStats};
+use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
 use partitions::state_transfer::STAGING_SUFFIX;
 use partitions::{IggyIndexReader, Segment};
-use server_common::SegmentStorage;
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
+use server_common::{SegmentStorage, yield_to_reactor};
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use tracing::{error, warn};
 
 const LOG_EXTENSION: &str = "log";
@@ -65,14 +64,28 @@ const SCAN_WINDOW_CAPACITY: usize = 4 * 1024 * 1024;
 /// batch always gets one.
 const REBUILT_INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 
-/// Multiple of the residue width cap the damage probe may spend, counting
-/// bytes read from disk plus bytes handed to batch verification. The width
-/// cap already bounds how much residue is scanned at all; the budget is a
-/// second line of defense against shapes whose decodable headers claim large
-/// batches at many byte offsets, each paying a verify over window bytes that
-/// were read once. Exhaustion refuses recovery; it never falls through to
-/// the truncating no-survivor verdict.
-const PROBE_BUDGET_MULTIPLIER: u64 = 2;
+/// Units the damage probes of one partition load may spend per byte of
+/// residue they are asked to classify, at one unit per candidate offset
+/// examined. Candidates never outnumber residue bytes, so an honest
+/// front-to-back scan always fits under this multiple regardless of residue
+/// width; only a shape that re-examines offsets can exhaust it. Deriving the
+/// limit from the residue actually present -- rather than from any
+/// configuration knob or frozen size constant -- makes it immune to knob
+/// changes between boots by construction: no legal segment can be refused
+/// because a limit was derived from a value the segment was not written
+/// under. Exhaustion refuses recovery; it never falls through to the
+/// truncating no-survivor verdict.
+const PROBE_BUDGET_UNITS_PER_RESIDUE_BYTE: u64 = 2;
+
+/// Largest on-disk batch record recovery treats as plausible: the frozen
+/// ceiling on `message_bus.max_message_size` -- the widest wire frame any
+/// legal configuration admits, validated at boot -- plus one batch header of
+/// slack in case an admission path counts its cap against the blob alone. A
+/// header claiming more cannot be a real batch, so rejecting it at the
+/// header is verdict-identical to reading the claimed bytes and failing the
+/// verify, minus a claimed-size allocation and read that a single
+/// bit-flipped length field could otherwise drive up to a whole segment.
+const MAX_RECOVERABLE_BATCH_BYTES: u64 = MAX_MESSAGE_SIZE_UPPER_BYTES + COMMAND_HEADER_SIZE as u64;
 
 /// Attempts at finding a free `<partition dir>.fenced.<n>` name, mirroring
 /// the partition-level quarantine's bound.
@@ -139,7 +152,6 @@ pub async fn load_persisted_segments(
 
     let max_size = segment_size;
     let mut scratch = ScanScratch::default();
-    let probe_limits = ProbeLimits::from_config(config);
 
     // Pass A: derive every segment's bounds without touching an existing
     // byte (the only write is each rebuilt index staged to a fresh
@@ -166,7 +178,6 @@ pub async fn load_persisted_segments(
             &messages_path,
             start_offset,
             raw_messages_size,
-            probe_limits,
             &mut scratch,
         )
         .await?;
@@ -359,26 +370,37 @@ struct PlannedSegment {
     recovered_empty: bool,
 }
 
-/// Hard bounds on the damage probe, derived once per partition load from
-/// `message_bus.max_message_size` -- the knob that caps an appendable batch,
-/// and so the widest record a torn append can leave holed.
-#[derive(Clone, Copy)]
-struct ProbeLimits {
-    /// Widest residue the probe classifies at all; anything wider refuses
-    /// without a scan.
-    max_residue_bytes: u64,
-    /// Bytes read plus bytes handed to verification before the probe gives
-    /// up and refuses.
-    scan_budget_bytes: u64,
+/// Work bound shared by every damage probe in one partition load.
+///
+/// One unit is charged per candidate byte offset a probe examines, and the
+/// limit grows by [`PROBE_BUDGET_UNITS_PER_RESIDUE_BYTE`] units per residue
+/// byte a probe is asked to classify. Examining a candidate is flat-cost by
+/// construction -- the header decode bails on an undersized length or the
+/// first nonzero reserved byte, and the sizes a decoded header CLAIMS gate
+/// whether a verify runs at all -- so units track real work without scaling
+/// with file size or any knob.
+///
+/// Scoped to the LOAD, not to one probe: pass A probes every segment before
+/// pass B can refuse the chain, so a per-probe budget would multiply the
+/// worst case by the segment count.
+#[derive(Default)]
+struct ProbeBudget {
+    limit_units: u64,
+    spent_units: u64,
 }
 
-impl ProbeLimits {
-    fn from_config(config: &ServerConfig) -> Self {
-        let max_residue_bytes = config.message_bus.max_message_size.as_bytes_u64();
-        Self {
-            max_residue_bytes,
-            scan_budget_bytes: max_residue_bytes.saturating_mul(PROBE_BUDGET_MULTIPLIER),
-        }
+impl ProbeBudget {
+    const fn grow_for_residue(&mut self, residue_bytes: u64) {
+        self.limit_units = self
+            .limit_units
+            .saturating_add(residue_bytes.saturating_mul(PROBE_BUDGET_UNITS_PER_RESIDUE_BYTE));
+    }
+
+    /// Charges one candidate; `false` means the budget is exhausted and the
+    /// probe must give up without a verdict.
+    const fn charge_candidate(&mut self) -> bool {
+        self.spent_units = self.spent_units.saturating_add(1);
+        self.spent_units <= self.limit_units
     }
 }
 
@@ -392,12 +414,13 @@ struct WalkedBounds {
     rebuilt_index: Option<Vec<u8>>,
 }
 
-/// Reusable buffers for the walk, probe, and index validation scans, allocated
-/// once per partition load.
+/// Reusable buffers for the walk, probe, and index validation scans, plus the
+/// probe work budget they share, allocated once per partition load.
 #[derive(Default)]
 struct ScanScratch {
     window: Vec<u8>,
     spill: Vec<u8>,
+    probe_budget: ProbeBudget,
 }
 
 /// Contiguity guard: recovery takes every `.log` stem in the directory, so a
@@ -853,7 +876,6 @@ async fn recover_segment_bounds(
     messages_path: &str,
     start_offset: u64,
     messages_size: u64,
-    probe_limits: ProbeLimits,
     scratch: &mut ScanScratch,
 ) -> Result<Option<WalkedBounds>, ServerError> {
     let reader = IggyIndexReader::new(index_path).await.map_err(|source| {
@@ -912,7 +934,7 @@ async fn recover_segment_bounds(
             validate_index_entries(identity, index_path, start_offset, entry_count, scratch)?;
 
             let messages = open_messages_file(identity, messages_path)?;
-            let mut scanner = FileScanner::new(&messages, messages_size, probe_limits, scratch);
+            let mut scanner = FileScanner::new(&messages, messages_size, scratch);
             // The sparse index holds ONE entry per flushed chunk, pointing
             // at the chunk's FIRST batch -- `last.offset` is where the last
             // chunk STARTS, not where the segment ends (a whole journal
@@ -942,15 +964,19 @@ async fn recover_segment_bounds(
                     break;
                 }
                 // The anchor entry names the offset its chunk starts at, and
-                // batches inside one segment are contiguous from there. A
-                // decodable header that breaks the chain is not a later
-                // flush of this segment: absorbing it would adopt offsets
-                // the chain never proved -- a lower one regresses the
-                // partition's offset counter at bootstrap and re-mints
-                // already-served offsets on the next append, and one below
+                // batches inside one segment are contiguous from there --
+                // except in one direction the server mints itself. Refuse
+                // only a REGRESSION: a lower offset re-adopted here regresses
+                // the partition's offset counter at bootstrap (re-minting
+                // already-served offsets on the next append) and one below
                 // the segment start underflows the recovered message count.
-                // Refuse, mirroring the index-less walk.
-                if header.base_offset != expected_offset {
+                // A FORWARD gap in a byte-clean, fully decodable tail is
+                // ordinary boot output, not damage: a crash can persist the
+                // offset frontier ahead of the unsynced log, and the next
+                // boot then stamps `base_offset = frontier` into this same
+                // tail segment. Absorb it and keep serving; every offset
+                // adopted is one the primary durably promised.
+                if header.base_offset < expected_offset {
                     return Err(
                         identity.refusal(PartitionRecoveryRefusal::OffsetDiscontinuity {
                             start_offset,
@@ -958,6 +984,20 @@ async fn recover_segment_bounds(
                             found_offset: header.base_offset,
                             position,
                         }),
+                    );
+                }
+                if header.base_offset > expected_offset {
+                    warn!(
+                        stream_id = identity.stream_id,
+                        topic_id = identity.topic_id,
+                        partition_id = identity.partition_id,
+                        start_offset,
+                        expected_offset,
+                        found_offset = header.base_offset,
+                        position,
+                        "segment holds a forward offset gap in a byte-clean \
+                         chain; absorbing it (a restart most likely stamped \
+                         the restored offset frontier into this tail segment)"
                     );
                 }
                 if header.message_count > 0 {
@@ -1017,7 +1057,7 @@ async fn recover_segment_bounds(
         // a sealed segment does not pay a full-scan poll penalty forever.
         _ if messages_size > 0 => {
             let messages = open_messages_file(identity, messages_path)?;
-            let mut scanner = FileScanner::new(&messages, messages_size, probe_limits, scratch);
+            let mut scanner = FileScanner::new(&messages, messages_size, scratch);
             let mut position = 0u64;
             let mut start_timestamp = None;
             let mut end_offset = start_offset;
@@ -1255,15 +1295,15 @@ fn scan_read_failure(
 /// can only exist because an append completed after the damaged region -- so
 /// discarding it would hide real loss behind a silent boot-time repair.
 ///
-/// What needs bounding is the torn RECORD, not the flush chunk: a flush
-/// chunk is unbounded, but every record inside it is capped by
-/// `message_bus.max_message_size`, and a residue holding no complete batch
-/// is about one record wide by construction -- any following whole batch
-/// verifies and ends the probe. Several holed near-max records can stack
-/// wider than the cap, which is exactly why cap and budget exhaustion REFUSE
-/// and keep the bytes rather than truncating: past the limits the probe has
-/// proven nothing, and the cheapest input to construct must never earn the
-/// destructive verdict.
+/// The residue is deliberately NOT width-gated: a torn flush chunk is
+/// bounded by the CHUNK, not by one record, and with `enforce_fsync = false`
+/// delayed allocation routinely extends a file far past its written-back
+/// pages, leaving hundreds of MiB of zeros behind one crash. That is the
+/// canonical torn tail this module exists to truncate, so every residue is
+/// probed whole. What bounds the probe instead is the per-candidate work
+/// budget, whose exhaustion REFUSES and keeps the bytes rather than
+/// truncating: past the limit the probe has proven nothing, and the cheapest
+/// input to construct must never earn the destructive verdict.
 async fn refuse_if_survivor_past_damage(
     identity: PartitionIdentity<'_>,
     scanner: &mut FileScanner<'_>,
@@ -1278,17 +1318,7 @@ async fn refuse_if_survivor_past_damage(
         return Ok(());
     }
     let residue_bytes = messages_size - damage_position;
-    let limits = scanner.limits;
-    if residue_bytes > limits.max_residue_bytes {
-        return Err(
-            identity.refusal(PartitionRecoveryRefusal::UnverifiedResidue {
-                start_offset,
-                damage_position,
-                residue_bytes,
-                scan_limit_bytes: limits.max_residue_bytes,
-            }),
-        );
-    }
+    scanner.budget.grow_for_residue(residue_bytes);
     match scanner
         .probe_for_survivor(damage_position, chain_end_offset, start_offset)
         .await
@@ -1306,7 +1336,8 @@ async fn refuse_if_survivor_past_damage(
                 start_offset,
                 damage_position,
                 residue_bytes,
-                scan_limit_bytes: limits.scan_budget_bytes,
+                candidates_examined: scanner.budget.spent_units,
+                budget_units: scanner.budget.limit_units,
             },
         )),
         ProbeOutcome::NoSurvivor => Ok(()),
@@ -1340,29 +1371,28 @@ enum ProbeOutcome {
 struct FileScanner<'scan> {
     file: &'scan fs::File,
     file_len: u64,
-    limits: ProbeLimits,
     window: &'scan mut Vec<u8>,
     window_start: u64,
     spill: &'scan mut Vec<u8>,
+    budget: &'scan mut ProbeBudget,
     refilled: bool,
 }
 
 impl<'scan> FileScanner<'scan> {
-    fn new(
-        file: &'scan fs::File,
-        file_len: u64,
-        limits: ProbeLimits,
-        scratch: &'scan mut ScanScratch,
-    ) -> Self {
-        let ScanScratch { window, spill } = scratch;
+    fn new(file: &'scan fs::File, file_len: u64, scratch: &'scan mut ScanScratch) -> Self {
+        let ScanScratch {
+            window,
+            spill,
+            probe_budget,
+        } = scratch;
         window.clear();
         Self {
             file,
             file_len,
-            limits,
             window,
             window_start: 0,
             spill,
+            budget: probe_budget,
             refilled: false,
         }
     }
@@ -1387,6 +1417,8 @@ impl<'scan> FileScanner<'scan> {
         }
         if len > SCAN_WINDOW_CAPACITY {
             // A batch larger than the window: one direct read, no windowing.
+            // Callers only pass lengths from headers that already passed the
+            // plausibility cap, which is what bounds this resize.
             self.spill.resize(len, 0);
             self.file.read_exact_at(&mut self.spill[..], position)?;
             self.refilled = true;
@@ -1408,12 +1440,19 @@ impl<'scan> FileScanner<'scan> {
     }
 
     /// The batch command header at `position`, or `None` when it does not fit
-    /// the file or does not decode (torn header, garbage bytes).
+    /// the file, does not decode (torn header, garbage bytes), or claims a
+    /// size no legal batch can reach. The size check runs BEFORE any caller
+    /// slices the claimed extent: an oversized claim cannot be a real batch,
+    /// so treating the header as undecodable is verdict-identical to reading
+    /// the claimed bytes and failing the verify, and it keeps one bit-flipped
+    /// length field from driving a claimed-size allocation and read.
     fn peek_header(&mut self, position: u64) -> io::Result<Option<BatchHeader>> {
         let Some(bytes) = self.slice_at(position, COMMAND_HEADER_SIZE)? else {
             return Ok(None);
         };
-        Ok(BatchHeader::decode(bytes).ok())
+        Ok(BatchHeader::decode(bytes)
+            .ok()
+            .filter(|header| header.total_size() as u64 <= MAX_RECOVERABLE_BATCH_BYTES))
     }
 
     /// Probes the residue for the first complete, checksum-verifying batch
@@ -1431,13 +1470,16 @@ impl<'scan> FileScanner<'scan> {
     /// on byte positions that already look like a plausible chain
     /// continuation.
     ///
-    /// Every byte read from disk and every byte handed to verification is
-    /// charged against the scan budget. Charging the handed slice whole --
-    /// even when the verify bails early or the bytes were already windowed --
-    /// is deliberate: verification cost is what a crafted residue can inflate
-    /// without adding reads, and a pessimistic charge keeps the bound
-    /// deterministic. Exhaustion returns [`ProbeOutcome::BudgetExhausted`],
-    /// never `NoSurvivor`.
+    /// Each candidate examined is charged one unit against the shared probe
+    /// budget -- examined, not verified: examining is flat-cost (zeros bail
+    /// on the undersized length, garbage on the first nonzero reserved
+    /// byte), so with the budget sized per residue byte an honest
+    /// front-to-back scan always fits, at any residue width, and total probe
+    /// work stays linear in the residue by construction. Window refills and
+    /// verify slices are deliberately not charged; they are already bounded
+    /// by the strictly-forward window advance and the plausibility cap on
+    /// claimed sizes. Exhaustion returns
+    /// [`ProbeOutcome::BudgetExhausted`], never `NoSurvivor`.
     async fn probe_for_survivor(
         &mut self,
         damage_position: u64,
@@ -1445,14 +1487,16 @@ impl<'scan> FileScanner<'scan> {
         start_offset: u64,
     ) -> io::Result<ProbeOutcome> {
         let header_len = COMMAND_HEADER_SIZE as u64;
-        let mut spent_bytes = 0u64;
         // The bytes AT the damage already failed to decode or verify, so the
         // first candidate starts one past them.
         let mut candidate = damage_position.saturating_add(1);
         while candidate.saturating_add(header_len) <= self.file_len {
-            spent_bytes = spent_bytes.saturating_add(self.fill_window_at(candidate)?);
+            self.fill_window_at(candidate)?;
             let window_end = self.window_start + self.window.len() as u64;
             while candidate.saturating_add(header_len) <= window_end {
+                if !self.budget.charge_candidate() {
+                    return Ok(ProbeOutcome::BudgetExhausted);
+                }
                 // In-window by the loop bound, and the window is
                 // capacity-bounded, so the try_from cannot fail.
                 let at = usize::try_from(candidate - self.window_start).unwrap_or(0);
@@ -1463,23 +1507,22 @@ impl<'scan> FileScanner<'scan> {
                             header.base_offset > chain_end
                         });
                     let total_size = header.total_size();
-                    let fits = candidate.saturating_add(total_size as u64) <= self.file_len;
+                    // The plausibility cap, not just the file length: with no
+                    // width gate on the residue, this is what keeps one
+                    // corrupted-upward length claim from driving a
+                    // claimed-size spill allocation and read.
+                    let fits = total_size as u64 <= MAX_RECOVERABLE_BATCH_BYTES
+                        && candidate.saturating_add(total_size as u64) <= self.file_len;
                     if advances_chain && fits && header.message_count > 0 {
-                        let (batch, read_bytes) = self.verify_slice(candidate, total_size)?;
+                        let batch = self.verify_slice(candidate, total_size)?;
                         if decode_batch_slice(batch).is_ok() {
                             return Ok(ProbeOutcome::Survivor {
                                 position: candidate,
                             });
                         }
-                        spent_bytes = spent_bytes
-                            .saturating_add(read_bytes)
-                            .saturating_add(total_size as u64);
                     }
                 }
                 candidate += 1;
-                if spent_bytes > self.limits.scan_budget_bytes {
-                    return Ok(ProbeOutcome::BudgetExhausted);
-                }
             }
             if self.take_refilled() {
                 yield_to_reactor().await;
@@ -1489,14 +1532,14 @@ impl<'scan> FileScanner<'scan> {
     }
 
     /// Anchors the window at `position` unless the header there already sits
-    /// inside it; returns the bytes read (0 on a hit). The probe's outer
-    /// loop refills through this, so its windows advance strictly forward.
-    fn fill_window_at(&mut self, position: u64) -> io::Result<u64> {
+    /// inside it. The probe's outer loop refills through this, so its
+    /// windows advance strictly forward.
+    fn fill_window_at(&mut self, position: u64) -> io::Result<()> {
         let window_end = self.window_start + self.window.len() as u64;
         if position >= self.window_start
             && position.saturating_add(COMMAND_HEADER_SIZE as u64) <= window_end
         {
-            return Ok(0);
+            return Ok(());
         }
         let fill = usize::try_from((self.file_len - position).min(SCAN_WINDOW_CAPACITY as u64))
             .unwrap_or(SCAN_WINDOW_CAPACITY);
@@ -1504,36 +1547,28 @@ impl<'scan> FileScanner<'scan> {
         self.file.read_exact_at(&mut self.window[..], position)?;
         self.window_start = position;
         self.refilled = true;
-        Ok(fill as u64)
+        Ok(())
     }
 
     /// Bytes `[position, position + len)` for one probe verification without
     /// moving the scan window: an in-window slice costs no read, anything
-    /// else is one direct read into the spill buffer. Returns the slice and
-    /// the disk bytes it cost. The caller bounds `len` against the file
-    /// before calling.
-    fn verify_slice(&mut self, position: u64, len: usize) -> io::Result<(&[u8], u64)> {
+    /// else is one direct read into the spill buffer. The caller bounds
+    /// `len` against the file and the plausibility cap before calling, which
+    /// is what bounds the spill's growth.
+    fn verify_slice(&mut self, position: u64, len: usize) -> io::Result<&[u8]> {
         let window_end = self.window_start + self.window.len() as u64;
         let end = position.saturating_add(len as u64);
         if position >= self.window_start && end <= window_end {
             // In-window by the branch above, and the window is
             // capacity-bounded, so the try_from cannot fail.
             let at = usize::try_from(position - self.window_start).unwrap_or(0);
-            return Ok((&self.window[at..at + len], 0));
+            return Ok(&self.window[at..at + len]);
         }
         self.spill.resize(len, 0);
         self.file.read_exact_at(&mut self.spill[..], position)?;
         self.refilled = true;
-        Ok((&self.spill[..], len as u64))
+        Ok(&self.spill[..])
     }
-}
-
-/// Hands the shard core back to the reactor between scan windows. A
-/// zero-duration timer, NOT a bare self-waking yield: this runtime does not
-/// reliably re-poll a task that wakes itself from inside its own poll, and a
-/// boot task parked that way would never resume.
-async fn yield_to_reactor() {
-    compio::time::sleep(Duration::ZERO).await;
 }
 
 fn push_index_entry(rebuilt_index: &mut Vec<u8>, offset: u64, timestamp: u64, position: u64) {
@@ -1579,14 +1614,6 @@ mod tests {
             ..ServerSystemConfig::default()
         };
         config.system = Arc::new(system);
-        config
-    }
-
-    /// `test_config` with the probe width cap (and so its derived budget)
-    /// shrunk, keeping probe fixtures small.
-    fn test_config_with_probe_cap(tmp: &TempDir, max_residue_bytes: u64) -> ServerConfig {
-        let mut config = test_config(tmp);
-        config.message_bus.max_message_size = IggyByteSize::from(max_residue_bytes);
         config
     }
 
@@ -2227,16 +2254,16 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_zero_padded_records_when_probing_should_refuse_on_scan_budget() {
+    async fn given_zero_padded_records_when_probing_should_scan_whole_residue_and_recover_empty() {
         let tmp = tempdir().expect("tempdir");
-        let config = test_config_with_probe_cap(&tmp, 64 * 1024);
-        prepare_partition_dir(&config);
+        let config = test_config(&tmp);
+        let partition_path = prepare_partition_dir(&config);
         // Torn index forces the index-less walk, and the garbage head keeps
-        // it from decoding anything, so the whole file is probe residue --
-        // under the width cap, so the probe runs. Each record's header
-        // decodes and claims an 8 KiB batch that fits, so every aligned
-        // candidate pays a verify; the charged bytes blow the budget long
-        // before the residue is exhausted.
+        // it from decoding anything, so the whole file is probe residue.
+        // Each record's header decodes and claims an 8 KiB batch that fits,
+        // so aligned candidates pay a (fast-failing) verify -- and none of
+        // that exhausts the residue-sized budget, so the probe classifies
+        // the whole file as survivor-free and the empty recovery fences it.
         let mut log = GARBAGE.to_vec();
         for record in 0..128u32 {
             log.extend_from_slice(&zero_padded_record(
@@ -2244,58 +2271,110 @@ mod tests {
                 record + 1,
             ));
         }
-        let (messages_path, index_path) = write_segment(&config, 0, &log, &GARBAGE[..10]);
+        let (messages_path, _index_path) = write_segment(&config, 0, &log, &GARBAGE[..10]);
 
-        let error = recover(&config)
+        let recovered = recover(&config)
             .await
-            .err()
-            .expect("a residue that exhausts the scan budget must refuse recovery");
+            .expect("a survivor-free residue must recover as empty, not refuse");
 
-        // `scan_limit_bytes` equal to the 2x budget (not the width cap)
-        // proves the probe ran and gave up, rather than refusing on width.
-        assert!(
-            matches!(
-                &error,
-                ServerError::PartitionRecoveryRefused {
-                    reason: PartitionRecoveryRefusal::UnverifiedResidue {
-                        scan_limit_bytes, ..
-                    },
-                    ..
-                } if *scan_limit_bytes == 2 * 64 * 1024
-            ),
-            "expected a budget-exhausted refusal, got {error:?}"
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.size, IggyByteSize::default());
+        assert_eq!(len_of(&messages_path), 0, "the served log must be empty");
+        let fenced_log = Path::new(&format!("{partition_path}.fenced.0")).join(
+            Path::new(&messages_path)
+                .file_name()
+                .expect("log file name"),
         );
         assert_eq!(
-            bytes_of(&messages_path),
+            fs::read(fenced_log).expect("read fenced log"),
             log,
-            "a refusal must leave the log byte-identical"
+            "the unclassifiable bytes must survive in the fence directory"
         );
-        assert_eq!(bytes_of(&index_path), &GARBAGE[..10]);
     }
 
     #[compio::test]
-    async fn given_residue_wider_than_max_message_when_recovering_should_refuse_unscanned() {
+    async fn given_wide_zeros_residue_when_recovering_should_truncate_at_break() {
         let tmp = tempdir().expect("tempdir");
-        let cap = 4 * 1024u64;
-        let config = test_config_with_probe_cap(&tmp, cap);
+        let config = test_config(&tmp);
         prepare_partition_dir(&config);
+        // The canonical torn flush chunk: a crash under `enforce_fsync =
+        // false` leaves the file extended far past its written-back pages,
+        // reading as zeros -- residue bounded by the CHUNK (up to a whole
+        // segment), not by one record. No survivor decodes anywhere in it,
+        // so recovery must truncate to the walked prefix, at any residue
+        // width and regardless of any configured message size.
+        let mut log = encoded_batch(0, 3);
+        let valid_len = log.len() as u64;
+        log.resize(log.len() + 512 * 1024, 0);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
+
+        let recovered = recover(&config)
+            .await
+            .expect("a zero-filled torn flush chunk must truncate, not refuse");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 2);
+        assert_eq!(
+            len_of(&messages_path),
+            valid_len,
+            "the zero-filled residue must be gone from disk"
+        );
+        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+    }
+
+    #[test]
+    fn probe_budget_charges_per_candidate_across_probes() {
+        let mut budget = ProbeBudget::default();
+        budget.grow_for_residue(4);
+        for _ in 0..8 {
+            assert!(budget.charge_candidate(), "honest scans fit the budget");
+        }
+        assert!(
+            !budget.charge_candidate(),
+            "the ninth candidate against a 4-byte residue must exhaust"
+        );
+        // A later probe in the same load widens the shared limit; spent
+        // units carry over rather than resetting per probe.
+        budget.grow_for_residue(2);
+        assert!(budget.charge_candidate());
+    }
+
+    #[compio::test]
+    async fn given_exhausted_probe_budget_when_classifying_residue_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
         let mut log = encoded_batch(0, 2);
         let valid_len = log.len() as u64;
-        let residue_len = cap + 1;
-        log.resize(
-            log.len() + usize::try_from(residue_len).expect("fixture size"),
-            0xAB,
-        );
-        let index = index_entry(0, 0);
-        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+        log.extend_from_slice(&GARBAGE);
+        let messages_path = tmp.path().join("00000000000000000000.log");
+        fs::write(&messages_path, &log).expect("write log fixture");
+        let file = fs::File::open(&messages_path).expect("open log fixture");
+        let partition_path = tmp.path().to_string_lossy().into_owned();
+        let identity = PartitionIdentity {
+            partition_path: &partition_path,
+            stream_id: STREAM_ID,
+            topic_id: TOPIC_ID,
+            partition_id: PARTITION_ID,
+        };
+        // No once-through scan can exhaust a residue-sized budget, so the
+        // exhaustion path is a tripwire for probe defects that re-examine
+        // candidates. Simulate one by pre-spending the shared budget past
+        // anything this residue can grow it by.
+        let mut scratch = ScanScratch::default();
+        scratch.probe_budget.spent_units = u64::MAX / 2;
+        let mut scanner = FileScanner::new(&file, log.len() as u64, &mut scratch);
 
-        let error = recover(&config)
-            .await
-            .err()
-            .expect("a residue wider than one appendable record must refuse recovery");
+        let error = refuse_if_survivor_past_damage(
+            identity,
+            &mut scanner,
+            &messages_path.to_string_lossy(),
+            valid_len,
+            log.len() as u64,
+            Some(1),
+            0,
+        )
+        .await
+        .expect_err("an exhausted budget must refuse instead of truncating");
 
-        // `scan_limit_bytes` equal to the width cap (not the 2x budget)
-        // proves the refusal fired before any scanning.
         assert!(
             matches!(
                 &error,
@@ -2303,18 +2382,22 @@ mod tests {
                     reason: PartitionRecoveryRefusal::UnverifiedResidue {
                         damage_position,
                         residue_bytes,
-                        scan_limit_bytes,
+                        candidates_examined,
+                        budget_units,
                         ..
                     },
                     ..
                 } if *damage_position == valid_len
-                    && *residue_bytes == residue_len
-                    && *scan_limit_bytes == cap
+                    && *residue_bytes == GARBAGE.len() as u64
+                    && candidates_examined > budget_units
             ),
-            "expected a width-cap refusal, got {error:?}"
+            "expected a budget-exhausted refusal, got {error:?}"
         );
-        assert_eq!(bytes_of(&messages_path), log);
-        assert_eq!(bytes_of(&index_path), index);
+        assert_eq!(
+            bytes_of(&messages_path.to_string_lossy()),
+            log,
+            "a refusal must leave the log byte-identical"
+        );
     }
 
     #[compio::test]
@@ -2351,6 +2434,94 @@ mod tests {
         );
         assert_eq!(bytes_of(&messages_path), log);
         assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_indexed_forward_offset_gap_when_recovering_should_absorb_and_serve() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The shape the server's own boot path mints: a crash persists the
+        // offset frontier ahead of the unsynced log, and the next boot
+        // appends `base_offset = frontier` into the existing tail segment.
+        // Byte-clean, fully decodable, index intact -- must serve, not
+        // refuse.
+        let mut log = encoded_batch(0, 2);
+        log.extend_from_slice(&encoded_batch(5, 1));
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
+
+        let recovered = recover(&config)
+            .await
+            .expect("a forward offset gap in a byte-clean indexed chain must recover");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 5);
+        assert_eq!(
+            bytes_of(&messages_path),
+            log,
+            "absorbing the gap must leave the log byte-identical"
+        );
+        assert_eq!(bytes_of(&index_path), index_entry(0, 0));
+    }
+
+    #[compio::test]
+    async fn given_bit_flipped_batch_length_when_recovering_should_truncate_at_break() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // A corrupted-upward length claim (the classic all-ones flip) is not
+        // a plausible batch: the walk must break at the header itself, never
+        // sizing an allocation or a read by what the header claims.
+        let mut log = encoded_batch(0, 2);
+        let valid_len = log.len() as u64;
+        log.extend_from_slice(&zero_padded_record(0xFFFF_FFFF, 1));
+        let (messages_path, _index_path) = write_segment(&config, 0, &log, &GARBAGE[..10]);
+
+        let recovered = recover(&config)
+            .await
+            .expect("an implausible length claim in the tail must truncate, not refuse");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 1);
+        assert_eq!(
+            len_of(&messages_path),
+            valid_len,
+            "the walk must break at the implausible header and truncate there"
+        );
+    }
+
+    #[compio::test]
+    async fn given_bit_flipped_batch_length_before_valid_batch_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let mut log = encoded_batch(0, 2);
+        let valid_len = log.len() as u64;
+        log.extend_from_slice(&zero_padded_record(0xFFFF_FFFF, 1));
+        log.extend_from_slice(&encoded_batch(2, 1));
+        let (messages_path, _index_path) = write_segment(&config, 0, &log, &GARBAGE[..10]);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("a surviving batch past an implausible header must refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::InteriorDamage {
+                        damage_position,
+                        survivor_position,
+                        ..
+                    },
+                    ..
+                } if *damage_position == valid_len
+                    && *survivor_position == valid_len + COMMAND_HEADER_SIZE as u64
+            ),
+            "expected an interior-damage refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
     }
 
     #[compio::test]
