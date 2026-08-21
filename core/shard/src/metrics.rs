@@ -120,6 +120,14 @@ pub mod frame_drop_variant {
 /// replicated traffic has nobody to answer, so this is the only record the op
 /// was destroyed.
 pub mod frame_drop_reason {
+    /// Operation discriminant unknown to this build: the sender is newer.
+    ///
+    /// Distinct from `UNPARSABLE` because upgrading this node is the fix, and
+    /// until it is, the frame's consensus group gap-stops here.
+    pub const UNSUPPORTED_OPERATION: &str = "unsupported_operation";
+    /// A consensus frame failed typed decode for any other reason (corrupt
+    /// header, bad size, client-bound command on the inbound path).
+    pub const UNPARSABLE: &str = "unparsable";
     pub const FULL: &str = "full";
     pub const DISCONNECTED: &str = "disconnected";
     pub const UNROUTABLE: &str = "unroutable";
@@ -134,7 +142,7 @@ pub mod frame_drop_reason {
 // site actually produces it, so the unreachable corners of the 7 x 7 cross
 // product never appear as permanent zero-valued series.
 const VARIANT_COUNT: usize = 7;
-const REASON_COUNT: usize = 7;
+const REASON_COUNT: usize = 9;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::CONSENSUS,
@@ -147,6 +155,8 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
+    frame_drop_reason::UNSUPPORTED_OPERATION,
+    frame_drop_reason::UNPARSABLE,
     frame_drop_reason::FULL,
     frame_drop_reason::DISCONNECTED,
     frame_drop_reason::UNROUTABLE,

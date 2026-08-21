@@ -79,6 +79,12 @@ pub enum ConsensusError {
     #[error("invalid bit pattern in header (enum discriminant out of range)")]
     InvalidBitPattern,
 
+    #[error(
+        "operation {operation:#04x} is not known to this build; the sender runs a release that \
+         added a consensus operation, so this node cannot journal or ack the frame"
+    )]
+    UnsupportedOperation { operation: u8 },
+
     #[error("client-bound command {0:?} cannot be dispatched on inbound path")]
     ClientBoundCommand(Command),
 }
