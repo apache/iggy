@@ -162,18 +162,20 @@ pub enum ServerError {
         expected: u128,
         found: u128,
     },
-    // Per-partition, not fatal: the boot path fences this one group (quarantines
-    // its segment files and materialises it fresh) instead of taking the node
-    // down for one damaged local chain. Only STRUCTURAL refusals route here --
-    // shapes where the local files contradict themselves, so a retried boot
-    // cannot help. Transient recovery I/O failures (stat, open, read, truncate,
-    // fsync) stay node-fatal on purpose: a retried boot can still serve that
-    // partition, while fencing it would quarantine healthy data.
+    // Per-partition, not fatal: the boot path fences this one group instead of
+    // taking the node down for one damaged local chain. Only STRUCTURAL
+    // refusals route here -- shapes where the local files contradict
+    // themselves, so a retried boot cannot help. Transient recovery I/O
+    // failures (stat, open, read, truncate, fsync) stay node-fatal on purpose:
+    // a retried boot can still serve that partition, while fencing it would
+    // quarantine healthy data.
     #[error(
         "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused segment \
-         recovery: {reason}. The boot path quarantines this partition's segment \
-         files beside its directory and rebuilds it empty for the rejoin path; \
-         restore from a healthy replica, or repair the quarantined files offline."
+         recovery: {reason}. Boot moves the partition's segment files into a \
+         sibling `<partition dir>.fenced.N` directory and keeps them; with peer \
+         replicas the partition is rebuilt empty and refilled by state transfer, \
+         while with replica_count = 1 (or when the quarantine itself fails) it \
+         is tombstoned and not served"
     )]
     PartitionRecoveryRefused {
         dir: PathBuf,
@@ -277,10 +279,12 @@ pub enum ServerError {
 ///
 /// Every shape here is structural -- the local files contradict themselves or
 /// each other -- but they are distinguished because they point at different
-/// causes: an empty non-tail segment is a failed rebuild's orphan pairing, a
-/// hole is a stray or half-unlinked file, interior damage or a broken offset
-/// chain is bit rot (or a resurrected tail appended over), and a divergent
-/// index is a mis-strided or foreign write.
+/// causes, and not all of them are at-rest corruption: an empty non-tail
+/// segment is a failed rebuild's orphan pairing, a hole is a stray or
+/// half-unlinked file, interior damage is bit rot (or a resurrected tail
+/// appended over), a divergent index is a mis-strided or foreign write, and
+/// offsets that do not continue the chain can be minted into byte-clean files
+/// by an upstream crash window as well as by damage.
 #[derive(Debug)]
 pub enum PartitionRecoveryRefusal {
     EmptyNonTailSegment {
@@ -308,8 +312,22 @@ pub enum PartitionRecoveryRefusal {
         damage_position: u64,
         survivor_position: u64,
     },
-    /// A verifying batch does not continue the offset chain, so offsets in
-    /// between are missing (or duplicated) inside one segment file.
+    /// Bytes past the walked prefix that the damage probe could not
+    /// classify: the residue is wider than the largest record a torn append
+    /// can leave, or the probe ran out of scan budget before proving or
+    /// disproving a survivor. Truncation is only ever sound for a proven
+    /// torn tail, so giving up keeps the bytes.
+    UnverifiedResidue {
+        start_offset: u64,
+        damage_position: u64,
+        residue_bytes: u64,
+        scan_limit_bytes: u64,
+    },
+    /// A batch does not continue the offset chain, so offsets are not
+    /// contiguous inside one segment file. The cause is not necessarily
+    /// at-rest damage: a crash window that leaves the durable offset
+    /// frontier past the recovered end offset stamps the same shape into
+    /// byte-clean files.
     OffsetDiscontinuity {
         start_offset: u64,
         expected_offset: u64,
@@ -377,6 +395,18 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                  with a complete verifying batch after them at {survivor_position}; \
                  not a torn tail, and truncating would discard durable batches"
             ),
+            Self::UnverifiedResidue {
+                start_offset,
+                damage_position,
+                residue_bytes,
+                scan_limit_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} holds {residue_bytes} bytes past the walked \
+                 prefix at {damage_position} that the damage probe could not \
+                 classify within its {scan_limit_bytes}-byte limit; truncating \
+                 unproven bytes could destroy durable batches"
+            ),
             Self::OffsetDiscontinuity {
                 start_offset,
                 expected_offset,
@@ -384,8 +414,8 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 position,
             } => write!(
                 f,
-                "segment {start_offset} holds a verifying batch at byte {position} \
-                 whose base offset {found_offset} does not continue the chain at \
+                "segment {start_offset} holds a batch at byte {position} whose \
+                 base offset {found_offset} does not continue the chain at \
                  {expected_offset}"
             ),
             Self::IndexEntriesNotMonotone {
