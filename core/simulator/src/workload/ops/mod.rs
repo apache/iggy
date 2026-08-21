@@ -26,7 +26,7 @@
 //! - `classify_reply`: decode reply into a declared outcome
 //! - `predicted_effect`: predicted shadow mutation on commit
 //!
-//! Dispatch via the [`op_dispatch!`] macro; missing variants are a compile
+//! Dispatch via the `op_dispatch!` macro; missing variants are a compile
 //! error.
 
 pub mod change_password;

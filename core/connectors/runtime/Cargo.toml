@@ -78,3 +78,6 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

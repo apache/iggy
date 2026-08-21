@@ -70,7 +70,7 @@ pub(crate) fn verify_login_credentials<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -116,7 +116,7 @@ pub(crate) fn verify_pat_credentials<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -134,7 +134,7 @@ pub(crate) fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -191,7 +191,7 @@ pub(crate) async fn complete_login_register<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -302,7 +302,7 @@ pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -340,7 +340,7 @@ async fn send_login_transient_reply<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {

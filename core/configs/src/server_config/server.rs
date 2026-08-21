@@ -102,9 +102,9 @@ pub type ServerSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
 
 /// Top-level on-disk config schema for the `iggy-server` binary.
 ///
-/// Composes the shared section types from [`crate::common`] with the
+/// Composes the shared section types from `crate::common` with the
 /// transport, cluster, metadata and [`MessageBusConfig`] sections owned
-/// by [`super`].
+/// by `super`.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[config_env(prefix = "IGGY_", name = "iggy-server-config")]
 pub struct ServerConfig {
