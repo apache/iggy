@@ -168,7 +168,7 @@ impl Drop for JournalAccessGuard<'_> {
 }
 
 #[allow(clippy::future_not_send)]
-impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
+impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
     type HeaderRef<'a>
@@ -283,7 +283,6 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
 }
 
 impl JournalHandle for SimJournal<MemStorage> {
-    type Storage = MemStorage;
     type Target = Self;
 
     fn handle(&self) -> &Self::Target {

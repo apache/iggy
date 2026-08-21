@@ -195,7 +195,7 @@ runs:
     - name: Install dependencies for Rust tests
       if: startsWith(inputs.task, 'test-') && runner.os == 'Linux'
       run: |
-        sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
+        ./scripts/ci/apt-install.sh musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
         rm -f $HOME/.local/share/keyrings/*
       shell: bash
 
@@ -396,7 +396,7 @@ runs:
     - name: Install musl tools for aarch64-musl
       if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
       run: |
-        sudo apt-get update && sudo apt-get install -y musl-tools
+        ./scripts/ci/apt-install.sh musl-tools
         rustup target add aarch64-unknown-linux-musl
       shell: bash
 

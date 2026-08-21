@@ -21,7 +21,7 @@ use crate::messages_writer::MessagesWriter;
 use crate::poll_plan::SealedSegmentHandle;
 use crate::segment::Segment;
 use iggy_common::IggyByteSize;
-use journal::{Journal, Storage};
+use journal::Journal;
 use ringbuffer::AllocRingBuffer;
 use server_common::SegmentStorage;
 use std::collections::VecDeque;
@@ -65,10 +65,9 @@ pub struct JournalState<J> {
     pub info: JournalInfo,
 }
 
-impl<J, S> Journal<S> for JournalState<J>
+impl<J> Journal for JournalState<J>
 where
-    S: Storage,
-    J: Journal<S>,
+    J: Journal,
 {
     type Header = J::Header;
     type Entry = J::Entry;
@@ -135,18 +134,12 @@ impl<J: Default> Default for JournalState<J> {
     }
 }
 
-// TODO: Structure this better, the segmented log does not need to be generic over S, the Journal needs.
-
-// This struct aliases in terms of the code contained the `SegmentedLog` from `core/server/src/streaming/partitions/log.rs`.
-// The only difference is the `Journal` generic, we use different trait.
 #[derive(Debug)]
-pub struct SegmentedLog<J, S>
+pub struct SegmentedLog<J>
 where
-    S: Storage,
-    J: Debug + Journal<S>,
+    J: Debug + Journal,
 {
     journal: JournalState<J>,
-    _pd: std::marker::PhantomData<S>,
     // Ring buffer tracking recently accessed segment indices for cleanup optimization.
     // A background task uses this to identify and close file descriptors for unused segments.
     _access_map: AllocRingBuffer<usize>,
@@ -168,15 +161,13 @@ where
     sealed_lru: VecDeque<u64>,
 }
 
-impl<J, S> Default for SegmentedLog<J, S>
+impl<J> Default for SegmentedLog<J>
 where
-    S: Storage,
-    J: Debug + Default + Journal<S>,
+    J: Debug + Default + Journal,
 {
     fn default() -> Self {
         Self {
             journal: JournalState::default(),
-            _pd: std::marker::PhantomData,
             _access_map: AllocRingBuffer::with_capacity_power_of_2(ACCESS_MAP_CAPACITY),
             _cache: (),
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
@@ -190,10 +181,9 @@ where
     }
 }
 
-impl<J, S> SegmentedLog<J, S>
+impl<J> SegmentedLog<J>
 where
-    S: Storage,
-    J: Debug + Journal<S>,
+    J: Debug + Journal,
 {
     pub const fn has_segments(&self) -> bool {
         !self.segments.is_empty()
@@ -277,6 +267,7 @@ where
             handle.tracked.set(false);
             *handle.fd.borrow_mut() = None;
             *handle.index.borrow_mut() = None;
+            handle.offset_cursor.set(None);
         }
         self.sealed_lru.clear();
     }
@@ -431,10 +422,9 @@ where
     }
 }
 
-impl<J, S> SegmentedLog<J, S>
+impl<J> SegmentedLog<J>
 where
-    S: Storage,
-    J: Debug + Journal<S>,
+    J: Debug + Journal,
 {
     pub const fn journal_mut(&mut self) -> &mut JournalState<J> {
         &mut self.journal
@@ -450,8 +440,7 @@ mod tests {
     use super::*;
     use crate::journal::{PartitionJournal, PartitionJournalMemStorage};
 
-    type TestLog =
-        SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>;
+    type TestLog = SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>;
 
     /// Push a sealed segment with a resident (index-filled) read handle and
     /// return a clone of that handle, standing in for an in-flight poll's clone.
