@@ -48,6 +48,20 @@ max-threads = 1
 filter = 'package(integration) and test(/connectors::elasticsearch::/)'
 test-group = "elasticsearch"
 
+# OpenSearch tests share one reusable container (fixed name
+# `iggy-test-opensearch`, ReuseDirective::Always), same reasoning as
+# elasticsearch above. Serializing the group lets the first test create it and
+# the rest attach by name, instead of racing to create the same name
+# concurrently (Docker 409 Conflict) or hammering a single freshly-started
+# instance with concurrent requests before it has stabilized. Per-test
+# isolation comes from a unique index per fixture, not a fresh container.
+[test-groups.opensearch]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(integration) and test(/connectors::opensearch::/)'
+test-group = "opensearch"
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 

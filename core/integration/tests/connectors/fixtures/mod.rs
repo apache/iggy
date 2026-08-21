@@ -26,6 +26,7 @@ mod iceberg;
 mod influxdb;
 mod meilisearch;
 mod mongodb;
+mod opensearch;
 mod postgres;
 mod quickwit;
 mod s3;
@@ -73,6 +74,11 @@ pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
+};
+pub use opensearch::{
+    OpenSearchSourceCircuitBreakerFixture, OpenSearchSourceMissingIndexFixture,
+    OpenSearchSourcePreCreatedFixture, OpenSearchSourceSmallBatchFixture,
+    OpenSearchSourceTransientErrorFixture, OpenSearchSourceTypedFieldsFixture,
 };
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
