@@ -212,6 +212,7 @@ export const translateErrorCode = (code: number): string => {
     case '4041': return "Unsupported option key: {0}";
     case '4042': return "Invalid option value for key: {0}";
     case '4043': return "Options block exceeds its limits: {0}";
+    case '4044': return "Segment file size on disk: {0} does not match expected size: {1}";
     case '4050': return "Cannot sed messages due to client disconnection";
     case '4051': return "Background send error";
     case '4052': return "Background send timeout";

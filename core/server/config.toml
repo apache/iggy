@@ -463,6 +463,14 @@ archive_expired = false
 # Unsupported: setting this to `true` aborts boot.
 recreate_missing_state = false
 
+# At boot, segment recovery walks each partition's segments: bytes after the
+# last verifiable batch of a genuinely torn tail are physically truncated from
+# the .log/.index files, and the index is rebuilt when it was damaged. Damage
+# in the middle of a segment is never silently truncated: the partition is
+# refused, its files are quarantined to a .fenced.N directory and the
+# partition is rebuilt from replicas. The metadata WAL is stricter and
+# refuses boot instead.
+
 # Memory pool configuration
 [system.memory_pool]
 # Enables or disables the memory pool (boolean).

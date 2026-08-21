@@ -22,11 +22,16 @@ use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
 
-// A gap in the discriminants is a RETIRED code, not free space. Shipped SDKs
-// keep their own code tables (foreign/go/errors/errors.yaml,
-// foreign/node/src/wire/error.code.ts) that still map the old meaning, and
-// Go's is a typed error matched by errors.Is, so refilling a gap reroutes
-// caller control flow. Allocate above the highest code in its range.
+// Codes are allocated per semantic family: a new code goes one above its
+// family's highest code (4044 extended message validation past 4043 even
+// though background send already owned 4050-4057); a brand-new family starts
+// at a fresh round base, and the headroom below that base belongs to the
+// family under it. A gap below a family's highest code is a RETIRED code,
+// not free space. Shipped SDKs keep their own code tables
+// (foreign/go/errors/errors.yaml, foreign/node/src/wire/error.code.ts) that
+// still map the old meaning, and Go's is a typed error matched by errors.Is,
+// so refilling a gap reroutes caller control flow. Retired discriminants
+// are never reused.
 #[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr, Default)]
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
@@ -425,6 +430,11 @@ pub enum IggyError {
     InvalidOptionValue(String) = 4042,
     #[error("Options block exceeds its limits: {0}")]
     OptionsBlockTooLarge(String) = 4043,
+    /// The on-disk segment file length disagrees with the recovered bounds the
+    /// writer was seeded with; appending would corrupt the segment, so the
+    /// open fails instead. Field order: `(on_disk, expected)`.
+    #[error("Segment file size on disk: {0} does not match expected size: {1}")]
+    SegmentSizeMismatchAtOpen(u64, u64) = 4044,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Background send error")]
