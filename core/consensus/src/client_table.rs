@@ -78,6 +78,11 @@ impl CachedReply {
     fn as_bytes(&self) -> &[u8] {
         self.bytes.as_slice()
     }
+
+    /// Wire size of this reply, the unit [`REPLY_RING_RETENTION_BYTES`] budgets.
+    fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 /// Reserved request number for [`Operation::Register`](iggy_binary_protocol::Operation::Register).
@@ -101,7 +106,63 @@ pub const CLIENTS_TABLE_SLOT_MAX: usize = 1 << 16;
 /// original bytes instead of a bare "already applied"; losing one
 /// degrades the answer, never correctness. In-memory only: ring contents are
 /// refcount bumps and are never persisted or transferred.
+///
+/// This many replies are retained unconditionally, whatever they weigh, which
+/// is what bounds the memory a client holding megabyte replies can pin.
+/// Retention past it is governed by [`REPLY_RING_RETENTION_BYTES`]: a client
+/// sending small operations -- the common case -- keeps a far deeper replay
+/// history for the same memory, so a retry that arrives late still replays its
+/// original bytes instead of drawing a bare "already applied".
 pub const REPLY_RING_CAPACITY: usize = 5;
+
+/// Byte budget for the replies retained past [`REPLY_RING_CAPACITY`].
+///
+/// Deep retention exists for the slow retrier: a request whose reply aged out
+/// can only be answered "already applied, reply gone", which tells the caller
+/// its operation succeeded but hands back no result. Sizing the extra
+/// retention in bytes rather than in replies spends the same memory where it
+/// buys the most history.
+///
+/// The added cost is bounded by this budget per occupied slot, and it is less
+/// than the [`REPLY_RING_CAPACITY`] floor already costs for any reply above
+/// roughly 1.6 KiB, so a table full of large replies is dominated by the floor
+/// exactly as it was before.
+pub const REPLY_RING_RETENTION_BYTES: usize = 8 * 1024;
+
+/// Hard cap on retained replies, so a stream of tiny replies cannot grow the
+/// ring without bound under [`REPLY_RING_RETENTION_BYTES`].
+///
+/// Stays well inside `u8`: [`ClientTable::encode`] writes the ring length as
+/// one byte for state transfer.
+pub const REPLY_RING_MAX_CAPACITY: usize = 64;
+
+/// What capacity eviction keeps after reclaiming an entry's replies.
+///
+/// At-most-once needs only the fence: the watermark says which request numbers
+/// already committed, and the ring merely supplies the bytes to replay. Dropping
+/// the whole entry made an evicted client's resume mint at watermark zero, so the
+/// retry of a committed request re-executed. Keeping it lets the resume answer
+/// from the fence instead: [`RequestStatus::Duplicate`] when the watermark's
+/// reply was still ringed, [`RequestStatus::AlreadyApplied`] when it was not.
+///
+/// In memory only, like the ring: a fence does not survive a checkpoint or a state
+/// transfer, and losing one degrades a resume to the pre-fix behaviour rather than
+/// corrupting anything.
+#[derive(Debug)]
+struct EvictedFence {
+    client_id: u128,
+    epoch: u64,
+    user_id: u32,
+    watermark: u64,
+    watermark_checksum: u128,
+    /// The watermark request's own reply when the ring still held it, so the
+    /// retry the resume contract prescribes replays its original bytes. `None`
+    /// when it had already aged out, or when a rebind left the register reply
+    /// as the newest entry: the resume then answers
+    /// [`RequestStatus::AlreadyApplied`], which still never re-executes.
+    /// One refcount bump, not a copy.
+    latest: Option<CachedReply>,
+}
 
 /// Per-session entry: fence epoch + committed-request watermark + replies.
 ///
@@ -407,6 +468,17 @@ pub struct ClientTable {
     slots: Vec<Option<ClientEntry>>,
     /// `client_id` -> slot index. Rebuilt on decode.
     index: HashMap<u128, usize>,
+    /// Fences of clients capacity eviction reclaimed, oldest at the front.
+    ///
+    /// Bounded by the slot count. A fence is the entry's header fields plus, at
+    /// most, the watermark request's own reply, so it costs a fraction of the
+    /// entry it replaces. Trimmed oldest-first.
+    ///
+    /// Replica-local best-effort, NOT replicated state: the bound is
+    /// `slots.len()`, which `from_snapshot` and `decode` size per node, and a
+    /// state transfer replaces the table wholesale. Losing a fence degrades a
+    /// resume to the pre-fence behaviour; it never makes one more permissive.
+    evicted_fences: VecDeque<EvictedFence>,
 }
 
 /// Whether two integrity stamps for the same request number disagree.
@@ -426,6 +498,7 @@ impl ClientTable {
         Self {
             slots,
             index: HashMap::with_capacity(max_clients),
+            evicted_fences: VecDeque::new(),
         }
     }
 
@@ -558,7 +631,12 @@ impl ClientTable {
                 latest_commit,
             });
         }
-        Ok(Self { slots, index })
+        Ok(Self {
+            slots,
+            index,
+            // Fences are in-memory only; a restored table starts with none.
+            evicted_fences: VecDeque::new(),
+        })
     }
 
     /// Check a request against the table. Epoch fence first, then the
@@ -654,6 +732,11 @@ impl ClientTable {
     ///
     /// Full table evicts the oldest commit, see [`Self::evict_oldest`].
     ///
+    /// A key this table evicted for capacity re-registers as a fresh entry that
+    /// RESTORES the evicted watermark (and the watermark reply when it survived)
+    /// from [`EvictedFence`], for the same `user_id` only. A committed `Logout`
+    /// forgets that fence, so a register after one starts clean.
+    ///
     /// # Panics
     /// If `client_id == 0` or `client_id != reply.header().client`.
     pub fn commit_register(&mut self, client_id: u128, user_id: u32, reply: Message<ReplyHeader>) {
@@ -689,6 +772,17 @@ impl ClientTable {
                 .retain(|stored| stored.header().request != REGISTER_REQUEST_ID);
             entry.push_latest(cached);
         } else {
+            // A client this table evicted for capacity is resuming, not
+            // arriving: its committed request numbers must stay deduped, or the
+            // retry the resume contract prescribes re-executes. The watermark's
+            // own reply comes back with the fence when the ring still held it,
+            // so that retry replays its bytes; every other retry at or below the
+            // watermark answers `AlreadyApplied`, which also never re-executes.
+            //
+            // Same identity only: `client_id` is client-supplied, so a fence
+            // must never hand one user another user's dedup history, nor its
+            // cached reply bytes, merely because the key was reused.
+            let fence = self.take_fence(client_id, user_id);
             let freed = if self.index.len() >= self.slots.len() {
                 self.evict_oldest()
             } else {
@@ -697,16 +791,27 @@ impl ClientTable {
             let slot_idx = freed
                 .or_else(|| self.first_free_slot())
                 .expect("eviction must free a slot");
+            debug_assert!(
+                fence.as_ref().is_none_or(|fence| epoch > fence.epoch),
+                "commit_register: revived fence epoch regression"
+            );
             let latest_commit = cached.header().commit;
             let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
+            // Oldest at the front: the retained reply committed before this
+            // register did, and `latest()` must stay the register's own reply.
+            if let Some(replay) = fence.as_ref().and_then(|fence| fence.latest.as_ref()) {
+                ring.push_back(replay.clone());
+            }
             ring.push_back(cached);
             self.slots[slot_idx] = Some(ClientEntry {
                 epoch,
                 user_id,
                 client_id,
                 latest_commit,
-                watermark: REGISTER_REQUEST_ID,
-                watermark_checksum: 0,
+                watermark: fence
+                    .as_ref()
+                    .map_or(REGISTER_REQUEST_ID, |fence| fence.watermark),
+                watermark_checksum: fence.as_ref().map_or(0, |fence| fence.watermark_checksum),
                 ring,
             });
             self.index.insert(client_id, slot_idx);
@@ -797,9 +902,14 @@ impl ClientTable {
                 .find(|stored| stored.header().request == new_request)
             {
                 *stored = cached;
-                // The watermark's reply is the ring's back, so replacing it in
-                // place moves the latest commit without a push.
-                entry.latest_commit = new_commit;
+                // Re-derived, not assigned from `new_commit`: the replaced entry
+                // is not necessarily the ring's back. A rebind pushes the
+                // register reply last, and a fence-revived entry carries the
+                // watermark's reply at the front, so assuming otherwise lets
+                // `latest_commit` disagree with what `decode` rebuilds from
+                // `ring.back()` -- and it is `evict_oldest`'s only ranking key,
+                // so the two would pick different victims from one log.
+                entry.latest_commit = entry.latest().header().commit;
             } else {
                 entry.push_latest(cached);
             }
@@ -830,6 +940,13 @@ impl ClientTable {
     ///
     /// [`Operation::Register`]: iggy_binary_protocol::Operation
     pub fn remove_client(&mut self, client_id: u128) -> bool {
+        // A committed Logout is the explicit end of the session, so it also
+        // forgets any fence a capacity eviction left for this key. Otherwise a
+        // Logout that commits after the eviction (its prepare predates it, so
+        // there is no entry left to drop) would strand a fence, and a later
+        // register would revive a watermark the client had already ended.
+        self.evicted_fences
+            .retain(|fence| fence.client_id != client_id);
         let Some(slot_idx) = self.index.remove(&client_id) else {
             return false;
         };
@@ -849,9 +966,14 @@ impl ClientTable {
     /// session that every backup drops.
     ///
     /// A client with an uncommitted prepare is therefore evictable. Its
-    /// commit lands as [`CommitReply::NoEntry`] -- the reply still ships, and
-    /// the client learns the session is gone on its next request (`NoSession`
-    /// -> eviction frame -> re-register).
+    /// commit lands as [`CommitReply::NoEntry`] -- the reply still ships, the
+    /// client learns the session is gone on its next request (`NoSession` ->
+    /// eviction frame -> re-register), and that commit reaches no fence, so a
+    /// resume can re-execute exactly that request.
+    ///
+    /// The evicted session's dedup fence survives via [`Self::remember_fence`]
+    /// unless it had committed nothing or the fence is later trimmed, so the
+    /// re-registering client is normally answered rather than re-executed.
     ///
     /// **Caveat**: eviction erases the evicted session's watermark, so its
     /// next retry is treated as `New` (re-executes). Bounded by table
@@ -876,11 +998,65 @@ impl ClientTable {
         let (slot_idx, _) = evictee?;
         let entry = self.slots[slot_idx].take().expect("evictee must exist");
         self.index.remove(&entry.client_id);
+        // Reclaim the replies, keep the fence: the evicted client's own resume
+        // must not read as a first-time register, or the retry of a committed
+        // request re-executes.
+        self.remember_fence(&entry);
         trace!(
             client_id = entry.client_id,
             "evict_oldest: removed client from session table"
         );
         Some(slot_idx)
+    }
+
+    /// Record an evicted entry's dedup fence, trimming oldest-first.
+    fn remember_fence(&mut self, entry: &ClientEntry) {
+        // Nothing committed under this session, so there is nothing to dedup.
+        // Worth skipping rather than storing: `evict_oldest` ranks on the oldest
+        // `latest_commit`, and a session idle since its register carries its own
+        // register op, which makes these the PREFERRED victims -- storing them
+        // would crowd real fences out of a store bounded by the slot count.
+        if entry.watermark == REGISTER_REQUEST_ID {
+            return;
+        }
+        // One fence per identity: a later eviction supersedes the earlier one,
+        // and two fences for one key would let the older (lower) watermark be
+        // found first and revive a stale one.
+        self.evicted_fences
+            .retain(|fence| fence.client_id != entry.client_id || fence.user_id != entry.user_id);
+        self.evicted_fences.push_back(EvictedFence {
+            client_id: entry.client_id,
+            epoch: entry.epoch,
+            user_id: entry.user_id,
+            watermark: entry.watermark,
+            watermark_checksum: entry.watermark_checksum,
+            latest: entry.find_cached(entry.watermark).cloned(),
+        });
+        while self.evicted_fences.len() > self.slots.len() {
+            self.evicted_fences.pop_front();
+        }
+    }
+
+    /// Take back the fence a previous capacity eviction left for this
+    /// `(client_id, user_id)` pair. The identity half is the security-relevant
+    /// one: `client_id` arrives off the wire.
+    ///
+    /// Linear because it runs only on a register that missed the index, which is
+    /// a consensus commit and already far dearer than a scan of at most
+    /// `slots.len()` fences.
+    fn take_fence(&mut self, client_id: u128, user_id: u32) -> Option<EvictedFence> {
+        // Both fields in the predicate, not a client_id match with the identity
+        // checked afterwards: `client_id` is client-supplied, so the store can
+        // legitimately hold one fence per user for the same key. Matching on the
+        // id alone would let whichever fence sits nearer the front shadow the
+        // caller's own, handing it a fresh watermark and re-executing a request
+        // it had already committed. It also leaves another user's fence in place
+        // rather than consuming it.
+        let position = self
+            .evicted_fences
+            .iter()
+            .position(|fence| fence.client_id == client_id && fence.user_id == user_id)?;
+        self.evicted_fences.remove(position)
     }
 
     fn first_free_slot(&self) -> Option<usize> {
@@ -972,9 +1148,9 @@ pub enum ClientTableWireError {
     /// slot occupied but unindexed, which desynchronizes the capacity check in
     /// [`ClientTable::commit_register`] from the actual occupancy.
     DuplicateClientId { slot: usize, client_id: u128 },
-    /// A reply ring longer than [`REPLY_RING_CAPACITY`]. `push_latest` only
-    /// evicts on equality, so an over-capacity ring grows without bound, and
-    /// `encode` writes its length as a `u8`.
+    /// A reply ring longer than [`REPLY_RING_MAX_CAPACITY`]. `encode` writes
+    /// the length as a `u8`, and a peer that sends more replies than this crate
+    /// ever retains is reporting state this one cannot have produced.
     RingTooLong { slot: usize, len: u8, max: usize },
 }
 
@@ -1056,8 +1232,7 @@ impl ClientTable {
                 .map(|entry| {
                     ENCODED_ENTRY_FIXED_LEN
                         + entry
-                            .ring
-                            .iter()
+                            .transferable_replies()
                             .map(|reply| size_of::<u32>() + reply.bytes.len())
                             .sum::<usize>()
                 })
@@ -1074,8 +1249,8 @@ impl ClientTable {
             out.extend_from_slice(&entry.user_id.to_le_bytes());
             out.extend_from_slice(&entry.watermark.to_le_bytes());
             out.extend_from_slice(&entry.watermark_checksum.to_le_bytes());
-            out.push(entry.ring.len() as u8);
-            for reply in &entry.ring {
+            out.push(entry.transferable_replies().count() as u8);
+            for reply in entry.transferable_replies() {
                 let bytes = reply.bytes.as_slice();
                 out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 out.extend_from_slice(bytes);
@@ -1139,15 +1314,14 @@ impl ClientTable {
                 return Err(ClientTableWireError::EmptyRing);
             }
             // The artifact checksum only proves the bytes survived transit; it
-            // says nothing about the peer that computed them. An over-capacity
-            // ring is admitted forever after (`push_latest` evicts only on
-            // equality) and eventually wraps `encode`'s `u8` length, making
-            // this table permanently un-transferable onward.
-            if usize::from(ring_len) > REPLY_RING_CAPACITY {
+            // says nothing about the peer that computed them. A ring longer
+            // than this crate retains eventually wraps `encode`'s `u8` length,
+            // making this table permanently un-transferable onward.
+            if usize::from(ring_len) > REPLY_RING_MAX_CAPACITY {
                 return Err(ClientTableWireError::RingTooLong {
                     slot: slot_idx,
                     len: ring_len,
-                    max: REPLY_RING_CAPACITY,
+                    max: REPLY_RING_MAX_CAPACITY,
                 });
             }
             let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
@@ -1216,6 +1390,19 @@ impl ClientEntry {
             .expect("ring is never empty after registration")
     }
 
+    /// The newest replies a state transfer carries, oldest first.
+    ///
+    /// Capped at [`REPLY_RING_CAPACITY`] rather than shipping whatever
+    /// retention holds locally: an artifact a recovering node has to fetch is
+    /// worth keeping small, and the deeper history rebuilds itself from the
+    /// receiver's own commits. Dropping it costs a late retrier its bytes on
+    /// the transferred node, which the watermark still refuses to re-execute.
+    fn transferable_replies(&self) -> impl Iterator<Item = &CachedReply> {
+        self.ring
+            .iter()
+            .skip(self.ring.len().saturating_sub(REPLY_RING_CAPACITY))
+    }
+
     /// Cached reply whose `request` matches (scan order is irrelevant
     /// because request numbers in the ring are unique).
     fn find_cached(&self, request: u64) -> Option<&CachedReply> {
@@ -1224,14 +1411,29 @@ impl ClientEntry {
             .find(|cached| cached.header().request == request)
     }
 
-    /// Push the newest committed reply, evicting the oldest when full, and
-    /// refresh the denormalized `latest_commit`.
+    /// Push the newest committed reply, drop the oldest ones retention no
+    /// longer covers, and refresh the denormalized `latest_commit`.
     fn push_latest(&mut self, cached: CachedReply) {
         self.latest_commit = cached.header().commit;
-        if self.ring.len() == REPLY_RING_CAPACITY {
-            self.ring.pop_front();
-        }
         self.ring.push_back(cached);
+        self.trim_ring();
+    }
+
+    /// Drop the oldest replies once the entry holds more than
+    /// [`REPLY_RING_CAPACITY`] and either retention bound is exceeded.
+    ///
+    /// The total is summed here rather than denormalized onto the entry: the
+    /// ring is capped at [`REPLY_RING_MAX_CAPACITY`], so this is a bounded walk
+    /// of buffer lengths with no header casts, and it leaves no running total
+    /// for the sites that write the ring to drift out of sync with.
+    fn trim_ring(&mut self) {
+        let mut bytes: usize = self.ring.iter().map(CachedReply::byte_len).sum();
+        while self.ring.len() > REPLY_RING_CAPACITY
+            && (self.ring.len() > REPLY_RING_MAX_CAPACITY || bytes > REPLY_RING_RETENTION_BYTES)
+        {
+            let dropped = self.ring.pop_front().expect("length checked above");
+            bytes -= dropped.byte_len();
+        }
     }
 }
 
@@ -1244,6 +1446,184 @@ mod tests {
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
     const TEST_USER_ID: u32 = 7;
+
+    /// Capacity eviction reclaims an entry's replies but must not reset its
+    /// dedup fence: the evicted client's own resume is a rebind in everything
+    /// but bookkeeping, and the resume contract has it retry the request it
+    /// never saw answered.
+    #[test]
+    fn eviction_keeps_the_fence_so_a_resumed_client_is_not_re_executed() {
+        const CLIENT_A: u128 = 0xA11CE;
+        const CHURN: [u128; 2] = [0xB0B1, 0xB0B2];
+
+        let mut table = ClientTable::new(2);
+        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 1));
+        // Request 1 commits for A, so its watermark is 1.
+        table.commit_reply(CLIENT_A, make_reply_for(CLIENT_A, 1, 2));
+
+        // Two fresh registers fill the table and evict A (oldest commit).
+        for (offset, churn) in CHURN.iter().enumerate() {
+            let commit = 3 + offset as u64;
+            table.commit_register(*churn, TEST_USER_ID, make_register_reply(*churn, commit));
+        }
+        assert!(
+            table.get_epoch(CLIENT_A).is_none(),
+            "the churn must have evicted A for this test to mean anything"
+        );
+
+        // A resumes: fresh register under the same id, then retries request 1.
+        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 10));
+        let resumed_epoch = table.get_epoch(CLIENT_A).expect("resume registered");
+
+        match table.check_request(CLIENT_A, resumed_epoch, 1, 0) {
+            RequestStatus::Duplicate(replayed) => {
+                assert_eq!(
+                    replayed.header().request,
+                    1,
+                    "the retained reply must be the watermark request's own"
+                );
+            }
+            other => panic!(
+                "a committed request retried after capacity eviction must replay its cached \
+                 reply, not be executed a second time; got {other:?}"
+            ),
+        }
+
+        // A request above the restored watermark is still new.
+        assert!(matches!(
+            table.check_request(CLIENT_A, resumed_epoch, 2, 0),
+            RequestStatus::New
+        ));
+    }
+
+    /// `client_id` is client-supplied, so a fence belongs to the user that
+    /// earned it: a register under a different identity must neither inherit the
+    /// dedup history (it would be handed another user's cached reply bytes) nor
+    /// consume the fence (anyone could then erase another client's history just
+    /// by presenting its key).
+    #[test]
+    fn a_fence_is_neither_inherited_nor_consumed_by_a_different_user() {
+        const CLIENT_A: u128 = 0xA11CE;
+        const OTHER_USER: u32 = TEST_USER_ID + 1;
+
+        let mut table = ClientTable::new(2);
+        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 1));
+        table.commit_reply(CLIENT_A, make_reply_for(CLIENT_A, 1, 2));
+        for (offset, churn) in [0xB0B1u128, 0xB0B2].iter().enumerate() {
+            let commit = 3 + offset as u64;
+            table.commit_register(*churn, TEST_USER_ID, make_register_reply(*churn, commit));
+        }
+        assert!(
+            table.get_epoch(CLIENT_A).is_none(),
+            "the churn must have evicted A, leaving its fence"
+        );
+
+        table.commit_register(CLIENT_A, OTHER_USER, make_register_reply(CLIENT_A, 10));
+        let squatter_epoch = table.get_epoch(CLIENT_A).expect("registered");
+        assert!(
+            matches!(
+                table.check_request(CLIENT_A, squatter_epoch, 1, 0),
+                RequestStatus::New
+            ),
+            "a different user must start at a fresh watermark, not inherit the fence"
+        );
+        assert!(
+            table
+                .evicted_fences
+                .iter()
+                .any(|fence| fence.client_id == CLIENT_A && fence.user_id == TEST_USER_ID),
+            "the owner's fence must survive a register under another identity"
+        );
+    }
+
+    /// Two fences can share a `client_id` with different users (the key is
+    /// client-supplied). Lookup must find the caller's own fence rather than
+    /// stopping at whichever one happens to sit closer to the front.
+    #[test]
+    fn a_fence_is_found_behind_another_users_fence_for_the_same_client_id() {
+        const CLIENT_A: u128 = 0xA11CE;
+        const FIRST_USER: u32 = TEST_USER_ID;
+        const SECOND_USER: u32 = TEST_USER_ID + 1;
+
+        let mut table = ClientTable::new(2);
+        for (user, watermark) in [(FIRST_USER, 1u64), (SECOND_USER, 4u64)] {
+            table.evicted_fences.push_back(EvictedFence {
+                client_id: CLIENT_A,
+                epoch: watermark,
+                user_id: user,
+                watermark,
+                watermark_checksum: 0,
+                latest: Some(CachedReply::from_message(make_reply_for(
+                    CLIENT_A, watermark, watermark,
+                ))),
+            });
+        }
+
+        let fence = table
+            .take_fence(CLIENT_A, SECOND_USER)
+            .expect("the second user's own fence must be reachable behind the first user's");
+        assert_eq!(fence.watermark, 4);
+        assert!(
+            table
+                .evicted_fences
+                .iter()
+                .any(|fence| fence.user_id == FIRST_USER),
+            "and taking it must leave the other user's fence in place"
+        );
+        assert!(
+            table.take_fence(CLIENT_A, SECOND_USER).is_none(),
+            "a fence is consumed on the hit, so a re-minted key cannot revive a \
+             stale watermark and swallow a fresh session's requests"
+        );
+    }
+
+    /// A committed `Logout` ends the session explicitly, so it must not leave a
+    /// fence behind for a later register to revive: the client asked to be
+    /// forgotten, and a Logout committing after its entry was evicted finds
+    /// nothing to drop.
+    #[test]
+    fn logout_forgets_an_evicted_fence() {
+        const CLIENT_A: u128 = 0xA11CE;
+
+        let mut table = ClientTable::new(2);
+        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 1));
+        table.commit_reply(CLIENT_A, make_reply_for(CLIENT_A, 1, 2));
+        for (offset, churn) in [0xB0B1u128, 0xB0B2].iter().enumerate() {
+            let commit = 3 + offset as u64;
+            table.commit_register(*churn, TEST_USER_ID, make_register_reply(*churn, commit));
+        }
+        assert!(table.get_epoch(CLIENT_A).is_none(), "A must be evicted");
+
+        table.remove_client(CLIENT_A);
+        table.commit_register(CLIENT_A, TEST_USER_ID, make_register_reply(CLIENT_A, 10));
+        let epoch = table.get_epoch(CLIENT_A).expect("registered again");
+        assert!(
+            matches!(
+                table.check_request(CLIENT_A, epoch, 1, 0),
+                RequestStatus::New
+            ),
+            "a register after Logout must start fresh, not revive the ended session's watermark"
+        );
+    }
+
+    /// The fence store is bounded by the slot count, so a churn far longer than
+    /// the table cannot grow it without limit.
+    #[test]
+    fn evicted_fences_stay_bounded_by_the_slot_count() {
+        let mut table = ClientTable::new(2);
+        // Each client commits an app request, so eviction has a real fence to
+        // keep -- a register-only session is skipped on purpose.
+        for client in 1..=20u128 {
+            let commit = (client * 2) as u64;
+            table.commit_register(client, TEST_USER_ID, make_register_reply(client, commit));
+            table.commit_reply(client, make_reply_for(client, 1, commit + 1));
+        }
+        assert_eq!(
+            table.evicted_fences.len(),
+            table.slots.len(),
+            "fences must be trimmed to the slot count"
+        );
+    }
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_register_reply(client: u128, commit: u64) -> Message<ReplyHeader> {
@@ -1268,6 +1648,29 @@ mod tests {
 
     fn make_reply_for(client: u128, request: u64, commit: u64) -> Message<ReplyHeader> {
         make_reply_with_checksum(client, request, commit, 0)
+    }
+
+    /// A reply heavy enough that two of them exhaust
+    /// [`REPLY_RING_RETENTION_BYTES`], so only the floor keeps it cached.
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_big_reply(client: u128, request: u64, commit: u64) -> Message<ReplyHeader> {
+        let header_size = std::mem::size_of::<ReplyHeader>();
+        let size = header_size + REPLY_RING_RETENTION_BYTES;
+        let mut msg = Message::<ReplyHeader>::new(size);
+        let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
+            &mut msg.as_mut_slice()[..header_size],
+        )
+        .expect("zeroed bytes are valid");
+        *header = ReplyHeader {
+            client,
+            request,
+            commit,
+            size: size as u32,
+            command: Command::Reply,
+            operation: Operation::SendMessages,
+            ..ReplyHeader::default()
+        };
+        msg
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -1665,26 +2068,73 @@ mod tests {
     // Below-watermark duplicate whose reply aged out of the ring is refused
     // execution with nothing to replay.
     #[test]
-    fn check_request_below_watermark_past_ring_is_already_applied() {
+    fn check_request_below_watermark_past_retention_is_already_applied() {
         let (mut table, epoch) = table_with_client();
-        // Requests 1..=6: request 1's reply is displaced beyond the ring
-        // (capacity 5 holds 2..=6 once 6 commits; the register reply and
-        // request 1 aged out first).
-        for request in 1..=6u64 {
+        // Enough small replies to exhaust the byte budget several times over,
+        // so the oldest are certain to have been dropped.
+        let requests = (REPLY_RING_RETENTION_BYTES / size_of::<ReplyHeader>() + 8) as u64;
+        for request in 1..=requests {
             table.commit_reply(1, make_reply_for(1, request, 10 + request));
         }
         match table.check_request(1, epoch, 1, 0) {
             RequestStatus::AlreadyApplied { request, watermark } => {
                 assert_eq!(request, 1);
-                assert_eq!(watermark, 6);
+                assert_eq!(watermark, requests);
             }
             other => panic!("expected AlreadyApplied, got {other:?}"),
         }
-        // The oldest retained entry still answers.
-        match table.check_request(1, epoch, 2, 0) {
-            RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, 2),
+        // The newest still answers with its own bytes.
+        match table.check_request(1, epoch, requests, 0) {
+            RequestStatus::Duplicate(cached) => assert_eq!(cached.header().request, requests),
             other => panic!("expected Duplicate, got {other:?}"),
         }
+    }
+
+    // A retry that arrives after more commits than the floor holds still gets
+    // its original bytes back: retention past the floor is budgeted in bytes,
+    // and small replies are what a late retrier usually has outstanding.
+    #[test]
+    fn a_late_retry_replays_while_the_retention_budget_holds_it() {
+        let (mut table, epoch) = table_with_client();
+        let requests = REPLY_RING_CAPACITY as u64 + 2;
+        for request in 1..=requests {
+            table.commit_reply(1, make_reply_for(1, request, 10 + request));
+        }
+
+        match table.check_request(1, epoch, 1, 0) {
+            RequestStatus::Duplicate(cached) => {
+                assert_eq!(cached.header().request, 1);
+                assert_eq!(
+                    cached.header().commit,
+                    11,
+                    "the original reply, not a re-run"
+                );
+            }
+            other => panic!("expected the original reply to replay, got {other:?}"),
+        }
+    }
+
+    // Heavy replies stay bounded by the floor, so the deeper retention cannot
+    // be turned into a memory amplifier by a client polling large batches.
+    #[test]
+    fn heavy_replies_are_retained_only_to_the_floor() {
+        let (mut table, epoch) = table_with_client();
+        let requests = REPLY_RING_CAPACITY as u64 + 2;
+        for request in 1..=requests {
+            table.commit_reply(1, make_big_reply(1, request, 10 + request));
+        }
+
+        // The floor counts the register reply out: it aged out first, leaving
+        // the last REPLY_RING_CAPACITY app replies.
+        let oldest_retained = requests - REPLY_RING_CAPACITY as u64 + 1;
+        assert!(matches!(
+            table.check_request(1, epoch, oldest_retained - 1, 0),
+            RequestStatus::AlreadyApplied { .. }
+        ));
+        assert!(matches!(
+            table.check_request(1, epoch, oldest_retained, 0),
+            RequestStatus::Duplicate(_)
+        ));
     }
 
     // Dedup across view change. Backup inherits client_table via
@@ -2141,9 +2591,9 @@ mod tests {
         ));
     }
 
-    // `push_latest` evicts only on equality, so an over-capacity ring is
-    // admitted permanently and grows on every later reply until `encode`'s u8
-    // length wraps and the table stops being transferable at all.
+    // A ring longer than this crate ever retains comes from a peer this one
+    // cannot model; admitting it would eventually wrap `encode`'s u8 length and
+    // leave the table untransferable onward.
     #[test]
     fn decode_rejects_a_ring_longer_than_capacity() {
         let mut table = ClientTable::new(1);
@@ -2157,7 +2607,7 @@ mod tests {
         assert_eq!(oversized[ring_len_at], 1, "entry's ring holds one reply");
         #[allow(clippy::cast_possible_truncation)]
         {
-            oversized[ring_len_at] = REPLY_RING_CAPACITY as u8 + 1;
+            oversized[ring_len_at] = REPLY_RING_MAX_CAPACITY as u8 + 1;
         }
 
         assert!(matches!(

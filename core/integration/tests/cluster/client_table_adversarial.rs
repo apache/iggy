@@ -17,14 +17,14 @@
 
 //! Adversarial specs against the VSR client table's at-most-once guarantees.
 //!
-//! Both tests are RED SPECS, expected to FAIL: they assert the dedup contract
-//! a retrying client needs, and the current table cannot honour it at its two
-//! resource edges.
+//! Both assert the dedup contract a retrying client needs at the table's two
+//! resource edges. The capacity one now passes; the reply-ring one is still a
+//! RED SPEC, expected to FAIL.
 //!
-//! 1. Capacity: a full table evicts the entry with the oldest commit, and the
-//!    eviction erases that client's request watermark. A client that was
-//!    merely quiet (not gone) re-registers and its retry of an
-//!    already-committed request id re-executes.
+//! 1. Capacity: a full table evicts the entry with the oldest commit. Eviction
+//!    keeps that client's request watermark (and the watermark's reply when the
+//!    ring still held it), so a client that was merely quiet re-registers and
+//!    its retry of an already-committed request id is answered, not re-executed.
 //! 2. Reply ring: each entry retains only its `REPLY_RING_CAPACITY` most
 //!    recent committed replies. A retry of a request whose reply aged out is
 //!    refused with the terminal `RequestAlreadyApplied` and no result payload,
@@ -77,25 +77,21 @@ const REPLY_WAIT: Duration = Duration::from_secs(5);
 
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-/// RED SPEC, expected to FAIL: capacity eviction must not erase a live
-/// client's dedup watermark.
+/// Capacity eviction must not erase a live client's dedup watermark.
 ///
 /// With the table floored at two slots, three fresh registrations evict
 /// `CLIENT_A` (its commit is the oldest) while its connection is still open
 /// and its request 1 is committed. The client then does exactly what the
 /// resume contract tells a disconnected client to do: reconnect,
 /// re-authenticate under its own identity, and retry the request it never saw
-/// answered. The register finds no entry to rebind, mints a fresh one at
-/// watermark zero, and the retry of the committed request re-executes.
+/// answered. The register finds no entry to rebind, so it restores the fence
+/// eviction left and the retry is answered from it.
 ///
-/// The proof of re-execution is the committed duplicate-name rejection: a
-/// dedup hit replays the cached success bytes, so any committed rejection
-/// means the state machine ran the operation a second time. At-most-once
-/// holds only for clients the table happened not to evict.
-// TODO(hubcio): fix this test
-#[ignore = "capacity eviction erases a live client's dedup watermark; replay re-executes"]
+/// A committed duplicate-name rejection is the proof of re-execution: a dedup
+/// hit replays the cached success bytes, so any committed rejection means the
+/// state machine ran the operation a second time.
 #[iggy_harness(cluster_nodes = 1, server(metadata.clients_table_max = "2"))]
-async fn given_a_low_client_table_cap_when_connects_churn_should_erase_a_live_dedup_watermark(
+async fn given_a_low_client_table_cap_when_connects_churn_should_keep_a_live_dedup_watermark(
     harness: &mut TestHarness,
 ) {
     let addr = tcp_addr(harness);
@@ -141,25 +137,23 @@ async fn given_a_low_client_table_cap_when_connects_churn_should_erase_a_live_de
         other => panic!(
             "capacity eviction erased a live client's dedup watermark: request 1 was \
              committed and its reply delivered, but after the table (capacity 2) evicted \
-             the entry to admit churn registrations, the resume re-registered at watermark \
-             zero and the retry of request 1 was re-executed by the state machine instead \
-             of being answered from the dedup cache (at-most-once broken for any client \
-             the table evicts while it is merely quiet); got {other:?}"
+             the entry to admit churn registrations, the resume did not restore the fence, \
+             so the retry of request 1 was re-executed by the state machine instead of \
+             being answered from the dedup cache (at-most-once broken for any client the \
+             table evicts while it is merely quiet); got {other:?}"
         ),
     }
 }
 
-/// RED SPEC, expected to FAIL: a retry that falls off the reply ring must not
-/// be terminally rejected without a result.
+/// A retry that arrives after more commits than the reply floor holds must
+/// still replay its original result, not a terminal refusal.
 ///
-/// Request 1 commits, then later requests on the same session push its reply
-/// out of the ring. The retry of request 1 is then answered with the terminal
-/// `RequestAlreadyApplied` code and no result payload. The
-/// caller cannot distinguish "your operation succeeded, the reply aged out"
-/// from "your operation was rejected", so a slow retrier is forced to treat a
-/// success as a failure.
-// TODO(hubcio): fix this test
-#[ignore = "replay past the reply ring draws terminal RequestAlreadyApplied, no result payload"]
+/// Request 1 commits, then more requests than `REPLY_RING_CAPACITY` commit on
+/// the same session. Retention past the floor is budgeted in bytes, so these
+/// small replies all stay cached and the retry of request 1 answers with its
+/// original bytes. Answering `RequestAlreadyApplied` instead tells the caller
+/// its operation succeeded while handing back no result, which a slow retrier
+/// cannot tell apart from a rejection.
 #[iggy_harness(cluster_nodes = 1)]
 async fn given_replays_past_the_reply_ring_when_a_request_id_falls_off_should_not_terminally_reject(
     harness: &mut TestHarness,
@@ -169,8 +163,8 @@ async fn given_replays_past_the_reply_ring_when_a_request_id_falls_off_should_no
     let aged_payload = create_stream_payload("adv-l-aged");
     let committed = commit_request(&mut stream, CLIENT_A, session, 1, &aged_payload).await;
 
-    // One more commit than the ring holds, so request 1's reply is evicted
-    // even though the register reply seeded a slot of its own.
+    // More commits than the unconditional floor holds, so passing depends on
+    // the byte-budgeted retention rather than on the floor alone.
     let later_requests = REPLY_RING_CAPACITY as u64 + 1;
     for index in 0..later_requests {
         let payload = create_stream_payload(&format!("adv-l-filler-{index}"));
@@ -184,12 +178,11 @@ async fn given_replays_past_the_reply_ring_when_a_request_id_falls_off_should_no
             assert_replayed_from_cache(&committed, &replayed, 1);
         }
         other => panic!(
-            "a committed request replayed past the reply ring is terminally rejected: \
-             request 1 was applied and confirmed, but after {later_requests} newer commits \
-             its reply aged out of the {REPLY_RING_CAPACITY}-deep ring and the server \
-             answered the terminal RequestAlreadyApplied code with no result payload, which the \
-             client cannot distinguish from a rejection of an operation that in fact \
-             succeeded; got {other:?}"
+            "a committed request replayed past the reply floor lost its result: request 1 \
+             was applied and confirmed, and {later_requests} newer commits of this size fit \
+             the retention budget, so its reply must still replay; a terminal \
+             RequestAlreadyApplied tells the client its operation succeeded while handing \
+             back no result, which it cannot tell apart from a rejection; got {other:?}"
         ),
     }
 }

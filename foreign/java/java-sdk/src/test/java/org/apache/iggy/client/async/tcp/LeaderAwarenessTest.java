@@ -206,6 +206,10 @@ class LeaderAwarenessTest {
         private final ConnectionInfo currentTarget = new ConnectionInfo("iggy-follower", 8092);
 
         private Optional<ConnectionInfo> findLeader(Supplier<CompletableFuture<ClusterMetadata>> fetch) {
+            return lookUpLeader(fetch).redirect();
+        }
+
+        private LeaderAwareness.LeaderLookup lookUpLeader(Supplier<CompletableFuture<ClusterMetadata>> fetch) {
             return LeaderAwareness.findLeaderElsewhere(fetch, currentTarget, BUDGET, INTERVAL)
                     .orTimeout(30, TimeUnit.SECONDS)
                     .join();
@@ -248,7 +252,8 @@ class LeaderAwarenessTest {
                             Duration.ofMillis(100),
                             INTERVAL)
                     .orTimeout(30, TimeUnit.SECONDS)
-                    .join();
+                    .join()
+                    .redirect();
 
             assertThat(leader).isEmpty();
             assertThat(fetchCount.get()).isGreaterThan(1);
@@ -277,6 +282,22 @@ class LeaderAwarenessTest {
         }
 
         @Test
+        void shouldRememberEveryNodeTheRosterNamesEvenWhileLeaderless() {
+            var lookup = LeaderAwareness.findLeaderElsewhere(
+                            () -> CompletableFuture.completedFuture(leaderlessCluster()),
+                            currentTarget,
+                            Duration.ofMillis(100),
+                            INTERVAL)
+                    .orTimeout(30, TimeUnit.SECONDS)
+                    .join();
+
+            // A leaderless roster still names where the nodes are, and that is
+            // what a redial needs.
+            assertThat(lookup.redirect()).isEmpty();
+            assertThat(lookup.endpoints()).isNotEmpty();
+        }
+
+        @Test
         void shouldStayWithoutPollingWhenAlreadyOnLeader() {
             var fetchCount = new AtomicInteger();
 
@@ -289,7 +310,8 @@ class LeaderAwarenessTest {
                             BUDGET,
                             INTERVAL)
                     .orTimeout(30, TimeUnit.SECONDS)
-                    .join();
+                    .join()
+                    .redirect();
 
             assertThat(leader).isEmpty();
             assertThat(fetchCount).hasValue(1);

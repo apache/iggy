@@ -119,6 +119,13 @@ export class IggyConnection extends EventEmitter {
   private reconnectPromise?: Promise<this>;
   /** Endpoint the client was configured with, kept across leader redirects */
   private readonly seedOptions: ClientConfig['options'];
+  /**
+   * Every node the roster named on the last read, kept as redial candidates.
+   * A node dies together with its address, and the roster is unreachable
+   * exactly when it is needed, so it has to have been remembered while the
+   * connection was still healthy.
+   */
+  private rosterEndpoints: { host: string, port: number }[];
 
   /** Incremental response frame decoder */
   private responseDecoder: ResponseFrameDecoder;
@@ -136,6 +143,7 @@ export class IggyConnection extends EventEmitter {
     this.ending = false;
     this.reconnectOption = { ...DefaultReconnectOption, ...config.reconnect };
     this.seedOptions = { ...config.options };
+    this.rosterEndpoints = [];
     this.reconnectCount = 0;
     this.connectPromise = undefined;
     this.reconnectPromise = undefined;
@@ -301,7 +309,6 @@ export class IggyConnection extends EventEmitter {
   ): Promise<this> {
     let lastError = initialError;
     let expectedSocket = this.socket;
-    let attempt = 0;
     while (enabled && this.reconnectCount < maxRetries) {
       this.connecting = true;
       this.reconnectCount += 1;
@@ -313,24 +320,28 @@ export class IggyConnection extends EventEmitter {
       if (this.connected || this.socket !== expectedSocket)
         return this.connect();
 
-      const options = this._reconnectTarget(attempt);
-      attempt += 1;
-      const socket = this._installSocket(
-        getTransport({ ...this.config, options })
-      );
-      this.socket = socket;
-      expectedSocket = socket;
-      try {
-        await this._waitForConnection(socket);
-        if (this.socket !== socket)
-          return this.connect();
-        this.config.options = options;
-        return this;
-      } catch (error) {
-        lastError = error instanceof Error
-          ? error
-          : new Error(String(error));
-        debug('reconnect attempt failed', lastError);
+      // Every endpoint gets its turn inside one attempt, so a full pass over
+      // the cluster costs one retry rather than one per endpoint: a pass that
+      // stopped at the first refusal would never reach the survivors of a
+      // client configured for a single retry.
+      for (const options of this._redialCandidates()) {
+        const socket = this._installSocket(
+          getTransport({ ...this.config, options })
+        );
+        this.socket = socket;
+        expectedSocket = socket;
+        try {
+          await this._waitForConnection(socket);
+          if (this.socket !== socket)
+            return this.connect();
+          this.config.options = options;
+          return this;
+        } catch (error) {
+          lastError = error instanceof Error
+            ? error
+            : new Error(String(error));
+          debug('reconnect attempt failed', lastError);
+        }
       }
     }
 
@@ -342,16 +353,43 @@ export class IggyConnection extends EventEmitter {
   }
 
   /**
-   * Alternates reconnect dials between the current endpoint and the
-   * configured seed. After a leader redirect the current endpoint may die
-   * with the leader, and the seed is the way back to the rest of the cluster.
+   * Records the cluster roster as redial candidates.
+   *
+   * Replaced wholesale rather than merged: the roster is the cluster's own
+   * answer about where its nodes are, so a node it dropped stops being
+   * dialed. The configured seed is kept separately and outlives it.
    */
-  private _reconnectTarget(attempt: number): ClientConfig['options'] {
-    const current = this.config.options;
-    if (this.seedOptions.host === current.host &&
-        this.seedOptions.port === current.port)
-      return current;
-    return attempt % 2 === 0 ? current : this.seedOptions;
+  rememberRoster(endpoints: { host: string, port: number }[]): void {
+    if (endpoints.length === 0)
+      return;
+    this.rosterEndpoints = endpoints;
+  }
+
+  /**
+   * Endpoints a redial rotates through, likeliest first: where the client
+   * currently is, the endpoint it was configured with, then the roster it
+   * learned while connected. After a leader redirect the current endpoint may
+   * die with the leader, and the rest of the list is the way back to the
+   * cluster. Duplicates are dropped, so an endpoint the roster merely spells
+   * differently does not earn a second attempt.
+   */
+  _redialCandidates(): ClientConfig['options'][] {
+    const candidates = [this.config.options];
+    const known = [
+      this.seedOptions,
+      ...this.rosterEndpoints.map(
+        ({ host, port }) => ({ ...this.config.options, host, port })
+      )
+    ];
+    for (const candidate of known) {
+      const duplicate = candidates.some(
+        (known) => known.port === candidate.port &&
+          normalizeHost(known.host) === normalizeHost(candidate.host)
+      );
+      if (!duplicate)
+        candidates.push(candidate);
+    }
+    return candidates;
   }
 
   async redirect(host: string, port: number) {

@@ -24,26 +24,36 @@ import org.apache.iggy.config.RetryPolicy;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ReconnectPlanTest {
 
     private final ConnectionInfo seed = new ConnectionInfo("seed-node", 8090);
     private final ConnectionInfo current = new ConnectionInfo("leader-node", 8090);
+    private final ConnectionInfo survivor = new ConnectionInfo("survivor-node", 8090);
 
     @Test
-    void shouldAlternateBetweenCurrentAndSeed() {
-        assertThat(ReconnectPlan.target(current, seed, 1)).isEqualTo(current);
-        assertThat(ReconnectPlan.target(current, seed, 2)).isEqualTo(seed);
-        assertThat(ReconnectPlan.target(current, seed, 3)).isEqualTo(current);
-        assertThat(ReconnectPlan.target(current, seed, 4)).isEqualTo(seed);
+    void shouldRotateThroughEveryKnownEndpoint() {
+        var candidates = List.of(current, seed, survivor);
+
+        assertThat(ReconnectPlan.target(candidates, 1)).isEqualTo(current);
+        assertThat(ReconnectPlan.target(candidates, 2)).isEqualTo(seed);
+        assertThat(ReconnectPlan.target(candidates, 3)).isEqualTo(survivor);
+        assertThat(ReconnectPlan.target(candidates, 4)).isEqualTo(current);
     }
 
     @Test
     void shouldDialOnlyOneAddressWhenNeverRedirected() {
-        assertThat(ReconnectPlan.target(seed, seed, 1)).isEqualTo(seed);
-        assertThat(ReconnectPlan.target(seed, seed, 2)).isEqualTo(seed);
+        assertThat(ReconnectPlan.target(List.of(seed), 1)).isEqualTo(seed);
+        assertThat(ReconnectPlan.target(List.of(seed), 2)).isEqualTo(seed);
+    }
+
+    @Test
+    void shouldRefuseToPlanARedialWithoutCandidates() {
+        assertThatThrownBy(() -> ReconnectPlan.target(List.of(), 1)).isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test

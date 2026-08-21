@@ -33,7 +33,12 @@ func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password
 	if err != nil {
 		return nil, err
 	}
-	return c.register(ctx, uint32(command.LoginRegisterCode), body)
+	identity, err := c.register(ctx, uint32(command.LoginRegisterCode), body)
+	if err != nil {
+		return nil, err
+	}
+	c.rememberLogin(NewUsernamePasswordCredentials(username, password))
+	return identity, nil
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
@@ -41,7 +46,12 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token 
 	if err != nil {
 		return nil, err
 	}
-	return c.register(ctx, uint32(command.LoginRegisterWithPATCode), body)
+	identity, err := c.register(ctx, uint32(command.LoginRegisterWithPATCode), body)
+	if err != nil {
+		return nil, err
+	}
+	c.rememberLogin(NewPersonalAccessTokenCredentials(token))
+	return identity, nil
 }
 
 // register runs the sign-in handshake, binds the session the server assigned,
@@ -188,6 +198,7 @@ func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
 	c.groups.clear()
 	c.topics.clearCounts()
 	c.mtx.Unlock()
+	c.forgetLogin()
 	return nil
 }
 

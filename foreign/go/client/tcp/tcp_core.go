@@ -85,6 +85,14 @@ type IggyTcpClient struct {
 	// loggedOut records an explicit sign-out, so a reconnect's automatic
 	// sign-in does not silently reverse it; guarded by c.mtx.
 	loggedOut bool
+	// rememberedLogin holds the credentials a manual sign-in succeeded with,
+	// so a reconnect -- on this node or, after a failover, another one -- can
+	// re-establish the session instead of surfacing an unauthenticated error.
+	// A caller that signs in by hand is otherwise less reconnectable than one
+	// that configures auto-login, which is a surprising difference between
+	// two ways of doing the same thing. Cleared on sign-out; guarded by
+	// c.mtx.
+	rememberedLogin AutoLogin
 	// groups caches the consumer-group assignments this client polls with.
 	groups groupAssignmentCache
 	// topics caches what a send needs to resolve a partition locally.
@@ -480,12 +488,13 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 		return nil, err
 	}
 
-	// Without auto-login a reconnect cannot restore the session, so anything
-	// but a sign-in fails here instead of replaying unauthenticated. The
-	// sign-in itself is the exception: the server stays silent on a transient
+	// With no credentials -- neither configured nor remembered from a
+	// sign-in -- a reconnect cannot restore the session, so anything but a
+	// sign-in fails here instead of replaying unauthenticated. The sign-in
+	// itself is the exception: the server stays silent on a transient
 	// register failure and expects the client to replay it.
 	login := isRegisterCode(code)
-	if !c.config.autoLogin.enabled && !login {
+	if _, ok := c.signInCredentials(); !ok && !login {
 		return nil, err
 	}
 	c.mtx.Lock()
@@ -890,8 +899,13 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	connectedAt := c.connectedAt
 	c.mtx.Unlock()
 
-	// handle reestablish interval
-	if !connectedAt.IsZero() {
+	candidates := c.connectionCandidates()
+
+	// The reestablish interval paces reconnects to the one endpoint a
+	// single-address client has. With other endpoints known there is somewhere
+	// else to go, and pausing first only pushes the failover past the window
+	// the caller is willing to wait; the retry interval still paces the loop.
+	if !connectedAt.IsZero() && len(candidates) == 1 {
 		now := time.Now()
 		elapsed := now.Sub(connectedAt)
 		reestablishAfter := c.config.reconnection.reestablishAfter
@@ -909,10 +923,7 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		attempts = uint(c.config.reconnection.maxRetries)
 		interval = c.config.reconnection.interval
 	}
-
-	candidates := c.connectionCandidates()
 	var conn net.Conn
-	var candidateIndex int
 	if err := retry.New(
 		retry.Context(ctx),
 		retry.Attempts(attempts),
@@ -923,46 +934,23 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		}),
 	).Do(
 		func() error {
-			address := candidates[candidateIndex%len(candidates)]
-			candidateIndex++
-			c.logger.Info("Iggy client is connecting to server...", slog.String("server_address", address))
-			connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
-			if err != nil {
-				c.logger.Error("Failed to establish TCP connection to the server", slog.Any("error", err))
-				return ierror.ErrCannotEstablishConnection
-			}
+			// Every endpoint gets its turn inside one attempt, so a full pass
+			// over the cluster costs one retry rather than one per endpoint:
+			// a pass that stopped at the first refusal would never reach the
+			// survivors of a client configured for a single retry.
+			var lastErr error
+			for _, address := range candidates {
+				connection, err := c.dialCandidate(ctx, address)
+				if err != nil {
+					lastErr = err
+					continue
+				}
 
-			tc := connection.(*net.TCPConn)
-			if err := tc.SetNoDelay(c.config.noDelay); err != nil {
-				c.logger.Error("Failed to set the nodelay option on the client, continuing...", slog.Any("error", err))
-			}
-
-			c.mtx.Lock()
-			c.clientAddress = tc.LocalAddr().String()
-			c.currentServerAddress = address
-			c.mtx.Unlock()
-
-			if !c.config.tlsEnabled {
 				conn = connection
 				return nil
 			}
 
-			// TLS logic
-			tlsConfig, err := c.createTLSConfig()
-			if err != nil {
-				_ = connection.Close()
-				return err
-			}
-
-			tlsConn := tls.Client(connection, tlsConfig)
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				c.logger.Error("Failed to establish a TLS connection to the server", slog.Any("error", err))
-				_ = connection.Close()
-				return fmt.Errorf("TLS handshake failed: %w", err)
-			}
-
-			conn = tlsConn
-			return nil
+			return lastErr
 		}); err != nil {
 		c.mtx.Lock()
 		c.transportState = iggcon.TransportStateDisconnected
@@ -992,6 +980,47 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// dialCandidate opens one connection, wrapping it in TLS when configured, and
+// records the endpoint that answered: the leader check compares against it and
+// the next reconnect starts from it.
+func (c *IggyTcpClient) dialCandidate(ctx context.Context, address string) (net.Conn, error) {
+	c.logger.Info("Iggy client is connecting to server...", slog.String("server_address", address))
+	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		c.logger.Error("Failed to establish TCP connection to the server", slog.Any("error", err))
+		return nil, ierror.ErrCannotEstablishConnection
+	}
+
+	tc := connection.(*net.TCPConn)
+	if err := tc.SetNoDelay(c.config.noDelay); err != nil {
+		c.logger.Error("Failed to set the nodelay option on the client, continuing...", slog.Any("error", err))
+	}
+
+	c.mtx.Lock()
+	c.clientAddress = tc.LocalAddr().String()
+	c.currentServerAddress = address
+	c.mtx.Unlock()
+
+	if !c.config.tlsEnabled {
+		return connection, nil
+	}
+
+	tlsConfig, err := c.createTLSConfig()
+	if err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+
+	tlsConn := tls.Client(connection, tlsConfig)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		c.logger.Error("Failed to establish a TLS connection to the server", slog.Any("error", err))
+		_ = connection.Close()
+		return nil, fmt.Errorf("TLS handshake failed: %w", err)
+	}
+
+	return tlsConn, nil
 }
 
 func (c *IggyTcpClient) connectionCandidates() []string {
@@ -1025,8 +1054,9 @@ func (c *IggyTcpClient) connectionCandidates() []string {
 // backup: once the caller signs in, the first replicated request fails over
 // through the transient-deny path.
 func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool) error {
-	if !c.config.autoLogin.enabled {
-		c.logger.Info("Automatic sign-in is disabled.")
+	credentials, ok := c.signInCredentials()
+	if !ok {
+		c.logger.Info("No credentials to sign in with.")
 		return nil
 	}
 	if skipAutoLogin {
@@ -1034,13 +1064,38 @@ func (c *IggyTcpClient) establishSession(ctx context.Context, skipAutoLogin bool
 		return nil
 	}
 
-	credentials := c.config.autoLogin.credentials
 	if credentials.personalAccessToken != "" {
 		_, err := c.LoginWithPersonalAccessToken(ctx, credentials.personalAccessToken)
 		return err
 	}
 	_, err := c.LoginUser(ctx, credentials.username, credentials.password)
 	return err
+}
+
+// signInCredentials reports the credentials a reconnect signs in with: the
+// configured ones, or else the ones a manual sign-in succeeded with.
+func (c *IggyTcpClient) signInCredentials() (Credentials, bool) {
+	if c.config.autoLogin.enabled {
+		return c.config.autoLogin.credentials, true
+	}
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.rememberedLogin.credentials, c.rememberedLogin.enabled
+}
+
+// rememberLogin keeps the credentials a sign-in just succeeded with.
+func (c *IggyTcpClient) rememberLogin(credentials Credentials) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.rememberedLogin = NewAutoLogin(credentials)
+}
+
+// forgetLogin drops them: after an explicit sign-out there is no session to
+// restore, and a reconnect must not resurrect one.
+func (c *IggyTcpClient) forgetLogin() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.rememberedLogin = AutoLogin{}
 }
 
 func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {

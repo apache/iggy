@@ -16,7 +16,8 @@
 // under the License.
 
 use crate::leader_aware::{
-    LeaderRedirectionState, check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
+    LeaderRedirectionState, check_and_redirect_to_leader, is_same_address,
+    is_unauthenticated_metadata_probe,
 };
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
@@ -36,6 +37,7 @@ use iggy_common::{
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use secrecy::ExposeSecret;
+use std::io;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -68,6 +70,13 @@ const NOT_READY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// overall.
 const TRANSIENT_FAILOVER_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Bound on one dial while the client has other endpoints to try. A host
+/// that drops the SYN -- powered off, or partitioned away -- takes the OS
+/// connect timeout to fail, which is minutes, and every other endpoint waits
+/// behind it. A client that knows a single endpoint has nothing to starve, so
+/// its dial stays unbounded.
+const FAILOVER_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// TCP client for interacting with the Iggy API.
 /// It requires a valid server address.
 #[derive(Debug)]
@@ -80,6 +89,15 @@ pub struct TcpClient {
     pub(crate) connected_at: Mutex<Option<IggyTimestamp>>,
     leader_redirection_state: Mutex<LeaderRedirectionState>,
     pub(crate) current_server_address: Mutex<String>,
+    /// Every endpoint the cluster roster named, refreshed on each leader
+    /// check. A node dies together with its address, and the roster is
+    /// unreachable exactly when it is needed, so the client has to have
+    /// remembered it while the connection was still healthy.
+    roster_endpoints: Mutex<Vec<String>>,
+    /// Credentials a sign-in on this client succeeded with, so a reconnect --
+    /// onto this node or, after a failover, another one -- can re-establish
+    /// the session instead of surfacing `Unauthenticated`. Cleared on logout.
+    session_credentials: Mutex<Option<Credentials>>,
     // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
     // is `encode_request_header`, which is pure CPU and never awaits. The
     // tokio variant would pay a waker alloc + internal semaphore on
@@ -159,9 +177,10 @@ impl BinaryTransport for TcpClient {
             return Err(IggyError::Disconnected);
         }
 
-        if matches!(self.config.auto_login, AutoLogin::Disabled) && !is_login_register_code(code) {
-            // Without auto-login a reconnect cannot re-establish the session,
-            // so non-login requests fail fast. Login/register itself is the
+        if !is_login_register_code(code) && self.sign_in_credentials().await.is_none() {
+            // With no credentials -- neither configured nor remembered from a
+            // sign-in -- a reconnect cannot re-establish the session, so
+            // non-login requests fail fast. Login/register itself is the
             // exception: the server stays deliberately silent on transient
             // register failures (the server `surface_login_failure`) and
             // relies on the client timing out and replaying the request.
@@ -230,6 +249,14 @@ impl iggy_common::VsrSessionControl for TcpClient {
         Ok(())
     }
 
+    async fn remember_session_credentials(&self, credentials: Credentials) {
+        self.session_credentials.lock().await.replace(credentials);
+    }
+
+    async fn forget_session_credentials(&self) {
+        self.session_credentials.lock().await.take();
+    }
+
     fn sdk_version(&self) -> &'static str {
         crate::SDK_VERSION
     }
@@ -292,6 +319,8 @@ impl TcpClient {
             connected_at: Mutex::new(None),
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
+            roster_endpoints: Mutex::new(Vec::new()),
+            session_credentials: Mutex::new(None),
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -320,19 +349,20 @@ impl TcpClient {
             }
 
             self.set_state(ClientState::Connecting).await;
-            if let Some(connected_at) = self.connected_at.lock().await.as_ref() {
-                let now = IggyTimestamp::now();
-                let elapsed = now.as_micros() - connected_at.as_micros();
-                let interval = self.config.reconnection.reestablish_after.as_micros();
-                trace!(
-                    "Elapsed time since last connection: {}",
-                    IggyDuration::from(elapsed)
-                );
-                if elapsed < interval {
-                    let remaining = IggyDuration::from(interval - elapsed);
-                    info!("Trying to connect to the server in: {remaining}",);
-                    sleep(remaining.get_duration()).await;
-                }
+            let candidates = self.dial_candidates().await;
+            // The reestablish delay paces reconnects to the one endpoint a
+            // single-address client has. With other endpoints known there is
+            // somewhere else to go, and pausing first only pushes the
+            // failover past the window the caller is willing to wait; the
+            // retry interval still paces the loop.
+            let reestablish_wait = if candidates.len() > 1 {
+                None
+            } else {
+                self.reestablish_wait().await
+            };
+            if let Some(remaining) = reestablish_wait {
+                info!("Trying to connect to the server in: {remaining}",);
+                sleep(remaining.get_duration()).await;
             }
 
             let tls_enabled = self.config.tls_enabled;
@@ -340,14 +370,15 @@ impl TcpClient {
             let connection_stream: ConnectionStreamKind;
             let remote_address;
             let client_address;
+            let mut candidate = 0;
             loop {
-                let server_address = self.current_server_address.lock().await.clone();
+                let server_address = candidates[candidate].clone();
                 info!(
                     "{NAME} client is connecting to server: {}...",
                     server_address
                 );
 
-                let connection = TcpStream::connect(&server_address).await;
+                let connection = self.dial(&server_address, candidates.len() > 1).await;
                 if let Err(err) = &connection {
                     error!(
                         "Failed to connect to server: {}. Error: {}",
@@ -357,6 +388,15 @@ impl TcpClient {
                         warn!("Automatic reconnection is disabled.");
                         return Err(IggyError::CannotEstablishConnection);
                     }
+
+                    // Every other endpoint gets its turn before the retry
+                    // interval: the node just lost may be gone for good, and
+                    // pausing on it helps nothing.
+                    candidate += 1;
+                    if candidate < candidates.len() {
+                        continue;
+                    }
+                    candidate = 0;
 
                     let unlimited_retries = self.config.reconnection.max_retries.is_none();
                     let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
@@ -387,6 +427,10 @@ impl TcpClient {
                     error!("Failed to establish TCP connection to the server: {error}",);
                     IggyError::CannotEstablishConnection
                 })?;
+                // The endpoint that answered is where this client now lives:
+                // the leader check compares against it, and the next
+                // reconnect starts from it.
+                *self.current_server_address.lock().await = server_address.clone();
                 client_address = stream.local_addr().map_err(|error| {
                     error!("Failed to get the local address of the client: {error}",);
                     IggyError::CannotEstablishConnection
@@ -485,9 +529,9 @@ impl TcpClient {
             };
 
             // Handle auto-login
-            let should_redirect = match &self.config.auto_login {
-                AutoLogin::Disabled => {
-                    info!("Automatic sign-in is disabled.");
+            let should_redirect = match self.sign_in_credentials().await {
+                None => {
+                    info!("No credentials to sign in with.");
                     // Only `IggyClient` redirects after a manual sign-in, so
                     // a raw transport can stay on a backup: its first
                     // replicated write gets `TransientNotAccepted`, the
@@ -495,14 +539,14 @@ impl TcpClient {
                     // `Unauthenticated` until the caller signs in again.
                     false
                 }
-                AutoLogin::Enabled(credentials) => {
+                Some(credentials) => {
                     if skip_auto_login {
                         info!("Skipping automatic sign-in for a retried login/register request.");
                         false
                     } else {
                         info!("{NAME} client: {client_address} is signing in...");
                         self.set_state(ClientState::Authenticating).await;
-                        match credentials {
+                        match &credentials {
                             Credentials::UsernamePassword(username, password) => {
                                 self.login_user(username, password.expose_secret()).await?;
                                 info!(
@@ -540,14 +584,22 @@ impl TcpClient {
     /// Returns true if redirection occurred and reconnection is needed.
     pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
         let current_address = self.current_server_address.lock().await.clone();
-        let leader_address = check_and_redirect_to_leader(
+        let leader_check = check_and_redirect_to_leader(
             self,
             &current_address,
             iggy_common::TransportProtocol::Tcp,
         )
         .await?;
 
-        if let Some(new_leader_address) = leader_address {
+        // Replaced wholesale rather than merged: the roster is the cluster's
+        // own answer about where its nodes are, so a node it dropped should
+        // stop being dialed. The configured seeds are kept separately and
+        // outlive it.
+        if !leader_check.endpoints.is_empty() {
+            *self.roster_endpoints.lock().await = leader_check.endpoints;
+        }
+
+        if let Some(new_leader_address) = leader_check.redirect {
             let mut redirection_state = self.leader_redirection_state.lock().await;
             if !redirection_state.can_redirect() {
                 warn!("Maximum leader redirections reached, continuing with current connection");
@@ -571,6 +623,69 @@ impl TcpClient {
             self.leader_redirection_state.lock().await.reset();
             Ok(false)
         }
+    }
+
+    /// Credentials to sign in with after connecting: the configured ones, or
+    /// else the ones a manual sign-in on this client succeeded with. A manual
+    /// sign-in is otherwise less reconnectable than a configured one, which
+    /// is a surprising difference between two ways of doing the same thing.
+    async fn sign_in_credentials(&self) -> Option<Credentials> {
+        match &self.config.auto_login {
+            AutoLogin::Enabled(credentials) => Some(credentials.clone()),
+            AutoLogin::Disabled => self.session_credentials.lock().await.clone(),
+        }
+    }
+
+    /// Endpoints to dial for one connect, likeliest first: where the client
+    /// currently is, then the roster it learned while connected, then the
+    /// configured seeds.
+    async fn dial_candidates(&self) -> Vec<String> {
+        let mut candidates = vec![self.current_server_address.lock().await.clone()];
+        let roster = self.roster_endpoints.lock().await.clone();
+        for endpoint in roster.iter().chain(self.config.failover_addresses.iter()) {
+            if !candidates
+                .iter()
+                .any(|candidate| is_same_address(candidate, endpoint))
+            {
+                candidates.push(endpoint.clone());
+            }
+        }
+        candidates
+    }
+
+    /// Dial one endpoint, bounding the wait while other endpoints are queued
+    /// behind it (see `FAILOVER_DIAL_TIMEOUT`).
+    async fn dial(&self, server_address: &str, bounded: bool) -> io::Result<TcpStream> {
+        if !bounded {
+            return TcpStream::connect(server_address).await;
+        }
+
+        match tokio::time::timeout(FAILOVER_DIAL_TIMEOUT, TcpStream::connect(server_address)).await
+        {
+            Ok(connection) => connection,
+            Err(_elapsed) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("dialing {server_address} took longer than {FAILOVER_DIAL_TIMEOUT:?}"),
+            )),
+        }
+    }
+
+    /// What is left of the `reestablish_after` window since the last
+    /// successful connection, if any.
+    async fn reestablish_wait(&self) -> Option<IggyDuration> {
+        let connected_at = self
+            .connected_at
+            .lock()
+            .await
+            .as_ref()
+            .map(IggyTimestamp::as_micros)?;
+        let elapsed = IggyTimestamp::now().as_micros() - connected_at;
+        let interval = self.config.reconnection.reestablish_after.as_micros();
+        trace!(
+            "Elapsed time since last connection: {}",
+            IggyDuration::from(elapsed)
+        );
+        (elapsed < interval).then(|| IggyDuration::from(interval - elapsed))
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
@@ -870,6 +985,92 @@ const fn is_login_register_code(code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client_with(server_address: &str, failover_addresses: Vec<String>) -> TcpClient {
+        TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: server_address.to_string(),
+            failover_addresses,
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client")
+    }
+
+    #[tokio::test]
+    async fn dial_candidates_lead_with_the_current_endpoint_and_name_each_other_one_once() {
+        let client = client_with(
+            "127.0.0.1:8090",
+            vec!["127.0.0.1:8092".to_string(), "localhost:8090".to_string()],
+        );
+        *client.roster_endpoints.lock().await = vec![
+            "127.0.0.1:8090".to_string(),
+            "127.0.0.1:8091".to_string(),
+            "127.0.0.1:8092".to_string(),
+        ];
+
+        // The current endpoint leads, the roster follows, and neither the
+        // roster's copy of the current endpoint nor a seed that only spells
+        // the same endpoint differently earns a second dial.
+        assert_eq!(
+            client.dial_candidates().await,
+            vec![
+                "127.0.0.1:8090".to_string(),
+                "127.0.0.1:8091".to_string(),
+                "127.0.0.1:8092".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_learned_no_roster_still_dials_its_configured_seeds() {
+        let client = client_with("127.0.0.1:8090", vec!["127.0.0.1:8091".to_string()]);
+
+        assert_eq!(
+            client.dial_candidates().await,
+            vec!["127.0.0.1:8090".to_string(), "127.0.0.1:8091".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_makes_a_client_without_auto_login_reconnectable() {
+        let client = client_with("127.0.0.1:8090", Vec::new());
+        assert!(client.sign_in_credentials().await.is_none());
+
+        client
+            .remember_session_credentials(Credentials::UsernamePassword(
+                "iggy".to_string(),
+                "iggy".into(),
+            ))
+            .await;
+        assert!(client.sign_in_credentials().await.is_some());
+
+        // An explicit logout leaves no session to restore, and a reconnect
+        // must not resurrect one.
+        client.forget_session_credentials().await;
+        assert!(client.sign_in_credentials().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn configured_credentials_outrank_the_ones_a_sign_in_remembered() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "configured".to_string(),
+                "iggy".into(),
+            )),
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+        client
+            .remember_session_credentials(Credentials::UsernamePassword(
+                "signed-in".to_string(),
+                "iggy".into(),
+            ))
+            .await;
+
+        match client.sign_in_credentials().await {
+            Some(Credentials::UsernamePassword(username, _)) => assert_eq!(username, "configured"),
+            other => panic!("expected the configured credentials, got {other:?}"),
+        }
+    }
 
     #[test]
     fn should_fail_with_empty_connection_string() {

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ClientState, DiagnosticEvent, IggyDuration, IggyError};
+use crate::{ClientState, Credentials, DiagnosticEvent, IggyDuration, IggyError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -51,6 +51,16 @@ mod vsr_session_sealed {
 pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     async fn bind_vsr_session(&self, session: u64) -> Result<(), IggyError>;
     async fn reset_vsr_session(&self) -> Result<(), IggyError>;
+    /// Keep the credentials a sign-in succeeded with, so a transport that
+    /// loses its connection can re-establish the session -- on this node or,
+    /// after failing over, on another one. A caller that signs in by hand is
+    /// otherwise less reconnectable than one that configures `AutoLogin`,
+    /// which is a surprising difference between two ways of doing the same
+    /// thing. Transports that cannot reconnect leave this a no-op.
+    async fn remember_session_credentials(&self, _credentials: Credentials) {}
+    /// Drop them: after an explicit logout there is no session to restore,
+    /// and a reconnect must not resurrect one.
+    async fn forget_session_credentials(&self) {}
     /// SDK crate version sent in the login-register version prefix.
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.
