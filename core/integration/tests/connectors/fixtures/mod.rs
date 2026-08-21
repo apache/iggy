@@ -21,6 +21,7 @@ mod clickhouse;
 mod delta;
 mod doris;
 mod elasticsearch;
+mod fluss;
 mod http;
 mod iceberg;
 mod influxdb;
@@ -57,6 +58,7 @@ pub use doris::{
     DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
 };
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
+pub use fluss::FlussSinkFixture;
 pub use http::{
     HttpSinkIndividualFixture, HttpSinkJsonArrayFixture, HttpSinkMultiTopicFixture,
     HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,

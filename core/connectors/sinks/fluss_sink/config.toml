@@ -1,0 +1,60 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "fluss"
+enabled = true
+version = 0
+name = "Fluss sink"
+path = "../../target/release/libiggy_connector_fluss_sink"
+verbose = false
+
+[[streams]]
+stream = "user_events"
+topics = ["users", "orders"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "fluss_sink"
+
+[plugin_config]
+# iggy's fluss table settings
+target_database = "fluss"
+target_table = "iggy_messages"
+auto_create_table = true
+include_metadata = true
+include_checksum = true
+include_origin_timestamp = true
+payload_format = "json"
+
+# fluss connection settings, passed to the fluss connector
+bootstrap_servers = "127.0.0.1:9123"
+writer_request_max_size = 10485760
+writer_acks = "all"
+writer_retries = 2147483647
+writer_batch_size = 2097152
+writer_bucket_no_key_assigner = "sticky"
+writer_batch_timeout_ms = 100
+writer_enable_idempotence = true
+writer_max_inflight_requests_per_bucket = 5
+writer_buffer_memory_size = 67108864
+writer_buffer_wait_timeout_ms = "18446744073709551615"
+connect_timeout_ms = 120000
+security_protocol = "PLAINTEXT"
+security_sasl_mechanism = "PLAIN"
+security_sasl_username = ""
+security_sasl_password = ""
