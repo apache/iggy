@@ -32,35 +32,71 @@
 //! remaining in the frame - it never materializes a value or allocates a collection. Call the
 //! matching `validate_*_shape` function before handing the body to `kafka_protocol`.
 //!
-//! Kept independent of `kafka_protocol`'s own type decoders on purpose: if this walker's field
-//! order ever drifts from the real schema, the worst outcome is a false-positive rejection of a
-//! legitimate request (caught immediately by the wire-fixture round-trip tests), never a false
-//! negative that lets an oversized count back through to the crate.
+//! Kept independent of `kafka_protocol`'s own type decoders on purpose, so this walker doesn't
+//! inherit a bug from the thing it's guarding against. That independence only delivers a
+//! false-positive-only guarantee (a legitimate request gets rejected - caught immediately by the
+//! wire-fixture round-trip tests - rather than an oversized count sneaking through) if every
+//! primitive reader here consumes the *exact same byte count* the real decoder would for the
+//! same field, not merely fields in the same order: a reader that eats more or fewer bytes than
+//! the crate's for one field desyncs every field after it, so a small value validated here can
+//! correspond to a huge one at the decoder's real (different) position. `read_varint` below
+//! documents a real instance of this class of bug and how it's avoided.
 
 use bytes::{Buf, Bytes};
 
 use crate::error::{KafkaProtocolError, Result};
 
-/// Same bound the pre-migration hand-rolled codec used: large enough for any real request, small
-/// enough that even `MAX_REQUEST_ELEMENTS` identically-sized nested arrays cannot approach a
-/// meaningful fraction of memory.
+/// Per-array cap: large enough that no single legitimate array (e.g. a topic list) is rejected,
+/// small enough that a `Vec::with_capacity` sized from it is trivial memory regardless of element
+/// type.
 const MAX_COLLECTION_LEN: usize = 65_536;
 
-/// Cumulative cap on the total array elements this guard will walk across one request. A single
-/// array's count is capped by [`MAX_COLLECTION_LEN`], but not the product across nested arrays
-/// (`topics` x `partitions`) - this budget bounds the sum across the whole frame.
-const MAX_REQUEST_ELEMENTS: usize = MAX_COLLECTION_LEN;
+/// Cumulative cap on the total array elements this guard will walk across one request -
+/// deliberately much smaller than [`MAX_COLLECTION_LEN`]. A single array's count is capped by
+/// `MAX_COLLECTION_LEN`, but not the *product* across nested arrays (`topics` x `partitions`),
+/// and it was that product - not any single array - that let a 393 KB Produce v9 request
+/// (1 topic x 65,535 partitions, all within the old 65,536 cumulative budget) produce a
+/// 2.16 MB response (5.5x) built by a single synchronous, non-yielding call with no `.await`
+/// anywhere in the decode-then-encode path. That's not a crash: it's 10+ ms of one tokio worker
+/// thread fully occupied per request, and every worker can be saturated with as few connections
+/// as there are worker threads (default = core count), stalling every other connection's I/O
+/// while it happens. 4,096 keeps the same request's response under ~135 KB - a small fraction of
+/// the default 8 MiB `max_frame_size` - while remaining generous for any real client (a single
+/// request with 4,096 total array elements across every nested array combined is already an
+/// unusually large batch).
+const MAX_REQUEST_ELEMENTS: usize = 4_096;
+
+/// Conservative per-element upper bound on how many bytes one array entry can add to the
+/// response, used only to reject before decode when the *projected* response size would exceed
+/// the connection's `max_frame_size` - a second, independent bound from [`MAX_REQUEST_ELEMENTS`]
+/// alone, since [`MAX_REQUEST_ELEMENTS`] bounds element *count*, not response *bytes*, and a
+/// request with few elements but very long echoed strings (e.g. topic names, each individually
+/// valid up to [`MAX_COLLECTION_LEN`]) could still be small in count and large in bytes.
+/// Measured: `encode_produce_response`'s largest fixed per-partition response entry is ~33 bytes
+/// (`index` + `error_code` + `base_offset` + `log_append_time` + `log_start_offset` + empty
+/// `record_errors`/`error_message` + tagged field); 64 stays comfortably above every message
+/// type's fixed per-element cost without needing a bespoke weight per type.
+const RESPONSE_BYTES_PER_ELEMENT: usize = 64;
 
 struct ShapeCursor {
     bytes: Bytes,
     element_budget: usize,
+    /// Running total of estimated response bytes this request could produce, charged as the
+    /// walk encounters elements (`charge_elements`) and echoed strings (`compact_string`/
+    /// `legacy_string` - never bytes fields, since `records`/config values are never echoed back
+    /// but can legitimately be large). Never decreases; checked against `max_response_bytes`
+    /// on every charge so an oversized projection fails fast instead of finishing the walk.
+    estimated_response_bytes: usize,
+    max_response_bytes: usize,
 }
 
 impl ShapeCursor {
-    const fn new(body: Bytes) -> Self {
+    const fn new(body: Bytes, max_response_bytes: usize) -> Self {
         Self {
             bytes: body,
             element_budget: MAX_REQUEST_ELEMENTS,
+            estimated_response_bytes: 0,
+            max_response_bytes,
         }
     }
 
@@ -100,23 +136,31 @@ impl ShapeCursor {
         Ok(self.bytes.get_i64())
     }
 
+    /// Byte-for-byte the same algorithm `kafka_protocol`'s `UnsignedVarInt::decode` uses
+    /// (`kafka-protocol-0.17.0/src/protocol/types.rs:119-130`): exactly 5 bytes, `u32`
+    /// arithmetic, and no error if the 5th byte still has its continuation bit set - the crate
+    /// silently stops and returns whatever accumulated in those 5 bytes.
+    ///
+    /// This is not a stylistic match, it's load-bearing: an earlier version of this cursor read
+    /// up to 10 bytes with a `shift >= 64` overflow check, which is the textbook-correct general
+    /// LEB128 reader but *reads more bytes than the real decoder does* for any varint with 6-10
+    /// continuation-bit bytes. That desyncs this cursor's position from the crate's for every
+    /// field after it - the crate reads its own (differently-positioned) bytes for the next
+    /// count field, so a small value validated here can correspond to a huge one there. That
+    /// class of bug is exactly the false negative this module's doc claims can't happen; the
+    /// guarantee only holds if every field here consumes the identical byte count the real
+    /// decoder would.
     fn read_varint(&mut self) -> Result<u64> {
-        let mut result = 0u64;
-        let mut shift = 0u32;
-        loop {
+        let mut value: u32 = 0;
+        for i in 0..5 {
             self.ensure(1)?;
             let byte = self.bytes.get_u8();
-            result |= u64::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(KafkaProtocolError::Malformed(
-                    "varint overflows 64 bits".to_string(),
-                ));
+            value |= u32::from(byte & 0x7F) << (i * 7);
+            if byte < 0x80 {
+                break;
             }
         }
+        Ok(u64::from(value))
     }
 
     fn skip(&mut self, len: usize) -> Result<()> {
@@ -132,6 +176,20 @@ impl ShapeCursor {
                 self.element_budget
             ))
         })?;
+        self.charge_response_bytes(count.saturating_mul(RESPONSE_BYTES_PER_ELEMENT))
+    }
+
+    /// Adds `bytes` to the running projected-response-size estimate, rejecting once it would
+    /// exceed `max_response_bytes`. See [`RESPONSE_BYTES_PER_ELEMENT`]'s doc for why this exists
+    /// alongside, not instead of, the element-count budget.
+    fn charge_response_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.estimated_response_bytes = self.estimated_response_bytes.saturating_add(bytes);
+        if self.estimated_response_bytes > self.max_response_bytes {
+            return Err(KafkaProtocolError::Malformed(format!(
+                "projected response size {} exceeds max_frame_size {}",
+                self.estimated_response_bytes, self.max_response_bytes
+            )));
+        }
         Ok(())
     }
 
@@ -198,6 +256,13 @@ impl ShapeCursor {
 
     /// Legacy string/bytes length caps at `i16`/`i32`, but a non-nullable field with `-1` (or a
     /// nullable field encoded non-null-but-negative) is malformed either way.
+    /// Charges the string's own length against the projected-response-size budget, not just its
+    /// element slot: every message type this guard covers echoes request strings back in its
+    /// response somewhere (topic names, at minimum), so a request with few array elements but
+    /// very long strings could still bypass the count-only [`Self::charge_elements`] check.
+    /// Deliberately blanket - it also charges strings that are never echoed (e.g. `CreateTopics`
+    /// config values), which can only ever reject a legitimate request more eagerly than
+    /// necessary, never let an amplifying one through.
     fn legacy_string(&mut self, nullable: bool) -> Result<()> {
         let len = self.read_i16()?;
         if len < 0 {
@@ -210,7 +275,9 @@ impl ShapeCursor {
             };
         }
         // Safe: len is in [0, i16::MAX], checked above.
-        self.skip(len.unsigned_abs().into())
+        let len: usize = len.unsigned_abs().into();
+        self.charge_response_bytes(len)?;
+        self.skip(len)
     }
 
     /// Compact string length is otherwise bounded only by the frame; cap it at
@@ -237,6 +304,7 @@ impl ShapeCursor {
                 self.remaining()
             )));
         }
+        self.charge_response_bytes(len)?;
         self.skip(len)
     }
 
@@ -311,8 +379,8 @@ impl ShapeCursor {
 ///
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
-pub fn validate_produce_shape(version: i16, body: &Bytes) -> Result<()> {
-    let mut c = ShapeCursor::new(body.clone());
+pub fn validate_produce_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 9;
 
     if flexible {
@@ -366,8 +434,8 @@ pub fn validate_produce_shape(version: i16, body: &Bytes) -> Result<()> {
 ///
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
-pub fn validate_fetch_shape(version: i16, body: &Bytes) -> Result<()> {
-    let mut c = ShapeCursor::new(body.clone());
+pub fn validate_fetch_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 12;
 
     let _replica_id = c.read_i32()?;
@@ -465,8 +533,12 @@ pub fn validate_fetch_shape(version: i16, body: &Bytes) -> Result<()> {
 ///
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
-pub fn validate_list_offsets_shape(version: i16, body: &Bytes) -> Result<()> {
-    let mut c = ShapeCursor::new(body.clone());
+pub fn validate_list_offsets_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 6;
 
     let _replica_id = c.read_i32()?;
@@ -519,8 +591,12 @@ pub fn validate_list_offsets_shape(version: i16, body: &Bytes) -> Result<()> {
 ///
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
-pub fn validate_create_topics_shape(version: i16, body: &Bytes) -> Result<()> {
-    let mut c = ShapeCursor::new(body.clone());
+pub fn validate_create_topics_shape(
+    version: i16,
+    body: &Bytes,
+    max_frame_size: usize,
+) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 5;
 
     let topics_count = if flexible {
@@ -594,8 +670,8 @@ pub fn validate_create_topics_shape(version: i16, body: &Bytes) -> Result<()> {
 ///
 /// Returns an error when a declared array/string/bytes length cannot fit in the bytes remaining
 /// in the frame, or the body is truncated or malformed in a way that cannot be walked.
-pub fn validate_metadata_shape(version: i16, body: &Bytes) -> Result<()> {
-    let mut c = ShapeCursor::new(body.clone());
+pub fn validate_metadata_shape(version: i16, body: &Bytes, max_frame_size: usize) -> Result<()> {
+    let mut c = ShapeCursor::new(body.clone(), max_frame_size);
     let flexible = version >= 9;
 
     let topics_count = if flexible {
@@ -643,7 +719,11 @@ pub fn validate_api_versions_shape(version: i16, body: &Bytes) -> Result<()> {
     if version < 3 {
         return Ok(());
     }
-    let mut c = ShapeCursor::new(body.clone());
+    // No response-size guard needed: `encode_api_versions_response` takes only
+    // `(api_version, error_code)` - the decoded `client_software_name`/`_version` never reach
+    // the response, so nothing here can amplify. `usize::MAX` disables the (harmless but
+    // pointless) check rather than plumbing `max_frame_size` through for no effect.
+    let mut c = ShapeCursor::new(body.clone(), usize::MAX);
     c.compact_string(false)?;
     c.compact_string(false)?;
     c.tagged_fields()?;
@@ -654,24 +734,129 @@ pub fn validate_api_versions_shape(version: i16, body: &Bytes) -> Result<()> {
 mod tests {
     use super::*;
 
+    const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
     /// The two payloads reproduced in review, verbatim: both must be rejected before reaching
     /// `kafka_protocol`, not merely rejected eventually.
     #[test]
     fn create_topics_v5_huge_topics_count_rejected() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
-        assert!(validate_create_topics_shape(5, &body).is_err());
+        assert!(validate_create_topics_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]
     fn metadata_v0_huge_topics_count_rejected() {
         let body = Bytes::from_static(&[0x7F, 0xFF, 0xFF, 0xFF]);
-        assert!(validate_metadata_shape(0, &body).is_err());
+        assert!(validate_metadata_shape(0, &body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]
     fn metadata_v0_null_array_all_topics_accepted() {
         let body = Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF]); // -1: all topics
-        assert!(validate_metadata_shape(0, &body).is_ok());
+        assert!(validate_metadata_shape(0, &body, TEST_MAX_FRAME_SIZE).is_ok());
+    }
+
+    /// Reviewed POC: a 5-byte varint whose first byte is a 10-byte-reader-only artifact (`0x81`
+    /// followed by eight `0x80` continuation bytes then a `0x00` terminator) used to desync this
+    /// cursor from `kafka_protocol`'s actual 5-byte-max `UnsignedVarInt::decode` - this guard
+    /// would consume all 10 bytes as one (small) varint while the crate consumes only the first
+    /// 5, leaving the crate to read `FF FF FF FF 0F` (`u32::MAX`) as the real topics count a few
+    /// bytes later, an allocation the guard never saw coming because it was validating the wrong
+    /// bytes. `read_varint` now reads at most 5 bytes, exactly matching the crate, so this frame
+    /// must be rejected here - not accepted here and crash 5 bytes further into the real decode.
+    #[test]
+    fn produce_v9_desync_varint_poc_rejected() {
+        let body = Bytes::from_static(&[
+            0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x00, // 10-byte over-long varint
+            0x00, // acks high byte (never reached by the fixed reader)
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // u32::MAX topics count, 5-byte varint
+            0x01, 0x00,
+        ]);
+        assert!(validate_produce_shape(9, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Same desync class as `produce_v9_desync_varint_poc_rejected`, via `CreateTopics`'s own
+    /// `compact_string`/`compact_array_count` path.
+    #[test]
+    fn create_topics_v5_desync_varint_poc_rejected() {
+        let body = Bytes::from_static(&[
+            0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            0x00, // 10-byte over-long varint
+            0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // u32::MAX topics count, 5-byte varint
+        ]);
+        assert!(validate_create_topics_shape(5, &body, TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Reviewed POC (C2): 1 topic x 65,535 partitions was within the *old* 65,536 cumulative
+    /// budget - no single array count exceeded `MAX_COLLECTION_LEN`, only their product did -
+    /// and drove a 393 KB request to a 2.16 MB response built by one synchronous,
+    /// non-yielding call. Pins the fix: the same shape, sized to exceed the new 4,096 budget by
+    /// one, must be rejected by the cumulative element charge specifically - filler bytes are
+    /// present so the earlier "count exceeds remaining bytes" check can't short-circuit before
+    /// the budget check runs.
+    #[test]
+    fn element_budget_rejects_cumulative_amplification_poc() {
+        let mut body = Vec::new();
+        body.push(0x00); // compact null transactional_id
+        body.extend_from_slice(&1i16.to_be_bytes()); // acks
+        body.extend_from_slice(&1000i32.to_be_bytes()); // timeout_ms
+        body.push(0x02); // one topic (N+1=2)
+        body.push(0x02); // topic name length 1 (N+1=2)
+        body.push(b't');
+        // partitions count varint(4098) = 4097 partitions: one more than the whole request's
+        // remaining budget (4096 - 1 already charged for the topic = 4095).
+        body.extend_from_slice(&[0x82, 0x20]);
+        body.extend(std::iter::repeat_n(0u8, 4097)); // filler, not parsed as elements
+        assert!(validate_produce_shape(9, &Bytes::from(body), TEST_MAX_FRAME_SIZE).is_err());
+    }
+
+    /// Companion to the element-budget POC above: few elements (well within 4,096) but one
+    /// echoed string long enough alone to blow a small `max_frame_size` - the element-count
+    /// budget has nothing to say about this shape, only the response-size projection catches
+    /// it. Confirms the two guards are covering genuinely different amplification vectors, not
+    /// duplicating each other.
+    #[test]
+    fn response_size_guard_rejects_long_echoed_string_within_element_budget() {
+        let mut body = Vec::new();
+        body.push(0x02); // one topic (N+1=2)
+        let name_len = 2000usize;
+        body.extend_from_slice(&[0xD1, 0x0F]); // compact string length varint(2001) = 2000 bytes
+        body.extend(std::iter::repeat_n(b'x', name_len));
+        body.extend_from_slice(&3i32.to_be_bytes()); // num_partitions
+        body.extend_from_slice(&1i16.to_be_bytes()); // replication_factor
+        body.push(0x01); // empty assignments (N+1=1)
+        body.push(0x01); // empty configs (N+1=1)
+        body.push(0x00); // topic tagged fields (empty)
+        body.extend_from_slice(&5000i32.to_be_bytes()); // timeout_ms
+        body.push(0x01); // validate_only = true
+        body.push(0x00); // request tagged fields (empty)
+
+        let small_max_frame = 1000; // smaller than the 2,000-byte topic name alone
+        assert!(validate_create_topics_shape(5, &Bytes::from(body), small_max_frame).is_err());
+    }
+
+    /// `read_varint` must stop after exactly 5 bytes even when the 5th byte still has its
+    /// continuation bit set (`kafka_protocol`'s own behavior - see `read_varint`'s doc) rather
+    /// than erroring or reading further; the 6th+ bytes belong to whatever field comes next.
+    #[test]
+    fn read_varint_stops_at_five_bytes_matching_kafka_protocol() {
+        let mut c = ShapeCursor::new(
+            Bytes::from_static(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x2A]),
+            TEST_MAX_FRAME_SIZE,
+        );
+        let value = c
+            .read_varint()
+            .expect("5-byte varint with trailing continuation bit");
+        assert_eq!(
+            value, 0xFFFF_FFFF,
+            "must match kafka_protocol's own u32 truncation"
+        );
+        assert_eq!(
+            c.remaining(),
+            1,
+            "must consume exactly 5 bytes, leaving the 6th for the next field"
+        );
     }
 
     #[test]
@@ -681,7 +866,7 @@ mod tests {
         body.extend_from_slice(&1i16.to_be_bytes()); // acks
         body.extend_from_slice(&1000i32.to_be_bytes()); // timeout_ms
         body.extend_from_slice(&0i32.to_be_bytes()); // empty topics
-        assert!(validate_produce_shape(3, &Bytes::from(body)).is_ok());
+        assert!(validate_produce_shape(3, &Bytes::from(body), TEST_MAX_FRAME_SIZE).is_ok());
     }
 
     #[test]
@@ -693,7 +878,7 @@ mod tests {
         body.extend_from_slice(&1024i32.to_be_bytes()); // max_bytes (v3+)
         body.push(0); // isolation_level (v4+)
         body.extend_from_slice(&i32::MAX.to_be_bytes()); // topics count: impossible
-        assert!(validate_fetch_shape(4, &Bytes::from(body)).is_err());
+        assert!(validate_fetch_shape(4, &Bytes::from(body), TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]
@@ -706,7 +891,7 @@ mod tests {
         body.push(0xFF);
         body.push(0xFF);
         body.push(0x0F);
-        assert!(validate_list_offsets_shape(6, &Bytes::from(body)).is_err());
+        assert!(validate_list_offsets_shape(6, &Bytes::from(body), TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]

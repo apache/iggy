@@ -153,6 +153,12 @@ pub fn supported_api_ranges() -> &'static [ApiVersionRange] {
     SUPPORTED_RANGES
 }
 
+/// Default `max_frame_size` used by [`handle_request`] - the ~150 direct call sites across this
+/// crate's test suite that don't care about the response-size guard specifically. Production
+/// traffic goes through [`handle_request_bounded`] instead (see `server.rs`'s call site), with
+/// the connection's actual configured `max_frame_size`.
+const DEFAULT_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
 /// Handles one decoded request frame and returns how the connection should proceed.
 pub fn handle_request(
     api_key: i16,
@@ -160,10 +166,27 @@ pub fn handle_request(
     body: Bytes,
     broker: &BrokerAdvertise,
 ) -> HandleOutcome {
+    handle_request_bounded(api_key, api_version, body, broker, DEFAULT_MAX_FRAME_SIZE)
+}
+
+/// Same as [`handle_request`], but rejects a request whose declared array/string lengths project
+/// a response larger than `max_frame_size` before decoding it.
+///
+/// See [`crate::protocol::bounds_guard`]'s `MAX_REQUEST_ELEMENTS`/`RESPONSE_BYTES_PER_ELEMENT`
+/// docs for the CPU/memory amplification this closes (a request within the old element budget
+/// alone could still produce a multi-megabyte response from a single synchronous, non-yielding
+/// call).
+pub fn handle_request_bounded(
+    api_key: i16,
+    api_version: i16,
+    body: Bytes,
+    broker: &BrokerAdvertise,
+    max_frame_size: usize,
+) -> HandleOutcome {
     if api_key == API_KEY_PRODUCE {
-        return handle_produce_request(api_version, body);
+        return handle_produce_request(api_version, body, max_frame_size);
     }
-    handle_other_request(api_key, api_version, body, broker)
+    handle_other_request(api_key, api_version, body, broker, max_frame_size)
 }
 
 /// Decode `T` from the whole request body and reject unconsumed trailing bytes.
@@ -218,7 +241,7 @@ fn respond_or_close(result: Result<Bytes>, api_name: &str) -> HandleOutcome {
 /// spec-compliant client can legitimately send Produce v0-2 with `acks=0`. Rejecting those
 /// versions before reading `acks` would send an error response the client never expects,
 /// desyncing the next correlation id it reads.
-fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
+fn handle_produce_request(api_version: i16, body: Bytes, max_frame_size: usize) -> HandleOutcome {
     // Above the encoder max there is no response parseable at the client's version, so close
     // rather than decode (same policy the other APIs apply). Fail-closed on a missing row
     // (i16::MIN, not i16::MAX): `handle_request` dispatches Produce on a hard-coded `api_key ==`
@@ -247,7 +270,9 @@ fn handle_produce_request(api_version: i16, body: Bytes) -> HandleOutcome {
             }),
         };
     }
-    match decode_guarded::<ProduceRequest>(api_version, body, validate_produce_shape) {
+    match decode_guarded::<ProduceRequest>(api_version, body, |v, b| {
+        validate_produce_shape(v, b, max_frame_size)
+    }) {
         // acks=0 is fire-and-forget: the client isn't reading a response, so
         // sending one desyncs the next correlation id it expects.
         Ok(req) if req.acks == 0 => HandleOutcome::NoResponse,
@@ -277,15 +302,20 @@ fn handle_other_request(
     api_version: i16,
     body: Bytes,
     broker: &BrokerAdvertise,
+    max_frame_size: usize,
 ) -> HandleOutcome {
     match api_key {
         API_KEY_API_VERSIONS => handle_api_versions(api_version, body),
-        API_KEY_METADATA => handle_metadata(api_version, body, broker),
+        API_KEY_METADATA => handle_metadata(api_version, body, broker, max_frame_size),
         API_KEY_FETCH => handle_versioned_request(
             API_KEY_FETCH,
             api_version,
             body,
-            |v, b| decode_guarded::<FetchRequest>(v, b, validate_fetch_shape),
+            |v, b| {
+                decode_guarded::<FetchRequest>(v, b, |v, b| {
+                    validate_fetch_shape(v, b, max_frame_size)
+                })
+            },
             encode_fetch_response,
             encode_fetch_error_response,
             "Fetch",
@@ -294,7 +324,11 @@ fn handle_other_request(
             API_KEY_LIST_OFFSETS,
             api_version,
             body,
-            |v, b| decode_guarded::<ListOffsetsRequest>(v, b, validate_list_offsets_shape),
+            |v, b| {
+                decode_guarded::<ListOffsetsRequest>(v, b, |v, b| {
+                    validate_list_offsets_shape(v, b, max_frame_size)
+                })
+            },
             encode_list_offsets_response,
             encode_list_offsets_error_response,
             "ListOffsets",
@@ -303,7 +337,11 @@ fn handle_other_request(
             API_KEY_CREATE_TOPICS,
             api_version,
             body,
-            |v, b| decode_guarded::<CreateTopicsRequest>(v, b, validate_create_topics_shape),
+            |v, b| {
+                decode_guarded::<CreateTopicsRequest>(v, b, |v, b| {
+                    validate_create_topics_shape(v, b, max_frame_size)
+                })
+            },
             encode_create_topics_response,
             encode_create_topics_error_response,
             "CreateTopics",
@@ -339,7 +377,12 @@ fn handle_api_versions(api_version: i16, body: Bytes) -> HandleOutcome {
     }
 }
 
-fn handle_metadata(api_version: i16, body: Bytes, broker: &BrokerAdvertise) -> HandleOutcome {
+fn handle_metadata(
+    api_version: i16,
+    body: Bytes,
+    broker: &BrokerAdvertise,
+    max_frame_size: usize,
+) -> HandleOutcome {
     if !is_supported_version(API_KEY_METADATA, api_version) {
         // Clamping the response to the supported max leaves a body the client parses at its own
         // (unsupported) version, so UNSUPPORTED_VERSION never survives. Clients that skip
@@ -351,7 +394,7 @@ fn handle_metadata(api_version: i16, body: Bytes, broker: &BrokerAdvertise) -> H
         );
         return HandleOutcome::Close;
     }
-    match decode_metadata_topics(api_version, body) {
+    match decode_metadata_topics(api_version, body, max_frame_size) {
         Ok(topics) => respond_or_close(
             encode_metadata_response(api_version, &topics, broker, ERROR_NONE),
             "Metadata",
@@ -516,8 +559,14 @@ fn encode_metadata_response(
 /// A null topics array (`-1` legacy / `varint=0` compact) means "all topics" and decodes to an
 /// empty list for this stub. A null per-topic `name` (v10+ allows topic-id-only lookups) has no
 /// name to echo, so it errors rather than silently dropping the topic from the response.
-fn decode_metadata_topics(api_version: i16, body: Bytes) -> Result<Vec<StrBytes>> {
-    let req = decode_guarded::<MetadataRequest>(api_version, body, validate_metadata_shape)?;
+fn decode_metadata_topics(
+    api_version: i16,
+    body: Bytes,
+    max_frame_size: usize,
+) -> Result<Vec<StrBytes>> {
+    let req = decode_guarded::<MetadataRequest>(api_version, body, |v, b| {
+        validate_metadata_shape(v, b, max_frame_size)
+    })?;
     req.topics
         .unwrap_or_default()
         .into_iter()
@@ -534,13 +583,15 @@ fn decode_metadata_topics(api_version: i16, body: Bytes) -> Result<Vec<StrBytes>
 mod tests {
     use super::*;
 
+    const TEST_MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
+
     #[test]
     fn decode_metadata_topics_legacy_null_topic_name_fails() {
         let body = Bytes::from_static(&[
             0x00, 0x00, 0x00, 0x01, // one topic
             0xff, 0xff, // null topic name
         ]);
-        let err = decode_metadata_topics(0, body).unwrap_err();
+        let err = decode_metadata_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap_err();
         assert!(matches!(err, KafkaProtocolError::NullTopicName));
     }
 
@@ -549,20 +600,20 @@ mod tests {
         // -1 is the spec-defined "all topics" sentinel for the legacy i32 array count, not a
         // malformed request - must decode to an empty list.
         let body = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]); // -1
-        let topics = decode_metadata_topics(0, body).unwrap();
+        let topics = decode_metadata_topics(0, body, TEST_MAX_FRAME_SIZE).unwrap();
         assert!(topics.is_empty());
     }
 
     #[test]
     fn decode_metadata_topics_empty_body_is_malformed() {
-        assert!(decode_metadata_topics(0, Bytes::new()).is_err());
+        assert!(decode_metadata_topics(0, Bytes::new(), TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]
     fn decode_metadata_topics_flexible_truncated_after_topics_fails() {
         // topics = null (all topics) but missing allow_auto / auth flags / tagged fields.
         let body = Bytes::from_static(&[0x00]);
-        assert!(decode_metadata_topics(9, body).is_err());
+        assert!(decode_metadata_topics(9, body, TEST_MAX_FRAME_SIZE).is_err());
     }
 
     #[test]

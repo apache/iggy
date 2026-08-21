@@ -62,21 +62,26 @@ impl Decoder {
     }
 
     /// Unsigned varint (Kafka uses this for compact array lengths and tagged-field counts).
+    /// Byte-for-byte the same algorithm `kafka_protocol`'s `UnsignedVarInt::decode` uses
+    /// (`kafka-protocol-0.17.0/src/protocol/types.rs:119-130`), not a generic LEB128 reader:
+    /// exactly 5 bytes, `u32` arithmetic, no error if the 5th byte still has its continuation bit
+    /// set. A general 10-byte/64-bit reader here would decode a real gateway response
+    /// identically (the crate's own encoder always terminates within 5 bytes for a real `u32`),
+    /// but would silently disagree with the crate on any hand-built adversarial payload with a
+    /// 6th+ continuation byte - exactly the shape `protocol/bounds_guard.rs`'s own `read_varint`
+    /// needed this same fix for, and the reason to keep this decoder byte-exact with the crate
+    /// even where it happens not to matter for well-formed input.
     pub fn read_varint(&mut self) -> Result<u64> {
-        let mut result: u64 = 0;
-        let mut shift = 0u32;
-        loop {
+        let mut value: u32 = 0;
+        for i in 0..5 {
             self.ensure(1)?;
             let byte = self.bytes.get_u8();
-            result |= u64::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err("varint overflows 64 bits".into());
+            value |= u32::from(byte & 0x7F) << (i * 7);
+            if byte < 0x80 {
+                break;
             }
         }
+        Ok(u64::from(value))
     }
 
     /// Legacy nullable string: i16 length prefix (-1 = null).

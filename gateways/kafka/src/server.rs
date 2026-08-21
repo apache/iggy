@@ -32,7 +32,9 @@ use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 
 use crate::error::{KafkaProtocolError, Result};
-use crate::protocol::api::{BrokerAdvertise, DEFAULT_KAFKA_PORT, HandleOutcome, handle_request};
+use crate::protocol::api::{
+    BrokerAdvertise, DEFAULT_KAFKA_PORT, HandleOutcome, handle_request_bounded,
+};
 use crate::protocol::header::{request_header_version, response_header_version};
 use std::io;
 
@@ -348,7 +350,13 @@ async fn handle_connection(
 
         // `RequestHeader::decode` advances `body` past the header fields it consumed via
         // `Buf::advance`, so `body` is already exactly the request payload.
-        let outcome = handle_request(req.request_api_key, req.request_api_version, body, &broker);
+        let outcome = handle_request_bounded(
+            req.request_api_key,
+            req.request_api_version,
+            body,
+            &broker,
+            config.max_frame_size,
+        );
         if dispatch_outcome(&mut stream, &peer, &config, &req, resp_hdr_ver, outcome).await? {
             return Ok(());
         }

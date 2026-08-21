@@ -287,14 +287,26 @@ runs:
         if grep -q 'package(iggy-gateway-kafka)' <<< "$NEXTEST_FILTER"; then
           NEEDS_KAFKA_FIXTURES=true
         elif [[ -z "$NEXTEST_FILTER" ]]; then
-          if git diff --name-only origin/master...HEAD 2>/dev/null | grep -qE '^gateways/'; then
-            NEEDS_KAFKA_FIXTURES=true
-          elif ! git rev-parse --verify origin/master >/dev/null 2>&1; then
-            # Base ref unavailable: full suite still runs gateway tests — generate safely.
-            NEEDS_KAFKA_FIXTURES=true
-            echo "::notice::origin/master unavailable; generating Kafka fixtures for full suite"
+          # `2>&1` into a variable, not `2>/dev/null` piped straight to grep: the old form
+          # silenced *any* git failure (e.g. a shallow checkout with no merge-base history for
+          # origin/master) into empty output, which `grep -q` then reads identically to "diff
+          # succeeded, no gateways/ changes" - so a broken diff and a clean diff produced the
+          # same "skip fixtures" outcome. Confirmed in CI run 32256598833: gateways/-only PR,
+          # full-workspace lane, fixtures silently skipped, KAFKA_FIXTURES_REQUIRED never set -
+          # every fixture-backed test quietly passed by skipping all its assertions instead of
+          # running them (0.005s for a test meant to decode 9 real fixtures).
+          if DIFF_OUTPUT=$(git diff --name-only origin/master...HEAD 2>&1); then
+            if grep -qE '^gateways/' <<< "$DIFF_OUTPUT"; then
+              NEEDS_KAFKA_FIXTURES=true
+            else
+              echo "::notice::Skipping Kafka wire fixtures (full suite, gateways/** unchanged)"
+            fi
           else
-            echo "::notice::Skipping Kafka wire fixtures (full suite, gateways/** unchanged)"
+            # Diff itself failed - NOT the same as "no gateways/ changes". Generate
+            # unconditionally as the fail-safe default; this is the case the bug above collapsed
+            # into a silent skip.
+            NEEDS_KAFKA_FIXTURES=true
+            echo "::warning::git diff origin/master...HEAD failed (${DIFF_OUTPUT}); generating Kafka fixtures unconditionally as a fail-safe"
           fi
         fi
         if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then

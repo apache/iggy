@@ -395,6 +395,34 @@ fn list_offsets_v0_with_topic_closes_connection() {
 
 // ── Comprehensive scoped-API coverage (correlation id, boundary versions) ──
 
+/// `kafka-message-gen`'s own `API_REGISTRY` floor for each key - the earliest version
+/// `ci-wire-fixtures.sh generate` can ever produce a `.bin` fixture for (it asks for every
+/// version the tool's registry knows, never a specific one - see the tool's `API_REGISTRY`).
+/// `SCOPED_API_KEYS`' firewall floors happen to equal these today, so the only versions ever
+/// queried below them are the deliberately out-of-range ones the below-min-version boundary
+/// tests construct (`min_ver - 1`) - a fixture for those can never exist, by construction, not
+/// because generation failed.
+const FIXTURE_GENERATABLE_FLOOR: &[(i16, i16)] = &[
+    (API_KEY_PRODUCE, 3),
+    (API_KEY_FETCH, 4),
+    (API_KEY_LIST_OFFSETS, 1),
+];
+
+/// Whether a `.bin` fixture could plausibly exist for `(api_key, version)` - `false` only for
+/// the below-floor case above, where `KAFKA_FIXTURES_REQUIRED=1` must not panic on an absence
+/// that isn't a broken CI step. Callers still call `load_fixture_body_or_skip` (not a bare
+/// `fixture_exists`/`load_fixture_body`) whenever this returns `true`, so a genuinely broken
+/// generation step for an in-range version is still caught - see
+/// `apiversions_advertises_exact_supported_ranges_v1`'s doc for why `supported_api_ranges()`
+/// itself is never the source of truth to compare against; `FIXTURE_GENERATABLE_FLOOR` is
+/// independent of it for the same reason.
+fn fixture_may_exist(api_key: i16, version: i16) -> bool {
+    FIXTURE_GENERATABLE_FLOOR
+        .iter()
+        .find(|(k, _)| *k == api_key)
+        .is_none_or(|(_, floor)| version >= *floor)
+}
+
 fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes {
     match api_key {
         API_KEY_METADATA => {
@@ -413,25 +441,63 @@ fn request_body_for_scoped_api(api_key: i16, name: &str, version: i16) -> Bytes 
         }
         API_KEY_PRODUCE => {
             // `_or_skip` (not bare `load_fixture_body`) so `KAFKA_FIXTURES_REQUIRED=1` panics on
-            // a missing fixture instead of this falling through to a synthetic body and CI
-            // silently never exercising the real generated fixture.
-            load_fixture_body_or_skip(api_key, name, version).unwrap_or_else(|| {
-                if version >= 9 {
-                    build_produce_flexible_body(1, 0)
-                } else if version >= 3 {
-                    build_produce_v3_body(1, 0)
-                } else {
-                    build_produce_v2_body(1, 0)
-                }
-            })
+            // a missing in-range fixture instead of this falling through to a synthetic body and
+            // CI silently never exercising the real generated fixture. Gated on
+            // `fixture_may_exist` first: below `kafka-message-gen`'s own floor, no fixture can
+            // ever exist, and treating that absence as a required-fixture failure would turn the
+            // below-min-version boundary tests red for a reason that has nothing to do with a
+            // broken generation step.
+            fixture_may_exist(api_key, version)
+                .then(|| load_fixture_body_or_skip(api_key, name, version))
+                .flatten()
+                .unwrap_or_else(|| {
+                    if version >= 9 {
+                        build_produce_flexible_body(1, 0)
+                    } else if version >= 3 {
+                        build_produce_v3_body(1, 0)
+                    } else {
+                        build_produce_v2_body(1, 0)
+                    }
+                })
         }
-        API_KEY_FETCH => load_fixture_body_or_skip(api_key, name, version)
+        API_KEY_FETCH => fixture_may_exist(api_key, version)
+            .then(|| load_fixture_body_or_skip(api_key, name, version))
+            .flatten()
             .unwrap_or_else(|| build_fetch_empty_topics_request(version)),
-        API_KEY_LIST_OFFSETS => load_fixture_body_or_skip(api_key, name, version)
+        API_KEY_LIST_OFFSETS => fixture_may_exist(api_key, version)
+            .then(|| load_fixture_body_or_skip(api_key, name, version))
+            .flatten()
             .unwrap_or_else(|| build_list_offsets_request(version, "scope-topic", 0)),
         API_KEY_CREATE_TOPICS => build_create_topics_empty_request(version),
         _ => Bytes::new(),
     }
+}
+
+/// The below-min-version boundary tests query `SCOPED_API_KEYS`' `min_ver - 1` for every scoped
+/// key. For Produce/Fetch/ListOffsets that's exactly one below `FIXTURE_GENERATABLE_FLOOR`
+/// (firewall floor == fixture floor for these three today) - pins that `fixture_may_exist`
+/// correctly says "no" there, not just at arbitrarily chosen values, so `KAFKA_FIXTURES_REQUIRED
+/// =1` can't panic on the below-min-version boundary tests.
+#[test]
+fn fixture_may_exist_false_only_below_generatable_floor() {
+    for &(api_key, _, min_ver, _) in SCOPED_API_KEYS {
+        if api_key == API_KEY_PRODUCE || api_key == API_KEY_FETCH || api_key == API_KEY_LIST_OFFSETS
+        {
+            assert!(
+                !fixture_may_exist(api_key, min_ver - 1),
+                "api_key {api_key} v{} (min_ver - 1) must report no fixture possible",
+                min_ver - 1
+            );
+        }
+        assert!(
+            fixture_may_exist(api_key, min_ver),
+            "api_key {api_key} v{min_ver} (the firewall's own min) must report a fixture is possible"
+        );
+    }
+    // Keys with no `FIXTURE_GENERATABLE_FLOOR` entry (Metadata, ApiVersions, CreateTopics) never
+    // gate on this at all - always "may exist" regardless of version.
+    assert!(fixture_may_exist(API_KEY_METADATA, -1));
+    assert!(fixture_may_exist(API_KEY_CREATE_TOPICS, 0));
 }
 
 #[tokio::test]
