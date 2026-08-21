@@ -11,7 +11,7 @@ Every instance of this plugin shares one listener, so a single port can serve ma
 Loss windows, explicitly:
 
 1. **Process crash** between HTTP 200 and the producer send. Buffered messages are volatile.
-2. **Producer failure.** The runtime's `source_forwarding_loop` logs `producer.send()` errors and continues; there is no feedback channel back to the HTTP handler. This is structural in the current poll-based SDK, not a defect in this connector.
+2. **Producer failure.** Narrowed by #3855, which gave sources a delivery result: the runtime NACKs a batch it could not send, or whose state it could not persist, and this connector holds that batch and replays it on the next `poll()` instead of dropping it. Nothing is ever abandoned, because a 200 already told the sender this gateway owns the event, and the only honest way to shed load is the 429 the handlers return once the bridge fills. What remains is the SDK's circuit breaker: it stops a source after five consecutive NACKs, roughly 1.5s of backoff plus five send rounds, so a broker outage longer than that stops the poll task with up to `buffer_capacity` accepted messages still in the bridge.
 3. **Shutdown.** Narrowed by #3321, which closes the plugin before tearing down the forwarding channel so in-flight batches drain. Messages still in the bridge when the poll task stops are lost; the connector logs the count and increments `http_source_dropped_on_close_total`.
 
 What mitigates this in practice is the caller: webhook senders such as GitHub, Stripe, and Twilio retry on timeout and 5xx, so the sender side is at-least-once up to the moment this connector returns 200. The connector's job is to make the post-200 window as small and as observable as possible.
