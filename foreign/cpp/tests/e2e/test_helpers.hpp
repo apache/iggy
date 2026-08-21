@@ -118,7 +118,7 @@ class E2ETestFixture : public ::testing::Test {
 
     iggy::ffi::Client *GetLoggedOutClient() {
         iggy::ffi::Client *client = nullptr;
-        EXPECT_NO_THROW({ client = iggy::ffi::new_connection(""); });
+        EXPECT_NO_THROW({ client = iggy::ffi::new_connection({}); });
         EXPECT_NE(client, nullptr);
         if (client == nullptr) {
             return nullptr;
@@ -140,10 +140,15 @@ class E2ETestFixture : public ::testing::Test {
         return client;
     }
 
-    std::string GetRandomName() {
+    std::string GetRandomName(const std::size_t max_length = 255) {
+        if (max_length == 0) {
+            return {};
+        }
+
         static constexpr char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         static thread_local std::mt19937 generator(std::random_device{}());
-        std::uniform_int_distribution<std::size_t> length_distribution(8, 255);
+        const std::size_t min_length = std::min<std::size_t>(8, max_length);
+        std::uniform_int_distribution<std::size_t> length_distribution(min_length, max_length);
         std::uniform_int_distribution<std::size_t> distribution(0, sizeof(alphabet) - 2);
         const std::size_t length = length_distribution(generator);
 
@@ -155,6 +160,28 @@ class E2ETestFixture : public ::testing::Test {
         }
 
         return name;
+    }
+
+    iggy::ffi::UserInfoDetails CreateUser(iggy::ffi::Client *client,
+                                          const std::string &username,
+                                          const std::string &password,
+                                          const iggy::ffi::UserStatus status,
+                                          const bool has_permissions         = false,
+                                          iggy::ffi::Permissions permissions = {}) {
+        auto user = client->create_user(username, password, status, has_permissions, std::move(permissions));
+        tracked_user_names_.push_back(username);
+        return user;
+    }
+
+    void ForgetUser(const std::string &username) {
+        tracked_user_names_.erase(std::remove(tracked_user_names_.begin(), tracked_user_names_.end(), username),
+                                  tracked_user_names_.end());
+    }
+
+    void RenameTrackedUser(const std::string &from, const std::string &to) {
+        const auto tracked_user = std::find(tracked_user_names_.begin(), tracked_user_names_.end(), from);
+        ASSERT_NE(tracked_user, tracked_user_names_.end());
+        *tracked_user = to;
     }
 
     void TrackStream(const std::string &stream_name) { tracked_stream_names_.push_back(stream_name); }
@@ -199,13 +226,14 @@ class E2ETestFixture : public ::testing::Test {
         iggy::ffi::Client *client_to_delete = client;
         client                              = nullptr;
         ForgetClient(client_to_delete);
-        EXPECT_NO_THROW(iggy::ffi::delete_client(client_to_delete));
+        iggy::ffi::delete_client(client_to_delete);
     }
 
     void Cleanup() {
         CleanupConsumerGroups();
         CleanupStreams();
         CleanupClients();
+        CleanupUsers();
     }
 
   private:
@@ -213,6 +241,7 @@ class E2ETestFixture : public ::testing::Test {
         CleanupConsumerGroupsBestEffort();
         CleanupStreamsBestEffort();
         CleanupClientsBestEffort();
+        CleanupUsersBestEffort();
     }
 
     void ForgetClient(iggy::ffi::Client *client) {
@@ -222,13 +251,56 @@ class E2ETestFixture : public ::testing::Test {
         }
     }
 
+    void CleanupUsers() {
+        if (tracked_user_names_.empty()) {
+            return;
+        }
+
+        iggy::ffi::Client *cleanup_client = nullptr;
+        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection({}); });
+        EXPECT_NE(cleanup_client, nullptr);
+        if (cleanup_client != nullptr) {
+            EXPECT_NO_THROW(cleanup_client->connect());
+            EXPECT_NO_THROW(cleanup_client->login_user("iggy", "iggy"));
+            for (const auto &username : tracked_user_names_) {
+                EXPECT_NO_THROW(cleanup_client->delete_user(make_string_identifier(username)));
+            }
+            iggy::ffi::delete_client(cleanup_client);
+        }
+
+        tracked_user_names_.clear();
+    }
+
+    void CleanupUsersBestEffort() noexcept {
+        if (tracked_user_names_.empty()) {
+            return;
+        }
+
+        iggy::ffi::Client *cleanup_client = nullptr;
+        try {
+            cleanup_client = iggy::ffi::new_connection({});
+            if (cleanup_client != nullptr) {
+                cleanup_client->connect();
+                cleanup_client->login_user("iggy", "iggy");
+                for (const auto &username : tracked_user_names_) {
+                    cleanup_client->delete_user(make_string_identifier(username));
+                }
+            }
+        } catch (...) {
+        }
+
+        iggy::ffi::delete_client(cleanup_client);
+
+        tracked_user_names_.clear();
+    }
+
     void CleanupStreams() {
         if (tracked_stream_names_.empty() && tracked_stream_ids_.empty()) {
             return;
         }
 
         iggy::ffi::Client *cleanup_client = nullptr;
-        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
+        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection({}); });
         EXPECT_NE(cleanup_client, nullptr);
         if (cleanup_client != nullptr) {
             EXPECT_NO_THROW(cleanup_client->connect());
@@ -239,7 +311,7 @@ class E2ETestFixture : public ::testing::Test {
             for (const auto stream_id : tracked_stream_ids_) {
                 EXPECT_NO_THROW(cleanup_client->delete_stream(make_numeric_identifier(stream_id)));
             }
-            EXPECT_NO_THROW(iggy::ffi::delete_client(cleanup_client));
+            iggy::ffi::delete_client(cleanup_client);
         }
 
         tracked_stream_names_.clear();
@@ -252,7 +324,7 @@ class E2ETestFixture : public ::testing::Test {
         }
 
         iggy::ffi::Client *cleanup_client = nullptr;
-        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection(""); });
+        EXPECT_NO_THROW({ cleanup_client = iggy::ffi::new_connection({}); });
         EXPECT_NE(cleanup_client, nullptr);
         if (cleanup_client != nullptr) {
             EXPECT_NO_THROW(cleanup_client->connect());
@@ -262,7 +334,7 @@ class E2ETestFixture : public ::testing::Test {
                                                                       make_string_identifier(group.topic_name),
                                                                       make_string_identifier(group.group_name)));
             }
-            EXPECT_NO_THROW(iggy::ffi::delete_client(cleanup_client));
+            iggy::ffi::delete_client(cleanup_client);
         }
 
         tracked_consumer_groups_.clear();
@@ -275,7 +347,7 @@ class E2ETestFixture : public ::testing::Test {
 
         iggy::ffi::Client *cleanup_client = nullptr;
         try {
-            cleanup_client = iggy::ffi::new_connection("");
+            cleanup_client = iggy::ffi::new_connection({});
             if (cleanup_client != nullptr) {
                 cleanup_client->connect();
                 cleanup_client->login_user("iggy", "iggy");
@@ -289,12 +361,7 @@ class E2ETestFixture : public ::testing::Test {
         } catch (...) {
         }
 
-        if (cleanup_client != nullptr) {
-            try {
-                iggy::ffi::delete_client(cleanup_client);
-            } catch (...) {
-            }
-        }
+        iggy::ffi::delete_client(cleanup_client);
 
         tracked_stream_names_.clear();
         tracked_stream_ids_.clear();
@@ -307,7 +374,7 @@ class E2ETestFixture : public ::testing::Test {
 
         iggy::ffi::Client *cleanup_client = nullptr;
         try {
-            cleanup_client = iggy::ffi::new_connection("");
+            cleanup_client = iggy::ffi::new_connection({});
             if (cleanup_client != nullptr) {
                 cleanup_client->connect();
                 cleanup_client->login_user("iggy", "iggy");
@@ -320,12 +387,7 @@ class E2ETestFixture : public ::testing::Test {
         } catch (...) {
         }
 
-        if (cleanup_client != nullptr) {
-            try {
-                iggy::ffi::delete_client(cleanup_client);
-            } catch (...) {
-            }
-        }
+        iggy::ffi::delete_client(cleanup_client);
 
         tracked_consumer_groups_.clear();
     }
@@ -334,7 +396,7 @@ class E2ETestFixture : public ::testing::Test {
         for (iggy::ffi::Client *&client : clients_) {
             iggy::ffi::Client *client_to_delete = client;
             client                              = nullptr;
-            EXPECT_NO_THROW(iggy::ffi::delete_client(client_to_delete));
+            iggy::ffi::delete_client(client_to_delete);
         }
         clients_.clear();
     }
@@ -343,15 +405,14 @@ class E2ETestFixture : public ::testing::Test {
         for (iggy::ffi::Client *&client : clients_) {
             iggy::ffi::Client *client_to_delete = client;
             client                              = nullptr;
-            try {
-                iggy::ffi::delete_client(client_to_delete);
-            } catch (...) {
-            }
+            iggy::ffi::delete_client(client_to_delete);
         }
         clients_.clear();
     }
 
+  private:
     std::vector<iggy::ffi::Client *> clients_;
+    std::vector<std::string> tracked_user_names_;
     std::vector<std::string> tracked_stream_names_;
     std::vector<std::uint32_t> tracked_stream_ids_;
     std::vector<TrackedConsumerGroup> tracked_consumer_groups_;
