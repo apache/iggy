@@ -18,8 +18,9 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::personal_access_tokens_from_wire;
 use crate::{
-    BinaryClient, ClientState, DiagnosticEvent, IdentityInfo, IggyError, PersonalAccessTokenClient,
-    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, RawPersonalAccessToken,
+    BinaryClient, ClientState, Credentials, DiagnosticEvent, IdentityInfo, IggyError,
+    PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
+    RawPersonalAccessToken,
 };
 use iggy_binary_protocol::MAX_WIRE_NAME_LENGTH;
 use iggy_binary_protocol::WireName;
@@ -134,6 +135,10 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
             "authenticated against iggy server"
         );
         self.set_state(ClientState::Authenticated).await;
+        self.remember_session_credentials(Credentials::PersonalAccessToken(SecretString::from(
+            token.to_string(),
+        )))
+        .await;
         self.publish_event(DiagnosticEvent::SignedIn).await;
         Ok(IdentityInfo {
             user_id: wire_resp.user_id,

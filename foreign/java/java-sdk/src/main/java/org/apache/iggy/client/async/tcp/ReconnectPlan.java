@@ -23,6 +23,7 @@ import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.config.RetryPolicy;
 
 import java.time.Duration;
+import java.util.List;
 
 /**
  * Pure redial planning: which address to dial on a given reconnect attempt
@@ -33,16 +34,18 @@ final class ReconnectPlan {
     private ReconnectPlan() {}
 
     /**
-     * Alternates reconnect dials between the current endpoint and the
-     * configured seed. After a leader redirect the current endpoint may die
-     * with the leader, and the seed is the way back to the rest of the
-     * cluster. Attempts are 1-based; odd attempts dial the current endpoint.
+     * Rotates reconnect dials through every endpoint the client knows, in the
+     * order the candidate list gives them. After a leader redirect the current
+     * endpoint may die with the leader, and the rest of the list -- the
+     * configured seed and the roster learned while connected -- is the way
+     * back to the rest of the cluster. Attempts are 1-based; the first dials
+     * the head of the list.
      */
-    static ConnectionInfo target(ConnectionInfo current, ConnectionInfo seed, int attempt) {
-        if (current.equals(seed)) {
-            return current;
+    static ConnectionInfo target(List<ConnectionInfo> candidates, int attempt) {
+        if (candidates.isEmpty()) {
+            throw new IllegalArgumentException("a redial needs at least one candidate endpoint");
         }
-        return attempt % 2 == 1 ? current : seed;
+        return candidates.get(Math.floorMod(attempt - 1, candidates.size()));
     }
 
     /**

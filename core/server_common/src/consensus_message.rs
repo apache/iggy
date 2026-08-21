@@ -242,7 +242,7 @@ where
 
         let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
         let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<T>(bytes))?;
         // Before `validate`: a header that did not survive the link intact cannot
         // have any of its fields believed, and `validate` reads them.
         typed.verify_frame()?;
@@ -281,7 +281,7 @@ where
 
         let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
         let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<T>(bytes))?;
         // Before `validate`: a header that did not survive the link intact cannot
         // have any of its fields believed, and `validate` reads them.
         typed.verify_frame()?;
@@ -477,7 +477,7 @@ where
         }
 
         let header = bytemuck::checked::try_from_bytes::<H>(&bytes[..size_of::<H>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<H>(bytes))?;
         header.validate()?;
 
         // `size` is the whole-frame length and must at least span the header, or
@@ -524,7 +524,7 @@ where
         }
 
         let header = bytemuck::checked::try_from_bytes::<H>(&first.as_slice()[..size_of::<H>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<H>(first.as_slice()))?;
         header.validate()?;
 
         // See `TryFrom<Owned>`: `size` must at least span the header so a
@@ -772,6 +772,25 @@ impl MessageBag {
             Self::ForwardLogoutResult(message) => message.header().operation(),
         }
     }
+}
+
+/// Why `H`'s header bytes failed bytemuck's checked cast.
+///
+/// An operation discriminant this build does not define means the sender runs a
+/// newer release; the frame is wire-valid and the node needs upgrading, which is
+/// a different operator action from the corrupted-header case. bytemuck reports
+/// both as one error, so the operation byte is probed here to separate them.
+fn classify_failed_cast<H>(bytes: &[u8]) -> ConsensusError
+where
+    H: ConsensusHeader,
+{
+    if let Some(offset) = H::OPERATION_OFFSET
+        && let Some(&code) = bytes.get(offset)
+        && !Operation::is_known_code(code)
+    {
+        return ConsensusError::UnsupportedOperation { operation: code };
+    }
+    ConsensusError::InvalidBitPattern
 }
 
 impl<T> TryFrom<Message<T>> for MessageBag

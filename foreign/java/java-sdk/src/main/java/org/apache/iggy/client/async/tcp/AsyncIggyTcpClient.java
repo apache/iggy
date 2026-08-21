@@ -49,6 +49,8 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -58,6 +60,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 /**
  * Async TCP client for Apache Iggy message streaming, built on Netty.
@@ -129,10 +132,38 @@ public class AsyncIggyTcpClient {
     private final Optional<File> tlsCertificate;
     private final TcpConnectionPoolConfig poolConfig;
     private final ClientRoutingState routingState = new ClientRoutingState();
+    private final LoginRoutingHook loginRoutingHook = new LoginRoutingHook() {
+
+        @Override
+        public CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt) {
+            return AsyncIggyTcpClient.this.loginOnLeader(loginAttempt);
+        }
+
+        @Override
+        public void forgetLogin() {
+            rememberedLogin = null;
+        }
+    };
     private final AtomicReference<AsyncTcpConnection> connection = new AtomicReference<>();
     private final AtomicReference<CompletableFuture<Void>> loginChain =
             new AtomicReference<>(CompletableFuture.completedFuture(null));
     private volatile ConnectionInfo connectionInfo;
+    /**
+     * Every node the roster named on the last leader check, kept as redial
+     * candidates. A node dies together with its address, and the roster is
+     * unreachable exactly when it is needed, so it has to have been
+     * remembered while the connection was still healthy.
+     */
+    private volatile List<ConnectionInfo> rosterTargets = List.of();
+    /**
+     * The login a successful sign-in ran, replayed after a redial so the
+     * session is re-established on whichever node answers. The supplier
+     * already carries the credentials it signed in with, so nothing new is
+     * stored. Cleared on an explicit sign-out, which leaves no session to
+     * restore.
+     */
+    private volatile Supplier<CompletableFuture<IdentityInfo>> rememberedLogin;
+
     private volatile boolean closed;
     private MessagesClient messagesClient;
     private ConsumerGroupsClient consumerGroupsClient;
@@ -235,9 +266,9 @@ public class AsyncIggyTcpClient {
             consumerOffsetsClient = new ConsumerOffsetsTcpClient(currentConnection);
             streamsClient = new StreamsTcpClient(currentConnection);
             topicsClient = new TopicsTcpClient(currentConnection);
-            usersClient = new UsersTcpClient(currentConnection, this::loginOnLeader);
+            usersClient = new UsersTcpClient(currentConnection, loginRoutingHook);
             systemClient = new SystemTcpClient(currentConnection);
-            personalAccessTokensClient = new PersonalAccessTokensTcpClient(currentConnection, this::loginOnLeader);
+            personalAccessTokensClient = new PersonalAccessTokensTcpClient(currentConnection, loginRoutingHook);
             partitionsClient = new PartitionsTcpClient(currentConnection);
         });
     }
@@ -585,7 +616,7 @@ public class AsyncIggyTcpClient {
             log.error("Redial gave up after {} attempts, next request will fail fast", policy.getMaxRetries());
             return CompletableFuture.completedFuture(null);
         }
-        ConnectionInfo target = ReconnectPlan.target(connectionInfo, seedConnectionInfo, attempt);
+        ConnectionInfo target = ReconnectPlan.target(redialCandidates(), attempt);
         Duration delay = ReconnectPlan.delay(policy, attempt);
         Executor delayedExecutor = CompletableFuture.delayedExecutor(delay.toMillis(), TimeUnit.MILLISECONDS);
         return CompletableFuture.supplyAsync(() -> null, delayedExecutor).thenCompose(ignored -> {
@@ -617,6 +648,12 @@ public class AsyncIggyTcpClient {
      * again before Register when the redialed node is not the leader.
      */
     private CompletableFuture<Void> replayLogin() {
+        Supplier<CompletableFuture<IdentityInfo>> replay = rememberedLogin;
+        if (replay != null) {
+            // Runs through loginOnLeader, so a redial that landed on a backup
+            // still settles on the leader before the session is used.
+            return loginOnLeader(replay).thenApply(identity -> null);
+        }
         if (username.isEmpty() || password.isEmpty() || usersClient == null) {
             return CompletableFuture.completedFuture(null);
         }
@@ -638,6 +675,9 @@ public class AsyncIggyTcpClient {
         CompletableFuture<IdentityInfo> callerFuture = new CompletableFuture<>();
         transaction.whenComplete((identity, error) -> {
             gate.complete(null);
+            if (error == null) {
+                rememberedLogin = loginAttempt;
+            }
             if (error != null) {
                 callerFuture.completeExceptionally(error);
             } else {
@@ -732,7 +772,33 @@ public class AsyncIggyTcpClient {
         if (currentSystemClient == null) {
             return CompletableFuture.completedFuture(Optional.empty());
         }
-        return LeaderAwareness.findLeaderElsewhere(currentSystemClient::getClusterMetadata, currentTarget);
+        return LeaderAwareness.findLeaderElsewhere(currentSystemClient::getClusterMetadata, currentTarget)
+                .thenApply(lookup -> {
+                    // Replaced wholesale rather than merged: the roster is the
+                    // cluster's own answer about where its nodes are, so a node
+                    // it dropped stops being dialed. The configured seed is
+                    // kept separately and outlives it.
+                    if (!lookup.endpoints().isEmpty()) {
+                        rosterTargets = lookup.endpoints();
+                    }
+                    return lookup.redirect();
+                });
+    }
+
+    /**
+     * Endpoints a redial rotates through, likeliest first: where the client
+     * currently is, the address it was configured with, then the roster it
+     * learned while connected. Duplicates are dropped, so an endpoint the
+     * roster merely spells differently does not earn a second attempt.
+     */
+    private List<ConnectionInfo> redialCandidates() {
+        List<ConnectionInfo> candidates = new ArrayList<>();
+        candidates.add(connectionInfo);
+        Stream.concat(Stream.of(seedConnectionInfo), rosterTargets.stream())
+                .filter(endpoint ->
+                        candidates.stream().noneMatch(candidate -> LeaderAwareness.isSameAddress(candidate, endpoint)))
+                .forEach(candidates::add);
+        return List.copyOf(candidates);
     }
 
     CompletableFuture<Void> retarget(ConnectionInfo newTarget) {

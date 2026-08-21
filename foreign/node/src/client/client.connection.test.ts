@@ -394,6 +394,31 @@ describe('IggyConnection', () => {
     }
   );
 
+  it('rotates a redial through the roster it learned while connected',
+    async () => {
+      const seed = await startServer();
+      const seedPort = (seed.address() as AddressInfo).port;
+      const connection = new IggyConnection(connectionConfig(seed));
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([
+          { host: '127.0.0.1', port: seedPort },
+          { host: '127.0.0.1', port: seedPort + 1 },
+          { host: '127.0.0.1', port: seedPort + 2 }
+        ]);
+        // The endpoint the client is on leads, the roster follows, and the
+        // roster's copy of that endpoint does not earn a second attempt.
+        assert.deepEqual(
+          connection._redialCandidates().map((options) => options.port),
+          [seedPort, seedPort + 1, seedPort + 2]
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => seed.close(() => resolve()));
+      }
+    }
+  );
+
   it('settles a dial in flight when a redirect replaces the socket',
     async () => {
       const seed = await startServer();

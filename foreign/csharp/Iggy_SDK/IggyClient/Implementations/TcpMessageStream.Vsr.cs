@@ -424,6 +424,25 @@ public sealed partial class TcpMessageStream
         return true;
     }
 
+    /// <summary>
+    ///     Keeps every node the roster names as a dial candidate. Replaced wholesale rather than merged: the
+    ///     roster is the cluster's own answer about where its nodes are, so a node it dropped stops being dialed.
+    ///     The configured address is kept separately and outlives it. A node that does not expose the tcp
+    ///     transport reports port 0 and is skipped, since dialing it would burn an attempt on an endpoint that
+    ///     cannot answer.
+    /// </summary>
+    private void RememberRoster(ClusterMetadata clusterMetadata)
+    {
+        var endpoints = clusterMetadata.Nodes
+            .Where(node => node.Endpoints.Tcp != 0)
+            .Select(node => ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp))
+            .ToArray();
+        if (endpoints.Length > 0)
+        {
+            _rosterAddresses = endpoints;
+        }
+    }
+
     private async Task<ClusterNode?> GetCurrentLeaderNodeAsync(CancellationToken token)
     {
         var leaderlessDeadline = Environment.TickCount64 + VsrLeaderlessWaitMs;
@@ -437,6 +456,8 @@ public sealed partial class TcpMessageStream
                 {
                     return null;
                 }
+
+                RememberRoster(clusterMetadata);
 
                 if (clusterMetadata.Nodes.Count() == 1)
                 {

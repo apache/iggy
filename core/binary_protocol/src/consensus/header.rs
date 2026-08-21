@@ -103,6 +103,15 @@ pub fn frame_checksum_bytes(header: &[u8; HEADER_SIZE]) -> u128 {
 pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     const COMMAND: Command;
 
+    /// Byte offset of this header's `operation` field, `None` when it carries
+    /// none.
+    ///
+    /// The typed decode reads the raw byte here after a failed checked cast,
+    /// so an operation a newer release added is reported as version skew
+    /// rather than corruption. An offset rather than a getter because the cast
+    /// has already failed by then, so no typed view of the header exists.
+    const OPERATION_OFFSET: Option<usize> = None;
+
     /// Whether a frame carrying `command` may be typed as this header.
     /// Defaults to an exact match; a header that serves several commands
     /// with one layout (e.g. `RepairDone` / `RangeEvicted`) widens it.
@@ -477,6 +486,7 @@ fn validate_request_fields(
 }
 
 impl ConsensusHeader for RoutedRequestHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const COMMAND: Command = Command::Request;
     /// The client-wire [`RequestHeader`] this is promoted from is unsealed, and the
     /// promotion copies `checksum` verbatim, so there is nothing here to verify.
@@ -511,6 +521,7 @@ impl ConsensusHeader for RoutedRequestHeader {
 }
 
 impl ConsensusHeader for RequestHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const COMMAND: Command = Command::Request;
     const FRAME_SEALED: bool = false;
 
@@ -621,6 +632,7 @@ impl Default for ReplyHeader {
 }
 
 impl ConsensusHeader for ReplyHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const COMMAND: Command = Command::Reply;
     const FRAME_SEALED: bool = false;
 
@@ -971,6 +983,7 @@ impl Default for PrepareHeader {
 }
 
 impl ConsensusHeader for PrepareHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const COMMAND: Command = Command::Prepare;
     const FRAME_SEALED: bool = false;
 
@@ -1178,6 +1191,7 @@ impl Default for PrepareOkHeader {
 }
 
 impl ConsensusHeader for PrepareOkHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const FRAME_SEALED: bool = true;
 
     const COMMAND: Command = Command::PrepareOk;

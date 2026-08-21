@@ -23,7 +23,7 @@ use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFra
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
-use iggy_binary_protocol::{GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{ConsensusError, GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
@@ -62,17 +62,33 @@ where
     pub fn dispatch(&self, message: Message<GenericHeader>) {
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
+            Err(ConsensusError::UnsupportedOperation { operation }) => {
+                // Terminal for this consensus group, not a per-frame hiccup:
+                // the op is never journaled, never acked, and every later
+                // prepare dies on the resulting gap while quorum hides the
+                // outage. Repair wraps the same typed header, so it cannot
+                // rescue this node either -- only upgrading it can. Nothing
+                // fences the sending peer, so the log and the counter are the
+                // whole signal an operator gets.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNSUPPORTED_OPERATION,
+                );
+                tracing::error!(
+                    shard = self.id,
+                    operation = format_args!("{operation:#04x}"),
+                    build_release = iggy_binary_protocol::IGGY_PROTOCOL_VERSION,
+                    "consensus frame carries an operation this build does not know; the sender \
+                     runs a newer release. This node cannot journal or ack it, so its consensus \
+                     group stops making progress until this node is upgraded"
+                );
+                return;
+            }
             Err(e) => {
-                // TODO(hubcio): this drop is the whole story for a consensus
-                // frame carrying an Operation this build does not know: no
-                // metric, no peer error, no eviction. An old node in a mixed
-                // cluster silently gap-stops the group here (never journals
-                // the op, never PrepareOks, every later prepare dies on the
-                // gap check) while quorum hides it, and repair wraps the same
-                // typed header so it cannot rescue. Rolling upgrades across
-                // consensus-op additions need a version fence (release_min /
-                // release_max bounds on the replica plane) before this arm is
-                // safe to hit.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNPARSABLE,
+                );
                 tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
                 return;
             }
@@ -804,25 +820,19 @@ mod tests {
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
     use std::mem::offset_of;
 
-    /// RED SPEC, expected to FAIL: pins the mixed-cluster upgrade hole in
-    /// `dispatch`'s decode seam.
-    ///
     /// An `Operation` discriminant this build does not know, arriving on an
     /// otherwise wire-valid consensus frame (correct command, size, checksum:
-    /// exactly what a newer release sends after an op addition), decodes to
-    /// the same undifferentiated `ConsensusError::InvalidBitPattern` as random
-    /// memory corruption. `dispatch` answers both identically: a warn log and
-    /// a dropped frame. No metric, no peer error, no eviction, no version
-    /// fence. An old node in a mixed cluster therefore gap-stops its consensus
-    /// group silently (never journals the op, never sends a `PrepareOk`, every
-    /// later prepare dies on the gap check) while quorum hides the outage.
+    /// exactly what a newer release sends after an op addition), must decode to
+    /// its own error rather than the `InvalidBitPattern` that random memory
+    /// corruption produces.
     ///
-    /// Passes once the decode surfaces a dedicated unsupported-operation
-    /// signal the router can fence and account, instead of collapsing it into
-    /// the corruption error.
+    /// The two need different operator actions: version skew is fixed by
+    /// upgrading this node, and until it is, the frame's consensus group makes
+    /// no progress (the op is never journaled, never acked, and every later
+    /// prepare dies on the gap). `dispatch` splits its drop arms on this
+    /// distinction; the accounting half is pinned in the server crate by
+    /// `given_an_unknown_operation_when_dispatched_should_account_an_upgrade_fence_drop`.
     #[test]
-    // TODO(hubcio): fix this test
-    #[ignore = "unknown operation collapses into InvalidBitPattern; no upgrade fence"]
     fn given_an_unknown_operation_when_a_consensus_frame_decodes_should_surface_an_upgrade_fence_signal()
      {
         // Far past every defined Operation discriminant (the highest is 165).
@@ -858,7 +868,12 @@ mod tests {
         };
 
         assert!(
-            !matches!(error, ConsensusError::InvalidBitPattern),
+            matches!(
+                error,
+                ConsensusError::UnsupportedOperation {
+                    operation: OPERATION_FROM_A_NEWER_RELEASE
+                }
+            ),
             "unknown operation {OPERATION_FROM_A_NEWER_RELEASE:#x} is silently dropped: the \
              typed decode collapses a wire-valid frame from a newer release into the same \
              InvalidBitPattern as corruption, and dispatch drops both with only a warn log, \
