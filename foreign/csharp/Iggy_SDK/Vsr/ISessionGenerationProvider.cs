@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.ConnectionStream;
+namespace Apache.Iggy.Vsr;
 
-internal interface IConnectionStream : IDisposable
+/// <summary>
+///     Exposes the consensus session generation of a transport, so session-scoped state - a consumer-group
+///     membership - can detect the session it was established under is gone. A client that does not implement
+///     it gets edge-based group rejoin from the connection-state events it publishes; a transport that
+///     publishes no such events (the built-in HTTP client) gets neither and keeps its membership as-is.
+/// </summary>
+public interface ISessionGenerationProvider
 {
-    ValueTask SendAsync(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default);
-    ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default);
-    Task FlushAsync(CancellationToken cancellationToken = default);
-    void Close();
+    /// <summary>Generation of the transport's consensus session, bumped on every session re-arm.</summary>
+    ulong SessionGeneration { get; }
 }
