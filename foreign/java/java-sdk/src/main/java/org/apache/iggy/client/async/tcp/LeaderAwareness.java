@@ -72,12 +72,12 @@ final class LeaderAwareness {
      * exceptionally, so the redirection path cannot fail the login that
      * triggered it.
      */
-    static CompletableFuture<Optional<ConnectionInfo>> findLeaderElsewhere(
+    static CompletableFuture<LeaderLookup> findLeaderElsewhere(
             Supplier<CompletableFuture<ClusterMetadata>> fetchMetadata, ConnectionInfo currentTarget) {
         return findLeaderElsewhere(fetchMetadata, currentTarget, LEADERLESS_WAIT_BUDGET, LEADERLESS_POLL_INTERVAL);
     }
 
-    static CompletableFuture<Optional<ConnectionInfo>> findLeaderElsewhere(
+    static CompletableFuture<LeaderLookup> findLeaderElsewhere(
             Supplier<CompletableFuture<ClusterMetadata>> fetchMetadata,
             ConnectionInfo currentTarget,
             Duration leaderlessWaitBudget,
@@ -87,7 +87,7 @@ final class LeaderAwareness {
                 fetchMetadata, currentTarget, leaderlessWaitBudget, leaderlessPollInterval, electionDeadlineNanos);
     }
 
-    private static CompletableFuture<Optional<ConnectionInfo>> pollForLeader(
+    private static CompletableFuture<LeaderLookup> pollForLeader(
             Supplier<CompletableFuture<ClusterMetadata>> fetchMetadata,
             ConnectionInfo currentTarget,
             Duration leaderlessWaitBudget,
@@ -99,16 +99,18 @@ final class LeaderAwareness {
         } catch (RuntimeException fetchError) {
             fetched = CompletableFuture.failedFuture(fetchError);
         }
-        return fetched.<CompletableFuture<Optional<ConnectionInfo>>>handleAsync((metadata, error) -> {
+        return fetched.<CompletableFuture<LeaderLookup>>handleAsync((metadata, error) -> {
                     if (error != null) {
                         log.warn(
                                 "Failed to get cluster metadata: {}, connection will continue on server node {}",
                                 error.getMessage(),
                                 currentTarget.serverAddress());
-                        return CompletableFuture.completedFuture(Optional.empty());
+                        return CompletableFuture.completedFuture(LeaderLookup.inconclusive());
                     }
                     LeaderCheck check;
+                    List<ConnectionInfo> endpoints;
                     try {
+                        endpoints = nodeTargets(metadata);
                         check = checkLeader(metadata, currentTarget);
                     } catch (RuntimeException selectionError) {
                         log.warn(
@@ -116,10 +118,11 @@ final class LeaderAwareness {
                                         + " on server node {}",
                                 selectionError.getMessage(),
                                 currentTarget.serverAddress());
-                        return CompletableFuture.completedFuture(Optional.empty());
+                        return CompletableFuture.completedFuture(LeaderLookup.inconclusive());
                     }
                     if (check instanceof LeaderCheck.Redirect redirect) {
-                        return CompletableFuture.completedFuture(Optional.of(redirect.target()));
+                        return CompletableFuture.completedFuture(
+                                new LeaderLookup(Optional.of(redirect.target()), endpoints));
                     }
                     if (check instanceof LeaderCheck.NoLeader) {
                         if (System.nanoTime() >= electionDeadlineNanos) {
@@ -128,7 +131,9 @@ final class LeaderAwareness {
                                             + " continue on server node {}",
                                     leaderlessWaitBudget,
                                     currentTarget.serverAddress());
-                            return CompletableFuture.completedFuture(Optional.empty());
+                            // A leaderless roster still names where the nodes
+                            // are, and that is what a redial needs.
+                            return CompletableFuture.completedFuture(new LeaderLookup(Optional.empty(), endpoints));
                         }
                         Executor retryAfterInterval = CompletableFuture.delayedExecutor(
                                 leaderlessPollInterval.toMillis(), TimeUnit.MILLISECONDS);
@@ -142,9 +147,21 @@ final class LeaderAwareness {
                                         retryAfterInterval)
                                 .thenCompose(Function.identity());
                     }
-                    return CompletableFuture.completedFuture(Optional.empty());
+                    return CompletableFuture.completedFuture(new LeaderLookup(Optional.empty(), endpoints));
                 })
                 .thenCompose(Function.identity());
+    }
+
+    /**
+     * Every node's target for the tcp transport, in roster order. A node that
+     * does not expose the transport reports port 0 and is skipped: dialing it
+     * would burn a redial attempt on an endpoint that cannot answer.
+     */
+    static List<ConnectionInfo> nodeTargets(ClusterMetadata metadata) {
+        return metadata.nodes().stream()
+                .filter(node -> node.endpoints().tcp() != 0)
+                .map(node -> new ConnectionInfo(node.ip(), node.endpoints().tcp()))
+                .toList();
     }
 
     /**
@@ -248,6 +265,24 @@ final class LeaderAwareness {
     /**
      * One leader-check verdict from a cluster-metadata snapshot.
      */
+    /**
+     * What one leader check learned from the roster: where to go, and every
+     * node the cluster named for this transport. A client keeps the latter as
+     * redial candidates, because the address it was configured with dies with
+     * its node and the roster is unreachable exactly when it is needed.
+     */
+    record LeaderLookup(Optional<ConnectionInfo> redirect, List<ConnectionInfo> endpoints) {
+
+        LeaderLookup {
+            endpoints = List.copyOf(endpoints);
+        }
+
+        /** A check that learned nothing: stay put, remember no endpoint. */
+        static LeaderLookup inconclusive() {
+            return new LeaderLookup(Optional.empty(), List.of());
+        }
+    }
+
     sealed interface LeaderCheck {
 
         /** A healthy leader with an enabled tcp transport lives elsewhere; reconnect to it. */

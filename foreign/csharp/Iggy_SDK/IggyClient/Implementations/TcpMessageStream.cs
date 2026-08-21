@@ -83,6 +83,17 @@ public sealed partial class TcpMessageStream : IIggyClient
     private DateTimeOffset _lastConnectionTime;
     private int _leaderRedirectCount;
 
+    // Every node the roster named on the last read, kept as dial candidates. A node dies together with its
+    // address, and the roster is unreachable exactly when it is needed, so the client has to have remembered it
+    // while the connection was still healthy. Written by the leader probe, read by the connect loop.
+    private string[] _rosterAddresses = [];
+
+    // The credentials a sign-in succeeded with, so a reconnect - on this node or, after a failover, another one -
+    // can re-establish the session instead of leaving every later request unauthenticated. A caller that signs in
+    // by hand is otherwise less reconnectable than one that configures auto login, which is a surprising
+    // difference between two ways of doing the same thing. Cleared on sign-out.
+    private AutoLoginSettings? _rememberedLogin;
+
     // Both are written by the connect and redirect paths, which do not hold the sending semaphore the request
     // paths read them under, so they are accessed through Interlocked rather than as plain fields. Losing an
     // update to the skip flag leaves a connection reporting Connected that never authenticated; losing one to
@@ -671,7 +682,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         if (_configuration.ReconnectionSettings.Enabled && !_configuration.AutoLoginSettings.Enabled)
         {
             _logger.LogWarning(
-                "Reconnection is enabled without auto login: a lost session cannot be restored, requests will fail until the client logs in again");
+                "Reconnection is enabled without auto login: a lost session can only be restored once the client has signed in at least once");
         }
 
         return ConnectAsync(true, token);
@@ -814,8 +825,14 @@ public sealed partial class TcpMessageStream : IIggyClient
             throw new NotConnectedException();
         }
 
-        return await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_CODE,
+        var identity = await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_CODE,
             LoginRegister.Serialize(userName, password), token);
+        _rememberedLogin = new AutoLoginSettings
+        {
+            Enabled = true, Username = userName, Password = password
+        };
+
+        return identity;
     }
 
     /// <inheritdoc />
@@ -832,6 +849,9 @@ public sealed partial class TcpMessageStream : IIggyClient
         finally
         {
             await ResetConsensusSessionAsync();
+
+            // An explicit sign-out leaves no session to restore, and a reconnect must not resurrect one.
+            _rememberedLogin = null;
 
             if (_state == ConnectionState.Authenticated)
             {
@@ -889,8 +909,11 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task<AuthResponse?> LoginWithPersonalAccessTokenAsync(string token, CancellationToken ct = default)
     {
-        return await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE,
+        var identity = await LoginRegisterAsync(CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE,
             LoginRegister.SerializeWithPersonalAccessToken(token), ct);
+        _rememberedLogin = new AutoLoginSettings { Enabled = true, PersonalAccessToken = token };
+
+        return identity;
     }
 
     /// <summary>
@@ -921,7 +944,10 @@ public sealed partial class TcpMessageStream : IIggyClient
                 return;
             }
 
-            if (_lastConnectionTime != DateTimeOffset.MinValue)
+            // The initial delay paces reconnects to the one endpoint a single-address client has. With other
+            // endpoints known there is somewhere else to go, and pausing first only pushes the failover past the
+            // window the caller is willing to wait; the dial loop's own delay still paces the retries.
+            if (_lastConnectionTime != DateTimeOffset.MinValue && DialCandidates().Length == 1)
             {
                 await Task.Delay(_configuration.ReconnectionSettings.InitialDelay, token);
             }
@@ -984,7 +1010,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 // the ping is what brings an idle client back.
                 var unrecoverable = _state is ConnectionState.Disconnected or ConnectionState.Connecting
                                     && !(_configuration.ReconnectionSettings.Enabled
-                                         && _configuration.AutoLoginSettings.Enabled);
+                                         && SignInSettings() != null);
                 if (IsConnecting || unrecoverable)
                 {
                     continue;
@@ -1130,14 +1156,17 @@ public sealed partial class TcpMessageStream : IIggyClient
         var retryCount = 0;
         var redirects = 0;
         var delay = _configuration.ReconnectionSettings.InitialDelay;
+
+        if (string.IsNullOrEmpty(_currentAddress))
+        {
+            _currentAddress = _configuration.BaseAddress;
+        }
+
+        var candidates = DialCandidates();
+        var candidate = 0;
         do
         {
             await DropStreamAsync();
-
-            if (string.IsNullOrEmpty(_currentAddress))
-            {
-                _currentAddress = _configuration.BaseAddress;
-            }
 
             if (!ServerAddress.TryParse(_currentAddress, out var host, out var port))
             {
@@ -1191,9 +1220,9 @@ public sealed partial class TcpMessageStream : IIggyClient
                 // No pre-login roster read: the server auth-gates cluster metadata, so leadership settles after
                 // a sign-in binds a session. A login dialed at a backup still succeeds because the server
                 // forwards the register to the primary.
-                if (autoLogin && _configuration.AutoLoginSettings.Enabled && !ConsumeSkipAutoLogin())
+                if (autoLogin && SignInSettings() is { } signInSettings && !ConsumeSkipAutoLogin())
                 {
-                    await AutoLoginAsync(token);
+                    await AutoLoginAsync(signInSettings, token);
 
                     if (await RedirectAsync(token))
                     {
@@ -1233,6 +1262,17 @@ public sealed partial class TcpMessageStream : IIggyClient
                     throw;
                 }
 
+                // Every other endpoint gets its turn before the retry delay: the node just lost may be gone for
+                // good, and pausing on it helps nothing.
+                if (++candidate < candidates.Length)
+                {
+                    _currentAddress = candidates[candidate];
+                    continue;
+                }
+
+                candidate = 0;
+                _currentAddress = candidates[0];
+
                 retryCount++;
                 if (_configuration.ReconnectionSettings.UseExponentialBackoff)
                 {
@@ -1267,6 +1307,10 @@ public sealed partial class TcpMessageStream : IIggyClient
 
             _logger.LogInformation("Following leader redirect {Redirect} to {Address}", redirects, _currentAddress);
 
+            // The redirect moved the client, so the endpoint it moved to leads the next dial.
+            candidates = DialCandidates();
+            candidate = 0;
+
             await Task.Delay(delay, token);
         }
     }
@@ -1294,18 +1338,62 @@ public sealed partial class TcpMessageStream : IIggyClient
         }
     }
 
-    private async Task AutoLoginAsync(CancellationToken token)
+    private string[] DialCandidates()
     {
-        var settings = _configuration.AutoLoginSettings;
+        return DialCandidates(_currentAddress, _configuration.BaseAddress, _rosterAddresses);
+    }
+
+    /// <summary>
+    ///     The endpoints one connect dials, likeliest first: where the client currently is, the address it was
+    ///     configured with, then the roster it learned while connected. Duplicates are dropped, so an endpoint the
+    ///     roster merely spells differently does not earn a second attempt.
+    /// </summary>
+    internal static string[] DialCandidates(string currentAddress, string baseAddress, string[] rosterAddresses)
+    {
+        var candidates = new List<string>();
+        if (!string.IsNullOrEmpty(currentAddress))
+        {
+            candidates.Add(currentAddress);
+        }
+
+        foreach (var endpoint in rosterAddresses.Prepend(baseAddress))
+        {
+            if (!string.IsNullOrEmpty(endpoint) &&
+                !candidates.Exists(known => ServerAddress.IsSame(known, endpoint)))
+            {
+                candidates.Add(endpoint);
+            }
+        }
+
+        return candidates.ToArray();
+    }
+
+    private async Task AutoLoginAsync(AutoLoginSettings settings, CancellationToken token)
+    {
         if (!string.IsNullOrEmpty(settings.PersonalAccessToken))
         {
-            _logger.LogInformation("Auto login enabled. Trying to login with a personal access token");
+            _logger.LogInformation("Signing in with a personal access token");
             await LoginWithPersonalAccessTokenAsync(settings.PersonalAccessToken, token);
             return;
         }
 
-        _logger.LogInformation("Auto login enabled. Trying to login with credentials: {Username}", settings.Username);
+        _logger.LogInformation("Signing in with credentials: {Username}", settings.Username);
         await LoginUserAsync(settings.Username, settings.Password, token);
+    }
+
+    /// <summary>
+    ///     The credentials a connect signs in with: the configured ones, or else the ones a sign-in on this client
+    ///     succeeded with. Null when nothing has ever signed in, which is when a reconnect cannot restore a
+    ///     session at all.
+    /// </summary>
+    private AutoLoginSettings? SignInSettings()
+    {
+        if (_configuration.AutoLoginSettings.Enabled)
+        {
+            return _configuration.AutoLoginSettings;
+        }
+
+        return _rememberedLogin;
     }
 
     /// <summary>
@@ -1360,11 +1448,12 @@ public sealed partial class TcpMessageStream : IIggyClient
                 throw;
             }
 
-            // Without auto login a reconnect cannot re-establish the session, so the request would only come
-            // back unauthenticated. Login and register are the exception: they re-authenticate themselves.
-            if (!_configuration.AutoLoginSettings.Enabled && Volatile.Read(ref _skipAutoLoginOnce) == 0)
+            // With no credentials - neither configured nor remembered from a sign-in - a reconnect cannot
+            // re-establish the session, so the request would only come back unauthenticated. Login and register
+            // are the exception: they re-authenticate themselves.
+            if (SignInSettings() == null && Volatile.Read(ref _skipAutoLoginOnce) == 0)
             {
-                _logger.LogWarning("Auto login is disabled, the session cannot be re-established");
+                _logger.LogWarning("No credentials to sign in with, the session cannot be re-established");
                 SetConnectionStateAsync(ConnectionState.Disconnected);
                 throw;
             }

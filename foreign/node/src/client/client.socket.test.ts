@@ -505,6 +505,111 @@ describe('VSR client socket', () => {
     }
   });
 
+  // The node a client authenticated on dies; its next command has to complete
+  // on a survivor the roster named, under a session established there.
+  // Mirrors `core/integration/tests/cluster/failover_client_continuity.rs`.
+  it('resumes on a survivor after the node it authenticated on dies',
+    async () => {
+      const primarySockets = new Set<Socket>();
+      let primaryDead = false;
+
+      const survivor = await startVsrServer((frame, socket) => {
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        if (operation === Operation.Register) {
+          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          return;
+        }
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (code === COMMAND_CODE.GetClusterMetadata) {
+          // The survivor leads once the primary is gone.
+          socket.write(replyFrame(
+            Operation.NonReplicated,
+            twoNodeMetadataBody(primary.port, survivor.port)
+          ));
+          return;
+        }
+        socket.write(replyFrame(operation));
+      });
+
+      const primary = await startVsrServer((frame, socket) => {
+        primarySockets.add(socket);
+        if (primaryDead) {
+          socket.destroy();
+          return;
+        }
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        if (operation === Operation.Register) {
+          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          return;
+        }
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (code === COMMAND_CODE.GetClusterMetadata) {
+          // The primary leads, so the login settles here and the roster is
+          // only remembered, not acted on, until the node dies.
+          socket.write(replyFrame(
+            Operation.NonReplicated,
+            twoNodeMetadataBody(survivor.port, primary.port)
+          ));
+          return;
+        }
+        socket.write(replyFrame(operation));
+      });
+
+      const config: ClientConfig = {
+        ...vsrConfig(primary.port),
+        reconnect: { enabled: true, interval: 1, maxRetries: 3 }
+      };
+      const client = new CommandResponseStream(config);
+      try {
+        await client.authenticate(config.credentials);
+        await client.sendCommand(60_021, Buffer.alloc(0));
+        assert.ok(
+          primary.frames.some(
+            (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_021
+          ),
+          'the live primary answered the first command'
+        );
+
+        primaryDead = true;
+        for (const socket of primarySockets)
+          socket.destroy();
+        await primary.close();
+
+        // The attempt in flight when the socket died is allowed to fail; what
+        // is not allowed is never completing one, which is what a client that
+        // only knows the dead endpoint does.
+        let resumed = false;
+        let lastError: unknown;
+        for (let attempt = 0; attempt < 20 && !resumed; attempt += 1) {
+          try {
+            await client.sendCommand(60_021, Buffer.alloc(0));
+            resumed = true;
+          } catch (error) {
+            lastError = error;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        }
+        assert.ok(resumed, `the client never resumed: ${String(lastError)}`);
+
+        const operations = survivor.frames.map(
+          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+        );
+        assert.ok(
+          operations.includes(Operation.Register),
+          'the client signed in again on the survivor'
+        );
+        assert.ok(
+          survivor.frames.some(
+            (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_021
+          ),
+          'the command landed on the survivor the roster named'
+        );
+      } finally {
+        client.destroy();
+        await survivor.close();
+      }
+    });
+
   it('keeps a single-node login on its node', async () => {
     const server = await startVsrServer(
       (frame, socket) => singleNodeHandler(server.port)(frame, socket)

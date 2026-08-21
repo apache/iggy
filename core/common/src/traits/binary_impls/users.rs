@@ -18,8 +18,8 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, permissions_to_wire, users_from_wire};
 use crate::{
-    BinaryClient, ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions,
-    UserClient, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
+    BinaryClient, ClientState, Credentials, DiagnosticEvent, Identifier, IdentityInfo, IggyError,
+    Permissions, UserClient, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::LOGIN_REGISTER_CODE;
@@ -218,6 +218,11 @@ impl<B: BinaryClient> UserClient for B {
             "authenticated against iggy server"
         );
         self.set_state(ClientState::Authenticated).await;
+        self.remember_session_credentials(Credentials::UsernamePassword(
+            username.to_owned(),
+            SecretString::from(password.to_string()),
+        ))
+        .await;
         self.publish_event(DiagnosticEvent::SignedIn).await;
         Ok(IdentityInfo {
             user_id: wire_resp.user_id,
@@ -229,6 +234,7 @@ impl<B: BinaryClient> UserClient for B {
         fail_if_not_authenticated(self).await?;
         self.send_raw_with_response(LOGOUT_USER_CODE, LogoutUserRequest.to_bytes())
             .await?;
+        self.forget_session_credentials().await;
         self.reset_vsr_session().await?;
         self.set_state(ClientState::Connected).await;
         self.publish_event(DiagnosticEvent::SignedOut).await;

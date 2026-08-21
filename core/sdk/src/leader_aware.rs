@@ -18,7 +18,7 @@
 use iggy_binary_protocol::codes::GET_CLUSTER_METADATA_CODE;
 use iggy_common::ClusterClient;
 use iggy_common::{
-    ClusterMetadata, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
+    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
 };
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -38,12 +38,33 @@ pub(crate) fn is_unauthenticated_metadata_probe(code: u32, error: &IggyError) ->
     code == GET_CLUSTER_METADATA_CODE && matches!(error, IggyError::Unauthenticated)
 }
 
+/// What one leader check learned from the cluster roster.
+pub struct LeaderCheck {
+    /// The leader's address, when it is not the node the client is on.
+    pub redirect: Option<String>,
+    /// Every endpoint the roster named for this transport. A client keeps
+    /// them as failover candidates: the address it was configured with dies
+    /// with its node, and the roster is unreachable exactly when it is
+    /// needed, so it has to be remembered while the connection is healthy.
+    pub endpoints: Vec<String>,
+}
+
+impl LeaderCheck {
+    /// A check that learned nothing: stay where we are, remember no endpoint.
+    fn inconclusive() -> Self {
+        Self {
+            redirect: None,
+            endpoints: Vec::new(),
+        }
+    }
+}
+
 /// Check if we need to redirect to leader and return the leader address if redirection is needed
 pub async fn check_and_redirect_to_leader<C: ClusterClient>(
     client: &C,
     current_address: &str,
     transport: TransportProtocol,
-) -> Result<Option<String>, IggyError> {
+) -> Result<LeaderCheck, IggyError> {
     debug!("Checking cluster metadata for leader detection");
 
     // A cluster can be transiently leaderless: a restarted node cedes the
@@ -60,15 +81,31 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
                     metadata.nodes.len(),
                     metadata.name
                 );
+                let endpoints = transport_endpoints(&metadata, transport);
                 match process_cluster_metadata(&metadata, current_address, transport) {
-                    Outcome::Redirect(address) => return Ok(Some(address)),
-                    Outcome::LeaderIsCurrent => return Ok(None),
+                    Outcome::Redirect(address) => {
+                        return Ok(LeaderCheck {
+                            redirect: Some(address),
+                            endpoints,
+                        });
+                    }
+                    Outcome::LeaderIsCurrent => {
+                        return Ok(LeaderCheck {
+                            redirect: None,
+                            endpoints,
+                        });
+                    }
                     Outcome::NoLeader => {
                         if tokio::time::Instant::now() >= deadline {
                             warn!(
                                 "No active leader found in cluster metadata within {LEADERLESS_WAIT_BUDGET:?}, connection will continue on server node {current_address}",
                             );
-                            return Ok(None);
+                            // A leaderless roster still names where the nodes
+                            // are, and that is what failover needs.
+                            return Ok(LeaderCheck {
+                                redirect: None,
+                                endpoints,
+                            });
                         }
                         tokio::time::sleep(LEADERLESS_POLL_INTERVAL).await;
                     }
@@ -82,14 +119,14 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
                 debug!(
                     "Cluster metadata answered Unauthenticated; the session is gone, connection will continue on server node {current_address}"
                 );
-                return Ok(None);
+                return Ok(LeaderCheck::inconclusive());
             }
             Err(e) => {
                 warn!(
                     "Failed to get cluster metadata: {}, connection will continue on server node {}",
                     e, current_address
                 );
-                return Ok(None);
+                return Ok(LeaderCheck::inconclusive());
             }
         }
     }
@@ -108,6 +145,29 @@ enum Outcome {
     LeaderIsCurrent,
     /// No healthy leader is marked (e.g. mid-election).
     NoLeader,
+}
+
+/// Every node's address for `transport`, in roster order. A node that does
+/// not expose the transport reports port 0 and is skipped: dialing it would
+/// burn a failover attempt on an endpoint that cannot answer.
+fn transport_endpoints(metadata: &ClusterMetadata, transport: TransportProtocol) -> Vec<String> {
+    metadata
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let port = transport_port(node, transport);
+            (port != 0).then(|| format!("{}:{port}", node.ip))
+        })
+        .collect()
+}
+
+fn transport_port(node: &ClusterNode, transport: TransportProtocol) -> u16 {
+    match transport {
+        TransportProtocol::Tcp => node.endpoints.tcp,
+        TransportProtocol::Quic => node.endpoints.quic,
+        TransportProtocol::Http => node.endpoints.http,
+        TransportProtocol::WebSocket => node.endpoints.websocket,
+    }
 }
 
 /// Process cluster metadata and determine if redirection is needed
@@ -132,12 +192,7 @@ fn process_cluster_metadata(
 
     match leader {
         Some(leader_node) => {
-            let leader_port = match transport {
-                TransportProtocol::Tcp => leader_node.endpoints.tcp,
-                TransportProtocol::Quic => leader_node.endpoints.quic,
-                TransportProtocol::Http => leader_node.endpoints.http,
-                TransportProtocol::WebSocket => leader_node.endpoints.websocket,
-            };
+            let leader_port = transport_port(leader_node, transport);
             let leader_address = format!("{}:{}", leader_node.ip, leader_port);
 
             info!(
@@ -162,7 +217,7 @@ fn process_cluster_metadata(
 
 /// Check if two addresses refer to the same endpoint
 /// Handles various formats like 127.0.0.1:8090 vs localhost:8090
-fn is_same_address(addr1: &str, addr2: &str) -> bool {
+pub(crate) fn is_same_address(addr1: &str, addr2: &str) -> bool {
     match (parse_address(addr1), parse_address(addr2)) {
         (Some(sock1), Some(sock2)) => sock1.ip() == sock2.ip() && sock1.port() == sock2.port(),
         _ => normalize_address(addr1) == normalize_address(addr2),
@@ -243,6 +298,36 @@ mod tests {
             GET_CLUSTER_METADATA_CODE + 1,
             &IggyError::Unauthenticated,
         ));
+    }
+
+    fn node(name: &str, ip: &str, tcp: u16, role: ClusterNodeRole) -> ClusterNode {
+        ClusterNode {
+            name: name.to_string(),
+            ip: ip.to_string(),
+            endpoints: iggy_common::TransportEndpoints::new(tcp, 0, 3000, 3001),
+            role,
+            status: ClusterNodeStatus::Healthy,
+        }
+    }
+
+    #[test]
+    fn the_roster_names_every_node_that_exposes_the_transport() {
+        let metadata = ClusterMetadata {
+            name: "iggy".to_string(),
+            nodes: vec![
+                node("iggy-1", "10.0.0.1", 8090, ClusterNodeRole::Leader),
+                node("iggy-2", "10.0.0.2", 8090, ClusterNodeRole::Follower),
+                node("iggy-3", "10.0.0.3", 8090, ClusterNodeRole::Follower),
+            ],
+        };
+
+        assert_eq!(
+            transport_endpoints(&metadata, TransportProtocol::Tcp),
+            vec!["10.0.0.1:8090", "10.0.0.2:8090", "10.0.0.3:8090"]
+        );
+        // A node that does not expose the transport reports port 0; dialing
+        // it would burn a failover attempt on an endpoint that cannot answer.
+        assert!(transport_endpoints(&metadata, TransportProtocol::Quic).is_empty());
     }
 
     #[test]

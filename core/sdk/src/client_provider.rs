@@ -132,6 +132,9 @@ impl ClientProviderConfig {
             TransportProtocol::Tcp => {
                 config.tcp = Some(Arc::new(TcpClientConfig {
                     server_address: args.tcp_server_address,
+                    // Command-line arguments name a single server; the roster
+                    // is learned once the client is connected.
+                    failover_addresses: Vec::new(),
                     tls_enabled: args.tcp_tls_enabled,
                     tls_domain: args.tcp_tls_domain,
                     tls_ca_file: args.tcp_tls_ca_file,
