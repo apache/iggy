@@ -1003,11 +1003,12 @@ fn document_from_json(value: Value) -> Map<String, Value> {
     }
 }
 
+// `serde_json::from_slice` parses without mutating `bytes` (unlike
+// `simd_json`, which parses in place), so the base64 fallback can reuse the
+// original buffer instead of cloning the whole payload up front.
 fn document_from_raw(bytes: Vec<u8>) -> Map<String, Value> {
-    // simd_json parses destructively, so the base64 fallback needs its own copy.
-    let mut parse_buffer = bytes.clone();
-    match simd_json::to_owned_value(&mut parse_buffer) {
-        Ok(value) => document_from_json(owned_value_to_serde_json(&value)),
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => document_from_json(value),
         Err(_) => Map::from_iter([
             (
                 "data".to_string(),
