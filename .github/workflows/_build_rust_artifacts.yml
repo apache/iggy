@@ -46,8 +46,8 @@ on:
       connector_plugins:
         type: string
         required: false
-        default: "iggy_connector_elasticsearch_sink,iggy_connector_elasticsearch_source,iggy_connector_iceberg_sink,iggy_connector_postgres_sink,iggy_connector_postgres_source,iggy_connector_quickwit_sink,iggy_connector_random_source,iggy_connector_s3_sink,iggy_connector_stdout_sink,iggy_connector_surrealdb_sink"
-        description: "Comma-separated list of connector plugin crates to build as shared libraries"
+        default: ""
+        description: "Comma-separated list of connector plugin crates to build as shared libraries. Empty (default) derives the full cdylib set from scripts/ci/connector-plugins.sh so new connectors are picked up automatically."
     outputs:
       artifact_name:
         description: "Name of the uploaded artifact containing all artifacts"
@@ -216,12 +216,25 @@ jobs:
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Resolve connector plugin list
+        env:
+          OVERRIDE: ${{ inputs.connector_plugins }}
+        run: |
+          if [[ -n "$OVERRIDE" ]]; then
+            plugins="$OVERRIDE"
+            echo "Using connector plugin list from workflow input (override)"
+          else
+            plugins="$(scripts/ci/connector-plugins.sh --comma-names)"
+            echo "Derived connector plugin list from cargo metadata"
+          fi
+          echo "Plugins: $plugins"
+          echo "CONNECTOR_PLUGINS=$plugins" >> "$GITHUB_ENV"
+
       - name: Build connector plugins
         run: |
-          plugins="${{ inputs.connector_plugins }}"
           pkg_flags=()
 
-          IFS=',' read -ra pkgs <<< "$plugins"
+          IFS=',' read -ra pkgs <<< "$CONNECTOR_PLUGINS"
           for pkg in "${pkgs[@]}"; do
             name="$(echo "$pkg" | xargs)"
             [[ -z "$name" ]] && continue
@@ -238,13 +251,16 @@ jobs:
           outdir="dist/${target}"
           mkdir -p "${outdir}"
 
-          plugins="${{ inputs.connector_plugins }}"
-          IFS=',' read -ra pkgs <<< "$plugins"
+          IFS=',' read -ra pkgs <<< "$CONNECTOR_PLUGINS"
           for pkg in "${pkgs[@]}"; do
             lib_name="$(echo "$pkg" | xargs)"
             [[ -z "$lib_name" ]] && continue
             so_file="target/${target}/release/lib${lib_name}.so"
-            [[ -f "$so_file" ]] && cp "$so_file" "${outdir}/"
+            if [[ ! -f "$so_file" ]]; then
+              echo "::error::expected connector plugin artifact missing: ${so_file}. The plugin crate built no cdylib, or its name does not match lib<crate>.so." >&2
+              exit 1
+            fi
+            cp "$so_file" "${outdir}/"
           done
 
           tarball="iggy-connectors-${target}-${version}.tar.gz"

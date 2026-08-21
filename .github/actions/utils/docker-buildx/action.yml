@@ -46,6 +46,10 @@ inputs:
     description: "Single platform to build (e.g., linux/amd64). If set, builds only this platform without QEMU. Leave empty for multi-arch build."
     required: false
     default: ""
+  target:
+    description: "Dockerfile stage to build. Empty builds the default (last) stage. Used to select an image flavor from a multi-flavor Dockerfile."
+    required: false
+    default: ""
   gha-cache:
     description: "Whether to use GitHub Actions cache for Docker layers (disable to save cache space)"
     required: false
@@ -342,6 +346,7 @@ runs:
       with:
         context: ${{ steps.ctx.outputs.context }}
         file: ${{ steps.config.outputs.dockerfile }}
+        target: ${{ inputs.target }}
         platforms: ${{ steps.platforms.outputs.platforms }}
         labels: ${{ steps.meta.outputs.labels }}
         cache-from: ${{ env.CACHE_FROM }}
@@ -357,6 +362,7 @@ runs:
       with:
         context: ${{ steps.ctx.outputs.context }}
         file: ${{ steps.config.outputs.dockerfile }}
+        target: ${{ inputs.target }}
         platforms: ${{ steps.platforms.outputs.platforms }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
