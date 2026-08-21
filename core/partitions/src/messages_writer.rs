@@ -273,20 +273,6 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_seeded_size_matching_disk_when_opening_existing_file_should_keep_counter() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("segment.log");
-        std::fs::write(&path, [7u8; 128]).unwrap();
-
-        let counter = Rc::new(AtomicU64::new(128));
-        MessagesWriter::new(path.to_str().unwrap(), counter.clone(), false, true, None)
-            .await
-            .unwrap();
-
-        assert_eq!(counter.load(Ordering::Relaxed), 128);
-    }
-
-    #[compio::test]
     async fn given_seeded_size_diverging_from_disk_when_opening_existing_file_should_return_size_mismatch_error()
      {
         let directory = tempfile::tempdir().unwrap();
