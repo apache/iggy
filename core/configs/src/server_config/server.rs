@@ -19,6 +19,7 @@ use super::COMPONENT;
 use super::cluster::ClusterConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::node::NodeConfig;
 use super::partition::PartitionConfig;
 use super::quic::QuicConfig;
 use super::tcp::TcpConfig;
@@ -111,6 +112,7 @@ pub struct ServerConfig {
     pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
     #[serde(default)]
+    pub node: NodeConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
     pub system: Arc<ServerSystemConfig>,

@@ -5103,8 +5103,13 @@ mod tests {
         let multi_node = Rc::new(ClusterRoster {
             enabled: true,
             name: "test-cluster".to_owned(),
-            nodes: vec![roster_node("node-0").into(), roster_node("node-1").into()],
-            self_ip: "127.0.0.1".to_owned(),
+            nodes: ["node-0", "node-1"]
+                .map(|name| {
+                    configs::cluster::ResolvedClusterNode::try_from(roster_node(name))
+                        .expect("valid roster node")
+                })
+                .to_vec(),
+            self_advertised: "127.0.0.1".to_owned(),
             self_ports: TransportPorts::default(),
             metadata_view: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,

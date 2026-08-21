@@ -89,6 +89,14 @@ spec:
                   name: {{ include "iggy.fullname" . }}-root-credentials
                   key: password
   {{- end }}{{- end}}
+  {{- $declaredInEnv := false }}
+  {{- range .Values.server.env }}
+    {{- if eq .name "IGGY_NODE_ADVERTISED_ADDRESS" }}{{- $declaredInEnv = true }}{{- end }}
+  {{- end }}
+  {{- if not $declaredInEnv }}
+            - name: IGGY_NODE_ADVERTISED_ADDRESS
+              value: {{ .Values.server.advertisedAddress | default (printf "%s.%s.svc.cluster.local" (include "iggy.fullname" .) .Release.Namespace) | quote }}
+  {{- end }}
   {{- if .Values.server.env }}
     {{- range .Values.server.env }}
             - name: {{ .name }}

@@ -17,6 +17,8 @@
 
 # -- Iggy server configuration
 server:
+  # -- Client-facing address published in cluster metadata.
+  advertisedAddress: ""
   # -- Enable the Iggy server deployment
   enabled: true
   # -- Number of server replicas

@@ -65,7 +65,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
 use crate::bootstrap::ServerShard;
-use crate::cluster_meta::ClusterRoster;
+use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes};
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
@@ -103,6 +103,7 @@ pub async fn start(
     max_tokens_per_user: u32,
     cluster: &ClusterConfig,
     system_config: Arc<ServerSystemConfig>,
+    self_advertised: &str,
     self_ports: TransportPorts,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
@@ -149,8 +150,8 @@ pub async fn start(
         roster: ClusterRoster {
             enabled: cluster.enabled,
             name: cluster.name.clone(),
-            nodes: cluster.nodes.iter().cloned().map(Into::into).collect(),
-            self_ip: bound_addr.ip().to_string(),
+            nodes: resolved_roster_nodes(cluster).map_err(ServerError::Config)?,
+            self_advertised: self_advertised.to_owned(),
             // The self node reports the live bound HTTP port; the other client
             // ports arrive resolved from the caller.
             self_ports: TransportPorts {

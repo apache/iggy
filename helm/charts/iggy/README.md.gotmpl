@@ -228,6 +228,13 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 * `IGGY_TCP_ADDRESS=0.0.0.0:8090`
 * `IGGY_QUIC_ADDRESS=0.0.0.0:8080`
 
+A wildcard bind says which interfaces accept connections, not where clients
+reach the pod, so the server also needs the address to publish in cluster
+metadata and refuses to start without it. The chart sets
+`IGGY_NODE_ADVERTISED_ADDRESS` to the in-cluster Service DNS name; override it
+with `server.advertisedAddress` when clients arrive through a LoadBalancer or
+an Ingress.
+
 ## Accessing the Server
 
 ### Port Forward

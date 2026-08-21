@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::auth::warm_dummy_password_hash;
-use crate::cluster_meta::ClusterRoster;
+use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes, self_advertised_address};
 use crate::config_writer::write_current_config;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
@@ -1748,23 +1748,32 @@ fn spawn_shutdown_watchdog(
 /// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
 /// the real topology. `self_*` back only the cluster-disabled self-synthesis
 /// and carry the requested listener ports from the resolved topology, not the
-/// bound ones (a `:0` wildcard is reported as 0).
+/// bound ones (a `:0` wildcard is reported as 0). The self address resolves
+/// through [`self_advertised_address`], which boot validation has already
+/// guaranteed names somewhere a client can dial.
 fn build_cluster_roster(
+    shard_id: u16,
     config: &ServerConfig,
     topology: &TcpTopology,
     metadata_view: Arc<AtomicU64>,
-) -> ClusterRoster {
-    ClusterRoster {
+) -> Result<ClusterRoster, ServerError> {
+    let declared = config.node.advertised_address.as_deref();
+    let self_advertised = self_advertised_address(declared, topology.client_listen_addr.ip());
+    // The roster answers this per node, so a value here would be read by
+    // nobody. Silence would leave the operator believing it took effect.
+    // Every shard builds its own roster off the same config, so keep the
+    // operator-facing explanation to one line per process.
+    if declared.is_some() && config.cluster.enabled && shard_id == 0 {
+        warn!(
+            "node.advertised_address is set but cluster.enabled is true, so it is ignored; \
+             the client-facing address of each node comes from its cluster.nodes entry"
+        );
+    }
+    Ok(ClusterRoster {
         enabled: config.cluster.enabled,
         name: config.cluster.name.clone(),
-        nodes: config
-            .cluster
-            .nodes
-            .iter()
-            .cloned()
-            .map(Into::into)
-            .collect(),
-        self_ip: topology.client_listen_addr.ip().to_string(),
+        nodes: resolved_roster_nodes(&config.cluster).map_err(ServerError::Config)?,
+        self_advertised,
         self_ports: configs::cluster::TransportPorts {
             tcp: Some(topology.client_listen_addr.port()),
             quic: topology.quic_listen_addr.map(|addr| addr.port()),
@@ -1773,7 +1782,7 @@ fn build_cluster_roster(
             tcp_replica: None,
         },
         metadata_view,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2035,10 +2044,11 @@ async fn build_shard_for_thread(
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
+            shard_id,
             config,
             topology,
             metadata_view,
-        )));
+        )?));
     let shard_name = format!("server-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
@@ -3030,6 +3040,12 @@ async fn start_tcp_runtime(
     // reactor, so it binds independently. Shard-0 gating comes from the sole
     // caller of this function.
     if let Some(http_addr) = topology.http_listen_addr {
+        // One host for all four transports, resolved from the client-facing
+        // TCP bind so both listeners publish the same node address.
+        let self_advertised = self_advertised_address(
+            config.node.advertised_address.as_deref(),
+            topology.client_listen_addr.ip(),
+        );
         let self_ports = configs::cluster::TransportPorts {
             tcp: config
                 .tcp
@@ -3047,6 +3063,7 @@ async fn start_tcp_runtime(
             config.personal_access_token.max_tokens_per_user,
             &config.cluster,
             Arc::clone(&config.system),
+            &self_advertised,
             self_ports,
             shard_metrics_all,
         )

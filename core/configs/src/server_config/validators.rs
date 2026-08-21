@@ -31,6 +31,7 @@ use crate::common::http::HMAC_JWT_ALGORITHMS;
 use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use err_trail::ErrContext;
 use iggy_common::{IggyExpiry, Validatable};
+use std::net::SocketAddr;
 
 /// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
 /// evaluate the `max_write_buffer_size > write_buffer_size` invariant
@@ -76,6 +77,10 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
         })?;
+        self.node.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate node config")
+        })?;
+        self.validate_client_facing_address()?;
         self.metadata.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate metadata config")
         })?;
@@ -397,6 +402,38 @@ fn reject_unsupported(config: &ServerConfig) -> Result<(), ConfigurationError> {
     Ok(())
 }
 
+impl ServerConfig {
+    /// `tcp.address` must name a bind address, and a wildcard one must be
+    /// paired with a declared client-facing address.
+    fn validate_client_facing_address(&self) -> Result<(), ConfigurationError> {
+        let bind = self.tcp.address.parse::<SocketAddr>().map_err(|error| {
+            eprintln!(
+                "{COMPONENT} - tcp.address '{}' is not an address and port: {error}. The host \
+                     is required and must be a literal IP, so ':PORT' and 'hostname:PORT' are \
+                     both rejected; use 127.0.0.1:PORT for loopback or 0.0.0.0:PORT to accept on \
+                     every interface.",
+                self.tcp.address
+            );
+            ConfigurationError::InvalidConfigurationValue
+        })?;
+
+        if self.cluster.enabled || self.node.advertised_address.is_some() {
+            return Ok(());
+        }
+        if !bind.ip().is_unspecified() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "{COMPONENT} - tcp.address binds the wildcard {bind}, which says which interfaces this \
+             node accepts on rather than where a client reaches it, so cluster metadata would carry \
+             no address for this node. Set node.advertised_address to the address clients dial, or \
+             bind a concrete address."
+        );
+        Err(ConfigurationError::InvalidConfigurationValue)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::cluster::{ClusterNodeConfig, TransportPorts};
@@ -441,6 +478,56 @@ mod tests {
             config.validate().is_err(),
             "an artifact budget under segment maximum + one frame must refuse boot"
         );
+    }
+
+    #[test]
+    fn given_wildcard_bind_without_advertised_address_when_validating_should_reject() {
+        for wildcard in ["0.0.0.0:8090", "[::]:8090"] {
+            let config = config_with_override(&format!(
+                "[tcp]\naddress = \"{wildcard}\"\n[cluster]\nenabled = false\n"
+            ));
+            assert!(
+                config.validate().is_err(),
+                "{wildcard} names no address a client can dial"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_hostless_or_named_bind_address_when_validating_should_reject() {
+        for address in [":8090", "localhost:8090", "0.0.0.0", "not-an-address"] {
+            let config = config_with_override(&format!("[tcp]\naddress = \"{address}\"\n"));
+            assert!(
+                config.validate().is_err(),
+                "{address} does not name a bind address"
+            );
+        }
+    }
+
+    #[test]
+    fn given_wildcard_bind_with_advertised_address_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = false\n\
+             [node]\nadvertised_address = \"broker-1.example.com\"\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_concrete_bind_without_advertised_address_when_validating_should_pass() {
+        let config = config_with_override(
+            "[tcp]\naddress = \"192.0.2.10:8090\"\n[cluster]\nenabled = false\n",
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_clustered_wildcard_bind_without_advertised_address_when_validating_should_pass() {
+        // The roster answers the client-facing address per node, so the bind
+        // address is free to be a wildcard with nothing declared here.
+        let config =
+            config_with_override("[tcp]\naddress = \"0.0.0.0:8090\"\n[cluster]\nenabled = true\n");
+        assert!(config.validate().is_ok());
     }
 
     #[test]

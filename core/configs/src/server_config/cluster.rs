@@ -421,6 +421,7 @@ pub struct ClusterTlsConfig {
 #[serde(deny_unknown_fields)]
 pub struct ClusterNodeConfig {
     pub name: String,
+    /// Replica-plane address, dialed verbatim by every peer, a literal IP.
     pub ip: String,
     /// Optional client-facing address: a literal IP or a DNS hostname,
     /// validated as [`AdvertisedAddress`] at boot. Replica traffic continues
@@ -473,10 +474,7 @@ pub struct AdvertisedAddressSelector {
 /// once, built wherever a roster is assembled for serving clients
 /// (listener/shard start). Per-request resolution never re-parses config
 /// strings: everything is snapshotted here, so mutating the source config
-/// after conversion has no effect on what clients are told. Entries that do
-/// not parse are dropped at build time; validation already rejects them
-/// whenever the cluster is enabled, and a disabled cluster never consults
-/// the roster.
+/// after conversion has no effect on what clients are told.
 #[derive(Debug, Clone)]
 pub struct ResolvedClusterNode {
     config: ClusterNodeConfig,
@@ -484,38 +482,72 @@ pub struct ResolvedClusterNode {
     /// addresses, in declaration order.
     selectors: Vec<(IpNet, AdvertisedAddress)>,
     /// Parsed catch-all: [`ClusterNodeConfig::advertised_address`], else the
-    /// roster [`ClusterNodeConfig::ip`]. `None` when the configured value
-    /// does not parse - a set `advertised_address` never falls through to
-    /// the private roster ip.
-    catch_all: Option<AdvertisedAddress>,
+    /// roster [`ClusterNodeConfig::ip`]. A set `advertised_address` never
+    /// falls through to the private roster ip.
+    catch_all: AdvertisedAddress,
     /// Parsed roster [`ClusterNodeConfig::ip`], the replica-plane dial
-    /// address. `None` when the roster ip is not a literal IP (boot only
-    /// requires it non-empty); internal forwarding then has no dial target.
-    replica_ip: Option<IpAddr>,
+    /// address.
+    replica_ip: IpAddr,
 }
 
-impl From<ClusterNodeConfig> for ResolvedClusterNode {
-    fn from(config: ClusterNodeConfig) -> Self {
-        let selectors = config
-            .advertised_addresses
-            .iter()
-            .filter_map(|selector| {
-                let network = selector.client_cidr.parse::<IpNet>().ok()?;
-                let address = selector.address.parse::<AdvertisedAddress>().ok()?;
-                Some((canonical_ip_net(network.trunc()), address))
-            })
-            .collect();
-        let catch_all = match config.advertised_address.as_deref() {
-            Some(advertised_address) => advertised_address.parse().ok(),
-            None => config.ip.parse().ok(),
-        };
-        let replica_ip = config.ip.parse().ok();
-        Self {
+impl TryFrom<ClusterNodeConfig> for ResolvedClusterNode {
+    type Error = ConfigurationError;
+
+    fn try_from(config: ClusterNodeConfig) -> Result<Self, Self::Error> {
+        let replica_ip = config.ip.parse::<IpAddr>().map_err(|error| {
+            eprintln!(
+                "Invalid cluster configuration: IP '{}' for node '{}' is not a literal IP \
+                 address: {error}",
+                config.ip, config.name
+            );
+            ConfigurationError::InvalidConfigurationValue
+        })?;
+
+        let catch_all =
+            match config.advertised_address.as_deref() {
+                Some(advertised_address) => advertised_address
+                    .parse::<AdvertisedAddress>()
+                    .map_err(|error| {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised_address \
+                             '{advertised_address}' for node '{}': {error}",
+                            config.name
+                        );
+                        ConfigurationError::InvalidConfigurationValue
+                    })?,
+                None => AdvertisedAddress::Ip(replica_ip),
+            };
+
+        let mut selectors = Vec::with_capacity(config.advertised_addresses.len());
+        for selector in &config.advertised_addresses {
+            let network = selector.client_cidr.parse::<IpNet>().map_err(|error| {
+                eprintln!(
+                    "Invalid cluster configuration: advertised_addresses client_cidr '{}' for \
+                     node '{}': {error}",
+                    selector.client_cidr, config.name
+                );
+                ConfigurationError::InvalidConfigurationValue
+            })?;
+            let address = selector
+                .address
+                .parse::<AdvertisedAddress>()
+                .map_err(|error| {
+                    eprintln!(
+                        "Invalid cluster configuration: advertised_addresses address '{}' for \
+                         node '{}': {error}",
+                        selector.address, config.name
+                    );
+                    ConfigurationError::InvalidConfigurationValue
+                })?;
+            selectors.push((canonical_ip_net(network.trunc()), address));
+        }
+
+        Ok(Self {
             config,
             selectors,
             catch_all,
             replica_ip,
-        }
+        })
     }
 }
 
@@ -531,33 +563,19 @@ impl ResolvedClusterNode {
     /// internal request forwarding. Never routed through the advertised
     /// ladder: this is what servers dial, not what clients are told.
     #[must_use]
-    pub fn replica_ip(&self) -> Option<IpAddr> {
+    pub fn replica_ip(&self) -> IpAddr {
         self.replica_ip
     }
 
     /// The client-facing address for a client connecting from `client_ip`:
-    /// longest-prefix match over the selector networks, then the parsed
-    /// catch-all. `None` when no selector matches and the catch-all did not
-    /// parse; callers choose whether to fail closed (redirect URLs) or to
-    /// publish [`Self::raw_advertised_fallback`] verbatim (cluster metadata).
+    /// longest-prefix match over the selector networks, then the catch-all.
+    /// Always an address, since construction refused a node whose sources did
+    /// not parse.
     #[must_use]
-    pub fn advertised_for(&self, client_ip: Option<IpAddr>) -> Option<&AdvertisedAddress> {
+    pub fn advertised_for(&self, client_ip: Option<IpAddr>) -> &AdvertisedAddress {
         client_ip
             .and_then(|client_ip| self.selector_address(client_ip))
-            .or(self.catch_all.as_ref())
-    }
-
-    /// The catch-all ladder ([`ClusterNodeConfig::advertised_address`], else
-    /// the roster [`ClusterNodeConfig::ip`]) as configured, unparsed. Cluster
-    /// metadata publishes this verbatim when [`Self::advertised_for`] finds
-    /// nothing: the roster `ip` is only validated non-empty, and Docker
-    /// service names with underscores exist in the wild.
-    #[must_use]
-    pub fn raw_advertised_fallback(&self) -> &str {
-        self.config
-            .advertised_address
-            .as_deref()
-            .unwrap_or(&self.config.ip)
+            .unwrap_or(&self.catch_all)
     }
 
     /// Longest-prefix match over the boot-parsed selector networks. The
@@ -629,6 +647,10 @@ pub enum AdvertisedAddress {
 }
 
 impl AdvertisedAddress {
+    pub fn is_unspecified(&self) -> bool {
+        matches!(self, Self::Ip(ip) if ip.is_unspecified())
+    }
+
     /// Render `host:port` for a URL or endpoint listing, bracketing IPv6
     /// hosts (`[::1]:8080`) so the port separator stays unambiguous.
     pub fn authority(&self, port: u16) -> String {
@@ -990,10 +1012,23 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
 
-            if node.ip.trim().is_empty() {
+            // The roster ip is dialed verbatim for replica traffic and is
+            // never resolved, so no hostname can work here whatever its
+            // shape.
+            let node_ip = node.ip.parse::<IpAddr>().map_err(|error| {
                 eprintln!(
-                    "Invalid cluster configuration: IP cannot be empty for node '{}'",
-                    node.name
+                    "Invalid cluster configuration: IP '{}' for node '{}' is not a literal IP \
+                     address: {error}; set node.advertised_address for the name clients dial",
+                    node.ip, node.name
+                );
+                ConfigurationError::InvalidConfigurationValue
+            })?;
+
+            if node_ip.is_unspecified() {
+                eprintln!(
+                    "Invalid cluster configuration: IP '{}' for node '{}' is the unspecified \
+                     address; declare the address peers and clients reach this node at",
+                    node.ip, node.name
                 );
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
@@ -1054,13 +1089,20 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             // An advertised address must parse strictly (IP or RFC 1123
             // hostname): the value is handed verbatim to every client via
             // cluster metadata and redirect URLs, so a bad one poisons them
-            // all. The roster `ip` predates this check and is only validated
-            // as non-empty (Docker service names with underscores exist in
-            // the wild), so when it backs the client endpoints an unparsable
-            // value falls back to raw-string comparison instead of failing
-            // boot.
+            // all. It is the wider of the two - the roster `ip` above is
+            // held to a literal IP - so a node reachable only by name still
+            // publishes that name to clients.
             let client_address = match node.advertised_address.as_deref() {
                 Some(advertised_address) => match advertised_address.parse::<AdvertisedAddress>() {
+                    Ok(address) if address.is_unspecified() => {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised_address '{advertised_address}' for node '{}' \
+                             is the unspecified address, which tells a client which interfaces this node accepts \
+                             on rather than where to reach it; declare a routable address",
+                            node.name
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
                     Ok(address) => Some(address),
                     Err(error) => {
                         eprintln!(
@@ -1112,6 +1154,14 @@ impl Validatable<ConfigurationError> for ClusterConfig {
                     return Err(ConfigurationError::InvalidConfigurationValue);
                 }
                 let address = match selector.address.parse::<AdvertisedAddress>() {
+                    Ok(address) if address.is_unspecified() => {
+                        eprintln!(
+                            "Invalid cluster configuration: advertised_addresses address '{}' for node '{}' \
+                             is the unspecified address; declare the address clients in '{}' reach this node at",
+                            selector.address, node.name, selector.client_cidr
+                        );
+                        return Err(ConfigurationError::InvalidConfigurationValue);
+                    }
                     Ok(address) => address,
                     Err(error) => {
                         eprintln!(
@@ -1136,10 +1186,7 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             // override shadowing the same node's wider selector); a conflict
             // means some client wins both entries and would resolve both
             // nodes to one endpoint. The catch-all is an implicit
-            // match-everything-else selector, so it pools the same way. A
-            // roster ip that fails the strict parse skips the pool: it can
-            // never equal a parsed host, and two raw ips sharing host:port
-            // are already rejected by the bind-endpoint check above.
+            // match-everything-else selector, so it pools the same way.
             if let Some(address) = &client_address {
                 let catch_all_clients = EffectiveClients::for_catch_all(&selector_ranges);
                 for (name, port) in &client_ports {
@@ -1641,7 +1688,7 @@ mod advertised_for_tests {
     }
 
     fn resolved(node: ClusterNodeConfig) -> ResolvedClusterNode {
-        node.into()
+        ResolvedClusterNode::try_from(node).expect("a roster node the validator would accept")
     }
 
     fn ip(address: &str) -> IpAddr {
@@ -1653,7 +1700,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(Vec::new());
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+            &AdvertisedAddress::Ip(ip("203.0.113.10"))
         );
     }
 
@@ -1663,16 +1710,18 @@ mod advertised_for_tests {
         node.advertised_address = None;
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
     #[test]
-    fn is_none_when_no_fallback_parses() {
+    fn refuses_a_node_whose_ip_is_not_an_address() {
+        // Nothing downstream carries a fallback for an unparsable source, so
+        // the conversion is where such a node has to stop.
         let mut node = node_with_selectors(Vec::new());
         node.advertised_address = None;
         node.ip = "iggy_node".to_owned();
-        assert_eq!(resolved(node).advertised_for(Some(ip("10.0.0.7"))), None);
+        assert!(ResolvedClusterNode::try_from(node).is_err());
     }
 
     #[test]
@@ -1680,7 +1729,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.200.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
@@ -1689,7 +1738,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("192.168.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+            &AdvertisedAddress::Ip(ip("203.0.113.10"))
         );
     }
 
@@ -1698,7 +1747,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(None),
-            Some(&AdvertisedAddress::Ip(ip("203.0.113.10")))
+            &AdvertisedAddress::Ip(ip("203.0.113.10"))
         );
     }
 
@@ -1710,12 +1759,12 @@ mod advertised_for_tests {
         ]));
         assert_eq!(
             node.advertised_for(Some(ip("10.0.200.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5"))),
+            &AdvertisedAddress::Ip(ip("10.0.1.5")),
             "the /16 must win over the /8 even though it is declared second"
         );
         assert_eq!(
             node.advertised_for(Some(ip("10.9.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.255.255.1"))),
+            &AdvertisedAddress::Ip(ip("10.255.255.1")),
             "a client outside the /16 but inside the /8 must match the /8"
         );
     }
@@ -1732,7 +1781,7 @@ mod advertised_for_tests {
         ]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.200.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
@@ -1742,7 +1791,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("::ffff:10.0.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
@@ -1754,7 +1803,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("::ffff:10.0.0.0/104", "10.0.1.5")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.0.7"))),
-            Some(&AdvertisedAddress::Ip(ip("10.0.1.5")))
+            &AdvertisedAddress::Ip(ip("10.0.1.5"))
         );
     }
 
@@ -1763,7 +1812,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("2001:db8::/32", "2001:db8::1")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("2001:db8::7"))),
-            Some(&AdvertisedAddress::Ip(ip("2001:db8::1")))
+            &AdvertisedAddress::Ip(ip("2001:db8::1"))
         );
     }
 
@@ -1772,9 +1821,7 @@ mod advertised_for_tests {
         let node = node_with_selectors(vec![selector("10.0.0.0/16", "Broker.Internal.Example")]);
         assert_eq!(
             resolved(node).advertised_for(Some(ip("10.0.0.7"))),
-            Some(&AdvertisedAddress::Hostname(
-                "broker.internal.example".to_owned()
-            ))
+            &AdvertisedAddress::Hostname("broker.internal.example".to_owned())
         );
     }
 }
@@ -1983,6 +2030,43 @@ mod cluster_validate_tests {
     }
 
     #[test]
+    fn validate_rejects_an_unspecified_node_ip() {
+        for wildcard in ["0.0.0.0", "::"] {
+            let mut nodes = vec![node("n1", 0), node("n2", 1)];
+            nodes[0].ip = wildcard.to_owned();
+            assert!(cfg(nodes).validate().is_err(), "{wildcard} is not dialable");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_hostname_node_ip() {
+        for hostname in ["iggy_leader", "node-1.example.com"] {
+            let mut nodes = vec![node("n1", 0), node("n2", 1)];
+            nodes[0].ip = hostname.to_owned();
+            assert!(
+                cfg(nodes).validate().is_err(),
+                "'{hostname}' must not pass as a roster ip"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_unspecified_advertised_address() {
+        for wildcard in ["0.0.0.0", "::"] {
+            let mut nodes = vec![node("n1", 0), node("n2", 1)];
+            nodes[0].advertised_address = Some(wildcard.to_owned());
+            assert!(cfg(nodes).validate().is_err(), "{wildcard} is not dialable");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_unspecified_selector_address() {
+        let mut nodes = vec![node("n1", 0), node("n2", 1)];
+        nodes[0].advertised_addresses = vec![selector("10.0.0.0/16", "0.0.0.0")];
+        assert!(cfg(nodes).validate().is_err());
+    }
+
+    #[test]
     fn validate_rejects_out_of_range_replica_id() {
         // 2 nodes total, so id 2 is out of range.
         let c = cfg(vec![node("n1", 0), node("n2", 2)]);
@@ -2188,19 +2272,6 @@ mod cluster_validate_tests {
         let mut n2 = node("n2", 1);
         n2.ip = "10.0.0.2".to_owned();
         n2.advertised_address = Some("Broker.Example.COM".to_owned());
-        n2.ports.tcp = Some(8090);
-
-        assert!(cfg(vec![n1, n2]).validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_node_ip_hostname_clashing_with_advertised_hostname() {
-        let mut n1 = node("n1", 0);
-        n1.ip = "10.0.0.1".to_owned();
-        n1.advertised_address = Some("broker.example.com".to_owned());
-        n1.ports.tcp = Some(8090);
-        let mut n2 = node("n2", 1);
-        n2.ip = "broker.example.com".to_owned();
         n2.ports.tcp = Some(8090);
 
         assert!(cfg(vec![n1, n2]).validate().is_err());

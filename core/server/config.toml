@@ -186,6 +186,17 @@ cert_file = "core/certs/iggy_cert.pem"
 # Path to the TLS key file.
 key_file = "core/certs/iggy_key.pem"
 
+# This node's own client-facing identity, used when 'cluster.enabled' is
+# false.
+[node]
+# A literal IP or a DNS hostname, without a port. Named to match its roster
+# counterpart 'cluster.nodes.advertised_address', which answers the same
+# question per node. The unspecified address ("0.0.0.0", "::") is rejected: it
+# is the bind address's answer to a question clients are not asking. Commented
+# out here because the shipped 'tcp.address' binds a concrete address and needs
+# no declaration.
+#advertised_address = "broker-1.example.com"
+
 # TCP server configuration.
 [tcp]
 # Determines if the TCP server is active.
@@ -693,7 +704,7 @@ skip_shard_zero_for_clients = false
 #
 #   [[cluster.nodes]]
 #   name = "iggy-node-1"
-#   ip = "10.0.1.5"                        # replica plane + last-resort fallback
+#   ip = "10.0.1.5"                        # replica plane, literal IP only
 #   advertised_address = "203.0.113.10"    # catch-all for unmatched clients
 #   replica_id = 0
 #   ports = { tcp = 8090, http = 3000, tcp_replica = 9090 }
