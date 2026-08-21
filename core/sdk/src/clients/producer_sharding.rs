@@ -110,15 +110,22 @@ impl Sizeable for ShardMessage {
 
 pub struct ShardMessageWithPermit {
     pub inner: ShardMessage,
-    _bytes_permit: Option<OwnedSemaphorePermit>,
+    bytes_permit: OwnedSemaphorePermit,
 }
 
 impl ShardMessageWithPermit {
     pub fn new(msg: ShardMessage, permit_bytes: OwnedSemaphorePermit) -> Self {
         Self {
             inner: msg,
-            _bytes_permit: Some(permit_bytes),
+            bytes_permit: permit_bytes,
         }
+    }
+
+    /// Takes over `other`'s messages together with its byte permit, so the buffered bytes stay
+    /// charged against the `max_buffer_size` budget until the merged batch has been written.
+    fn merge(&mut self, other: Self) {
+        self.inner.messages.extend(other.inner.messages);
+        self.bytes_permit.merge(other.bytes_permit);
     }
 }
 
@@ -212,6 +219,27 @@ impl Shard {
         }
     }
 
+    /// Drains the buffer into batches.
+    ///
+    /// If adjacent ShardMessages have the same destination (stream, topic, partition combination),
+    /// merge to avoid multiple sends.
+    /// The merge happens on both, the inner [`IggyMessage`] and the [`OwnedSemaphorePermit`].
+    fn merge_batches(buffer: &mut Vec<ShardMessageWithPermit>) -> Vec<ShardMessageWithPermit> {
+        let mut merged_batches: Vec<ShardMessageWithPermit> = Vec::with_capacity(buffer.len());
+        // Since buffer is a mutable reference, the drain leaves the buffer intact but empty,
+        // such that it can be filled up again.
+        for msg in buffer.drain(..) {
+            if let Some(last) = merged_batches.last_mut()
+                && Self::same_destination(&last.inner, &msg.inner)
+            {
+                last.merge(msg);
+                continue;
+            }
+            merged_batches.push(msg);
+        }
+        merged_batches
+    }
+
     async fn flush_buffer(
         core: &Arc<impl ProducerCoreBackend>,
         slots_permit: &Arc<Semaphore>,
@@ -223,18 +251,7 @@ impl Shard {
             return;
         }
 
-        let mut merged_batches: Vec<ShardMessageWithPermit> = Vec::new();
-        for msg in buffer.drain(..) {
-            if let Some(last) = merged_batches.last_mut()
-                && Self::same_destination(&last.inner, &msg.inner)
-            {
-                last.inner.messages.extend(msg.inner.messages);
-                continue;
-            }
-            merged_batches.push(msg);
-        }
-
-        for msg in merged_batches {
+        for msg in Self::merge_batches(buffer) {
             let _slot_permit = slots_permit.acquire().await;
 
             let result = core
@@ -310,6 +327,120 @@ mod tests {
             .payload(Bytes::from(vec![0u8; size]))
             .build()
             .unwrap()
+    }
+
+    async fn charged_batch(
+        budget: &Arc<Semaphore>,
+        stream: Arc<Identifier>,
+        topic: Arc<Identifier>,
+        payload_size: usize,
+    ) -> ShardMessageWithPermit {
+        let message = ShardMessage {
+            stream,
+            topic,
+            messages: vec![dummy_message(payload_size)],
+            partitioning: None,
+        };
+        let permit = budget
+            .clone()
+            .acquire_many_owned(message.get_size_bytes().as_bytes_u32())
+            .await
+            .unwrap();
+        ShardMessageWithPermit::new(message, permit)
+    }
+
+    #[tokio::test]
+    async fn test_merge_batches_keeps_permits_of_merged_batches_charged() {
+        let budget = Arc::new(Semaphore::new(10_000));
+        let stream = dummy_identifier();
+        let topic = dummy_identifier();
+
+        let mut buffer = Vec::new();
+        for _ in 0..3 {
+            buffer.push(charged_batch(&budget, stream.clone(), topic.clone(), 10).await);
+        }
+        let charged = 10_000 - budget.available_permits();
+        let merged = Shard::merge_batches(&mut buffer);
+
+        // The original buffer should be drained.
+        assert!(buffer.is_empty());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].inner.messages.len(), 3);
+        assert_eq!(budget.available_permits(), 10_000 - charged);
+
+        // Dropping merged gives back to the semaphore.
+        drop(merged);
+        assert_eq!(budget.available_permits(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_shard_keeps_budget_charged_until_merged_batch_is_written() {
+        const BUDGET: usize = 10_000;
+
+        // The two channels simulate the timing of a real write, which `flush_buffer` awaits at
+        // `core.send_internal`. Receiving on `write_started_rx` means the worker has entered that
+        // call, so the batch is on the wire and its bytes are still buffered from the producer's
+        // point of view. Sending on `release_write_tx` simulates that the call
+        // returns, the loop iteration ends and the batch drops and frees its permit.
+        let (write_started_tx, write_started_rx) = flume::unbounded::<()>();
+        let (release_write_tx, release_write_rx) = flume::unbounded::<()>();
+
+        let mut mock = MockProducerCoreBackend::new();
+        mock.expect_send_internal()
+            .times(1)
+            .returning(move |_, _, _, _| {
+                let write_started_tx = write_started_tx.clone();
+                let release_write_rx = release_write_rx.clone();
+                Box::pin(async move {
+                    write_started_tx.send_async(()).await.unwrap();
+                    release_write_rx.recv_async().await.unwrap();
+                    Ok(no_confirmations())
+                })
+            });
+
+        let bb = BackgroundConfig::builder()
+            .batch_length(3)
+            .batch_size(0)
+            .linger_time(IggyDuration::new_from_secs(60));
+        let config = Arc::new(bb.build());
+
+        let budget = Arc::new(Semaphore::new(BUDGET));
+        let slots_permit = Arc::new(Semaphore::new(100));
+
+        let (_stop_tx, stop_rx) = broadcast::channel(1);
+        let shard = Shard::new(
+            Arc::new(mock),
+            config,
+            slots_permit,
+            flume::unbounded().0,
+            stop_rx,
+        );
+
+        let stream = dummy_identifier();
+        let topic = dummy_identifier();
+        for _ in 0..3 {
+            let batch = charged_batch(&budget, stream.clone(), topic.clone(), 100).await;
+            shard.send(batch).await.unwrap();
+        }
+        let charged = BUDGET - budget.available_permits();
+        assert!(charged > 0);
+
+        // The three batches share a destination, so the flush merges them into a single write.
+        write_started_rx.recv_async().await.unwrap();
+        assert_eq!(
+            budget.available_permits(),
+            BUDGET - charged,
+            "the merged batch must hold every permit it absorbed until the write completes"
+        );
+
+        release_write_tx.send_async(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_permits() != BUDGET {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the written batch must give its permits back");
     }
 
     #[tokio::test]
