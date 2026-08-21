@@ -42,7 +42,7 @@ use crate::options::OptionSpec as PyOptionSpec;
 use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
-use crate::stream::StreamDetails;
+use crate::stream::{Stream, StreamDetails};
 use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
     UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
@@ -497,6 +497,132 @@ impl IggyClient {
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(stream.map(StreamDetails::from))
+        })
+    }
+
+    /// Return all streams visible to the authenticated user.
+    ///
+    /// The result is ordered by ascending numeric stream ID.
+    ///
+    /// Returns:
+    ///     A list of `Stream` summaries.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the client is not authenticated, the user lacks global
+    ///         `read_streams` or `manage_streams` permission, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Stream]]", imports=("collections.abc")))]
+    fn get_streams<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let streams = inner
+                .get_streams()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(streams.into_iter().map(Stream::from).collect::<Vec<_>>())
+        })
+    }
+
+    /// Rename a stream selected by name or numeric ID.
+    ///
+    /// `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
+    /// decimal-only string is interpreted as a numeric ID. `name` must be unique
+    /// and contain between 1 and 255 UTF-8 bytes. Renaming a stream to its current
+    /// name succeeds without changing it.
+    ///
+    /// Returns:
+    ///     None.
+    ///
+    /// Raises:
+    ///     TypeError: If `stream_id` is neither `str` nor `int`, or `name` is not
+    ///         `str`.
+    ///     OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+    ///     ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+    ///     RuntimeError: If the client is not authenticated, the user lacks global
+    ///         `manage_streams` or per-stream `manage_stream` permission, the
+    ///         stream does not exist, the new name is invalid or already used, or
+    ///         the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_stream<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+        name: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .update_stream(&stream_id, &name, &StreamUpdateOptions::default())
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Delete a stream selected by name or numeric ID.
+    ///
+    /// Deletion removes the stream and all of its topics, partitions, and messages.
+    /// `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
+    /// decimal-only string is interpreted as a numeric ID.
+    ///
+    /// Returns:
+    ///     None.
+    ///
+    /// Raises:
+    ///     TypeError: If `stream_id` is neither `str` nor `int`.
+    ///     OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+    ///     ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+    ///     RuntimeError: If the client is not authenticated, the user lacks global
+    ///         `manage_streams` or per-stream `manage_stream` permission, the
+    ///         stream does not exist, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn delete_stream<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .delete_stream(&stream_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Delete all messages from every topic in a stream.
+    ///
+    /// The stream, topics, and partitions remain available. Repeated purges of an
+    /// existing empty stream succeed. `stream_id` accepts a stream name as `str`
+    /// or numeric ID as `int`. A decimal-only string is interpreted as a numeric
+    /// ID.
+    ///
+    /// Returns:
+    ///     None.
+    ///
+    /// Raises:
+    ///     TypeError: If `stream_id` is neither `str` nor `int`.
+    ///     OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+    ///     ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+    ///     RuntimeError: If the client is not authenticated, the user lacks global
+    ///         `manage_streams` or per-stream `manage_stream` permission, the
+    ///         stream does not exist, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn purge_stream<'a>(
+        &self,
+        py: Python<'a>,
+        stream_id: PyIdentifier,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let stream_id = Identifier::try_from(stream_id)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .purge_stream(&stream_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
         })
     }
 

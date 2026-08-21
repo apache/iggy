@@ -22,13 +22,12 @@ This module provides pytest fixtures for setting up test environments
 and connecting to Iggy servers in various configurations.
 """
 
-# TODO(slbotbm): Create text fixture for clean up after
-# delete_stream() has been implemented.
-
 import asyncio
+import contextlib
 import os
 import secrets
 import string
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
@@ -106,6 +105,26 @@ def unique_name():
         return f"{prefix}{suffix}"
 
     return make_name
+
+
+@pytest.fixture(scope="function", autouse=True)
+async def cleanup_streams(
+    request: pytest.FixtureRequest,
+) -> AsyncGenerator[None, None]:
+    """Delete streams created by the current test."""
+    if "iggy_client" not in request.fixturenames:
+        yield
+        return
+
+    client: IggyClient = request.getfixturevalue("iggy_client")
+    existing_stream_ids = {stream.id for stream in await client.get_streams()}
+
+    yield
+
+    for stream in await client.get_streams():
+        if stream.id not in existing_stream_ids:
+            with contextlib.suppress(RuntimeError):
+                await client.delete_stream(stream.id)
 
 
 @pytest.fixture(scope="session", autouse=True)

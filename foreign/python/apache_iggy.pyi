@@ -49,6 +49,7 @@ __all__ = [
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "Stream",
     "StreamDetails",
     "StreamPermissions",
     "TcpConfig",
@@ -872,6 +873,27 @@ class IggyClient:
         Sends a ping request to the server to check connectivity.
         Raises `RuntimeError` if the connection fails.
         """
+    def describe_options(
+        self, scope: builtins.str
+    ) -> collections.abc.Awaitable[list[OptionSpec]]:
+        r"""
+        Describe the option catalog for a resource scope.
+
+        This is the discovery surface for the `options` argument on
+        `create_topic`/`update_topic`: a key outside the catalog is refused at
+        create, and the binary transports carry only the error code back.
+
+        Args:
+            scope: One of `"topic"`, `"stream"`, `"user"`.
+
+        Returns:
+            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+            with no keys yet.
+
+        Raises:
+            ValueError: If the scope name is not one of the three above.
+            RuntimeError: If the request fails.
+        """
     def login_user(
         self, username: builtins.str, password: builtins.str
     ) -> collections.abc.Awaitable[None]:
@@ -1034,26 +1056,85 @@ class IggyClient:
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
         """
-    def describe_options(
-        self, scope: builtins.str
-    ) -> collections.abc.Awaitable[builtins.list[OptionSpec]]:
+    def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
         r"""
-        Describe the option catalog for a resource scope.
+        Return all streams visible to the authenticated user.
 
-        This is the discovery surface for the `options` argument on
-        `create_topic`/`update_topic`: a key outside the catalog is refused at
-        create, and the binary transports carry only the error code back.
-
-        Args:
-            scope: One of `"topic"`, `"stream"`, `"user"`.
+        The result is ordered by ascending numeric stream ID.
 
         Returns:
-            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
-            with no keys yet.
+            A list of `Stream` summaries.
 
         Raises:
-            ValueError: If the scope name is not one of the three above.
-            RuntimeError: If the request fails.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `read_streams` or `manage_streams` permission, or the request fails.
+        """
+    def update_stream(
+        self, stream_id: builtins.str | builtins.int, name: builtins.str
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Rename a stream selected by name or numeric ID.
+
+        `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
+        decimal-only string is interpreted as a numeric ID. `name` must be unique
+        and contain between 1 and 255 UTF-8 bytes. Renaming a stream to its current
+        name succeeds without changing it.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is neither `str` nor `int`, or `name` is not
+                `str`.
+            OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, the new name is invalid or already used, or
+                the request fails.
+        """
+    def delete_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete a stream selected by name or numeric ID.
+
+        Deletion removes the stream and all of its topics, partitions, and messages.
+        `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
+        decimal-only string is interpreted as a numeric ID.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is neither `str` nor `int`.
+            OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, or the request fails.
+        """
+    def purge_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete all messages from every topic in a stream.
+
+        The stream, topics, and partitions remain available. Repeated purges of an
+        existing empty stream succeed. `stream_id` accepts a stream name as `str`
+        or numeric ID as `int`. A decimal-only string is interpreted as a numeric
+        ID.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is neither `str` nor `int`.
+            OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, or the request fails.
         """
     def create_topic(
         self,
@@ -1831,6 +1912,45 @@ class SendMessagesResponse:
         """
 
 @typing.final
+class Stream:
+    r"""
+    Summary information returned by `IggyClient.get_streams()`.
+
+    `created_at` is Unix time in microseconds. `size_bytes` is the stream's
+    current stored size in bytes.
+    """
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        Numeric stream identifier.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        Stream creation time as Unix time in microseconds.
+        """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        Unique stream name.
+        """
+    @property
+    def size_bytes(self) -> builtins.int:
+        r"""
+        Current stored stream size in bytes.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        Total messages across all topics in the stream.
+        """
+    @property
+    def topics_count(self) -> builtins.int:
+        r"""
+        Number of topics in the stream.
+        """
+
+@typing.final
 class StreamDetails:
     @property
     def id(self) -> builtins.int: ...
@@ -2093,8 +2213,8 @@ class Topic:
         r"""
         Options admission resolved for the keys the client did not send.
 
-        Same shape as `options`. These would have resolved differently under
-        another server configuration.
+        Same shape as [`Self::options`]. These would have resolved differently
+        under another server configuration.
         """
 
 @typing.final
@@ -2158,8 +2278,8 @@ class TopicDetails:
         r"""
         Options admission resolved for the keys the client did not send.
 
-        Same shape as `options`. These would have resolved differently under
-        another server configuration.
+        Same shape as [`Self::options`]. These would have resolved differently
+        under another server configuration.
         """
     @property
     def partitions(self) -> builtins.list[Partition]:
