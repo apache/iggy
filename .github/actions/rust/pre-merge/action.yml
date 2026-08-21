@@ -293,7 +293,12 @@ runs:
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
           if [[ -n "$NEXTEST_FILTER" ]]; then
-            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
+            # Every test target in the `bdd` crate is `required-features =
+            # ["bdd"]`, so the `cargo test --no-run` above builds no binaries
+            # for it. A PR touching only that crate then produces a valid
+            # filter that matches zero tests, and nextest's default
+            # `--no-tests=fail` turns that into exit 4 on a green PR.
+            cargo nextest run --locked --no-fail-fast --no-tests=warn --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
           else
             cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG
           fi
