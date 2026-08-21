@@ -1917,22 +1917,34 @@ async fn build_shard_for_thread(
             // this refuses are structural -- what a failed state-transfer
             // quarantine leaves behind, or damage the recovery walk proved
             // inside a segment -- so fence that group the same way the runtime
-            // path does -- move its segment files aside, keeping the superblock
-            // so it cannot re-enter view 0 -- and materialise it fresh. The
-            // ordinary rejoin path (repair, then state transfer on a refused
-            // floor) recovers its data from a peer; a single-replica group has
-            // no peer, so it comes back EMPTY while every refused byte stays
-            // in the quarantine directory for the operator.
+            // path does: move its segment files aside, keeping the superblock
+            // so it cannot re-enter view 0. What follows depends on whether a
+            // peer can restore the data. With peers, the group is materialised
+            // fresh and the ordinary rejoin path (repair, then state transfer
+            // on a refused floor) refills it. Single-replica, only the two
+            // directory-shape refusals (a hole from a stray or half-unlinked
+            // file, an orphaned empty segment) still rebuild: their segment
+            // bytes sit intact in quarantine and no damage verdict needs
+            // surfacing. Every refusal that proved or suspects damage
+            // tombstones instead -- a rebuilt empty partition answers polls
+            // exactly like a healthy empty one and hides the loss, while an
+            // unrouted namespace is a failure an operator can see.
             Err(ServerError::PartitionRecoveryRefused { dir, reason, .. }) => {
                 let partition_dir = dir.to_string_lossy().into_owned();
+                let rebuild_for_rejoin = topology.replica_count > 1
+                    || matches!(
+                        reason,
+                        PartitionRecoveryRefusal::Hole { .. }
+                            | PartitionRecoveryRefusal::EmptyNonTailSegment { .. }
+                    );
                 error!(
                     stream_id,
                     topic_id,
                     partition_id = partition_metadata.id,
                     partition_dir,
                     %reason,
-                    "refusing the recovered segment chain; fencing this partition and \
-                     rebuilding it empty for the rejoin path"
+                    "refusing the recovered segment chain; fencing this partition's \
+                     segment files"
                 );
                 match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
                     Ok(fenced_dir) => error!(
@@ -1973,6 +1985,18 @@ async fn build_shard_for_thread(
                 // counts only accepted chains), but the hydrate-reopen refusal
                 // arrives after a fully counted load, so clear them either way.
                 partition_stats.zero_out_all();
+                if !rebuild_for_rejoin {
+                    error!(
+                        stream_id,
+                        topic_id,
+                        partition_id = partition_metadata.id,
+                        partition_dir,
+                        "no peer replica holds this partition's data; tombstoning it \
+                         instead of serving it empty"
+                    );
+                    partitions.tombstone(namespace);
+                    continue;
+                }
                 build_partition_fresh(
                     config,
                     namespace,
@@ -2789,13 +2813,15 @@ async fn hydrate_partition_log(
 }
 
 /// Routes a hydrate-reopen writer failure. The seed-vs-stat divergence guard
-/// (`SegmentSizeMismatchAtOpen`) is the same structural contradiction the
-/// recovery walk refuses on -- and the heal path for data directories an
-/// earlier size-counter bug left with resurrected tails -- so it fences this
-/// one partition. Every other failure here (open, stat, sync) is transient
-/// I/O and stays node-fatal: a retried boot can still serve the partition,
-/// while fencing would quarantine healthy data (and at `replica_count = 1`
-/// destroy its availability outright).
+/// (`SegmentSizeMismatchAtOpen`) is a post-condition assertion on recovery's
+/// own truncation: pass C truncates every file to its recovered size before
+/// storage and writers reopen it, so the guard can only fire if the
+/// filesystem lied about a length or a change broke that truncate-then-open
+/// contract. Kept as defense-in-depth and routed as a structural refusal
+/// because a retried boot cannot help. Every other failure here (open, stat,
+/// sync) is transient I/O and stays node-fatal: a retried boot can still
+/// serve the partition, while fencing would quarantine healthy data (and at
+/// `replica_count = 1` tombstone the partition outright).
 fn hydrate_reopen_error(
     source: IggyError,
     partition_dir: &str,

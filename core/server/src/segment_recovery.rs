@@ -37,7 +37,8 @@ use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batc
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::{error, warn};
 
 const LOG_EXTENSION: &str = "log";
@@ -64,6 +65,19 @@ const SCAN_WINDOW_CAPACITY: usize = 4 * 1024 * 1024;
 /// batch always gets one.
 const REBUILT_INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 
+/// Multiple of the residue width cap the damage probe may spend, counting
+/// bytes read from disk plus bytes handed to batch verification. The width
+/// cap already bounds how much residue is scanned at all; the budget is a
+/// second line of defense against shapes whose decodable headers claim large
+/// batches at many byte offsets, each paying a verify over window bytes that
+/// were read once. Exhaustion refuses recovery; it never falls through to
+/// the truncating no-survivor verdict.
+const PROBE_BUDGET_MULTIPLIER: u64 = 2;
+
+/// Attempts at finding a free `<partition dir>.fenced.<n>` name, mirroring
+/// the partition-level quarantine's bound.
+const FENCED_DIR_PROBE_LIMIT: u32 = 1000;
+
 /// A persisted segment recovered from disk: its metadata plus the storage
 /// handles (readers/writers) opened over its `.log` / `.index` files.
 pub struct RecoveredSegment {
@@ -75,19 +89,26 @@ pub struct RecoveredSegment {
 ///
 /// Segment offsets and timestamps are recovered from the 24-byte sparse index
 /// (see module docs); segment byte size comes from walking the `.log` batch
-/// chain. Recovery runs in three passes: every segment is bounded READ-ONLY
-/// first, then the chain guard runs over those bounds, and only an accepted
-/// chain is made physical -- torn tails truncated, index-less indexes rebuilt
-/// -- before storage opens over it. A refusal at any point therefore leaves
-/// every file byte-identical to what boot found. The last segment is left
-/// unsealed so it can accept further writes.
+/// chain. Recovery runs in three passes: every segment is bounded first
+/// without touching an existing byte (pass A's only write is staging each
+/// rebuilt index in a fresh `.staging` file), then the chain guard runs over
+/// those bounds, and only an accepted chain is made physical -- torn tails
+/// truncated, staged indexes renamed into place, unreadable segments fenced
+/// aside -- before storage opens over it. A refusal raised in pass A or B
+/// therefore leaves every pre-existing file byte-identical to what boot found
+/// (staged scratch is swept at the next boot or quarantined with the fence).
+/// Pass C is NOT atomic across segments: its own refusals -- the storage-open
+/// guard -- can land after earlier segments in the chain were already
+/// truncated. The last segment is left unsealed so it can accept further
+/// writes.
 ///
 /// # Errors
 ///
 /// Transient I/O failures (listing, stat, open, read, truncate, fsync) are
 /// returned as-is and abort the boot so it can be retried. Structural
 /// contradictions -- a holed chain, an index diverging from its log, damage
-/// with intact batches after it -- return
+/// with intact batches after it, residue the damage probe could not classify
+/// within its limits -- return
 /// [`ServerError::PartitionRecoveryRefused`] so the caller can fence this one
 /// partition instead of taking the node down.
 #[allow(clippy::too_many_lines)]
@@ -118,11 +139,14 @@ pub async fn load_persisted_segments(
 
     let max_size = segment_size;
     let mut scratch = ScanScratch::default();
+    let probe_limits = ProbeLimits::from_config(config);
 
-    // Pass A: derive every segment's bounds without touching disk. Nothing
-    // moves until the WHOLE chain is accepted, so a refusal raised by a later
-    // segment (or by the chain guard) leaves the earlier segments' files
-    // byte-identical for the caller's quarantine to keep.
+    // Pass A: derive every segment's bounds without touching an existing
+    // byte (the only write is each rebuilt index staged to a fresh
+    // `.staging` scratch file). Nothing moves until the WHOLE chain is
+    // accepted, so a refusal raised by a later segment (or by the chain
+    // guard) leaves the earlier segments' files byte-identical for the
+    // caller's quarantine to keep.
     let mut planned = Vec::with_capacity(start_offsets.len());
     for start_offset in start_offsets {
         let messages_path =
@@ -142,20 +166,23 @@ pub async fn load_persisted_segments(
             &messages_path,
             start_offset,
             raw_messages_size,
+            probe_limits,
             &mut scratch,
         )
         .await?;
 
         // `bounds == None` means the log holds no whole batch ANYWHERE: the
         // index-less walk tried from byte 0 and the damage probe found no
-        // surviving batch deeper in the file. There is nothing to recover:
-        // zeroed sizes make the next append overwrite the torn bytes, where
-        // counting them with `end_offset == start_offset` would fabricate one
+        // surviving batch deeper in the file. There is nothing to serve:
+        // zeroed sizes seed fresh empty files (pass C fences the unreadable
+        // originals aside rather than deleting them), where counting the
+        // bytes with `end_offset == start_offset` would fabricate one
         // phantom message for the bootstrap non-empty filters and strand
         // undecodable garbage inside the readable range. Note this is NOT
         // tail-only -- a torn index is reachable mid-chain on the shipped
         // `enforce_fsync = false`, which is why the walk exists rather than
         // refusing the partition.
+        let recovered_empty = bounds.is_none();
         let bounds = bounds.unwrap_or_else(|| {
             if raw_messages_size > 0 {
                 warn!(
@@ -166,7 +193,7 @@ pub async fn load_persisted_segments(
                     messages_size = raw_messages_size,
                     "segment log holds bytes but no whole batch decodes \
                      anywhere in it (torn write); recovering the segment as \
-                     empty"
+                     empty and fencing its files aside"
                 );
             }
             WalkedBounds {
@@ -178,6 +205,13 @@ pub async fn load_persisted_segments(
                 rebuilt_index: None,
             }
         });
+
+        // Staged now so pass C can install it with one atomic rename, and so
+        // a long chain never holds more than one rebuilt index in memory.
+        let rebuilt_index_staging = match &bounds.rebuilt_index {
+            Some(entries) => Some(stage_rebuilt_index(&index_path, entries)?),
+            None => None,
+        };
 
         let mut segment = Segment::new(start_offset, max_size);
         segment.sealed = true;
@@ -193,7 +227,8 @@ pub async fn load_persisted_segments(
             messages_path,
             index_path,
             index_size: bounds.index_size,
-            rebuilt_index: bounds.rebuilt_index,
+            rebuilt_index_staging,
+            recovered_empty,
         });
     }
 
@@ -210,14 +245,28 @@ pub async fn load_persisted_segments(
     let mut recovered = Vec::with_capacity(planned.len());
     for plan in planned {
         let messages_size = plan.segment.size.as_bytes_u64();
+        if plan.recovered_empty {
+            // The pair holds bytes that prove nothing, yet they are the only
+            // copy of whatever the crash tore: move them aside and seed fresh
+            // empty files rather than truncating them away.
+            fence_unrecoverable_segment_files(
+                identity,
+                &plan.messages_path,
+                &plan.index_path,
+                plan.segment.start_offset,
+            )?;
+        }
         // Log first, index second: a walk only accepts bounds when a whole
         // batch decodes at the last index entry's position, so the walked log
         // length strictly exceeds that position and every surviving index
         // entry still points inside the shortened log even if a crash lands
-        // between the two mutations.
+        // between the two mutations. The staged-rebuild install keeps the
+        // same property: until its rename lands, the on-disk index still
+        // holds no whole entry, so a crash between the two re-runs the
+        // index-less walk over the already-truncated log.
         truncate_to(&plan.messages_path, messages_size)?;
-        if let Some(rebuilt_index) = &plan.rebuilt_index {
-            write_rebuilt_index(&plan.index_path, rebuilt_index)?;
+        if let Some(staging_path) = &plan.rebuilt_index_staging {
+            install_rebuilt_index(staging_path, &plan.index_path, identity.partition_path)?;
         } else {
             truncate_to(&plan.index_path, plan.index_size)?;
         }
@@ -239,11 +288,13 @@ pub async fn load_persisted_segments(
                 error = %source,
                 "failed to open persisted segment storage during recovery"
             );
-            // The seed-vs-stat guard refusing the open means disk diverged
-            // from the size this pass just truncated to: structural, and the
-            // heal path for data directories an earlier size-counter bug left
-            // with resurrected tails. Everything else here is transient I/O
-            // and stays node-fatal.
+            // The seed-vs-stat guard refusing the open is a post-condition
+            // assertion on the truncation this pass just performed: it can
+            // only fire if the filesystem lied about a length or a change
+            // broke the truncate-then-open contract. Kept as defense-in-depth
+            // and routed as a structural refusal (fence one partition, not
+            // the node) because a retried boot cannot help. Everything else
+            // here is transient I/O and stays node-fatal.
             match source {
                 IggyError::SegmentSizeMismatchAtOpen(on_disk_bytes, expected_bytes) => identity
                     .refusal(PartitionRecoveryRefusal::StorageSizeMismatch {
@@ -301,7 +352,34 @@ struct PlannedSegment {
     messages_path: String,
     index_path: String,
     index_size: u64,
-    rebuilt_index: Option<Vec<u8>>,
+    /// Path of the staged rebuilt index pass C renames over `index_path`.
+    rebuilt_index_staging: Option<String>,
+    /// The pair holds bytes but nothing in them decodes; pass C fences the
+    /// files aside and reseeds empty ones instead of truncating.
+    recovered_empty: bool,
+}
+
+/// Hard bounds on the damage probe, derived once per partition load from
+/// `message_bus.max_message_size` -- the knob that caps an appendable batch,
+/// and so the widest record a torn append can leave holed.
+#[derive(Clone, Copy)]
+struct ProbeLimits {
+    /// Widest residue the probe classifies at all; anything wider refuses
+    /// without a scan.
+    max_residue_bytes: u64,
+    /// Bytes read plus bytes handed to verification before the probe gives
+    /// up and refuses.
+    scan_budget_bytes: u64,
+}
+
+impl ProbeLimits {
+    fn from_config(config: &ServerConfig) -> Self {
+        let max_residue_bytes = config.message_bus.max_message_size.as_bytes_u64();
+        Self {
+            max_residue_bytes,
+            scan_budget_bytes: max_residue_bytes.saturating_mul(PROBE_BUDGET_MULTIPLIER),
+        }
+    }
 }
 
 /// Readable bounds recovered for one segment holding data.
@@ -450,8 +528,8 @@ fn sweep_scratch_files_and_collect_offsets(partition_path: &str) -> Result<Vec<u
 /// Any other stat failure is fail-stop, mirroring the `NotFound`-only leniency
 /// of the directory listing above: recovery physically truncates files to the
 /// bounds derived from these lengths, so folding a transient `EACCES` or
-/// `EIO` into 0 would route a healthy segment into recover-as-empty and
-/// truncate it to nothing (worst route: an index stat error floors a healthy
+/// `EIO` into 0 would route a healthy segment into recover-as-empty, fencing
+/// it out of service (worst route: an index stat error floors a healthy
 /// sealed index to a 0-byte target while its entries still load).
 fn file_len(path: &str) -> Result<u64, ServerError> {
     match fs::metadata(path) {
@@ -545,32 +623,36 @@ fn truncate_to(path: &str, target_size: u64) -> Result<(), ServerError> {
     Ok(())
 }
 
-/// Persists the index rebuilt by the index-less walk, replacing whatever
-/// partial or stale bytes the crash left. Without this a SEALED segment --
-/// which never flushes again -- would keep an empty index forever and pay a
-/// full log scan on every poll.
+/// Stages the index rebuilt by the index-less walk in a scratch file beside
+/// its final name. Without a rebuild a SEALED segment -- which never flushes
+/// again -- would keep an empty index forever and pay a full log scan on
+/// every poll.
 ///
-/// Written straight to the final path: a crash mid-write leaves a shorter
-/// index whose whole entries are a valid prefix of this same rebuild, and the
-/// next boot walks and rewrites it again -- recovery is itself the repair
-/// path for a torn index, so no rename dance is needed.
-fn write_rebuilt_index(path: &str, entries: &[u8]) -> Result<(), ServerError> {
+/// Staged, not written in place: an in-place writeback can tear -- a crash
+/// mid-write may persist a later page while an earlier one still reads
+/// zeros, and 24-byte zero runs decode as valid non-monotone entries, so the
+/// next boot would fence the whole partition over its own repair artifact.
+/// The staging file is pure scratch until pass C renames it into place: the
+/// boot sweep unlinks orphaned `*.staging` files, so a crash anywhere before
+/// the rename costs nothing.
+fn stage_rebuilt_index(index_path: &str, entries: &[u8]) -> Result<String, ServerError> {
+    let staging_path = format!("{index_path}{STAGING_SUFFIX}");
     let file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(path)
+        .open(&staging_path)
         .map_err(|source| {
             error!(
-                path,
+                path = %staging_path,
                 error = %source,
-                "failed to open a sparse index file for rebuild during recovery"
+                "failed to open a sparse index staging file during recovery"
             );
             ServerError::from(IggyError::CannotWriteToFile)
         })?;
     file.write_all_at(entries, 0).map_err(|source| {
         error!(
-            path,
+            path = %staging_path,
             error = %source,
             "failed to write a rebuilt sparse index during recovery"
         );
@@ -578,13 +660,177 @@ fn write_rebuilt_index(path: &str, entries: &[u8]) -> Result<(), ServerError> {
     })?;
     file.sync_all().map_err(|source| {
         error!(
-            path,
+            path = %staging_path,
             error = %source,
             "failed to fsync a rebuilt sparse index after recovery"
         );
         ServerError::from(IggyError::CannotSyncFile)
     })?;
+    Ok(staging_path)
+}
+
+/// Installs a staged rebuilt index at its final name. The rename is the
+/// atomic commit point: the on-disk index is either the old one holding no
+/// whole entry (whose walk re-runs the rebuild) or the complete rebuilt one,
+/// never a mix of pages from both.
+fn install_rebuilt_index(
+    staging_path: &str,
+    index_path: &str,
+    partition_path: &str,
+) -> Result<(), ServerError> {
+    fs::rename(staging_path, index_path).map_err(|source| {
+        error!(
+            from = %staging_path,
+            to = %index_path,
+            error = %source,
+            "failed to rename a rebuilt sparse index into place during recovery"
+        );
+        ServerError::from(IggyError::CannotWriteToFile)
+    })?;
+    fsync_dir(partition_path)
+}
+
+/// Makes renames and new files in `dir` durable. Synchronous like every
+/// other mutation in this module (see [`FileScanner`]).
+fn fsync_dir(dir: &str) -> Result<(), ServerError> {
+    fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|source| {
+            error!(
+                dir,
+                error = %source,
+                "failed to fsync a directory during recovery"
+            );
+            ServerError::from(IggyError::CannotSyncFile)
+        })
+}
+
+/// Moves a segment pair that recovery proved unreadable into a fresh
+/// `<partition dir>.fenced.<n>` directory -- the naming the partition-level
+/// quarantine uses, so operators grep one pattern -- and seeds empty files
+/// at the original names for the empty recovery to open. The bytes prove
+/// nothing, yet they are the only copy of whatever the crash tore, so the
+/// one verdict that would otherwise destroy data keeps it instead.
+///
+/// Index first, log second on the reseed: recovery keys on `.log` stems and
+/// sweeps orphaned indexes, so a crash between the two creates leaves only
+/// states a later boot already understands (segment absent, or one orphan
+/// index).
+fn fence_unrecoverable_segment_files(
+    identity: PartitionIdentity<'_>,
+    messages_path: &str,
+    index_path: &str,
+    start_offset: u64,
+) -> Result<(), ServerError> {
+    let log_bytes = file_len(messages_path)?;
+    let index_bytes = file_len(index_path)?;
+    if log_bytes == 0 && index_bytes == 0 {
+        return Ok(());
+    }
+    let mut fenced_dir = None;
+    for attempt in 0..FENCED_DIR_PROBE_LIMIT {
+        let candidate = format!("{}.fenced.{attempt}", identity.partition_path);
+        // `create_dir`, not `create_dir_all`: success is the claim on this
+        // suffix, and merging into an existing fence would mix evidence from
+        // two incidents.
+        match fs::create_dir(&candidate) {
+            Ok(()) => {
+                fenced_dir = Some(candidate);
+                break;
+            }
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => {
+                error!(
+                    path = %candidate,
+                    error = %source,
+                    "failed to create a fence directory during recovery"
+                );
+                return Err(IggyError::CannotWriteToFile.into());
+            }
+        }
+    }
+    let Some(fenced_dir) = fenced_dir else {
+        error!(
+            partition_path = identity.partition_path,
+            "every fence directory suffix is taken; refusing to merge into one"
+        );
+        return Err(IggyError::CannotWriteToFile.into());
+    };
+    let fenced_log = fenced_target(&fenced_dir, messages_path)?;
+    let fenced_index = fenced_target(&fenced_dir, index_path)?;
+    rename_into_fence(messages_path, &fenced_log)?;
+    rename_into_fence(index_path, &fenced_index)?;
+    seed_empty_file(index_path)?;
+    seed_empty_file(messages_path)?;
+    // The fence directory's new dirents, the partition directory's renames
+    // plus fresh files, and the parent's new fence-directory dirent.
+    fsync_dir(&fenced_dir)?;
+    fsync_dir(identity.partition_path)?;
+    if let Some(parent) = Path::new(identity.partition_path)
+        .parent()
+        .and_then(Path::to_str)
+    {
+        fsync_dir(parent)?;
+    }
+    warn!(
+        stream_id = identity.stream_id,
+        topic_id = identity.topic_id,
+        partition_id = identity.partition_id,
+        start_offset,
+        fenced_log = %fenced_log.display(),
+        fenced_index = %fenced_index.display(),
+        log_bytes,
+        index_bytes,
+        "segment holds bytes but nothing in it decodes; moved the whole \
+         .log/.index pair into the fence directory and recovered the segment \
+         empty over fresh files"
+    );
     Ok(())
+}
+
+/// Destination of one fenced file: the fence directory plus the file's own
+/// name, so the fenced copy stays greppable by its segment stem.
+fn fenced_target(fenced_dir: &str, source_path: &str) -> Result<PathBuf, ServerError> {
+    Path::new(source_path).file_name().map_or_else(
+        || {
+            error!(
+                source_path,
+                "segment file path has no final component; cannot fence it"
+            );
+            Err(IggyError::CannotWriteToFile.into())
+        },
+        |name| Ok(Path::new(fenced_dir).join(name)),
+    )
+}
+
+fn rename_into_fence(source_path: &str, target: &Path) -> Result<(), ServerError> {
+    match fs::rename(source_path, target) {
+        Ok(()) => Ok(()),
+        // A missing index beside a present log has nothing to move.
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => {
+            error!(
+                from = source_path,
+                to = %target.display(),
+                error = %source,
+                "failed to move an unreadable segment file into its fence directory"
+            );
+            Err(IggyError::CannotWriteToFile.into())
+        }
+    }
+}
+
+fn seed_empty_file(path: &str) -> Result<(), ServerError> {
+    fs::File::create(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| {
+            error!(
+                path,
+                error = %source,
+                "failed to seed a fresh empty segment file after fencing"
+            );
+            ServerError::from(IggyError::CannotWriteToFile)
+        })
 }
 
 /// Derives a segment's readable bounds. `None` when the log holds no whole
@@ -598,7 +844,8 @@ fn write_rebuilt_index(path: &str, entries: &[u8]) -> Result<(), ServerError> {
 /// bytes are incomplete. Without one, the log itself is walked from byte 0 and
 /// the index is rebuilt from the batches found. Either way, bytes left past
 /// the walked prefix go through the damage probe: a torn tail truncates, but
-/// damage with intact batches after it refuses recovery.
+/// damage with intact batches after it -- or residue the probe cannot
+/// classify within its limits -- refuses recovery.
 #[allow(clippy::too_many_lines)]
 async fn recover_segment_bounds(
     identity: PartitionIdentity<'_>,
@@ -606,6 +853,7 @@ async fn recover_segment_bounds(
     messages_path: &str,
     start_offset: u64,
     messages_size: u64,
+    probe_limits: ProbeLimits,
     scratch: &mut ScanScratch,
 ) -> Result<Option<WalkedBounds>, ServerError> {
     let reader = IggyIndexReader::new(index_path).await.map_err(|source| {
@@ -664,7 +912,7 @@ async fn recover_segment_bounds(
             validate_index_entries(identity, index_path, start_offset, entry_count, scratch)?;
 
             let messages = open_messages_file(identity, messages_path)?;
-            let mut scanner = FileScanner::new(&messages, messages_size, scratch);
+            let mut scanner = FileScanner::new(&messages, messages_size, probe_limits, scratch);
             // The sparse index holds ONE entry per flushed chunk, pointing
             // at the chunk's FIRST batch -- `last.offset` is where the last
             // chunk STARTS, not where the segment ends (a whole journal
@@ -674,6 +922,7 @@ async fn recover_segment_bounds(
             let mut position = last.position;
             let mut end_offset = last.offset;
             let mut end_timestamp = last.timestamp;
+            let mut expected_offset = last.offset;
             let mut walked_any = false;
             // TODO(hubcio): this indexed walk trusts the header decode alone,
             // so a torn flush that persisted the header page but zeroed the
@@ -692,14 +941,37 @@ async fn recover_segment_bounds(
                 if extent > messages_size {
                     break;
                 }
+                // The anchor entry names the offset its chunk starts at, and
+                // batches inside one segment are contiguous from there. A
+                // decodable header that breaks the chain is not a later
+                // flush of this segment: absorbing it would adopt offsets
+                // the chain never proved -- a lower one regresses the
+                // partition's offset counter at bootstrap and re-mints
+                // already-served offsets on the next append, and one below
+                // the segment start underflows the recovered message count.
+                // Refuse, mirroring the index-less walk.
+                if header.base_offset != expected_offset {
+                    return Err(
+                        identity.refusal(PartitionRecoveryRefusal::OffsetDiscontinuity {
+                            start_offset,
+                            expected_offset,
+                            found_offset: header.base_offset,
+                            position,
+                        }),
+                    );
+                }
                 if header.message_count > 0 {
                     end_offset = header
                         .base_offset
                         .saturating_add(u64::from(header.message_count) - 1);
                     end_timestamp = header.base_timestamp;
+                    expected_offset = end_offset.saturating_add(1);
                 }
                 walked_any = true;
                 position = extent;
+                if scanner.take_refilled() {
+                    yield_to_reactor().await;
+                }
             }
             if !walked_any {
                 return Err(
@@ -719,7 +991,8 @@ async fn recover_segment_bounds(
                 messages_size,
                 Some(end_offset),
                 start_offset,
-            )?;
+            )
+            .await?;
             Ok(Some(WalkedBounds {
                 start_timestamp: first.timestamp,
                 end_timestamp,
@@ -744,7 +1017,7 @@ async fn recover_segment_bounds(
         // a sealed segment does not pay a full-scan poll penalty forever.
         _ if messages_size > 0 => {
             let messages = open_messages_file(identity, messages_path)?;
-            let mut scanner = FileScanner::new(&messages, messages_size, scratch);
+            let mut scanner = FileScanner::new(&messages, messages_size, probe_limits, scratch);
             let mut position = 0u64;
             let mut start_timestamp = None;
             let mut end_offset = start_offset;
@@ -810,6 +1083,9 @@ async fn recover_segment_bounds(
                     }
                 }
                 position = extent;
+                if scanner.take_refilled() {
+                    yield_to_reactor().await;
+                }
             }
             refuse_if_survivor_past_damage(
                 identity,
@@ -819,7 +1095,8 @@ async fn recover_segment_bounds(
                 messages_size,
                 start_timestamp.map(|_| end_offset),
                 start_offset,
-            )?;
+            )
+            .await?;
             let Some(start_timestamp) = start_timestamp else {
                 // Not one whole batch, and the probe above proved nothing
                 // decodable follows either: the bytes really are unusable, so
@@ -934,7 +1211,7 @@ fn validate_index_entries(
 /// failure, mirroring `file_len`: recovery truncates to the bounds the walk
 /// produces, so folding an open failure into "walked nothing" would route a
 /// healthy indexed segment into a divergence refusal -- or an index-less one
-/// into recover-as-empty, truncating the whole log to zero.
+/// into recover-as-empty, fencing the whole log out of service.
 fn open_messages_file(
     identity: PartitionIdentity<'_>,
     messages_path: &str,
@@ -977,10 +1254,17 @@ fn scan_read_failure(
 /// decodes, checksums, and plausibly extends the chain is durable data -- it
 /// can only exist because an append completed after the damaged region -- so
 /// discarding it would hide real loss behind a silent boot-time repair.
-/// Unlike the WAL there is NO width cap on the damage: a segment flush chunk
-/// is unbounded, so any amount of trailing garbage can still be one torn
-/// write.
-fn refuse_if_survivor_past_damage(
+///
+/// What needs bounding is the torn RECORD, not the flush chunk: a flush
+/// chunk is unbounded, but every record inside it is capped by
+/// `message_bus.max_message_size`, and a residue holding no complete batch
+/// is about one record wide by construction -- any following whole batch
+/// verifies and ends the probe. Several holed near-max records can stack
+/// wider than the cap, which is exactly why cap and budget exhaustion REFUSE
+/// and keep the bytes rather than truncating: past the limits the probe has
+/// proven nothing, and the cheapest input to construct must never earn the
+/// destructive verdict.
+async fn refuse_if_survivor_past_damage(
     identity: PartitionIdentity<'_>,
     scanner: &mut FileScanner<'_>,
     messages_path: &str,
@@ -993,17 +1277,54 @@ fn refuse_if_survivor_past_damage(
         // The walk consumed the whole file: nothing to classify.
         return Ok(());
     }
-    let survivor = scanner
-        .probe_for_survivor(damage_position, chain_end_offset, start_offset)
-        .map_err(|source| scan_read_failure(identity, messages_path, &source))?;
-    if let Some(survivor_position) = survivor {
-        return Err(identity.refusal(PartitionRecoveryRefusal::InteriorDamage {
-            start_offset,
-            damage_position,
-            survivor_position,
-        }));
+    let residue_bytes = messages_size - damage_position;
+    let limits = scanner.limits;
+    if residue_bytes > limits.max_residue_bytes {
+        return Err(
+            identity.refusal(PartitionRecoveryRefusal::UnverifiedResidue {
+                start_offset,
+                damage_position,
+                residue_bytes,
+                scan_limit_bytes: limits.max_residue_bytes,
+            }),
+        );
     }
-    Ok(())
+    match scanner
+        .probe_for_survivor(damage_position, chain_end_offset, start_offset)
+        .await
+        .map_err(|source| scan_read_failure(identity, messages_path, &source))?
+    {
+        ProbeOutcome::Survivor { position } => {
+            Err(identity.refusal(PartitionRecoveryRefusal::InteriorDamage {
+                start_offset,
+                damage_position,
+                survivor_position: position,
+            }))
+        }
+        ProbeOutcome::BudgetExhausted => Err(identity.refusal(
+            PartitionRecoveryRefusal::UnverifiedResidue {
+                start_offset,
+                damage_position,
+                residue_bytes,
+                scan_limit_bytes: limits.scan_budget_bytes,
+            },
+        )),
+        ProbeOutcome::NoSurvivor => Ok(()),
+    }
+}
+
+/// Verdict of the damage probe over the residue past the walked prefix.
+/// `NoSurvivor` is the only verdict that permits truncation; running out of
+/// budget is deliberately NOT folded into it, so a residue that is expensive
+/// to scan refuses (keeping the bytes) instead of earning the destructive
+/// outcome.
+enum ProbeOutcome {
+    /// A complete, checksum-verifying batch starts at this position.
+    Survivor { position: u64 },
+    /// The whole residue was scanned and nothing in it verifies.
+    NoSurvivor,
+    /// The scan budget ran out before the residue was classified.
+    BudgetExhausted,
 }
 
 /// Forward-only buffered reads over one segment file for the recovery walk
@@ -1019,22 +1340,40 @@ fn refuse_if_survivor_past_damage(
 struct FileScanner<'scan> {
     file: &'scan fs::File,
     file_len: u64,
+    limits: ProbeLimits,
     window: &'scan mut Vec<u8>,
     window_start: u64,
     spill: &'scan mut Vec<u8>,
+    refilled: bool,
 }
 
 impl<'scan> FileScanner<'scan> {
-    fn new(file: &'scan fs::File, file_len: u64, scratch: &'scan mut ScanScratch) -> Self {
+    fn new(
+        file: &'scan fs::File,
+        file_len: u64,
+        limits: ProbeLimits,
+        scratch: &'scan mut ScanScratch,
+    ) -> Self {
         let ScanScratch { window, spill } = scratch;
         window.clear();
         Self {
             file,
             file_len,
+            limits,
             window,
             window_start: 0,
             spill,
+            refilled: false,
         }
+    }
+
+    /// True when the scanner hit disk since the last call. The async scan
+    /// loops yield to the reactor once per window of work on it: recovery
+    /// runs in front of the bootstrap barrier with the blocking pool sized
+    /// at zero, so an unyielding walk over a damaged multi-GiB chain would
+    /// pin the shard core -- signal handling included -- until it finishes.
+    fn take_refilled(&mut self) -> bool {
+        std::mem::take(&mut self.refilled)
     }
 
     /// Bytes `[position, position + len)`, or `None` when they run past the
@@ -1050,6 +1389,7 @@ impl<'scan> FileScanner<'scan> {
             // A batch larger than the window: one direct read, no windowing.
             self.spill.resize(len, 0);
             self.file.read_exact_at(&mut self.spill[..], position)?;
+            self.refilled = true;
             return Ok(Some(&self.spill[..]));
         }
         let window_end = self.window_start + self.window.len() as u64;
@@ -1059,6 +1399,7 @@ impl<'scan> FileScanner<'scan> {
             self.window.resize(fill, 0);
             self.file.read_exact_at(&mut self.window[..], position)?;
             self.window_start = position;
+            self.refilled = true;
         }
         // In-window by the branch above, and the window is capacity-bounded,
         // so the try_from cannot fail.
@@ -1075,45 +1416,124 @@ impl<'scan> FileScanner<'scan> {
         Ok(BatchHeader::decode(bytes).ok())
     }
 
-    /// Position of the first complete, checksum-verifying batch starting
-    /// after `damage_position`, or `None` when the residue holds none.
+    /// Probes the residue for the first complete, checksum-verifying batch
+    /// starting after `damage_position`.
     ///
     /// Batch starts are byte-aligned (appends write exact-sized records with
     /// no padding) and the damaged region's own lengths cannot be trusted, so
-    /// every offset is a candidate. The header decode pre-filters candidates
-    /// cheaply -- 204 reserved bytes must be zero -- and offset sanity plus
-    /// length bounds run before a checksum is paid, so the full verify only
-    /// runs on byte positions that already look like a plausible chain
+    /// every byte offset is a candidate. Candidates are scanned inside the
+    /// loaded window and the window advances sequentially -- refilled at the
+    /// first candidate whose header no longer fits, re-reading at most one
+    /// header of overlap -- so each residue byte is read O(1) times instead
+    /// of once per candidate. The header decode pre-filters candidates
+    /// cheaply (204 reserved bytes must be zero), and offset sanity plus
+    /// length bounds run before a verify is paid, so the checksum only runs
+    /// on byte positions that already look like a plausible chain
     /// continuation.
-    fn probe_for_survivor(
+    ///
+    /// Every byte read from disk and every byte handed to verification is
+    /// charged against the scan budget. Charging the handed slice whole --
+    /// even when the verify bails early or the bytes were already windowed --
+    /// is deliberate: verification cost is what a crafted residue can inflate
+    /// without adding reads, and a pessimistic charge keeps the bound
+    /// deterministic. Exhaustion returns [`ProbeOutcome::BudgetExhausted`],
+    /// never `NoSurvivor`.
+    async fn probe_for_survivor(
         &mut self,
         damage_position: u64,
         chain_end_offset: Option<u64>,
         start_offset: u64,
-    ) -> io::Result<Option<u64>> {
+    ) -> io::Result<ProbeOutcome> {
+        let header_len = COMMAND_HEADER_SIZE as u64;
+        let mut spent_bytes = 0u64;
         // The bytes AT the damage already failed to decode or verify, so the
         // first candidate starts one past them.
         let mut candidate = damage_position.saturating_add(1);
-        while candidate.saturating_add(COMMAND_HEADER_SIZE as u64) <= self.file_len {
-            if let Some(header) = self.peek_header(candidate)? {
-                let advances_chain = chain_end_offset
-                    .map_or(header.base_offset >= start_offset, |chain_end| {
-                        header.base_offset > chain_end
-                    });
-                let fits = candidate.saturating_add(header.total_size() as u64) <= self.file_len;
-                if advances_chain
-                    && fits
-                    && header.message_count > 0
-                    && let Some(batch) = self.slice_at(candidate, header.total_size())?
-                    && decode_batch_slice(batch).is_ok()
+        while candidate.saturating_add(header_len) <= self.file_len {
+            spent_bytes = spent_bytes.saturating_add(self.fill_window_at(candidate)?);
+            let window_end = self.window_start + self.window.len() as u64;
+            while candidate.saturating_add(header_len) <= window_end {
+                // In-window by the loop bound, and the window is
+                // capacity-bounded, so the try_from cannot fail.
+                let at = usize::try_from(candidate - self.window_start).unwrap_or(0);
+                if let Ok(header) = BatchHeader::decode(&self.window[at..at + COMMAND_HEADER_SIZE])
                 {
-                    return Ok(Some(candidate));
+                    let advances_chain = chain_end_offset
+                        .map_or(header.base_offset >= start_offset, |chain_end| {
+                            header.base_offset > chain_end
+                        });
+                    let total_size = header.total_size();
+                    let fits = candidate.saturating_add(total_size as u64) <= self.file_len;
+                    if advances_chain && fits && header.message_count > 0 {
+                        let (batch, read_bytes) = self.verify_slice(candidate, total_size)?;
+                        if decode_batch_slice(batch).is_ok() {
+                            return Ok(ProbeOutcome::Survivor {
+                                position: candidate,
+                            });
+                        }
+                        spent_bytes = spent_bytes
+                            .saturating_add(read_bytes)
+                            .saturating_add(total_size as u64);
+                    }
+                }
+                candidate += 1;
+                if spent_bytes > self.limits.scan_budget_bytes {
+                    return Ok(ProbeOutcome::BudgetExhausted);
                 }
             }
-            candidate += 1;
+            if self.take_refilled() {
+                yield_to_reactor().await;
+            }
         }
-        Ok(None)
+        Ok(ProbeOutcome::NoSurvivor)
     }
+
+    /// Anchors the window at `position` unless the header there already sits
+    /// inside it; returns the bytes read (0 on a hit). The probe's outer
+    /// loop refills through this, so its windows advance strictly forward.
+    fn fill_window_at(&mut self, position: u64) -> io::Result<u64> {
+        let window_end = self.window_start + self.window.len() as u64;
+        if position >= self.window_start
+            && position.saturating_add(COMMAND_HEADER_SIZE as u64) <= window_end
+        {
+            return Ok(0);
+        }
+        let fill = usize::try_from((self.file_len - position).min(SCAN_WINDOW_CAPACITY as u64))
+            .unwrap_or(SCAN_WINDOW_CAPACITY);
+        self.window.resize(fill, 0);
+        self.file.read_exact_at(&mut self.window[..], position)?;
+        self.window_start = position;
+        self.refilled = true;
+        Ok(fill as u64)
+    }
+
+    /// Bytes `[position, position + len)` for one probe verification without
+    /// moving the scan window: an in-window slice costs no read, anything
+    /// else is one direct read into the spill buffer. Returns the slice and
+    /// the disk bytes it cost. The caller bounds `len` against the file
+    /// before calling.
+    fn verify_slice(&mut self, position: u64, len: usize) -> io::Result<(&[u8], u64)> {
+        let window_end = self.window_start + self.window.len() as u64;
+        let end = position.saturating_add(len as u64);
+        if position >= self.window_start && end <= window_end {
+            // In-window by the branch above, and the window is
+            // capacity-bounded, so the try_from cannot fail.
+            let at = usize::try_from(position - self.window_start).unwrap_or(0);
+            return Ok((&self.window[at..at + len], 0));
+        }
+        self.spill.resize(len, 0);
+        self.file.read_exact_at(&mut self.spill[..], position)?;
+        self.refilled = true;
+        Ok((&self.spill[..], len as u64))
+    }
+}
+
+/// Hands the shard core back to the reactor between scan windows. A
+/// zero-duration timer, NOT a bare self-waking yield: this runtime does not
+/// reliably re-poll a task that wakes itself from inside its own poll, and a
+/// boot task parked that way would never resume.
+async fn yield_to_reactor() {
+    compio::time::sleep(Duration::ZERO).await;
 }
 
 fn push_index_entry(rebuilt_index: &mut Vec<u8>, offset: u64, timestamp: u64, position: u64) {
@@ -1162,12 +1582,38 @@ mod tests {
         config
     }
 
+    /// `test_config` with the probe width cap (and so its derived budget)
+    /// shrunk, keeping probe fixtures small.
+    fn test_config_with_probe_cap(tmp: &TempDir, max_residue_bytes: u64) -> ServerConfig {
+        let mut config = test_config(tmp);
+        config.message_bus.max_message_size = IggyByteSize::from(max_residue_bytes);
+        config
+    }
+
     fn prepare_partition_dir(config: &ServerConfig) -> String {
         let partition_path = config
             .system
             .get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID);
         fs::create_dir_all(&partition_path).expect("create partition dir");
         partition_path
+    }
+
+    // Batch header wire offsets the zero-padded fixture plants values at.
+    const HEADER_BATCH_LENGTH_OFFSET: usize = 32;
+    const HEADER_MESSAGE_COUNT_OFFSET: usize = 48;
+
+    /// One fixed-width zero-padded record of the shape foreign storage
+    /// formats emit: a monotone u64 where the batch header keeps
+    /// `batch_length`, a nonzero u32 where it keeps `message_count`, zeros
+    /// everywhere else -- so its header decodes without any of it being a
+    /// batch.
+    fn zero_padded_record(claimed_batch_length: u64, sequence: u32) -> Vec<u8> {
+        let mut record = vec![0u8; COMMAND_HEADER_SIZE];
+        record[HEADER_BATCH_LENGTH_OFFSET..HEADER_BATCH_LENGTH_OFFSET + 8]
+            .copy_from_slice(&claimed_batch_length.to_le_bytes());
+        record[HEADER_MESSAGE_COUNT_OFFSET..HEADER_MESSAGE_COUNT_OFFSET + 4]
+            .copy_from_slice(&sequence.to_le_bytes());
+        record
     }
 
     /// One valid on-disk batch record: real message frames with their
@@ -1308,10 +1754,10 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_no_recoverable_bytes_when_recovering_should_truncate_both_files_to_zero() {
+    async fn given_no_recoverable_bytes_when_recovering_should_fence_files_and_seed_empty() {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
-        prepare_partition_dir(&config);
+        let partition_path = prepare_partition_dir(&config);
         let (messages_path, index_path) = write_segment(&config, 0, &GARBAGE, &GARBAGE[..10]);
 
         let recovered = recover(&config).await.expect("recover segment as empty");
@@ -1320,8 +1766,22 @@ mod tests {
         let segment = &recovered[0].segment;
         assert_eq!(segment.size, IggyByteSize::default());
         assert_eq!(segment.end_offset, 0);
-        assert_eq!(len_of(&messages_path), 0, "unusable log bytes must be gone");
-        assert_eq!(len_of(&index_path), 0, "unusable index bytes must be gone");
+        assert_eq!(len_of(&messages_path), 0, "the served log must be empty");
+        assert_eq!(len_of(&index_path), 0, "the served index must be empty");
+        let fenced_dir = format!("{partition_path}.fenced.0");
+        let fenced = |original: &str| {
+            Path::new(&fenced_dir).join(Path::new(original).file_name().expect("fixture file name"))
+        };
+        assert_eq!(
+            fs::read(fenced(&messages_path)).expect("read fenced log"),
+            GARBAGE,
+            "the unreadable log bytes must survive in the fence directory"
+        );
+        assert_eq!(
+            fs::read(fenced(&index_path)).expect("read fenced index"),
+            &GARBAGE[..10],
+            "the unreadable index bytes must survive in the fence directory"
+        );
     }
 
     #[compio::test]
@@ -1605,6 +2065,10 @@ mod tests {
             index_entry(0, 0),
             "the index must be rebuilt from the walked batches"
         );
+        assert!(
+            fs::metadata(format!("{index_path}{STAGING_SUFFIX}")).is_err(),
+            "the staged rebuild must be renamed into place, not copied"
+        );
 
         let sizes_after_first = (len_of(&messages_path), len_of(&index_path));
         drop(recovered);
@@ -1760,5 +2224,195 @@ mod tests {
         };
         assert_eq!(entry(0), (0, FIXTURE_TIMESTAMP, 0));
         assert_eq!(entry(1), (1, FIXTURE_TIMESTAMP, wide.len() as u64));
+    }
+
+    #[compio::test]
+    async fn given_zero_padded_records_when_probing_should_refuse_on_scan_budget() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config_with_probe_cap(&tmp, 64 * 1024);
+        prepare_partition_dir(&config);
+        // Torn index forces the index-less walk, and the garbage head keeps
+        // it from decoding anything, so the whole file is probe residue --
+        // under the width cap, so the probe runs. Each record's header
+        // decodes and claims an 8 KiB batch that fits, so every aligned
+        // candidate pays a verify; the charged bytes blow the budget long
+        // before the residue is exhausted.
+        let mut log = GARBAGE.to_vec();
+        for record in 0..128u32 {
+            log.extend_from_slice(&zero_padded_record(
+                8 * 1024 + u64::from(record),
+                record + 1,
+            ));
+        }
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &GARBAGE[..10]);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("a residue that exhausts the scan budget must refuse recovery");
+
+        // `scan_limit_bytes` equal to the 2x budget (not the width cap)
+        // proves the probe ran and gave up, rather than refusing on width.
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::UnverifiedResidue {
+                        scan_limit_bytes, ..
+                    },
+                    ..
+                } if *scan_limit_bytes == 2 * 64 * 1024
+            ),
+            "expected a budget-exhausted refusal, got {error:?}"
+        );
+        assert_eq!(
+            bytes_of(&messages_path),
+            log,
+            "a refusal must leave the log byte-identical"
+        );
+        assert_eq!(bytes_of(&index_path), &GARBAGE[..10]);
+    }
+
+    #[compio::test]
+    async fn given_residue_wider_than_max_message_when_recovering_should_refuse_unscanned() {
+        let tmp = tempdir().expect("tempdir");
+        let cap = 4 * 1024u64;
+        let config = test_config_with_probe_cap(&tmp, cap);
+        prepare_partition_dir(&config);
+        let mut log = encoded_batch(0, 2);
+        let valid_len = log.len() as u64;
+        let residue_len = cap + 1;
+        log.resize(
+            log.len() + usize::try_from(residue_len).expect("fixture size"),
+            0xAB,
+        );
+        let index = index_entry(0, 0);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("a residue wider than one appendable record must refuse recovery");
+
+        // `scan_limit_bytes` equal to the width cap (not the 2x budget)
+        // proves the refusal fired before any scanning.
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::UnverifiedResidue {
+                        damage_position,
+                        residue_bytes,
+                        scan_limit_bytes,
+                        ..
+                    },
+                    ..
+                } if *damage_position == valid_len
+                    && *residue_bytes == residue_len
+                    && *scan_limit_bytes == cap
+            ),
+            "expected a width-cap refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_indexed_offset_regression_when_recovering_should_refuse_without_panicking() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // A decodable batch claiming offsets below the segment start: absorbed,
+        // it would regress the recovered end offset below the start and
+        // underflow the message-count arithmetic.
+        let mut log = encoded_batch(100, 1);
+        log.extend_from_slice(&encoded_batch(5, 1));
+        let index = index_entry(100, 0);
+        let (messages_path, index_path) = write_segment(&config, 100, &log, &index);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("an indexed walk hitting a regressed offset must refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::OffsetDiscontinuity {
+                        expected_offset: 101,
+                        found_offset: 5,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected an offset-discontinuity refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_refused_chain_when_index_rebuilt_should_stage_without_touching_final() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The index-less first segment wants a rebuild; the hole to the next
+        // segment refuses the chain in pass B, before any install.
+        let first_log = encoded_batch(0, 2);
+        let first_index = GARBAGE[..10].to_vec();
+        let (first_messages_path, first_index_path) =
+            write_segment(&config, 0, &first_log, &first_index);
+        write_segment(&config, 10, &encoded_batch(10, 1), &index_entry(10, 0));
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("a holed chain must refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::Hole { .. },
+                    ..
+                }
+            ),
+            "expected a hole refusal, got {error:?}"
+        );
+        assert_eq!(
+            bytes_of(&format!("{first_index_path}{STAGING_SUFFIX}")),
+            index_entry(0, 0),
+            "pass A must stage the rebuilt index beside the final one"
+        );
+        assert_eq!(
+            bytes_of(&first_index_path),
+            first_index,
+            "a refusal must leave the final index byte-identical"
+        );
+        assert_eq!(bytes_of(&first_messages_path), first_log);
+    }
+
+    #[compio::test]
+    async fn given_orphaned_index_staging_when_recovering_should_sweep_it() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let log = encoded_batch(0, 2);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
+        let staging_path = format!("{index_path}{STAGING_SUFFIX}");
+        fs::write(&staging_path, GARBAGE).expect("write orphaned staging fixture");
+
+        let recovered = recover(&config).await.expect("recover clean segment");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 1);
+        assert!(
+            fs::metadata(&staging_path).is_err(),
+            "an orphaned staging file must be swept at boot"
+        );
+        assert_eq!(len_of(&messages_path), log.len() as u64);
+        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
     }
 }
