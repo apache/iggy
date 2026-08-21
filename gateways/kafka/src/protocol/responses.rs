@@ -177,7 +177,7 @@ fn fetch_partition_response(partition: i32, error_code: i16) -> PartitionData {
 ///
 /// `kafka_protocol` has no encodable representation for `ListOffsets` v0 (the legacy
 /// `old_style_offsets` shape predates the schema this crate generates from); a v0 request now
-/// falls through [`super::api::unsupported_version_response`]'s encode-failure path to `Close`
+/// falls through `super::api::unsupported_version_response`'s encode-failure path to `Close`
 /// instead of the pre-migration downgraded response.
 ///
 /// # Errors
