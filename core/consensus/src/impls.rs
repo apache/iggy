@@ -27,7 +27,7 @@ use crate::{
 use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    Command, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     ReplyHeader, RequestStartViewHeader, RoutedRequestHeader, StartViewChangeHeader,
     StartViewHeader, frame_body,
 };
@@ -86,7 +86,6 @@ pub trait Sequencer {
     fn current_sequence(&self) -> Self::Sequence;
 
     /// Allocate the next sequence number.
-    /// TODO Should this return a Future<Output = u64>? for async case?
     fn next_sequence(&self) -> Self::Sequence;
 
     /// Update the current sequence number.
@@ -1114,6 +1113,49 @@ where
     clock: ConsensusClock,
 }
 
+/// Boot-time timer set for a consensus group, one struct so every plane's
+/// restore path applies the same values in the same place.
+#[derive(Debug, Clone, Copy)]
+pub struct ConsensusTimers {
+    pub normal_heartbeat_ticks: u64,
+    pub commit_message_ticks: u64,
+    pub prepare_ticks: u64,
+    pub view_change_retransmit_ticks: u64,
+    pub view_change_status_ticks: u64,
+    pub request_start_view_ticks: u64,
+    pub probe_attempts_max: u32,
+}
+
+/// How a restored replica joins its group.
+#[derive(Debug, Clone, Copy)]
+pub enum JoinMode {
+    /// Fresh group or solo replica: plain init; the group needs its view-0
+    /// primary to exist.
+    Init,
+    /// Prior life detected: join quorum-invisible and probe for the current
+    /// view (`RequestStartView`) instead of resuming a role the cluster may
+    /// have elected past.
+    ProbeAsBackup {
+        /// Also await a state-transfer offer before serving, replacing
+        /// snapshot-shaped state from the live primary.
+        await_state_transfer: bool,
+    },
+}
+
+/// Restored state handed to [`VsrConsensus::restored`].
+#[derive(Debug, Clone, Copy)]
+pub struct VsrRestore<'a> {
+    pub timers: &'a ConsensusTimers,
+    /// `(view, log_view)` read back from the group's durable superblock.
+    pub durable_view: Option<(u32, u32)>,
+    /// View inferred from the last journaled prepare, consulted only when no
+    /// durable record exists; `log_view` cannot be inferred and stays 0.
+    pub view_fallback: Option<u32>,
+    /// Non-zero boot incarnation; `None` keeps the default.
+    pub incarnation: Option<u128>,
+    pub join: JoinMode,
+}
+
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// # Panics
     /// - If `replica >= replica_count`.
@@ -1135,6 +1177,73 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             pipeline,
             ConsensusClock::system(),
         )
+    }
+
+    /// Restore constructor: the one ordered boot path for every plane, so the
+    /// metadata and partition planes cannot diverge in restore order. Timers
+    /// first, then the durable view, then role selection - a probe must never
+    /// advertise a view older than the recorded one.
+    ///
+    /// # Panics
+    /// - If `replica >= replica_count`.
+    /// - If `replica_count < 1`.
+    pub fn restored(
+        cluster: u128,
+        replica: u8,
+        replica_count: u8,
+        group: u64,
+        message_bus: B,
+        pipeline: P,
+        restore: VsrRestore<'_>,
+    ) -> Self {
+        let mut consensus = Self::new(
+            cluster,
+            replica,
+            replica_count,
+            group,
+            message_bus,
+            pipeline,
+        );
+        let timers = restore.timers;
+        consensus.set_normal_heartbeat_ticks(timers.normal_heartbeat_ticks);
+        consensus.set_commit_message_ticks(timers.commit_message_ticks);
+        consensus.set_prepare_ticks(timers.prepare_ticks);
+        consensus.set_view_change_retransmit_ticks(timers.view_change_retransmit_ticks);
+        consensus.set_view_change_status_ticks(timers.view_change_status_ticks);
+        consensus.set_request_start_view_ticks(timers.request_start_view_ticks);
+        consensus.set_probe_attempts_max(timers.probe_attempts_max);
+        if let Some(incarnation) = restore.incarnation {
+            consensus.set_incarnation(incarnation);
+        }
+        if let Some((view, log_view)) = restore.durable_view {
+            // The one line proving the durable record was READ BACK, not merely
+            // written: a replica that came back at view 0 is otherwise
+            // indistinguishable from one that resumed correctly until it votes.
+            tracing::info!(
+                group,
+                view,
+                log_view,
+                "restored group view from its superblock"
+            );
+            consensus.set_view(view);
+            consensus.set_log_view(log_view);
+            consensus.mark_superblock_durable(view, log_view);
+        } else if let Some(view) = restore.view_fallback {
+            consensus.set_view(view);
+        }
+        match restore.join {
+            JoinMode::Init => consensus.init(),
+            JoinMode::ProbeAsBackup {
+                await_state_transfer,
+            } => {
+                consensus.init_as_backup();
+                consensus.begin_view_probe();
+                if await_state_transfer {
+                    consensus.begin_state_transfer_await();
+                }
+            }
+        }
+        consensus
     }
 
     /// [`Self::new`] with an explicit time source. Simulator and clock
@@ -1167,9 +1276,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             "VsrConsensus group must be METADATA_GROUP or a packable \
              IggyNamespace; got {group:#x}"
         );
-        // TODO: Verify that XOR-based seeding provides sufficient jitter diversity
-        // across groups. Consider using a proper hash (e.g., Murmur3) of
-        // (replica_id, group) for production.
+        // Jitter only has to desynchronize replicas of one group, whose ids
+        // differ, so the XOR cannot collide where it matters; `seed_from_u64`
+        // (SplitMix64) decorrelates the streams of nearby seeds.
         let timeout_seed = u128::from(replica) ^ u128::from(group);
         let prepare_queue_max = pipeline.prepare_queue_max();
         Self {
@@ -1604,7 +1713,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// the head has to either stop it (nothing left to retransmit) or restart it
     /// (the next entry becomes the oldest, and it must be timed from now rather
     /// than inheriting the drained entry's elapsed ticks). Arming happens in
-    /// [`Self::push_prepare_entry`]; between the two the invariant is "ticking
+    /// `Self::push_prepare_entry`; between the two the invariant is "ticking
     /// iff the pipeline is non-empty".
     pub fn pop_committed_prepare(&self) -> Option<P::Entry> {
         let popped = self.pipeline.borrow_mut().pop();
@@ -1695,7 +1804,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
-    /// Undo the [`Self::push_prepare_entry`] pre-advance for a prepare whose
+    /// Undo the `Self::push_prepare_entry` pre-advance for a prepare whose
     /// journal append failed, so the op it claimed is handed back.
     ///
     /// The pre-advance runs the sequencer ahead of the WAL on purpose, so that a
@@ -2059,7 +2168,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         pipeline.clear_request_queue();
     }
 
-    /// Process one tick. Call this periodically (e.g., every 10ms).
+    /// Process one tick. Call this every [`crate::TICK_INTERVAL`].
     ///
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
@@ -3085,11 +3194,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // outranks the real primary's and pushes ops that view already discarded back
         // over committed bodies.
         //
-        // TODO(suffix-truncation): re-adoption drops the head again, but the WAL
-        // still holds the discarded suffix, so the primary's next prepare lands on an
-        // op that suffix already occupies and fails `append`'s slot-collision check,
-        // poisoning the journal. Loud beats the silent divergence above; a durable
-        // truncate-from-op primitive is what actually closes it.
+        // Re-adoption drops the head again while the WAL still holds the discarded
+        // suffix. Consensus is sans-io and cannot truncate it; the plane sweeps it
+        // on every adoption (`reconcile_{metadata,partition}_view_divergence`,
+        // above-head branch) before the primary's next prepare can collide with a
+        // relic in `append`'s slot-collision check.
         if msg_view == self.log_view.get() && msg_op < self.commit_min() {
             return Vec::new();
         }
@@ -3227,9 +3336,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return CommitOutcome::Accepted;
         }
 
-        // TODO: Once connection-level peer verification is added promote
-        // this to an assert, the network layer would guarantee the sender
-        // matches header.replica.
+        // Tolerant skip, not an assert: the replica handshake proves cluster
+        // membership only, so nothing binds `header.replica` to the sender.
         if header.replica != self.primary_index(header.view) {
             return CommitOutcome::Accepted;
         }
@@ -3562,14 +3670,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Caller (`on_ack`) should validate `is_primary` and status before calling.
     ///
     /// # Panics
-    /// - If `header.command` is not `Command2::PrepareOk`.
+    /// - If `header.command` is not `Command::PrepareOk`.
     /// - If `header.replica >= self.replica_count`.
     pub fn handle_prepare_ok(
         &self,
         plane: PlaneKind,
         header: &PrepareOkHeader,
     ) -> PrepareOkOutcome {
-        assert_eq!(header.command, Command2::PrepareOk);
+        assert_eq!(header.command, Command::PrepareOk);
         assert!(
             header.replica < self.replica_count,
             "handle_prepare_ok: invalid replica {}",
@@ -3772,7 +3880,7 @@ where
                 size: old.size,
                 view: consensus.view.get(),
                 release: old.release,
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 replica: consensus.replica,
                 client: old.client,
                 parent: consensus.last_prepare_checksum(),
@@ -3814,7 +3922,7 @@ where
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
-                command: Command2::PrepareOk,
+                command: Command::PrepareOk,
                 parent: old.parent,
                 prepare_checksum: old.checksum,
                 request: old.request,
@@ -3843,8 +3951,10 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     type MessageBus = B;
-    #[rustfmt::skip] // Scuffed formatter. TODO: Make the naming less ambiguous for `Message`.
-    type Message<H> = Message<H> where H: ConsensusHeader;
+    type Message<H>
+        = server_common::Message<H>
+    where
+        H: ConsensusHeader;
     type RoutedRequestHeader = RoutedRequestHeader;
     type ReplicateHeader = PrepareHeader;
     type AckHeader = PrepareOkHeader;
@@ -3881,7 +3991,7 @@ where
 #[cfg(test)]
 mod request_queue_tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, Operation};
+    use iggy_binary_protocol::{Command, Operation};
 
     fn make_request(client: u128, request_num: u64) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
@@ -3891,7 +4001,7 @@ mod request_queue_tests {
         )
         .expect("zeroed bytes are valid");
         *header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             client,
             session: 1,
             request: request_num,
@@ -4035,7 +4145,7 @@ mod pipeline_entry_tests {
     //! subscriber `Canceled` even on happy path. Tests pin both halves.
 
     use super::*;
-    use iggy_binary_protocol::{Command2, ReplyHeader};
+    use iggy_binary_protocol::{Command, ReplyHeader};
     use server_common::Message;
 
     fn make_reply(client: u128, request: u64) -> Message<ReplyHeader> {
@@ -4046,7 +4156,7 @@ mod pipeline_entry_tests {
         )
         .expect("zeroed bytes are valid");
         *header = ReplyHeader {
-            command: Command2::Reply,
+            command: Command::Reply,
             client,
             request,
             ..ReplyHeader::default()
@@ -4126,7 +4236,7 @@ mod pipeline_entry_tests {
         for op in 1..=depth as u64 {
             let checksum = u128::from(op);
             let header = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 size: std::mem::size_of::<PrepareHeader>() as u32,
                 op,
                 parent,
@@ -4259,7 +4369,7 @@ mod timestamp_clamp_tests {
             &mut msg.as_mut_slice()[..size],
         )
         .expect("zeroed bytes are a valid StartViewHeader");
-        header.command = Command2::StartView;
+        header.command = Command::StartView;
         header.cluster = 1;
         header.view = view;
         header.op = op;
@@ -4361,7 +4471,7 @@ mod timestamp_clamp_tests {
                 &mut msg.as_mut_slice()[..header_size],
             )
             .expect("zeroed bytes are a valid RoutedRequestHeader");
-            header.command = Command2::Request;
+            header.command = Command::Request;
             header.client = 1;
             header.request = 1;
             header.operation = iggy_binary_protocol::Operation::SendMessages;
@@ -4703,7 +4813,7 @@ mod vsr_consensus_tests {
     fn projected_prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(|_, new| {
             *new = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 size: size_of::<PrepareHeader>() as u32,
                 op,
                 parent,
@@ -4723,7 +4833,7 @@ mod vsr_consensus_tests {
     ) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(|_, new| {
             *new = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 size: size_of::<PrepareHeader>() as u32,
                 op,
                 parent,
@@ -4760,7 +4870,7 @@ mod vsr_consensus_tests {
         Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>()).transmute_header(
             |_, new| {
                 *new = RoutedRequestHeader {
-                    command: Command2::Request,
+                    command: Command::Request,
                     size: size_of::<RoutedRequestHeader>() as u32,
                     client,
                     session: 1,

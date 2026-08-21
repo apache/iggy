@@ -83,22 +83,18 @@ pub struct ShardingConfig {
     /// `false` drops both the CPU and memory-node bindings (and logs a
     /// warning, since NUMA placement without pinning is meaningless).
     pub pin_cores: bool,
-    /// Per-shard inter-shard inbox channel capacity. Bounded by design.
-    /// Drops on full inbox of consensus frames are recovered by VSR
-    /// retransmit. Drops of cross-shard client Reply frames are terminal:
-    /// the client never receives the reply (no in-protocol retransmit).
-    /// Both frame classes share this one channel, so a consensus burst
-    /// can starve client-reply forwards: size against the worst-case sum
-    /// of consensus working set + peak client-reply fan-out per shard
-    /// occurring together.
-    ///
-    // TODO(hubcio): split into two priority lanes - one bounded queue for
-    // consensus frames (drops recovered by VSR retransmit) and one for
-    // client `Reply` frames (drops terminal, must be sized for worst-case
-    // fan-out). Current single-channel design is the minimum-viable
-    // wiring so `frame_drops_total{variant,reason}` surfaces under load
-    // and yields real numbers to size the split against.
+    /// Per-shard inter-shard inbox channel capacity (the main lane:
+    /// consensus frames, connection setup, reconcile wakes). Bounded by
+    /// design; drops of consensus frames on a full inbox are recovered by
+    /// VSR retransmit. Size against the consensus working set per shard.
     pub inbox_capacity: usize,
+    /// Capacity of the reply lane: the separate bounded channel carrying
+    /// cross-shard client `Reply` forwards, whose drops are terminal (no
+    /// in-protocol retransmit; the client never receives the reply). Split
+    /// from [`Self::inbox_capacity`] so a consensus burst cannot evict
+    /// reply forwards and each lane is sized for its own worst case: this
+    /// one against peak client-reply fan-out per shard.
+    pub reply_inbox_capacity: usize,
     /// Wall-clock budget for a single shard's bus drain on shutdown.
     /// Drives `IggyMessageBus::shutdown(..)` from the per-shard watchdog
     /// and the parallel-join survivor path. Sized larger than typical
@@ -145,6 +141,7 @@ impl Default for ShardingConfig {
             cpu_allocation: CpuAllocation::default(),
             pin_cores: SERVER_CONFIG.system.sharding.pin_cores,
             inbox_capacity: SERVER_CONFIG.system.sharding.inbox_capacity as usize,
+            reply_inbox_capacity: SERVER_CONFIG.system.sharding.reply_inbox_capacity as usize,
             shutdown_drain_timeout: SERVER_CONFIG
                 .system
                 .sharding
@@ -188,6 +185,22 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                  shard preallocates a channel of this size; oversizing here OOMs the process at \
                  boot)",
                 self.inbox_capacity, INBOX_CAPACITY_MAX
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.reply_inbox_capacity == 0 {
+            eprintln!(
+                "Invalid sharding configuration: reply_inbox_capacity must be > 0 (crossfire \
+                 silently rounds 0 to 1, masking config errors)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.reply_inbox_capacity > INBOX_CAPACITY_MAX {
+            eprintln!(
+                "Invalid sharding configuration: reply_inbox_capacity {} exceeds the {} cap \
+                 (each shard preallocates a channel of this size; oversizing here OOMs the \
+                 process at boot)",
+                self.reply_inbox_capacity, INBOX_CAPACITY_MAX
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -385,6 +398,7 @@ mod tests {
         let sharding = &config.system.sharding;
         assert!(sharding.pin_cores);
         assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.reply_inbox_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
@@ -403,6 +417,7 @@ mod tests {
 
         assert!(!sharding.pin_cores);
         assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.reply_inbox_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
@@ -418,6 +433,7 @@ mod tests {
 
         assert!(sharding.pin_cores);
         assert_eq!(sharding.inbox_capacity, 1024);
+        assert_eq!(sharding.reply_inbox_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());

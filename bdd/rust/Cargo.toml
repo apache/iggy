@@ -49,3 +49,11 @@ required-features = ["bdd"]
 name = "raw_command"
 harness = false
 required-features = ["bdd"]
+
+[[test]]
+name = "stream_crud"
+harness = false
+required-features = ["bdd"]
+
+[lints]
+workspace = true

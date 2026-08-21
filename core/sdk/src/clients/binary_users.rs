@@ -18,6 +18,7 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
+use iggy_common::UserUpdateOptions;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{Client, UserClient};
 use iggy_common::{
@@ -58,11 +59,12 @@ impl UserClient for IggyClient {
         user_id: &Identifier,
         username: Option<&str>,
         status: Option<UserStatus>,
+        options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
         self.client
             .read()
             .await
-            .update_user(user_id, username, status)
+            .update_user(user_id, username, status, options)
             .await
     }
 

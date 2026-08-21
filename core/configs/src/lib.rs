@@ -20,11 +20,11 @@ extern crate self as configs;
 mod common;
 mod configs_impl;
 mod server_config;
-pub use common::{COMPONENT, cache_indexes, defaults, displays, http, system, validators};
+pub use common::{COMPONENT, defaults, displays, http, system, validators};
 pub use configs_derive::ConfigEnv;
 pub use configs_impl::{
     ConfigEnvMappings, ConfigProvider, ConfigurationError, ConfigurationType, EnvVarMapping,
-    FileConfigProvider, TypedEnvProvider, parse_env_value_to_json,
+    FileConfigProvider, RelocatedKey, TypedEnvProvider, parse_env_value_to_json,
 };
 pub use server_config::{
     cluster, message_bus, metadata, partition, quic, server, sharding, tcp, websocket,

@@ -19,6 +19,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { CREATE_TOPIC } from './create-topic.command.js';
+import { deserializeOptions } from '../options.utils.js';
+import { HeaderValue } from '../message/header.utils.js';
 
 describe('CreateTopic', () => {
 
@@ -30,15 +32,85 @@ describe('CreateTopic', () => {
       partitionCount: 1,
       compressionAlgorithm: 1, // 1 = None, 2 = Gzip
       messageExpiry: 0n,
-      maxTopicSize: 0n,
-      replicationFactor: 1
+      maxTopicSize: 0n
     };
 
-    it('serialize 1 name into buffer', () => {
+    // TLV field: [kind:u8][len:u32_le][bytes]
+    const tlvSize = (bytes: number) => 1 + 4 + bytes;
+    const identifierSize = 1 + 1 + 4; // numeric stream id
+    const fixedSize = identifierSize + 4 + 1; // + partitions_count + name_len
+
+    it('serialize name and default options into buffer', () => {
+      // Server-default sentinels are omitted, leaving an empty options block.
       assert.deepEqual(
         CREATE_TOPIC.serialize(t1).length,
-        6  + 4 + 1 + 8 + 8 + 1 + 1 + t1.name.length
+        fixedSize + t1.name.length
       );
+    });
+
+    it('serialize partitionCount as a fixed u32 before the name', () => {
+      const t = { ...t1, partitionCount: 7 };
+      const b = CREATE_TOPIC.serialize(t);
+      assert.equal(b.readUInt32LE(identifierSize), 7);
+      assert.equal(b.readUInt8(identifierSize + 4), t.name.length);
+      assert.equal(b.subarray(fixedSize).toString(), t.name);
+    });
+
+    it('serialize non-default options into buffer', () => {
+      const t = {
+        ...t1,
+        compressionAlgorithm: 2,
+        messageExpiry: 42n,
+        maxTopicSize: 1024n
+      };
+      assert.deepEqual(
+        CREATE_TOPIC.serialize(t).length,
+        fixedSize + t1.name.length
+        + tlvSize('compression_algorithm'.length) + tlvSize('gzip'.length)
+        + tlvSize('message_expiry'.length) + tlvSize(8)
+        + tlvSize('max_topic_size'.length) + tlvSize(8)
+      );
+    });
+
+    it('serialize segment and save-trigger options into buffer', () => {
+      const t = {
+        ...t1,
+        segmentSize: 1048576n,
+        enforceFsync: true,
+        messagesRequiredToSave: 1000,
+        sizeOfMessagesRequiredToSave: 4096n,
+        preallocateSegments: false
+      };
+      assert.deepEqual(
+        CREATE_TOPIC.serialize(t).length,
+        fixedSize + t1.name.length
+        + tlvSize('segment_size'.length) + tlvSize(8)
+        + tlvSize('enforce_fsync'.length) + tlvSize(1)
+        + tlvSize('messages_required_to_save'.length) + tlvSize(4)
+        + tlvSize('size_of_messages_required_to_save'.length) + tlvSize(8)
+        + tlvSize('preallocate_segments'.length) + tlvSize(1)
+      );
+    });
+
+    it('serialize caller-supplied option keys, typed fields winning', () => {
+      const t = {
+        ...t1,
+        maxTopicSize: 4096n,
+        options: [
+          { key: 'enforce_fsync', value: HeaderValue.Bool(true) },
+          // The typed field covers this key, so the caller's entry is dropped:
+          // a duplicate key makes the server refuse the whole block.
+          { key: 'max_topic_size', value: HeaderValue.String('1 GiB') }
+        ]
+      };
+
+      const b = CREATE_TOPIC.serialize(t);
+      // The create payload runs its options block to the end, unprefixed.
+      const options = deserializeOptions(b, fixedSize + t.name.length);
+
+      assert.deepEqual(Object.keys(options).sort(), ['enforce_fsync', 'max_topic_size']);
+      assert.equal(options.enforce_fsync, true);
+      assert.equal(options.max_topic_size, 4096n);
     });
 
     it('throw on name < 1', () => {
@@ -59,20 +131,6 @@ describe('CreateTopic', () => {
       const t = { ...t1, name: "¥Ø£Ø".repeat(33) };
       assert.throws(
         () => CREATE_TOPIC.serialize(t)
-      );
-    });
-
-    it('throw on replication_factor < 1', () => {
-      const t = { ...t1, replicationFactor: 0 };
-      assert.throws(
-        () => CREATE_TOPIC.serialize(t),
-      );
-    });
-
-    it('throw on replication_factor > 255', () => {
-      const t = { ...t1, replicationFactor: 257 };
-      assert.throws(
-        () => CREATE_TOPIC.serialize(t),
       );
     });
 

@@ -17,41 +17,44 @@
 
 use crate::WireError;
 use crate::WireIdentifier;
-use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le, read_u64_le};
+use crate::codec::{WireDecode, WireEncode, read_u32_le};
 use crate::primitives::identifier::WireName;
+use crate::primitives::options::WireOptions;
 use bytes::{BufMut, BytesMut};
 
 /// `CreateTopic` request.
 ///
 /// Wire format:
-/// `[stream_id:WireIdentifier][partitions_count:u32_le][compression_algorithm:u8]
-///  [message_expiry:u64_le][max_topic_size:u64_le][replication_factor:u8][name_len:u8][name:N]`
+/// `[stream_id:WireIdentifier][partitions_count:u32_le][name_len:u8][name:N][options TLV to end]`
+///
+/// The fixed fields are the shape of the operation itself: which stream, how
+/// many partitions to allocate, and what to call the topic. `partitions_count`
+/// is an argument, not a setting -- admission consumes it to compute the
+/// partition assignments and it is deliberately never persisted as an option
+/// (`CreatePartitions` would make a stored count stale).
+///
+/// Every actual topic SETTING -- expiry, size caps, segment sizing, durability
+/// and any future knob -- rides the options block, so adding a knob never
+/// changes this layout. The block runs to the end of the payload; its
+/// validator requires exact consumption, so no length prefix is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTopicRequest {
     pub stream_id: WireIdentifier,
     pub partitions_count: u32,
-    pub compression_algorithm: u8,
-    pub message_expiry: u64,
-    pub max_topic_size: u64,
-    pub replication_factor: u8,
     pub name: WireName,
+    pub options: WireOptions,
 }
-
-const FIXED_FIELDS_SIZE: usize = 4 + 1 + 8 + 8 + 1; // 22 bytes
 
 impl WireEncode for CreateTopicRequest {
     fn encoded_size(&self) -> usize {
-        self.stream_id.encoded_size() + FIXED_FIELDS_SIZE + self.name.encoded_size()
+        self.stream_id.encoded_size() + 4 + self.name.encoded_size() + self.options.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         self.stream_id.encode(buf);
         buf.put_u32_le(self.partitions_count);
-        buf.put_u8(self.compression_algorithm);
-        buf.put_u64_le(self.message_expiry);
-        buf.put_u64_le(self.max_topic_size);
-        buf.put_u8(self.replication_factor);
         self.name.encode(buf);
+        self.options.encode(buf);
     }
 }
 
@@ -60,27 +63,17 @@ impl WireDecode for CreateTopicRequest {
         let (stream_id, mut pos) = WireIdentifier::decode(buf)?;
         let partitions_count = read_u32_le(buf, pos)?;
         pos += 4;
-        let compression_algorithm = read_u8(buf, pos)?;
-        pos += 1;
-        let message_expiry = read_u64_le(buf, pos)?;
-        pos += 8;
-        let max_topic_size = read_u64_le(buf, pos)?;
-        pos += 8;
-        let replication_factor = read_u8(buf, pos)?;
-        pos += 1;
         let (name, consumed) = WireName::decode(&buf[pos..])?;
         pos += consumed;
+        let options = WireOptions::from_slice(&buf[pos..])?;
         Ok((
             Self {
                 stream_id,
                 partitions_count,
-                compression_algorithm,
-                message_expiry,
-                max_topic_size,
-                replication_factor,
                 name,
+                options,
             },
-            pos,
+            buf.len(),
         ))
     }
 }
@@ -88,16 +81,26 @@ impl WireDecode for CreateTopicRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::user_headers::encode_user_headers;
+
+    fn sample_options() -> WireOptions {
+        let mut buf = BytesMut::new();
+        encode_user_headers(
+            &[
+                (2, b"message_expiry", 2, b"7 days"),
+                (2, b"max_topic_size", 12, &1024u64.to_le_bytes()),
+            ],
+            &mut buf,
+        );
+        WireOptions::from_bytes(buf.freeze()).unwrap()
+    }
 
     fn sample_request() -> CreateTopicRequest {
         CreateTopicRequest {
             stream_id: WireIdentifier::numeric(1),
             partitions_count: 3,
-            compression_algorithm: 1,
-            message_expiry: 3600,
-            max_topic_size: 1_000_000,
-            replication_factor: 1,
             name: WireName::new("orders").unwrap(),
+            options: sample_options(),
         }
     }
 
@@ -111,15 +114,12 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_named_stream() {
+    fn roundtrip_without_options() {
         let req = CreateTopicRequest {
             stream_id: WireIdentifier::named("my-stream").unwrap(),
-            partitions_count: 10,
-            compression_algorithm: 2,
-            message_expiry: 0,
-            max_topic_size: u64::MAX,
-            replication_factor: 3,
+            partitions_count: 1,
             name: WireName::new("events").unwrap(),
+            options: WireOptions::empty(),
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = CreateTopicRequest::decode(&bytes).unwrap();
@@ -128,8 +128,38 @@ mod tests {
     }
 
     #[test]
-    fn truncated_returns_error() {
-        let req = sample_request();
+    fn truncated_options_return_error() {
+        // A single key-value pair: any strict-interior truncation of the
+        // block is structurally invalid (a multi-pair block truncates
+        // cleanly at pair boundaries).
+        let mut buf = BytesMut::new();
+        encode_user_headers(&[(2, b"message_expiry", 2, b"7 days")], &mut buf);
+        let req = CreateTopicRequest {
+            stream_id: WireIdentifier::numeric(1),
+            partitions_count: 2,
+            name: WireName::new("orders").unwrap(),
+            options: WireOptions::from_bytes(buf.freeze()).unwrap(),
+        };
+        let bytes = req.to_bytes();
+        let fixed_end = bytes.len() - req.options.encoded_size();
+        for i in fixed_end + 1..bytes.len() {
+            assert!(
+                CreateTopicRequest::decode(&bytes[..i]).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+        let (decoded, _) = CreateTopicRequest::decode(&bytes[..fixed_end]).unwrap();
+        assert!(decoded.options.is_empty());
+    }
+
+    #[test]
+    fn truncated_fixed_fields_return_error() {
+        let req = CreateTopicRequest {
+            stream_id: WireIdentifier::numeric(1),
+            partitions_count: 1,
+            name: WireName::new("orders").unwrap(),
+            options: WireOptions::empty(),
+        };
         let bytes = req.to_bytes();
         for i in 0..bytes.len() {
             assert!(

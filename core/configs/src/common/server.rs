@@ -20,7 +20,7 @@ use iggy_common::{IggyByteSize, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
-use server_common::MemoryPoolConfigOther;
+use server_common::MemoryPoolSettings;
 use server_common::log::{TelemetryEndpointSettings, TelemetrySettings};
 
 pub use server_common::log::TelemetryTransport;
@@ -34,12 +34,12 @@ pub struct MemoryPoolConfig {
     pub bucket_capacity: u32,
 }
 
-impl MemoryPoolConfig {
-    pub fn into_other(&self) -> MemoryPoolConfigOther {
-        MemoryPoolConfigOther {
-            enabled: self.enabled,
-            size: self.size,
-            bucket_capacity: self.bucket_capacity,
+impl From<&MemoryPoolConfig> for MemoryPoolSettings {
+    fn from(config: &MemoryPoolConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            size: config.size,
+            bucket_capacity: config.bucket_capacity,
         }
     }
 }
@@ -54,16 +54,6 @@ pub struct DataMaintenanceConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct MessagesMaintenanceConfig {
     pub cleaner_enabled: bool,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub interval: IggyDuration,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct MessageSaverConfig {
-    pub enabled: bool,
-    pub enforce_fsync: bool,
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub interval: IggyDuration,
@@ -99,9 +89,6 @@ pub struct ConsumerGroupConfig {
     #[config_env(leaf)]
     #[serde_as(as = "DisplayFromStr")]
     pub rebalancing_timeout: IggyDuration,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub rebalancing_check_interval: IggyDuration,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]

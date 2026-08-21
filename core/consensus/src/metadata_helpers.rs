@@ -470,7 +470,7 @@ mod tests {
     use super::*;
     use crate::client_table::REGISTER_REQUEST_ID;
     use crate::{CLIENTS_TABLE_MAX, LocalPipeline};
-    use iggy_binary_protocol::{Command2, Operation, ReplyHeader};
+    use iggy_binary_protocol::{Command, Operation, ReplyHeader};
     use message_bus::SendError;
 
     /// Acting user for register fixtures; these tests exercise preflight /
@@ -579,7 +579,7 @@ mod tests {
         let header =
             bytemuck::checked::try_from_bytes::<EvictionHeader>(&frozen.as_slice()[..HEADER_SIZE])
                 .expect("valid EvictionHeader");
-        assert_eq!(header.command, Command2::Eviction);
+        assert_eq!(header.command, Command::Eviction);
         assert_eq!(header.reason, EvictionReason::NoSession);
         assert_eq!(header.client, client_id);
     }
@@ -908,7 +908,7 @@ mod tests {
             cluster: consensus.cluster(),
             size: header_size as u32,
             view: consensus.view(),
-            command: Command2::Reply,
+            command: Command::Reply,
             replica: consensus.replica(),
             client: client_id,
             op: register_commit,
@@ -942,7 +942,7 @@ mod tests {
             cluster: consensus.cluster(),
             size: header_size as u32,
             view: consensus.view(),
-            command: Command2::Reply,
+            command: Command::Reply,
             replica: consensus.replica(),
             client: client_id,
             op: commit,

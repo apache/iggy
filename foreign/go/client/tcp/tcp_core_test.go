@@ -553,16 +553,18 @@ func TestCanReplay_RefusesOnlyReplicatedRequestsWithAnUnknownOutcome(t *testing.
 }
 
 // topicDetailsBody builds the reply body of GetTopic for a topic with the
-// given partition count and no partitions listed.
+// given partition count and no partitions listed. The trailing 8 zero bytes
+// are the u32 length prefixes of the empty explicit and derived options
+// blocks.
 func topicDetailsBody(t *testing.T, partitionsCount uint32) []byte {
 	t.Helper()
 
-	const nameOffset = 50
+	const nameLenOffset = 49
 	name := "orders"
-	body := make([]byte, nameOffset+1+len(name))
+	body := make([]byte, nameLenOffset+1+len(name)+4+4)
 	binary.LittleEndian.PutUint32(body[0:4], 1)
 	binary.LittleEndian.PutUint32(body[12:16], partitionsCount)
-	body[nameOffset] = byte(len(name))
-	copy(body[nameOffset+1:], name)
+	body[nameLenOffset] = byte(len(name))
+	copy(body[nameLenOffset+1:], name)
 	return body
 }

@@ -80,6 +80,14 @@ pub fn sample(
                 partitions_count,
             })
         }
+        // Not targeted (absent from `OUTCOMES`): the sim client sends only valid
+        // catalog keys, the slab ceiling needs `MAX_TOPICS` creates under one
+        // stream, and the primary mints dense 0-based partition ids, so neither
+        // partition guard is reachable from the wire.
+        Outcome::InvalidOptionValue
+        | Outcome::TooManyTopics
+        | Outcome::InvalidPartitionsCount
+        | Outcome::PartitionIdSpaceExhausted => None,
     }
 }
 

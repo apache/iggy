@@ -150,22 +150,22 @@ assert.deepEqual(
   'Node EvictionReason differs from the Rust consensus enum'
 );
 
-const rustCommand2Block =
-  rustCommand.match(/pub enum Command2 \{([\s\S]*?)\n\}/)?.[1] ?? '';
-const rustCommand2 = enumValues(
-  rustCommand2Block,
+const rustCommandBlock =
+  rustCommand.match(/pub enum Command \{([\s\S]*?)\n\}/)?.[1] ?? '';
+const rustCommandTable = enumValues(
+  rustCommandBlock,
   /^\s+([A-Za-z0-9]+)\s*=\s*([0-9]+),$/gm
 );
-const nodeCommand2 = enumValues(
-  nodeHeader.match(/export const Command2 = \{([\s\S]*?)\n\}/)?.[1] ?? '',
+const nodeCommandTable = enumValues(
+  nodeHeader.match(/export const Command = \{([\s\S]*?)\n\}/)?.[1] ?? '',
   /^\s+([A-Za-z0-9]+):\s*([0-9]+),?$/gm
 );
-assert.ok(nodeCommand2.size > 0, 'Node Command2 table was not found');
-for (const [name, value] of nodeCommand2)
+assert.ok(nodeCommandTable.size > 0, 'Node Command table was not found');
+for (const [name, value] of nodeCommandTable)
   assert.equal(
-    rustCommand2.get(name),
+    rustCommandTable.get(name),
     value,
-    `Node Command2.${name} differs from Rust`
+    `Node Command.${name} differs from Rust`
   );
 
 const rustHeaderSize = Number(
@@ -185,7 +185,7 @@ const FIELD_LAYOUT = new Map([
   ['u32', [4, 4]],
   ['u64', [8, 8]],
   ['u128', [16, 16]],
-  ['Command2', [1, 1]],
+  ['Command', [1, 1]],
   ['Operation', [1, 1]],
   ['EvictionReason', [1, 1]]
 ]);

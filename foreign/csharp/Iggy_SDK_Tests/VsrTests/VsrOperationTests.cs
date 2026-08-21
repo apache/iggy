@@ -35,8 +35,6 @@ public sealed class VsrOperationTests
     [InlineData(CommandCodes.SEND_MESSAGES_CODE, (byte)VsrOperation.SendMessages)]
     [InlineData(CommandCodes.STORE_CONSUMER_OFFSET_CODE, (byte)VsrOperation.StoreConsumerOffset)]
     [InlineData(CommandCodes.DELETE_CONSUMER_OFFSET_CODE, (byte)VsrOperation.DeleteConsumerOffset)]
-    [InlineData(CommandCodes.STORE_CONSUMER_OFFSET_2_CODE, (byte)VsrOperation.StoreConsumerOffset2)]
-    [InlineData(CommandCodes.DELETE_CONSUMER_OFFSET_2_CODE, (byte)VsrOperation.DeleteConsumerOffset2)]
     [InlineData(CommandCodes.CREATE_STREAM_CODE, (byte)VsrOperation.CreateStream)]
     [InlineData(CommandCodes.DELETE_STREAM_CODE, (byte)VsrOperation.DeleteStream)]
     [InlineData(CommandCodes.UPDATE_STREAM_CODE, (byte)VsrOperation.UpdateStream)]
@@ -110,7 +108,7 @@ public sealed class VsrOperationTests
     {
         Assert.True(VsrOperation.CreateStream.IsResultFramed());
         Assert.True(VsrOperation.StoreConsumerOffset.IsResultFramed());
-        Assert.True(VsrOperation.DeleteConsumerOffset2.IsResultFramed());
+        Assert.True(VsrOperation.DeleteConsumerOffset.IsResultFramed());
         Assert.False(VsrOperation.SendMessages.IsResultFramed());
         Assert.False(VsrOperation.NonReplicated.IsResultFramed());
         Assert.False(VsrOperation.Register.IsResultFramed());
@@ -122,6 +120,8 @@ public sealed class VsrOperationTests
     {
         Assert.True(VsrOperations.IsKnown((byte)VsrOperation.SendMessages));
         Assert.False(VsrOperations.IsKnown(163));
+        Assert.False(VsrOperations.IsKnown(164));
+        Assert.False(VsrOperations.IsKnown(165));
         Assert.False(VsrOperations.IsKnown(200));
     }
 
@@ -156,7 +156,7 @@ public sealed class VsrOperationTests
     [Theory]
     [InlineData((byte)VsrOperation.SendMessages)]
     [InlineData((byte)VsrOperation.StoreConsumerOffset)]
-    [InlineData((byte)VsrOperation.DeleteConsumerOffset2)]
+    [InlineData((byte)VsrOperation.DeleteConsumerOffset)]
     [InlineData((byte)VsrOperation.DeleteSegments)]
     [InlineData((byte)VsrOperation.NonReplicated)]
     [InlineData((byte)VsrOperation.Logout)]

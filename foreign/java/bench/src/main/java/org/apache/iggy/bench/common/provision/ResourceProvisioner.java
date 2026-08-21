@@ -32,7 +32,6 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 public final class ResourceProvisioner {
 
@@ -87,7 +86,6 @@ public final class ResourceProvisioner {
                                     CompressionAlgorithm.None,
                                     BigInteger.valueOf(pinnedProducerCliArgs.messageExpiry()),
                                     BigInteger.valueOf(pinnedProducerCliArgs.maxTopicSize()),
-                                    Optional.empty(),
                                     topicNames.get(0));
                 }
             }

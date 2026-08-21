@@ -21,9 +21,11 @@
 //! topic, create partitions and delete partitions alike); a custom
 //! `max_topic_size` below the configured segment size denies with
 //! `InvalidTopicSize`; `ServerDefault` and `Unlimited` sizes pass. Update
-//! stores `max_topic_size` and `message_expiry` verbatim and gets echo the
-//! stored value (never the node default frozen at update time), matching
-//! legacy wire behavior. Deleting more partitions than the topic has rejects
+//! enforces the same size floor, since a topic capped below one segment can
+//! never rotate however it acquired that cap. Update otherwise stores
+//! `max_topic_size` and `message_expiry` verbatim and gets echo the stored
+//! value (never the node default frozen at update time), matching legacy wire
+//! behavior. Deleting more partitions than the topic has rejects
 //! with `InvalidPartitionsCount` as a committed result instead of silently
 //! acking a no-op. Listing topics of a missing stream replies with an empty
 //! list, as the legacy server does.
@@ -46,18 +48,19 @@ async fn create_topic_with(
         .create_topic(
             stream_id,
             name,
-            partitions_count,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            max_topic_size,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: (max_topic_size != MaxTopicSize::ServerDefault)
+                    .then_some(max_topic_size),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_out_of_bounds_topic_when_creating_should_reject_typed(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
@@ -113,9 +116,99 @@ async fn given_out_of_bounds_topic_when_creating_should_reject_typed(harness: &T
     .expect("unlimited max_topic_size is accepted");
 }
 
+// The topic's own segment size is pinned at create so the floor the
+// assertions straddle is exact rather than the shipped default.
+#[iggy_harness(test_client_transport = [Tcp])]
+async fn given_topic_size_below_segment_size_when_updating_should_reject_typed(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    client
+        .create_stream("update-bounds-stream")
+        .await
+        .expect("create stream");
+    let stream_id = Identifier::from_str_value("update-bounds-stream").expect("stream identifier");
+    let segment_size = IggyByteSize::from_str("8MiB").expect("byte size");
+    let at_floor = MaxTopicSize::Custom(segment_size);
+    client
+        .create_topic(
+            &stream_id,
+            "update-bounds-topic",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(at_floor),
+                segment_size: Some(segment_size),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("a topic exactly one segment large is accepted");
+    let topic_id = Identifier::from_str_value("update-bounds-topic").expect("topic identifier");
+
+    let update_to = |max_topic_size: MaxTopicSize| {
+        let client = &client;
+        let stream_id = &stream_id;
+        let topic_id = &topic_id;
+        async move {
+            client
+                .update_topic(
+                    stream_id,
+                    topic_id,
+                    "update-bounds-topic",
+                    &TopicUpdateOptions {
+                        max_topic_size: Some(max_topic_size),
+                        ..TopicUpdateOptions::default()
+                    },
+                )
+                .await
+        }
+    };
+
+    let below_floor = MaxTopicSize::Custom(IggyByteSize::from_str("4MiB").expect("byte size"));
+    let invalid_size = IggyError::InvalidTopicSize(below_floor, segment_size).as_code();
+    let result = update_to(below_floor).await;
+    assert!(
+        matches!(&result, Err(error) if error.as_code() == invalid_size),
+        "an update below the segment size must deny with InvalidTopicSize, got {result:?}"
+    );
+    let topic = client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("get topic")
+        .expect("topic exists");
+    assert_eq!(
+        topic.max_topic_size, at_floor,
+        "the rejected update must not reach consensus, so the stored cap is unchanged"
+    );
+
+    update_to(at_floor)
+        .await
+        .expect("an update to exactly one segment is accepted");
+    update_to(MaxTopicSize::Unlimited)
+        .await
+        .expect("unlimited is exempt from the floor");
+
+    // The sentinel encodes as 0, which the option parser reads as "not set", so
+    // no cap reaches admission at all: the accept proves nothing on its own.
+    // What it must leave behind is the value the previous update stored.
+    update_to(MaxTopicSize::ServerDefault)
+        .await
+        .expect("server default is exempt from the floor");
+    let topic = client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("get topic")
+        .expect("topic exists");
+    assert_eq!(
+        topic.max_topic_size,
+        MaxTopicSize::Unlimited,
+        "a sentinel update carries no cap, so the stored one survives"
+    );
+}
+
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
@@ -145,10 +238,11 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
                     stream_id,
                     topic_id,
                     "echo-topic",
-                    CompressionAlgorithm::None,
-                    None,
-                    message_expiry,
-                    max_topic_size,
+                    &TopicUpdateOptions {
+                        message_expiry: Some(message_expiry),
+                        max_topic_size: Some(max_topic_size),
+                        ..TopicUpdateOptions::default()
+                    },
                 )
                 .await
                 .expect("update topic");
@@ -161,15 +255,16 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
         }
     };
 
-    // The server echoes both stored sentinels as wire 0 (legacy parity). The
-    // SDK decodes a topic-response size 0 as `ServerDefault` but an expiry 0
-    // as `NeverExpire` (`wire_conversions`), so that is the legacy-identical
-    // client-visible read-back; the node default must NOT leak into either.
+    // Settings ride the options block and 0 is its "resolve the default"
+    // sentinel, so a `ServerDefault` on update carries no key at all: the topic
+    // keeps what it already had. Resetting a setting back to the node default
+    // is deliberately not expressible -- an update states the values it wants,
+    // and everything it omits survives.
+    let created_size = MaxTopicSize::Custom(IggyByteSize::from_str("2GiB").expect("byte size"));
     assert_eq!(
         update_topic(MaxTopicSize::ServerDefault, IggyExpiry::ServerDefault).await,
-        (MaxTopicSize::ServerDefault, IggyExpiry::NeverExpire),
-        "an update to ServerDefault must echo the stored sentinel, \
-         not the node default frozen at update time"
+        (created_size, IggyExpiry::NeverExpire),
+        "a sentinel carries no key, so the value set at creation survives"
     );
     let custom_size = MaxTopicSize::Custom(IggyByteSize::from_str("3GiB").expect("byte size"));
     let custom_expiry = IggyExpiry::ExpireDuration(IggyDuration::from_str("5s").expect("duration"));
@@ -185,10 +280,60 @@ async fn given_updated_topic_when_getting_topic_should_echo_stored_values(harnes
     );
 }
 
-#[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
-)]
+#[iggy_harness(test_client_transport = [Tcp])]
+async fn given_sentinel_option_when_creating_topic_should_store_the_resolved_default(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    client
+        .create_stream("sentinel-stream")
+        .await
+        .expect("create stream");
+    let stream_id = Identifier::from_str_value("sentinel-stream").expect("stream identifier");
+
+    // `server_default` reaches the wire as a literal 0 through the raw map, the
+    // same shape the CLI's `--set max_topic_size=server_default` produces. The
+    // stored map has to report the resolved default rather than that 0, or one
+    // GetTopic response contradicts itself.
+    client
+        .create_topic(
+            &stream_id,
+            "sentinel-topic",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                raw: std::collections::BTreeMap::from([(
+                    "max_topic_size".to_string(),
+                    "server_default".to_string(),
+                )]),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create topic with a sentinel option");
+
+    let topic_id = Identifier::from_str_value("sentinel-topic").expect("topic identifier");
+    let topic = client
+        .get_topic(&stream_id, &topic_id)
+        .await
+        .expect("get topic")
+        .expect("topic exists");
+    let stored = topic
+        .options
+        .get(&HeaderKey::from_str("max_topic_size").expect("option key"))
+        .expect("max_topic_size is stored");
+    assert_eq!(
+        u64::from(topic.max_topic_size),
+        iggy_common::DEFAULT_MAX_TOPIC_SIZE,
+        "the typed field resolves to the node default"
+    );
+    assert_eq!(
+        stored.value.as_bytes(),
+        &iggy_common::DEFAULT_MAX_TOPIC_SIZE.to_le_bytes(),
+        "the options map must agree with the typed field"
+    );
+}
+
+#[iggy_harness(test_client_transport = [Tcp])]
 async fn given_out_of_bounds_partitions_count_when_mutating_should_reject_typed(
     harness: &TestHarness,
 ) {
@@ -257,8 +402,7 @@ async fn given_out_of_bounds_partitions_count_when_mutating_should_reject_typed(
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_over_count_when_deleting_partitions_should_reject_invalid_partitions_count(
     harness: &TestHarness,
@@ -320,8 +464,7 @@ async fn given_over_count_when_deleting_partitions_should_reject_invalid_partiti
 }
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_missing_stream_when_listing_topics_should_return_empty(harness: &TestHarness) {
     let client = harness.tcp_root_client().await.expect("tcp root client");

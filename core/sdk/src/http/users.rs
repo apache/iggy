@@ -20,6 +20,7 @@ use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Identifier, IggyError};
 use async_trait::async_trait;
 use iggy_common::UserClient;
+use iggy_common::UserUpdateOptions;
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
 use iggy_common::login_user::LoginUser;
@@ -94,6 +95,7 @@ impl UserClient for HttpClient {
         user_id: &Identifier,
         username: Option<&str>,
         status: Option<UserStatus>,
+        options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
         self.put(
             &format!("{PATH}/{}", user_id.as_cow_str()),
@@ -101,6 +103,7 @@ impl UserClient for HttpClient {
                 user_id: user_id.clone(),
                 username: username.map(|s| s.to_string()),
                 status,
+                options: options.raw.clone(),
             },
         )
         .await?;

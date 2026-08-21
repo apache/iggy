@@ -35,8 +35,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-import static java.util.Optional.empty;
-
 /**
  * TCP/TLS Producer Example
  *
@@ -139,14 +137,7 @@ public final class TcpTlsProducer {
             return;
         }
         client.topics()
-                .createTopic(
-                        STREAM_ID,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        empty(),
-                        TOPIC_NAME);
+                .createTopic(STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, TOPIC_NAME);
         log.info("Topic {} was created.", TOPIC_NAME);
     }
 }

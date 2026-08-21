@@ -75,6 +75,12 @@ public class IggyPublisherConfig
     public string Password { get; set; } = string.Empty;
 
     /// <summary>
+    ///     Personal access token used instead of <see cref="Login" /> and <see cref="Password" /> when creating
+    ///     the client. Takes precedence over them when set.
+    /// </summary>
+    public string PersonalAccessToken { get; set; } = string.Empty;
+
+    /// <summary>
     ///     Gets or sets the identifier of the target stream.
     ///     Can be either a numeric ID or a string name.
     /// </summary>
@@ -146,13 +152,6 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="CreateTopic" /> is true.
     /// </summary>
     public CompressionAlgorithm TopicCompressionAlgorithm { get; set; }
-
-    /// <summary>
-    ///     Gets or sets the replication factor for the topic.
-    ///     Determines how many replicas of each partition are maintained.
-    ///     Only used when <see cref="CreateTopic" /> is true.
-    /// </summary>
-    public byte? TopicReplicationFactor { get; set; }
 
     /// <summary>
     ///     Gets or sets the message expiry time (0 for server default, TimeSpan.MaxValue for no expiry).
@@ -259,7 +258,14 @@ public class IggyPublisherConfig
     /// <summary>
     ///     Gets or sets the reconnection settings to control the behavior of the iggy client
     ///     in case of a disconnect or network failure.
-    ///     This property is optional and can be null. If null, reconnection will be disabled.
+    ///     This property is optional and can be null. If null, the default <see cref="Configuration.ReconnectionSettings" />
+    ///     apply.
     /// </summary>
     public ReconnectionSettings? ReconnectionSettings { get; set; }
+
+    /// <summary>
+    ///     Interval between the pings the created client sends to keep an idle session alive.
+    ///     See <see cref="IggyClientConfigurator.HeartbeatInterval" />.
+    /// </summary>
+    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(5);
 }

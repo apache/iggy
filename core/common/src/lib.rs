@@ -109,6 +109,7 @@ pub use types::either::Either;
 pub use types::http::HttpMethod;
 pub use types::identifier::*;
 pub use types::message::*;
+pub use types::options::*;
 pub use types::partition::*;
 pub use types::permissions::permissions_global::*;
 pub use types::permissions::personal_access_token::*;

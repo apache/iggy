@@ -26,7 +26,7 @@ use crate::dispatch::{
 use crate::http;
 use crate::partition_helpers::{
     build_partition_fresh, configure_consumer_offsets, ensure_initial_segment,
-    open_partition_superblock, restore_partition_view, validate_namespace_bounds,
+    open_partition_superblock,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
@@ -37,8 +37,8 @@ use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
 use consensus::{
-    ClientTable, LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry, Sequencer,
-    VsrConsensus,
+    ClientTable, ConsensusTimers, JoinMode, LocalPipeline, MetadataHandle, PartitionsHandle,
+    PipelineEntry, Sequencer, VsrConsensus, VsrRestore,
 };
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
@@ -50,7 +50,9 @@ use iggy_common::defaults::{
     DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
     MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
-use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, variadic};
+use iggy_common::{
+    Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, TopicRuntimeOptions, variadic,
+};
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
@@ -155,7 +157,7 @@ impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
 /// The five dispatch handlers a shard is built with, plus the
 /// [`SessionManager`] the request-plane pair shares.
 ///
-/// Both production ([`build_shard_for_thread`]) and the simulator's shell
+/// Both production (`build_shard_for_thread`) and the simulator's shell
 /// mode construct these through [`wire_shell_handlers`], so the request
 /// plane is wired one way. The simulator's shell-off fast path uses
 /// [`ShellHandlers::noop`] instead.
@@ -202,7 +204,7 @@ pub fn wire_shell_handlers<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -683,6 +685,13 @@ fn validate_sharding_runtime_knobs(
             max: INBOX_CAPACITY_MAX,
         });
     }
+    let reply_inbox_capacity = sharding.reply_inbox_capacity;
+    if reply_inbox_capacity == 0 || reply_inbox_capacity > INBOX_CAPACITY_MAX {
+        return Err(ServerError::InvalidReplyInboxCapacity {
+            value: reply_inbox_capacity,
+            max: INBOX_CAPACITY_MAX,
+        });
+    }
     let drain_timeout = sharding.shutdown_drain_timeout.get_duration();
     if drain_timeout.is_zero() || drain_timeout > SHUTDOWN_DRAIN_TIMEOUT_MAX {
         return Err(ServerError::InvalidShutdownDrainTimeout {
@@ -754,9 +763,11 @@ pub fn bootstrap(
     // busy-loop every shutdown watchdog on a zero poll cadence, or wedge
     // process exit on an unbounded drain budget.
     let inbox_capacity = config.system.sharding.inbox_capacity;
+    let reply_inbox_capacity = config.system.sharding.reply_inbox_capacity;
     validate_sharding_runtime_knobs(&config.system.sharding)?;
 
-    let (senders, mut inboxes) = shard_mesh_channels(total_shards, inbox_capacity);
+    let (senders, mut inboxes, mut reply_inboxes) =
+        shard_mesh_channels(total_shards, inbox_capacity, reply_inbox_capacity);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let config = Arc::new(config);
     // One owner table per server process, Arc-cloned into every shard's bus so
@@ -788,12 +799,22 @@ pub fn bootstrap(
     // Shared metadata-group view: written by shard 0's publisher task, read by
     // every shard's cluster-metadata roster so leader marking works off-shard.
     let metadata_view = Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN));
+    // Every shard's metric handles, minted before the threads spawn: each
+    // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
+    // the whole set (counters are Arc-backed, so cross-thread reads see the
+    // owning shard's bumps).
+    let shard_metrics_all: Vec<ShardMetrics> = (0..shards_count)
+        .map(|_| ShardMetrics::for_shard())
+        .collect();
     for (idx, assignment) in assignments.into_iter().enumerate() {
         #[allow(clippy::cast_possible_truncation)]
         let shard_id = idx as u16;
         let inbox = inboxes[idx]
             .take()
             .expect("shard_mesh_channels populates every inbox slot exactly once");
+        let reply_inbox = reply_inboxes[idx]
+            .take()
+            .expect("shard_mesh_channels populates every reply-inbox slot exactly once");
         let senders_for_shard = senders.clone();
         let config_for_shard = Arc::clone(&config);
         let shutdown_flag_for_shard = Arc::clone(&shutdown_flag);
@@ -818,6 +839,7 @@ pub fn bootstrap(
         };
 
         let metadata_view_for_shard = Arc::clone(&metadata_view);
+        let shard_metrics_for_shard = shard_metrics_all.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -828,12 +850,14 @@ pub fn bootstrap(
                     assignment,
                     senders_for_shard,
                     inbox,
+                    reply_inbox,
                     config_for_shard,
                     shutdown_flag_for_shard,
                     metadata_handoff_for_shard,
                     barrier_for_shard,
                     owner_table_for_shard,
                     metadata_view_for_shard,
+                    shard_metrics_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -891,12 +915,14 @@ fn run_shard_thread(
     assignment: ShardInfo,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     config: Arc<ServerConfig>,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     metadata_view: Arc<AtomicU64>,
+    shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -932,12 +958,14 @@ fn run_shard_thread(
             replica_id,
             senders,
             inbox,
+            reply_inbox,
             &config,
             shutdown_flag,
             metadata_handoff,
             barrier,
             owner_table,
             metadata_view,
+            shard_metrics_all,
         ))
         .await
     });
@@ -959,12 +987,14 @@ async fn shard_main(
     replica_id: Option<u8>,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     config: &ServerConfig,
     shutdown_flag: Arc<AtomicBool>,
     metadata_handoff: MetadataHandoff,
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     metadata_view: Arc<AtomicU64>,
+    shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -987,7 +1017,12 @@ async fn shard_main(
     let poll_interval = config.system.sharding.shutdown_poll_interval.get_duration();
 
     let shutdown_flag_for_handoff = Arc::clone(&shutdown_flag);
-    spawn_shutdown_watchdog(Rc::clone(&bus), shutdown_flag, drain_timeout, poll_interval);
+    let mut shutdown_watchdog = Some(spawn_shutdown_watchdog(
+        Rc::clone(&bus),
+        shutdown_flag,
+        drain_timeout,
+        poll_interval,
+    ));
 
     // Metadata bootstrap is single-writer: shard 0 owns the WAL and the
     // only `WriteHandle`-bearing `MuxStateMachine`. Peer shards receive
@@ -1013,6 +1048,11 @@ async fn shard_main(
                 config.metadata.clients_table_max,
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
+                },
+                |mux_stm, client, timestamp| {
+                    mux_stm
+                        .streams()
+                        .remove_consumer_group_member(client, timestamp);
                 },
             )
             .await
@@ -1125,16 +1165,12 @@ async fn shard_main(
     // view-change superblock write records the real (checkpoint_op, checksum)
     // instead of (0, 0). No-op on peer shards, which have no coordinator.
     metadata.seed_checkpoint_ref(checkpoint_seed.0, checkpoint_seed.1);
-    // Shard 0's copy resolves the `ServerDefault` sentinels (max topic size and
-    // message expiry) at create admission; responses echo stored values verbatim.
-    metadata.set_default_max_topic_size(config.system.topic.max_size.as_bytes_u64());
-    metadata.set_default_message_expiry(u64::from(config.system.topic.message_expiry));
     // Keep the forced-checkpoint margin >= the configured prepare-queue
     // depth: ops already pipelined while a checkpoint runs append into that
     // margin (config validation keeps journal_slots >= 4x this).
     metadata.set_checkpoint_margin(config.metadata.checkpoint_margin());
 
-    let shard_metrics = ShardMetrics::for_shard();
+    let shard_metrics = shard_metrics_all[usize::from(shard_id)].clone();
     // Notifier install deferred until after tick handler wires below.
     let senders_for_notifier = senders.clone();
     let metrics_for_notifier = shard_metrics.clone();
@@ -1150,6 +1186,7 @@ async fn shard_main(
         Rc::clone(&bus),
         senders,
         inbox,
+        reply_inbox,
         shard_metrics,
         Arc::clone(&metadata_view),
     ))
@@ -1191,20 +1228,17 @@ async fn shard_main(
     );
 
     // Re-check the cross-thread shutdown flag here, *before* spawning the
-    // message pump. A sibling shard may have failed in the window between
-    // the metadata broadcast and this point; gating before spawn keeps the
-    // bus' `background_tasks` vec empty on the shutdown path. Spawn-then-
-    // check would leave `bus.track_background(pump_handle)` registering a
-    // `JoinHandle` that only `bus.shutdown()` drains, but the watchdog
-    // driving `bus.shutdown()` is `.detach()`'d (see TODO at
-    // `spawn_shutdown_watchdog`) and may not be scheduled before this
-    // function returns `Ok(())` and the compio runtime drops, cancelling
-    // the pump mid-`write_vectored_all`.
-    //
-    // Without this gate shard 0 would also still open TCP/QUIC/WS
+    // message pump: it keeps the bus' `background_tasks` vec empty on the
+    // shutdown path, and shard 0 would otherwise still open TCP/QUIC/WS
     // listeners for a server that is already tearing down, briefly
     // accepting connections that immediately get torn by the watchdog.
+    //
+    // The flag is set, so the watchdog is (about to be) driving
+    // `bus.shutdown()`; await it so the runtime does not drop mid-drain.
     if shutdown_flag_for_handoff.load(Ordering::Relaxed) {
+        if let Some(watchdog) = shutdown_watchdog.take() {
+            let _ = watchdog.await;
+        }
         return Ok(());
     }
 
@@ -1400,6 +1434,7 @@ async fn shard_main(
             accepted_replica,
             dialed_replica,
             accepted_client,
+            &shard_metrics_all,
         )
         .await
         {
@@ -1417,6 +1452,12 @@ async fn shard_main(
             // The bind failure is the primary fault; the drain verdict only
             // matters for the log it emits.
             let _ = await_pump_drain(pump_handle.take(), config, shard_id).await;
+            // Neither the flag nor the bus token has fired yet on this path,
+            // so the watchdog is still idle-looping; awaiting it would hang.
+            // Detach and let `run_shard_thread`'s unwind flip the flag.
+            if let Some(watchdog) = shutdown_watchdog.take() {
+                watchdog.detach();
+            }
             return Err(error);
         }
 
@@ -1443,7 +1484,15 @@ async fn shard_main(
         let _ = tx.try_send(());
     }
 
-    await_pump_drain(pump_handle.take(), config, shard_id).await?;
+    // Await the watchdog even when the drain verdict is an error: the token
+    // has fired, so it either stands down within one poll interval or is
+    // mid-`bus.shutdown()`, and dropping it there truncates in-flight
+    // `ClientForwardFailed` replies.
+    let pump_verdict = await_pump_drain(pump_handle.take(), config, shard_id).await;
+    if let Some(watchdog) = shutdown_watchdog.take() {
+        let _ = watchdog.await;
+    }
+    pump_verdict?;
 
     info!(shard = shard_id, "server shard exited cleanly");
     Ok(())
@@ -1659,16 +1708,27 @@ async fn await_bootstrap_complete(
 /// is the only Send signal we have; the bus' shutdown machinery is
 /// `!Send` (`Rc<Cell<bool>>` + per-shard `async_channel`), so it must be
 /// triggered from within the runtime that owns the bus.
+///
+/// The caller owns the returned handle and must await it on the exit paths
+/// where shutdown is in progress (flag set or bus token triggered):
+/// dropping it there cancels the watchdog mid-`bus.shutdown()`, truncating
+/// in-flight `ClientForwardFailed` replies (terminal per `SendError` docs).
+/// It cannot go through `bus.track_background` instead: the watchdog itself
+/// drives `bus.shutdown()`, and the bg-drain loop in `shutdown()` would
+/// re-enter awaiting the watchdog's own pending shutdown call
+/// (self-deadlock). The await is bounded: once the token fires the loop
+/// stands down within one poll interval, and the shutdown call itself is
+/// capped by `drain_timeout`.
 #[allow(clippy::needless_pass_by_value)]
 fn spawn_shutdown_watchdog(
     bus: Rc<IggyMessageBus>,
     shutdown_flag: Arc<AtomicBool>,
     drain_timeout: Duration,
     poll_interval: Duration,
-) {
+) -> compio::runtime::JoinHandle<()> {
     let bus_for_task = Rc::clone(&bus);
     let bus_token = bus.token();
-    let watchdog = compio::runtime::spawn(async move {
+    compio::runtime::spawn(async move {
         loop {
             if shutdown_flag.load(Ordering::Relaxed) {
                 break;
@@ -1681,19 +1741,7 @@ fn spawn_shutdown_watchdog(
             compio::time::sleep(poll_interval).await;
         }
         let _ = bus_for_task.shutdown(drain_timeout).await;
-    });
-    // TODO(hubcio): `.detach()` races bus shutdown: when `bus.token()` is
-    // triggered, `shard_main` returns and the runtime drops the watchdog
-    // mid-`bus.shutdown()`, truncating in-flight `ClientForwardFailed`
-    // replies (terminal per `SendError` docs). Cannot use
-    // `bus.track_background(watchdog)` here because the watchdog itself
-    // drives `bus.shutdown()`, and the bg-drain loop in `shutdown()`
-    // would re-enter awaiting the watchdog's own pending shutdown call
-    // (self-deadlock). Fix: extract a `core/task_registry` crate mirroring
-    // `core/server`'s task-tracking mechanism, share it between the bus
-    // and server so background tasks can be reaped without coupling
-    // to the bus shutdown order.
-    watchdog.detach();
+    })
 }
 
 /// Copy the configured cluster roster plus this node's own client ports into
@@ -1738,6 +1786,7 @@ async fn build_shard_for_thread(
     bus: Rc<IggyMessageBus>,
     senders: Vec<TaggedSender>,
     inbox: ShardReceiver<ShardFrame>,
+    reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     metadata_view: Arc<AtomicU64>,
 ) -> Result<(Rc<ServerShard>, Rc<RefCell<SessionManager>>), ServerError> {
@@ -1778,16 +1827,20 @@ async fn build_shard_for_thread(
     let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
-            messages_required_to_save: config.system.partition.messages_required_to_save,
-            size_of_messages_required_to_save: config
-                .system
-                .partition
-                .size_of_messages_required_to_save,
-            enforce_fsync: config.system.partition.enforce_fsync,
+            messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
+            size_of_messages_required_to_save: IggyByteSize::from(
+                iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+            ),
+            enforce_fsync: iggy_common::DEFAULT_ENFORCE_FSYNC,
             validate_checksum: config.system.partition.validate_checksum,
-            segment_size: config.system.segment.size,
-            preallocate_segments: config.system.segment.preallocate,
+            segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
+            preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
             encryptor,
+            path_layout: partitions::PartitionPathLayout {
+                streams_root: config.system.get_streams_path(),
+                topics_dir: config.system.topic.path.clone(),
+                partitions_dir: config.system.partition.path.clone(),
+            },
         },
         owned_partitions_capacity,
     );
@@ -1815,7 +1868,13 @@ async fn build_shard_for_thread(
                             partition.id,
                             topic.stats.clone(),
                         );
-                        owned.push((stream.id, topic_id, stats, partition.clone()));
+                        owned.push((
+                            stream.id,
+                            topic_id,
+                            stats,
+                            partition.clone(),
+                            TopicRuntimeOptions::from_resource_options(&topic.options),
+                        ));
                     } else {
                         shards_table.insert(
                             namespace,
@@ -1835,14 +1894,14 @@ async fn build_shard_for_thread(
     // bundle was broadcast (see `MetadataHandoff::Owner`). All shards
     // here only add their per-partition deltas, so the shared
     // `Arc<TopicStats>` atomics race only against other atomic adds.
-    for (stream_id, topic_id, partition_stats, partition_metadata) in owned {
-        validate_namespace_bounds(config, stream_id, topic_id, partition_metadata.id)?;
+    for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
         let partition = match load_partition(
             config,
             namespace,
             Arc::clone(&partition_stats),
             &partition_metadata,
+            topic_runtime,
             topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
@@ -1911,6 +1970,7 @@ async fn build_shard_for_thread(
                     namespace,
                     partition_stats,
                     partition_metadata.created_revision,
+                    topic_runtime,
                     topology.cluster_id,
                     topology.self_replica_id,
                     topology.replica_count,
@@ -1992,13 +2052,17 @@ async fn build_shard_for_thread(
         partitions,
         senders,
         inbox,
+        reply_inbox,
         shards_table,
         PartitionConsensusConfig::new(
             topology.cluster_id,
             shard::ReplicaTopology::new(topology.self_replica_id, topology.replica_count),
             Rc::clone(&bus),
         ),
-        CoordinatorConfig::default(),
+        CoordinatorConfig {
+            skip_shard_zero_for_replicas: config.cluster.coordinator.skip_shard_zero_for_replicas,
+            skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
+        },
         metrics,
     )
     .build()
@@ -2008,6 +2072,7 @@ async fn build_shard_for_thread(
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_superblock_wedged_fatal_failures(superblock_wedged_fatal_failures(config));
     shard.set_served_segment_cache_bytes_max(
         config
             .partition
@@ -2087,6 +2152,28 @@ const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
 fn duration_to_ticks(interval: Duration) -> u64 {
     let ticks = interval.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis();
     u64::try_from(ticks.max(1)).unwrap_or(u64::MAX)
+}
+
+/// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count.
+/// Retries pin at the backoff cap after warmup, so the window divided by
+/// [`journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS`] bounds how
+/// long a wedged replica may limp before it fail-stops. Zero stays zero
+/// (fail-stop disabled).
+pub(crate) fn superblock_wedged_fatal_failures(config: &ServerConfig) -> u64 {
+    superblock_window_to_failures(
+        config
+            .cluster
+            .superblock_wedged_fatal_timeout
+            .get_duration(),
+    )
+}
+
+fn superblock_window_to_failures(window: Duration) -> u64 {
+    if window.is_zero() {
+        return 0;
+    }
+    let cap_micros = u128::from(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
+    u64::try_from((window.as_micros() / cap_micros).max(1)).unwrap_or(u64::MAX)
 }
 
 /// `[cluster] heartbeat_timeout` in consensus ticks. Every consensus group
@@ -2177,6 +2264,20 @@ pub(crate) fn request_start_view_ticks(config: &ServerConfig) -> u64 {
     )
 }
 
+/// The full `[cluster]` timer set every consensus group boots with, built
+/// once so the planes cannot diverge in what they apply.
+pub(crate) fn consensus_timers(config: &ServerConfig) -> ConsensusTimers {
+    ConsensusTimers {
+        normal_heartbeat_ticks: cluster_heartbeat_ticks(config),
+        commit_message_ticks: commit_broadcast_ticks(config),
+        prepare_ticks: prepare_retransmit_ticks(config),
+        view_change_retransmit_ticks: view_change_retransmit_ticks(config),
+        view_change_status_ticks: view_change_status_ticks(config),
+        request_start_view_ticks: request_start_view_ticks(config),
+        probe_attempts_max: config.cluster.view_probe_attempts_max,
+    }
+}
+
 /// `[cluster] repair_retry_interval` in consensus ticks: how long a stalled
 /// journal-repair stream waits before re-requesting its window. Both planes'
 /// repair loops share it, so it is applied once per shard (not per consensus
@@ -2231,50 +2332,10 @@ fn restore_metadata_consensus(
     );
     let prepare_queue_depth = config.metadata.prepare_queue_depth;
 
-    let mut consensus = VsrConsensus::new(
-        topology.cluster_id,
-        topology.self_replica_id,
-        replica_count,
-        server_common::sharding::METADATA_GROUP,
-        bus,
-        // Request queue keeps the stock 2x ratio over the prepare queue
-        // (32 -> 64 at defaults): buffered requests are cheap relative to
-        // in-flight prepares and drain as prepares commit.
-        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
-    );
-    consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
-    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
-    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
-    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
-    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
-    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
-    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
-    // Fresh random incarnation each boot, so a StartView addressed to a previous
-    // incarnation still in flight is ignored (`handle_start_view` guard). `| 1`
-    // guarantees the non-zero the guard treats as set. The deterministic simulator
-    // overrides this with a seed-derived value bumped per restart.
-    consensus.set_incarnation(rand::random::<u128>() | 1);
-
     let last_header = journal
         .last_op()
         .and_then(|op| usize::try_from(op).ok())
         .and_then(|op| journal.header(op).map(|header| *header));
-    // View and log_view come from the durable superblock when present. A present but
-    // unreadable superblock already refused boot in `recover()`, so reaching the
-    // `else` means it is genuinely absent: a fresh node, or one that took writes but
-    // never checkpointed or changed view. There, inferring the view from the last WAL
-    // prepare is safe, since the persist-before-send gate guarantees this replica
-    // never externalized a view beyond what a re-probe re-derives, and it re-probes
-    // as a backup below. log_view cannot be inferred and stays 0 until the next
-    // superblock write.
-    if let Some(state) = recovered_state {
-        consensus.set_view(state.view);
-        consensus.set_log_view(state.log_view);
-        consensus.mark_superblock_durable(state.view, state.log_view);
-    } else if let Some(header) = last_header {
-        consensus.set_view(header.view);
-    }
-
     // On a RESTART in a cluster, rejoin as a quorum-invisible backup and
     // probe for the current view (`RequestStartView`): the view's primary
     // answers with a `StartView`, the replica adopts it as a backup, and
@@ -2291,18 +2352,51 @@ fn restore_metadata_consensus(
     // and an empty journal; gating on the WAL alone would `init()` it into
     // `Status::Normal` as primary for a view the cluster may have moved past,
     // with `ceded_primaryship` false and no probe to correct it.
-    if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
-        consensus.init_as_backup();
-        consensus.begin_view_probe();
-        // Restart in a cluster: replace snapshot-shaped metadata state
-        // (snapshot + client table) from the live primary the probe finds,
-        // then journal-repair the tail. If the probe exhausts instead --
-        // full-cluster bootstrap, nobody live to fetch from -- the election
-        // fallback clears the stage and this local recovery stands.
-        consensus.begin_state_transfer_await();
+    //
+    // The rejoin also awaits a state transfer: snapshot-shaped metadata state
+    // (snapshot + client table) is replaced from the live primary the probe
+    // finds, then journal repair fills the tail. If the probe exhausts
+    // instead -- full-cluster bootstrap, nobody live to fetch from -- the
+    // election fallback clears the stage and this local recovery stands.
+    let join = if replica_count > 1 && (restored_op > 0 || recovered_state.is_some()) {
+        JoinMode::ProbeAsBackup {
+            await_state_transfer: true,
+        }
     } else {
-        consensus.init();
-    }
+        JoinMode::Init
+    };
+    let timers = consensus_timers(config);
+    let consensus = VsrConsensus::restored(
+        topology.cluster_id,
+        topology.self_replica_id,
+        replica_count,
+        server_common::sharding::METADATA_GROUP,
+        bus,
+        // Request queue keeps the stock 2x ratio over the prepare queue
+        // (32 -> 64 at defaults): buffered requests are cheap relative to
+        // in-flight prepares and drain as prepares commit.
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
+        VsrRestore {
+            timers: &timers,
+            // View and log_view come from the durable superblock when present.
+            // A present but unreadable superblock already refused boot in
+            // `recover()`, so no durable record means genuinely absent: a
+            // fresh node, or one that took writes but never checkpointed or
+            // changed view. There, inferring the view from the last WAL
+            // prepare is safe, since the persist-before-send gate guarantees
+            // this replica never externalized a view beyond what a re-probe
+            // re-derives, and it re-probes as a backup.
+            durable_view: recovered_state.map(|state| (state.view, state.log_view)),
+            view_fallback: last_header.map(|header| header.view),
+            // Fresh random incarnation each boot, so a StartView addressed to
+            // a previous incarnation still in flight is ignored
+            // (`handle_start_view` guard). `| 1` guarantees the non-zero the
+            // guard treats as set. The deterministic simulator overrides this
+            // with a seed-derived value bumped per restart.
+            incarnation: Some(rand::random::<u128>() | 1),
+            join,
+        },
+    );
     consensus.sequencer().set_sequence(restored_op);
     // A SOLO replica's durable journal head IS its commit point: quorum is
     // 1-of-1, so an entry commits the instant it is durable, and the acks
@@ -2384,12 +2478,49 @@ fn restore_metadata_consensus(
     consensus
 }
 
+/// Recover this partition's persisted segment chain, stamping each segment
+/// with the topic's effective segment size (the per-topic value when the
+/// topic was created with one, else the shard-wide configured size).
+async fn recover_partition_segments(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    runtime_options: TopicRuntimeOptions,
+    stats: &PartitionStats,
+) -> Result<Vec<RecoveredSegment>, ServerError> {
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    let partition_id = namespace.partition_id();
+    let segment_size = runtime_options
+        .segment_size
+        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    load_persisted_segments(
+        config,
+        stream_id,
+        topic_id,
+        partition_id,
+        segment_size,
+        stats,
+    )
+    .await
+    .map_err(|source| {
+        error!(
+            stream_id,
+            topic_id,
+            partition_id,
+            error = %source,
+            "failed to load partition log during server bootstrap"
+        );
+        source
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn load_partition(
     config: &ServerConfig,
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
     partition_metadata: &Partition,
+    runtime_options: TopicRuntimeOptions,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
@@ -2398,30 +2529,9 @@ async fn load_partition(
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
-    // Request queue holds 2x the prepare depth (buffered requests drain as
-    // prepares commit); depth is the per-partition `[partition]` knob.
-    let prepare_queue_depth = config.partition.prepare_queue_depth;
-    let mut consensus = VsrConsensus::new(
-        cluster_id,
-        self_replica_id,
-        replica_count,
-        namespace.inner(),
-        bus,
-        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
-    );
-    consensus.set_normal_heartbeat_ticks(cluster_heartbeat_ticks(config));
-    consensus.set_commit_message_ticks(commit_broadcast_ticks(config));
-    consensus.set_prepare_ticks(prepare_retransmit_ticks(config));
-    consensus.set_view_change_retransmit_ticks(view_change_retransmit_ticks(config));
-    consensus.set_view_change_status_ticks(view_change_status_ticks(config));
-    consensus.set_request_start_view_ticks(request_start_view_ticks(config));
-    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
-
     // (view, log_view) come from the group's durable superblock when present;
     // a present but unverifiable record already refused boot inside
-    // `open_partition_superblock`. Restored BEFORE choosing how to join, so
-    // the backup probe below never advertises a view older than the recorded
-    // one.
+    // `open_partition_superblock`.
     let partition_dir = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
@@ -2434,9 +2544,6 @@ async fn load_partition(
         },
     )
     .await?;
-    if let Some(state) = recovered_state.as_ref() {
-        restore_partition_view(&mut consensus, state);
-    }
 
     // A recovered partition lost its journal state with the process: the
     // partition journal is in-memory and segments carry no op numbers, so
@@ -2448,12 +2555,34 @@ async fn load_partition(
     // at the serving peer's retention point. The probe re-broadcasts on its
     // timeout, so it needs no live mesh at boot. Single-replica groups
     // have no peer to ask and keep the plain init.
-    if replica_count > 1 {
-        consensus.init_as_backup();
-        consensus.begin_view_probe();
+    let join = if replica_count > 1 {
+        JoinMode::ProbeAsBackup {
+            await_state_transfer: false,
+        }
     } else {
-        consensus.init();
-    }
+        JoinMode::Init
+    };
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
+    let timers = consensus_timers(config);
+    let consensus = VsrConsensus::restored(
+        cluster_id,
+        self_replica_id,
+        replica_count,
+        namespace.inner(),
+        bus,
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
+        VsrRestore {
+            timers: &timers,
+            durable_view: recovered_state
+                .as_ref()
+                .map(|state| (state.view, state.log_view)),
+            view_fallback: None,
+            incarnation: None,
+            join,
+        },
+    );
 
     // No prepare-timestamp floor is restored here: the partition consensus
     // journal is non-durable today, so there is no persisted head to observe
@@ -2464,20 +2593,10 @@ async fn load_partition(
     // regress persisted `base_timestamp`.
 
     let recovered_segments =
-        load_persisted_segments(config, stream_id, topic_id, partition_id, &stats)
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    error = %source,
-                    "failed to load partition log during server bootstrap"
-                );
-                source
-            })?;
+        recover_partition_segments(config, namespace, runtime_options, &stats).await?;
 
     let mut partition = IggyPartition::new(stats.clone(), consensus);
+    partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Recovered partitions honor the same config-surfaced ring ceilings as the
     // fresh-create path (build_partition_fresh). Retention is already off for
@@ -2493,7 +2612,6 @@ async fn load_partition(
     partition.hydrate_applied_purge_generation().await?;
     hydrate_partition_log(
         &mut partition,
-        config,
         stream_id,
         topic_id,
         partition_id,
@@ -2553,14 +2671,31 @@ async fn load_partition(
     Ok(partition)
 }
 
+/// Reopen writers over a recovered segment chain.
+///
+/// Takes no `&ServerConfig`: every knob it needs is the partition's own
+/// resolved topic option now, which is the whole point of the per-topic move.
 async fn hydrate_partition_log(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
-    config: &ServerConfig,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
     recovered_segments: Vec<RecoveredSegment>,
 ) -> Result<(), ServerError> {
+    // The partition's own resolved knobs, not the shard-wide config: a topic
+    // created with `enforce_fsync` or a per-topic `segment_size` must get them
+    // on the writers reopened over its recovered chain too, or a restart would
+    // silently drop back to the node defaults.
+    let runtime = partition.runtime_options();
+    let enforce_fsync = runtime
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
+    let segment_size = runtime
+        .segment_size
+        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let preallocate_segments = runtime
+        .preallocate_segments
+        .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS);
     for RecoveredSegment { segment, storage } in recovered_segments {
         partition
             .log
@@ -2590,13 +2725,9 @@ async fn hydrate_partition_log(
                 MessagesWriter::new(
                     &messages_reader.path(),
                     messages_size_counter,
-                    config.system.partition.enforce_fsync,
+                    enforce_fsync,
                     true,
-                    config
-                        .system
-                        .segment
-                        .preallocate
-                        .then_some(config.system.segment.size),
+                    preallocate_segments.then_some(segment_size),
                 )
                 .await
                 .map_err(|source| {
@@ -2612,24 +2743,19 @@ async fn hydrate_partition_log(
                 })?,
             ));
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
-                IggyIndexWriter::new(
-                    &index_path,
-                    index_size_counter,
-                    config.system.partition.enforce_fsync,
-                    true,
-                )
-                .await
-                .map_err(|source| {
-                    error!(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        path = %index_path,
-                        error = %source,
-                        "failed to initialize persisted sparse index writer"
-                    );
-                    source
-                })?,
+                IggyIndexWriter::new(&index_path, index_size_counter, enforce_fsync, true)
+                    .await
+                    .map_err(|source| {
+                        error!(
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            path = %index_path,
+                            error = %source,
+                            "failed to initialize persisted sparse index writer"
+                        );
+                        source
+                    })?,
             ));
         }
     }
@@ -2876,6 +3002,7 @@ async fn start_tcp_runtime(
     accepted_replica: AcceptedReplicaFn,
     dialed_replica: DialedReplicaFn,
     accepted_clients: LocalClientAcceptFns,
+    shard_metrics_all: &[ShardMetrics],
 ) -> Result<(), ServerError> {
     if config.tcp.enabled && !config.tcp.tls.enabled {
         start_via_replica_io(
@@ -2921,6 +3048,7 @@ async fn start_tcp_runtime(
             &config.cluster,
             Arc::clone(&config.system),
             self_ports,
+            shard_metrics_all,
         )
         .await?;
     }
@@ -3583,6 +3711,7 @@ fn load_replica_tls_ctx(
     };
 
     let credentials = if tls.self_signed {
+        warn_ignored_certificate_files("cluster.tls", &tls.cert_file, &tls.key_file);
         let san = config
             .cluster
             .nodes
@@ -3663,7 +3792,7 @@ fn load_tcp_tls_server_credentials(
     config: &ServerConfig,
 ) -> Result<TlsServerCredentials, ServerError> {
     let tls = &config.tcp.tls;
-    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+    if ephemeral_certificate("tcp.tls", tls.self_signed, &tls.cert_file) {
         return Ok(self_signed_for_loopback());
     }
 
@@ -3717,7 +3846,7 @@ async fn start_websocket_listener(
 
 fn load_wss_server_credentials(config: &ServerConfig) -> Result<TlsServerCredentials, ServerError> {
     let tls = &config.websocket.tls;
-    if tls.self_signed && !Path::new(&tls.cert_file).exists() {
+    if ephemeral_certificate("websocket.tls", tls.self_signed, &tls.cert_file) {
         return Ok(self_signed_for_loopback());
     }
 
@@ -3734,6 +3863,11 @@ fn load_quic_server_credentials(
 ) -> Result<replica_io::QuicServerCredentials, ServerError> {
     let certificate = &config.quic.certificate;
     if certificate.self_signed {
+        warn_ignored_certificate_files(
+            "quic.certificate",
+            &certificate.cert_file,
+            &certificate.key_file,
+        );
         let (cert_chain, key_der) = server_common::generate_self_signed_certificate("localhost")
             .map_err(|error| ServerError::ListenerCredentials {
                 transport: "quic",
@@ -3757,6 +3891,44 @@ fn load_quic_server_credentials(
         cert_chain: credentials.cert_chain,
         key_der: credentials.key_der,
     })
+}
+
+/// Client-listener certificate precedence: `self_signed = true` mints an
+/// ephemeral loopback certificate only while `cert_file` is absent from disk.
+/// An existing PEM pair wins, so a deployment that lays certificates down
+/// serves them without also having to unset the flag - the contract every
+/// SDK test lane relies on when it points the server at `core/certs/`.
+fn ephemeral_certificate(section: &str, self_signed: bool, cert_file: &str) -> bool {
+    if !self_signed {
+        return false;
+    }
+    if Path::new(cert_file).exists() {
+        info!(
+            "{section}.self_signed = true but cert_file = {cert_file} exists on disk; loading it - remove the file or clear the path to serve an ephemeral certificate"
+        );
+        return false;
+    }
+    true
+}
+
+/// `self_signed = true` never reads the PEM pair (cluster and QUIC keep the
+/// flag authoritative: their generated certificates carry non-loopback SANs),
+/// so a cert path resolving on disk looks active to an operator who never
+/// asked for it.
+fn warn_ignored_certificate_files(section: &str, cert_file: &str, key_file: &str) {
+    let found: Vec<String> = [("cert_file", cert_file), ("key_file", key_file)]
+        .into_iter()
+        .filter(|(_, path)| Path::new(path).exists())
+        .map(|(field, path)| format!("{field} = {path}"))
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+
+    warn!(
+        "{section}.self_signed = true, ignoring certificate files found on disk ({}); set {section}.self_signed = false to load them",
+        found.join(", ")
+    );
 }
 
 fn parse_socket_addr(context: &'static str, address: &str) -> Result<SocketAddr, ServerError> {
@@ -3859,6 +4031,25 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superblock_fatal_window_converts_to_capped_backoff_retries() {
+        assert_eq!(
+            superblock_window_to_failures(Duration::ZERO),
+            0,
+            "zero window must stay the disabled sentinel"
+        );
+        assert_eq!(
+            superblock_window_to_failures(Duration::from_mins(2)),
+            120,
+            "past warmup one retry rides each 1s backoff cap"
+        );
+        assert_eq!(
+            superblock_window_to_failures(Duration::from_micros(500)),
+            1,
+            "a sub-cap window still needs one failure to fire"
+        );
+    }
 
     #[test]
     fn fresh_cluster_bootstrap_requires_explicit_root_credentials() {

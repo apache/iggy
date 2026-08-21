@@ -53,62 +53,11 @@ on:
         type: string
         required: false
         default: ""
-
-  workflow_call:
-    inputs:
-      dry_run:
-        description: "Dry run (build/test only, no actual publish)"
-        type: boolean
-        default: false
-      commit:
-        description: "Commit SHA (defaults to github.sha)"
-        type: string
-        default: ""
-      publish_crates:
-        description: "Rust crates to publish (comma-separated)"
-        type: string
-        default: ""
-      publish_dockerhub:
-        description: "Docker images to publish (comma-separated)"
-        type: string
-        default: ""
-      publish_other:
-        description: "Other SDKs to publish (comma-separated)"
-        type: string
-        default: ""
-      skip_tag_creation:
-        description: "Skip git tag creation"
-        type: boolean
-        default: false
-      use_latest_ci:
-        description: "Use latest CI from master"
-        type: boolean
-        default: false
       create_edge_docker_tag:
-        description: "Create rolling :edge Docker tag"
+        description: "Create rolling :edge Docker tag (used by post-merge automation)"
         type: boolean
+        required: false
         default: false
-    secrets:
-      CARGO_REGISTRY_TOKEN:
-        required: false
-      DOCKERHUB_USER:
-        required: false
-      DOCKERHUB_TOKEN:
-        required: false
-      PYPI_API_TOKEN:
-        required: false
-      NPM_TOKEN:
-        required: false
-      NEXUS_USER:
-        required: false
-      NEXUS_PW:
-        required: false
-      JAVA_GPG_SIGNING_KEY:
-        required: false
-      JAVA_GPG_PASSWORD:
-        required: false
-      NUGET_API_KEY:
-        required: false
 
 env:
   IGGY_CI_BUILD: true
@@ -116,7 +65,6 @@ env:
 permissions:
   contents: write # For tag creation
   packages: write
-  id-token: write
 
 # Static group so two concurrent release dispatches cannot race the
 # crates.io / Maven Central / npm / NuGet / DockerHub / PyPI uploads.
@@ -134,34 +82,10 @@ jobs:
     outputs:
       commit: ${{ steps.resolve.outputs.commit }}
       has_targets: ${{ steps.check.outputs.has_targets }}
-      is_workflow_call: ${{ steps.detect.outputs.is_workflow_call }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-
-      # Detect whether we are invoked via workflow_call (reusable) or
-      # workflow_dispatch (manual). Trust chain: when called via
-      # workflow_call, the caller is responsible for having validated its
-      # own trigger — the only in-tree caller today is
-      # .github/workflows/post-merge.yml, which is branch-filtered to
-      # master, so the SHA passed in is by construction a commit on
-      # master. Direct workflow_dispatch callers have no such guarantee
-      # and must pass through the master-ancestry check in Resolve
-      # commit below. Any future direct workflow_call caller added to
-      # this repo must preserve the master-ancestry property or the
-      # branch gate below will not apply to them.
-      - name: Detect trigger type
-        id: detect
-        run: |
-          # workflow_call sets github.event_name to 'workflow_call'
-          if [ "${{ github.event_name }}" = "workflow_call" ]; then
-            echo "is_workflow_call=true" >> "$GITHUB_OUTPUT"
-            echo "📞 Triggered via workflow_call"
-          else
-            echo "is_workflow_call=false" >> "$GITHUB_OUTPUT"
-            echo "🖱️ Triggered via workflow_dispatch"
-          fi
 
       - name: Check if any targets specified
         id: check
@@ -178,7 +102,6 @@ jobs:
         id: resolve
         env:
           INPUT_COMMIT: ${{ inputs.commit }}
-          IS_WORKFLOW_CALL: ${{ steps.detect.outputs.is_workflow_call }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -206,10 +129,7 @@ jobs:
           fi
           COMMIT="$FULL_SHA"
 
-          # Skip master branch check for workflow_call (caller already verified on master)
-          if [ "$IS_WORKFLOW_CALL" = "true" ]; then
-            echo "✅ Called from workflow, skipping master check"
-          elif [ "$DRY_RUN" = "true" ]; then
+          if [ "$DRY_RUN" = "true" ]; then
             echo "🌵 Dry run, skipping master branch check"
           else
             echo "🔍 Verifying commit is on master branch..."
@@ -736,14 +656,15 @@ jobs:
       needs.validate.outputs.has_targets == 'true' &&
       contains(inputs.publish_crates, 'rust-')
     uses: ./.github/workflows/_publish_rust_crates.yml
+    permissions:
+      contents: write
+      id-token: write
     with:
       crates: ${{ inputs.publish_crates }}
       dry_run: ${{ inputs.dry_run }}
       commit: ${{ needs.validate.outputs.commit }}
       use_latest_ci: ${{ inputs.use_latest_ci }}
       skip_tag_creation: ${{ inputs.skip_tag_creation }}
-    secrets:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # Docker publishing on native runners (no QEMU emulation)
   publish-docker:
@@ -1077,18 +998,13 @@ jobs:
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.non_docker_targets) }}
     env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-      NEXUS_USER: ${{ secrets.NEXUS_USER }}
-      NEXUS_PW: ${{ secrets.NEXUS_PW }}
-      JAVA_GPG_SIGNING_KEY: ${{ secrets.JAVA_GPG_SIGNING_KEY }}
-      JAVA_GPG_PASSWORD: ${{ secrets.JAVA_GPG_PASSWORD }}
-      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
       DRY_RUN: ${{ inputs.dry_run }}
     outputs:
       status: ${{ steps.status.outputs.status }}
@@ -1194,6 +1110,14 @@ jobs:
           wheels_artifact: python-wheels-all
           wheels_path: dist
 
+      - name: Upload Python SDK to PyPI
+        if: matrix.type == 'python' && inputs.dry_run == false
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+          attestations: true
+
       # ─────────────────────────────────────────
       # Node SDK Publishing
       # ─────────────────────────────────────────
@@ -1210,6 +1134,11 @@ jobs:
       - name: Publish Java SDK
         if: matrix.type == 'java'
         uses: ./.github/actions/java-gradle/post-merge
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PW: ${{ secrets.NEXUS_PW }}
+          JAVA_GPG_SIGNING_KEY: ${{ secrets.JAVA_GPG_SIGNING_KEY }}
+          JAVA_GPG_PASSWORD: ${{ secrets.JAVA_GPG_PASSWORD }}
         with:
           version: ${{ steps.ver.outputs.version }}
           dry_run: ${{ inputs.dry_run }}

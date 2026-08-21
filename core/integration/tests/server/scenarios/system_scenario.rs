@@ -123,11 +123,11 @@ pub async fn run(harness: &TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -150,7 +150,6 @@ pub async fn run(harness: &TestHarness) {
     assert_eq!(topic.messages_count, 0);
     assert_eq!(topic.message_expiry, IggyExpiry::NeverExpire);
     assert_eq!(topic.max_topic_size, MaxTopicSize::Unlimited);
-    assert_eq!(topic.replication_factor, 1);
 
     // 11. Get topic details by ID. The owning shards materialize fresh
     // partitions asynchronously after the commit, but the reply reports the
@@ -213,11 +212,11 @@ pub async fn run(harness: &TestHarness) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            PARTITIONS_COUNT,
-            Default::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await;
     assert!(create_topic_result.is_err());
@@ -596,17 +595,18 @@ pub async fn run(harness: &TestHarness) {
     let updated_message_expiry = 1000;
     let message_expiry_duration = updated_message_expiry.into();
     let updated_max_topic_size = MaxTopicSize::Custom(IggyByteSize::from_str("2 GB").unwrap());
-    let updated_replication_factor = 5;
 
     client
         .update_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::named(TOPIC_NAME).unwrap(),
             &updated_topic_name,
-            CompressionAlgorithm::Gzip,
-            Some(updated_replication_factor),
-            IggyExpiry::ExpireDuration(message_expiry_duration),
-            updated_max_topic_size,
+            &TopicUpdateOptions {
+                compression_algorithm: Some(CompressionAlgorithm::Gzip),
+                message_expiry: Some(IggyExpiry::ExpireDuration(message_expiry_duration)),
+                max_topic_size: Some(updated_max_topic_size),
+                ..TopicUpdateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -630,7 +630,31 @@ pub async fn run(harness: &TestHarness) {
         CompressionAlgorithm::Gzip
     );
     assert_eq!(updated_topic.max_topic_size, updated_max_topic_size);
-    assert_eq!(updated_topic.replication_factor, updated_replication_factor);
+    // The three settings the update carries as fixed fields are mirrored into
+    // the stored map, so `options` cannot report a value the typed field has
+    // already moved past. Compared through the rendered value rather than the
+    // raw bytes: this scenario runs on every transport, and HTTP renders option
+    // values as readable strings where the binary transports carry the kind the
+    // server stored.
+    let expiry_key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).unwrap();
+    let expiry = updated_topic
+        .options
+        .get(&expiry_key)
+        .expect("message expiry echoes back as an option");
+    assert!(expiry.explicit, "an updated key is explicit");
+    assert_eq!(
+        expiry.value.to_string_value(),
+        u64::from(updated_topic.message_expiry).to_string()
+    );
+    let max_size_key = HeaderKey::from_str(topic_option_keys::MAX_TOPIC_SIZE).unwrap();
+    let max_size = updated_topic
+        .options
+        .get(&max_size_key)
+        .expect("max topic size echoes back as an option");
+    assert_eq!(
+        max_size.value.to_string_value(),
+        u64::from(updated_topic.max_topic_size).to_string()
+    );
 
     // 39. Purge the existing topic and ensure it has no messages
     client
@@ -674,6 +698,7 @@ pub async fn run(harness: &TestHarness) {
         .update_stream(
             &Identifier::named(STREAM_NAME).unwrap(),
             &updated_stream_name,
+            &StreamUpdateOptions::default(),
         )
         .await
         .unwrap();
@@ -761,11 +786,11 @@ pub async fn run(harness: &TestHarness) {
         .create_topic(
             &Identifier::named(&stream_name).unwrap(),
             &topic_name,
-            PARTITIONS_COUNT,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(PARTITIONS_COUNT),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

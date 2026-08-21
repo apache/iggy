@@ -358,6 +358,34 @@ impl TestHarness {
         server.stop()
     }
 
+    /// SIGKILL node `index` and leave it down: the crash counterpart of
+    /// [`Self::stop_node`]. No shutdown hook runs, so nothing buffered in
+    /// process memory reaches disk. Restart via [`Self::restart_node`] to
+    /// exercise crash recovery.
+    pub fn kill_node(&mut self, index: usize) -> Result<(), TestBinaryError> {
+        let server = self
+            .servers
+            .get_mut(index)
+            .ok_or(TestBinaryError::MissingServer)?;
+        server.kill()
+    }
+
+    /// SIGKILL EVERY node, in ascending index order: the whole-cluster
+    /// power-loss shape, versus [`Self::restart_cluster`]'s graceful
+    /// stop-all-then-start-all. The kills spread over at most a couple hundred
+    /// milliseconds (a watchdog join plus a reap each), far below the 5s
+    /// heartbeat timeout, so no election starts between them. Restart via
+    /// [`Self::restart_cluster`].
+    pub fn kill_cluster(&mut self) -> Result<(), TestBinaryError> {
+        if self.servers.is_empty() {
+            return Err(TestBinaryError::MissingServer);
+        }
+        for server in &mut self.servers {
+            server.kill()?;
+        }
+        Ok(())
+    }
+
     /// Restart EVERY node and reconnect all clients: the full-cluster
     /// restart path, where no settled primary survives to answer the rejoin
     /// probes and the replicas must fall back to an election among their

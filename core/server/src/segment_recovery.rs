@@ -33,7 +33,7 @@ use iggy_common::{IggyByteSize, IggyError, PartitionStats};
 use partitions::state_transfer::STAGING_SUFFIX;
 use partitions::{IggyIndexReader, Segment};
 use server_common::SegmentStorage;
-use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header, decode_batch_slice};
+use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use std::fs;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -65,6 +65,7 @@ pub async fn load_persisted_segments(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
+    segment_size: IggyByteSize,
     stats: &PartitionStats,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
     let partition_path = config
@@ -78,8 +79,7 @@ pub async fn load_persisted_segments(
     let mut start_offsets = sweep_scratch_files_and_collect_offsets(&partition_path)?;
     start_offsets.sort_unstable();
 
-    let enforce_fsync = config.system.partition.enforce_fsync;
-    let max_size = config.system.segment.size;
+    let max_size = segment_size;
 
     let mut recovered = Vec::with_capacity(start_offsets.len());
     for start_offset in start_offsets {
@@ -139,8 +139,6 @@ pub async fn load_persisted_segments(
             &index_path,
             effective_messages_size,
             effective_index_size,
-            enforce_fsync,
-            enforce_fsync,
             true,
         )
         .await
@@ -520,7 +518,7 @@ async fn recover_segment_bounds(
 fn batch_verifies(
     messages: &fs::File,
     position: u64,
-    header: &SendMessages2Header,
+    header: &BatchHeader,
     scratch: &mut Vec<u8>,
 ) -> bool {
     scratch.clear();
@@ -535,11 +533,11 @@ fn read_batch_header(
     messages: &fs::File,
     position: u64,
     messages_size: u64,
-) -> Option<SendMessages2Header> {
+) -> Option<BatchHeader> {
     if position.checked_add(COMMAND_HEADER_SIZE as u64)? > messages_size {
         return None;
     }
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE];
     messages.read_exact_at(&mut header_bytes, position).ok()?;
-    SendMessages2Header::decode(&header_bytes).ok()
+    BatchHeader::decode(&header_bytes).ok()
 }

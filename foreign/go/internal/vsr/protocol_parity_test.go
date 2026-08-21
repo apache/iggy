@@ -87,8 +87,6 @@ var goOperations = map[string]Operation{
 	"SendMessages":                    OperationSendMessages,
 	"StoreConsumerOffset":             OperationStoreConsumerOffset,
 	"DeleteConsumerOffset":            OperationDeleteConsumerOffset,
-	"StoreConsumerOffset2":            OperationStoreConsumerOffset2,
-	"DeleteConsumerOffset2":           OperationDeleteConsumerOffset2,
 }
 
 // goEvictionReasons names every eviction discriminant the codec declares.
@@ -159,7 +157,7 @@ var rustFieldLayout = map[string][2]int{
 	"u32":            {4, 4},
 	"u64":            {8, 8},
 	"u128":           {16, 16},
-	"Command2":       {1, 1},
+	"Command":        {1, 1},
 	"Operation":      {1, 1},
 	"EvictionReason": {1, 1},
 }
@@ -346,15 +344,15 @@ func TestProtocolParity_EvictionReasons(t *testing.T) {
 
 func TestProtocolParity_FrameCommands(t *testing.T) {
 	sources := loadRustSources(t)
-	rustValues := rustEnumValues(sources["command"], "Command2")
-	require.NotEmpty(t, rustValues, "the Rust Command2 enum was not found")
+	rustValues := rustEnumValues(sources["command"], "Command")
+	require.NotEmpty(t, rustValues, "the Rust Command enum was not found")
 
 	for name, got := range goFrameCommands {
 		want, ok := rustValues[name]
-		if !assert.True(t, ok, "Rust does not declare Command2::%s", name) {
+		if !assert.True(t, ok, "Rust does not declare Command::%s", name) {
 			continue
 		}
-		assert.Equal(t, want, uint64(got), "Command2::%s", name)
+		assert.Equal(t, want, uint64(got), "Command::%s", name)
 	}
 }
 

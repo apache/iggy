@@ -36,7 +36,7 @@ use crate::args::{
     },
 };
 
-pub use client_factory::{ClientFactory, authenticate};
+pub use client_factory::ClientFactory;
 
 pub mod batch_generator;
 pub mod client_factory;

@@ -30,7 +30,8 @@ import (
 )
 
 // streamDetailsBody builds a stream reply with no topics:
-// [id u32][created_at u64][topics u32][size u64][messages u64][name_len u8][name].
+// [id u32][created_at u64][topics u32][size u64][messages u64][name_len u8][name]
+// [options_len u32 = 0].
 func streamDetailsBody(id uint32, name string) []byte {
 	body := binary.LittleEndian.AppendUint32(nil, id)
 	body = binary.LittleEndian.AppendUint64(body, 1700000000)
@@ -38,7 +39,8 @@ func streamDetailsBody(id uint32, name string) []byte {
 	body = binary.LittleEndian.AppendUint64(body, 0)
 	body = binary.LittleEndian.AppendUint64(body, 0)
 	body = append(body, byte(len(name)))
-	return append(body, name...)
+	body = append(body, name...)
+	return binary.LittleEndian.AppendUint32(body, 0)
 }
 
 func TestCreateStream_DecodesTheCreatedStream(t *testing.T) {

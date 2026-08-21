@@ -101,7 +101,7 @@ pub const CLIENTS_TABLE_SLOT_MAX: usize = 1 << 16;
 /// original bytes instead of a bare "already applied"; losing one
 /// degrades the answer, never correctness. In-memory only: ring contents are
 /// refcount bumps and are never persisted or transferred.
-const REPLY_RING_CAPACITY: usize = 5;
+pub const REPLY_RING_CAPACITY: usize = 5;
 
 /// Per-session entry: fence epoch + committed-request watermark + replies.
 ///
@@ -166,7 +166,7 @@ pub struct ClientEntrySnapshot {
     pub watermark: u64,
     pub watermark_checksum: u128,
     /// Wire bytes of the entry's latest committed reply, round-tripped through
-    /// [`CachedReply::from_message`]. Never empty: registration seeds the ring.
+    /// `CachedReply::from_message`. Never empty: registration seeds the ring.
     ///
     /// Serialized as a msgpack `bin` blob, not the integer array a plain `Vec<u8>`
     /// produces, which spends 2 bytes on every byte >= 0x80 and runs a checkpoint's
@@ -652,7 +652,7 @@ impl ClientTable {
     /// previous register reply is dropped), and preserves the watermark -
     /// session resume keeps dedup history.
     ///
-    /// Full table evicts the oldest commit, see [`Self::evict_oldest`].
+    /// Full table evicts the oldest commit, see `Self::evict_oldest`.
     ///
     /// # Panics
     /// If `client_id == 0` or `client_id != reply.header().client`.
@@ -1239,7 +1239,7 @@ impl ClientEntry {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, Operation};
+    use iggy_binary_protocol::{Command, Operation};
 
     /// Arbitrary non-zero user id for register fixtures; most tests don't
     /// assert on it (see `register_stores_user_id` for the accessor check).
@@ -1259,7 +1259,7 @@ mod tests {
             commit,
             // Real size so codec-roundtripped replies re-parse.
             size: header_size as u32,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::Register,
             ..ReplyHeader::default()
         };
@@ -1290,7 +1290,7 @@ mod tests {
             request_checksum,
             // Real size so codec-roundtripped replies re-parse.
             size: header_size as u32,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::SendMessages,
             ..ReplyHeader::default()
         };

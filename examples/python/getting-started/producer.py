@@ -149,7 +149,6 @@ async def init_system(client: IggyClient):
             stream=STREAM_NAME,
             partitions_count=1,
             name=TOPIC_NAME,
-            replication_factor=1,
         )
         logger.info("Topic was created successfully.")
     else:

@@ -17,44 +17,48 @@
 
 use crate::WireError;
 use crate::WireIdentifier;
-use crate::codec::{WireDecode, WireEncode, read_u8, read_u64_le};
+use crate::codec::{WireDecode, WireEncode};
 use crate::primitives::identifier::WireName;
-use bytes::{BufMut, BytesMut};
+use crate::primitives::options::WireOptions;
+use bytes::BytesMut;
 
 /// `UpdateTopic` request.
 ///
 /// Wire format:
-/// `[stream_id:WireIdentifier][topic_id:WireIdentifier][compression_algorithm:u8]
-///  [message_expiry:u64_le][max_topic_size:u64_le][replication_factor:u8][name_len:u8][name:N]`
+/// `[stream_id:WireIdentifier][topic_id:WireIdentifier][name_len:u8][name:N]
+///  [options TLV to end]`
+///
+/// Identity and the new name are the only fixed fields; every SETTING rides the
+/// options block, which mirrors `CreateTopic`'s and carries the same catalog.
+/// A knob added there is updatable here without another layout change, and no
+/// setting has two homes to disagree between.
+///
+/// Keys absent from the block are LEFT ALONE rather than reset to their
+/// defaults. A client built before a key existed cannot send it, so treating
+/// the block as the topic's complete option set would let an old client wipe a
+/// newer knob just by updating the name -- the same forward-compatibility
+/// argument that makes unknown keys survive a round trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateTopicRequest {
     pub stream_id: WireIdentifier,
     pub topic_id: WireIdentifier,
-    pub compression_algorithm: u8,
-    pub message_expiry: u64,
-    pub max_topic_size: u64,
-    pub replication_factor: u8,
     pub name: WireName,
+    pub options: WireOptions,
 }
-
-const FIXED_FIELDS_SIZE: usize = 1 + 8 + 8 + 1; // 18 bytes
 
 impl WireEncode for UpdateTopicRequest {
     fn encoded_size(&self) -> usize {
         self.stream_id.encoded_size()
             + self.topic_id.encoded_size()
-            + FIXED_FIELDS_SIZE
             + self.name.encoded_size()
+            + self.options.encoded_size()
     }
 
     fn encode(&self, buf: &mut BytesMut) {
         self.stream_id.encode(buf);
         self.topic_id.encode(buf);
-        buf.put_u8(self.compression_algorithm);
-        buf.put_u64_le(self.message_expiry);
-        buf.put_u64_le(self.max_topic_size);
-        buf.put_u8(self.replication_factor);
         self.name.encode(buf);
+        self.options.encode(buf);
     }
 }
 
@@ -63,27 +67,17 @@ impl WireDecode for UpdateTopicRequest {
         let (stream_id, mut pos) = WireIdentifier::decode(buf)?;
         let (topic_id, consumed) = WireIdentifier::decode(&buf[pos..])?;
         pos += consumed;
-        let compression_algorithm = read_u8(buf, pos)?;
-        pos += 1;
-        let message_expiry = read_u64_le(buf, pos)?;
-        pos += 8;
-        let max_topic_size = read_u64_le(buf, pos)?;
-        pos += 8;
-        let replication_factor = read_u8(buf, pos)?;
-        pos += 1;
         let (name, name_consumed) = WireName::decode(&buf[pos..])?;
         pos += name_consumed;
+        let options = WireOptions::from_slice(&buf[pos..])?;
         Ok((
             Self {
                 stream_id,
                 topic_id,
-                compression_algorithm,
-                message_expiry,
-                max_topic_size,
-                replication_factor,
                 name,
+                options,
             },
-            pos,
+            buf.len(),
         ))
     }
 }
@@ -91,16 +85,20 @@ impl WireDecode for UpdateTopicRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::user_headers::encode_user_headers;
+
+    fn sample_options() -> WireOptions {
+        let mut buf = BytesMut::new();
+        encode_user_headers(&[(2, b"future_option", 9, &[3u8])], &mut buf);
+        WireOptions::from_bytes(buf.freeze()).unwrap()
+    }
 
     fn sample_request() -> UpdateTopicRequest {
         UpdateTopicRequest {
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(2),
-            compression_algorithm: 1,
-            message_expiry: 7200,
-            max_topic_size: 500_000,
-            replication_factor: 2,
             name: WireName::new("updated-topic").unwrap(),
+            options: sample_options(),
         }
     }
 
@@ -118,11 +116,8 @@ mod tests {
         let req = UpdateTopicRequest {
             stream_id: WireIdentifier::named("stream-a").unwrap(),
             topic_id: WireIdentifier::named("topic-b").unwrap(),
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: u64::MAX,
-            replication_factor: 1,
             name: WireName::new("new-name").unwrap(),
+            options: WireOptions::empty(),
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = UpdateTopicRequest::decode(&bytes).unwrap();
@@ -131,8 +126,27 @@ mod tests {
     }
 
     #[test]
-    fn truncated_returns_error() {
+    fn truncated_options_return_error() {
+        // One key-value pair, so any strict-interior truncation of the block
+        // is structurally invalid. Cutting at the block boundary is NOT an
+        // error: that is a legitimate update carrying no options.
         let req = sample_request();
+        let bytes = req.to_bytes();
+        let fixed_end = bytes.len() - req.options.encoded_size();
+        for i in fixed_end + 1..bytes.len() {
+            assert!(
+                UpdateTopicRequest::decode(&bytes[..i]).is_err(),
+                "expected error for truncation at byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_fixed_fields_return_error() {
+        let req = UpdateTopicRequest {
+            options: WireOptions::empty(),
+            ..sample_request()
+        };
         let bytes = req.to_bytes();
         for i in 0..bytes.len() {
             assert!(

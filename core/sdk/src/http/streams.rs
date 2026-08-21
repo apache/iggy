@@ -21,6 +21,7 @@ use crate::prelude::Identifier;
 use crate::prelude::IggyError;
 use async_trait::async_trait;
 use iggy_common::StreamClient;
+use iggy_common::StreamUpdateOptions;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::{Stream, StreamDetails};
@@ -71,12 +72,18 @@ impl StreamClient for HttpClient {
         Ok(stream)
     }
 
-    async fn update_stream(&self, stream_id: &Identifier, name: &str) -> Result<(), IggyError> {
+    async fn update_stream(
+        &self,
+        stream_id: &Identifier,
+        name: &str,
+        options: &StreamUpdateOptions,
+    ) -> Result<(), IggyError> {
         self.put(
             &get_details_path(&stream_id.as_cow_str()),
             &UpdateStream {
                 stream_id: stream_id.clone(),
                 name: name.to_string(),
+                options: options.raw.clone(),
             },
         )
         .await?;

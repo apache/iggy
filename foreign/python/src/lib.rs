@@ -20,6 +20,7 @@ mod config;
 mod consumer;
 mod duration;
 mod identifier;
+mod options;
 mod permissions;
 mod receive_message;
 mod send_message;
@@ -31,9 +32,10 @@ mod user_headers;
 use client::IggyClient;
 use config::{AutoLogin, TcpConfig, TcpReconnectionConfig};
 use consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, ConsumerGroup, ConsumerGroupDetails,
+    AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
 };
+use options::OptionSpec;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
@@ -59,7 +61,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TopicDetails>()?;
     m.add_class::<IggyExpiry>()?;
     m.add_class::<MaxTopicSize>()?;
+    m.add_class::<OptionSpec>()?;
     m.add_class::<Partition>()?;
+    m.add_class::<Consumer>()?;
     m.add_class::<ConsumerGroup>()?;
     m.add_class::<ConsumerGroupDetails>()?;
     m.add_class::<ConsumerGroupMember>()?;

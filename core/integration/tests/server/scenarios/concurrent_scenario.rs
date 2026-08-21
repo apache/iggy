@@ -85,11 +85,11 @@ pub async fn run(
             .create_topic(
                 &stream_id,
                 TEST_TOPIC_NAME,
-                PARTITIONS_COUNT,
-                CompressionAlgorithm::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(PARTITIONS_COUNT),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await
             .unwrap();
@@ -274,11 +274,11 @@ async fn execute_topics_hot(
                 .create_topic(
                     &stream_id,
                     &topic_name,
-                    PARTITIONS_COUNT,
-                    CompressionAlgorithm::default(),
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::ServerDefault,
+                    &TopicCreateOptions {
+                        partitions_count: Some(PARTITIONS_COUNT),
+                        message_expiry: Some(IggyExpiry::NeverExpire),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await
                 .map(|_| ())
@@ -314,11 +314,11 @@ async fn execute_topics_cold(
                 .create_topic(
                     &stream_id,
                     DUPLICATE_TOPIC,
-                    PARTITIONS_COUNT,
-                    CompressionAlgorithm::default(),
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::ServerDefault,
+                    &TopicCreateOptions {
+                        partitions_count: Some(PARTITIONS_COUNT),
+                        message_expiry: Some(IggyExpiry::NeverExpire),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await
                 .map(|_| ())

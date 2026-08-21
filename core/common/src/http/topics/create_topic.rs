@@ -23,6 +23,7 @@ use crate::error::IggyError;
 use crate::utils::expiry::IggyExpiry;
 use crate::utils::topic_size::MaxTopicSize;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// `CreateTopic` command is used to create a new topic in a stream.
 /// It has additional payload:
@@ -31,7 +32,6 @@ use serde::{Deserialize, Serialize};
 /// - `message_expiry` - message expiry, if `NeverExpire` then messages will never expire.
 /// - `max_topic_size` - maximum size of the topic, if `Unlimited` then topic size is unlimited.
 ///   Can't be lower than segment size in the config.
-/// - `replication_factor` - replication factor for the topic.
 /// - `name` - unique topic name, max length is 255 characters.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub struct CreateTopic {
@@ -47,10 +47,16 @@ pub struct CreateTopic {
     /// Max topic size, if `Unlimited` then topic size is unlimited.
     /// Can't be lower than segment size in the config.
     pub max_topic_size: MaxTopicSize,
-    /// Replication factor for the topic.
-    pub replication_factor: Option<u8>,
     /// Unique topic name, max length is 255 characters.
     pub name: String,
+    /// Additional topic options as string key-values, parsed by the server
+    /// with the same rules as its config file. Unknown keys are rejected.
+    ///
+    /// A response renders each option as `{"value": "<string>", "explicit":
+    /// bool}`, in this same string form, so the values a `GET` reports can be
+    /// sent straight back here.
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 impl Default for CreateTopic {
@@ -61,8 +67,8 @@ impl Default for CreateTopic {
             compression_algorithm: CompressionAlgorithm::None,
             message_expiry: IggyExpiry::NeverExpire,
             max_topic_size: MaxTopicSize::ServerDefault,
-            replication_factor: None,
             name: "topic".to_string(),
+            options: BTreeMap::new(),
         }
     }
 }
@@ -75,12 +81,6 @@ impl Validatable<IggyError> for CreateTopic {
 
         if !(0..=MAX_PARTITIONS_COUNT).contains(&self.partitions_count) {
             return Err(IggyError::TooManyPartitions);
-        }
-
-        if let Some(replication_factor) = self.replication_factor
-            && replication_factor == 0
-        {
-            return Err(IggyError::InvalidReplicationFactor);
         }
 
         Ok(())

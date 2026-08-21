@@ -20,6 +20,7 @@ use crate::wire_conversions::{consumer_to_wire, identifier_to_wire};
 use crate::{
     BinaryClient, Consumer, ConsumerOffsetClient, ConsumerOffsetInfo, Identifier, IggyError,
 };
+use iggy_binary_protocol::AckLevel;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
     DELETE_CONSUMER_OFFSET_CODE, GET_CONSUMER_OFFSET_CODE, STORE_CONSUMER_OFFSET_CODE,
@@ -51,6 +52,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
                 topic_id: wire_topic_id,
                 partition_id,
                 offset,
+                ack: AckLevel::Quorum,
             }
             .to_bytes(),
         )
@@ -106,6 +108,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
                 stream_id: wire_stream_id,
                 topic_id: wire_topic_id,
                 partition_id,
+                ack: AckLevel::Quorum,
             }
             .to_bytes(),
         )

@@ -42,7 +42,6 @@ excludes = [
     "**/LICENSE",
     "LICENSE",
     "NOTICE",
-    "DISCLAIMER",
     "**/NOTICE",
     "**/.gitignore",
     "**/.dockerignore",

@@ -22,7 +22,7 @@
 //! state, so the op commits as a deterministic no-op whose error rides the
 //! cached reply and replays on retry, exactly like a business rejection.
 //!
-//! Replay-determinism invariant: [`authorize`] is a pure function of the
+//! Replay-determinism invariant: `authorize` is a pure function of the
 //! prepare header (`operation` + the acting `user_id`, stamped into the
 //! replicated header at submit time) and the committed permission/stream
 //! state as of the op immediately before this one. That state is applied in
@@ -83,7 +83,7 @@ where
     mux.update(prepare)
 }
 
-/// Generic entry point to [`gated_apply`] for the WAL-replay path.
+/// Generic entry point to `gated_apply` for the WAL-replay path.
 ///
 /// The replay path is generic over the state machine and cannot name the
 /// concrete accessors, so it dispatches through this trait. Implemented only
@@ -92,7 +92,7 @@ where
 pub trait GatedApply:
     StateMachine<Input = Message<PrepareHeader>, Output = ApplyReply, Error = IggyError>
 {
-    /// See [`gated_apply`].
+    /// See `gated_apply`.
     ///
     /// # Errors
     /// Propagates the underlying [`StateMachine::update`] error.
@@ -341,9 +341,7 @@ pub(crate) fn authorize(
         | Operation::DeletePersonalAccessToken
         | Operation::SendMessages
         | Operation::StoreConsumerOffset
-        | Operation::DeleteConsumerOffset
-        | Operation::StoreConsumerOffset2
-        | Operation::DeleteConsumerOffset2 => None,
+        | Operation::DeleteConsumerOffset => None,
     }
 }
 
@@ -409,7 +407,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_binary_protocol::requests::users::CreateUserRequest;
-    use iggy_binary_protocol::{Command2, WireEncode, WireName};
+    use iggy_binary_protocol::{Command, WireEncode, WireName, WireOptions};
     use iggy_common::UserStatus;
     use server_common::iobuf::Owned;
 
@@ -438,7 +436,7 @@ mod tests {
             let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
                 &mut buffer.as_mut_slice()[..HEADER_SIZE],
             );
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = operation;
             header.op = op;
             header.user_id = user_id;
@@ -473,6 +471,7 @@ mod tests {
             password: "hash".to_string(),
             status: UserStatus::Active.as_code(),
             permissions: Some(WirePermissions { global, streams }),
+            options: WireOptions::empty(),
         }
         .to_bytes()
     }
@@ -480,6 +479,7 @@ mod tests {
     fn create_stream_body(name: &str) -> bytes::Bytes {
         CreateStreamRequest {
             name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes()
     }
@@ -489,12 +489,10 @@ mod tests {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
                 partitions_count: 1,
-                compression_algorithm: 0,
-                message_expiry: 0,
-                max_topic_size: 0,
-                replication_factor: 1,
                 name: WireName::new(name).unwrap(),
+                options: WireOptions::empty(),
             },
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,

@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { ClientConfig } from './client.type.js';
 import {
+  DEFAULT_HEARTBEAT_INTERVAL,
   DEFAULT_MAX_RESPONSE_FRAME_SIZE,
   normalizeClientConfig
 } from './client.config.js';
@@ -37,6 +38,40 @@ describe('normalizeClientConfig', () => {
       normalized.maxResponseFrameSize,
       DEFAULT_MAX_RESPONSE_FRAME_SIZE
     );
+  });
+
+  it('enables the heartbeat by default and honours an explicit interval', () => {
+    assert.equal(DEFAULT_HEARTBEAT_INTERVAL, 5000);
+
+    assert.equal(
+      normalizeClientConfig(config()).heartbeatInterval,
+      DEFAULT_HEARTBEAT_INTERVAL
+    );
+
+    assert.equal(
+      normalizeClientConfig({ ...config(), heartbeatInterval: 1000 })
+        .heartbeatInterval,
+      1000
+    );
+
+    assert.equal(
+      normalizeClientConfig({ ...config(), heartbeatInterval: 0 })
+        .heartbeatInterval,
+      0
+    );
+  });
+
+  it('rejects unusable heartbeat intervals', () => {
+    for (const heartbeatInterval of [
+      -1, -5000, Number.NaN, 1.5, 2_147_483_648, 2 ** 32, Number.MAX_VALUE
+    ])
+      assert.throws(
+        () => normalizeClientConfig({
+          ...config(),
+          heartbeatInterval
+        }),
+        /heartbeatInterval/
+      );
   });
 
   it('restricts the client to one pooled connection', () => {

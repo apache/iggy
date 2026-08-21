@@ -31,15 +31,15 @@
 //! which a backup commit must persist only the committed prefix and keep the
 //! uncommitted tail resident); the sequential run that follows drives many backup
 //! commit cycles and would expose a backup left permanently behind. The segment
-//! `.index` is excluded - see `is_comparable`.
+//! `.index` is excluded - see `integration::harness::disk`.
+//!
+//! The run stays far below the checkpoint margin, so the metadata WAL is still
+//! byte-identical across replicas and is included in the comparison.
 
 use iggy::prelude::*;
+use integration::harness::disk;
 use integration::iggy_harness;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-use tokio::time::sleep;
+use std::path::PathBuf;
 
 const STREAM_NAME: &str = "di-stream";
 const TOPIC_NAME: &str = "di-topic";
@@ -65,23 +65,12 @@ const BURST_CLIENTS: usize = 8;
 const BURST_SENDS_PER_CLIENT: u32 = 3;
 const BURST_BATCH_MESSAGES: u32 = 2;
 
-// Poll the per-node segment `.log` sizes until they agree and hold steady,
-// instead of a fixed sleep: a fixed wait either flakes under CI load or hides a
-// real replication lag. `messages_required_to_save = 1` flushes every committed
-// batch, so the at-rest `.log` total tracks committed persistence while running.
-const CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(20);
-const CONVERGENCE_STABLE_POLLS: u32 = 3;
-
 // `messages_required_to_save = 1` forces every committed batch to persist to its
 // segment immediately on every node, so each replica materialises the segment
 // files while running (the VSR server serves no flush_unsaved_buffer, and
-// shutdown-flush would couple the test to drain behaviour). The harness applies
-// the `server(...)` config to every cluster node.
-#[iggy_harness(
-    cluster_nodes = 3,
-    server(partition.messages_required_to_save = 1)
-)]
+// shutdown-flush would couple the test to drain behaviour). It is a topic
+// creation option, so it travels with the topic to every replica.
+#[iggy_harness(cluster_nodes = 3)]
 async fn should_persist_byte_identical_data_across_cluster_replicas(harness: &mut TestHarness) {
     let client = harness.tcp_root_client().await.unwrap();
     client.create_stream(STREAM_NAME).await.unwrap();
@@ -89,11 +78,12 @@ async fn should_persist_byte_identical_data_across_cluster_replicas(harness: &mu
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -172,7 +162,9 @@ async fn should_persist_byte_identical_data_across_cluster_replicas(harness: &mu
 
     // Wait for replication + per-batch persistence to converge across nodes
     // before reading files at rest (replaces a fixed settle sleep).
-    wait_for_log_convergence(&data_paths).await;
+    // `messages_required_to_save = 1` flushes every committed batch, so the
+    // at-rest `.log` total tracks committed persistence while running.
+    disk::wait_for_log_convergence(&data_paths).await;
 
     // Stop the whole cluster so every segment / metadata file is at rest. The
     // burst connections are still held; dropping them only after stop avoids the
@@ -180,22 +172,7 @@ async fn should_persist_byte_identical_data_across_cluster_replicas(harness: &mu
     harness.stop().await.unwrap();
     drop(_burst_clients);
 
-    let per_node: Vec<BTreeMap<String, Vec<u8>>> = data_paths
-        .iter()
-        .map(|root| collect_comparable_files(root))
-        .collect();
-
-    for (idx, node) in per_node.iter().enumerate() {
-        eprintln!(
-            "node {idx}: {} comparable file(s): {:?}",
-            node.len(),
-            node.iter()
-                .map(|(rel, bytes)| format!("{rel} ({} B)", bytes.len()))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    assert_replica_data_identical(&per_node);
+    disk::assert_replica_data_identical(&data_paths, true);
 }
 
 /// Drive a concurrent send burst across independent connections so the primary
@@ -250,197 +227,4 @@ async fn send_concurrent_burst(clients: Vec<IggyClient>) -> Vec<IggyClient> {
         clients.push(handle.await.unwrap());
     }
     clients
-}
-
-/// Poll each node's total segment `.log` bytes until all nodes agree and the
-/// figure holds steady for `CONVERGENCE_STABLE_POLLS` consecutive polls, or the
-/// deadline elapses. On timeout, return anyway: the byte-for-byte compare after
-/// stop then fails with a precise diff instead of this masking a real lag.
-async fn wait_for_log_convergence(data_paths: &[PathBuf]) {
-    let deadline = tokio::time::Instant::now() + CONVERGENCE_DEADLINE;
-    let mut previous: Option<Vec<u64>> = None;
-    let mut stable_polls = 0u32;
-    loop {
-        let sizes: Vec<u64> = data_paths
-            .iter()
-            .map(|root| total_log_bytes(root))
-            .collect();
-        let all_equal = sizes.iter().all(|size| *size == sizes[0]);
-        if all_equal && previous.as_ref() == Some(&sizes) {
-            stable_polls += 1;
-            if stable_polls >= CONVERGENCE_STABLE_POLLS {
-                return;
-            }
-        } else {
-            stable_polls = 0;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return;
-        }
-        previous = Some(sizes);
-        sleep(CONVERGENCE_POLL_INTERVAL).await;
-    }
-}
-
-/// Total bytes of every partition segment `.log` under a node's data dir.
-/// Mirrors the `.log` selection in `is_comparable`; sizes only, no contents.
-fn total_log_bytes(root: &Path) -> u64 {
-    let mut total = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
-                && let Ok(rel) = path.strip_prefix(root)
-            {
-                let rel = rel.to_string_lossy().replace('\\', "/");
-                if rel.starts_with("streams/") && rel.ends_with(".log") {
-                    total += fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-                }
-            }
-        }
-    }
-    total
-}
-
-/// A file (relative to a node's data dir) whose bytes must match across replicas:
-/// the partition segment `.log` and the replicated metadata WAL. Per-node files
-/// (logs, runtime, config, stdout) are excluded by construction.
-///
-/// Only the replicated, byte-identical artifacts are compared. Two metadata-plane
-/// files are deliberately excluded as local, per-replica artifacts:
-///
-/// - `metadata/snapshot.bin`: a local compaction artifact stamped with
-///   `created_at = now()` and a per-replica `sequence_number` at each node's own
-///   checkpoint, plus unsorted hashmap iteration order. It can never match across
-///   replicas even when the data is identical, so comparing it would ship a
-///   nondeterministic oracle (it is only written once a node crosses the
-///   checkpoint margin, so the flake is latent, not constant).
-/// - `state/`: not populated by the VSR plane (0 bytes today); excluded for the
-///   same local-artifact reason so it cannot start flaking if that ever changes.
-///
-/// The segment `.index` is excluded for the same class of reason: a local sparse
-/// index (one entry per persist flush), not replicated and not part of the VSR
-/// hash chain; recovery rebuilds it from the `.log`. Its byte length tracks the
-/// number of `commit_messages` flushes, which differs by commit cadence - the
-/// primary commits one op per quorum ack (one flush per op), a backup commits a
-/// whole heartbeat's committed range in a single `commit_journal` (one flush for
-/// many ops). So the `.index` legitimately differs across replicas for a
-/// multi-batch stream even though every committed `.log` byte is identical.
-fn is_comparable(rel: &str) -> bool {
-    let is_segment = rel.starts_with("streams/") && rel.ends_with(".log");
-    let is_metadata_wal = rel == "metadata/journal.wal";
-    is_segment || is_metadata_wal
-}
-
-fn collect_comparable_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
-    let mut files = BTreeMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file()
-                && let Ok(rel) = path.strip_prefix(root)
-            {
-                let rel = rel.to_string_lossy().replace('\\', "/");
-                if is_comparable(&rel) {
-                    let bytes = fs::read(&path)
-                        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-                    files.insert(rel, bytes);
-                }
-            }
-        }
-    }
-    files
-}
-
-fn assert_replica_data_identical(per_node: &[BTreeMap<String, Vec<u8>>]) {
-    // Guard against a vacuous pass: node 0 must actually hold a produced segment,
-    // otherwise nothing was persisted and the comparison proves nothing.
-    let node0 = &per_node[0];
-    assert!(
-        node0
-            .keys()
-            .any(|k| k.starts_with("streams/") && k.ends_with(".log")),
-        "node 0 holds no segment .log under streams/ - no partition data was persisted, \
-         so the cross-replica comparison would be vacuous. Comparable files: {:?}",
-        node0.keys().collect::<Vec<_>>()
-    );
-
-    let all_keys: BTreeSet<&str> = per_node
-        .iter()
-        .flat_map(|node| node.keys().map(String::as_str))
-        .collect();
-
-    let mut problems = Vec::new();
-    for key in all_keys {
-        let mut reference: Option<(usize, &[u8])> = None;
-        for (idx, node) in per_node.iter().enumerate() {
-            let Some(bytes) = node.get(key) else {
-                problems.push(format!(
-                    "`{key}` present on some replicas but MISSING on node {idx}"
-                ));
-                continue;
-            };
-            let bytes: &[u8] = bytes;
-            match reference {
-                None => reference = Some((idx, bytes)),
-                Some((ref_idx, ref_bytes)) => {
-                    if bytes != ref_bytes {
-                        problems.push(describe_mismatch(key, ref_idx, ref_bytes, idx, bytes));
-                    }
-                }
-            }
-        }
-    }
-
-    assert!(
-        problems.is_empty(),
-        "cross-replica data divergence ({} issue(s)):\n{}",
-        problems.len(),
-        problems.join("\n")
-    );
-}
-
-fn describe_mismatch(key: &str, a_idx: usize, a: &[u8], b_idx: usize, b: &[u8]) -> String {
-    let window = |buf: &[u8], at: usize| {
-        let start = at.saturating_sub(8);
-        let end = (at + 8).min(buf.len());
-        buf[start..end]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    match a.iter().zip(b.iter()).position(|(x, y)| x != y) {
-        Some(at) => format!(
-            "`{key}`: bytes differ between node {a_idx} ({} B) and node {b_idx} ({} B) at offset {at}. \
-             node{a_idx}=[{}] node{b_idx}=[{}]",
-            a.len(),
-            b.len(),
-            window(a, at),
-            window(b, at),
-        ),
-        None => format!(
-            "`{key}`: length differs between node {a_idx} ({} B) and node {b_idx} ({} B)",
-            a.len(),
-            b.len(),
-        ),
-    }
 }

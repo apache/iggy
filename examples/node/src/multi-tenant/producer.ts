@@ -74,7 +74,6 @@ async function setupTenants(
         name: topicName,
         partitionCount: 2,
         compressionAlgorithm: 1, // None
-        replicationFactor: 1,
       });
 
       log('Topic created for tenant %d with ID: %d', tenantId, topic.id);

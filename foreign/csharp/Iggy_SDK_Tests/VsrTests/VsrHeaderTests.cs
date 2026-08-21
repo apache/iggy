@@ -81,7 +81,7 @@ public sealed class VsrHeaderTests
 
         Assert.Equal(VsrHeader.HEADER_SIZE + payload.Length, totalSize);
         Assert.Equal((uint)totalSize, ReadUInt32(header, VsrHeader.SIZE_OFFSET));
-        Assert.Equal((byte)Command2.Request, header[VsrHeader.COMMAND_OFFSET]);
+        Assert.Equal((byte)Command.Request, header[VsrHeader.COMMAND_OFFSET]);
         Assert.Equal((byte)VsrOperation.Register, header[VsrHeader.REQUEST_OPERATION_OFFSET]);
         Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_ID_OFFSET));
         Assert.Equal(0UL, ReadUInt64(header, VsrHeader.REQUEST_SESSION_OFFSET));
@@ -213,14 +213,14 @@ public sealed class VsrHeaderTests
     {
         var header = new byte[VsrHeader.HEADER_SIZE];
 
-        header[VsrHeader.COMMAND_OFFSET] = (byte)Command2.Reply;
-        Assert.Equal(Command2.Reply, VsrHeader.PeekCommand(header));
+        header[VsrHeader.COMMAND_OFFSET] = (byte)Command.Reply;
+        Assert.Equal(Command.Reply, VsrHeader.PeekCommand(header));
 
-        header[VsrHeader.COMMAND_OFFSET] = (byte)Command2.Eviction;
-        Assert.Equal(Command2.Eviction, VsrHeader.PeekCommand(header));
+        header[VsrHeader.COMMAND_OFFSET] = (byte)Command.Eviction;
+        Assert.Equal(Command.Eviction, VsrHeader.PeekCommand(header));
 
         header[VsrHeader.COMMAND_OFFSET] = 6;
-        Assert.Equal(Command2.Reserved, VsrHeader.PeekCommand(header));
+        Assert.Equal(Command.Reserved, VsrHeader.PeekCommand(header));
     }
 
     [Fact]
