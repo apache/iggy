@@ -521,29 +521,41 @@ impl OpenSearchSink {
                         // A bulk call answers 200 even when individual documents
                         // fail, so the per-item results decide the outcome.
                         match response.json::<Value>().await {
-                            Ok(payload) => {
-                                let attempt = parse_bulk_response(&payload);
-                                let retry_set = documents_at(&pending, &attempt.retryable);
+                            Ok(payload) => match parse_bulk_response(&payload, pending.len()) {
+                                Ok(attempt) => {
+                                    let retry_set = documents_at(&pending, &attempt.retryable);
 
-                                if retry_set.is_empty() || retries >= self.config.max_retries {
-                                    outcome.merge(attempt.into_outcome());
-                                    return Ok(outcome);
+                                    if retry_set.is_empty() || retries >= self.config.max_retries {
+                                        outcome.merge(attempt.into_outcome());
+                                        return Ok(outcome);
+                                    }
+
+                                    // Only the permanent half is final; the retryable half
+                                    // is settled by a later attempt.
+                                    outcome.merge(BulkOutcome {
+                                        indexed: attempt.indexed,
+                                        failed: attempt.permanent_failed,
+                                        transient: false,
+                                        first_failure: attempt.first_permanent_failure,
+                                    });
+
+                                    let rejected = retry_set.len();
+                                    pending = retry_set;
+                                    body = build_bulk_body(&self.config.index, &pending)?;
+                                    format!(
+                                        "{rejected} document(s) rejected with a transient status"
+                                    )
                                 }
-
-                                // Only the permanent half is final; the retryable half
-                                // is settled by a later attempt.
-                                outcome.merge(BulkOutcome {
-                                    indexed: attempt.indexed,
-                                    failed: attempt.permanent_failed,
-                                    transient: false,
-                                    first_failure: attempt.first_permanent_failure,
-                                });
-
-                                let rejected = retry_set.len();
-                                pending = retry_set;
-                                body = build_bulk_body(&self.config.index, &pending)?;
-                                format!("{rejected} document(s) rejected with a transient status")
-                            }
+                                // A 200 whose `items` array can't be trusted to cover
+                                // every pending document leaves the true per-item
+                                // outcome unknown. Retrying is safe because indexing
+                                // is idempotent by `_id`, so this is treated as
+                                // transient rather than silently counting the chunk
+                                // as handled.
+                                Err(error) => {
+                                    format!("failed to parse bulk response items: {error}")
+                                }
+                            },
                             // A 200 with an unparsable body leaves the true
                             // per-item outcome unknown. Retrying is safe
                             // because indexing is idempotent by `_id`, so this
@@ -874,10 +886,50 @@ fn documents_at<'a>(
         .collect()
 }
 
-fn parse_bulk_response(response: &Value) -> BulkAttempt {
-    let Some(items) = response.get("items").and_then(Value::as_array) else {
-        return BulkAttempt::default();
-    };
+/// Why a `_bulk` response's `items` array could not be trusted to reflect
+/// what OpenSearch actually did with every pending document.
+#[derive(Debug)]
+enum BulkResponseError {
+    MissingItems,
+    ItemCountMismatch { expected: usize, actual: usize },
+    MalformedItem { position: usize },
+}
+
+impl std::fmt::Display for BulkResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingItems => write!(f, "response has no `items` array"),
+            Self::ItemCountMismatch { expected, actual } => write!(
+                f,
+                "response `items` array has {actual} entries, expected {expected}"
+            ),
+            Self::MalformedItem { position } => {
+                write!(f, "item at position {position} has no recognizable result")
+            }
+        }
+    }
+}
+
+/// Requires exactly one item per pending document. A missing, short, or
+/// malformed `items` array leaves the true per-item outcome unknown, so the
+/// whole response is rejected rather than silently under-accounted: a chunk
+/// that OpenSearch answered with fewer or unparsable items must not be
+/// treated as cleanly handled just because nothing came back marked failed.
+fn parse_bulk_response(
+    response: &Value,
+    expected: usize,
+) -> Result<BulkAttempt, BulkResponseError> {
+    let items = response
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or(BulkResponseError::MissingItems)?;
+
+    if items.len() != expected {
+        return Err(BulkResponseError::ItemCountMismatch {
+            expected,
+            actual: items.len(),
+        });
+    }
 
     // The top-level flag lets a clean batch skip the per-item scan entirely.
     if !response
@@ -885,17 +937,19 @@ fn parse_bulk_response(response: &Value) -> BulkAttempt {
         .and_then(Value::as_bool)
         .unwrap_or(true)
     {
-        return BulkAttempt {
+        return Ok(BulkAttempt {
             indexed: items.len(),
             ..BulkAttempt::default()
-        };
+        });
     }
 
     let mut attempt = BulkAttempt::default();
     for (position, item) in items.iter().enumerate() {
-        let Some(result) = item.as_object().and_then(|item| item.values().next()) else {
-            continue;
-        };
+        let result = item
+            .as_object()
+            .and_then(|item| item.values().next())
+            .ok_or(BulkResponseError::MalformedItem { position })?;
+
         let status = result.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
         if result.get("error").is_none() && (200..300).contains(&status) {
             attempt.indexed += 1;
@@ -923,7 +977,7 @@ fn parse_bulk_response(response: &Value) -> BulkAttempt {
         }
     }
 
-    attempt
+    Ok(attempt)
 }
 
 fn document_from_json(value: Value) -> Map<String, Value> {
@@ -1782,7 +1836,7 @@ mod tests {
             ]
         });
 
-        let attempt = parse_bulk_response(&response);
+        let attempt = parse_bulk_response(&response, 2).expect("well-formed response");
 
         assert_eq!(
             attempt,
@@ -1811,7 +1865,12 @@ mod tests {
             ]
         });
 
-        assert_eq!(parse_bulk_response(&response).indexed, 2);
+        assert_eq!(
+            parse_bulk_response(&response, 2)
+                .expect("well-formed response")
+                .indexed,
+            2
+        );
     }
 
     #[test]
@@ -1832,7 +1891,7 @@ mod tests {
             ]
         });
 
-        let attempt = parse_bulk_response(&response);
+        let attempt = parse_bulk_response(&response, 2).expect("well-formed response");
 
         assert_eq!(attempt.indexed, 1);
         assert_eq!(attempt.permanent_failed, 1);
@@ -1855,7 +1914,8 @@ mod tests {
             ]
         });
 
-        let error = parse_bulk_response(&response)
+        let error = parse_bulk_response(&response, 1)
+            .expect("well-formed response")
             .into_outcome()
             .into_error("iggy_probe")
             .expect("failed items should produce an error");
@@ -1872,7 +1932,8 @@ mod tests {
             ]
         });
 
-        let error = parse_bulk_response(&response)
+        let error = parse_bulk_response(&response, 1)
+            .expect("well-formed response")
             .into_outcome()
             .into_error("iggy_probe")
             .expect("failed items should produce an error");
@@ -1890,7 +1951,9 @@ mod tests {
             ]
         });
 
-        let outcome = parse_bulk_response(&response).into_outcome();
+        let outcome = parse_bulk_response(&response, 2)
+            .expect("well-formed response")
+            .into_outcome();
 
         assert_eq!(outcome.failed, 2);
         assert!(outcome.transient);
@@ -1945,8 +2008,45 @@ mod tests {
     }
 
     #[test]
-    fn given_bulk_response_without_items_should_report_nothing_indexed() {
-        assert_eq!(parse_bulk_response(&json!({})), BulkAttempt::default());
+    fn given_bulk_response_without_items_should_be_rejected_as_unparsable() {
+        assert!(matches!(
+            parse_bulk_response(&json!({}), 1),
+            Err(BulkResponseError::MissingItems)
+        ));
+    }
+
+    #[test]
+    fn given_bulk_response_with_short_items_array_should_be_rejected_as_unparsable() {
+        let response = json!({
+            "errors": false,
+            "items": [
+                { "index": { "_id": "a", "status": 201, "result": "created" } }
+            ]
+        });
+
+        assert!(matches!(
+            parse_bulk_response(&response, 2),
+            Err(BulkResponseError::ItemCountMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn given_bulk_response_with_malformed_item_should_be_rejected_as_unparsable() {
+        let response = json!({
+            "errors": true,
+            "items": [
+                { "index": { "_id": "a", "status": 201, "result": "created" } },
+                {}
+            ]
+        });
+
+        assert!(matches!(
+            parse_bulk_response(&response, 2),
+            Err(BulkResponseError::MalformedItem { position: 1 })
+        ));
     }
 
     #[test]
@@ -1961,7 +2061,7 @@ mod tests {
             ]
         });
 
-        let attempt = parse_bulk_response(&response);
+        let attempt = parse_bulk_response(&response, 4).expect("well-formed response");
 
         assert_eq!(attempt.indexed, 1);
         assert_eq!(attempt.permanent_failed, 1);
@@ -1977,7 +2077,12 @@ mod tests {
             ]
         });
 
-        assert!(parse_bulk_response(&response).retryable.is_empty());
+        assert!(
+            parse_bulk_response(&response, 1)
+                .expect("well-formed response")
+                .retryable
+                .is_empty()
+        );
     }
 
     fn prepared(id: &str) -> PreparedDocument {
@@ -2396,6 +2501,44 @@ mod tests {
             .index_chunk(&client, &documents)
             .await
             .expect("an unparsable 200 body should be retried, not hard-failed");
+
+        assert_eq!(outcome.indexed, 1);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    // A missing `items` array must never be read as zero failures: a chunk
+    // OpenSearch didn't fully account for must not be treated as cleanly
+    // handled, it must be retried instead.
+    #[tokio::test]
+    async fn given_bulk_response_missing_items_should_be_retried_as_transient() {
+        let server = MockServer::start().await;
+        let sink = mock_bulk_sink(&server, 1).await;
+        let client = mock_client(&sink);
+        let documents = [prepared("a")];
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "errors": false })))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": false,
+                "items": [
+                    { "index": { "_id": "a", "status": 201, "result": "created" } }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let outcome = sink
+            .index_chunk(&client, &documents)
+            .await
+            .expect("a response missing `items` should be retried, not silently dropped");
 
         assert_eq!(outcome.indexed, 1);
         assert_eq!(outcome.failed, 0);
