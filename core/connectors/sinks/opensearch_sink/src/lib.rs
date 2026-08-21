@@ -1188,10 +1188,23 @@ fn normalize_url(raw: &str) -> Result<String, Error> {
         ));
     }
 
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{trimmed}")
+    // `://` (rather than a plain colon) is the marker of an explicit scheme,
+    // since a bare `host:port` also contains a colon. Detected
+    // case-insensitively so `HTTPS://host` isn't missed and mistaken for a
+    // schemeless host, which would otherwise get `http://` prepended and
+    // send the request to a bogus host built from the original string.
+    let with_scheme = match trimmed.split_once("://") {
+        Some((scheme, _))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            trimmed.to_string()
+        }
+        Some((scheme, _)) => {
+            return Err(Error::Connection(format!(
+                "Invalid OpenSearch URL: unsupported scheme '{scheme}', expected http or https"
+            )));
+        }
+        None => format!("http://{trimmed}"),
     };
     let mut url = Url::parse(&with_scheme)
         .map_err(|error| Error::Connection(format!("Invalid OpenSearch URL: {error}")))?;
@@ -2733,6 +2746,23 @@ mod tests {
             normalize_url("localhost:9200").expect("normalize"),
             "http://localhost:9200"
         );
+    }
+
+    #[test]
+    fn given_uppercase_scheme_should_be_recognized_not_double_prefixed() {
+        assert_eq!(
+            normalize_url("HTTPS://localhost:9200").expect("normalize"),
+            "https://localhost:9200"
+        );
+    }
+
+    #[test]
+    fn given_unsupported_scheme_should_fail_normalization() {
+        let error =
+            normalize_url("ftp://localhost:9200").expect_err("ftp is not a supported scheme");
+
+        assert!(matches!(error, Error::Connection(_)));
+        assert!(format!("{error}").contains("ftp"));
     }
 
     #[test]
