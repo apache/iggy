@@ -69,7 +69,9 @@ pub use influxdb::{
     InfluxDbSinkNoMetadataFixture, InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture,
     InfluxDbSourceFixture, InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
 };
-pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
+pub use meilisearch::{
+    MeilisearchOps, MeilisearchSinkFixture, MeilisearchSourceFixture, TEST_INDEX,
+};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
