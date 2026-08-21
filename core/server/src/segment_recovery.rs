@@ -969,11 +969,13 @@ async fn recover_segment_bounds(
             let mut end_timestamp = last.timestamp;
             let mut expected_offset = last.offset;
             let mut walked_any = false;
-            // TODO(hubcio): this indexed walk trusts the header decode alone,
-            // so a torn flush that persisted the header page but zeroed the
-            // body is absorbed silently; the index-less walk below checksums
-            // every batch. Decide whether the indexed arm should checksum too
-            // (boot cost) or leave body rot to protocol-aware repair.
+            // TODO(hubcio): for batches that continue the chain exactly this
+            // indexed walk trusts the header decode alone (gap-opening
+            // batches checksum-verify below), so a torn flush that persisted
+            // the header page but zeroed the body is absorbed silently; the
+            // index-less walk below checksums every batch. Decide whether the
+            // indexed arm should checksum too (boot cost) or leave body rot
+            // to protocol-aware repair.
             while position < messages_size {
                 let header = match scanner.peek_header(position) {
                     Ok(Some(header)) => header,
@@ -993,11 +995,15 @@ async fn recover_segment_bounds(
                 // the partition's offset counter at bootstrap (re-minting
                 // already-served offsets on the next append) and one below
                 // the segment start underflows the recovered message count.
-                // A FORWARD gap in a byte-clean, fully decodable tail is
-                // ordinary boot output, not damage: a crash can persist the
-                // offset frontier ahead of the unsynced log, and the next
-                // boot then stamps `base_offset = frontier` into this same
-                // tail segment. Absorb it and keep serving; every offset
+                // A FORWARD gap can be ordinary boot output: a crash can
+                // persist the offset frontier ahead of the unsynced log, and
+                // the next boot then stamps `base_offset = frontier` into
+                // this same tail segment. But `base_offset` is covered by the
+                // batch checksum and an upward bit flip in an unverified
+                // header wears the same shape, so the gap-opening batch must
+                // checksum-verify before its offset is adopted (the legit
+                // frontier stamp is server-minted and checksums clean).
+                // Absorb a verified gap and keep serving; every offset
                 // adopted is one the primary durably promised.
                 if header.base_offset < expected_offset {
                     return Err(
@@ -1010,6 +1016,16 @@ async fn recover_segment_bounds(
                     );
                 }
                 if header.base_offset > expected_offset {
+                    let verifies = scanner
+                        .slice_at(position, header.total_size())
+                        .map_err(|source| scan_read_failure(identity, messages_path, &source))?
+                        .is_some_and(|batch| decode_batch_slice(batch).is_ok());
+                    if !verifies {
+                        // Damage, not a frontier stamp: break and let the
+                        // probe below classify the residue (a torn tail
+                        // truncates, a verifying batch past it refuses).
+                        break;
+                    }
                     warn!(
                         stream_id = identity.stream_id,
                         topic_id = identity.topic_id,
@@ -2487,6 +2503,73 @@ mod tests {
             "absorbing the gap must leave the log byte-identical"
         );
         assert_eq!(bytes_of(&index_path), index_entry(0, 0));
+    }
+
+    #[compio::test]
+    async fn given_indexed_forward_gap_with_failing_checksum_when_recovering_should_truncate_at_break()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // Wears the frontier-stamp shape (header decodes, base_offset ahead
+        // of the chain) but fails the batch checksum: a real frontier stamp
+        // is server-minted and checksums clean, so this is damage and must
+        // never be adopted as the new offset frontier.
+        let mut log = encoded_batch(0, 2);
+        let valid_len = log.len() as u64;
+        let mut corrupt = encoded_batch(5, 1);
+        corrupt[COMMAND_HEADER_SIZE + 4] ^= 0xFF;
+        log.extend_from_slice(&corrupt);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
+
+        let recovered = recover(&config)
+            .await
+            .expect("a failing gap batch with nothing verifying past it must truncate");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 1);
+        assert_eq!(
+            len_of(&messages_path),
+            valid_len,
+            "the unverified gap batch must be gone from disk"
+        );
+        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+    }
+
+    #[compio::test]
+    async fn given_indexed_forward_gap_with_failing_checksum_before_valid_batch_when_recovering_should_refuse()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // A verifying batch past the failing gap batch is durable data:
+        // truncating there would erase it, so recovery must refuse and keep
+        // every byte.
+        let mut log = encoded_batch(0, 2);
+        let mut corrupt = encoded_batch(5, 1);
+        corrupt[COMMAND_HEADER_SIZE + 4] ^= 0xFF;
+        log.extend_from_slice(&corrupt);
+        log.extend_from_slice(&encoded_batch(6, 1));
+        let index = index_entry(0, 0);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("a verifying batch past the failing gap batch must refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::InteriorDamage { .. },
+                    ..
+                }
+            ),
+            "expected an interior-damage refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
     }
 
     #[compio::test]
