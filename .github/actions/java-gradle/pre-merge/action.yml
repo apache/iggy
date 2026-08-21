@@ -143,6 +143,11 @@ runs:
           mkdir -p reports/java-tests
           cp -r foreign/java/external-processors/iggy-connector-flink/iggy-connector-library/build/test-results reports/java-tests/flink
         fi
+        if [ -d "foreign/java/external-processors/iggy-connector-pinot/build/test-results" ]; then
+          echo "Found test reports in pinot"
+          mkdir -p reports/java-tests
+          cp -r foreign/java/external-processors/iggy-connector-pinot/build/test-results reports/java-tests/pinot
+        fi
 
     - name: Stop Iggy server
       if: always() && inputs.task == 'test'
@@ -188,4 +193,5 @@ runs:
         paths: |
           foreign/java/java-sdk/build/test-results/**/TEST-*.xml
           foreign/java/external-processors/iggy-connector-flink/iggy-connector-library/build/test-results/**/TEST-*.xml
+          foreign/java/external-processors/iggy-connector-pinot/build/test-results/**/TEST-*.xml
       if: ${{ !cancelled() && inputs.task == 'test' }}
