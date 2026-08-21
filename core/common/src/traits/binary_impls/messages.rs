@@ -43,6 +43,14 @@ use std::time::Duration;
 /// coordinator rejects a stale assignment, then retry once.
 const GROUP_POLL_MAX_ATTEMPTS: usize = 2;
 
+struct PollGroupOptions<'a> {
+    consumer: &'a Consumer,
+    strategy: &'a PollingStrategy,
+    count: u32,
+    auto_commit: bool,
+    wait_timeout_us: u64,
+}
+
 fn duration_to_wait_timeout_us(wait_timeout: Duration) -> Result<u64, IggyError> {
     wait_timeout
         .as_micros()
@@ -180,12 +188,15 @@ async fn poll_group_messages<B: BinaryClient>(
     client: &B,
     stream_id: &Identifier,
     topic_id: &Identifier,
-    consumer: &Consumer,
-    strategy: &PollingStrategy,
-    count: u32,
-    auto_commit: bool,
-    wait_timeout_us: u64,
+    options: PollGroupOptions<'_>,
 ) -> Result<PolledMessages, IggyError> {
+    let PollGroupOptions {
+        consumer,
+        strategy,
+        count,
+        auto_commit,
+        wait_timeout_us,
+    } = options;
     let key = group_cache_key(stream_id, topic_id, &consumer.id);
     if !client.consumer_group_state().has_assignment(&key) {
         sync_group_assignment(client, stream_id, topic_id, &consumer.id).await?;
@@ -328,11 +339,13 @@ impl<B: BinaryClient> MessageClient for B {
                 self,
                 stream_id,
                 topic_id,
-                consumer,
-                strategy,
-                count,
-                auto_commit,
-                wait_timeout_us,
+                PollGroupOptions {
+                    consumer,
+                    strategy,
+                    count,
+                    auto_commit,
+                    wait_timeout_us,
+                },
             )
             .await;
         }
