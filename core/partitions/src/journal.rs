@@ -824,6 +824,23 @@ where
         }
     }
 
+    /// Highest `commit` any resident header stamped, in ONE pass.
+    ///
+    /// A lower bound on the group's commit point, which is what a rebuilt replica
+    /// can recover from a log alone: a prepare records the primary's commit point
+    /// at send time, so the true point may be one higher.
+    ///
+    /// Exists so callers do not walk `1..=head` through [`Self::header_by_op`],
+    /// which is a linear scan per op and so quadratic in the head.
+    pub fn max_commit_watermark(&self) -> u64 {
+        let headers = unsafe { &*self.headers.get() };
+        headers
+            .iter()
+            .map(|header| header.commit)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
     /// stopping at the first missing op. A replication gap must not be skipped:
     /// the caller advances `commit_min` strictly by one, so a hole would break

@@ -12080,7 +12080,9 @@ dependencies = [
  "server_common",
  "shard",
  "strum 0.28.0",
+ "tempfile",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

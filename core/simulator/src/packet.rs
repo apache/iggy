@@ -39,13 +39,15 @@
 //! the same tick cannot trigger chain reactions within that tick.
 
 use crate::ready_queue::{Ready, ReadyQueue};
+use crate::seeds::SimSeeds;
 use enumset::EnumSet;
 use iggy_binary_protocol::{Command, GenericHeader};
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
 use server_common::Message;
 use std::collections::HashMap;
+use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
 /// Per-link command filter. An `EnumSet<Command>` where:
 /// - [`ALLOW_ALL`] = all commands pass (link fully enabled)
@@ -153,6 +155,76 @@ impl Default for PacketSimulatorOptions {
     }
 }
 
+impl PacketSimulatorOptions {
+    /// Every network parameter drawn from `seed`, so the seed picks the weather as
+    /// well as the traffic.
+    ///
+    /// A fixed profile explores ONE point in parameter space however many seeds are
+    /// thrown at it, so `--faults heavy` run a thousand times is the same network a
+    /// thousand times.
+    ///
+    /// `node_count` and `client_count` are left at their defaults for the caller to
+    /// fill, as [`Self::default`] leaves them; `seed` is stamped here so a value
+    /// used as-is still replays.
+    ///
+    /// The ceilings sit roughly 1.5x above the hand-calibrated `heavy` profile,
+    /// which already costs an order of magnitude of throughput: far enough to reach
+    /// past what a fixed profile could, near enough that a healthy cluster still
+    /// drains and a failure to converge is worth reading. A tick here runs every
+    /// shard's pump to quiescence rather than one IO step, so the same percentages
+    /// describe a more hostile network than they would in a per-IO model. Forcing a
+    /// single axis past its ceiling is what the individual `--packet-loss-prob`
+    /// overrides are for.
+    #[must_use]
+    pub fn swarm(seed: u64) -> Self {
+        // The swarm stream, not the network one: [`PacketSimulator`] draws its
+        // delays and drops from the same `seed`, so sharing would correlate the loss
+        // probability with the loss events it produces.
+        let mut prng = Xoshiro256PlusPlus::seed_from_u64(SimSeeds::derive(seed).swarm);
+        // `PacketSimulator::new` asserts `min >= 1` (zero causes unbounded replay
+        // loops) and `mean >= min`, so both are drawn to satisfy it rather than
+        // clamped afterwards.
+        let one_way_delay_min = prng.random_range(1..=3u64);
+        let one_way_delay_mean = prng.random_range(one_way_delay_min..=10u64);
+        Self {
+            one_way_delay_min,
+            one_way_delay_mean,
+            packet_loss_probability: f64::from(prng.random_range(0..=15u32)) / 100.0,
+            replay_probability: f64::from(prng.random_range(0..=5u32)) / 100.0,
+            // Floored well above 2, deliberately. A tiny queue drops packets by
+            // eviction, the same fault class as `packet_loss_probability` above, so
+            // the two compound into a network that never converges without covering
+            // anything the loss draw does not. `--link-capacity` forces it lower.
+            link_capacity: prng.random_range(8..=64u8),
+            partition_probability: f64::from(prng.random_range(0..=30u32)) / 1_000.0,
+            // Never zero: a partition that cannot heal is a permanently split
+            // cluster, and every run drawing it reports a liveness failure that
+            // says nothing.
+            unpartition_probability: f64::from(prng.random_range(1..=10u32)) / 100.0,
+            partition_stability: prng.random_range(20..=80u32),
+            unpartition_stability: prng.random_range(0..=60u32),
+            partition_mode: draw_variant(&mut prng),
+            partition_symmetry: draw_variant(&mut prng),
+            path_clog_probability: f64::from(prng.random_range(0..=15u32)) / 1_000.0,
+            path_clog_duration_mean: prng.random_range(0..=40u64),
+            seed,
+            ..Self::default()
+        }
+    }
+}
+
+/// Uniform draw over an enum's variants.
+///
+/// Generic rather than a `match` on a drawn index: a match would silently keep
+/// drawing the old variant set after one is added to [`PartitionMode`], and a
+/// fault mode the swarm never reaches looks like one that never finds anything.
+fn draw_variant<T: IntoEnumIterator + EnumCount>(prng: &mut Xoshiro256PlusPlus) -> T {
+    let index = prng.random_range(0..T::COUNT);
+    T::iter()
+        .nth(index)
+        .expect("an index drawn below the variant count always names a variant")
+}
+
 /// Per-path link: holds packets in a [`ReadyQueue`] sorted by `ready_at`.
 struct Link {
     /// Packets waiting to be delivered, ordered by `ready_at` (min-heap).
@@ -192,7 +264,11 @@ impl Link {
 
 /// Determines how automatic partitions are created.
 /// Only nodes (replicas) are partitioned. There will always be exactly two partitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `EnumCount` + `EnumIter` so [`PacketSimulatorOptions::swarm`] can draw a
+/// variant uniformly; adding one here puts it in the swarm's reach with no
+/// second edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, EnumCount, EnumIter)]
 pub enum PartitionMode {
     /// Disable automatic partitioning.
     #[default]
@@ -207,8 +283,9 @@ pub enum PartitionMode {
     IsolateSingle,
 }
 
-/// Whether partitions are symmetric or asymmetric.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Whether partitions are symmetric or asymmetric. See [`PartitionMode`] for
+/// why the strum derives are here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, EnumCount, EnumIter)]
 pub enum PartitionSymmetry {
     #[default]
     Symmetric,
@@ -230,7 +307,7 @@ pub struct PacketSimulator {
     /// Current tick (network global time).
     current_tick: u64,
     /// PRNG for deterministic randomness.
-    prng: Xoshiro256Plus,
+    prng: Xoshiro256PlusPlus,
     /// Whether an automatic partition is currently active.
     auto_partition_active: bool,
     /// Per-node partition assignment (true = partition A, false = partition B).
@@ -241,7 +318,64 @@ pub struct PacketSimulator {
     auto_partition_nodes: Vec<usize>,
     /// Reusable buffer for delivered packets.
     delivered: Vec<Packet>,
+    /// Packets actually delivered, per [`Command`] discriminant.
+    ///
+    /// Counted at delivery, past every drop path, so a command appears only if a
+    /// process really received one. This is how a run answers which parts of the
+    /// protocol it exercised, which is the difference between covering a path and
+    /// merely compiling it.
+    command_counts: [u64; COMMAND_COUNT_MAX],
 }
+
+/// One past the highest [`Command`] discriminant, sizing [`COMMAND_LABELS`] and
+/// the delivery counters. Raising it is part of adding a command.
+pub const COMMAND_COUNT_MAX: usize = 30;
+
+/// Names for each [`Command`] discriminant, so a coverage report reads as
+/// protocol rather than as integers. Indexed by discriminant; the trailing
+/// assert keeps it aligned with the enum.
+pub const COMMAND_LABELS: [&str; COMMAND_COUNT_MAX] = [
+    "Reserved",
+    "Ping",
+    "Pong",
+    "PingClient",
+    "PongClient",
+    "Request",
+    "Prepare",
+    "PrepareOk",
+    "Reply",
+    "Commit",
+    "StartViewChange",
+    "DoViewChange",
+    "StartView",
+    "Eviction",
+    "ReplicaHello",
+    "ReplicaChallenge",
+    "ReplicaFinish",
+    "RequestStartView",
+    "RequestPrepares",
+    "RepairPrepare",
+    "RepairDone",
+    "RangeEvicted",
+    "RequestStateTransfer",
+    "StateTransferTarget",
+    "RequestStateChunk",
+    "StateChunk",
+    "ForwardRegister",
+    "ForwardRegisterResult",
+    "ForwardLogout",
+    "ForwardLogoutResult",
+];
+
+const _: () = {
+    // Adding a command without extending the table would report it under the wrong
+    // name or index past the end of `command_counts`. Asserts the TABLE's length
+    // rather than pinning one variant to the end: `ForwardLogoutResult ==
+    // COMMAND_COUNT_MAX - 1` still holds after a `NewThing = 30` is appended past
+    // it, so that form passed exactly when it needed to fire.
+    assert!(COMMAND_LABELS.len() == COMMAND_COUNT_MAX);
+    assert!(enumset::EnumSet::<Command>::variant_count() as usize == COMMAND_COUNT_MAX);
+};
 
 impl PacketSimulator {
     /// Create a new packet simulator.
@@ -316,12 +450,13 @@ impl PacketSimulator {
             process_indices,
             next_index: node_count,
             current_tick: 0,
-            prng: Xoshiro256Plus::seed_from_u64(seed),
+            prng: Xoshiro256PlusPlus::seed_from_u64(SimSeeds::derive(seed).network),
             auto_partition_active: false,
             auto_partition: vec![false; node_count],
             auto_partition_stability: initial_stability,
             auto_partition_nodes: (0..node_count).collect(),
             delivered: Vec::new(),
+            command_counts: [0; COMMAND_COUNT_MAX],
         }
     }
 
@@ -402,7 +537,7 @@ impl PacketSimulator {
 
     /// Calculate a random delay using exponential distribution.
     /// Returns max(min, exponential(mean)).
-    fn calculate_delay(prng: &mut Xoshiro256Plus, options: &PacketSimulatorOptions) -> u64 {
+    fn calculate_delay(prng: &mut Xoshiro256PlusPlus, options: &PacketSimulatorOptions) -> u64 {
         let min = options.one_way_delay_min;
         let mean = options.one_way_delay_mean;
         let exp = Self::random_exponential(prng, mean);
@@ -416,7 +551,7 @@ impl PacketSimulator {
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation
     )]
-    fn random_exponential(prng: &mut Xoshiro256Plus, mean: u64) -> u64 {
+    fn random_exponential(prng: &mut Xoshiro256PlusPlus, mean: u64) -> u64 {
         let u: f64 = prng.random::<f64>();
         if u > 0.0 {
             (-(mean as f64) * u.ln()) as u64
@@ -524,6 +659,7 @@ impl PacketSimulator {
             delivered,
             max_processes,
             next_index,
+            command_counts,
             ..
         } = self;
 
@@ -580,12 +716,27 @@ impl PacketSimulator {
                         tracing::trace!("packet replayed");
                     }
 
+                    command_counts[command as usize] += 1;
                     delivered.push(packet);
                 }
             }
         }
 
         std::mem::take(&mut self.delivered)
+    }
+
+    /// Packets delivered so far, per [`Command`] discriminant. See
+    /// [`Self::command_counts`]'s field docs for why this counts at delivery.
+    #[must_use]
+    pub const fn command_counts(&self) -> &[u64; COMMAND_COUNT_MAX] {
+        &self.command_counts
+    }
+
+    /// Whether any packet of this command has been delivered. The question a
+    /// coverage assertion actually asks.
+    #[must_use]
+    pub const fn delivered_any(&self, command: Command) -> bool {
+        self.command_counts[command as usize] > 0
     }
 
     /// Return a previously taken buffer for reuse.
