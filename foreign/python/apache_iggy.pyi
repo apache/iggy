@@ -1331,7 +1331,7 @@ class IggyClient:
         self,
         stream: builtins.str | builtins.int,
         topic: builtins.str | builtins.int,
-        partitioning: builtins.int,
+        partitioning: Partitioning | builtins.int,
         messages: list[SendMessage],
     ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
@@ -1340,6 +1340,10 @@ class IggyClient:
         confirmations, or a PyRuntimeError on failure. The confirmation list is
         empty when the server reports no offsets, and the legacy server never
         reports any.
+
+        `partitioning` is required. Pass `Partitioning.balanced()`,
+        `Partitioning.partition_id(id)`, or `Partitioning.messages_key(key)`.
+        An integer remains supported as shorthand for `partition_id`.
         """
     def poll_messages(
         self,
@@ -1633,6 +1637,30 @@ class Partition:
     def messages_count(self) -> builtins.int:
         r"""
         The number of messages in the partition.
+        """
+
+@typing.final
+class Partitioning:
+    r"""
+    Defines how a batch of messages is assigned to a topic partition.
+    """
+    @staticmethod
+    def balanced() -> Partitioning:
+        r"""
+        Routes the batch to partitions using server-side round-robin selection.
+        """
+    @staticmethod
+    def partition_id(partition_id: builtins.int) -> Partitioning:
+        r"""
+        Routes the batch to the specified partition.
+        """
+    @staticmethod
+    def messages_key(key: builtins.str | builtins.bytes) -> Partitioning:
+        r"""
+        Routes the batch using a binary key hashed by the server.
+
+        String keys are encoded as UTF-8. The encoded key must contain between
+        1 and 255 bytes.
         """
 
 @typing.final

@@ -21,6 +21,7 @@ mod consumer;
 mod duration;
 mod identifier;
 mod options;
+mod partitioning;
 mod permissions;
 mod receive_message;
 mod send_message;
@@ -36,6 +37,7 @@ use consumer::{
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
 };
 use options::OptionSpec;
+use partitioning::Partitioning;
 use permissions::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions};
 use pyo3::prelude::*;
 use receive_message::{PollingStrategy, ReceiveMessage};
@@ -62,6 +64,7 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IggyExpiry>()?;
     m.add_class::<MaxTopicSize>()?;
     m.add_class::<OptionSpec>()?;
+    m.add_class::<Partitioning>()?;
     m.add_class::<Partition>()?;
     m.add_class::<Consumer>()?;
     m.add_class::<ConsumerGroup>()?;
