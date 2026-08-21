@@ -620,7 +620,11 @@ impl OpenSearchSink {
         }
     }
 
-    /// Waits out the backoff for an already-incremented `retries`.
+    /// Waits out the backoff for an already-incremented `retries`. The first
+    /// retry (`retries == 1`) uses attempt `0` so it sleeps `retry_delay`
+    /// itself rather than `retry_delay * 2`. Jitter can push the raw backoff
+    /// up to 20% above `max_retry_delay`, so the jittered result is clamped
+    /// back down to it.
     async fn sleep_before_retry(
         &self,
         operation: &str,
@@ -630,9 +634,10 @@ impl OpenSearchSink {
     ) {
         let delay = jitter(exponential_backoff(
             self.config.retry_delay,
-            retries,
+            retries - 1,
             self.config.max_retry_delay,
-        ));
+        ))
+        .min(self.config.max_retry_delay);
         warn!(
             "OpenSearch {} failed (retry {}/{}): {}. Retrying in {:?}...",
             operation, retries, max_retries, failure, delay
