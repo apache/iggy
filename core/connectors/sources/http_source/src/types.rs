@@ -128,7 +128,11 @@ impl Display for EndpointIdError {
 impl std::error::Error for EndpointIdError {}
 
 /// Message accepted by an HTTP handler, queued for `poll()` to drain.
-#[derive(Debug)]
+///
+/// `Clone` exists so a batch can be held aside until the runtime acknowledges
+/// it: the bridge drain in `poll()` is destructive, so a NACKed batch has no
+/// other copy to fall back on.
+#[derive(Debug, Clone)]
 pub struct QueuedMessage {
     /// Raw HTTP request body bytes, exactly as received.
     pub payload: Vec<u8>,

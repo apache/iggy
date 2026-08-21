@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use axum::http::HeaderName;
 use iggy_common::HeaderKey;
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source,
+    source_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::auth::HmacAlgorithm;
 use crate::state::EndpointRegistry;
@@ -80,6 +81,20 @@ pub struct HttpSource {
     /// [`Source`] requires. The runtime drives exactly one `poll()` at a time,
     /// so it is never contended despite being held across the wait.
     receiver: Mutex<MessageReceiver>,
+    /// Batch already handed to the runtime and not yet acknowledged.
+    ///
+    /// The runtime NACKs a batch it could not send, expecting the next `poll()`
+    /// to produce it again. Draining the bridge is destructive, so without this
+    /// the events would exist nowhere else and the NACK would be silent loss.
+    staged: Mutex<Option<StagedBatch>>,
+}
+
+/// Unacknowledged batch, kept whole so a NACK can be re-polled verbatim.
+#[derive(Debug)]
+struct StagedBatch {
+    messages: Vec<QueuedMessage>,
+    /// Consecutive NACKs this batch has taken, for the retry policy below.
+    nacks: u32,
 }
 
 /// Everything an HTTP handler needs from one instance.
@@ -397,11 +412,72 @@ impl HttpSource {
             id,
             shared: Arc::new(shared),
             receiver: Mutex::new(receiver),
+            staged: Mutex::new(None),
         }
     }
 
     pub fn shared(&self) -> &Arc<SharedState> {
         &self.shared
+    }
+
+    /// Re-emits the unacknowledged batch, if one is waiting.
+    async fn staged_batch(&self) -> Option<ProducedMessages> {
+        let staged = self.staged.lock().await;
+        let staged = staged.as_ref()?;
+        debug!(
+            "Replaying {} unacknowledged messages after {} NACK(s) for {CONNECTOR_NAME} connector ID: {}",
+            staged.messages.len(),
+            staged.nacks,
+            self.id
+        );
+        Some(ProducedMessages {
+            schema: Schema::Raw,
+            messages: staged.messages.iter().cloned().map(Into::into).collect(),
+            // State rides an empty batch only, and a replay is never empty.
+            state: None,
+        })
+    }
+
+    /// Holds `queued` until the runtime acknowledges it and converts it into
+    /// the batch to produce. The clone buys the ability to replay.
+    async fn stage(&self, queued: Vec<QueuedMessage>) -> Vec<ProducedMessage> {
+        let messages: Vec<ProducedMessage> = queued.iter().cloned().map(Into::into).collect();
+        if !queued.is_empty() {
+            *self.staged.lock().await = Some(StagedBatch {
+                messages: queued,
+                nacks: 0,
+            });
+        }
+        messages
+    }
+
+    /// Keeps a batch the runtime could not deliver so the next `poll()` replays
+    /// it. A batch is never abandoned here.
+    ///
+    /// Answering 200 told the sender this gateway owns the event, so the only
+    /// honest way to shed load is the 429 the handlers return once the bridge
+    /// fills, which senders retry. Dropping a staged batch instead would trade
+    /// that bounded, visible backpressure for silent loss growing with the
+    /// length of the outage, and no downstream can detect it.
+    ///
+    /// A batch that can never be delivered would replay forever, but this
+    /// connector rejects malformed work at the door rather than mid-stream:
+    /// oversized bodies get 413 before a handler runs, headers are clamped on
+    /// accept, and `Schema::Raw` cannot fail to decode.
+    async fn on_nack(&self) -> Result<(), Error> {
+        let mut staged = self.staged.lock().await;
+        let Some(batch) = staged.as_mut() else {
+            return Ok(());
+        };
+        batch.nacks += 1;
+        let nacks = batch.nacks;
+        let count = batch.messages.len();
+        drop(staged);
+        warn!(
+            "Runtime NACKed {count} messages ({nacks} so far) for {CONNECTOR_NAME} connector ID: {}, replaying them on the next poll",
+            self.id
+        );
+        Ok(())
     }
 }
 
@@ -421,8 +497,14 @@ impl Source for HttpSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
+        // An unacknowledged batch outranks new traffic: replaying it in order
+        // is what turns the runtime's NACK into a retry instead of a gap.
+        if let Some(staged) = self.staged_batch().await {
+            return Ok(staged);
+        }
+
         let max_batch_size = self.shared.config.max_batch_size;
-        let mut messages = Vec::with_capacity(max_batch_size);
+        let mut queued: Vec<QueuedMessage> = Vec::with_capacity(max_batch_size);
         let receiver = self.receiver.lock().await;
         tokio::select! {
             // The SDK races poll() against its own shutdown watch, so blocking
@@ -430,12 +512,12 @@ impl Source for HttpSource {
             // CPU. crossfire documents recv() as cancellation-safe.
             received = receiver.recv() => match received {
                 Ok(message) => {
-                    messages.push(message.into());
-                    while messages.len() < max_batch_size {
+                    queued.push(message);
+                    while queued.len() < max_batch_size {
                         let Ok(message) = receiver.try_recv() else {
                             break;
                         };
-                        messages.push(message.into());
+                        queued.push(message);
                     }
                 }
                 // Reachable only once every sender is gone. Idle rather than
@@ -445,8 +527,8 @@ impl Source for HttpSource {
             _ = self.shared.state_flush.notified() => {}
         }
 
-        if !messages.is_empty() {
-            let count = messages.len();
+        if !queued.is_empty() {
+            let count = queued.len();
             if self.shared.config.verbose_logging.unwrap_or(false) {
                 info!(
                     "Polled {count} messages for {CONNECTOR_NAME} connector ID: {}",
@@ -463,7 +545,7 @@ impl Source for HttpSource {
         // State rides an empty batch and nothing else, so the send it depends
         // on cannot fail. Under traffic that means deferring to a later poll;
         // re-arming the notify is what stops it waiting on traffic to arrive.
-        let state = if messages.is_empty() {
+        let state = if queued.is_empty() {
             self.shared.take_dirty_state()
         } else {
             if self.shared.has_pending_state() {
@@ -474,9 +556,24 @@ impl Source for HttpSource {
 
         Ok(ProducedMessages {
             schema: Schema::Raw,
-            messages,
+            messages: self.stage(queued).await,
             state,
         })
+    }
+
+    /// Applies the runtime's verdict on the batch `poll()` last produced.
+    ///
+    /// An Ack means the batch reached the topic and its state was persisted, so
+    /// the staged copy is free. A Nack means neither happened, so the copy has
+    /// to outlive it for the next `poll()` to replay.
+    async fn on_batch_result(&self, result: source::SourceBatchResult) -> Result<(), Error> {
+        match result {
+            source::SourceBatchResult::Ack => {
+                self.staged.lock().await.take();
+                Ok(())
+            }
+            source::SourceBatchResult::Nack => self.on_nack().await,
+        }
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -484,6 +581,15 @@ impl Source for HttpSource {
         // in the bridge is already unreachable. Deregistering first is what
         // stops new requests from being accepted into a queue nobody drains.
         server::leave(&self.shared).await;
+        // A staged batch was NACKed on the way down and has no reader left.
+        // Name the loss instead of letting it disappear with the instance.
+        if let Some(staged) = self.staged.lock().await.take() {
+            warn!(
+                "Dropping {} unacknowledged messages for {CONNECTOR_NAME} connector ID: {}",
+                staged.messages.len(),
+                self.id
+            );
+        }
         info!("Closed {CONNECTOR_NAME} connector ID: {}", self.id);
         Ok(())
     }
@@ -594,6 +700,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::test_support::{ENDPOINT_ONE, ENDPOINT_TWO};
+    use iggy_connector_sdk::source::SourceBatchResult;
     use std::time::Instant;
 
     fn minimal_config_json() -> &'static str {
@@ -1007,6 +1114,11 @@ mod tests {
             "and the deferred flush must still be armed"
         );
 
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ack must succeed");
+
         let flushed = source.poll().await.expect("poll must succeed");
         assert!(flushed.messages.is_empty());
         assert!(
@@ -1029,6 +1141,12 @@ mod tests {
         }
 
         let first = source.poll().await.expect("poll must succeed");
+        // Without the Ack the runtime never confirmed the batch, so the next
+        // poll owes a replay rather than fresh traffic.
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ack must succeed");
         let second = source.poll().await.expect("poll must succeed");
 
         assert_eq!(first.messages.len(), 2);
@@ -1036,6 +1154,126 @@ mod tests {
         assert_eq!(first.messages[0].payload, b"one");
         assert!(matches!(first.schema, Schema::Raw));
         assert!(first.state.is_none());
+    }
+
+    #[tokio::test]
+    async fn given_nacked_batch_when_polled_should_replay_the_same_messages() {
+        let mut config = test_support::config(None, &[]);
+        config.max_batch_size = 2;
+        let source = HttpSource::new(1, config, None);
+        for payload in ["one", "two", "three"] {
+            source
+                .shared
+                .sender
+                .try_send(queued(payload))
+                .expect("bridge must accept within capacity");
+        }
+
+        let first = source.poll().await.expect("poll must succeed");
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("nack must succeed");
+        let replayed = source.poll().await.expect("poll must succeed");
+
+        assert_eq!(
+            replayed.messages.len(),
+            first.messages.len(),
+            "the drain is destructive, so a NACK the source cannot replay is lost data"
+        );
+        assert_eq!(replayed.messages[0].payload, b"one");
+        assert_eq!(replayed.messages[1].payload, b"two");
+        assert!(
+            replayed.state.is_none(),
+            "a replay carries messages only, never state"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_many_nacks_when_polled_should_never_abandon_the_batch() {
+        let mut config = test_support::config(None, &[]);
+        config.max_batch_size = 1;
+        let source = HttpSource::new(1, config, None);
+        source
+            .shared
+            .sender
+            .try_send(queued("one"))
+            .expect("bridge must accept");
+
+        source.poll().await.expect("poll must succeed");
+        for _ in 0..20 {
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("nack must succeed");
+            let replayed = source.poll().await.expect("poll must succeed");
+            assert_eq!(
+                replayed.messages[0].payload, b"one",
+                "the sender already has a 200 for this event, so dropping it is never an option"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_replayed_batch_when_acked_should_resume_new_traffic() {
+        let mut config = test_support::config(None, &[]);
+        config.max_batch_size = 2;
+        let source = HttpSource::new(1, config, None);
+        for payload in ["one", "two", "three"] {
+            source
+                .shared
+                .sender
+                .try_send(queued(payload))
+                .expect("bridge must accept within capacity");
+        }
+
+        source.poll().await.expect("poll must succeed");
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("nack must succeed");
+        source.poll().await.expect("poll must succeed");
+        source
+            .on_batch_result(SourceBatchResult::Ack)
+            .await
+            .expect("ack must succeed");
+
+        let fresh = source.poll().await.expect("poll must succeed");
+        assert_eq!(fresh.messages.len(), 1);
+        assert_eq!(
+            fresh.messages[0].payload, b"three",
+            "the acked replay must release the bridge, not repeat itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_state_only_batch_when_nacked_should_not_stage_a_replay() {
+        let config = test_support::config(None, &[ENDPOINT_ONE]);
+        let source = HttpSource::new(1, config, None);
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42))
+            .await;
+
+        let flushed = source.poll().await.expect("poll must succeed");
+        assert!(flushed.messages.is_empty());
+        assert!(flushed.state.is_some(), "the mutation must arm a flush");
+
+        source
+            .on_batch_result(SourceBatchResult::Nack)
+            .await
+            .expect("nack must succeed");
+        source
+            .shared
+            .sender
+            .try_send(queued("one"))
+            .expect("bridge must accept");
+
+        let next = source.poll().await.expect("poll must succeed");
+        assert_eq!(
+            next.messages[0].payload, b"one",
+            "an empty batch stages nothing, so its NACK must not wedge the poll loop"
+        );
     }
 
     #[tokio::test]
