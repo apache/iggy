@@ -93,7 +93,6 @@ pub struct OpenSearchSinkConfig {
     pub verbose_logging: Option<bool>,
 }
 
-#[derive(Debug)]
 pub struct OpenSearchSink {
     id: u32,
     config: ResolvedOpenSearchSinkConfig,
@@ -101,6 +100,23 @@ pub struct OpenSearchSink {
     invocations_count: AtomicU64,
     documents_indexed: AtomicU64,
     errors_count: AtomicU64,
+}
+
+// `OpenSearch` derives `Debug` down through its `Transport`, and
+// `opensearch::auth::Credentials::Basic` derives `Debug` on its raw
+// `(String, String)` without redaction, so a derived `Debug` on this struct
+// would print the Basic-auth password in plaintext once `client` is set.
+impl std::fmt::Debug for OpenSearchSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenSearchSink")
+            .field("id", &self.id)
+            .field("config", &self.config)
+            .field("client", &self.client.is_some())
+            .field("invocations_count", &self.invocations_count)
+            .field("documents_indexed", &self.documents_indexed)
+            .field("errors_count", &self.errors_count)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -2805,6 +2821,23 @@ mod tests {
         config.password = Some(SecretString::from("hunter2"));
 
         let rendered = format!("{:?}", sink_with_config(config));
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+    }
+
+    // Regression test: formatting an unopened sink never touches `client`
+    // (it's `None`), so it can't catch a leak coming from inside the
+    // `OpenSearch` client itself. Install a real authenticated client, as
+    // `open()` would, before formatting.
+    #[test]
+    fn given_debug_formatted_sink_with_open_client_should_redact_password() {
+        let mut config = base_config();
+        config.username = Some("admin".to_string());
+        config.password = Some(SecretString::from("hunter2"));
+        let mut sink = sink_with_config(config);
+        sink.client = Some(mock_client(&sink));
+
+        let rendered = format!("{sink:?}");
 
         assert!(!rendered.contains("hunter2"), "{rendered}");
     }
