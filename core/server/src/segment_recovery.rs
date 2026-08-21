@@ -31,7 +31,7 @@ use crate::server_error::{PartitionRecoveryRefusal, ServerError};
 use configs::server::ServerConfig;
 use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
 use partitions::state_transfer::STAGING_SUFFIX;
-use partitions::{IggyIndexReader, Segment};
+use partitions::{IggyIndex, IggyIndexReader, Segment};
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
 use server_common::{SegmentStorage, yield_to_reactor};
 use std::fs;
@@ -856,28 +856,25 @@ fn seed_empty_file(path: &str) -> Result<(), ServerError> {
         })
 }
 
-/// Derives a segment's readable bounds. `None` when the log holds no whole
-/// batch at all (the caller recovers the segment as empty).
+/// Index anchors for one segment: `(entry_count, first, last)`.
 ///
-/// With a whole index entry present, the last entry's `position` is only the
-/// last flushed chunk's START byte, so the batch chain is walked from there to
-/// prove where the segment really ends -- without `enforce_fsync` there is no
-/// ordering barrier between the message write and the index write, and a tail
-/// torn mid-flush would otherwise pass while `end_offset` claims offsets whose
-/// bytes are incomplete. Without one, the log itself is walked from byte 0 and
-/// the index is rebuilt from the batches found. Either way, bytes left past
-/// the walked prefix go through the damage probe: a torn tail truncates, but
-/// damage with intact batches after it -- or residue the probe cannot
-/// classify within its limits -- refuses recovery.
-#[allow(clippy::too_many_lines)]
-async fn recover_segment_bounds(
+/// A `.log` with NO `.index` beside it reads exactly like a 0-byte one, and
+/// both belong on the index-less walk. It is an ordinary shape:
+/// `SegmentStorage::new` creates the log before the index, so a crash or a
+/// failed open between the two leaves precisely that pair, as does any
+/// operator restore that drops an index. The reader's open is bare
+/// `read(true)` and folds ENOENT into `CannotReadFile`, which propagates as a
+/// plain `ServerError::Iggy` -- not a `PartitionRecoveryRefused` the caller
+/// can fence -- so it would abort the whole boot for a segment the walk
+/// rebuilds. Stat through the `NotFound`-lenient [`file_len`] first; every
+/// other stat failure still fails stop there.
+async fn load_index_anchors(
     identity: PartitionIdentity<'_>,
     index_path: &str,
-    messages_path: &str,
-    start_offset: u64,
-    messages_size: u64,
-    scratch: &mut ScanScratch,
-) -> Result<Option<WalkedBounds>, ServerError> {
+) -> Result<(u64, Option<IggyIndex>, Option<IggyIndex>), ServerError> {
+    if file_len(index_path)? == 0 {
+        return Ok((0, None, None));
+    }
     let reader = IggyIndexReader::new(index_path).await.map_err(|source| {
         error!(
             stream_id = identity.stream_id,
@@ -922,6 +919,32 @@ async fn recover_segment_bounds(
         );
         source
     })?;
+    Ok((entry_count, first, last))
+}
+
+/// Derives a segment's readable bounds. `None` when the log holds no whole
+/// batch at all (the caller recovers the segment as empty).
+///
+/// With a whole index entry present, the last entry's `position` is only the
+/// last flushed chunk's START byte, so the batch chain is walked from there to
+/// prove where the segment really ends -- without `enforce_fsync` there is no
+/// ordering barrier between the message write and the index write, and a tail
+/// torn mid-flush would otherwise pass while `end_offset` claims offsets whose
+/// bytes are incomplete. Without one, the log itself is walked from byte 0 and
+/// the index is rebuilt from the batches found. Either way, bytes left past
+/// the walked prefix go through the damage probe: a torn tail truncates, but
+/// damage with intact batches after it -- or residue the probe cannot
+/// classify within its limits -- refuses recovery.
+#[allow(clippy::too_many_lines)]
+async fn recover_segment_bounds(
+    identity: PartitionIdentity<'_>,
+    index_path: &str,
+    messages_path: &str,
+    start_offset: u64,
+    messages_size: u64,
+    scratch: &mut ScanScratch,
+) -> Result<Option<WalkedBounds>, ServerError> {
+    let (entry_count, first, last) = load_index_anchors(identity, index_path).await?;
 
     match (first, last) {
         (Some(first), Some(last)) => {
@@ -1858,17 +1881,19 @@ mod tests {
         // bypasses).
         symlink(&index_path, &index_path).expect("create self-referential index symlink");
 
+        // Recovery stats the index before opening it (a missing one routes to
+        // the index-less walk), so an ELOOP surfaces from the stat.
         let error = recover(&config)
             .await
             .err()
-            .expect("an unopenable index must refuse recovery");
+            .expect("an unstattable index must refuse recovery");
 
         assert!(
             matches!(
                 &error,
-                ServerError::Iggy(inner) if matches!(**inner, IggyError::CannotReadFile)
+                ServerError::Iggy(inner) if matches!(**inner, IggyError::CannotReadFileMetadata)
             ),
-            "expected CannotReadFile, got {error:?}"
+            "expected CannotReadFileMetadata, got {error:?}"
         );
         assert_eq!(
             bytes_of(&messages_path),
@@ -2585,5 +2610,33 @@ mod tests {
         );
         assert_eq!(len_of(&messages_path), log.len() as u64);
         assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+    }
+    #[compio::test]
+    async fn given_absent_index_when_recovering_should_walk_index_less_and_rebuild() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let log = encoded_batch(0, 4);
+        let messages_path =
+            config
+                .system
+                .get_messages_file_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        let index_path = config
+            .system
+            .get_index_path(STREAM_ID, TOPIC_ID, PARTITION_ID, 0);
+        fs::write(&messages_path, &log).expect("write log fixture");
+
+        let recovered = recover(&config)
+            .await
+            .expect("a log with no index beside it must recover, not abort the boot");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 3);
+        assert_eq!(len_of(&messages_path), log.len() as u64);
+        assert_eq!(
+            len_of(&index_path),
+            SPARSE_INDEX_ENTRY_SIZE as u64,
+            "the walk must install a rebuilt index over the missing one"
+        );
     }
 }
