@@ -21,8 +21,19 @@ use crate::types::message::IggyMessage;
 use std::fmt::Debug;
 
 /// The trait represent the logic responsible for calculating the partition ID and is used by the `IggyClient`.
-/// This might be especially useful when the partition ID is not constant and might be calculated based on the stream ID, topic ID and other parameters.
+///
+/// Iggy uses a hierarchical model for append-only logs. A stream contains topics which hold partitions. Each partition is an append-only log.[^note]
+/// A producer of messages such as an [`IggyProducer`], that appends messages to the log, may want to choose which partition to write the messages into.
+/// To do that, a producer can take a type that implements this trait.
+/// This is especially useful when computing the partition ID requires some client side info, i.e. stream ID, topic ID and/ or [`IggyMessage`] attributes.
+///
+/// Note the difference between [`Partitioning`] and [`Partitioner`]. [`Partitioning`] is a type used to set the _partitioning strategy_ for a producer.
+/// If you use both, the [`Partitioner`] overwrites the strategy, sets it to [`PartitioningKind::PartitionID`] and the partition ID is
+/// calculated with with the logic implemented in [`Partitioner::calculate_partition_id()`].
+///
+/// [^note]: [Website docs on how Iggy organizes data.](https://iggy.apache.org/docs/#how-iggy-organizes-data)
 pub trait Partitioner: Send + Sync + Debug {
+    /// Calculate a partition ID.
     fn calculate_partition_id(
         &self,
         stream_id: &Identifier,
