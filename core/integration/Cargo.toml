@@ -54,6 +54,8 @@ dtor = { workspace = true }
 figment = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
+# Sign GitHub-style webhook payloads in the http_source integration tests.
+hex = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
 iggy-cli = { workspace = true }
@@ -77,6 +79,7 @@ rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
+ring = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "reqwest",
