@@ -15,14 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod http;
+
+use crate::configs::runtime::{StateConfig, StateStorageKind};
+use crate::error::RuntimeError;
 use iggy_connector_sdk::{ConnectorState, Error};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use strum::Display;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+
+pub use http::{HttpStateFactory, HttpStateProvider};
 
 pub trait StateProvider {
     async fn load(&self) -> Result<Option<ConnectorState>, Error>;
@@ -34,6 +41,75 @@ pub trait StateProvider {
 pub enum StateStorage {
     #[strum(to_string = "file")]
     File(FileStateProvider),
+    #[strum(to_string = "http")]
+    Http(HttpStateProvider),
+}
+
+impl StateStorage {
+    pub async fn load(&self) -> Result<Option<ConnectorState>, Error> {
+        match self {
+            StateStorage::File(provider) => provider.load().await,
+            StateStorage::Http(provider) => provider.load().await,
+        }
+    }
+
+    pub async fn save(&self, state: ConnectorState) -> Result<(), Error> {
+        match self {
+            StateStorage::File(provider) => provider.save(state).await,
+            StateStorage::Http(provider) => provider.save(state).await,
+        }
+    }
+}
+
+/// Builds the configured [`StateStorageFactory`]. The only backend-selection
+/// point in the runtime: a bad backend configuration fails here, at boot.
+pub fn factory_from_config(
+    config: &StateConfig,
+) -> Result<Arc<dyn StateStorageFactory>, RuntimeError> {
+    match config.storage {
+        StateStorageKind::File => {
+            std::fs::create_dir_all(&config.path).map_err(|create_error| {
+                RuntimeError::InvalidConfiguration(format!(
+                    "Failed to create state directory '{}': {create_error}",
+                    config.path
+                ))
+            })?;
+            info!("State will be stored in: {}", config.path);
+            Ok(Arc::new(FileStateFactory::new(config.path.clone())))
+        }
+        StateStorageKind::Http => {
+            let factory = HttpStateFactory::new(&config.http)?;
+            info!("State will be stored via HTTP at: {}", config.http.url);
+            Ok(Arc::new(factory))
+        }
+    }
+}
+
+/// Builds the per-connector [`StateStorage`]. Resolved once at startup and
+/// shared via the runtime context, so API-driven restarts get their storage
+/// from the same place as the initial start. Fallible because a storage
+/// backend may have per-connector prerequisites, even though the file backend
+/// never fails.
+pub trait StateStorageFactory: Send + Sync {
+    fn storage_for(&self, connector_key: &str) -> Result<StateStorage, RuntimeError>;
+}
+
+#[derive(Debug)]
+pub struct FileStateFactory {
+    path: String,
+}
+
+impl FileStateFactory {
+    pub fn new(path: String) -> Self {
+        Self { path }
+    }
+}
+
+impl StateStorageFactory for FileStateFactory {
+    fn storage_for(&self, connector_key: &str) -> Result<StateStorage, RuntimeError> {
+        let path = format!("{}/source_{connector_key}.state", self.path);
+        Ok(StateStorage::File(FileStateProvider::new(path)))
+    }
 }
 
 #[derive(Debug)]
@@ -221,6 +297,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_file_factory_when_storage_built_should_round_trip_state() {
+        let dir = TempDir::new().unwrap();
+        let factory = FileStateFactory::new(dir.path().to_string_lossy().to_string());
+        let storage = factory.storage_for("test").unwrap();
+        storage.save(ConnectorState(vec![1, 2, 3])).await.unwrap();
+        let loaded = storage.load().await.unwrap().unwrap();
+        assert_eq!(loaded.0, vec![1, 2, 3]);
+        assert!(dir.path().join("source_test.state").is_file());
+    }
+
+    #[tokio::test]
     async fn given_no_existing_file_when_loaded_should_return_none() {
         let dir = TempDir::new().unwrap();
         let provider = provider_in(&dir, "source_test.state");
@@ -395,6 +482,51 @@ mod tests {
             matches!(result, Err(Error::CannotReadStateFile)),
             "expected CannotReadStateFile, got {result:?}"
         );
+    }
+
+    #[test]
+    fn given_default_config_when_factory_built_should_use_file_backend() {
+        let dir = TempDir::new().unwrap();
+        let config = StateConfig {
+            path: dir.path().join("state").to_string_lossy().to_string(),
+            ..StateConfig::default()
+        };
+        let factory = factory_from_config(&config).expect("file factory should build");
+        assert!(
+            matches!(factory.storage_for("test"), Ok(StateStorage::File(_))),
+            "default storage must remain the file backend"
+        );
+        assert!(
+            dir.path().join("state").is_dir(),
+            "the file arm still creates the state directory at boot"
+        );
+    }
+
+    #[test]
+    fn given_http_storage_without_url_when_factory_built_should_fail() {
+        let config = StateConfig {
+            storage: StateStorageKind::Http,
+            ..StateConfig::default()
+        };
+        let result = factory_from_config(&config);
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidConfiguration(ref message)) if message.contains("state.http.url")),
+            "http storage without a url must fail boot"
+        );
+    }
+
+    #[test]
+    fn given_http_storage_with_url_when_factory_built_should_use_http_backend() {
+        let mut config = StateConfig {
+            storage: StateStorageKind::Http,
+            ..StateConfig::default()
+        };
+        config.http.url = "http://localhost:1/state".to_string();
+        let factory = factory_from_config(&config).expect("http factory should build");
+        assert!(matches!(
+            factory.storage_for("test"),
+            Ok(StateStorage::Http(_))
+        ));
     }
 
     #[tokio::test]
