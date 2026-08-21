@@ -116,12 +116,15 @@ impl IggyIndexWriter {
             .0
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
 
-        self.index_size_bytes
-            .fetch_add(len as u64, Ordering::Release);
-
         if self.fsync {
             self.fsync().await?;
         }
+
+        // Advance the write cursor last: if the write or fsync fails, the
+        // counter must stay put so the retry overwrites the same slot instead
+        // of appending a duplicate entry that boot recovery would refuse.
+        self.index_size_bytes
+            .fetch_add(len as u64, Ordering::Release);
 
         trace!(
             target: "iggy.partitions.storage",
