@@ -49,7 +49,7 @@
 //! connection share ONE request id (only metadata ops advance the dedup
 //! counter), so a stranded reply would be consumed by the NEXT partition
 //! op's bidi and shift the connection's data-plane stream off by one,
-//! permanently. Instead, [`REPLY_WAIT_BACKSTOP`] (longer than the SDK's
+//! permanently. Instead, `REPLY_WAIT_BACKSTOP` (longer than the SDK's
 //! whole-request deadline, so the client always gives up first and
 //! reconnects) closes the CONNECTION, which drops the mailbox and every
 //! pending reply with it -- nothing can strand or cross request ids. A

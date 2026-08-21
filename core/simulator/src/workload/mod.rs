@@ -362,7 +362,7 @@ const FAULT_SEED_SALT: u64 = 0x5A1A_F0E5_FACE_0001;
 /// The invariants are asserted after every tick, so a consensus or
 /// workload regression panics at the tick it occurs (the seed in the message
 /// replays it). When `crash_per_tick_ratio > 0` the driver also injects
-/// crash-only faults via [`maybe_inject_crash`].
+/// crash-only faults via `maybe_inject_crash`.
 pub fn run(
     sim: &mut Simulator,
     workload: &mut Workload,

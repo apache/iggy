@@ -33,7 +33,7 @@
 //! replicated prepare/WAL. A mismatch is committed as a rejecting no-op
 //! (signalled by an empty new password) rather than denied pre-consensus, so
 //! the caller's request sequence stays contiguous; see
-//! [`verify_and_rewrite_change_password`].
+//! `verify_and_rewrite_change_password`.
 
 use crate::bootstrap::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};

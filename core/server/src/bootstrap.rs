@@ -157,7 +157,7 @@ impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
 /// The five dispatch handlers a shard is built with, plus the
 /// [`SessionManager`] the request-plane pair shares.
 ///
-/// Both production ([`build_shard_for_thread`]) and the simulator's shell
+/// Both production (`build_shard_for_thread`) and the simulator's shell
 /// mode construct these through [`wire_shell_handlers`], so the request
 /// plane is wired one way. The simulator's shell-off fast path uses
 /// [`ShellHandlers::noop`] instead.

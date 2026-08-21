@@ -77,6 +77,9 @@ resolver = "3"
 [workspace.package]
 rust-version = "1.95"
 
+[workspace.lints.rust]
+warnings = "deny"
+
 [workspace.dependencies]
 actix-cors = "0.7.1"
 actix-files = "0.6.10"
