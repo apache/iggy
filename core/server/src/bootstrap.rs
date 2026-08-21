@@ -1916,19 +1916,20 @@ async fn build_shard_for_thread(
             // ONE damaged local chain must not take the node down. The shapes
             // this refuses are structural -- what a failed state-transfer
             // quarantine leaves behind, or damage the recovery walk proved
-            // inside a segment -- so fence that group the same way the runtime
-            // path does: move its segment files aside, keeping the superblock
-            // so it cannot re-enter view 0. What follows depends on whether a
-            // peer can restore the data. With peers, the group is materialised
-            // fresh and the ordinary rejoin path (repair, then state transfer
-            // on a refused floor) refills it. Single-replica, only the two
-            // directory-shape refusals (a hole from a stray or half-unlinked
-            // file, an orphaned empty segment) still rebuild: their segment
+            // inside a segment. What follows depends on whether a peer can
+            // restore the data. With peers, the segment files are fenced
+            // aside (keeping the superblock so the group cannot re-enter
+            // view 0), the group is materialised fresh, and the ordinary
+            // rejoin path (repair, then state transfer on a refused floor)
+            // refills it. Single-replica, only the two directory-shape
+            // refusals (a hole from a stray or half-unlinked file, an
+            // orphaned empty segment) still fence and rebuild: their segment
             // bytes sit intact in quarantine and no damage verdict needs
             // surfacing. Every refusal that proved or suspects damage
-            // tombstones instead -- a rebuilt empty partition answers polls
-            // exactly like a healthy empty one and hides the loss, while an
-            // unrouted namespace is a failure an operator can see.
+            // tombstones instead, leaving its files exactly where they are:
+            // a rebuilt empty partition answers polls exactly like a healthy
+            // empty one and hides the loss, while an unrouted namespace is a
+            // failure an operator can see.
             Err(ServerError::PartitionRecoveryRefused { dir, reason, .. }) => {
                 let partition_dir = dir.to_string_lossy().into_owned();
                 let rebuild_for_rejoin = topology.replica_count > 1
@@ -1943,9 +1944,42 @@ async fn build_shard_for_thread(
                     partition_id = partition_metadata.id,
                     partition_dir,
                     %reason,
-                    "refusing the recovered segment chain; fencing this partition's \
-                     segment files"
+                    "refusing the recovered segment chain"
                 );
+                // A pass-A refusal folded nothing into the stats (recovery
+                // counts only accepted chains), but the hydrate-reopen refusal
+                // arrives after a fully counted load, so clear them either way.
+                partition_stats.zero_out_all();
+                if !rebuild_for_rejoin {
+                    // No quarantine here, mirroring the superblock arm below:
+                    // a tombstone is only durable if its cause is. Fencing the
+                    // chain aside would leave the next boot zero segments to
+                    // walk, so it would re-seed from the surviving superblock,
+                    // plant a fresh segment, and serve the partition empty
+                    // with no refusal logged. Left at their real paths, the
+                    // same files re-derive this verdict (and this log line)
+                    // every boot, and the reconciler's tombstone gate keeps
+                    // the namespace away from a fresh build, whose
+                    // initial-segment open would truncate the oldest refused
+                    // segment in place. The one refusal whose cause is NOT
+                    // durable is `StorageSizeMismatch`: it fires from the
+                    // reopen right after recovery truncated the same file, so
+                    // the next boot re-walks the already-truncated bytes and,
+                    // unless the length diverges again, accepts the chain
+                    // instead of re-tombstoning -- acceptable for an
+                    // assertion that the filesystem lied about a length.
+                    error!(
+                        stream_id,
+                        topic_id,
+                        partition_id = partition_metadata.id,
+                        partition_dir,
+                        "no peer replica holds this partition's data; leaving the refused \
+                         segment files in place and tombstoning it instead of serving it \
+                         empty"
+                    );
+                    partitions.tombstone(namespace);
+                    continue;
+                }
                 match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
                     Ok(fenced_dir) => error!(
                         stream_id,
@@ -1976,26 +2010,9 @@ async fn build_shard_for_thread(
                             "failed to quarantine the refused segment files; leaving this \
                              partition tombstoned rather than rebuilding over them"
                         );
-                        partition_stats.zero_out_all();
                         partitions.tombstone(namespace);
                         continue;
                     }
-                }
-                // A pass-A refusal folded nothing into the stats (recovery
-                // counts only accepted chains), but the hydrate-reopen refusal
-                // arrives after a fully counted load, so clear them either way.
-                partition_stats.zero_out_all();
-                if !rebuild_for_rejoin {
-                    error!(
-                        stream_id,
-                        topic_id,
-                        partition_id = partition_metadata.id,
-                        partition_dir,
-                        "no peer replica holds this partition's data; tombstoning it \
-                         instead of serving it empty"
-                    );
-                    partitions.tombstone(namespace);
-                    continue;
                 }
                 build_partition_fresh(
                     config,

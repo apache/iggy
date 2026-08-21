@@ -527,6 +527,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     true
 }
 
+#[allow(clippy::too_many_lines)]
 async fn reconcile_additions(
     ctx: &ReconcilerCtx,
     target: Vec<(IggyNamespace, u64)>,
@@ -595,6 +596,25 @@ async fn reconcile_additions(
             );
             counters.stale += 1;
             tear_down_owned_partition(ctx, ns, counters).await;
+            continue;
+        }
+
+        // Tombstoned without ever being materialised: a boot-time damage
+        // verdict (a refused segment chain, an untrusted superblock) fenced
+        // the namespace before any partition existed, so no teardown ran and
+        // no `ConfirmRemove` is coming to lift the tombstone. Building fresh
+        // would plant segment 0 over the refused files, truncating the
+        // oldest one, and the partition would then serve empty, hiding
+        // exactly the loss the tombstone surfaces. Deliberately uncounted:
+        // nothing lifts this state short of a metadata commit, and a commit
+        // bumps `Streams::revision`, which forces the next pass past the
+        // fast-skip.
+        if partitions.is_tombstoned(&ns) {
+            trace!(
+                shard = shard_id,
+                ns_raw = ns.inner(),
+                "additions: ns tombstoned before materialisation; refusing to rebuild over fenced files"
+            );
             continue;
         }
 
@@ -2656,6 +2676,100 @@ mod tests {
         assert!(
             std::path::Path::new(&partition_root).exists(),
             "defer must not re-drive teardown: the directory must remain"
+        );
+    }
+
+    /// A namespace tombstoned before it was ever materialised is a boot-time
+    /// damage verdict (a refused segment chain, an untrusted superblock): its
+    /// files are still on disk and no `ConfirmRemove` is coming. The
+    /// additions pass must not rebuild it -- `build_partition_fresh` would
+    /// plant segment 0 over the refused files and the partition would serve
+    /// empty -- and it must stay unrouted so the loss stays visible.
+    #[compio::test]
+    async fn reconcile_never_rebuilds_tombstoned_unmaterialised_namespace() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-fence");
+        seed_topic(&mux, 2, 0, "topic-fence", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        // Boot-fence shape: the verdict lands during partition load, before
+        // anything is inserted, so the namespace is tombstoned but absent
+        // from the map while still in the committed target.
+        partitions.tombstone(ns);
+
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            !partitions.contains(&ns),
+            "tombstoned namespace must not be rebuilt"
+        );
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the boot fence must survive the pass"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            None,
+            "tombstoned namespace must stay unrouted"
+        );
+        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        assert!(
+            !std::path::Path::new(&partition_root).exists(),
+            "no fresh build may touch the refused files' directory"
+        );
+    }
+
+    /// Backstop at the pump: an `InsertOwned` staged before a tombstone
+    /// landed must be discarded at apply, not routed. Applying it would put
+    /// the namespace in `partitions` + `shards_table` while the tombstone
+    /// stands, and the plane drops requests for tombstoned namespaces
+    /// without replying, so every client would hang to its read timeout.
+    #[compio::test]
+    async fn apply_discards_insert_owned_for_tombstoned_namespace() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-race");
+        seed_topic(&mux, 2, 0, "topic-race", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+
+        // Stage the build without applying it, then fence: models a
+        // tombstone landing between the reconciler pass and the pump drain.
+        reconcile_once(&ctx).await;
+        assert!(shard.has_staged_insert_owned(ns));
+        partitions.tombstone(ns);
+        shard.apply_reconcile_ops();
+
+        assert!(
+            !partitions.contains(&ns),
+            "InsertOwned for a tombstoned namespace must be discarded"
+        );
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the discard must not clear the tombstone"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            None,
+            "the discarded build must not route the namespace"
+        );
+
+        // The follow-up pass sees the same tombstone before building, so the
+        // namespace stays dark instead of looping build-and-discard.
+        reconcile_pass(&ctx).await;
+        assert!(!partitions.contains(&ns));
+        assert!(
+            !shard.has_staged_insert_owned(ns),
+            "no second build may be staged while the tombstone stands"
         );
     }
 

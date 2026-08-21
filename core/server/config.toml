@@ -471,11 +471,15 @@ recreate_missing_state = false
 # and bytes before the last index entry are not re-examined at boot at all --
 # at-rest damage there surfaces on the read path via validate_checksum.
 # Damage in the middle of a segment, or trailing bytes too large or costly to
-# prove torn, is never silently truncated: the partition is refused and its
-# files are kept in a .fenced.N directory beside it. With peer replicas the
-# partition is then rebuilt empty and refilled from them; with
-# replica_count = 1 there is no peer, so it is tombstoned (not served) and
-# its files stay in .fenced.N for the operator. The metadata WAL truncates
+# prove torn, is never silently truncated: the partition is refused. With
+# peer replicas the refused files are moved to a .fenced.N directory beside
+# the partition, which is rebuilt empty and refilled from a peer. With
+# replica_count = 1 there is no peer: the refused files stay at their
+# original paths, the partition is tombstoned (unrouted, never served
+# empty), and the same refusal is re-derived and re-logged on every boot
+# until an operator intervenes. Only single-replica refusals with no
+# recoverable bytes at stake (a hole from a stray file, an orphaned empty
+# segment) still rebuild through .fenced.N. The metadata WAL truncates
 # genuinely torn tails too; interior WAL damage or oversized trailing bytes
 # refuse boot instead.
 

@@ -2176,6 +2176,30 @@ where
                         drop(partition);
                         continue;
                     }
+                    // A standing tombstone is a damage verdict or an
+                    // unfinished teardown, and it lifts only through
+                    // `ConfirmRemove` below, i.e. proof the disk delete
+                    // completed. Inserting would route the namespace while
+                    // the verdict stands: the plane drops requests for
+                    // tombstoned namespaces without replying, so clients
+                    // would hang to their read timeout over data declared
+                    // lost. The reconciler skips tombstoned namespaces
+                    // before building, so reaching this means the op was
+                    // staged before the fence landed. Damage control like
+                    // the guard above: the build already planted its
+                    // initial segment on disk.
+                    if partitions.is_tombstoned(&namespace) {
+                        tracing::error!(
+                            shard = self_shard_id,
+                            ns_raw = namespace.inner(),
+                            epoch,
+                            "discarding InsertOwned for a tombstoned namespace: the \
+                             tombstone lifts only via ConfirmRemove, never by routing a \
+                             fresh build over it"
+                        );
+                        drop(partition);
+                        continue;
+                    }
                     partitions.insert(namespace, *partition);
                     self.shards_table.insert(
                         namespace,
