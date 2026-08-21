@@ -24,6 +24,7 @@ use iggy_common::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
     SendMessagesResponse,
 };
+use std::time::Duration;
 
 #[async_trait]
 impl MessageClient for IggyClient {
@@ -37,6 +38,30 @@ impl MessageClient for IggyClient {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError> {
+        self.poll_messages_with_timeout(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            strategy,
+            count,
+            auto_commit,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn poll_messages_with_timeout(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        count: u32,
+        auto_commit: bool,
+        wait_timeout: Duration,
+    ) -> Result<PolledMessages, IggyError> {
         if count == 0 {
             return Err(IggyError::InvalidMessagesCount);
         }
@@ -45,7 +70,7 @@ impl MessageClient for IggyClient {
             .client
             .read()
             .await
-            .poll_messages(
+            .poll_messages_with_timeout(
                 stream_id,
                 topic_id,
                 partition_id,
@@ -53,6 +78,7 @@ impl MessageClient for IggyClient {
                 strategy,
                 count,
                 auto_commit,
+                wait_timeout,
             )
             .await?;
 

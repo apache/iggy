@@ -575,6 +575,7 @@ impl SimClient {
             strategy: WirePollingStrategy::first(),
             count,
             auto_commit: false,
+            wait_timeout_us: 0,
         }
         .to_bytes();
 

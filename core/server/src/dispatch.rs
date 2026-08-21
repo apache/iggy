@@ -2146,6 +2146,21 @@ async fn handle_poll_messages<B, MJ, S, SB>(
         .await;
         return;
     };
+    if wire.wait_timeout_us != 0 {
+        warn!(
+            transport_client_id,
+            wait_timeout_us = wire.wait_timeout_us,
+            "deferred poll waits are not available on the active server"
+        );
+        send_non_replicated_deny(
+            shard,
+            request,
+            transport_client_id,
+            IggyError::FeatureUnavailable.as_code(),
+        )
+        .await;
+        return;
+    }
     // Gate on (stream, topic) before touching the partition plane. A resolution
     // miss falls through to the resolve path below (empty-poll / not-found); a
     // denial replies status!=0 with an empty body, distinct from the empty-poll
@@ -2491,6 +2506,9 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    if wire.wait_timeout_us != 0 {
+        return Err(IggyError::FeatureUnavailable);
+    }
     let strategy = polling_strategy_from_wire(&wire.strategy)?;
     let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
 
