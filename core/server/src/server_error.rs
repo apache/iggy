@@ -162,21 +162,27 @@ pub enum ServerError {
         expected: u128,
         found: u128,
     },
-    // Per-partition, not fatal: the boot path fences this one group (quarantines
-    // its segment files and materialises it fresh) instead of taking the node
-    // down for one damaged local chain. The shapes it reports are exactly what a
-    // failed state-transfer quarantine leaves behind, and the rebuild recovers
-    // the data from a peer.
+    // Per-partition, not fatal: the boot path fences this one group instead of
+    // taking the node down for one damaged local chain. Only STRUCTURAL
+    // refusals route here -- shapes where the local files contradict
+    // themselves, so a retried boot cannot help. Transient recovery I/O
+    // failures (stat, open, read, truncate, fsync) stay node-fatal on purpose:
+    // a retried boot can still serve that partition, while fencing it would
+    // quarantine healthy data.
     #[error(
-        "partition {stream_id}/{topic_id}/{partition_id} at {dir} recovered an \
-         unusable segment chain: {reason}"
+        "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused segment \
+         recovery: {reason}. Boot moves the partition's segment files into a \
+         sibling `<partition dir>.fenced.N` directory and keeps them; with peer \
+         replicas the partition is rebuilt empty and refilled by state transfer, \
+         while with replica_count = 1 (or when the quarantine itself fails) it \
+         is tombstoned and not served"
     )]
-    PartitionChainRefused {
+    PartitionRecoveryRefused {
         dir: PathBuf,
         stream_id: usize,
         topic_id: usize,
         partition_id: usize,
-        reason: PartitionChainRefusal,
+        reason: PartitionRecoveryRefusal,
     },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
@@ -244,18 +250,6 @@ pub enum ServerError {
         source: std::io::Error,
     },
     #[error(
-        "recovered segment for stream {stream_id}, topic {topic_id}, partition {partition_id} at start_offset {start_offset} has message/index divergence (messages_size={messages_size_bytes}, indexed_size={indexed_size_bytes}, end_offset={end_offset}); recovery aborted before opening listeners. Restore the partition from a healthy replica or snapshot, or move the segment aside for offline repair before restarting."
-    )]
-    RecoveredSegmentSizeDivergence {
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-        start_offset: u64,
-        end_offset: u64,
-        messages_size_bytes: u64,
-        indexed_size_bytes: u64,
-    },
-    #[error(
         "failed to load persisted {consumer_kind} offsets for stream {stream_id}, topic {topic_id}, partition {partition_id} from {path}"
     )]
     ConsumerOffsetsLoad {
@@ -281,14 +275,18 @@ pub enum ServerError {
     ShardJoinFailures { failures: Vec<ShardJoinFailure> },
 }
 
-/// Why a recovered segment chain cannot be served.
+/// Why a partition's recovered segments cannot be served.
 ///
-/// Both shapes mean the same thing operationally -- the local files do not form
-/// a chain this replica can serve -- but they are distinguished because they
-/// point at different causes: an empty non-tail segment is a failed rebuild's
-/// orphan pairing, a hole is a stray or half-unlinked file.
+/// Every shape here is structural -- the local files contradict themselves or
+/// each other -- but they are distinguished because they point at different
+/// causes, and not all of them are at-rest corruption: an empty non-tail
+/// segment is a failed rebuild's orphan pairing, a hole is a stray or
+/// half-unlinked file, interior damage is bit rot (or a resurrected tail
+/// appended over), a divergent index is a mis-strided or foreign write, and
+/// offsets that do not continue the chain can be minted into byte-clean files
+/// by an upstream crash window as well as by damage.
 #[derive(Debug)]
-pub enum PartitionChainRefusal {
+pub enum PartitionRecoveryRefusal {
     EmptyNonTailSegment {
         empty_start: u64,
         next_start: u64,
@@ -298,9 +296,69 @@ pub enum PartitionChainRefusal {
         previous_end: u64,
         next_start: u64,
     },
+    /// The index holds entries but no whole batch decodes where its last
+    /// entry points, so index and log describe different files.
+    IndexLogDivergence {
+        start_offset: u64,
+        end_offset: u64,
+        messages_size_bytes: u64,
+        indexed_size_bytes: u64,
+    },
+    /// A complete, checksum-verifying batch survives PAST bytes that do not
+    /// decode. A torn tail has nothing after it, so this is interior damage,
+    /// and truncating at it would silently discard the surviving batches.
+    InteriorDamage {
+        start_offset: u64,
+        damage_position: u64,
+        survivor_position: u64,
+    },
+    /// Bytes past the walked prefix that the damage probe could not
+    /// classify: it ran out of work budget before proving or disproving a
+    /// survivor. The budget is sized so a front-to-back scan of every
+    /// residue in the load always fits, so exhaustion means candidate
+    /// offsets were re-examined -- a probe defect, not an at-rest shape.
+    /// Truncation is only ever sound for a proven torn tail, so giving up
+    /// keeps the bytes. The residue width is diagnostic only; it is not a
+    /// gate.
+    UnverifiedResidue {
+        start_offset: u64,
+        damage_position: u64,
+        residue_bytes: u64,
+        candidates_examined: u64,
+        budget_units: u64,
+    },
+    /// A batch does not continue the offset chain, so offsets are not
+    /// contiguous inside one segment file. The cause is not necessarily
+    /// at-rest damage: a crash window that leaves the durable offset
+    /// frontier past the recovered end offset stamps the same shape into
+    /// byte-clean files.
+    OffsetDiscontinuity {
+        start_offset: u64,
+        expected_offset: u64,
+        found_offset: u64,
+        position: u64,
+    },
+    /// Index entries must ascend in offset and position (they are appended,
+    /// one per flushed chunk, over a growing log); a regression means the
+    /// file was written mis-strided or over foreign bytes.
+    IndexEntriesNotMonotone {
+        start_offset: u64,
+        entry_index: u64,
+    },
+    IndexEntryBeforeSegmentStart {
+        start_offset: u64,
+        first_entry_offset: u64,
+    },
+    /// A writer reopening over recovered bounds found the on-disk length
+    /// diverging from the size recovery just validated and truncated to.
+    StorageSizeMismatch {
+        start_offset: u64,
+        on_disk_bytes: u64,
+        expected_bytes: u64,
+    },
 }
 
-impl std::fmt::Display for PartitionChainRefusal {
+impl std::fmt::Display for PartitionRecoveryRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyNonTailSegment {
@@ -319,6 +377,77 @@ impl std::fmt::Display for PartitionChainRefusal {
                 f,
                 "segment {previous_start} ends at offset {previous_end} but the next \
                  starts at {next_start}, leaving a hole"
+            ),
+            Self::IndexLogDivergence {
+                start_offset,
+                end_offset,
+                messages_size_bytes,
+                indexed_size_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} has message/index divergence: the index ends \
+                 at offset {end_offset}, byte {indexed_size_bytes}, where the \
+                 {messages_size_bytes}-byte log holds no whole batch"
+            ),
+            Self::InteriorDamage {
+                start_offset,
+                damage_position,
+                survivor_position,
+            } => write!(
+                f,
+                "segment {start_offset} holds undecodable bytes at {damage_position} \
+                 with a complete verifying batch after them at {survivor_position}; \
+                 not a torn tail, and truncating would discard durable batches"
+            ),
+            Self::UnverifiedResidue {
+                start_offset,
+                damage_position,
+                residue_bytes,
+                candidates_examined,
+                budget_units,
+            } => write!(
+                f,
+                "segment {start_offset} holds {residue_bytes} bytes past the walked \
+                 prefix at {damage_position} that the damage probe could not \
+                 classify before exhausting its work budget ({candidates_examined} \
+                 candidate offsets examined of {budget_units} allowed); truncating \
+                 unproven bytes could destroy durable batches"
+            ),
+            Self::OffsetDiscontinuity {
+                start_offset,
+                expected_offset,
+                found_offset,
+                position,
+            } => write!(
+                f,
+                "segment {start_offset} holds a batch at byte {position} whose \
+                 base offset {found_offset} does not continue the chain at \
+                 {expected_offset}"
+            ),
+            Self::IndexEntriesNotMonotone {
+                start_offset,
+                entry_index,
+            } => write!(
+                f,
+                "segment {start_offset} index entry {entry_index} regresses in \
+                 offset or position; the index was not appended over this log"
+            ),
+            Self::IndexEntryBeforeSegmentStart {
+                start_offset,
+                first_entry_offset,
+            } => write!(
+                f,
+                "segment {start_offset} index claims offset {first_entry_offset}, \
+                 below the segment's own start"
+            ),
+            Self::StorageSizeMismatch {
+                start_offset,
+                on_disk_bytes,
+                expected_bytes,
+            } => write!(
+                f,
+                "segment {start_offset} file length {on_disk_bytes} diverged from \
+                 its recovered size {expected_bytes} at writer open"
             ),
         }
     }

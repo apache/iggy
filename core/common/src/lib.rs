@@ -40,6 +40,17 @@ pub use consumer_group_client_state::ConsumerGroupClientState;
 /// partition id (those are small, dense, zero-based), so it can't collide with
 /// a genuine end-of-partition empty poll, which echoes the real partition id.
 pub const RESYNC_REQUIRED_PARTITION_SENTINEL: u32 = u32::MAX;
+
+/// Frozen ceiling on `message_bus.max_message_size`, the knob that caps a
+/// single framed wire message and with it the widest batch record any
+/// admission path can persist. Frozen rather than knob-derived because
+/// boot-time segment recovery sizes fixed scan and allocation limits from the
+/// widest LEGAL record: a limit read from the live knob would change meaning
+/// between boots and refuse partitions written under an older value. Config
+/// validation rejects a knob above this at boot; raising it is a
+/// compatibility decision, not a tuning change, since segments written under
+/// a larger value would exceed what recovery on an older build accepts.
+pub const MAX_MESSAGE_SIZE_UPPER_BYTES: u64 = 256 * 1024 * 1024;
 pub use http::consumer_groups::*;
 pub use http::consumer_offsets::*;
 pub use http::messages::*;

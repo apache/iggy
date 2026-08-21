@@ -463,6 +463,26 @@ archive_expired = false
 # Unsupported: setting this to `true` aborts boot.
 recreate_missing_state = false
 
+# At boot, segment recovery walks each partition's segments: bytes after the
+# last decodable batch of a genuinely torn tail are physically truncated from
+# the .log/.index files, and the index is rebuilt when it was damaged. Only
+# the walk of a segment whose index was lost re-checksums batches; with an
+# intact index the walk trusts batch headers (decodable, contiguous offsets),
+# and bytes before the last index entry are not re-examined at boot at all --
+# at-rest damage there surfaces on the read path via validate_checksum.
+# Damage in the middle of a segment, or trailing bytes too large or costly to
+# prove torn, is never silently truncated: the partition is refused. With
+# peer replicas the refused files are moved to a .fenced.N directory beside
+# the partition, which is rebuilt empty and refilled from a peer. With
+# replica_count = 1 there is no peer: the refused files stay at their
+# original paths, the partition is tombstoned (unrouted, never served
+# empty), and the same refusal is re-derived and re-logged on every boot
+# until an operator intervenes. Only single-replica refusals with no
+# recoverable bytes at stake (a hole from a stray file, an orphaned empty
+# segment) still rebuild through .fenced.N. The metadata WAL truncates
+# genuinely torn tails too; interior WAL damage or oversized trailing bytes
+# refuse boot instead.
+
 # Memory pool configuration
 [system.memory_pool]
 # Enables or disables the memory pool (boolean).
