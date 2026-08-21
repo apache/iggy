@@ -126,6 +126,7 @@ pub fn new_shard(
     metadata_journal: Option<Rc<SimJournal<MemStorage>>>,
     recovered_state: Option<VsrState>,
     incarnation: u128,
+    data_dir: Option<std::path::PathBuf>,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
@@ -244,13 +245,15 @@ pub fn new_shard(
     });
     let metadata_snapshot = (shard_idx == 0).then(SimSnapshot::default);
 
+    // A data directory arms the `SnapshotCoordinator`; without one
+    // `checkpoint_if_needed` returns immediately and nothing ever checkpoints.
     let metadata = IggyMetadata::new(
         metadata_consensus,
         metadata_journal,
         metadata_snapshot,
         superblock,
         mux,
-        None,
+        data_dir,
     );
 
     // Reconstruct shard 0's committed metadata from the retained WAL, the sim analog

@@ -28,7 +28,7 @@
 
 use indexmap::IndexSet;
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use std::collections::HashMap;
 
 use server_common::sharding::IggyNamespace;
@@ -99,7 +99,7 @@ impl Shadow {
 
     /// Pick a live namespace uniformly. `IndexSet` preserves insertion
     /// order, so for deduplicated input this matches `Vec::get(i)`.
-    pub fn pick_namespace(&self, prng: &mut Xoshiro256Plus) -> Option<IggyNamespace> {
+    pub fn pick_namespace(&self, prng: &mut Xoshiro256PlusPlus) -> Option<IggyNamespace> {
         let n = self.namespaces_live.len();
         if n == 0 {
             return None;
@@ -108,7 +108,7 @@ impl Shadow {
         self.namespaces_live.get_index(i).copied()
     }
 
-    pub fn pick_stream_name(&self, prng: &mut Xoshiro256Plus) -> Option<String> {
+    pub fn pick_stream_name(&self, prng: &mut Xoshiro256PlusPlus) -> Option<String> {
         let n = self.stream_names.len();
         if n == 0 {
             return None;
@@ -117,7 +117,7 @@ impl Shadow {
         self.stream_names.get_index(i).cloned()
     }
 
-    pub fn pick_topic_pair(&self, prng: &mut Xoshiro256Plus) -> Option<(String, String)> {
+    pub fn pick_topic_pair(&self, prng: &mut Xoshiro256PlusPlus) -> Option<(String, String)> {
         let n = self.topic_names.len();
         if n == 0 {
             return None;
@@ -126,7 +126,7 @@ impl Shadow {
         self.topic_names.get_index(i).cloned()
     }
 
-    pub fn pick_user_name(&self, prng: &mut Xoshiro256Plus) -> Option<String> {
+    pub fn pick_user_name(&self, prng: &mut Xoshiro256PlusPlus) -> Option<String> {
         let n = self.user_names.len();
         if n == 0 {
             return None;
@@ -135,7 +135,7 @@ impl Shadow {
         self.user_names.get_index(i).cloned()
     }
 
-    pub fn pick_pat_name(&self, prng: &mut Xoshiro256Plus) -> Option<String> {
+    pub fn pick_pat_name(&self, prng: &mut Xoshiro256PlusPlus) -> Option<String> {
         let n = self.pat_names.len();
         if n == 0 {
             return None;
@@ -146,7 +146,7 @@ impl Shadow {
 
     pub fn pick_consumer_group_triple(
         &self,
-        prng: &mut Xoshiro256Plus,
+        prng: &mut Xoshiro256PlusPlus,
     ) -> Option<(String, String, String)> {
         let n = self.consumer_group_names.len();
         if n == 0 {

@@ -48,6 +48,10 @@ server_common = { path = "../server_common", features = ["simulator"] }
 shard = { path = "../shard", features = ["simulator"] }
 strum = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"
