@@ -84,6 +84,7 @@ Each sink should have its own, custom configuration, which is passed along with 
 - **Elasticsearch Sink** - sends messages to Elasticsearch indices
 - **Iceberg Sink** - writes data to Apache Iceberg tables via REST catalog
 - **Meilisearch Sink** - indexes messages in Meilisearch
+- **OpenSearch Sink** - indexes messages in OpenSearch for full-text search
 - **PostgreSQL Sink** - stores messages in PostgreSQL database tables
 - **Quickwit Sink** - indexes messages in Quickwit search engine
 - **S3 Sink** - writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces)
