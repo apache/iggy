@@ -83,7 +83,6 @@ func (s purgeSteps) givenHaveTopic(ctx context.Context, topicName, streamName st
 		iggcon.CompressionAlgorithmNone,
 		iggcon.IggyExpiryNeverExpire,
 		0,
-		nil,
 	)
 	if err != nil {
 		return fmt.Errorf("error creating topic: %w", err)
