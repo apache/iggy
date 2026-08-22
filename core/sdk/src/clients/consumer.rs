@@ -26,7 +26,8 @@ use iggy_common::{
 };
 use iggy_common::{
     Consumer, ConsumerKind, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
-    IggyError, IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
+    IggyError, IggyMessage, IggyTimestamp, NonZeroIggyDuration, PolledMessages, PollingKind,
+    PollingStrategy,
 };
 use std::collections::VecDeque;
 use std::future::Future;
@@ -50,6 +51,7 @@ pub enum AutoCommit {
     /// The auto-commit is disabled and the offset must be stored manually by the consumer.
     Disabled,
     /// The auto-commit is enabled and the offset is stored on the server after a certain interval.
+    /// A zero interval stores the offsets in a busy loop.
     Interval(IggyDuration),
     /// The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
     IntervalOrWhen(IggyDuration, AutoCommitWhen),
@@ -134,9 +136,9 @@ pub struct IggyConsumer {
     store_after_every_nth_message: u64,
     last_polled_at: Arc<AtomicU64>,
     current_partition_id: Arc<AtomicU32>,
-    reconnection_retry_interval: IggyDuration,
+    reconnection_retry_interval: NonZeroIggyDuration,
     init_retries: Option<u32>,
-    init_retry_interval: IggyDuration,
+    init_retry_interval: NonZeroIggyDuration,
     allow_replay: bool,
     offset_drain_timeout: IggyDuration,
 }
@@ -157,9 +159,9 @@ impl IggyConsumer {
         auto_join_consumer_group: bool,
         create_consumer_group_if_not_exists: bool,
         encryptor: Option<Arc<EncryptorKind>>,
-        reconnection_retry_interval: IggyDuration,
+        reconnection_retry_interval: NonZeroIggyDuration,
         init_retries: Option<u32>,
-        init_retry_interval: IggyDuration,
+        init_retry_interval: NonZeroIggyDuration,
         allow_replay: bool,
         offset_drain_timeout: IggyDuration,
     ) -> Self {
@@ -1237,5 +1239,47 @@ impl Drop for IggyConsumer {
             "Consumer {} has been dropped, shutdown signal sent",
             self.consumer_name
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client_wrappers::client_wrapper::ClientWrapper;
+    use crate::clients::consumer_builder::IggyConsumerBuilder;
+    use crate::tcp::tcp_client::TcpClient;
+    use iggy_common::locking::IggyRwLockFn;
+
+    fn builder() -> IggyConsumerBuilder {
+        IggyConsumerBuilder::new(
+            IggyRwLock::new(ClientWrapper::Tcp(TcpClient::default())),
+            "consumer".to_owned(),
+            Consumer::new(Identifier::numeric(1).unwrap()),
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(1).unwrap(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn should_accept_auto_commit_modes_with_a_zero_interval() {
+        let zero = IggyDuration::new(Duration::ZERO);
+
+        for auto_commit in [
+            AutoCommit::Interval(zero),
+            AutoCommit::IntervalOrWhen(zero, AutoCommitWhen::PollingMessages),
+            AutoCommit::IntervalOrAfter(zero, AutoCommitAfter::ConsumingAllMessages),
+        ] {
+            let mut consumer = builder().auto_commit(auto_commit).build();
+
+            let error = consumer.init().await.err();
+
+            assert!(
+                !matches!(error, Some(IggyError::InvalidConfiguration)),
+                "{auto_commit:?} must be accepted"
+            );
+        }
     }
 }

@@ -1379,8 +1379,8 @@ class IggyClient:
         Creates a new consumer group consumer.
         Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
         `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-        `AutoCommit` interval is negative, or if any of those except `poll_interval`
-        is zero.
+        `AutoCommit` interval is negative, or if `polling_retry_interval` or
+        `init_retry_interval` is zero.
         """
     def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes
@@ -2027,8 +2027,7 @@ class TcpReconnectionConfig:
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
-                range of an unsigned 32-bit integer, or if `interval` is zero while
-                reconnection is enabled and `max_retries` is unlimited.
+                range of an unsigned 32-bit integer, or if `interval` is zero.
         """
     def __repr__(self) -> builtins.str: ...
 
