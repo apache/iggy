@@ -1719,7 +1719,7 @@ where
     /// channel path -- and collects their replies.
     ///
     /// Bounded: a shard that doesn't reply within
-    /// [`LIST_CLIENTS_GATHER_TIMEOUT`] is skipped and the partial result is
+    /// `LIST_CLIENTS_GATHER_TIMEOUT` is skipped and the partial result is
     /// logged, so one wedged shard cannot hang the read. Callers should
     /// treat the result as best-effort-complete.
     #[allow(clippy::future_not_send)]
@@ -1786,7 +1786,7 @@ where
     /// Routes a [`LifecycleFrame::PartitionRead`] through the shards table
     /// (self-sends included, so a locally-owned partition takes the same
     /// path). `None` = unroutable namespace, full owning-shard inbox,
-    /// dropped reply sender, or [`PARTITION_READ_TIMEOUT`] expiry; the
+    /// dropped reply sender, or `PARTITION_READ_TIMEOUT` expiry; the
     /// caller maps it to a client-visible error.
     #[allow(clippy::future_not_send)]
     pub async fn partition_read(
@@ -2743,7 +2743,7 @@ where
     /// lockstep, so silence wedges the connection until the SDK read-timeout.
     ///
     /// The one retirement path a prepare still travels. It is retained
-    /// everywhere else (see [`ParkedFrame::passes`]); here the namespace itself
+    /// everywhere else (see `ParkedFrame::passes`); here the namespace itself
     /// is unreachable, so holding it buys nothing.
     pub fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
         // Bound the borrow to this statement: the guard in an `if let`
@@ -3007,10 +3007,10 @@ where
     }
 
     /// Age every frame under `namespace` by one pass, answering CLIENT REQUESTS
-    /// past [`MAX_PARKED_PASSES`]. Returns the number answered.
+    /// past `MAX_PARKED_PASSES`. Returns the number answered.
     ///
     /// Prepares age but never expire. Expiry destroys a committed op with
-    /// nothing to recover it (see [`ParkedFrame::passes`]), and passes are
+    /// nothing to recover it (see `ParkedFrame::passes`), and passes are
     /// commit-driven: a non-empty buffer defeats the reconciler fast-skip, so a
     /// create burst elapses four in milliseconds, across every parked namespace
     /// rather than the one it concerns. Byte budgets bound them instead. Only

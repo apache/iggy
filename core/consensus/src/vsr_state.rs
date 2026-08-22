@@ -177,7 +177,7 @@ fn field<const N: usize>(bytes: &[u8; ENCODED_LEN], start: usize) -> [u8; N] {
 /// Failure decoding a [`VsrState`] from bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VsrStateError {
-    /// The byte slice was not exactly [`ENCODED_LEN`] long.
+    /// The byte slice was not exactly `ENCODED_LEN` long.
     WrongLength { expected: usize, actual: usize },
     /// The record violates `log_view <= view`, so it cannot be a state any replica
     /// reached.

@@ -61,7 +61,7 @@
 //!   frame's provenance, which is why the park stamp above is separate.
 //! - Nothing is left unanswered: a tombstoned namespace, an overflowing park
 //!   buffer, and a namespace this shard has given up materialising
-//!   ([`reconcile_parked_frames`]) all reply with a retriable status, so a
+//!   (`reconcile_parked_frames`) all reply with a retriable status, so a
 //!   lockstep transport never waits out its read timeout on silence.
 //!
 //! `shards_table` is therefore a **cache of a deterministic hash**, never a
