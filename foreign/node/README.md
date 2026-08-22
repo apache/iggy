@@ -105,6 +105,24 @@ const client = new Client({
 const stats = await client.system.getStats();
 ```
 
+### Connection strings
+
+Every client constructor also accepts a connection string instead of a config
+object:
+
+```ts
+import { Client } from "apache-iggy";
+
+const client = new Client("iggy://iggy:iggy@127.0.0.1:8090");
+const stats = await client.system.getStats();
+```
+
+Supported schemes are `iggy://` (TCP, default) and `iggy+tcp://`. Credentials
+are `username:password` or a single personal access token. Options mirror the
+other SDKs: `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries`,
+`reconnection_interval`, `heartbeat_interval` and `nodelay`. `reestablish_after`
+is accepted for format compatibility but has no Node equivalent.
+
 ## use sources
 
 ### Install

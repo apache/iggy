@@ -16,9 +16,27 @@
 // under the License.
 //
 
-export { Client, SimpleClient, SingleClient } from './client.js'
-export * from './client.config.js';
-export * from './client.connection-string.js';
-export * from './client.utils.js';
-export * from './client.socket.js';
-export * from './client.type.js';
+import { after, describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { Client } from '../client/client.js';
+import { getIggyAddress } from '../tcp.sm.utils.js';
+
+const dummyOpt = 'nodelay=true' +
+  '&reconnection_retries=1' +
+  '&reconnection_interval=1s' +
+  '&heartbeat_interval=10s' +
+  '&reconnection_retries=unlimited' +
+  '&tls=false';
+
+describe('e2e -> connection string', async () => {
+  const [host, port] = getIggyAddress();
+  const client = new Client(`iggy://iggy:iggy@${host}:${port}?${dummyOpt}`);
+
+  it('e2e -> connection string::ping', async () => {
+    assert.ok(await client.system.ping());
+  });
+
+  after(() => {
+    client.destroy();
+  });
+});
