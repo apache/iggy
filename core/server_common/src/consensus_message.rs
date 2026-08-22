@@ -20,11 +20,11 @@ use crate::sharding::METADATA_GROUP;
 use iggy_binary_protocol::{
     Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
     ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
-    ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader, RequestPreparesHeader,
-    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
-    RoutedRequestHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-    StateTransferTargetHeader,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
+    PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader, frame_checksum_bytes,
 };
 use smallvec::SmallVec;
 use std::{
@@ -242,7 +242,7 @@ where
 
         let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
         let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<T>(bytes))?;
         // Before `validate`: a header that did not survive the link intact cannot
         // have any of its fields believed, and `validate` reads them.
         typed.verify_frame()?;
@@ -281,7 +281,7 @@ where
 
         let bytes = <B as MessageBacking<T>>::header_storage(&self.backing);
         let typed = bytemuck::checked::try_from_bytes::<T>(&bytes[..size_of::<T>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<T>(bytes))?;
         // Before `validate`: a header that did not survive the link intact cannot
         // have any of its fields believed, and `validate` reads them.
         typed.verify_frame()?;
@@ -477,7 +477,7 @@ where
         }
 
         let header = bytemuck::checked::try_from_bytes::<H>(&bytes[..size_of::<H>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<H>(bytes))?;
         header.validate()?;
 
         // `size` is the whole-frame length and must at least span the header, or
@@ -524,7 +524,7 @@ where
         }
 
         let header = bytemuck::checked::try_from_bytes::<H>(&first.as_slice()[..size_of::<H>()])
-            .map_err(|_| ConsensusError::InvalidBitPattern)?;
+            .map_err(|_| classify_failed_cast::<H>(first.as_slice()))?;
         header.validate()?;
 
         // See `TryFrom<Owned>`: `size` must at least span the header so a
@@ -774,6 +774,60 @@ impl MessageBag {
     }
 }
 
+/// Why `H`'s header bytes failed bytemuck's checked cast.
+///
+/// An operation discriminant this build does not define means the sender runs a
+/// newer release; the frame is wire-valid and the node needs upgrading, which is
+/// a different operator action from the corrupted-header case. bytemuck reports
+/// both as one error, so the operation byte is probed here to separate them.
+fn classify_failed_cast<H>(bytes: &[u8]) -> ConsensusError
+where
+    H: ConsensusHeader,
+{
+    if let Some(offset) = H::OPERATION_OFFSET
+        && let Some(&code) = bytes.get(offset)
+        && !Operation::is_known_code(code)
+        && operation_byte_is_trustworthy::<H>(bytes)
+    {
+        return ConsensusError::UnsupportedOperation { operation: code };
+    }
+    ConsensusError::InvalidBitPattern
+}
+
+/// Whether the operation byte may be read as the sender's release rather than
+/// as damage.
+///
+/// This classification runs before `verify_frame`, so on a sealed header the
+/// byte is still unverified: a flipped bit landing in an undefined discriminant
+/// would otherwise be reported as "upgrade this node", and for a `PrepareOk` --
+/// which echoes an operation this primary minted itself -- corruption is the
+/// likelier cause anyway. Checking the seal first keeps that claim honest.
+///
+/// An unsealed header has nothing to check against here (its `checksum` field
+/// carries an identity, not a frame seal), so the byte is taken at face value,
+/// which is the pre-existing contract for those frames.
+fn operation_byte_is_trustworthy<H>(bytes: &[u8]) -> bool
+where
+    H: ConsensusHeader,
+{
+    if !H::FRAME_SEALED {
+        return true;
+    }
+    let Some(header) = bytes
+        .get(..HEADER_SIZE)
+        .and_then(|slice| <&[u8; HEADER_SIZE]>::try_from(slice).ok())
+    else {
+        return false;
+    };
+    let Some(stored) = header
+        .get(..size_of::<u128>())
+        .and_then(|slice| <[u8; size_of::<u128>()]>::try_from(slice).ok())
+    else {
+        return false;
+    };
+    u128::from_le_bytes(stored) == frame_checksum_bytes(header)
+}
+
 impl<T> TryFrom<Message<T>> for MessageBag
 where
     T: ConsensusHeader,
@@ -917,6 +971,101 @@ mod tests {
             seal_header_bytes(buf);
         }
         owned
+    }
+
+    /// An operation byte from a newer release, on a frame whose seal proves the
+    /// byte arrived as the sender wrote it.
+    fn sealed_prepare_ok_with_operation(operation: u8) -> Owned<MESSAGE_ALIGN> {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = Command::PrepareOk as u8;
+            buf[offset_of!(PrepareOkHeader, operation)] = operation;
+            seal_header_bytes(buf);
+        }
+        owned
+    }
+
+    const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+    #[test]
+    fn given_a_sealed_frame_when_its_operation_is_unknown_should_report_version_skew() {
+        let owned = sealed_prepare_ok_with_operation(OPERATION_FROM_A_NEWER_RELEASE);
+
+        assert!(matches!(
+            classify_failed_cast::<PrepareOkHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
+    }
+
+    // The classification runs before `verify_frame`, so on a sealed header the
+    // operation byte is unverified. A flipped bit landing in an undefined
+    // discriminant must not be reported as "the sender runs a newer release":
+    // that sends an operator upgrading a node over a corrupt link, and a
+    // `PrepareOk` echoes an operation this primary minted itself, so corruption
+    // is the likelier cause to begin with.
+    #[test]
+    fn given_a_corrupt_sealed_frame_when_its_operation_is_unknown_should_not_claim_version_skew() {
+        let mut owned = sealed_prepare_ok_with_operation(0);
+        // Flip the operation byte AFTER sealing, the way damage in flight does.
+        owned.as_mut_slice()[offset_of!(PrepareOkHeader, operation)] =
+            OPERATION_FROM_A_NEWER_RELEASE;
+
+        assert!(matches!(
+            classify_failed_cast::<PrepareOkHeader>(owned.as_slice()),
+            ConsensusError::InvalidBitPattern
+        ));
+    }
+
+    // An unsealed header spends `checksum` on a prepare identity, so there is
+    // nothing to verify the byte against and it is taken at face value. That is
+    // the pre-existing contract for the replication frames.
+    #[test]
+    fn given_an_unsealed_frame_when_its_operation_is_unknown_should_report_version_skew() {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = Command::Prepare as u8;
+            buf[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+        }
+
+        const { assert!(!PrepareHeader::FRAME_SEALED) };
+        assert!(matches!(
+            classify_failed_cast::<PrepareHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
+    }
+
+    // Transparent over `PrepareHeader`, so a repaired prepare from a newer
+    // release must reach the same fence instead of reading as corruption.
+    #[test]
+    fn given_a_repaired_prepare_when_its_operation_is_unknown_should_report_version_skew() {
+        assert_eq!(
+            RepairPrepareHeader::OPERATION_OFFSET,
+            PrepareHeader::OPERATION_OFFSET,
+            "the newtype carries the same operation field"
+        );
+
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = Command::RepairPrepare as u8;
+            buf[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+        }
+
+        assert!(matches!(
+            classify_failed_cast::<RepairPrepareHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
     }
 
     #[test]

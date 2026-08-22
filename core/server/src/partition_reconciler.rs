@@ -2350,6 +2350,65 @@ mod tests {
         );
     }
 
+    /// The mixed-version upgrade hole from IGGY-250, at the router seam this
+    /// time: a wire-valid consensus frame carrying an operation only a newer
+    /// release defines must leave an accounted, operator-visible trace instead
+    /// of a bare warn log, because the frame's group stops making progress
+    /// until this node is upgraded.
+    #[compio::test]
+    async fn given_an_unknown_operation_when_dispatched_should_account_an_upgrade_fence_drop() {
+        // Far past every discriminant this build defines.
+        const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let shard = build_test_shard(0, &config, TestMux::default());
+
+        let mut owned = server_common::iobuf::Owned::<{ server_common::MESSAGE_ALIGN }>::zeroed(
+            iggy_binary_protocol::HEADER_SIZE,
+        );
+        {
+            let frame = owned.as_mut_slice();
+            let size_offset = std::mem::offset_of!(PrepareHeader, size);
+            let frame_size =
+                u32::try_from(iggy_binary_protocol::HEADER_SIZE).expect("header size fits in u32");
+            frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
+            frame[std::mem::offset_of!(PrepareHeader, command)] = Command::Prepare as u8;
+            frame[std::mem::offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+            let header: &[u8; iggy_binary_protocol::HEADER_SIZE] = frame
+                [..iggy_binary_protocol::HEADER_SIZE]
+                .try_into()
+                .expect("frame spans a full header");
+            let checksum = iggy_binary_protocol::frame_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&checksum.to_le_bytes());
+        }
+        let message = Message::<iggy_binary_protocol::GenericHeader>::try_from(owned)
+            .expect("a sealed Prepare frame is wire-valid in the generic view");
+
+        let before = shard.metrics().frame_drop_count(
+            shard::metrics::frame_drop_variant::CONSENSUS,
+            shard::metrics::frame_drop_reason::UNSUPPORTED_OPERATION,
+        );
+        shard.dispatch(message);
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::CONSENSUS,
+                shard::metrics::frame_drop_reason::UNSUPPORTED_OPERATION,
+            ),
+            before + 1,
+            "an operation from a newer release must be accounted under its own reason, not \
+             folded into the generic unparsable drop"
+        );
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::CONSENSUS,
+                shard::metrics::frame_drop_reason::UNPARSABLE,
+            ),
+            0,
+            "version skew must not read as header corruption"
+        );
+    }
+
     /// Receive half of the purge gate in `on_repair_range_reply`: while a
     /// committed purge has not applied locally, a repair verdict must be
     /// deferred wholesale -- installing the peer's floor against pre-purge
