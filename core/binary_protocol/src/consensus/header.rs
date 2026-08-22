@@ -1082,6 +1082,10 @@ impl PrepareHeader {
 pub struct RepairPrepareHeader(pub PrepareHeader);
 
 impl ConsensusHeader for RepairPrepareHeader {
+    // Transparent over `PrepareHeader`, so the operation sits at the same
+    // offset. Without this a repaired prepare carrying a newer release's
+    // operation is classified as a corrupt header instead of version skew.
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(PrepareHeader, operation));
     const COMMAND: Command = Command::RepairPrepare;
     const FRAME_SEALED: bool = false;
 

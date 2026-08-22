@@ -79,9 +79,12 @@ pub enum ConsensusError {
     #[error("invalid bit pattern in header (enum discriminant out of range)")]
     InvalidBitPattern,
 
+    // Consequence deliberately left out: `RequestHeader` reaches here too, and a
+    // client frame is dropped without a reply rather than stalling a consensus
+    // group. The plane-specific outcome belongs to the call site that logs it.
     #[error(
         "operation {operation:#04x} is not known to this build; the sender runs a release that \
-         added a consensus operation, so this node cannot journal or ack the frame"
+         added a consensus operation"
     )]
     UnsupportedOperation { operation: u8 },
 

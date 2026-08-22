@@ -77,7 +77,9 @@ where
                 tracing::error!(
                     shard = self.id,
                     operation = format_args!("{operation:#04x}"),
-                    build_release = iggy_binary_protocol::IGGY_PROTOCOL_VERSION,
+                    build_release = %iggy_binary_protocol::ProtocolVersion(
+                        iggy_binary_protocol::IGGY_PROTOCOL_VERSION
+                    ),
                     "consensus frame carries an operation this build does not know; the sender \
                      runs a newer release. This node cannot journal or ack it, so its consensus \
                      group stops making progress until this node is upgraded"
@@ -835,7 +837,8 @@ mod tests {
     #[test]
     fn given_an_unknown_operation_when_a_consensus_frame_decodes_should_surface_an_upgrade_fence_signal()
      {
-        // Far past every defined Operation discriminant (the highest is 165).
+        // Far past every defined Operation discriminant (the highest is 162,
+        // `DeleteConsumerOffset`).
         const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
 
         let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
