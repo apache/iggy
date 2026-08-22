@@ -15,12 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-baseDir = "."
-headerPath = "ASF_LICENSE.txt"
-strictCheck = true
-useDefaultMapping = true
+[header]
+path = "ASF_LICENSE.txt"
 keywords = ["Licensed to the Apache Software Foundation"]
 
+[files]
+root = "."
 excludes = [
     "**/target/**",
     "**/node_modules/**",
@@ -44,6 +44,7 @@ excludes = [
     "NOTICE",
     "**/NOTICE",
     "**/.gitignore",
+    "**/.gitattributes",
     "**/.dockerignore",
     "**/.helmignore",
     "**/.prettierignore",
@@ -75,11 +76,11 @@ excludes = [
     "**/.env",
     "**/.gitkeep",
     "**/META-INF/services/**",
-    ".github/config/hawkeye.version",
     "**/.python-version",
+    "**/gradle/wrapper/**",
 ]
 
-[mapping.DOUBLESLASH_STYLE]
+[[rules]]
 extensions = [
     "cs",
     "go",
@@ -89,8 +90,10 @@ extensions = [
     "js",
     "ts",
 ]
+style_out = "doubleslash"
+styles_in = ["doubleslash", "slashstar", "javadoc"]
 
-[mapping.SCRIPT_STYLE]
+[[rules]]
 filenames = [
     "Dockerfile",
     "Dockerfile.test",
@@ -112,8 +115,9 @@ extensions = [
     "yaml",
     "yml",
 ]
+style_out = "script"
 
-[mapping.SLASHSTAR_STYLE]
+[[rules]]
 extensions = [
     "css",
     "fbs",
@@ -127,8 +131,9 @@ extensions = [
     "h",
     "hpp",
 ]
+style_out = "slashstar"
 
-[mapping.XML_STYLE]
+[[rules]]
 filenames = [
     "phpunit.xml.dist",
 ]
@@ -139,7 +144,8 @@ extensions = [
     "svelte",
     "xml",
 ]
+style_out = "xml"
 
 [git]
 ignore = "auto"
-attrs = "disable"
+file_attrs = "disable"

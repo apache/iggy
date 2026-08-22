@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import type { ClientProvider } from '../../client/index.js';
 import { createStream } from './create-stream.command.js';

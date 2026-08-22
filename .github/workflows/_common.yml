@@ -88,14 +88,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      - name: Read HawkEye version
-        id: hawkeye-version
-        run: echo "version=$(cat .github/config/hawkeye.version)" >> "$GITHUB_OUTPUT"
-
       - name: Install HawkEye
         uses: taiki-e/install-action@v2.85.11
         with:
-          tool: hawkeye@${{ steps.hawkeye-version.outputs.version }}
+          tool: hawkeye
 
       - name: Check license headers
         run: ./scripts/ci/license-headers.sh --check
