@@ -27,6 +27,8 @@ pub enum RuntimeError {
     FailedToSerializeMessagesMetadata,
     #[error("Failed to serialize raw messages")]
     FailedToSerializeRawMessages,
+    #[error("Sink plugin consume failed with status: {status} (plugin ID: {plugin_id})")]
+    SinkConsumeFailed { plugin_id: u32, status: i32 },
     #[error("Connector SDK error")]
     ConnectorSdkError(#[from] iggy_connector_sdk::Error),
     #[error("Iggy client error")]
