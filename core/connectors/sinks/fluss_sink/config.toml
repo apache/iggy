@@ -39,7 +39,9 @@ auto_create_table = true
 include_metadata = true
 include_checksum = true
 include_origin_timestamp = true
+# payload_format = "bytea"
 payload_format = "json"
+use_arrow_batch = true
 
 # fluss connection settings, passed to the fluss connector
 bootstrap_servers = "127.0.0.1:9123"

@@ -21,6 +21,7 @@ use crate::connectors::fixtures::fluss::fixture_error;
 
 use super::cluster::FlussCluster;
 use async_trait::async_trait;
+use fluss::record::ScanBatch;
 use fluss::row::ColumnarRow;
 use fluss::{
     client::{EARLIEST_OFFSET, FlussConnection},
@@ -106,6 +107,47 @@ impl FlussSinkFixture {
             for record in records {
                 rows.push(record.row);
             }
+        }
+
+        Ok(rows)
+    }
+
+    pub async fn read_from_test_table_arrow_batch(
+        &self,
+        timeout: u64,
+    ) -> Result<Vec<ScanBatch>, TestBinaryError> {
+        let connection = self.get_fluss_connection().await?;
+        let table_path = create_test_table_path();
+        let table = connection
+            .get_table(&table_path)
+            .await
+            .map_err(|e| fixture_error(format!("Failed to get table: {}", e)))?;
+
+        let log_scanner = table
+            .new_scan()
+            .create_record_batch_log_scanner()
+            .map_err(|e| fixture_error(format!("Failed to create log scanner: {}", e)))?;
+
+        log_scanner
+            .subscribe(0, EARLIEST_OFFSET)
+            .await
+            .map_err(|e| fixture_error(format!("Failed to subscribe to log scanner: {}", e)))?;
+
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+
+        let mut rows: Vec<ScanBatch> = Vec::new();
+
+        loop {
+            let records = match timeout_at(deadline, log_scanner.poll(Duration::from_secs(5))).await
+            {
+                Ok(Err(e)) => {
+                    return Err(fixture_error(format!("Failed to poll log scanner: {}", e)));
+                }
+                Ok(Ok(records)) => records,
+                Err(_) => break,
+            };
+
+            rows.extend(records);
         }
 
         Ok(rows)

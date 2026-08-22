@@ -49,7 +49,7 @@ ctor = { workspace = true }
 deltalake = { workspace = true }
 dtor = { workspace = true }
 figment = { workspace = true }
-fluss-rs = "0.1.0"
+fluss-rs = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
 humantime = { workspace = true }

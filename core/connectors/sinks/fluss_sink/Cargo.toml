@@ -33,12 +33,14 @@ publish = false
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
+arrow = "59.2.0"
 async-trait = { workspace = true }
 fluss-rs = { workspace = true }
 iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

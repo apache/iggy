@@ -56,6 +56,7 @@ pub struct FlussSinkConfig {
     pub include_checksum: bool,
     pub include_origin_timestamp: bool,
     pub payload_format: PayloadFormat,
+    pub use_arrow_batch: bool,
 }
 
 impl Default for FlussSinkConfig {
@@ -86,6 +87,7 @@ impl Default for FlussSinkConfig {
             include_checksum: true,
             include_origin_timestamp: true,
             payload_format: PayloadFormat::default(),
+            use_arrow_batch: false,
         }
     }
 }
