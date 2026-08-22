@@ -191,7 +191,7 @@ impl Shard {
         err_sender: flume::Sender<ErrorCtx>,
         mut stop_rx: broadcast::Receiver<()>,
     ) -> Self {
-        let (tx, rx) = flume::bounded::<ShardMessageWithPermit>(256);
+        let (tx, rx) = flume::bounded::<ShardMessageWithPermit>(256); //todo(haubur): Why hard code to 256?
         let closed = Arc::new(AtomicBool::new(false));
 
         let closed_clone = closed.clone();
