@@ -616,7 +616,7 @@ pub struct TransportPorts {
 ///
 /// Hostnames follow RFC 1123: ASCII letters, digits and hyphens in labels of
 /// 1-63 characters that do not start or end with a hyphen, at most
-/// [`MAX_HOSTNAME_LEN`] characters total, no port and no trailing dot. Names
+/// `MAX_HOSTNAME_LEN` characters total, no port and no trailing dot. Names
 /// consisting solely of digits and dots are rejected as malformed IPv4 rather
 /// than accepted as hostnames, so `10.0.0.256` fails loudly instead of being
 /// handed to DNS. Hostnames normalize to lowercase and IPs to their canonical

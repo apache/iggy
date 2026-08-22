@@ -1713,7 +1713,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// the head has to either stop it (nothing left to retransmit) or restart it
     /// (the next entry becomes the oldest, and it must be timed from now rather
     /// than inheriting the drained entry's elapsed ticks). Arming happens in
-    /// [`Self::push_prepare_entry`]; between the two the invariant is "ticking
+    /// `Self::push_prepare_entry`; between the two the invariant is "ticking
     /// iff the pipeline is non-empty".
     pub fn pop_committed_prepare(&self) -> Option<P::Entry> {
         let popped = self.pipeline.borrow_mut().pop();
@@ -1804,7 +1804,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
-    /// Undo the [`Self::push_prepare_entry`] pre-advance for a prepare whose
+    /// Undo the `Self::push_prepare_entry` pre-advance for a prepare whose
     /// journal append failed, so the op it claimed is handed back.
     ///
     /// The pre-advance runs the sequencer ahead of the WAL on purpose, so that a

@@ -119,7 +119,7 @@ fn find_mapping(path: &str) -> Option<&'static EnvVarMapping> {
 ///
 /// Names outside the `IGGY_` prefix are left alone: those address the process
 /// environment (`RUST_LOG`, test scaffolding), not the config schema.
-/// [`NON_CONFIG_ENV_VARS`] carries the `IGGY_`-prefixed names the server reads
+/// `NON_CONFIG_ENV_VARS` carries the `IGGY_`-prefixed names the server reads
 /// outside the config struct.
 ///
 /// # Errors

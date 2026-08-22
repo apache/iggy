@@ -42,3 +42,6 @@ iggy_connector_sdk = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true
