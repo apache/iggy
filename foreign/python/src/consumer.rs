@@ -24,7 +24,7 @@ use iggy::prelude::{
     AutoCommitWhen as RustAutoCommitWhen, Consumer as RustConsumer,
     ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
     ConsumerGroupMember as RustConsumerGroupMember, Identifier, IggyConsumer as RustIggyConsumer,
-    IggyDuration, IggyError, ReceivedMessage,
+    IggyConsumerState as RustIggyConsumerState, IggyDuration, IggyError, ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::PyDelta;
@@ -44,10 +44,16 @@ use crate::receive_message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
 /// It provides asynchronous functionality through the contained runtime.
+// `inner` stays locked for the whole duration of a consumption run, so the synchronous
+// getters must not touch it.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct IggyConsumer {
     pub(crate) inner: Arc<Mutex<RustIggyConsumer>>,
+    pub(crate) state: RustIggyConsumerState,
+    pub(crate) name: String,
+    pub(crate) stream: PyIdentifier,
+    pub(crate) topic: PyIdentifier,
 }
 
 #[gen_stub_pymethods]
@@ -56,39 +62,33 @@ impl IggyConsumer {
     /// Get the last consumed offset or `None` if no offset has been consumed yet.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
-        self.inner
-            .blocking_lock()
-            .get_last_consumed_offset(partition_id)
+        self.state.get_last_consumed_offset(partition_id)
     }
 
     /// Get the last stored offset or `None` if no offset has been stored yet.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
-        self.inner
-            .blocking_lock()
-            .get_last_stored_offset(partition_id)
+        self.state.get_last_stored_offset(partition_id)
     }
 
     /// Gets the name of the consumer group.
     fn name(&self) -> String {
-        self.inner.blocking_lock().name().to_string()
+        self.name.clone()
     }
 
     /// Gets the current partition id or `0` if no messages have been polled yet.
     fn partition_id(&self) -> u32 {
-        self.inner.blocking_lock().partition_id()
+        self.state.partition_id()
     }
 
     /// Gets the name of the stream this consumer group is configured for.
-    fn stream(&self) -> PyResult<PyIdentifier> {
-        let guard = self.inner.blocking_lock();
-        PyIdentifier::try_from(guard.stream())
+    fn stream(&self) -> PyIdentifier {
+        self.stream.clone()
     }
 
     /// Gets the name of the topic this consumer group is configured for.
-    fn topic(&self) -> PyResult<PyIdentifier> {
-        let guard = self.inner.blocking_lock();
-        PyIdentifier::try_from(guard.topic())
+    fn topic(&self) -> PyIdentifier {
+        self.topic.clone()
     }
 
     /// Stores the provided offset for the provided partition id or if none is specified

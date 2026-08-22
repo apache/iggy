@@ -19,6 +19,7 @@
 # + consumer_group setup once test fixture is in place.
 
 import asyncio
+import faulthandler
 from datetime import timedelta
 
 import pytest
@@ -855,6 +856,74 @@ class TestConsumerGroup:
         assert consumer.partition_id() == partition_id
         assert consumer.get_last_consumed_offset(partition_id) is None
         assert consumer.get_last_stored_offset(partition_id) is None
+
+    @pytest.mark.asyncio
+    async def test_consumer_group_metadata_while_consuming(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test that metadata can be read while a consumption run is in progress."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        message = f"Metadata test - {unique_name()}"
+        received_messages = []
+        consuming = asyncio.Event()
+        shutdown_event = asyncio.Event()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.First(),
+            10,
+            auto_commit=AutoCommit.Disabled(),
+            poll_interval=timedelta(milliseconds=25),
+        )
+
+        async def take(received: ReceiveMessage) -> None:
+            received_messages.append(received)
+            consuming.set()
+
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(message)],
+        )
+
+        consume = consumer.consume_messages(take, shutdown_event)
+        try:
+            await asyncio.wait_for(consuming.wait(), timeout=10)
+
+            # A getter that blocks holds the GIL, so neither pytest-timeout nor asyncio
+            # can fire. The faulthandler watchdog needs no GIL and aborts instead.
+            # A regression hangs forever, so the timeout only has to outlast normal GIL
+            # contention -- it is generous because tripping it kills the whole run.
+            faulthandler.dump_traceback_later(5, exit=True)
+            try:
+                current_partition_id = consumer.partition_id()
+                assert consumer.name() == consumer_name
+                assert consumer.stream() == stream_name
+                assert consumer.topic() == topic_name
+                assert (
+                    consumer.get_last_consumed_offset(current_partition_id)
+                    == received_messages[-1].offset()
+                )
+                assert consumer.get_last_stored_offset(current_partition_id) == 0
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+        finally:
+            shutdown_event.set()
+            await consume
 
     @pytest.mark.asyncio
     async def test_get_last_consumed_offset_updates_as_messages_are_consumed(
