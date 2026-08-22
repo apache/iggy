@@ -55,6 +55,7 @@ members = [
     "core/cpu_allocation",
     "core/harness_derive",
     "core/integration",
+    "core/integration/fixtures/test_sink",
     "core/journal",
     "core/message_bus",
     "core/metadata",
