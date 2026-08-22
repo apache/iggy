@@ -737,7 +737,7 @@ async fn process_messages(
     })?;
 
     let ffi_start = Instant::now();
-    (consume)(
+    let status = (consume)(
         plugin_id,
         topic_meta.as_ptr(),
         topic_meta.len(),
@@ -747,6 +747,18 @@ async fn process_messages(
         messages.len(),
     );
     let ffi_elapsed = ffi_start.elapsed();
+
+    // The status code is the plugin's only channel for reporting a failed write:
+    // the SDK returns non-zero when the sink's consume() errors or the batch cannot
+    // be deserialized. Ignoring it would count the batch as processed and advance
+    // consumer offsets over messages the sink never stored — the same silent-loss
+    // class that the iggy_sink_open status check prevents at startup.
+    if status != 0 {
+        error!(
+            "Sink plugin consume failed with status: {status} for sink connector with ID: {plugin_id}"
+        );
+        return Err(RuntimeError::SinkConsumeFailed { plugin_id, status });
+    }
 
     Ok(SinkBatchTiming {
         processed_count,
@@ -759,4 +771,113 @@ struct SinkBatchTiming {
     processed_count: usize,
     decode_elapsed: Duration,
     ffi_elapsed: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_connector_sdk::decoders::json::JsonStreamDecoder;
+
+    extern "C" fn consume_ok(
+        _id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        _messages_meta_ptr: *const u8,
+        _messages_meta_len: usize,
+        _messages_ptr: *const u8,
+        _messages_len: usize,
+    ) -> i32 {
+        0
+    }
+
+    extern "C" fn consume_fail(
+        _id: u32,
+        _topic_meta_ptr: *const u8,
+        _topic_meta_len: usize,
+        _messages_meta_ptr: *const u8,
+        _messages_meta_len: usize,
+        _messages_ptr: *const u8,
+        _messages_len: usize,
+    ) -> i32 {
+        1
+    }
+
+    fn fixtures() -> (
+        TopicMetadata,
+        MessagesMetadata,
+        Vec<IggyMessage>,
+        Arc<dyn StreamDecoder>,
+        Arc<Metrics>,
+        SinkLabels,
+    ) {
+        let topic_metadata = TopicMetadata {
+            stream: "test-stream".to_owned(),
+            topic: "test-topic".to_owned(),
+        };
+        let messages_metadata = MessagesMetadata {
+            partition_id: 1,
+            current_offset: 0,
+            schema: Schema::Json,
+        };
+        let messages = vec![
+            IggyMessage::builder()
+                .payload(br#"{"key":"value"}"#.to_vec().into())
+                .build()
+                .expect("test message should be valid"),
+        ];
+        (
+            topic_metadata,
+            messages_metadata,
+            messages,
+            Arc::new(JsonStreamDecoder),
+            Arc::new(Metrics::init()),
+            SinkLabels::new("test-sink"),
+        )
+    }
+
+    #[tokio::test]
+    async fn given_zero_status_when_plugin_consumes_should_return_timing() {
+        let (topic_metadata, messages_metadata, messages, decoder, metrics, labels) = fixtures();
+        let result = process_messages(
+            1,
+            messages_metadata,
+            &topic_metadata,
+            messages,
+            &(consume_ok as ConsumeCallback),
+            &Vec::new(),
+            &decoder,
+            &metrics,
+            &labels,
+        )
+        .await;
+        match result {
+            Ok(timing) => assert_eq!(timing.processed_count, 1),
+            Err(error) => panic!("expected success, got error: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn given_nonzero_status_when_plugin_consume_fails_should_propagate_error() {
+        let (topic_metadata, messages_metadata, messages, decoder, metrics, labels) = fixtures();
+        let result = process_messages(
+            2,
+            messages_metadata,
+            &topic_metadata,
+            messages,
+            &(consume_fail as ConsumeCallback),
+            &Vec::new(),
+            &decoder,
+            &metrics,
+            &labels,
+        )
+        .await;
+        match result {
+            Err(RuntimeError::SinkConsumeFailed { plugin_id, status }) => {
+                assert_eq!(plugin_id, 2);
+                assert_eq!(status, 1);
+            }
+            Err(error) => panic!("expected SinkConsumeFailed, got: {error}"),
+            Ok(_) => panic!("expected SinkConsumeFailed, got success"),
+        }
+    }
 }
