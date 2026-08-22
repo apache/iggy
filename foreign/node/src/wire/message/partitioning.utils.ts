@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { uint32ToBuf, uint64ToBuf } from '../number.utils.js';
 import type { ValueOf } from '../../type.utils.js';

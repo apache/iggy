@@ -67,10 +67,10 @@ If it's indeed not a typo, you can set an exception in `.typos.toml`.
 
 ### License Header Checks
 
-We use [HawkEye](https://github.com/korandoru/hawkeye):
+We use [HawkEye](https://github.com/fast/hawkeye):
 
 ```bash
-cargo install hawkeye --version "$(cat .github/config/hawkeye.version)" --locked
+cargo install hawkeye --locked
 ./scripts/ci/license-headers.sh --check
 ./scripts/ci/license-headers.sh --fix
 ```
