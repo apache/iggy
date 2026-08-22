@@ -45,8 +45,6 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:$PATH
 ENV PHP=/usr/bin/php8.3
 ENV PHP_CONFIG=/usr/bin/php-config8.3
-ENV IGGY_HOST=iggy-server
-ENV IGGY_PORT=8090
 ENV BDD_FEATURE_FILE=/workspace/bdd/scenarios/basic_messaging.feature
 
 RUN rustup component add llvm-tools-preview \

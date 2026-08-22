@@ -16,28 +16,25 @@
 // under the License.
 //
 
-import assert from 'node:assert/strict';
-import { Client } from '../client/index.js';
-import { Given } from "@cucumber/cucumber";
-import type { TestWorld } from './world.js';
-import { getRootCredentials, getServerAddress } from './env.js';
-
-const credentials = getRootCredentials();
-const [host, port] = getServerAddress();
-
-const opt = {
-  transport: 'TCP' as const,
-  options: { host, port },
-  credentials
+// A default here would turn a dropped compose variable into a run against
+// whatever happens to listen on the fallback address, so a missing value
+// aborts the suite instead.
+const requiredEnv = (name: string): string => {
+  const value = process.env[name];
+  if (!value)
+    throw new Error(`${name} must be set; run the suite via scripts/run-bdd-tests.sh`);
+  return value;
 };
 
-Given('I have a running Iggy server', function () {
-  return true;
-});
+export const getServerAddress = (): [string, number] => {
+  const address = requiredEnv('IGGY_TCP_ADDRESS');
+  const [host, port] = address.split(':');
+  if (!host || !port)
+    throw new Error(`IGGY_TCP_ADDRESS must be "host:port", got "${address}"`);
+  return [host, parseInt(port, 10)];
+};
 
-
-Given('I am authenticated as the root user', async function (this: TestWorld) {
-  this.client = new Client(opt);
-  assert.deepEqual({ userId: 0 }, await this.client.session.login(credentials));
-  assert.equal(true, await this.client.system.ping());
+export const getRootCredentials = () => ({
+  username: requiredEnv('IGGY_ROOT_USERNAME'),
+  password: requiredEnv('IGGY_ROOT_PASSWORD')
 });

@@ -51,7 +51,7 @@ final class IggySdkTest extends TestCase
 
         $client = new IggyClient('');
         $client->connect();
-        $client->loginUser(env_or_default('IGGY_USERNAME', 'iggy'), env_or_default('IGGY_PASSWORD', 'iggy'));
+        $client->loginUser(env_or_default('IGGY_ROOT_USERNAME', 'iggy'), env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
         $client->ping();
 
         assert_true($client instanceof IggyClient);

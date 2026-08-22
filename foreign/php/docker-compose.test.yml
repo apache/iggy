@@ -61,10 +61,9 @@ services:
     networks:
       - php-test-network
     environment:
-      - IGGY_HOST=iggy-server
-      - IGGY_PORT=8090
-      - IGGY_USERNAME=iggy
-      - IGGY_PASSWORD=iggy
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
     volumes:
       - ./test-results:/workspace/foreign/php/test-results
 
