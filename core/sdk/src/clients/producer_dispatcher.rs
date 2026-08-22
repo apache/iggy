@@ -49,29 +49,17 @@ impl ProducerDispatcher {
         let err_callback = config.error_callback.clone();
         let (stop_tx, _) = broadcast::channel::<()>(1);
 
-        let mut stop_rx = stop_tx.subscribe();
+        // A task that receives errors from shards when writing messages failed.
         let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    maybe_message = err_rx.recv_async() => {
-                        match maybe_message {
-                            Ok(ctx) => {
-                                if let Err(panic) = std::panic::AssertUnwindSafe(err_callback.call(ctx))
-                                    .catch_unwind()
-                                    .await
-                                {
-                                    tracing::error!("error_callback panicked: {:?}", panic);
-                                }
-                            }
-                            Err(_) => break
-                        }
-                    }
-                    _ = stop_rx.recv() => {
-                        tracing::debug!("error-callback worker finished");
-                        break
-                    }
+            while let Ok(ctx) = err_rx.recv_async().await {
+                if let Err(panic) = std::panic::AssertUnwindSafe(err_callback.call(ctx))
+                    .catch_unwind()
+                    .await
+                {
+                    tracing::error!("error_callback panicked: {:?}", panic);
                 }
             }
+            tracing::debug!("error-callback worker finished");
         });
 
         let bytes_permit = {
@@ -192,6 +180,8 @@ impl ProducerDispatcher {
             }
         }
 
+        // After shards are closed await the error callback task,
+        // that might drain queued errors from the final flush.
         if let Err(e) = self._join_handle.await {
             tracing::error!("error-worker panicked: {e:?}");
         }
@@ -430,6 +420,54 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(sharding_called.load(Ordering::SeqCst), 1);
+        assert_eq!(error_called.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_reports_errors_from_final_flush() {
+        let mut mock = MockProducerCoreBackend::new();
+        // mock a failed send to be caught by the error callback
+        mock.expect_send_internal()
+            .times(1)
+            .returning(|_, _, _, _| {
+                Box::pin(async {
+                    Err(IggyError::ProducerSendFailed {
+                        cause: Box::new(IggyError::Error),
+                        failed: Arc::new(vec![dummy_message(10)]),
+                        committed: Arc::new(Vec::new()),
+                        stream_name: "1".to_string(),
+                        topic_name: "1".to_string(),
+                    })
+                })
+            });
+
+        let error_called = Arc::new(AtomicUsize::new(0));
+
+        let config = BackgroundConfig::builder()
+            .num_shards(1)
+            .linger_time(Duration::from_secs(60).into()) // block/ wait so shutdown triggers the flush
+            .error_callback(Arc::new(Box::new(TestErrorCallback {
+                called: error_called.clone(),
+            })))
+            .build();
+
+        let dispatcher = ProducerDispatcher::new(Arc::new(mock), config);
+
+        dispatcher
+            .dispatch(
+                vec![dummy_message(10)],
+                dummy_identifier(),
+                dummy_identifier(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // trigger the final flush
+        dispatcher.shutdown().await;
+
+        // Passes, if the error callback is hit once after final
+        // flush from shutdown.
         assert_eq!(error_called.load(Ordering::SeqCst), 1);
     }
 }
