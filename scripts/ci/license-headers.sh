@@ -70,10 +70,19 @@ if ! command -v jq &> /dev/null; then
   exit 1
 fi
 
+HAWKEYE_VERSION="$(cat .github/config/hawkeye.version)"
+
 # Check if HawkEye is available
 if ! command -v hawkeye &> /dev/null; then
   echo "❌ hawkeye command not found"
-  echo "💡 Install HawkEye: cargo install hawkeye --locked"
+  echo "💡 Install HawkEye: cargo install hawkeye --version $HAWKEYE_VERSION --locked"
+  exit 1
+fi
+
+INSTALLED_HAWKEYE_VERSION="$(hawkeye -V | awk '{print $2}')"
+if [ "$INSTALLED_HAWKEYE_VERSION" != "$HAWKEYE_VERSION" ]; then
+  echo "❌ hawkeye $HAWKEYE_VERSION is required, found ${INSTALLED_HAWKEYE_VERSION:-unknown}"
+  echo "💡 Install HawkEye: cargo install hawkeye --version $HAWKEYE_VERSION --locked --force"
   exit 1
 fi
 

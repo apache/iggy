@@ -70,7 +70,7 @@ If it's indeed not a typo, you can set an exception in `.typos.toml`.
 We use [HawkEye](https://github.com/fast/hawkeye):
 
 ```bash
-cargo install hawkeye --locked
+cargo install hawkeye --version "$(cat .github/config/hawkeye.version)" --locked
 ./scripts/ci/license-headers.sh --check
 ./scripts/ci/license-headers.sh --fix
 ```

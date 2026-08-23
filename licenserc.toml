@@ -76,6 +76,7 @@ excludes = [
     "**/.env",
     "**/.gitkeep",
     "**/META-INF/services/**",
+    ".github/config/hawkeye.version",
     "**/.python-version",
     "**/gradle/wrapper/**",
     # cargo-php regenerates this file with an extra separator after the header.
