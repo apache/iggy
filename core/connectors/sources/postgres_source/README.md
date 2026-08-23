@@ -209,7 +209,7 @@ LIMIT $limit
 
 ### Delete After Read
 
-Deletes rows from the source table after successful processing:
+Deletes rows from the source table only after Iggy acknowledges the batch:
 
 ```toml
 [plugin_config]
@@ -219,7 +219,7 @@ primary_key_column = "id"
 
 ### Mark as Processed
 
-Updates a boolean column instead of deleting:
+Updates a boolean column after Iggy acknowledges the batch instead of deleting:
 
 ```toml
 [plugin_config]
@@ -267,6 +267,10 @@ tables = ["users", "orders"]
 capture_operations = ["INSERT", "UPDATE", "DELETE"]
 ```
 
+The connector peeks at logical changes and advances the replication slot only
+after Iggy acknowledges the batch. A failed delivery leaves the slot unchanged
+so the next poll can read the same changes again.
+
 The `pg_replicate` backend requires the `cdc_pg_replicate` feature flag at build time.
 
 ### Slot Naming
@@ -274,8 +278,9 @@ The `pg_replicate` backend requires the `cdc_pg_replicate` feature flag at build
 Each CDC connector must use a unique `replication_slot`. Setup accepts any
 pre-existing `test_decoding` slot, so two connectors pointed at the same
 database with the default `replication_slot = "iggy_slot"` will silently
-share one slot. `pg_logical_slot_get_changes` consumes changes on read, so
-each connector only sees a subset of the other's changes instead of erroring.
+share one slot. Each connector peeks from and advances the same slot after
+delivery, so one connector can move the shared position past changes that the
+other has not processed.
 Set an explicit, distinct `replication_slot` per connector instance.
 
 ### Decommissioning

@@ -340,8 +340,8 @@ async fn delete_source_config_version(http: &Client, api_url: &str, version: u64
     );
 }
 
-// The connector calls pg_logical_slot_get_changes on a fixed poll interval and
-// briefly holds the slot active during each call. A drop landing in that window
+// The connector peeks changes and advances the slot on a fixed poll interval.
+// Both operations briefly hold the slot active. A drop landing in that window
 // gets ERROR 55006 (slot is active for PID ...), so retry past transient hits
 // instead of dropping while the poller is guaranteed stopped.
 const PG_OBJECT_IN_USE: &str = "55006";

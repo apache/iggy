@@ -15,6 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::time::Duration;
+
+use iggy_common::MessageClient;
+use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_connector_sdk::api::{ConnectorRuntimeStats, ConnectorStatus};
+use integration::harness::seeds;
+use integration::iggy_harness;
+use reqwest::Client;
+use tokio::time::{sleep, timeout};
+
 use super::{DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
@@ -22,12 +32,10 @@ use crate::connectors::fixtures::{
     PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
     PostgresSourceOps,
 };
-use iggy_common::MessageClient;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
-use integration::harness::seeds;
-use integration::iggy_harness;
-use std::time::Duration;
-use tokio::time::sleep;
+
+const API_KEY: &str = "test-api-key";
+const SOURCE_KEY: &str = "postgres";
+const SEND_FAILURE_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
@@ -125,6 +133,166 @@ async fn json_rows_source_produces_messages_to_iggy(
             "BPCHAR tag mismatch at record {i}"
         );
     }
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_rows_in_postgres_when_iggy_server_crashes_should_redeliver_after_restart(
+    harness: &mut TestHarness,
+    fixture: PostgresSourceJsonFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        // Keep a failed send bounded instead of waiting indefinitely for Iggy to return.
+        .set_iggy_connection_options("reconnection_retries=0");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = Client::new();
+    let errors_before_failure = source_errors(&http, &api_url).await;
+
+    harness.kill_node(0).expect("Failed to kill Iggy server");
+
+    let expected = create_test_messages(TEST_MESSAGE_COUNT);
+    let mut transaction = pool.begin().await.expect("Failed to begin transaction");
+    let insert = format!(
+        "INSERT INTO {} (id, name, count, amount, active, timestamp, tag) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        fixture.table_name()
+    );
+    for message in &expected {
+        let tag = format!("{:<10}", format!("tag_{}", message.id));
+        sqlx::query(sqlx::AssertSqlSafe(insert.as_str()))
+            .bind(message.id as i32)
+            .bind(&message.name)
+            .bind(message.count as i32)
+            .bind(message.amount)
+            .bind(message.active)
+            .bind(message.timestamp)
+            .bind(tag)
+            .execute(&mut *transaction)
+            .await
+            .expect("Failed to insert source row");
+    }
+    transaction
+        .commit()
+        .await
+        .expect("Failed to commit source rows");
+
+    // The second error proves that NACK made the same rows eligible for another poll.
+    wait_for_source_errors(&http, &api_url, errors_before_failure + 2).await;
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .restart_node(0)
+        .expect("Failed to restart Iggy server");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "send_failure_consumer".try_into().unwrap();
+    let mut received = Vec::new();
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received.extend(polled.messages.into_iter().filter_map(|message| {
+                serde_json::from_slice::<DatabaseRecord>(&message.payload).ok()
+            }));
+            if received.len() >= TEST_MESSAGE_COUNT {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert_eq!(
+        received.len(),
+        TEST_MESSAGE_COUNT,
+        "Rows polled during the failed send should be delivered after restart"
+    );
+    for (record, expected) in received.iter().zip(expected) {
+        assert_eq!(record.data.id, expected.id);
+    }
+
+    pool.close().await;
+}
+
+async fn source_errors(http: &Client, api_url: &str) -> u64 {
+    http.get(format!("{api_url}/stats"))
+        .header("api-key", API_KEY)
+        .send()
+        .await
+        .expect("runtime stats should be available")
+        .json::<ConnectorRuntimeStats>()
+        .await
+        .expect("runtime stats should be valid")
+        .connectors
+        .into_iter()
+        .find(|connector| connector.key == SOURCE_KEY)
+        .expect("PostgreSQL source stats should be present")
+        .errors
+}
+
+async fn wait_for_source_errors(http: &Client, api_url: &str, minimum_errors: u64) {
+    timeout(SEND_FAILURE_TIMEOUT, async {
+        loop {
+            if let Ok(response) = http
+                .get(format!("{api_url}/stats"))
+                .header("api-key", API_KEY)
+                .send()
+                .await
+                && let Ok(stats) = response.json::<ConnectorRuntimeStats>().await
+                && let Some(source) = stats
+                    .connectors
+                    .iter()
+                    .find(|connector| connector.key == SOURCE_KEY)
+                && source.status == ConnectorStatus::Error
+                && source.errors >= minimum_errors
+            {
+                break;
+            }
+            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    })
+    .await
+    .expect("PostgreSQL source did not retry the NACKed batch");
 }
 
 #[iggy_harness(
