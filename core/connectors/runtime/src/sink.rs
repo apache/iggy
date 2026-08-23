@@ -748,11 +748,9 @@ async fn process_messages(
     );
     let ffi_elapsed = ffi_start.elapsed();
 
-    // The status code is the plugin's only channel for reporting a failed write:
-    // the SDK returns non-zero when the sink's consume() errors or the batch cannot
-    // be deserialized. Ignoring it would count the batch as processed and advance
-    // consumer offsets over messages the sink never stored — the same silent-loss
-    // class that the iggy_sink_open status check prevents at startup.
+    // Non-zero status is the plugin's only channel for reporting a failed write; propagate
+    // it so the runtime fails fast instead of counting the batch as processed. This does
+    // not redeliver the batch (offsets are already committed at poll time) — see #2927.
     if status != 0 {
         error!(
             "Sink plugin consume failed with status: {status} for sink connector with ID: {plugin_id}"
