@@ -80,7 +80,7 @@ void IggyBlockingClient::Reset() noexcept {
         return;
     }
 
-    ffi::Client *client = std::exchange(client_, nullptr);
+    ffi::Client *client{std::exchange(client_, nullptr)};
     ffi::delete_client(client);
 }
 

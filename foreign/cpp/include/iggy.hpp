@@ -340,9 +340,9 @@ namespace detail {
 /// a big-endian host produces the same block as a little-endian one.
 template <typename Value>
 rust::Vec<std::uint8_t> to_little_endian_bytes(const Value value) {
-    rust::Vec<std::uint8_t> bytes;
+    rust::Vec<std::uint8_t> bytes{};
     bytes.reserve(sizeof(Value));
-    for (std::size_t index = 0; index < sizeof(Value); ++index) {
+    for (std::size_t index{}; index < sizeof(Value); ++index) {
         bytes.push_back(static_cast<std::uint8_t>((value >> (index * 8)) & 0xFF));
     }
 
@@ -350,14 +350,14 @@ rust::Vec<std::uint8_t> to_little_endian_bytes(const Value value) {
 }
 
 inline rust::Vec<std::uint8_t> to_bool_bytes(const bool value) {
-    rust::Vec<std::uint8_t> bytes;
+    rust::Vec<std::uint8_t> bytes{};
     bytes.push_back(static_cast<std::uint8_t>(value ? 1 : 0));
 
     return bytes;
 }
 
 inline rust::Vec<std::uint8_t> to_key_bytes(const std::string_view key) {
-    rust::Vec<std::uint8_t> bytes;
+    rust::Vec<std::uint8_t> bytes{};
     bytes.reserve(key.size());
     for (const char character : key) {
         bytes.push_back(static_cast<std::uint8_t>(character));
@@ -367,7 +367,7 @@ inline rust::Vec<std::uint8_t> to_key_bytes(const std::string_view key) {
 }
 
 inline iggy::ffi::HeaderField to_header_field(const iggy::ffi::HeaderKind kind, rust::Vec<std::uint8_t> value) {
-    iggy::ffi::HeaderField field;
+    iggy::ffi::HeaderField field{};
     field.kind  = static_cast<std::uint8_t>(kind);
     field.value = std::move(value);
 
@@ -378,7 +378,7 @@ inline iggy::ffi::HeaderField to_header_field(const iggy::ffi::HeaderKind kind, 
 inline iggy::ffi::HeaderEntry to_option_entry(const std::string_view key,
                                               const iggy::ffi::HeaderKind value_kind,
                                               rust::Vec<std::uint8_t> value) {
-    iggy::ffi::HeaderEntry entry;
+    iggy::ffi::HeaderEntry entry{};
     entry.key   = to_header_field(iggy::ffi::HeaderKind::String, to_key_bytes(key));
     entry.value = to_header_field(value_kind, std::move(value));
 
@@ -387,59 +387,86 @@ inline iggy::ffi::HeaderEntry to_option_entry(const std::string_view key,
 
 }  // namespace detail
 
-/// Topic option entries for the trailing options block of
-/// `Client::create_topic(...)`.
-///
-/// Each factory names one key of the server's topic option catalog and encodes
-/// its value under that key's catalog kind. Both halves matter: the server
-/// refuses a key it does not list, and refuses a listed key whose value arrives
-/// under a different kind than the catalog gives it.
-/// `Client::describe_options("topic")` enumerates the catalog with each key's
-/// kind and default, which is the discovery path over the binary transports:
-/// they carry back an error code without naming the refused key.
-///
-/// These keys are create-time only. `Client::update_topic(...)` refuses every
-/// one of them by name: they describe how a topic's partitions were laid down,
-/// so changing one mid-life would leave earlier segments built to the old value.
+/**
+ * @brief Creates topic option entries for `Client::create_topic(...)`.
+ *
+ * Each factory encodes one key from the server's topic option catalog using
+ * that key's required value kind. The server rejects unknown keys and values
+ * encoded with a different kind.
+ *
+ * Use `Client::describe_options("topic")` to retrieve the supported keys,
+ * value kinds, and defaults. Binary transport errors do not identify a rejected
+ * key, so the catalog is the discovery mechanism for those transports.
+ *
+ * @note These options are accepted only during topic creation.
+ *       `Client::update_topic(...)` rejects them because they define how
+ *       partition storage is created. Changing them later could leave existing
+ *       and new segments with different storage settings.
+ */
 class TopicOption final {
   public:
-    /// Set the size at which this topic's segments rotate.
-    ///
-    /// Must be a multiple of 512 bytes, at least 1 MiB, and no larger than the
-    /// server's segment ceiling.
+    /**
+     * @brief Set the size at which this topic's segments rotate.
+     *
+     * Must be a multiple of 512 bytes, at least 1 MiB, and no larger than the
+     * server's segment ceiling.
+     *
+     * @param bytes Segment size in bytes.
+     * @return Encoded topic option entry.
+     */
     static iggy::ffi::HeaderEntry SegmentSize(const std::uint64_t bytes) {
         return detail::to_option_entry("segment_size", iggy::ffi::HeaderKind::Uint64,
                                        detail::to_little_endian_bytes(bytes));
     }
 
-    /// Choose whether writes to this topic's partitions are fsynced.
+    /**
+     * @brief Choose whether writes to this topic's partitions are fsynced.
+     *
+     * @param enabled Whether partition writes are fsynced.
+     * @return Encoded topic option entry.
+     */
     static iggy::ffi::HeaderEntry EnforceFsync(const bool enabled) {
         return detail::to_option_entry("enforce_fsync", iggy::ffi::HeaderKind::Bool, detail::to_bool_bytes(enabled));
     }
 
-    /// Flush the journal once it holds this many messages.
-    ///
-    /// Must be non-zero. Paired with
-    /// `SizeOfMessagesRequiredToSave(bytes)`: whichever threshold trips
-    /// first flushes.
+    /**
+     * @brief Flush the journal once it holds this many messages.
+     *
+     * Must be non-zero. Paired with
+     * `SizeOfMessagesRequiredToSave(bytes)`: whichever threshold trips
+     * first flushes.
+     *
+     * @param messages Message count at which to flush the journal.
+     * @return Encoded topic option entry.
+     */
     static iggy::ffi::HeaderEntry MessagesRequiredToSave(const std::uint32_t messages) {
         return detail::to_option_entry("messages_required_to_save", iggy::ffi::HeaderKind::Uint32,
                                        detail::to_little_endian_bytes(messages));
     }
 
-    /// Flush the journal once it holds this many bytes.
-    ///
-    /// Capped at 1 GiB: a threshold above the largest a segment may be never
-    /// trips, and the journal does not survive a crash.
+    /**
+     * @brief Flush the journal once it holds this many bytes.
+     *
+     * Capped at 1 GiB: a threshold above the largest a segment may be never
+     * trips, and the journal does not survive a crash.
+     *
+     * @param bytes Byte count at which to flush the journal.
+     * @return Encoded topic option entry.
+     */
     static iggy::ffi::HeaderEntry SizeOfMessagesRequiredToSave(const std::uint64_t bytes) {
         return detail::to_option_entry("size_of_messages_required_to_save", iggy::ffi::HeaderKind::Uint64,
                                        detail::to_little_endian_bytes(bytes));
     }
 
-    /// Choose whether a segment's bytes are reserved on disk when it is created.
-    ///
-    /// Reserves `segment_size * partitions_count` up front, which the server
-    /// caps at 64 GiB per topic.
+    /**
+     * @brief Choose whether a segment's bytes are reserved on disk when it is created.
+     *
+     * Reserves `segment_size * partitions_count` up front, which the server
+     * caps at 64 GiB per topic.
+     *
+     * @param enabled Whether to reserve segment storage on disk.
+     * @return Encoded topic option entry.
+     */
     static iggy::ffi::HeaderEntry PreallocateSegments(const bool enabled) {
         return detail::to_option_entry("preallocate_segments", iggy::ffi::HeaderKind::Bool,
                                        detail::to_bool_bytes(enabled));
@@ -469,9 +496,9 @@ class IggyException : public std::runtime_error {
  * client with FromConnectionString().
  *
  * @code{.cpp}
- * auto client = iggy::IggyBlockingClient::Builder()
- *                   .WithServerAddress("127.0.0.1:8090")
- *                   .Build();
+ * auto client{iggy::IggyBlockingClient::Builder()
+ *                 .WithServerAddress("127.0.0.1:8090")
+ *                 .Build()};
  * client.Connect();
  * client.Login("iggy", "iggy");
  * client.Shutdown();
@@ -883,19 +910,19 @@ class IggyBlockingClient::Builder final {
     IggyBlockingClient Build() const;
 
   private:
-    std::string server_address_;
-    ffi::AutoLoginKind auto_login_kind_ = ffi::AutoLoginKind::Disabled;
-    std::string auto_login_username_;
-    std::string auto_login_password_;
-    std::string personal_access_token_;
-    std::optional<std::uint32_t> reconnection_max_retries_;
-    std::optional<std::uint64_t> reconnection_interval_micros_;
-    std::optional<std::uint64_t> reestablish_after_micros_;
-    bool tls_enabled_ = false;
-    std::string tls_domain_;
-    std::string tls_ca_file_;
-    std::optional<bool> tls_validate_certificate_;
-    bool no_delay_ = false;
+    std::string server_address_{};
+    ffi::AutoLoginKind auto_login_kind_{ffi::AutoLoginKind::Disabled};
+    std::string auto_login_username_{};
+    std::string auto_login_password_{};
+    std::string personal_access_token_{};
+    std::optional<std::uint32_t> reconnection_max_retries_{};
+    std::optional<std::uint64_t> reconnection_interval_micros_{};
+    std::optional<std::uint64_t> reestablish_after_micros_{};
+    bool tls_enabled_{};
+    std::string tls_domain_{};
+    std::string tls_ca_file_{};
+    std::optional<bool> tls_validate_certificate_{};
+    bool no_delay_{};
 };
 
 }  // namespace iggy
