@@ -89,8 +89,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update --yes
-          sudo apt-get install --yes gnome-keyring keyutils dbus-x11 libsecret-tools
+          ./scripts/ci/apt-install.sh gnome-keyring keyutils dbus-x11 libsecret-tools
           rm -f $HOME/.local/share/keyrings/*
 
       - name: Setup Rust with cache
@@ -105,7 +104,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.8
+        uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-llvm-cov
 
@@ -294,7 +293,7 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.8
+        uses: taiki-e/install-action@v2.85.11
         with:
           tool: cargo-llvm-cov
 
@@ -433,7 +432,7 @@ jobs:
           save-cache: "false"
 
       - name: Install netcat
-        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
+        run: ./scripts/ci/apt-install.sh netcat-openbsd
 
       - name: Install dependencies
         run: |

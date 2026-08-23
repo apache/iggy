@@ -230,11 +230,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         // Reused across every pump iteration; pre-size to skip the
@@ -264,15 +261,16 @@ where
                 _ = stop.recv().fuse() => break,
                 () = consensus_tick.as_mut() => {
                     // Sharing the pump task is what keeps `tick_partitions`
-                    // borrow-safe, but it bounds the tick's worst-case delay to
-                    // one frame body's longest `.await` (replication append +
-                    // commit_journal fsync/rotate + reply).
+                    // borrow-safe, but it bounds the tick's worst-case delay
+                    // to one main frame body's longest `.await` (replication
+                    // append + commit_journal fsync/rotate + reply) plus the
+                    // one reply-lane bus send drained per main frame.
                     // TODO(hubcio): if a load test shows tick starvation,
                     // make `tick_partitions` borrow-free so the tick can be
                     // decoupled from the pump again without reintroducing the
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
-                    self.tick_partitions().await;
+                    self.tick_partitions(&mut namespace_scratch).await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -306,6 +304,32 @@ where
                                 // Tail drain catches reconcile ops whose marker was dropped.
                                 self.apply_reconcile_ops();
                             }
+                            // Guaranteed reply-lane service: `select_biased!`
+                            // polls the main lane first, so a saturated main
+                            // lane would otherwise starve the reply arm below
+                            // indefinitely. Taking at most ONE reply per main
+                            // frame makes the worst case a deterministic 1:1
+                            // interleave - replies keep flowing under a
+                            // consensus storm, and consensus keeps flowing
+                            // under a reply flood.
+                            if let Ok(reply) = self.reply_inbox.try_recv()
+                                && self.accept_frame_for_self(&reply)
+                            {
+                                self.process_frame(reply).await;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                frame = self.reply_inbox.recv().fuse() => {
+                    // Reached only while the main lane is quiet (biased order):
+                    // serve forwarded client replies without waiting for the
+                    // next main frame or tick.
+                    match frame {
+                        Ok(frame) => {
+                            if self.accept_frame_for_self(&frame) {
+                                self.process_frame(frame).await;
+                            }
                         }
                         Err(_) => break,
                     }
@@ -313,13 +337,20 @@ where
             }
         }
 
-        // Drain remaining frames so in-flight requests get a response.
+        // Drain remaining frames so in-flight requests get a response, and
+        // the reply lane so already-forwarded replies still reach their
+        // clients before the bus tears down.
         while let Ok(frame) = self.inbox.try_recv() {
             if self.accept_frame_for_self(&frame) {
                 self.process_frame(frame).await;
                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
                     .await;
                 self.apply_reconcile_ops();
+            }
+        }
+        while let Ok(frame) = self.reply_inbox.try_recv() {
+            if self.accept_frame_for_self(&frame) {
+                self.process_frame(frame).await;
             }
         }
 
@@ -367,11 +398,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         match frame {

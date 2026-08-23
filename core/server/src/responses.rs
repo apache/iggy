@@ -20,7 +20,7 @@
 //! Assemble `get_me` / `get_clients` / `get_stream(s)` / `get_topic(s)` /
 //! `get_user(s)` / `get_personal_access_tokens` / stats / cluster-metadata
 //! responses from per-shard session state and the metadata state machine, plus the
-//! [`NonReplicatedResponse`] dispatch shim and the partition-namespace
+//! `NonReplicatedResponse` dispatch shim and the partition-namespace
 //! resolvers.
 
 use crate::bootstrap::{ShellBus, ShellShard};
@@ -114,7 +114,7 @@ pub(crate) fn build_get_personal_access_tokens_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -151,7 +151,7 @@ pub(crate) fn build_get_me_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -225,7 +225,7 @@ pub(crate) fn connected_client_to_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -267,7 +267,7 @@ fn fence_group_offset<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -311,7 +311,7 @@ fn fence_and_resolve_offset_namespace<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -335,7 +335,7 @@ pub(crate) fn resolve_partition_request_namespace<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -402,7 +402,7 @@ fn resolve_send_messages_namespace<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -440,7 +440,7 @@ pub(crate) fn resolve_partition_namespace<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -506,7 +506,7 @@ pub(crate) fn build_non_replicated_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -607,7 +607,7 @@ fn build_consumer_group_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -632,7 +632,7 @@ fn build_consumer_groups_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -662,7 +662,7 @@ fn build_cluster_metadata_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -703,6 +703,51 @@ where
     }
 }
 
+/// `(streams, topics, partitions, segments, message bytes, messages)` for the
+/// whole node, from committed metadata plus the shared stats registry.
+///
+/// Segments are summed PER PARTITION through the same floor the detail
+/// responses apply (see [`partition_response`]), not from the stream's rolled-up
+/// counter: that counter only advances once a partition materialises, which
+/// trails its commit by a reconciler pass. Summing it made `[stats]` report
+/// fewer segments than `get_topic` did for the same partitions, and let the
+/// total climb between two reads with no write in between.
+fn aggregate_stats_totals(
+    streams: &metadata::stm::stream::StreamsInner,
+) -> Result<(u32, u32, u32, u32, u64, u64), IggyError> {
+    let mut topics_count = 0u32;
+    let mut partitions_count = 0u32;
+    let mut segments_count = 0u32;
+    let mut messages_size_bytes = 0u64;
+    let mut messages_count = 0u64;
+    for (_, stream) in &streams.items {
+        topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
+        messages_size_bytes =
+            messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
+        messages_count = messages_count.saturating_add(stream.stats.messages_count_inconsistent());
+        for (_, topic) in &stream.topics {
+            partitions_count =
+                partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
+            for partition in &topic.partitions {
+                segments_count = segments_count.saturating_add(partition_segments_count(
+                    streams,
+                    stream.id,
+                    topic.id,
+                    partition.id,
+                ));
+            }
+        }
+    }
+    Ok((
+        usize_to_u32(streams.items.len())?,
+        topics_count,
+        partitions_count,
+        segments_count,
+        messages_size_bytes,
+        messages_count,
+    ))
+}
+
 fn build_stats_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     clients_count: u32,
@@ -710,7 +755,7 @@ fn build_stats_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -726,36 +771,7 @@ where
         .metadata()
         .mux_stm
         .streams()
-        .read(|streams| -> Result<_, IggyError> {
-            let mut topics_count = 0u32;
-            let mut partitions_count = 0u32;
-            let mut segments_count = 0u32;
-            let mut messages_size_bytes = 0u64;
-            let mut messages_count = 0u64;
-            for (_, stream) in &streams.items {
-                topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
-                messages_size_bytes =
-                    messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
-                messages_count =
-                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                // Segment counts roll up from the partition plane through
-                // the shared stats registry (partition -> topic -> stream).
-                segments_count =
-                    segments_count.saturating_add(stream.stats.segments_count_inconsistent());
-                for (_, topic) in &stream.topics {
-                    partitions_count =
-                        partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
-                }
-            }
-            Ok((
-                usize_to_u32(streams.items.len())?,
-                topics_count,
-                partitions_count,
-                segments_count,
-                messages_size_bytes,
-                messages_count,
-            ))
-        })?;
+        .read(aggregate_stats_totals)?;
     let consumer_groups_count = usize_to_u32(
         shard
             .plane
@@ -910,7 +926,7 @@ fn build_get_stream_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -939,7 +955,7 @@ fn build_get_streams_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1090,7 +1106,7 @@ fn build_get_users_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1111,7 +1127,7 @@ fn build_get_user_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1155,7 +1171,7 @@ fn build_get_topic_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1192,7 +1208,7 @@ fn build_get_topics_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1225,7 +1241,7 @@ fn ensure_topic_exists<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1325,6 +1341,29 @@ fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeade
     })
 }
 
+/// Segments a committed partition reports before its storage exists.
+/// [`partition_response`] carries the reasoning.
+const MATERIALIZED_SEGMENTS_FLOOR: u32 = 1;
+
+/// Segments one committed partition reports. The single source for every
+/// client-facing segment count, so the `[stats]` total and the per-partition
+/// detail cannot disagree about the same partition.
+fn partition_segments_count(
+    streams: &metadata::stm::stream::StreamsInner,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> u32 {
+    streams
+        .stats_registry
+        .partition_get(stream_id, topic_id, partition_id)
+        .map_or(MATERIALIZED_SEGMENTS_FLOOR, |stats| {
+            stats
+                .segments_count_inconsistent()
+                .max(MATERIALIZED_SEGMENTS_FLOOR)
+        })
+}
+
 fn partition_response(
     streams: &metadata::stm::stream::StreamsInner,
     stream_id: usize,
@@ -1353,19 +1392,17 @@ fn partition_response(
     let stats = streams
         .stats_registry
         .partition_get(stream_id, topic_id, partition.id);
-    let (segments_count, current_offset, size_bytes, messages_count) =
-        stats.map_or((1, 0, 0, 0), |stats| {
-            (
-                stats.segments_count_inconsistent().max(1),
-                stats.current_offset(),
-                stats.size_bytes_inconsistent(),
-                stats.messages_count_inconsistent(),
-            )
-        });
+    let (current_offset, size_bytes, messages_count) = stats.map_or((0, 0, 0), |stats| {
+        (
+            stats.current_offset(),
+            stats.size_bytes_inconsistent(),
+            stats.messages_count_inconsistent(),
+        )
+    });
     Ok(PartitionResponse {
         id: usize_to_u32(partition.id)?,
         created_at: partition.created_at.as_micros(),
-        segments_count,
+        segments_count: partition_segments_count(streams, stream_id, topic_id, partition.id),
         current_offset,
         size_bytes,
         messages_count,
@@ -1603,7 +1640,7 @@ pub(crate) fn current_metadata_commit<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ,
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1855,6 +1892,65 @@ mod tests {
         assert_eq!(live.segments_count, 1);
         assert_eq!(live.messages_count, 7);
         assert_eq!(live.size_bytes, 64);
+    }
+
+    #[test]
+    fn stats_totals_count_every_committed_partition_before_it_materialises() {
+        use iggy_common::{StreamStats, TopicStats};
+        use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
+        use std::sync::atomic::AtomicUsize;
+
+        let created_at = IggyTimestamp::from(1u64);
+        let mut streams = StreamsInner::new();
+        let mut stream = Stream::new(Arc::from("stream"), created_at);
+        let topic_stats = Arc::new(TopicStats::new(stream.stats.clone()));
+        stream.topics.insert(Topic {
+            id: 0,
+            name: Arc::from("topic"),
+            created_at,
+            message_expiry: iggy_common::IggyExpiry::NeverExpire,
+            compression_algorithm: iggy_common::CompressionAlgorithm::None,
+            max_topic_size: iggy_common::MaxTopicSize::Unlimited,
+            options: iggy_common::ResourceOptions::default(),
+            stats: topic_stats.clone(),
+            partitions: vec![
+                Partition::new(0, 1, created_at, 0),
+                Partition::new(1, 1, created_at, 0),
+            ],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            consumer_groups: ahash::AHashMap::default(),
+            consumer_group_index: ahash::AHashMap::default(),
+            next_consumer_group_id: 0,
+        });
+        streams.items.insert(stream);
+
+        // Only partition 0 has materialised. Counting the stream's rolled-up
+        // counter reported 1 here, so a caller polling `[stats]` twice saw the
+        // total climb to 2 with no write in between (and `get_topic` already
+        // reported 2 for the same partitions).
+        let stats = streams.stats_registry.partition(0, 0, 0, topic_stats);
+        stats.increment_segments_count(1);
+
+        let (_, _, partitions, segments, _, _) =
+            aggregate_stats_totals(&streams).expect("totals aggregate");
+        assert_eq!(partitions, 2);
+        assert_eq!(
+            segments, 2,
+            "an unmaterialised partition must contribute the same floor the detail response reports"
+        );
+
+        // Materialising the second partition changes nothing: the total was
+        // already the steady-state answer.
+        let late = streams.stats_registry.partition(
+            0,
+            0,
+            1,
+            Arc::new(TopicStats::new(Arc::new(StreamStats::default()))),
+        );
+        late.increment_segments_count(1);
+        let (_, _, _, segments_after, _, _) =
+            aggregate_stats_totals(&streams).expect("totals aggregate");
+        assert_eq!(segments_after, 2);
     }
 
     #[test]

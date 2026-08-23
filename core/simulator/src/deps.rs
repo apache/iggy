@@ -168,7 +168,7 @@ impl Drop for JournalAccessGuard<'_> {
 }
 
 #[allow(clippy::future_not_send)]
-impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
+impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
     type HeaderRef<'a>
@@ -283,7 +283,6 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
 }
 
 impl JournalHandle for SimJournal<MemStorage> {
-    type Storage = MemStorage;
     type Target = Self;
 
     fn handle(&self) -> &Self::Target {
@@ -348,7 +347,7 @@ impl SimJournal<MemStorage> {
 
     /// Read the entry at `op` synchronously, for off-executor WAL replay at restart.
     /// Mirrors [`Journal::entry`] without the never-suspending `MemStorage` await, so
-    /// it needs no [`JournalAccessGuard`]: a synchronous read offers no suspension
+    /// it needs no `JournalAccessGuard`: a synchronous read offers no suspension
     /// point for another task to interleave on.
     ///
     /// # Panics
@@ -402,13 +401,13 @@ impl SimSuperblock {
     }
 
     /// Make every subsequent write fail, a persistent write fault, so the durability
-    /// gate withholds view-scoped sends. See [`Self::fail_writes`].
+    /// gate withholds view-scoped sends. See `Self::fail_writes`.
     pub fn set_fail_writes(&self) {
         self.fail_writes.set(true);
     }
 
     /// Make every subsequent write suspend once before completing, so tasks that
-    /// are ready at persist time interleave with it. See [`Self::yield_writes`].
+    /// are ready at persist time interleave with it. See `Self::yield_writes`.
     pub fn set_yield_writes(&self) {
         self.yield_writes.set(true);
     }

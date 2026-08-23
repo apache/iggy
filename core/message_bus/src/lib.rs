@@ -180,7 +180,7 @@ impl ReplicaOwnerTable {
     /// * `compare_exchange(OWNER_NONE -> shard_id)` wins. Common case.
     /// * The CAS fails because the slot already stores `shard_id`. A
     ///   same-shard reclaim during the post-loop clear window
-    ///   ([`IggyMessageBus::notify_connection_lost`]) is benign: the
+    ///   (`IggyMessageBus::notify_connection_lost`) is benign: the
     ///   slot already names us, and the stale post-loop will stand
     ///   down once it observes a live registry entry.
     ///
