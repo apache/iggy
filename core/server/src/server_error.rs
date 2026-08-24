@@ -296,8 +296,10 @@ pub enum PartitionRecoveryRefusal {
         previous_end: u64,
         next_start: u64,
     },
-    /// The index holds entries but no whole batch decodes where its last
-    /// entry points, so index and log describe different files.
+    /// The index holds entries but no whole batch decodes AND verifies where
+    /// its last entry points, so index and log describe different files. The
+    /// damage probe ran first: anything verifying past the anchor's damage
+    /// refuses as [`Self::InteriorDamage`] instead.
     IndexLogDivergence {
         start_offset: u64,
         end_offset: u64,
@@ -327,8 +329,10 @@ pub enum PartitionRecoveryRefusal {
         candidates_examined: u64,
         budget_units: u64,
     },
-    /// A batch does not continue the offset chain, so offsets are not
-    /// contiguous inside one segment file. The cause is not necessarily
+    /// A batch whose checksum verifies does not continue the offset chain,
+    /// so offsets are not contiguous inside one segment file. The verify is
+    /// what earns the refusal: an UNVERIFIED mismatch is damage and goes to
+    /// the probe (a torn tail truncates). The cause is not necessarily
     /// at-rest damage: a crash window that leaves the durable offset
     /// frontier past the recovered end offset stamps the same shape into
     /// byte-clean files.
@@ -336,6 +340,16 @@ pub enum PartitionRecoveryRefusal {
         start_offset: u64,
         expected_offset: u64,
         found_offset: u64,
+        position: u64,
+    },
+    /// A batch whose checksum verifies carries another partition's own
+    /// `partition_id` stamp: a real record that landed in the wrong file (a
+    /// misdirected write, a recycled block, an operator copy), not damage.
+    /// Adopting it would seed this partition's offset space from foreign
+    /// data; truncating it would destroy the only evidence of the misdirect.
+    ForeignBatch {
+        start_offset: u64,
+        batch_partition_id: u64,
         position: u64,
     },
     /// Index entries must ascend in offset and position (they are appended,
@@ -387,7 +401,8 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 f,
                 "segment {start_offset} has message/index divergence: the index ends \
                  at offset {end_offset}, byte {indexed_size_bytes}, where the \
-                 {messages_size_bytes}-byte log holds no whole batch"
+                 {messages_size_bytes}-byte log holds no batch that decodes and \
+                 verifies"
             ),
             Self::InteriorDamage {
                 start_offset,
@@ -420,9 +435,19 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 position,
             } => write!(
                 f,
-                "segment {start_offset} holds a batch at byte {position} whose \
-                 base offset {found_offset} does not continue the chain at \
+                "segment {start_offset} holds a verified batch at byte {position} \
+                 whose base offset {found_offset} does not continue the chain at \
                  {expected_offset}"
+            ),
+            Self::ForeignBatch {
+                start_offset,
+                batch_partition_id,
+                position,
+            } => write!(
+                f,
+                "segment {start_offset} holds a verified batch at byte {position} \
+                 stamped for partition {batch_partition_id}; a foreign record in \
+                 this log is preserved as evidence, not truncated"
             ),
             Self::IndexEntriesNotMonotone {
                 start_offset,

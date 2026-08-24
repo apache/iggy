@@ -320,9 +320,16 @@ pub async fn load_persisted_segments(
         stats.increment_segments_count(1);
         stats.increment_size_bytes(messages_size);
         if messages_size > 0 {
-            // Offsets in a segment are contiguous, so the message count is the
-            // inclusive span between the first (segment start) and last offset.
-            stats.increment_messages_count(plan.segment.end_offset - plan.segment.start_offset + 1);
+            // Offsets in a segment are contiguous (either walk refuses a
+            // discontinuity), so the message count is the inclusive span
+            // between the first (segment start) and last offset. Saturating:
+            // an end offset at u64::MAX must not wrap the counter.
+            stats.increment_messages_count(
+                plan.segment
+                    .end_offset
+                    .saturating_sub(plan.segment.start_offset)
+                    .saturating_add(1),
+            );
         }
 
         recovered.push(RecoveredSegment {
@@ -455,7 +462,9 @@ fn ensure_contiguous_chain(
                 }),
             );
         }
-        if next.start_offset != previous.end_offset + 1 {
+        // `checked_add`, not `+`: an end offset at u64::MAX must read as a
+        // hole (no start offset can follow it), not overflow.
+        if previous.end_offset.checked_add(1) != Some(next.start_offset) {
             return Err(identity.refusal(PartitionRecoveryRefusal::Hole {
                 previous_start: previous.start_offset,
                 previous_end: previous.end_offset,
@@ -970,12 +979,12 @@ async fn recover_segment_bounds(
             let mut expected_offset = last.offset;
             let mut walked_any = false;
             // TODO(hubcio): for batches that continue the chain exactly this
-            // indexed walk trusts the header decode alone (gap-opening
-            // batches checksum-verify below), so a torn flush that persisted
-            // the header page but zeroed the body is absorbed silently; the
-            // index-less walk below checksums every batch. Decide whether the
-            // indexed arm should checksum too (boot cost) or leave body rot
-            // to protocol-aware repair.
+            // indexed walk trusts the header decode alone (batches that
+            // contradict the walk checksum-verify below), so a torn flush
+            // that persisted the header page but zeroed the body is absorbed
+            // silently; the index-less walk below checksums every batch.
+            // Decide whether the indexed arm should checksum too (boot cost)
+            // or leave body rot to protocol-aware repair.
             while position < messages_size {
                 let header = match scanner.peek_header(position) {
                     Ok(Some(header)) => header,
@@ -988,24 +997,41 @@ async fn recover_segment_bounds(
                 if extent > messages_size {
                     break;
                 }
-                // The anchor entry names the offset its chunk starts at, and
-                // batches inside one segment are contiguous from there --
-                // except in one direction the server mints itself. Refuse
-                // only a REGRESSION: a lower offset re-adopted here regresses
-                // the partition's offset counter at bootstrap (re-minting
-                // already-served offsets on the next append) and one below
-                // the segment start underflows the recovered message count.
-                // A FORWARD gap can be ordinary boot output: a crash can
-                // persist the offset frontier ahead of the unsynced log, and
-                // the next boot then stamps `base_offset = frontier` into
-                // this same tail segment. But `base_offset` is covered by the
-                // batch checksum and an upward bit flip in an unverified
-                // header wears the same shape, so the gap-opening batch must
-                // checksum-verify before its offset is adopted (the legit
-                // frontier stamp is server-minted and checksums clean).
-                // Absorb a verified gap and keep serving; every offset
-                // adopted is one the primary durably promised.
-                if header.base_offset < expected_offset {
+                // A header contradicting the walk -- a foreign partition_id,
+                // or a base offset that does not continue the chain in
+                // EITHER direction -- is either damage wearing a decodable
+                // header or a real record that does not belong at this
+                // position. The batch checksum tells them apart, because it
+                // covers both fields and the server mints every legal record
+                // with it: a batch that fails it is damage, so break and let
+                // the probe below classify the residue (a bit flip in a tail
+                // batch then truncates like any torn tail, regardless of the
+                // flip's direction), while a batch that VERIFIES is durable
+                // evidence -- of a misdirected or copied write when the
+                // partition stamp is foreign, of duplicated or lost offsets
+                // when the chain breaks -- and both absorbing it and
+                // truncating it would hide that, so refuse and keep the
+                // bytes. Refusing the verified forward gap over absorbing it
+                // is deliberate: state transfer's own walk refuses any gap,
+                // so an absorbed one would mint a segment no peer can ever
+                // install, and the offsets it fabricates seed current_offset
+                // under an advance-only superblock persist.
+                let foreign_partition = header.partition_id != identity.partition_id as u64;
+                if foreign_partition || header.base_offset != expected_offset {
+                    let verifies = scanner
+                        .slice_at(position, header.total_size())
+                        .map_err(|source| scan_read_failure(identity, messages_path, &source))?
+                        .is_some_and(|batch| decode_batch_slice(batch).is_ok());
+                    if !verifies {
+                        break;
+                    }
+                    if foreign_partition {
+                        return Err(identity.refusal(PartitionRecoveryRefusal::ForeignBatch {
+                            start_offset,
+                            batch_partition_id: header.partition_id,
+                            position,
+                        }));
+                    }
                     return Err(
                         identity.refusal(PartitionRecoveryRefusal::OffsetDiscontinuity {
                             start_offset,
@@ -1013,30 +1039,6 @@ async fn recover_segment_bounds(
                             found_offset: header.base_offset,
                             position,
                         }),
-                    );
-                }
-                if header.base_offset > expected_offset {
-                    let verifies = scanner
-                        .slice_at(position, header.total_size())
-                        .map_err(|source| scan_read_failure(identity, messages_path, &source))?
-                        .is_some_and(|batch| decode_batch_slice(batch).is_ok());
-                    if !verifies {
-                        // Damage, not a frontier stamp: break and let the
-                        // probe below classify the residue (a torn tail
-                        // truncates, a verifying batch past it refuses).
-                        break;
-                    }
-                    warn!(
-                        stream_id = identity.stream_id,
-                        topic_id = identity.topic_id,
-                        partition_id = identity.partition_id,
-                        start_offset,
-                        expected_offset,
-                        found_offset = header.base_offset,
-                        position,
-                        "segment holds a forward offset gap in a byte-clean \
-                         chain; absorbing it (a restart most likely stamped \
-                         the restored offset frontier into this tail segment)"
                     );
                 }
                 if header.message_count > 0 {
@@ -1053,6 +1055,20 @@ async fn recover_segment_bounds(
                 }
             }
             if !walked_any {
+                // Probe before concluding: a verifying batch past the bytes
+                // that broke the walk at the anchor is a survivor, and
+                // refusing it as a divergence would claim the log holds
+                // nothing while durable data sits in it.
+                refuse_if_survivor_past_damage(
+                    identity,
+                    &mut scanner,
+                    messages_path,
+                    position,
+                    messages_size,
+                    Some(end_offset),
+                    start_offset,
+                )
+                .await?;
                 return Err(
                     identity.refusal(PartitionRecoveryRefusal::IndexLogDivergence {
                         start_offset,
@@ -1127,6 +1143,16 @@ async fn recover_segment_bounds(
                     .is_some_and(|batch| decode_batch_slice(batch).is_ok());
                 if !verifies {
                     break;
+                }
+                if header.partition_id != identity.partition_id as u64 {
+                    // Verified above, so this is a real record minted for
+                    // another partition (a misdirected write, an operator
+                    // copy), not damage: preserve it as evidence.
+                    return Err(identity.refusal(PartitionRecoveryRefusal::ForeignBatch {
+                        start_offset,
+                        batch_partition_id: header.partition_id,
+                        position,
+                    }));
                 }
                 if header.base_offset != expected_offset {
                     // A batch that VERIFIES but does not continue the chain is
@@ -1698,6 +1724,27 @@ mod tests {
         message_count: usize,
         payload: &Bytes,
     ) -> Vec<u8> {
+        encoded_batch_stamped(base_offset, message_count, payload, PARTITION_ID as u64)
+    }
+
+    /// Like [`encoded_batch`], but stamped with an arbitrary `partition_id`
+    /// and re-checksummed, so a foreign record verifies while contradicting
+    /// the identity of the partition being recovered.
+    fn encoded_foreign_batch(base_offset: u64, message_count: usize, partition_id: u64) -> Vec<u8> {
+        encoded_batch_stamped(
+            base_offset,
+            message_count,
+            &Bytes::from_static(b"segment-recovery-fixture"),
+            partition_id,
+        )
+    }
+
+    fn encoded_batch_stamped(
+        base_offset: u64,
+        message_count: usize,
+        payload: &Bytes,
+        partition_id: u64,
+    ) -> Vec<u8> {
         let mut messages = IggyMessages::with_capacity(message_count);
         for _ in 0..message_count {
             messages.push(IggyMessage {
@@ -1712,6 +1759,7 @@ mod tests {
         let namespace = IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID);
         let SendMessagesOwned { mut header, blob } =
             SendMessagesOwned::from_messages(namespace, &messages).expect("encode fixture batch");
+        header.partition_id = partition_id;
         header.base_offset = base_offset;
         header.base_timestamp = FIXTURE_TIMESTAMP;
         header.batch_checksum = calculate_batch_checksum(&header, &blob);
@@ -2478,53 +2526,64 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_indexed_forward_offset_gap_when_recovering_should_absorb_and_serve() {
+    async fn given_indexed_forward_offset_gap_when_recovering_should_refuse() {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        // The shape the server's own boot path mints: a crash persists the
-        // offset frontier ahead of the unsynced log, and the next boot
-        // appends `base_offset = frontier` into the existing tail segment.
-        // Byte-clean, fully decodable, index intact -- must serve, not
-        // refuse.
+        // A verified batch opening a forward gap is durable data whose
+        // offsets this chain never promised: absorbing it would inflate the
+        // recovered message count and mint a segment state transfer can
+        // never install, so recovery refuses and keeps every byte.
         let mut log = encoded_batch(0, 2);
         log.extend_from_slice(&encoded_batch(5, 1));
         let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
 
-        let recovered = recover(&config)
+        let error = recover(&config)
             .await
-            .expect("a forward offset gap in a byte-clean indexed chain must recover");
+            .err()
+            .expect("a verified forward offset gap in an indexed chain must refuse recovery");
 
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].segment.end_offset, 5);
-        assert_eq!(
-            bytes_of(&messages_path),
-            log,
-            "absorbing the gap must leave the log byte-identical"
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::OffsetDiscontinuity {
+                        expected_offset: 2,
+                        found_offset: 5,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected an offset-discontinuity refusal, got {error:?}"
         );
+        assert_eq!(bytes_of(&messages_path), log);
         assert_eq!(bytes_of(&index_path), index_entry(0, 0));
     }
 
+    // `base_offset` sits at header bytes 8..16, so flips inside that range
+    // leave the per-message checksums clean and trip the BATCH checksum on
+    // the offset field specifically -- pinning that `base_offset` is hashed.
+    const HEADER_BASE_OFFSET_OFFSET: usize = 8;
+
     #[compio::test]
-    async fn given_indexed_forward_gap_with_failing_checksum_when_recovering_should_truncate_at_break()
-     {
+    async fn given_bit_flipped_base_offset_upward_when_recovering_should_truncate_at_break() {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        // Wears the frontier-stamp shape (header decodes, base_offset ahead
-        // of the chain) but fails the batch checksum: a real frontier stamp
-        // is server-minted and checksums clean, so this is damage and must
-        // never be adopted as the new offset frontier.
+        // An upward flip wears the forward-gap shape (header decodes,
+        // base_offset ahead of the chain) but fails the batch checksum:
+        // damage, not data, so the walk breaks and the tail truncates.
         let mut log = encoded_batch(0, 2);
         let valid_len = log.len() as u64;
-        let mut corrupt = encoded_batch(5, 1);
-        corrupt[COMMAND_HEADER_SIZE + 4] ^= 0xFF;
+        let mut corrupt = encoded_batch(2, 1);
+        corrupt[HEADER_BASE_OFFSET_OFFSET] ^= 0x04;
         log.extend_from_slice(&corrupt);
         let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
 
         let recovered = recover(&config)
             .await
-            .expect("a failing gap batch with nothing verifying past it must truncate");
+            .expect("an unverified gap batch with nothing verifying past it must truncate");
 
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].segment.end_offset, 1);
@@ -2537,8 +2596,37 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_indexed_forward_gap_with_failing_checksum_before_valid_batch_when_recovering_should_refuse()
-     {
+    async fn given_bit_flipped_base_offset_downward_when_recovering_should_truncate_at_break() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The same flip downward wears the regression shape. It must earn
+        // the same verdict as the upward one -- verify fails, walk breaks,
+        // tail truncates -- rather than a permanent refusal: one bit must
+        // not get opposite verdicts by direction.
+        let mut log = encoded_batch(0, 2);
+        let valid_len = log.len() as u64;
+        let mut corrupt = encoded_batch(2, 1);
+        corrupt[HEADER_BASE_OFFSET_OFFSET] ^= 0x02;
+        log.extend_from_slice(&corrupt);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index_entry(0, 0));
+
+        let recovered = recover(&config)
+            .await
+            .expect("an unverified regressing batch with nothing verifying past it must truncate");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 1);
+        assert_eq!(
+            len_of(&messages_path),
+            valid_len,
+            "the unverified regressing batch must be gone from disk"
+        );
+        assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+    }
+
+    #[compio::test]
+    async fn given_bit_flipped_base_offset_before_valid_batch_when_recovering_should_refuse() {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
@@ -2546,8 +2634,8 @@ mod tests {
         // truncating there would erase it, so recovery must refuse and keep
         // every byte.
         let mut log = encoded_batch(0, 2);
-        let mut corrupt = encoded_batch(5, 1);
-        corrupt[COMMAND_HEADER_SIZE + 4] ^= 0xFF;
+        let mut corrupt = encoded_batch(2, 1);
+        corrupt[HEADER_BASE_OFFSET_OFFSET] ^= 0x04;
         log.extend_from_slice(&corrupt);
         log.extend_from_slice(&encoded_batch(6, 1));
         let index = index_entry(0, 0);
@@ -2570,6 +2658,141 @@ mod tests {
         );
         assert_eq!(bytes_of(&messages_path), log);
         assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_failing_gap_batch_at_index_anchor_when_recovering_should_probe_for_survivors() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The failing gap batch is the FIRST thing past the last index
+        // entry, so the walk breaks with nothing walked. The probe must
+        // still run: a verifying batch past the damage is a survivor and
+        // refuses as interior damage, not as a divergence claiming the log
+        // holds nothing.
+        let mut corrupt = encoded_batch(5, 1);
+        corrupt[HEADER_BASE_OFFSET_OFFSET] ^= 0x04;
+        let mut log = corrupt;
+        log.extend_from_slice(&encoded_batch(6, 1));
+        let index = index_entry(0, 0);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("a survivor past the anchor's failing batch must refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::InteriorDamage { .. },
+                    ..
+                }
+            ),
+            "expected an interior-damage refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_failing_gap_batch_at_index_anchor_with_no_survivor_when_recovering_should_refuse_divergence()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // Same anchor shape with nothing verifying past it: the index claims
+        // a batch where none decodes and verifies, which is the divergence
+        // verdict -- non-destructive, bytes preserved.
+        let mut log = encoded_batch(5, 1);
+        log[HEADER_BASE_OFFSET_OFFSET] ^= 0x04;
+        let index = index_entry(0, 0);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("an anchor batch that fails its checksum must refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::IndexLogDivergence { .. },
+                    ..
+                }
+            ),
+            "expected an index-log divergence refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_foreign_partition_batch_when_recovering_indexed_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // A verified batch stamped for partition 7 that continues the chain
+        // EXACTLY: only the partition_id comparison can catch it, and
+        // adopting it would serve foreign data under this partition's
+        // offsets.
+        let mut log = encoded_batch(0, 2);
+        log.extend_from_slice(&encoded_foreign_batch(2, 1, 7));
+        let index = index_entry(0, 0);
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("a verified foreign batch in an indexed chain must refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::ForeignBatch {
+                        batch_partition_id: 7,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected a foreign-batch refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_foreign_partition_batch_when_recovering_index_less_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let mut log = encoded_batch(0, 2);
+        log.extend_from_slice(&encoded_foreign_batch(2, 1, 7));
+        let (messages_path, _index_path) = write_segment(&config, 0, &log, &GARBAGE[..10]);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("a verified foreign batch in an index-less chain must refuse recovery");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::ForeignBatch {
+                        batch_partition_id: 7,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected a foreign-batch refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
     }
 
     #[compio::test]
