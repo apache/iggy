@@ -169,13 +169,15 @@ pub enum ServerError {
     // failures (stat, open, read, truncate, fsync) stay node-fatal on purpose:
     // a retried boot can still serve that partition, while fencing it would
     // quarantine healthy data.
+    //
+    // The Display text deliberately claims nothing about what happens to the
+    // refused files: disposition (quarantine into `.fenced.N` vs tombstone
+    // with files left in place) is decided by the `bootstrap.rs` arms that
+    // catch this error, and only they log it -- a claim here would render
+    // beside theirs and contradict one branch or the other.
     #[error(
         "partition {stream_id}/{topic_id}/{partition_id} at {dir} refused segment \
-         recovery: {reason}. Boot moves the partition's segment files into a \
-         sibling `<partition dir>.fenced.N` directory and keeps them; with peer \
-         replicas the partition is rebuilt empty and refilled by state transfer, \
-         while with replica_count = 1 (or when the quarantine itself fails) it \
-         is tombstoned and not served"
+         recovery: {reason}"
     )]
     PartitionRecoveryRefused {
         dir: PathBuf,

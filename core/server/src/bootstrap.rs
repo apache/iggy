@@ -1968,11 +1968,15 @@ async fn build_shard_for_thread(
                     // unless the length diverges again, accepts the chain
                     // instead of re-tombstoning -- acceptable for an
                     // assertion that the filesystem lied about a length.
+                    // `%reason` repeated on purpose: this is the line an
+                    // operator greps to enumerate dark partitions, so it has
+                    // to carry the verdict on its own.
                     error!(
                         stream_id,
                         topic_id,
                         partition_id = partition_metadata.id,
                         partition_dir,
+                        %reason,
                         "no peer replica holds this partition's data; leaving the refused \
                          segment files in place and tombstoning it instead of serving it \
                          empty"
