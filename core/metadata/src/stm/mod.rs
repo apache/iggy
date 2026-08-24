@@ -88,7 +88,7 @@ pub trait Command {
 /// Per-command handler for a given state type.
 ///
 /// Each command implements it for the state it mutates, returning an
-/// `ApplyReply`: a `code` (0 = success) plus the typed reply `body` to thread
+/// [`ApplyReply`](result::ApplyReply): a `code` (0 = success) plus the typed reply `body` to thread
 /// into the Reply message.
 ///
 /// Apply MUST be deterministic across replicas: both left/right buffers recompute

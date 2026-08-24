@@ -36,3 +36,6 @@ serde_with = { workspace = true }
 server_common = { workspace = true }
 static-toml = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

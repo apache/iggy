@@ -18,7 +18,7 @@
 //! Network abstraction layer for the cluster simulator.
 //!
 //! **Note:** Currently a thin passthrough over `PacketSimulator`. Once the
-//! Cluster and `MessageBus` layers are built, this will own
+//! Cluster and [`MessageBus`](message_bus::MessageBus) layers are built, this will own
 //! process-to-bus routing, and node enable/disable logic.
 
 use crate::packet::{

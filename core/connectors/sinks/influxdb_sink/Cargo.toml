@@ -50,3 +50,6 @@ tracing = { workspace = true }
 axum = { workspace = true }
 simd-json = { workspace = true }
 toml = { workspace = true }
+
+[lints]
+workspace = true

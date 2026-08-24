@@ -61,6 +61,11 @@ impl FileStorage {
     ///
     /// # Errors
     /// Returns an I/O error if truncation fails.
+    // TODO(hubcio): compio `set_len` submits IORING_OP_FTRUNCATE, which kernels
+    // below 6.9 do not support; the driver then falls back to its blocking
+    // pool, and shard proactors run with `thread_pool_limit(0)`, so the torn
+    // WAL repair panics the shard on such kernels instead of repairing. Use a
+    // synchronous `std::fs` truncate here (boot-time path) or gate on a probe.
     pub async fn truncate(&self, len: u64) -> io::Result<()> {
         let file = unsafe { &*self.file.get() };
         file.set_len(len).await?;

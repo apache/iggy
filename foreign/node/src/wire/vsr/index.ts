@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { createRequire } from 'node:module';
 import type { CommandResponse } from '../../client/client.type.js';
