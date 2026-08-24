@@ -373,6 +373,10 @@ impl Simulator {
     /// # Panics
     /// Panics if a replica's shard count does not fit `u32` (impossible:
     /// mesh construction caps it at `u16`).
+    // TODO(hubcio): partitions created down this path are built via
+    // `IggyPartition::with_in_memory_storage` and rely on the writer-less
+    // persist branch in `IggyPartition`; give them first-class in-memory
+    // segment storage so that branch can be deleted.
     #[allow(clippy::cast_possible_truncation)]
     pub fn init_partition(&mut self, namespace: IggyNamespace) {
         for (i, replica) in self.replicas.iter().enumerate() {
