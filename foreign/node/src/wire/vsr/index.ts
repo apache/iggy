@@ -20,11 +20,7 @@ import type { CommandResponse } from '../../client/client.type.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { responseError } from '../error.utils.js';
 import { HEADER_SIZE, encodeRequestHeader } from './header.js';
-import {
-  Operation,
-  isPartition,
-  operationForCode,
-} from './operation.js';
+import { Operation, operationForCode } from './operation.js';
 import {
   deserializeLoginRegister,
   serializeLoginRegister,
