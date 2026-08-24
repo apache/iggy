@@ -18,6 +18,7 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::StreamClient;
+use iggy_common::StreamUpdateOptions;
 use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
 
 #[async_trait]
@@ -52,13 +53,20 @@ impl StreamClient for ClientWrapper {
         }
     }
 
-    async fn update_stream(&self, stream_id: &Identifier, name: &str) -> Result<(), IggyError> {
+    async fn update_stream(
+        &self,
+        stream_id: &Identifier,
+        name: &str,
+        options: &StreamUpdateOptions,
+    ) -> Result<(), IggyError> {
         match self {
-            ClientWrapper::Iggy(client) => client.update_stream(stream_id, name).await,
-            ClientWrapper::Http(client) => client.update_stream(stream_id, name).await,
-            ClientWrapper::Tcp(client) => client.update_stream(stream_id, name).await,
-            ClientWrapper::Quic(client) => client.update_stream(stream_id, name).await,
-            ClientWrapper::WebSocket(client) => client.update_stream(stream_id, name).await,
+            ClientWrapper::Iggy(client) => client.update_stream(stream_id, name, options).await,
+            ClientWrapper::Http(client) => client.update_stream(stream_id, name, options).await,
+            ClientWrapper::Tcp(client) => client.update_stream(stream_id, name, options).await,
+            ClientWrapper::Quic(client) => client.update_stream(stream_id, name, options).await,
+            ClientWrapper::WebSocket(client) => {
+                client.update_stream(stream_id, name, options).await
+            }
         }
     }
 

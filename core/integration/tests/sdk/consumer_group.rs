@@ -30,7 +30,15 @@ const CONSUMER_USERNAME: &str = "consumer-group-rejoin-user";
 const CONSUMER_PASSWORD: &str = "password123";
 const CONSUMER_REJOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
+// Pins a 60s server heartbeat because harness clients never ping on their own:
+// the SDK pinger is spawned by `IggyClient::connect`, which the harness builder
+// does not call. At the shipped 30s interval an idle group member is reaped by
+// the server's verifier, and the failure surfaces as a short member count
+// instead of anything about the scenario under test.
+#[iggy_harness(
+    test_client_transport = [Tcp, WebSocket, Quic],
+    server(heartbeat.enabled = true, heartbeat.interval = "60s")
+)]
 async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
     let root_client = harness
         .root_client()
@@ -53,11 +61,11 @@ async fn consumer_group_retries_rejoin_after_failure(harness: &TestHarness) {
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

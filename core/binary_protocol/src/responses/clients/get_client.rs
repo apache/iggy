@@ -57,7 +57,7 @@ impl WireDecode for ClientDetailsResponse {
         let (client, mut pos) = ClientResponse::decode(buf)?;
         let count = client.consumer_groups_count as usize;
         let remaining = buf.len().saturating_sub(pos);
-        let mut consumer_groups = Vec::with_capacity(crate::codec::capped_capacity(
+        let mut consumer_groups = Vec::with_capacity(crate::codec::bounded_capacity(
             count,
             remaining,
             ConsumerGroupInfoResponse::SIZE,

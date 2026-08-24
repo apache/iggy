@@ -24,7 +24,6 @@ mod message_header;
 mod message_header_view;
 mod message_header_view_mut;
 mod message_view;
-mod message_view_mut;
 mod messages_batch;
 pub mod partitioning;
 pub mod partitioning_kind;
@@ -37,7 +36,9 @@ mod user_headers;
 pub const INDEX_SIZE: usize = 16;
 
 pub use crate::http::messages::poll_messages::PollMessages;
-pub use crate::http::messages::send_messages::SendMessages;
+pub use crate::http::messages::send_messages::{
+    SendMessages, SendMessagesConfirmation, SendMessagesConfirmations,
+};
 pub use iggy_message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
 pub use index::IggyIndex;
 pub use index_view::IggyIndexView;
@@ -53,7 +54,6 @@ pub use message_header::{
 pub use message_header_view::IggyMessageHeaderView;
 pub use message_header_view_mut::IggyMessageHeaderViewMut;
 pub use message_view::{IggyMessageView, IggyMessageViewIterator};
-pub use message_view_mut::{IggyMessageViewMut, IggyMessageViewMutIterator};
 pub use messages_batch::IggyMessagesBatch;
 pub use partitioning::Partitioning;
 pub use partitioning_kind::PartitioningKind;

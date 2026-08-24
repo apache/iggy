@@ -15,45 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! [`Validatable`] for [`ServerConfig`].
+//!
+//! Delegates section by section, including
+//! [`super::message_bus::MessageBusConfig::validate`], then applies the
+//! cross-section invariants: JWT gating when HTTP is enabled and
+//! server-default expiry sanity.
+
 use super::COMPONENT;
-use super::cluster::ClusterConfig;
-use super::server::{
-    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, TelemetryConfig,
-};
-use super::server::{MemoryPoolConfig, PersonalAccessTokenConfig, ServerConfig};
-use super::sharding::{CpuAllocation, ShardingConfig};
-use super::system::SegmentConfig;
-use super::system::{CompressionConfig, LoggingConfig, PartitionConfig};
+use super::cluster::STATE_CHUNK_HEADER_LEN;
+use super::partition::{CONCURRENT_SERVED_SEGMENTS, SEGMENT_SIZE_OVERSHOOT_BYTES};
+use super::server::ServerConfig;
 use crate::ConfigurationError;
-use cpu_allocation::allowed_cpus;
+use crate::common::http::HMAC_JWT_ALGORITHMS;
+use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use err_trail::ErrContext;
-use iggy_common::CompressionAlgorithm;
-use iggy_common::IggyExpiry;
-use iggy_common::MaxTopicSize;
-use iggy_common::Validatable;
-use std::thread::available_parallelism;
-use tracing::warn;
+use iggy_common::{IggyExpiry, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
 
-/// 1 GiB max segment size. Canonical definition; re-exported by core/server streaming.
-pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// Return `Err(reason)` when `alloc` would yield a host-dependent shard
-/// count, disqualifying it for cluster mode where every node must derive
-/// the same count from its byte-identical config.
-///
-/// Deterministic variants (`Count(n)`, `Range(s, e)`, explicit
-/// `NumaAware`) return `Ok`.
-fn host_dependent_cpu_allocation(alloc: &CpuAllocation) -> Result<(), &'static str> {
-    match alloc {
-        CpuAllocation::All => Err("'all' (follows host CPU count)"),
-        CpuAllocation::NumaAware(numa) if numa.nodes.is_empty() && numa.cores_per_node == 0 => {
-            Err("'numa:auto' (follows host NUMA topology)")
-        }
-        CpuAllocation::Count(_) | CpuAllocation::Range(_, _) | CpuAllocation::NumaAware(_) => {
-            Ok(())
-        }
-    }
-}
+/// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
+/// evaluate the `max_write_buffer_size > write_buffer_size` invariant
+/// when the operator leaves `write_buffer_size` unset; keep in sync
+/// with the defaults documented in the shipped config.toml.
+const WS_DEFAULT_WRITE_BUFFER_SIZE: u64 = 128 * 1024;
 
 impl Validatable<ConfigurationError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
@@ -81,12 +64,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate segment config")
             })?;
-        self.system
-            .compression
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate compression config")
-            })?;
         self.telemetry.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate telemetry config")
         })?;
@@ -99,49 +76,18 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.cluster.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate cluster config")
         })?;
-
-        // Cluster consensus routing (`calculate_shard_from_consensus_ns`)
-        // hashes namespaces modulo the local shard count. Every node must
-        // agree on that count or control-plane messages (StartViewChange,
-        // DoViewChange, StartView, Commit) route to different shards on
-        // different nodes, splitting the view-change quorum.
-        //
-        // Because `cluster.nodes` is byte-identical across every host, the
-        // only way shard counts can drift is if `system.sharding.cpu_allocation`
-        // depends on host topology. We can't prove divergence from a single
-        // node at load time (peers may be homogeneous), so this is a warning
-        // rather than a hard error; operators running heterogeneous hardware
-        // must pin a deterministic value themselves.
-        if self.cluster.enabled
-            && let Err(reason) = host_dependent_cpu_allocation(&self.system.sharding.cpu_allocation)
-        {
-            warn!(
-                "cluster.enabled = true with host-dependent system.sharding.cpu_allocation ({reason}); \
-                 if peers resolve this to different shard counts, view-change quorum will split. \
-                 Pin a deterministic value (count, explicit range, or explicit numa) on heterogeneous hardware."
-            );
-        }
-
+        self.metadata.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate metadata config")
+        })?;
+        self.partition.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate partition config")
+        })?;
         self.system
             .logging
             .validate()
             .error(|e: &ConfigurationError| {
                 format!("{COMPONENT} (error: {e}) - failed to validate logging config")
             })?;
-
-        let topic_size = match self.system.topic.max_size {
-            MaxTopicSize::Custom(size) => Ok(size.as_bytes_u64()),
-            MaxTopicSize::Unlimited => Ok(u64::MAX),
-            MaxTopicSize::ServerDefault => {
-                eprintln!("system.topic.max_size cannot be ServerDefault in server config");
-                Err(ConfigurationError::InvalidConfigurationValue)
-            }
-        }?;
-
-        if let IggyExpiry::ServerDefault = self.system.topic.message_expiry {
-            eprintln!("system.topic.message_expiry cannot be ServerDefault in server config");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
 
         if self.http.enabled
             && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
@@ -150,396 +96,53 @@ impl Validatable<ConfigurationError> for ServerConfig {
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        if topic_size < self.system.segment.size.as_bytes_u64() {
+        // The signing key is always HMAC (built from a shared secret; there is
+        // no PEM loading path), and jsonwebtoken refuses a header algorithm
+        // whose family does not match the key. An asymmetric algorithm builds
+        // the manager fine and then fails every login at token generation, so
+        // the server would serve HTTP that nobody can authenticate against.
+        if self.http.enabled && self.http.jwt.get_algorithm().is_err() {
+            let supported = HMAC_JWT_ALGORITHMS.map(|(name, _)| name).join(", ");
             eprintln!(
-                "system.topic.max_size ({} B) must be >= system.segment.size ({} B)",
-                topic_size,
-                self.system.segment.size.as_bytes_u64()
+                "http.jwt.algorithm '{}' is not supported: the server signs with a shared \
+                 secret, so only {supported} can be used. This field governs self-issued \
+                 tokens only; [[http.jwt.trusted_issuers]] is unaffected, because an issuer's \
+                 token is verified with the algorithm named in its own header and the matching \
+                 JWKS key, never with this field",
+                self.http.jwt.algorithm
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for CompressionConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        let compression_alg = &self.default_algorithm;
-        if *compression_alg != CompressionAlgorithm::None {
-            // TODO(numinex): Change this message once server side compression is fully developed.
-            warn!(
-                "Server started with server-side compression enabled, using algorithm: {compression_alg}, this feature is not implemented yet!"
-            );
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for TelemetryConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        if self.service_name.trim().is_empty() {
-            eprintln!("telemetry.service_name cannot be empty when telemetry is enabled");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.logs.endpoint.is_empty() {
-            eprintln!("telemetry.logs.endpoint cannot be empty when telemetry is enabled");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.traces.endpoint.is_empty() {
-            eprintln!("telemetry.traces.endpoint cannot be empty when telemetry is enabled");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for PartitionConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.messages_required_to_save == 0 {
-            eprintln!("Configured system.partition.messages_required_to_save cannot be 0");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for SegmentConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.size > SEGMENT_MAX_SIZE_BYTES {
-            eprintln!(
-                "Configured system.segment.size {} B is greater than maximum {} B",
-                self.size.as_bytes_u64(),
-                SEGMENT_MAX_SIZE_BYTES
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if !self.size.as_bytes_u64().is_multiple_of(512) {
-            eprintln!(
-                "Configured system.segment.size {} B is not a multiple of 512 B",
-                self.size.as_bytes_u64()
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for MessageSaverConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.enabled && self.interval.is_zero() {
-            eprintln!("message_saver.interval cannot be zero when message_saver is enabled");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for DataMaintenanceConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        self.messages.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate messages maintenance config")
-        })?;
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for MessagesMaintenanceConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.cleaner_enabled && self.interval.is_zero() {
-            eprintln!("data_maintenance.messages.interval cannot be zero when cleaner is enabled");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for PersonalAccessTokenConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.max_tokens_per_user == 0 {
-            eprintln!("personal_access_token.max_tokens_per_user cannot be 0");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.cleaner.enabled && self.cleaner.interval.is_zero() {
-            eprintln!(
-                "personal_access_token.cleaner.interval cannot be zero when cleaner is enabled"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for LoggingConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.level.is_empty() {
-            eprintln!("system.logging.level is supposed be configured");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.retention.as_secs() < 1 {
-            eprintln!(
-                "Configured system.logging.retention {} is less than minimum 1 second",
-                self.retention
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.rotation_check_interval.as_secs() < 1 {
-            eprintln!(
-                "Configured system.logging.rotation_check_interval {} is less than minimum 1 second",
-                self.rotation_check_interval
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        let max_total_size_unlimited = self.max_total_size.as_bytes_u64() == 0;
-        if !max_total_size_unlimited
-            && self.max_file_size.as_bytes_u64() > self.max_total_size.as_bytes_u64()
+        if self.http.enabled
+            && self.http.tls.enabled
+            && (self.http.tls.cert_file.is_empty() || self.http.tls.key_file.is_empty())
         {
             eprintln!(
-                "Configured system.logging.max_total_size {} is less than system.logging.max_file_size {}",
-                self.max_total_size, self.max_file_size
+                "http.tls.enabled=true requires non-empty http.tls.cert_file and http.tls.key_file"
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for MemoryPoolConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if self.enabled && self.size == 0 {
-            eprintln!(
-                "Configured system.memory_pool.enabled is true and system.memory_pool.size is 0"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        const MIN_POOL_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
-        const MIN_BUCKET_CAPACITY: u32 = 128;
-        const DEFAULT_PAGE_SIZE: u64 = 4096;
-
-        if self.enabled && self.size < MIN_POOL_SIZE {
-            eprintln!(
-                "Configured system.memory_pool.size {} B ({} MiB) is less than minimum {} B, ({} MiB)",
-                self.size.as_bytes_u64(),
-                self.size.as_bytes_u64() / (1024 * 1024),
-                MIN_POOL_SIZE,
-                MIN_POOL_SIZE / (1024 * 1024),
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.enabled && !self.size.as_bytes_u64().is_multiple_of(DEFAULT_PAGE_SIZE) {
-            eprintln!(
-                "Configured system.memory_pool.size {} B is not a multiple of default page size {} B",
-                self.size.as_bytes_u64(),
-                DEFAULT_PAGE_SIZE
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.enabled && self.bucket_capacity < MIN_BUCKET_CAPACITY {
-            eprintln!(
-                "Configured system.memory_pool.buffers {} is less than minimum {}",
-                self.bucket_capacity, MIN_BUCKET_CAPACITY
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.enabled && !self.bucket_capacity.is_power_of_two() {
-            eprintln!(
-                "Configured system.memory_pool.buffers {} is not a power of 2",
-                self.bucket_capacity
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        Ok(())
-    }
-}
-
-/// Validate a [`CpuAllocation`] against the machine's available parallelism
-/// and, when pinning, the process affinity mask. Shared by the legacy and
-/// server-ng sharding configs, which both carry these two knobs.
-pub(crate) fn validate_cpu_allocation(
-    cpu_allocation: &CpuAllocation,
-    pin_cores: bool,
-) -> Result<(), ConfigurationError> {
-    let available_cpus = available_parallelism()
-        .map_err(|_| {
-            eprintln!("Failed to detect available CPU cores");
-            ConfigurationError::InvalidConfigurationValue
-        })?
-        .get();
-
-    match cpu_allocation {
-        CpuAllocation::All => Ok(()),
-        CpuAllocation::Count(count) => {
-            if *count == 0 {
-                eprintln!("Invalid sharding configuration: cpu_allocation count cannot be 0");
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-            if *count > available_cpus {
-                eprintln!(
-                    "Invalid sharding configuration: cpu_allocation count {count} exceeds available CPU cores {available_cpus}"
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-            Ok(())
-        }
-        CpuAllocation::Range(start, end) => {
-            if start >= end {
-                eprintln!(
-                    "Invalid sharding configuration: cpu_allocation range {start}..{end} is invalid (start must be less than end)"
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-            if *end - *start > available_cpus {
-                eprintln!(
-                    "Invalid sharding configuration: cpu_allocation range {start}..{end} yields {} shards, exceeding available CPU cores {available_cpus}",
-                    *end - *start
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-            if !pin_cores {
-                return Ok(());
-            }
-            let allowed = allowed_cpus();
-            if let Some(cpu) = (*start..*end).find(|cpu| !allowed.contains(cpu)) {
-                eprintln!(
-                    "Invalid sharding configuration: cpu_allocation range {start}..{end} includes CPU {cpu}, which is outside the set of cores allowed for this process (affinity/cpuset mask)"
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-            Ok(())
-        }
-        // NUMA topology validation requires hwlocality (runtime dep).
-        // Full NUMA validation happens in shard_allocator at startup.
-        CpuAllocation::NumaAware(_) => Ok(()),
-    }
-}
-
-impl Validatable<ConfigurationError> for ShardingConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        validate_cpu_allocation(&self.cpu_allocation, self.pin_cores)
-    }
-}
-
-/// Length floor for the replica-auth PSK, in raw bytes. The 32-byte MAC key
-/// is KDF-derived from these bytes at use-site, so any encoding clearing this
-/// length is accepted.
-const MIN_SHARED_SECRET_LEN: usize = 32;
-
-impl Validatable<ConfigurationError> for ClusterConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        if self.name.trim().is_empty() {
-            eprintln!("Invalid cluster configuration: cluster name cannot be empty");
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        if self.nodes.is_empty() {
-            eprintln!(
-                "Invalid cluster configuration: cluster.nodes must contain at least one entry when cluster is enabled"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-
-        // VSR needs every replica to have a stable, unique id strictly
-        // less than the total replica count. Duplicate ids would split the
-        // cluster into two replicas claiming the same slot; out-of-range
-        // ids never win a primary election. Both are unrecoverable at
-        // runtime - fail fast at startup.
-        let total_replicas = u8::try_from(self.nodes.len()).map_err(|_| {
-            eprintln!("Invalid cluster configuration: more than 255 replicas is unsupported");
-            ConfigurationError::InvalidConfigurationValue
-        })?;
-
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut seen_names = std::collections::HashSet::new();
-        let mut used_endpoints = std::collections::HashSet::new();
-
-        for node in &self.nodes {
-            if node.name.trim().is_empty() {
-                eprintln!("Invalid cluster configuration: node name cannot be empty");
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-
-            if node.ip.trim().is_empty() {
-                eprintln!(
-                    "Invalid cluster configuration: IP cannot be empty for node '{}'",
-                    node.name
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-
-            if !seen_names.insert(node.name.clone()) {
-                eprintln!(
-                    "Invalid cluster configuration: duplicate node name '{}' found",
-                    node.name
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-
-            if node.replica_id >= total_replicas {
-                eprintln!(
-                    "Invalid cluster configuration: replica_id {} for node '{}' must be < total replica count {total_replicas}",
-                    node.replica_id, node.name
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-
-            if !seen_ids.insert(node.replica_id) {
-                eprintln!(
-                    "Invalid cluster configuration: duplicate replica_id {} (two nodes claim the same slot)",
-                    node.replica_id
-                );
-                return Err(ConfigurationError::InvalidConfigurationValue);
-            }
-
-            let port_list = [
-                ("TCP", node.ports.tcp),
-                ("QUIC", node.ports.quic),
-                ("HTTP", node.ports.http),
-                ("WebSocket", node.ports.websocket),
-                ("TCP_REPLICA", node.ports.tcp_replica),
-            ];
-
-            for (name, port_opt) in &port_list {
-                if let Some(port) = port_opt {
-                    if *port == 0 {
+        // Cluster mode has no port fallbacks: the roster is the single source
+        // of listener ports, so every enabled transport needs an explicit
+        // per-node port. Falling back to the port of a transport's top-level
+        // `address` would hand two same-host nodes the same socket and fail
+        // only at bind time, and a portless node would silently degrade every
+        // follower-to-primary HTTP forward through it to a fail-closed 503.
+        if self.cluster.enabled {
+            for node in &self.cluster.nodes {
+                let required_ports = [
+                    ("tcp", true, node.ports.tcp),
+                    ("quic", self.quic.enabled, node.ports.quic),
+                    ("http", self.http.enabled, node.ports.http),
+                    ("websocket", self.websocket.enabled, node.ports.websocket),
+                    ("tcp_replica", true, node.ports.tcp_replica),
+                ];
+                for (transport, enabled, port) in required_ports {
+                    if enabled && port.is_none() {
                         eprintln!(
-                            "Invalid cluster configuration: {} port cannot be 0 for node '{}'",
-                            name, node.name
-                        );
-                        return Err(ConfigurationError::InvalidConfigurationValue);
-                    }
-
-                    let endpoint = format!("{}:{}", node.ip, port);
-                    if !used_endpoints.insert(endpoint.clone()) {
-                        eprintln!(
-                            "Invalid cluster configuration: port conflict - {endpoint} is already bound (node '{}', transport {name})",
+                            "cluster node '{}' has no ports.{transport}; cluster mode requires an explicit roster port for every enabled transport",
                             node.name
                         );
                         return Err(ConfigurationError::InvalidConfigurationValue);
@@ -548,427 +151,705 @@ impl Validatable<ConfigurationError> for ClusterConfig {
             }
         }
 
-        // Replica-auth PSK (only reached when the cluster is enabled; the early
-        // return above skips these while it is disabled). When auth is enabled
-        // the key is mandatory; any configured key must clear the length floor -
-        // a typo guard that fires with auth off too, though only while the
-        // cluster itself is enabled.
-        let secret_len = self.auth.shared_secret.len();
-        if self.auth.enabled && self.auth.shared_secret.is_empty() {
+        // Validate the bus knobs BEFORE any cross-section bound derived from
+        // them: `max_message_size` has a frozen ceiling in there, and an
+        // operator who raised it past the ceiling must meet that error first
+        // -- not the artifact-floor error below, which would send them off
+        // to raise `transfer_artifact_bytes_max` and only then learn the
+        // edit was impossible.
+        self.message_bus
+            .validate()
+            .error(|e: &ConfigurationError| {
+                format!("{COMPONENT} (error: {e}) - failed to validate message_bus config")
+            })?;
+
+        // The HTTP produce path builds its bus message in-process, so the
+        // framing decoder's `max_message_size` cap never runs on it: the
+        // request body is the only bound on the widest batch record that
+        // path can persist. A produce request carries at most one batch and
+        // base64 leaves ~25% slack, so bounding the body above the frozen
+        // recovery ceiling would let a legally admitted, checksum-valid
+        // batch be refused as implausible by boot-time segment recovery.
+        if self.http.enabled
+            && self.http.max_request_size.as_bytes_u64() > MAX_MESSAGE_SIZE_UPPER_BYTES
+        {
             eprintln!(
-                "Invalid cluster configuration: cluster.auth.shared_secret must be set when cluster.auth.enabled is true"
-            );
-            return Err(ConfigurationError::InvalidConfigurationValue);
-        }
-        if !self.auth.shared_secret.is_empty() && secret_len < MIN_SHARED_SECRET_LEN {
-            eprintln!(
-                "Invalid cluster configuration: cluster.auth.shared_secret must be >= {MIN_SHARED_SECRET_LEN} bytes"
+                "{COMPONENT} http.max_request_size ({}) exceeds the frozen ceiling of \
+                 {MAX_MESSAGE_SIZE_UPPER_BYTES} bytes: the HTTP produce path is not framed by \
+                 the message bus, so its body size is what bounds the widest persistable batch \
+                 record, and records above the ceiling are refused as implausible by boot-time \
+                 segment recovery",
+                self.http.max_request_size.as_bytes_u64()
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
 
-        // Replica TLS. Both cert modes run one-directional TLS (no client
-        // certificate anywhere), so TLS only authenticates the acceptor to
-        // the dialer; peer authentication comes solely from the PSK
-        // handshake. Without it any TLS-capable host could register as a
-        // replica - require auth in both modes. CA mode (the default)
-        // additionally needs all three PEM paths: cert/key for this node's
-        // acceptor side, ca_file as the dialer's trust anchor.
-        if self.tls.enabled {
-            if !self.auth.enabled {
+        // A received segment artifact can be one whole batch larger than the
+        // segment cap (rotation checks the cap AFTER appending), and the real
+        // batch bound is the BUS frame cap -- the server never enforces
+        // `MAX_PAYLOAD_SIZE`. An artifact ceiling under that floor refuses a
+        // legal segment, and the manifest check is all-or-nothing, so the
+        // partition livelocks re-requesting the same segment from every peer at
+        // the backoff ceiling. Caught here so it is a boot error rather than one
+        // partition that silently never rejoins.
+        // Segment size is per topic now, so the floor is the LARGEST segment
+        // any topic may legally be created with, not a configured value.
+        let artifact_floor =
+            SEGMENT_MAX_SIZE_BYTES.saturating_add(self.message_bus.max_message_size.as_bytes_u64());
+        if self.partition.transfer_artifact_bytes_max.as_bytes_u64() < artifact_floor {
+            eprintln!(
+                "{COMPONENT} partition.transfer_artifact_bytes_max ({} B) must be at least the \
+                 largest legal segment ({SEGMENT_MAX_SIZE_BYTES} B) + \
+                 message_bus.max_message_size ({} B) = {artifact_floor} B: a segment may close \
+                 one whole batch past its cap, and an artifact ceiling below that refuses a \
+                 legal segment and livelocks the partition's rejoin",
+                self.partition.transfer_artifact_bytes_max.as_bytes_u64(),
+                self.message_bus.max_message_size.as_bytes_u64(),
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // Raising the artifact ceiling (or the segment size) without raising the
+        // served-payload budget silently serialises rejoins: a whole-node rejoin
+        // then walks its partitions one at a time. Warn rather than reject,
+        // because running under the budget costs re-reads, not failures, and an
+        // operator deliberately trading serving concurrency for memory still
+        // boots.
+        let (resident_len, served_slots) = served_transfer_slots(self);
+        if served_slots < CONCURRENT_SERVED_SEGMENTS {
+            let served_cache = self
+                .partition
+                .transfer_served_cache_bytes_max
+                .as_bytes_u64();
+            eprintln!(
+                "{COMPONENT} partition.transfer_served_cache_bytes_max ({served_cache} B) holds \
+                 only {served_slots} state-transfer slot(s) of {resident_len} B (the larger of \
+                 partition.transfer_artifact_bytes_max and the built-in segment ceiling of \
+                 {SEGMENT_MAX_SIZE_BYTES} B + {SEGMENT_SIZE_OVERSHOOT_BYTES} B of overshoot), \
+                 below the {CONCURRENT_SERVED_SEGMENTS} this shard is sized to serve at once, so \
+                 rejoins serialise and every cache miss re-reads and re-hashes a whole segment to \
+                 serve one chunk. The segment ceiling is a compile-time constant, so the only \
+                 knobs here are these two: raise transfer_served_cache_bytes_max to {} B, or \
+                 lower transfer_artifact_bytes_max",
+                resident_len.saturating_mul(CONCURRENT_SERVED_SEGMENTS)
+            );
+        }
+
+        // Repair frames ride the bounded per-peer message-bus queue. A repair
+        // round of cluster.repair_chunk_max frames that meets or overruns
+        // message_bus.peer_queue_capacity drops its own tail silently, wedging
+        // the repair loop into slow retries. Keep the chunk strictly below the
+        // queue; this also floors peer_queue_capacity, which is otherwise only
+        // checked for > 0.
+        if self.cluster.repair_chunk_max >= self.message_bus.peer_queue_capacity {
+            eprintln!(
+                "{COMPONENT} cluster.repair_chunk_max ({}) must be < message_bus.peer_queue_capacity ({}): repair frames ride the per-peer bus queue, so a chunk that fills or overruns it drops frames and wedges repair",
+                self.cluster.repair_chunk_max, self.message_bus.peer_queue_capacity
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // State-transfer chunks ride the same bus. A cap that cannot carry one
+        // header plus a byte of payload makes every rejoin that needs a
+        // transfer impossible, and the failure surfaces only as a replica
+        // connection tearing down when the frame is rejected on the read side.
+        let bus_cap = self.message_bus.max_message_size.as_bytes_u64();
+        if bus_cap <= STATE_CHUNK_HEADER_LEN {
+            eprintln!(
+                "{COMPONENT} message_bus.max_message_size ({bus_cap}) must exceed the {STATE_CHUNK_HEADER_LEN}-byte state-chunk header: state transfer serves artifact chunks over this bus, and a frame above the cap is rejected by the receiving transport, which tears down the whole replica connection"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // WS frame chain: websocket.max_frame_size <= websocket.max_message_size
+        // <= message_bus.max_message_size. The bus's WS / WSS install path takes
+        // its frame tuning from [websocket], so a WS ceiling above the bus's own
+        // frame cap would admit messages the bus read-side validator then tears
+        // the connection down over. An absent knob defers to the compio-ws
+        // default (16 MiB frame / 64 MiB message), which satisfies the chain
+        // against the shipped bus cap in practice.
+        let bus_max_message_size = self.message_bus.max_message_size.as_bytes_u64();
+        if let (Some(frame), Some(message)) = (
+            self.websocket.max_frame_size,
+            self.websocket.max_message_size,
+        ) && frame.as_bytes_u64() > message.as_bytes_u64()
+        {
+            eprintln!(
+                "{COMPONENT} websocket.max_frame_size ({}) exceeds websocket.max_message_size ({})",
+                frame.as_bytes_u64(),
+                message.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(message) = self.websocket.max_message_size
+            && message.as_bytes_u64() > bus_max_message_size
+        {
+            eprintln!(
+                "{COMPONENT} websocket.max_message_size ({}) exceeds message_bus.max_message_size ({})",
+                message.as_bytes_u64(),
+                bus_max_message_size
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if let Some(frame) = self.websocket.max_frame_size
+            && frame.as_bytes_u64() > bus_max_message_size
+        {
+            eprintln!(
+                "{COMPONENT} websocket.max_frame_size ({}) exceeds message_bus.max_message_size ({})",
+                frame.as_bytes_u64(),
+                bus_max_message_size
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        // "0", "unlimited" and "none" all parse to a zero IggyByteSize. A
+        // zero WS tunable is never usable: zero message or frame ceilings
+        // reject every inbound frame, and zero buffers starve the
+        // compio-ws pipeline. Reject at boot instead of shipping a
+        // listener that cannot serve a single message.
+        for (key, size) in [
+            ("read_buffer_size", self.websocket.read_buffer_size),
+            ("write_buffer_size", self.websocket.write_buffer_size),
+            (
+                "max_write_buffer_size",
+                self.websocket.max_write_buffer_size,
+            ),
+            ("max_message_size", self.websocket.max_message_size),
+            ("max_frame_size", self.websocket.max_frame_size),
+        ] {
+            if let Some(size) = size
+                && size.as_bytes_u64() == 0
+            {
                 eprintln!(
-                    "Invalid cluster configuration: cluster.tls.enabled = true requires cluster.auth.enabled = true (TLS authenticates the acceptor only; the PSK handshake authenticates the peer)"
+                    "{COMPONENT} websocket.{key} must be non-zero (\"0\", \"unlimited\" and \"none\" all parse to zero)"
                 );
                 return Err(ConfigurationError::InvalidConfigurationValue);
             }
-            if !self.tls.self_signed {
-                for (field, value) in [
-                    ("cert_file", &self.tls.cert_file),
-                    ("key_file", &self.tls.key_file),
-                    ("ca_file", &self.tls.ca_file),
-                ] {
-                    if value.trim().is_empty() {
-                        eprintln!(
-                            "Invalid cluster configuration: cluster.tls.{field} must be set when cluster.tls.enabled = true and self_signed = false"
-                        );
-                        return Err(ConfigurationError::InvalidConfigurationValue);
-                    }
-                }
+        }
+
+        // tungstenite asserts `max_write_buffer_size > write_buffer_size`
+        // during connection setup, so a violating pair panics on every
+        // accepted socket. Enforce the invariant at boot; an unset
+        // write_buffer_size runs at the compio-ws default.
+        if let Some(max_write) = self.websocket.max_write_buffer_size {
+            let write_buffer_size = self
+                .websocket
+                .write_buffer_size
+                .map_or(WS_DEFAULT_WRITE_BUFFER_SIZE, |size| size.as_bytes_u64());
+            if max_write.as_bytes_u64() <= write_buffer_size {
+                eprintln!(
+                    "{COMPONENT} websocket.max_write_buffer_size ({}) must exceed websocket.write_buffer_size ({write_buffer_size})",
+                    max_write.as_bytes_u64()
+                );
+                return Err(ConfigurationError::InvalidConfigurationValue);
             }
         }
+
+        self.quic.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate quic config")
+        })?;
+
+        // Both knobs below sit on shared section structs, so the rejects live
+        // here rather than in those types' own `Validatable` impls. `0` /
+        // `disabled` / `unlimited` all parse to the same zero duration.
+        if self
+            .consumer_group
+            .rebalancing_timeout
+            .get_duration()
+            .is_zero()
+        {
+            eprintln!(
+                "{COMPONENT} consumer_group.rebalancing_timeout must be nonzero: it is the deadline after which a pending revocation completes without the source client committing what it was served, so zero force-transfers every partition on the next reconciler tick and reopens the duplicate-delivery window"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.heartbeat.enabled && self.heartbeat.interval.get_duration().is_zero() {
+            eprintln!(
+                "{COMPONENT} heartbeat.interval must be nonzero when heartbeat.enabled: it sizes both the verifier's sleep and the staleness window, so zero spins the verifier and reaps every live session on its first pass"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        reject_unsupported(self)?;
 
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod cluster_validate_tests {
-    use super::*;
-    use crate::server_config::cluster::{
-        ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
-    };
+/// `(resident_len, slots)`: the size a SEALED segment actually reaches, and how
+/// many of them the served-payload budget holds at once.
+///
+/// Reproduces what `IggyShard::partition_transfer_admission_cap` computes at the
+/// shipped defaults, which is what really decides how many rejoins one shard
+/// serves concurrently. The shard divides by the CONFIGURED segment size plus
+/// overshoot; this divides by the compile-time segment ceiling, and the two
+/// coincide only because bootstrap pins the deployed segment size to
+/// `DEFAULT_SEGMENT_SIZE`. Where they diverge this side is the conservative one,
+/// so the warning it drives can over-fire but never under-fire.
+///
+/// The divisor is the sealed size rather than the configured target because
+/// rotation checks the cap after appending. Segment size is per topic now, so
+/// the sealed bound is the LARGEST segment any topic may legally declare, not a
+/// configured value. The `max` floor is never zero, so the division always
+/// holds, and the quotient carries the shard's own one-slot clamp so the warning
+/// never claims a slot count the runtime would not admit.
+fn served_transfer_slots(config: &ServerConfig) -> (u64, u64) {
+    let resident_len = config
+        .partition
+        .transfer_artifact_bytes_max
+        .as_bytes_u64()
+        .max(SEGMENT_MAX_SIZE_BYTES.saturating_add(SEGMENT_SIZE_OVERSHOOT_BYTES));
+    let slots = (config
+        .partition
+        .transfer_served_cache_bytes_max
+        .as_bytes_u64()
+        / resident_len)
+        .max(1);
+    (resident_len, slots)
+}
 
-    fn node(name: &str, id: u8) -> ClusterNodeConfig {
-        ClusterNodeConfig {
-            name: name.to_string(),
-            ip: "127.0.0.1".to_string(),
-            replica_id: id,
-            ports: TransportPorts::default(),
-        }
+/// The server parses the whole config surface but does not yet honor every
+/// knob. Make the still-inert ones loud at boot rather than silently ignored.
+/// All are off by default, so only a deliberate opt-in trips this.
+fn reject_unsupported(config: &ServerConfig) -> Result<(), ConfigurationError> {
+    if config.system.segment.archive_expired {
+        eprintln!("system.segment.archive_expired is not supported");
+        return Err(ConfigurationError::InvalidConfigurationValue);
+    }
+    if config.system.recovery.recreate_missing_state {
+        eprintln!("system.recovery.recreate_missing_state is not supported");
+        return Err(ConfigurationError::InvalidConfigurationValue);
     }
 
-    fn cfg(nodes: Vec<ClusterNodeConfig>) -> ClusterConfig {
-        ClusterConfig {
-            enabled: true,
-            name: "iggy-cluster".to_string(),
-            nodes,
-            auth: ClusterAuthConfig::default(),
-            tls: ClusterTlsConfig::default(),
-        }
-    }
-
-    #[test]
-    fn validate_rejects_empty_nodes() {
-        let c = cfg(vec![]);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_duplicate_replica_ids() {
-        let c = cfg(vec![node("n1", 0), node("n2", 0)]);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_duplicate_names() {
-        let c = cfg(vec![node("n1", 0), node("n1", 1)]);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_out_of_range_replica_id() {
-        // 2 nodes total, so id 2 is out of range.
-        let c = cfg(vec![node("n1", 0), node("n2", 2)]);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_accepts_unique_contiguous_replica_ids() {
-        let c = cfg(vec![node("n1", 0), node("n2", 1), node("n3", 2)]);
-        assert!(c.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_skips_checks_when_disabled() {
-        let mut c = cfg(vec![]);
-        c.enabled = false;
-        assert!(c.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_duplicate_tcp_replica_port() {
-        let ports = TransportPorts {
-            tcp: None,
-            quic: None,
-            http: None,
-            websocket: None,
-            tcp_replica: Some(9090),
-        };
-        let mut n1 = node("n1", 0);
-        n1.ports = ports.clone();
-        let mut n2 = node("n2", 1);
-        n2.ports = ports;
-        let c = cfg(vec![n1, n2]);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_cross_transport_port_reuse() {
-        let mut n1 = node("n1", 0);
-        n1.ports = TransportPorts {
-            tcp: Some(8090),
-            quic: None,
-            http: Some(8090),
-            websocket: None,
-            tcp_replica: None,
-        };
-        let c = cfg(vec![n1]);
-        assert!(
-            c.validate().is_err(),
-            "same port on TCP and HTTP of the same node must be rejected"
-        );
-    }
-
-    #[test]
-    fn validate_accepts_same_port_on_different_ips() {
-        let mut n1 = node("n1", 0);
-        n1.ip = "127.0.0.1".to_string();
-        n1.ports = TransportPorts {
-            tcp: Some(8090),
-            quic: None,
-            http: None,
-            websocket: None,
-            tcp_replica: None,
-        };
-        let mut n2 = node("n2", 1);
-        n2.ip = "127.0.0.2".to_string();
-        n2.ports = TransportPorts {
-            tcp: Some(8090),
-            quic: None,
-            http: None,
-            websocket: None,
-            tcp_replica: None,
-        };
-        let c = cfg(vec![n1, n2]);
-        assert!(c.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_zero_tcp_replica_port() {
-        let ports = TransportPorts {
-            tcp: None,
-            quic: None,
-            http: None,
-            websocket: None,
-            tcp_replica: Some(0),
-        };
-        let mut n1 = node("n1", 0);
-        n1.ports = ports;
-        let c = cfg(vec![n1]);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_accepts_empty_secret_when_auth_disabled() {
-        // Default: no secret, auth off -> legacy mode, must pass.
-        let c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        assert!(c.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_missing_secret_when_auth_enabled() {
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.auth.enabled = true;
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_short_secret_when_auth_enabled() {
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.auth.enabled = true;
-        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN - 1);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_short_secret_even_when_auth_disabled() {
-        // Typo guard: a configured-but-short key fails even with auth off.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN - 1);
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_accepts_valid_secret_when_auth_enabled() {
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.auth.enabled = true;
-        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
-        assert!(c.validate().is_ok());
-    }
-
-    fn tls_files() -> ClusterTlsConfig {
-        ClusterTlsConfig {
-            enabled: true,
-            self_signed: false,
-            cert_file: "cert.pem".to_string(),
-            key_file: "key.pem".to_string(),
-            ca_file: "ca.pem".to_string(),
-        }
-    }
-
-    #[test]
-    fn validate_rejects_tls_ca_mode_with_missing_files() {
-        // Auth on so the failure exercises the file check, not the auth gate.
-        for missing in ["cert_file", "key_file", "ca_file"] {
-            let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-            c.auth.enabled = true;
-            c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
-            c.tls = tls_files();
-            match missing {
-                "cert_file" => c.tls.cert_file.clear(),
-                "key_file" => c.tls.key_file.clear(),
-                _ => c.tls.ca_file.clear(),
-            }
-            assert!(c.validate().is_err(), "missing {missing} must be rejected");
-        }
-    }
-
-    #[test]
-    fn validate_rejects_tls_self_signed_without_auth() {
-        // Accept-any certificate without the PSK handshake = MITM-able.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.tls = ClusterTlsConfig {
-            enabled: true,
-            self_signed: true,
-            ..ClusterTlsConfig::default()
-        };
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_accepts_tls_self_signed_with_auth() {
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.auth.enabled = true;
-        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
-        c.tls = ClusterTlsConfig {
-            enabled: true,
-            self_signed: true,
-            ..ClusterTlsConfig::default()
-        };
-        assert!(c.validate().is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_tls_ca_mode_without_auth() {
-        // TLS never authenticates the dialer (no client certificates);
-        // only the PSK handshake does, so it is mandatory with TLS on.
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.tls = tls_files();
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn validate_accepts_tls_ca_mode_with_auth() {
-        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
-        c.auth.enabled = true;
-        c.auth.shared_secret = "a".repeat(MIN_SHARED_SECRET_LEN);
-        c.tls = tls_files();
-        assert!(c.validate().is_ok());
-    }
+    Ok(())
 }
 
 #[cfg(test)]
-mod cluster_shards_count_determinism_tests {
-    use super::*;
-    use crate::server_config::sharding::NumaConfig;
-
-    #[test]
-    fn all_is_rejected() {
-        let err = host_dependent_cpu_allocation(&CpuAllocation::All).unwrap_err();
-        assert!(err.contains("all"));
-    }
-
-    #[test]
-    fn numa_auto_is_rejected() {
-        let err = host_dependent_cpu_allocation(&CpuAllocation::NumaAware(NumaConfig::default()))
-            .unwrap_err();
-        assert!(err.contains("numa:auto"));
-    }
-
-    #[test]
-    fn count_is_accepted() {
-        assert!(host_dependent_cpu_allocation(&CpuAllocation::Count(4)).is_ok());
-    }
-
-    #[test]
-    fn range_is_accepted() {
-        assert!(host_dependent_cpu_allocation(&CpuAllocation::Range(0, 4)).is_ok());
-    }
-
-    #[test]
-    fn explicit_numa_is_accepted() {
-        let numa = NumaConfig {
-            nodes: vec![0, 1],
-            cores_per_node: 4,
-            avoid_hyperthread: true,
-        };
-        assert!(host_dependent_cpu_allocation(&CpuAllocation::NumaAware(numa)).is_ok());
-    }
-}
-
-#[cfg(test)]
-mod sharding_cpu_range_tests {
-    use super::*;
-
-    #[test]
-    fn inverted_range_is_rejected() {
-        let cfg = ShardingConfig {
-            cpu_allocation: CpuAllocation::Range(2, 2),
-            pin_cores: true,
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn pinned_range_within_allowed_set_is_accepted() {
-        let first = allowed_cpus()[0];
-        let cfg = ShardingConfig {
-            cpu_allocation: CpuAllocation::Range(first, first + 1),
-            pin_cores: true,
-        };
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn pinned_range_outside_allowed_set_is_rejected() {
-        let past_last = allowed_cpus().last().copied().unwrap() + 1;
-        let cfg = ShardingConfig {
-            cpu_allocation: CpuAllocation::Range(past_last, past_last + 1),
-            pin_cores: true,
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn pinned_range_wider_than_parallelism_is_rejected() {
-        // Under a cgroup CPU quota the affinity mask stays full while
-        // `available_parallelism` shrinks, so membership alone would
-        // accept this; the shard-count cap must reject it.
-        let first = allowed_cpus()[0];
-        let available = available_parallelism().unwrap().get();
-        let cfg = ShardingConfig {
-            cpu_allocation: CpuAllocation::Range(first, first + available + 1),
-            pin_cores: true,
-        };
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn unpinned_range_is_capped_by_shard_count_not_core_ids() {
-        // Core ids outside the machine are fine unpinned; only the
-        // resulting shard count matters.
-        let cfg = ShardingConfig {
-            cpu_allocation: CpuAllocation::Range(1 << 20, (1 << 20) + 1),
-            pin_cores: false,
-        };
-        assert!(cfg.validate().is_ok());
-
-        let available = available_parallelism().unwrap().get();
-        let cfg = ShardingConfig {
-            cpu_allocation: CpuAllocation::Range(0, available + 1),
-            pin_cores: false,
-        };
-        assert!(cfg.validate().is_err());
-    }
-}
-
-#[cfg(test)]
-mod sharding_embedded_default_tests {
+mod tests {
+    use super::super::cluster::{ClusterNodeConfig, TransportPorts};
     use super::*;
     use figment::Figment;
     use figment::providers::{Format, Toml};
 
-    // Guards the single source of truth: the legacy sharding defaults resolve
-    // from the embedded legacy TOML, not hard-coded Rust values.
-    #[test]
-    fn legacy_embedded_toml_resolves_sharding_defaults() {
-        let toml_str = include_str!("../../../server/config.toml");
-        let config: ServerConfig = Figment::new()
-            .merge(Toml::string(toml_str))
-            .extract()
-            .expect("embedded legacy TOML deserializes");
-        config.validate().expect("embedded legacy config validates");
+    const DEFAULT_CONFIG: &str = include_str!("../../../server/config.toml");
 
-        assert!(config.system.sharding.pin_cores);
+    /// Deep-merge a partial override over the shipped default, mirroring the
+    /// file-over-embedded layering the runtime loader performs.
+    fn config_with_override(override_toml: &str) -> ServerConfig {
+        Figment::new()
+            .merge(Toml::string(DEFAULT_CONFIG))
+            .merge(Toml::string(override_toml))
+            .extract()
+            .expect("config deserializes")
+    }
+
+    /// The per-topic `segment_size` ceiling lives in `iggy_common`, which cannot
+    /// import this crate. Admission reads it from there; boot validation reads
+    /// the constant here. This is the only place both are visible.
+    #[test]
+    fn given_segment_maximum_when_compared_to_the_option_ceiling_should_match() {
+        assert_eq!(
+            SEGMENT_MAX_SIZE_BYTES,
+            iggy_common::MAX_TOPIC_SEGMENT_SIZE,
+            "the option ceiling and the segment maximum must move together"
+        );
+    }
+
+    /// Admission may cap a topic's `segment_size` at
+    /// [`iggy_common::MAX_TOPIC_SEGMENT_SIZE`] flat only while boot refuses any
+    /// config whose artifact budget cannot carry a segment that large plus one
+    /// bus frame. Without that refusal the ceiling would have to be per node.
+    #[test]
+    fn given_artifact_budget_below_the_segment_ceiling_when_validating_should_reject() {
+        let config = config_with_override(
+            "[partition]\ntransfer_artifact_bytes_max = \"1 GiB\"\n[message_bus]\nmax_message_size = \"1 MiB\"\n",
+        );
+        assert!(
+            config.validate().is_err(),
+            "an artifact budget under segment maximum + one frame must refuse boot"
+        );
+    }
+
+    #[test]
+    fn given_shipped_default_config_when_validating_should_pass() {
+        let config: ServerConfig = Figment::new()
+            .merge(Toml::string(DEFAULT_CONFIG))
+            .extract()
+            .expect("default config deserializes");
+        config.validate().expect("pristine config must validate");
+    }
+
+    #[test]
+    fn given_web_ui_enabled_when_validating_should_pass() {
+        let config = config_with_override("[http]\nweb_ui = true\n");
+        config
+            .validate()
+            .expect("web_ui is served by the server and must validate");
+    }
+
+    #[test]
+    fn given_archive_expired_enabled_when_validating_should_reject() {
+        let config = config_with_override("[system.segment]\narchive_expired = true\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_recreate_missing_state_enabled_when_validating_should_reject() {
+        let config = config_with_override("[system.recovery]\nrecreate_missing_state = true\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_asymmetric_jwt_algorithm_when_validating_should_reject() {
+        // Boots clean today and then fails every login: the key is HMAC and
+        // jsonwebtoken refuses a mismatched algorithm family at sign time.
+        for algorithm in ["RS256", "RS384", "RS512", "ES256", "not-an-algorithm"] {
+            let config =
+                config_with_override(&format!("[http.jwt]\nalgorithm = \"{algorithm}\"\n"));
+            assert!(
+                config.validate().is_err(),
+                "{algorithm} has no key material and must not boot"
+            );
+        }
+    }
+
+    #[test]
+    fn given_hmac_jwt_algorithm_when_validating_should_pass() {
+        for (algorithm, _) in HMAC_JWT_ALGORITHMS {
+            let config =
+                config_with_override(&format!("[http.jwt]\nalgorithm = \"{algorithm}\"\n"));
+            config
+                .validate()
+                .unwrap_or_else(|_| panic!("{algorithm} is signable and must validate"));
+        }
+    }
+
+    #[test]
+    fn given_asymmetric_jwt_algorithm_when_http_disabled_should_pass() {
+        // No listener means no token is ever issued, so a stale algorithm is
+        // inert rather than a broken deployment.
+        let config =
+            config_with_override("[http]\nenabled = false\n\n[http.jwt]\nalgorithm = \"RS256\"\n");
+        config
+            .validate()
+            .expect("a disabled HTTP listener never signs a token");
+    }
+
+    // The shipped budget is exactly two artifact ceilings, so the pristine
+    // config sits on the boundary and a single MiB past it starves a slot.
+    #[test]
+    fn given_artifact_ceiling_starving_transfer_slots_when_validating_should_warn_only() {
+        let config =
+            config_with_override("[partition]\ntransfer_artifact_bytes_max = \"1089 MiB\"\n");
+        assert_eq!(served_transfer_slots(&config).1, 1);
+        config
+            .validate()
+            .expect("a starved served cache warns but still boots");
+    }
+
+    #[test]
+    fn given_artifact_ceiling_at_transfer_slot_boundary_when_sizing_should_keep_full_slot_count() {
+        let config = config_with_override("");
+        assert_eq!(
+            served_transfer_slots(&config).1,
+            CONCURRENT_SERVED_SEGMENTS,
+            "the shipped defaults must serve the concurrency they are sized for"
+        );
+    }
+
+    #[test]
+    fn given_served_cache_raised_with_artifact_ceiling_when_validating_should_keep_transfer_slots()
+    {
+        let config = config_with_override(
+            "[partition]\ntransfer_artifact_bytes_max = \"2 GiB\"\ntransfer_served_cache_bytes_max = \"4 GiB\"\n",
+        );
+        assert_eq!(served_transfer_slots(&config).1, CONCURRENT_SERVED_SEGMENTS);
+        config.validate().expect("budget raised in step must boot");
+    }
+
+    #[test]
+    fn given_peer_queue_capacity_not_above_repair_chunk_max_when_validating_should_reject() {
+        // The default repair_chunk_max (128) must stay strictly below
+        // peer_queue_capacity; shrinking the queue to the chunk size is the
+        // silent wedged-repair footgun this cross-section guard closes.
+        let config = config_with_override("[message_bus]\npeer_queue_capacity = 128\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_repair_chunk_max_at_peer_queue_capacity_when_validating_should_reject() {
+        let config = config_with_override("[cluster]\nrepair_chunk_max = 256\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_repair_chunk_max_below_peer_queue_capacity_when_validating_should_pass() {
+        let config = config_with_override("[cluster]\nrepair_chunk_max = 255\n");
+        config
+            .validate()
+            .expect("a chunk below the peer queue capacity must validate");
+    }
+
+    #[test]
+    fn given_ws_frame_size_above_ws_message_size_when_validating_should_reject() {
+        let config = config_with_override(
+            "[websocket]\nmax_message_size = \"1 MiB\"\nmax_frame_size = \"2 MiB\"\n",
+        );
+        assert!(config.validate().is_err());
+    }
+
+    // The shipped bus cap is 64 MiB, so a 128 MiB WS ceiling breaks the chain.
+    #[test]
+    fn given_ws_message_size_above_bus_max_message_size_when_validating_should_reject() {
+        let config = config_with_override("[websocket]\nmax_message_size = \"128 MiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_ws_frame_size_above_bus_max_message_size_when_validating_should_reject() {
+        let config = config_with_override("[websocket]\nmax_frame_size = \"128 MiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    // The HTTP produce path is not bus-framed, so its body cap is the only
+    // bound on the widest record that path can persist.
+    #[test]
+    fn given_http_max_request_size_above_recovery_ceiling_when_validating_should_reject() {
+        let config = config_with_override("[http]\nmax_request_size = \"257 MiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_http_max_request_size_at_recovery_ceiling_when_validating_should_pass() {
+        let config = config_with_override("[http]\nmax_request_size = \"256 MiB\"\n");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_http_disabled_when_max_request_size_above_ceiling_should_pass() {
+        let config =
+            config_with_override("[http]\nenabled = false\nmax_request_size = \"257 MiB\"\n");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_ws_frame_chain_in_ascending_order_when_validating_should_pass() {
+        let config = config_with_override(
+            "[websocket]\nmax_message_size = \"32 MiB\"\nmax_frame_size = \"16 MiB\"\n",
+        );
+        config
+            .validate()
+            .expect("frame <= message <= bus cap must validate");
+    }
+
+    // "unlimited" is not a supported sentinel for the WS size knobs: it
+    // parses to zero, which as a cap would reject every message.
+    #[test]
+    fn given_zero_ws_size_when_validating_should_reject() {
+        let config = config_with_override("[websocket]\nmax_message_size = \"unlimited\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    // tungstenite panics on this pair at connection setup; boot must
+    // reject it first.
+    #[test]
+    fn given_max_write_buffer_at_write_buffer_when_validating_should_reject() {
+        let config = config_with_override(
+            "[websocket]\nwrite_buffer_size = \"256 KiB\"\nmax_write_buffer_size = \"256 KiB\"\n",
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_max_write_buffer_below_default_write_buffer_when_validating_should_reject() {
+        let config = config_with_override("[websocket]\nmax_write_buffer_size = \"64 KiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_max_write_buffer_above_write_buffer_when_validating_should_pass() {
+        let config = config_with_override(
+            "[websocket]\nwrite_buffer_size = \"128 KiB\"\nmax_write_buffer_size = \"1 MiB\"\n",
+        );
+        config
+            .validate()
+            .expect("max write buffer above write buffer must validate");
+    }
+
+    // The size knobs are strictly typed; a malformed string must fail
+    // deserialization at load rather than degrade to the compio-ws default.
+    #[test]
+    fn given_malformed_ws_size_string_when_deserializing_should_reject() {
+        let result: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(DEFAULT_CONFIG))
+            .merge(Toml::string(
+                "[websocket]\nmax_message_size = \"not-a-size\"\n",
+            ))
+            .extract();
+        assert!(
+            result.is_err(),
+            "malformed websocket.max_message_size must fail config load"
+        );
+    }
+
+    // The shipped config is single-node (cluster.enabled = false), where the
+    // cross-section rule above is the only repair_chunk_max check that used to
+    // run; its structural bounds have to hold there too.
+    #[test]
+    fn given_single_node_zero_repair_chunk_max_when_validating_should_reject() {
+        let config = config_with_override("[cluster]\nrepair_chunk_max = 0\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_single_node_repair_chunk_max_above_ceiling_when_validating_should_reject() {
+        // Queue widened past the chunk so the cross-section rule passes and
+        // only the structural ceiling can reject.
+        let config = config_with_override(
+            "[cluster]\nrepair_chunk_max = 2000\n\n[message_bus]\npeer_queue_capacity = 4096\n",
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_zero_rebalancing_timeout_when_validating_should_reject() {
+        let config = config_with_override("[consumer_group]\nrebalancing_timeout = \"0\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_disabled_rebalancing_timeout_when_validating_should_reject() {
+        // "disabled" reads like an opt-out but parses to the same zero
+        // duration, which force-transfers every revocation instead.
+        let config = config_with_override("[consumer_group]\nrebalancing_timeout = \"disabled\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_zero_heartbeat_interval_when_heartbeat_enabled_should_reject() {
+        let config = config_with_override("[heartbeat]\nenabled = true\ninterval = \"0\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_zero_heartbeat_interval_when_heartbeat_disabled_should_pass() {
+        let config = config_with_override("[heartbeat]\nenabled = false\ninterval = \"0\"\n");
+        config
+            .validate()
+            .expect("a disabled heartbeat never reads its interval");
+    }
+
+    // http.enabled needs a non-ServerDefault JWT expiry to clear the sibling
+    // check above; ServerConfig::default() already satisfies that.
+    fn https_config(cert_file: &str, key_file: &str) -> ServerConfig {
+        let mut cfg = ServerConfig::default();
+        cfg.http.enabled = true;
+        cfg.http.tls.enabled = true;
+        cfg.http.tls.cert_file = cert_file.to_string();
+        cfg.http.tls.key_file = key_file.to_string();
+        cfg
+    }
+
+    #[test]
+    fn validate_rejects_tls_enabled_with_empty_cert_file() {
+        let cfg = https_config("", "key.pem");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_tls_enabled_with_both_files_set() {
+        let cfg = https_config("cert.pem", "key.pem");
+        assert!(cfg.validate().is_ok());
+    }
+
+    fn cluster_node(replica_id: u8, http: Option<u16>) -> ClusterNodeConfig {
+        ClusterNodeConfig {
+            name: format!("node-{replica_id}"),
+            ip: "127.0.0.1".to_string(),
+            advertised_address: None,
+            advertised_addresses: Vec::new(),
+            replica_id,
+            ports: TransportPorts {
+                tcp: Some(8090 + u16::from(replica_id)),
+                quic: Some(8080 + u16::from(replica_id)),
+                http,
+                websocket: Some(8070 + u16::from(replica_id)),
+                tcp_replica: Some(9090 + u16::from(replica_id)),
+            },
+        }
+    }
+
+    fn clustered_http_config(nodes: Vec<ClusterNodeConfig>) -> ServerConfig {
+        let mut cfg = ServerConfig::default();
+        cfg.http.enabled = true;
+        cfg.cluster.enabled = true;
+        cfg.cluster.name = "test-cluster".to_string();
+        cfg.cluster.nodes = nodes;
+        cfg
+    }
+
+    // Keyless cluster+http boots: forwarding degrades to off instead of
+    // failing the whole server.
+    #[test]
+    fn validate_accepts_cluster_http_without_jwt_secret_or_cluster_auth() {
+        let cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    // Cluster mode has no port fallbacks, so a portless roster node is
+    // invalid even when forwarding is off (keyless).
+    #[test]
+    fn validate_rejects_keyless_cluster_http_with_portless_roster_node() {
+        let cfg = clustered_http_config(vec![cluster_node(0, Some(3000)), cluster_node(1, None)]);
+        assert!(cfg.validate().is_err());
+    }
+
+    // The explicit-port rule covers every enabled transport, not just http.
+    #[test]
+    fn validate_rejects_cluster_node_without_port_for_enabled_quic() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.quic.enabled = true;
+        cfg.cluster.nodes[1].ports.quic = None;
+        assert!(cfg.validate().is_err());
+    }
+
+    // A disabled transport never binds, so its roster port may stay unset.
+    #[test]
+    fn validate_accepts_cluster_node_without_port_for_disabled_quic() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.quic.enabled = false;
+        cfg.cluster.nodes[1].ports.quic = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_cluster_http_with_configured_jwt_secrets() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef".to_string();
+        cfg.http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_cluster_http_with_cluster_auth_as_jwt_key_source() {
+        let mut cfg = clustered_http_config(vec![
+            cluster_node(0, Some(3000)),
+            cluster_node(1, Some(3001)),
+        ]);
+        cfg.cluster.auth.enabled = true;
+        cfg.cluster.auth.shared_secret = "0123456789abcdef0123456789abcdef".to_string();
+        assert!(cfg.validate().is_ok());
     }
 }

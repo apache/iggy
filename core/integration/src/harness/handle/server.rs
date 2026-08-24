@@ -18,7 +18,7 @@
 use super::client_builder::{ClientBuilder, ServerConnection};
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
-use crate::harness::config::{ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig};
+use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
@@ -92,15 +92,7 @@ impl std::fmt::Debug for ServerHandle {
 
 impl ServerHandle {
     fn default_server_binary() -> &'static str {
-        #[cfg(feature = "vsr")]
-        {
-            "iggy-server-ng"
-        }
-
-        #[cfg(not(feature = "vsr"))]
-        {
-            "iggy-server"
-        }
+        "iggy-server"
     }
 
     fn launched_binary(&self) -> String {
@@ -305,12 +297,6 @@ impl ServerHandle {
             .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
 
-        if self.config.ip_kind == IpAddrKind::V6 {
-            self.envs
-                .entry("IGGY_TCP_IPV6".to_string())
-                .or_insert_with(|| "true".to_string());
-        }
-
         self.envs
             .entry("IGGY_ROOT_USERNAME".to_string())
             .or_insert_with(|| DEFAULT_ROOT_USERNAME.to_string());
@@ -358,7 +344,14 @@ impl ServerHandle {
             self.set_tls_envs("WEBSOCKET", &tls);
         }
 
-        // Extra envs from config (includes resolved config paths from macro)
+        // Extra envs from config (includes resolved config paths from macro).
+        // Validated first: a name no config leaf reads is a silent no-op, and
+        // a test that believes it configured the server but did not is worse
+        // than one that fails to start.
+        if let Err(report) = crate::harness::config::validate_env_var_names(&self.config.extra_envs)
+        {
+            panic!("invalid extra_envs for the test server:\n{report}");
+        }
         for (k, v) in &self.config.extra_envs {
             self.envs.insert(k.clone(), v.clone());
         }
@@ -837,13 +830,9 @@ impl TestBinary for ServerHandle {
             // trusts (rcgen self-signed certs share the same subject DN), which
             // rustls rejects as `BadSignature`. Generate only when absent so all
             // nodes and clients share one keypair; this also keeps the
-            // certificate stable across a restart. The legacy single-node
-            // harness keeps its regenerate-per-start behavior.
-            #[cfg(feature = "vsr")]
+            // certificate stable across a restart.
             let should_generate = !(cert_dir.join("test_cert.pem").exists()
                 && cert_dir.join("test_key.pem").exists());
-            #[cfg(not(feature = "vsr"))]
-            let should_generate = true;
             if should_generate {
                 generate_test_certificates(cert_dir.to_str().unwrap()).map_err(|e| {
                     TestBinaryError::InvalidState {
@@ -894,13 +883,6 @@ impl TestBinary for ServerHandle {
             command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
         }
         command.envs(&self.envs);
-
-        // Legacy clustering elects node 0 externally and requires explicit followers.
-        // VSR/server-ng elects its own primary and should see symmetric node startup.
-        #[cfg(not(feature = "vsr"))]
-        if self.server_id > 0 {
-            command.arg("--follower");
-        }
 
         // `--replica-id` is the single identity input expected by the
         // server when cluster mode is enabled; all other cluster config is
@@ -1038,6 +1020,32 @@ impl ServerHandle {
 
         self.start()
     }
+
+    /// Kill the server with SIGKILL: no shutdown hook runs, nothing buffered
+    /// in process memory is flushed. Models a real crash, unlike
+    /// [`TestBinary::stop`] whose graceful shutdown flushes state before exit.
+    ///
+    /// Restart afterwards with [`TestBinary::start`]. Taking `child_handle`
+    /// makes the eventual `Drop -> stop()` a no-op.
+    pub fn kill(&mut self) -> Result<(), TestBinaryError> {
+        // Watchdog must stop BEFORE the signal lands: it polls liveness every
+        // 100ms and panics on unexpected process death.
+        self.stop_watchdog();
+        if let Some(mut child) = self.child_handle.take() {
+            // SAFETY: plain syscall. The watchdog is already joined, so its
+            // unexpected-death path (a raw waitpid) can no longer reap this
+            // pid, and `Child` has not waited yet; the worst case is a signal
+            // to an already-dead but unreaped zombie, which is harmless. The
+            // result is deliberately discarded for the same reason.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            // Reap via the owned Child, not reap_exit_status: a raw waitpid
+            // would race Child's own bookkeeping.
+            let _ = child.wait();
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ServerHandle {
@@ -1046,6 +1054,23 @@ impl Drop for ServerHandle {
         // without waiting, so the freed slot could be reused while this server
         // still holds its ports.
         let _ = self.stop();
+        if let Some(report) = super::common::stderr_panic_report(&self.stderr_path) {
+            if std::thread::panicking() {
+                // Ahead of the full dump, which buries these lines under the
+                // complete stdout of every node.
+                eprintln!("Iggy server panicked:\n{report}");
+            } else {
+                // A dead task leaves the process alive and the test green;
+                // failing here is the only thing that surfaces it. The panic
+                // unwinds out of this `Drop` before the dump below runs, so
+                // print this node's logs first.
+                let (stdout, stderr) =
+                    super::common::collect_logs(&self.stdout_path, &self.stderr_path);
+                eprintln!("Iggy server stdout:\n{stdout}");
+                eprintln!("Iggy server stderr:\n{stderr}");
+                panic!("Iggy server panicked:\n{report}");
+            }
+        }
         super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
     }
 }

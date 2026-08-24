@@ -90,7 +90,12 @@ public class IggyPublisherBuilder<T> : IggyPublisherBuilder
                 Protocol = Config.Protocol,
                 BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
-                SendBufferSize = Config.SendBufferSize
+                SendBufferSize = Config.SendBufferSize,
+                ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
+                HeartbeatInterval = Config.HeartbeatInterval,
+                AutoLoginSettings = AutoLogin(),
+                LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
+                MessageEncryptor = _encryptor
             });
         }
 
@@ -134,8 +139,7 @@ public class IggyPublisherBuilder<T> : IggyPublisherBuilder
         }
         else
         {
-            throw new InvalidOperationException(
-                $"Config must be of type IggyPublisherConfig<{typeof(T).Name}>.");
+            throw new InvalidOperationException($"Config must be of type IggyPublisherConfig<{typeof(T).Name}>.");
         }
     }
 }

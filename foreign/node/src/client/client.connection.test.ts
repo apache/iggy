@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
@@ -28,6 +27,9 @@ import { describe, it } from 'node:test';
 import { ProtocolFrameError } from './client.frame.js';
 import { IggyConnection } from './client.connection.js';
 import type { ClientConfig } from './client.type.js';
+import { Command, HEADER_SIZE, REPLY_OFFSET } from '../wire/vsr/header.js';
+
+const FRAME_LIMIT = 2 * HEADER_SIZE;
 
 const startServer = async (): Promise<Server> => {
   const server = createServer();
@@ -37,7 +39,6 @@ const startServer = async (): Promise<Server> => {
 };
 
 const connectionConfig = (server: Server): ClientConfig => ({
-  protocol: 'classic',
   transport: 'TCP',
   options: {
     host: '127.0.0.1',
@@ -45,8 +46,16 @@ const connectionConfig = (server: Server): ClientConfig => ({
   },
   credentials: { username: 'iggy', password: 'iggy' },
   reconnect: { enabled: false, interval: 0, maxRetries: 0 },
-  maxResponseFrameSize: 256
+  maxResponseFrameSize: FRAME_LIMIT
 });
+
+const replyFrame = (body: Buffer): Buffer => {
+  const frame = Buffer.alloc(HEADER_SIZE + body.length);
+  frame.writeUInt32LE(frame.length, REPLY_OFFSET.size);
+  frame.writeUInt8(Command.Reply, REPLY_OFFSET.command);
+  body.copy(frame, HEADER_SIZE);
+  return frame;
+};
 
 const closeConnection = async (
   connection: IggyConnection,
@@ -75,7 +84,7 @@ describe('IggyConnection', () => {
     }
   );
 
-  it('shares connection attempts, recognizes endpoints, and writes commands',
+  it('shares connection attempts, recognizes endpoints, and writes frames',
     async () => {
       const server = await startServer();
       const received = new Promise<Buffer>((resolve) => {
@@ -109,10 +118,9 @@ describe('IggyConnection', () => {
           true
         );
 
-        connection.writeCommand(1, Buffer.from('payload'));
-        const command = await received;
-        assert.equal(command.readUInt32LE(4), 1);
-        assert.deepEqual(command.subarray(8), Buffer.from('payload'));
+        const frame = replyFrame(Buffer.from('payload'));
+        connection.writeFrame(frame);
+        assert.deepEqual(await received, frame);
       } finally {
         await closeConnection(connection, server);
       }
@@ -125,17 +133,14 @@ describe('IggyConnection', () => {
       const connection = new IggyConnection(connectionConfig(server));
       try {
         await connection.connect();
-        const body = Buffer.from('response');
-        const frame = Buffer.alloc(8 + body.length);
-        frame.writeUInt32LE(body.length, 4);
-        body.copy(frame, 8);
+        const frame = replyFrame(Buffer.from('response'));
         const response = once(connection, 'response');
         connection._onData(frame.subarray(0, 6));
         connection._onData(frame.subarray(6));
         assert.deepEqual((await response)[0], frame);
 
-        const malformed = Buffer.alloc(8);
-        malformed.writeUInt32LE(256, 4);
+        const malformed = replyFrame(Buffer.alloc(0));
+        malformed.writeUInt32LE(FRAME_LIMIT + 1, REPLY_OFFSET.size);
         const error = once(connection, 'error');
         connection._onData(malformed);
         assert.ok((await error)[0] instanceof ProtocolFrameError);
@@ -225,10 +230,7 @@ describe('IggyConnection', () => {
         assert.equal(connection.connected, true);
         assert.equal(connections, 2);
 
-        const body = Buffer.from('fresh');
-        const frame = Buffer.alloc(8 + body.length);
-        frame.writeUInt32LE(body.length, 4);
-        body.copy(frame, 8);
+        const frame = replyFrame(Buffer.from('fresh'));
         const response = once(connection, 'response');
         oldSocket.emit('data', Buffer.alloc(8));
         connection._onData(frame);

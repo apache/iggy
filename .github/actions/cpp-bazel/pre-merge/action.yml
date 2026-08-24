@@ -31,7 +31,6 @@ runs:
       uses: ./.github/actions/utils/setup-cpp-with-cache
 
     - name: Setup Rust with cache
-      if: inputs.task != 'lint'
       uses: ./.github/actions/utils/setup-rust-with-cache
 
     - name: Install clang-format
@@ -42,8 +41,7 @@ runs:
           clang-format-18 --version
           exit 0
         fi
-        sudo apt-get update --yes
-        sudo apt-get install --yes clang-format-18
+        ./scripts/ci/apt-install.sh clang-format-18
         clang-format-18 --version
 
     - name: Lint (clang-format)
@@ -59,6 +57,13 @@ runs:
         fi
 
         printf '%s\n' "${files[@]}" | xargs clang-format-18 --style=file --dry-run --Werror
+
+    - name: Lint (clippy)
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        cd foreign/cpp
+        cargo clippy --manifest-path Cargo.toml --all-targets --all-features -- -D warnings
 
     - name: Build
       if: inputs.task == 'build'
@@ -77,6 +82,8 @@ runs:
     - name: Setup server for e2e tests
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server
 
     - name: Run e2e tests
       if: inputs.task == 'e2e'

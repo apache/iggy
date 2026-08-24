@@ -23,8 +23,9 @@ use consensus::{
     ClientTable, ClientTableDecodeError, VsrState, VsrStateError, build_reply_message,
     build_reply_message_with,
 };
-use iggy_binary_protocol::consensus::{Operation, PrepareHeader};
+use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
 use iggy_common::IggyError;
+use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
 use journal::superblock::{
     PingPongSuperblock, SLOT_FILE_NAMES, SuperblockContents, SuperblockStore,
@@ -307,6 +308,13 @@ pub struct RecoveredMetadata<M> {
     /// they stay journal-only until the recovered primary re-replicates them
     /// (or a backup sees the commit point advance past them).
     pub last_journaled_op: Option<u64>,
+    /// First op replay could not connect to its predecessor, `None` when the
+    /// replayed range is one unbroken chain.
+    ///
+    /// `Some(op)` means entries at and above `op` were truncated and must come back
+    /// from the cluster. `last_journaled_op` stops below it, which keeps the restored
+    /// head, the re-pipeline range, and the recovery barrier honest.
+    pub chain_break_op: Option<u64>,
 }
 
 /// Recover metadata state from disk.
@@ -350,6 +358,7 @@ pub async fn recover<M>(
     journal_slots: usize,
     clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
+    on_replayed_logout: impl Fn(&M, u128, iggy_common::IggyTimestamp),
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
@@ -545,10 +554,35 @@ where
 
     let mut last_applied_op: Option<u64> = None;
     let mut last_journaled_op: Option<u64> = None;
+    let mut chain_break_op: Option<u64> = None;
+    let mut previous: Option<PrepareHeader> = None;
     for header in &headers_to_replay {
-        // TODO: Check hash chain integrity against `previous_header`. On a
-        // same-view break, stop replay here and mark the remaining entries for
-        // repair via VSR instead of panicking.
+        // Stop at the first op that does not connect to the one before it. Applying
+        // across a hole replays effects onto a state machine that never saw the
+        // missing op, and nothing downstream re-checks it.
+        //
+        // The WAL scan does not cover this: it only fires on CONSECUTIVE ops with
+        // both ends sealed, so a gap reaches here. The first replayed op is exempt,
+        // since a snapshot records no checksum for its parent to chain to.
+        if let Some(previous) = previous {
+            let gap = previous.op + 1 != header.op;
+            let broken_chain = previous.checksum != CHECKSUM_UNSEALED
+                && header.checksum != CHECKSUM_UNSEALED
+                && header.parent != previous.checksum;
+            if gap || broken_chain {
+                tracing::error!(
+                    op = header.op,
+                    previous_op = previous.op,
+                    gap,
+                    broken_chain,
+                    "metadata WAL does not connect at this op; stopping replay and dropping the \
+                     suffix for VSR repair"
+                );
+                chain_break_op = Some(header.op);
+                break;
+            }
+        }
+        previous = Some(*header);
 
         last_journaled_op = Some(header.op);
         if header.op > commit_watermark {
@@ -585,10 +619,15 @@ where
         }
         if header.operation == Operation::Logout {
             client_table.remove_client(header.client);
-            // TODO: the commit paths also run `remove_consumer_group_member`
-            // here; recovery has no `StreamsFrontend` bound, so replayed
-            // logouts leave stale group members (pre-existing, harmless for
-            // dead connections but a divergence from the live apply).
+            // Logout's only state-machine effect, mirrored from the live
+            // commit path: the caller drops the client from its consumer
+            // groups (`remove_consumer_group_member`) so replay and live
+            // apply converge on the same group membership.
+            on_replayed_logout(
+                &mux_stm,
+                header.client,
+                iggy_common::IggyTimestamp::from(header.timestamp),
+            );
             last_applied_op = Some(header.op);
             continue;
         }
@@ -626,6 +665,22 @@ where
         last_applied_op = Some(header.op);
     }
 
+    // `truncate_from`, never `drain`: the removed ops must stay refillable, so the
+    // snapshot watermark stays put. Leaving them resident would make `append` refuse
+    // the slot, failing repair on exactly the ops it exists to fix.
+    if let Some(break_op) = chain_break_op {
+        let removed = journal
+            .truncate_from(break_op)
+            .await
+            .map_err(RecoveryError::Io)?;
+        tracing::warn!(
+            break_op,
+            removed,
+            last_journaled_op,
+            "dropped the disconnected metadata WAL suffix; the cluster re-supplies these ops"
+        );
+    }
+
     Ok(RecoveredMetadata {
         journal,
         snapshot,
@@ -636,6 +691,7 @@ where
         client_table,
         last_applied_op,
         last_journaled_op,
+        chain_break_op,
     })
 }
 
@@ -744,8 +800,9 @@ fn verify_checkpoint_pairing(
 mod tests {
     use super::*;
     use crate::impls::metadata::checkpoint_checksum;
+    use crate::stm::snapshot::SNAPSHOT_FORMAT_VERSION;
     use consensus::CLIENTS_TABLE_MAX;
-    use iggy_binary_protocol::consensus::{Command2, Operation};
+    use iggy_binary_protocol::consensus::{Command, Operation};
     use journal::Journal;
     use server_common::iobuf::Owned;
     use tempfile::tempdir;
@@ -781,6 +838,7 @@ mod tests {
             commit_max: 100,
             checkpoint_op,
             checkpoint_checksum,
+            offset_frontier: 0,
         }
     }
 
@@ -858,7 +916,7 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.commit = commit;
         header.operation = Operation::CreateStream;
@@ -884,7 +942,7 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.commit = op.saturating_sub(1);
         header.operation = operation;
@@ -904,6 +962,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -929,6 +988,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -964,6 +1024,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -973,6 +1034,132 @@ mod tests {
         assert_eq!(recovered.last_applied_op, Some(2));
         assert_eq!(recovered.last_journaled_op, Some(3));
         assert_eq!(recovered.journal.last_op(), Some(3));
+    }
+
+    /// A prepare sealed the way a live primary seals one: `parent` chains to the
+    /// previous op's identity and `checksum` is that identity.
+    fn make_chained_prepare(op: u64, commit: u64, parent: u128) -> Message<PrepareHeader> {
+        let mut message = make_prepare_with_commit(op, commit, 32);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut message.as_mut_slice()[..HEADER_SIZE],
+        );
+        header.parent = parent;
+        let checksum = header.identity_checksum();
+        header.checksum = checksum;
+        message
+    }
+
+    #[compio::test]
+    async fn recover_stops_at_a_gap_and_drops_the_disconnected_suffix() {
+        // Ops 1-3 then 5: op 4 never landed. Replaying 5 over a state machine that
+        // never saw 4 diverges silently, and the WAL scan waves this through --
+        // its chain check only fires on CONSECUTIVE ops, since a gap is also what
+        // ordinary compaction leaves behind.
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            for op in 1..=3u64 {
+                journal
+                    .append(make_prepare_with_commit(op, op, 32))
+                    .await
+                    .unwrap();
+            }
+            journal
+                .append(make_prepare_with_commit(5, 5, 32))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered.chain_break_op, Some(5));
+        assert_eq!(
+            recovered.last_applied_op,
+            Some(3),
+            "op 5 must not apply across the hole at op 4"
+        );
+        assert_eq!(
+            recovered.last_journaled_op,
+            Some(3),
+            "the restored head stops below the break, so nothing re-pipelines it"
+        );
+        assert_eq!(
+            recovered.journal.last_op(),
+            Some(3),
+            "the disconnected entry is dropped so repair can journal the cluster's op 5"
+        );
+        assert_eq!(
+            recovered.journal.snapshot_op(),
+            0,
+            "truncating a suffix must leave the watermark, or the ops stop being refillable"
+        );
+    }
+
+    #[compio::test]
+    async fn recover_stops_at_a_broken_chain_between_consecutive_ops() {
+        // Consecutive and sealed on both ends, but op 3 names a parent that is not
+        // op 2: a fork left by a crash mid view change. Ops are appended out of
+        // ascending file order so the scan's own chain check does not fire first.
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            let first = make_chained_prepare(1, 1, 0);
+            let first_checksum = first.header().checksum;
+            journal.append(first).await.unwrap();
+            let second = make_chained_prepare(2, 2, first_checksum);
+            journal.append(second).await.unwrap();
+            // Parent of a prepare that is not op 2.
+            journal
+                .append(make_chained_prepare(3, 3, 0xdead_beef))
+                .await
+                .unwrap();
+            journal.storage_ref().fsync().await.unwrap();
+        }
+
+        let recovered = recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _, _| {},
+        )
+        .await;
+
+        // The WAL scan reaches this first and refuses boot: consecutive ops, both
+        // sealed, chain broken, with no entry after it is only a tail. Either
+        // outcome is a refusal to apply the fork; what must never happen is a
+        // clean recovery that replayed op 3.
+        match recovered {
+            Err(RecoveryError::Journal(_) | RecoveryError::Io(_)) => {}
+            Ok(recovered) => {
+                assert!(
+                    recovered.last_applied_op < Some(3),
+                    "op 3 forks the chain and must not be applied"
+                );
+            }
+            Err(other) => panic!("unexpected recovery error: {other:?}"),
+        }
     }
 
     #[compio::test]
@@ -1006,6 +1193,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1043,6 +1231,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1112,6 +1301,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1187,6 +1377,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1252,6 +1443,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1301,12 +1493,14 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
+        let replayed_logouts = std::cell::RefCell::new(Vec::new());
         let recovered = recover::<TestStm>(
             dir.path(),
             SOLO,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, client, _| replayed_logouts.borrow_mut().push(client),
         )
         .await
         .unwrap();
@@ -1314,6 +1508,11 @@ mod tests {
             recovered.client_table.get_epoch(CLIENT),
             None,
             "logged-out session must not be resurrected"
+        );
+        assert_eq!(
+            replayed_logouts.into_inner(),
+            vec![CLIENT],
+            "replay must hand the logged-out client to the group-removal hook"
         );
         assert_eq!(recovered.last_applied_op, Some(2));
     }
@@ -1369,6 +1568,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await;
         assert!(matches!(
@@ -1401,6 +1601,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await;
         assert!(matches!(
@@ -1432,6 +1633,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1484,6 +1686,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
+                |_, _, _| {},
             )
             .await;
             match result {
@@ -1497,47 +1700,87 @@ mod tests {
     }
 
     #[compio::test]
-    async fn recover_accepts_snapshot_written_before_a_trailing_default_field() {
-        // Appending a `#[serde(default)]` field is this repo's forward-compatible
-        // snapshot migration, and msgpack encodes structs positionally: a file the
-        // previous build wrote decodes fine (the default fills the missing element)
-        // but re-encodes with one MORE element. A pairing checksum recomputed by
-        // re-encoding the decoded snapshot would therefore diverge on the FIRST boot
-        // of the new build and refuse every checkpointed node, with the WAL prefix
-        // already drained. Hashing the bytes on disk is what makes that upgrade boot.
-        //
-        // Emulated in the direction the migration runs: strip the trailing element off
-        // a current-shape file, which is what the pre-`client_table` build wrote.
+    async fn recover_refuses_a_snapshot_from_another_format_version() {
+        // A snapshot shape is only as trustworthy as the version stamped on it, so a
+        // foreign one refuses boot rather than restoring whatever msgpack happens to
+        // make of the bytes. Everything else about the directory is healthy: the
+        // superblock pairs with the file on disk, so the refusal can only be the
+        // version.
         const CHECKPOINT_OP: u64 = 42;
-        let encoded = IggySnapshot::new(CHECKPOINT_OP).encode().unwrap();
-        assert_eq!(
-            encoded[0] & 0xf0,
-            0x90,
-            "snapshot must encode as a msgpack fixarray for this emulation"
-        );
-        assert_eq!(
-            *encoded.last().unwrap(),
-            0xC0,
-            "the trailing snapshot field must encode as nil here; adjust the emulation \
-             if the last field stops being an Option"
-        );
-        let mut legacy = vec![0x90 | ((encoded[0] & 0x0f) - 1)];
-        legacy.extend_from_slice(&encoded[1..encoded.len() - 1]);
+        let mut snapshot = IggySnapshot::new(CHECKPOINT_OP);
+        snapshot.snapshot_mut().version = SNAPSHOT_FORMAT_VERSION + 1;
+        let foreign = snapshot.encode().unwrap();
 
-        let decoded = IggySnapshot::decode(&legacy).unwrap();
-        assert_eq!(decoded.sequence_number(), CHECKPOINT_OP);
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        std::fs::write(metadata_dir.join("snapshot.bin"), &foreign).unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&foreign));
+        {
+            let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+            superblock.write(&state.to_bytes()).await.unwrap();
+        }
+
+        match recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _, _| {},
+        )
+        .await
+        {
+            Err(RecoveryError::Snapshot(SnapshotError::UnsupportedFormatVersion {
+                found,
+                expected,
+            })) => {
+                assert_eq!(found, SNAPSHOT_FORMAT_VERSION + 1);
+                assert_eq!(expected, SNAPSHOT_FORMAT_VERSION);
+            }
+            Err(other) => panic!("expected a format-version refusal, got {other}"),
+            Ok(_) => panic!("expected a foreign format version to refuse boot"),
+        }
+    }
+
+    #[compio::test]
+    async fn recover_pairs_the_checkpoint_against_the_bytes_on_disk() {
+        // The pairing checksum is taken over the file's bytes, never over a re-encode
+        // of the decoded snapshot. Re-encoding would tie recovery to
+        // decode-then-encode staying byte-identical across every serde and rmp
+        // release, and a divergence there would refuse boot on every checkpointed node
+        // with its WAL prefix already drained.
+        //
+        // Canonical bytes cannot show that: they re-encode byte-identically (pinned by
+        // `populated_snapshot_reencode_and_checksum_are_stable`), so both candidate
+        // checksums agree and the assertion holds either way. This file is instead
+        // noncanonical but decodable, carrying the version in a `u32` marker that
+        // `read_int` accepts and a re-encode collapses back to a fixint, so hashing a
+        // re-encode gives a different checksum and the test can fail.
+        const CHECKPOINT_OP: u64 = 42;
+        let canonical = IggySnapshot::new(CHECKPOINT_OP).encode().unwrap();
+        let on_disk = with_wide_version_marker(&canonical);
+
+        // Both halves of "noncanonical but decodable", so this cannot pass vacuously.
         assert_ne!(
-            decoded.encode().unwrap(),
-            legacy,
-            "the emulated legacy file must NOT round-trip byte-identically, else this \
-             test cannot distinguish the two checksum sources"
+            on_disk, canonical,
+            "the file must not be byte-identical to the canonical encoding"
+        );
+        let round_tripped = MetadataSnapshot::decode(&on_disk)
+            .expect("a wide version marker must still decode")
+            .encode()
+            .unwrap();
+        assert_ne!(
+            checkpoint_checksum(&on_disk),
+            checkpoint_checksum(&round_tripped),
+            "the two candidate checksums must differ, or this proves nothing"
         );
 
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
-        std::fs::write(metadata_dir.join("snapshot.bin"), &legacy).unwrap();
-        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&legacy));
+        std::fs::write(metadata_dir.join("snapshot.bin"), &on_disk).unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&on_disk));
         {
             let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
             superblock.write(&state.to_bytes()).await.unwrap();
@@ -1549,15 +1792,37 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
         assert_eq!(recovered.snapshot_checkpoint.0, CHECKPOINT_OP);
         assert_eq!(
             recovered.snapshot_checkpoint.1,
-            checkpoint_checksum(&legacy),
+            checkpoint_checksum(&on_disk),
             "the verified pairing must be the checksum of the bytes on disk"
         );
+    }
+
+    /// Re-encode a snapshot's leading `version` as an explicit msgpack `u32` marker
+    /// instead of the canonical fixint: same value, five bytes instead of one.
+    ///
+    /// `rmp` reads it back through the same `read_int` the peek uses, and a re-encode
+    /// canonicalizes it away, which is what makes it a probe for "did recovery hash
+    /// the file or its own re-encode".
+    fn with_wide_version_marker(canonical: &[u8]) -> Vec<u8> {
+        let mut cursor = canonical;
+        rmp::decode::read_array_len(&mut cursor).expect("a snapshot encodes as an array");
+        let array_header = canonical.len() - cursor.len();
+        let version: u32 =
+            rmp::decode::read_int(&mut cursor).expect("version is the first element");
+        let version_len = canonical.len() - cursor.len() - array_header;
+
+        let mut wide = Vec::with_capacity(canonical.len() + 4);
+        wide.extend_from_slice(&canonical[..array_header]);
+        rmp::encode::write_u32(&mut wide, version).expect("writing to a Vec cannot fail");
+        wide.extend_from_slice(&canonical[array_header + version_len..]);
+        wide
     }
 
     #[compio::test]
@@ -1580,6 +1845,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();

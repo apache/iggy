@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Flush contract against server-ng (vsr): the server has no on-demand flush
+//! Flush contract against the server (vsr): the server has no on-demand flush
 //! primitive, so `FLUSH_UNSAVED_BUFFER` must surface a typed
 //! `FeatureUnavailable` over the SDK rather than the non-replicated catch-all's
 //! empty-ok, which would fake a durability guarantee.
@@ -27,12 +27,11 @@
 use iggy::prelude::*;
 use integration::iggy_harness;
 
-// server-ng partition ids are 0-based (CreateTopic assigns them from 0).
+// Partition ids are 0-based (CreateTopic assigns them from 0).
 const PARTITION_ID: u32 = 0;
 
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_valid_partition_when_flushing_should_reject_feature_unavailable(
     harness: &TestHarness,
@@ -47,11 +46,11 @@ async fn given_valid_partition_when_flushing_should_reject_feature_unavailable(
         .create_topic(
             &stream_id,
             "flush-topic",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic");

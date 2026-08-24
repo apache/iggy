@@ -15,19 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::command::Command2;
+use super::command::Command;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ConsensusError {
     #[error("invalid command: expected {expected:?}, found {found:?}")]
-    InvalidCommand { expected: Command2, found: Command2 },
+    InvalidCommand { expected: Command, found: Command },
 
     #[error("invalid size: expected {expected:?}, found {found:?}")]
     InvalidSize { expected: u32, found: u32 },
 
     #[error("invalid checksum")]
     InvalidChecksum,
+
+    #[error(
+        "{command:?}: header checksum {found:#034x} does not cover the frame (expected \
+         {expected:#034x}){}",
+        if *found == 0 {
+            ". A zeroed checksum is the signature of a peer predating the frame seal, \
+             which is a hard version break: replicas must be upgraded together, with the \
+             cluster down"
+        } else {
+            ""
+        }
+    )]
+    FrameChecksumMismatch {
+        command: Command,
+        expected: u128,
+        found: u128,
+    },
 
     #[error("invalid cluster ID")]
     InvalidCluster,
@@ -45,13 +62,13 @@ pub enum ConsensusError {
     PrepareRequestChecksumPaddingNonZero,
 
     #[error("command must be Commit")]
-    CommitInvalidCommand2,
+    CommitInvalidCommand,
 
     #[error("size must be 256, found {0}")]
     CommitInvalidSize(u32),
 
     #[error("command must be Reply")]
-    ReplyInvalidCommand2,
+    ReplyInvalidCommand,
 
     #[error("request_checksum_padding must be 0")]
     ReplyRequestChecksumPaddingNonZero,
@@ -63,5 +80,5 @@ pub enum ConsensusError {
     InvalidBitPattern,
 
     #[error("client-bound command {0:?} cannot be dispatched on inbound path")]
-    ClientBoundCommand(Command2),
+    ClientBoundCommand(Command),
 }

@@ -51,8 +51,9 @@ public class RawCommandTests
 
         foreach (var code in new uint[] { 38, 39, 40, 44, 45 })
         {
-            var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
-                () => client.SendBinaryRequestAsync(code, []));
+            var exception
+                = await Should.ThrowAsync<IggyInvalidStatusCodeException>(() =>
+                    client.SendBinaryRequestAsync(code, []));
             exception.StatusCode.ShouldBe(3);
         }
     }
@@ -64,8 +65,8 @@ public class RawCommandTests
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        var exception = await Should.ThrowAsync<IggyInvalidStatusCodeException>(
-            () => client.SendBinaryRequestAsync(60_000, []));
+        var exception
+            = await Should.ThrowAsync<IggyInvalidStatusCodeException>(() => client.SendBinaryRequestAsync(60_000, []));
 
         exception.StatusCode.ShouldBe(3);
     }
@@ -77,7 +78,6 @@ public class RawCommandTests
     {
         var client = await Fixture.CreateAuthenticatedClient(protocol);
 
-        await Should.ThrowAsync<FeatureUnavailableException>(
-            () => client.SendBinaryRequestAsync(1, []));
+        await Should.ThrowAsync<FeatureUnavailableException>(() => client.SendBinaryRequestAsync(1, []));
     }
 }

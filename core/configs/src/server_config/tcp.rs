@@ -15,20 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! TCP listener schema.
+
 use configs::ConfigEnv;
-use iggy_common::{IggyByteSize, IggyDuration};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
-use serde_with::serde_as;
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct TcpConfig {
     pub enabled: bool,
     pub address: String,
-    pub ipv6: bool,
     pub tls: TcpTlsConfig,
-    pub socket: TcpSocketConfig,
-    pub socket_migration: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
@@ -37,19 +33,4 @@ pub struct TcpTlsConfig {
     pub self_signed: bool,
     pub cert_file: String,
     pub key_file: String,
-}
-
-#[serde_as]
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct TcpSocketConfig {
-    pub override_defaults: bool,
-    #[config_env(leaf)]
-    pub recv_buffer_size: IggyByteSize,
-    #[config_env(leaf)]
-    pub send_buffer_size: IggyByteSize,
-    pub keepalive: bool,
-    pub nodelay: bool,
-    #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
-    pub linger: IggyDuration,
 }

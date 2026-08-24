@@ -448,40 +448,32 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsSessionRemovalAfterDisconnect) {
 }
 
 TEST_F(LowLevelE2E_Client, GetClientsReflectsLoggedOutSessionAsUnauthenticated) {
-    RecordProperty("description",
-                   "Keeps a logged out session visible in get_clients and get_client, but marks it unauthenticated.");
+    RecordProperty("description", "Drops a logged out session from get_clients and reports it missing in get_client.");
     iggy::ffi::Client *first_client  = GetLoggedInClient();
     iggy::ffi::Client *second_client = GetLoggedInClient();
 
     iggy::ffi::ClientInfoDetails first_me{};
-    iggy::ffi::ClientInfoDetails logged_out_client{};
-    rust::Vec<iggy::ffi::ClientInfo> clients_after_logout;
     ASSERT_NO_THROW({ first_me = first_client->get_me(); });
 
+    // The VSR server drops the client-table entry on logout (an unauthenticated
+    // session is not tracked), unlike the legacy server which kept it visible
+    // without a user id.
     ASSERT_NO_THROW(first_client->logout_user());
-    ASSERT_NO_THROW({
-        clients_after_logout = second_client->get_clients();
-        logged_out_client    = second_client->get_client(first_me.client_id);
-    });
-
-    bool found_first = false;
-    for (const auto &client : clients_after_logout) {
-        if (client.client_id != first_me.client_id) {
-            continue;
+    constexpr auto removal_timeout       = std::chrono::seconds(5);
+    constexpr auto removal_poll_interval = std::chrono::milliseconds(10);
+    const auto deadline                  = std::chrono::steady_clock::now() + removal_timeout;
+    bool removed                         = false;
+    do {
+        const auto clients = second_client->get_clients();
+        removed            = std::none_of(clients.begin(), clients.end(),
+                                          [&first_me](const auto &client) { return client.client_id == first_me.client_id; });
+        if (removed) {
+            break;
         }
-
-        found_first = true;
-        EXPECT_FALSE(client.has_user_id);
-        EXPECT_EQ(static_cast<std::string>(client.address), static_cast<std::string>(first_me.address));
-        EXPECT_EQ(static_cast<std::string>(client.transport), static_cast<std::string>(first_me.transport));
-        break;
-    }
-
-    EXPECT_TRUE(found_first);
-    EXPECT_EQ(logged_out_client.client_id, first_me.client_id);
-    EXPECT_FALSE(logged_out_client.has_user_id);
-    EXPECT_EQ(static_cast<std::string>(logged_out_client.address), static_cast<std::string>(first_me.address));
-    EXPECT_EQ(static_cast<std::string>(logged_out_client.transport), static_cast<std::string>(first_me.transport));
+        std::this_thread::sleep_for(removal_poll_interval);
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(removed);
+    ASSERT_THROW(second_client->get_client(first_me.client_id), std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, LoginWithoutConnect) {
@@ -567,9 +559,12 @@ TEST_F(LowLevelE2E_Client, GetStatsBeforeLoginThrows) {
     ASSERT_THROW(client->get_stats(), std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingPartition) {
+// The VSR server has no unsaved-buffer primitive (writes are journaled at
+// commit); FLUSH_UNSAVED_BUFFER denies typed with FeatureUnavailable even for
+// resolvable targets.
+TEST_F(LowLevelE2E_Client, FlushUnsavedBufferThrowsForExistingPartition) {
     RecordProperty("description",
-                   "Creates a stream and topic, sends one message, and flushes the partition buffer successfully.");
+                   "Rejects flush_unsaved_buffer with the feature-unavailable error for an existing partition.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -577,21 +572,22 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingPartition) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     messages.push_back(iggy::ffi::make_message(to_payload("flush-me"), rust::Vec<iggy::ffi::HeaderEntry>()));
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
-    ASSERT_NO_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true));
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
+                 std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingEmptyPartition) {
-    RecordProperty("description",
-                   "Succeeds when flush_unsaved_buffer is called for an existing partition with no unsaved messages.");
+TEST_F(LowLevelE2E_Client, FlushUnsavedBufferThrowsForExistingEmptyPartition) {
+    RecordProperty(
+        "description",
+        "Rejects flush_unsaved_buffer with the feature-unavailable error for a partition with no unsaved messages.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -599,11 +595,11 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferSucceedsForExistingEmptyPartition) 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
-    ASSERT_NO_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true));
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, FlushUnsavedBufferBeforeLoginThrows) {
@@ -631,8 +627,8 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferOnNonExistentStreamThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     ASSERT_THROW(
         client->flush_unsaved_buffer(make_string_identifier(GetRandomName()), make_numeric_identifier(0), 0, true),
@@ -647,8 +643,8 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferOnNonExistentTopicThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     ASSERT_THROW(client->flush_unsaved_buffer(make_string_identifier(stream_name),
                                               make_string_identifier(GetRandomName()), 0, true),
@@ -664,8 +660,8 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferAfterStreamDeletedThrows) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     const std::uint32_t saved_stream_id = stream.id;
     ASSERT_NO_THROW(client->delete_stream(make_numeric_identifier(saved_stream_id)));
@@ -685,8 +681,8 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferAfterTopicDeletedThrows) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
     ASSERT_NO_THROW(client->delete_topic(make_numeric_identifier(stream.id), make_string_identifier(topic_name)));
 
     ASSERT_THROW(
@@ -694,8 +690,9 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferAfterTopicDeletedThrows) {
         std::exception);
 }
 
-TEST_F(LowLevelE2E_Client, FlushUnsavedBufferTwiceSucceeds) {
-    RecordProperty("description", "Allows flush_unsaved_buffer to be called twice in a row for the same partition.");
+TEST_F(LowLevelE2E_Client, FlushUnsavedBufferTwiceThrows) {
+    RecordProperty("description",
+                   "Rejects flush_unsaved_buffer with the feature-unavailable error consistently across repeat calls.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -703,18 +700,18 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferTwiceSucceeds) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     messages.push_back(iggy::ffi::make_message(to_payload("flush-twice"), rust::Vec<iggy::ffi::HeaderEntry>()));
 
     ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                           "partition_id", partition_id_bytes(0), std::move(messages)));
-    ASSERT_NO_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true));
-    ASSERT_NO_THROW(
-        client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true));
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
+                 std::exception);
+    ASSERT_THROW(client->flush_unsaved_buffer(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, true),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_Client, FlushUnsavedBufferWithInvalidPartitionIdsThrows) {
@@ -726,8 +723,8 @@ TEST_F(LowLevelE2E_Client, FlushUnsavedBufferWithInvalidPartitionIdsThrows) {
     ASSERT_NO_THROW(client->create_stream(stream_name));
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
-    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     const std::uint32_t invalid_partition_ids[] = {1u, 9999u, static_cast<std::uint32_t>(-1)};
     for (const std::uint32_t invalid_partition_id : invalid_partition_ids) {
@@ -747,8 +744,8 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsBeforeLoginThrows) {
 
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                               "never_expire", 0, "server_default"));
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
+                                               "never_expire", 0, "server_default", {}));
 
     iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
     ASSERT_THROW(unauthenticated_client->delete_segments(make_string_identifier(stream_name),
@@ -774,8 +771,8 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentStreamThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     ASSERT_THROW(
         client->delete_segments(make_string_identifier(missing_stream_name), make_string_identifier(topic_name), 0, 1),
@@ -791,8 +788,8 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentTopicThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     ASSERT_THROW(
         client->delete_segments(make_string_identifier(stream_name), make_string_identifier(missing_topic_name), 0, 1),
@@ -807,8 +804,8 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsOnNonExistentPartitionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     ASSERT_THROW(
         client->delete_segments(make_string_identifier(stream_name), make_string_identifier(topic_name), 999, 1),
@@ -823,8 +820,8 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsWithZeroCountIsNoOp) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     std::uint32_t stream_id = 0;
     std::uint32_t topic_id  = 0;
@@ -904,8 +901,8 @@ TEST_F(LowLevelE2E_Client, DeleteSegmentsWhenOnlyActiveSegmentRemainsIsNoOp) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "never_expire",
-                                         0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "never_expire", 0,
+                                         "server_default", {}));
 
     std::uint32_t stream_id = 0;
     std::uint32_t topic_id  = 0;
@@ -1017,12 +1014,12 @@ TEST_F(LowLevelE2E_Client, GetStatsReturnsServerStats) {
     TrackStream(first_stream_name);
     ASSERT_NO_THROW(client->create_stream(second_stream_name));
     TrackStream(second_stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), first_topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), second_topic_name, 2, "none", 0,
-                                         "server_default", 0, "server_default"));
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(second_stream_name), third_topic_name, 3, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), first_topic_name, 1, "none",
+                                         "server_default", 0, "server_default", {}));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(first_stream_name), second_topic_name, 2, "none",
+                                         "server_default", 0, "server_default", {}));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(second_stream_name), third_topic_name, 3, "none",
+                                         "server_default", 0, "server_default", {}));
     ASSERT_NO_THROW(client->create_partitions(make_string_identifier(first_stream_name),
                                               make_string_identifier(first_topic_name), additional_partitions_count));
     const auto first_group  = client->create_consumer_group(make_string_identifier(first_stream_name),
@@ -1170,8 +1167,8 @@ TEST_F(LowLevelE2E_Client, GetMeReflectsConsumerGroupMembershipChanges) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     const auto stream_details = client->get_stream(make_string_identifier(stream_name));
     ASSERT_EQ(stream_details.topics.size(), 1u);
@@ -1567,15 +1564,21 @@ TEST_F(LowLevelE2E_Client, GetClientsReflectsAdditionalSession) {
 }
 
 TEST_F(LowLevelE2E_Client, GetClusterMetadataBeforeLoginThrows) {
-    RecordProperty(
-        "description",
-        "Rejects get_cluster_metadata before connect, after connect but before login, and after disconnect.");
+    RecordProperty("description",
+                   "Rejects get_cluster_metadata before connect, after connect but before login, and after disconnect, "
+                   "and serves it once authenticated.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
     ASSERT_THROW(client->get_cluster_metadata(), std::exception);
     ASSERT_NO_THROW(client->connect());
+    // The roster is private, so the read is auth-gated. No pre-login read is
+    // needed: a client that dialed a backup logs in there and the server
+    // forwards the register to the primary.
     ASSERT_THROW(client->get_cluster_metadata(), std::exception);
     ASSERT_NO_THROW(client->login_user("iggy", "iggy"));
+    iggy::ffi::ClusterMetadata metadata{};
+    ASSERT_NO_THROW({ metadata = client->get_cluster_metadata(); });
+    ASSERT_GE(metadata.nodes.size(), 1u);
     ASSERT_NO_THROW(client->disconnect());
     ASSERT_THROW(client->get_cluster_metadata(), std::exception);
 }
@@ -1631,6 +1634,8 @@ TEST_F(LowLevelE2E_Client, PingSucceedsForNewConnection) {
     RecordProperty("description", "Successfully pings the server from a fresh unauthenticated client session.");
     iggy::ffi::Client *client = GetLoggedOutClient();
 
+    // The VSR client has no lazy connect; ping still needs no authentication.
+    ASSERT_NO_THROW(client->connect());
     ASSERT_NO_THROW(client->ping());
 }
 

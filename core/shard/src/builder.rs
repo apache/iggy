@@ -36,6 +36,7 @@ use crate::{
 };
 use consensus::VsrConsensus;
 use journal::JournalHandle;
+use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{MessageBus, SendError};
@@ -47,17 +48,17 @@ use std::rc::Rc;
 use crate::shards_table::ShardsTable;
 
 /// A freshly constructed [`IggyShard`].
-pub struct BuiltShard<B, MJ, S, M, T>
+pub struct BuiltShard<B, MJ, S, M, T, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
-    pub shard: IggyShard<B, MJ, S, M, T>,
+    pub shard: IggyShard<B, MJ, S, M, T, SB>,
 }
 
 /// Builder that pairs [`IggyShard`] construction with coordinator wiring
 /// on shard 0. Non-zero shards skip the coordinator entirely; the
 /// `coord_config` field is then ignored.
-pub struct IggyShardBuilder<B, MJ, S, M, T>
+pub struct IggyShardBuilder<B, MJ, S, M, T, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
@@ -68,23 +69,25 @@ where
     on_metadata_submit: MetadataSubmitHandler,
     on_list_clients: ListClientsHandler,
     on_partition_read: PartitionReadHandler,
-    metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
-    partitions: IggyPartitions<B>,
+    metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
+    partitions: IggyPartitions<B, SB>,
     senders: Vec<TaggedSender>,
     inbox: Receiver<ShardFrame>,
+    reply_inbox: Receiver<ShardFrame>,
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
     metrics: ShardMetrics,
 }
 
-impl<B, MJ, S, M, T> IggyShardBuilder<B, MJ, S, M, T>
+impl<B, MJ, S, M, T, SB> IggyShardBuilder<B, MJ, S, M, T, SB>
 where
     B: MessageBus + Clone + 'static,
     T: ShardsTable,
     MJ: JournalHandle,
     S: Send + 'static,
     M: StateMachine,
+    SB: SuperblockStore,
 {
     /// Create a builder carrying every input needed by both
     /// [`IggyShard::new`] and (for shard 0) `ShardZeroCoordinator::new`.
@@ -97,10 +100,11 @@ where
         on_metadata_submit: MetadataSubmitHandler,
         on_list_clients: ListClientsHandler,
         on_partition_read: PartitionReadHandler,
-        metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M>,
-        partitions: IggyPartitions<B>,
+        metadata: IggyMetadata<VsrConsensus<B>, MJ, S, M, SB>,
+        partitions: IggyPartitions<B, SB>,
         senders: Vec<TaggedSender>,
         inbox: Receiver<ShardFrame>,
+        reply_inbox: Receiver<ShardFrame>,
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coord_config: CoordinatorConfig,
@@ -118,6 +122,7 @@ where
             partitions,
             senders,
             inbox,
+            reply_inbox,
             shards_table,
             partition_consensus,
             coord_config,
@@ -137,7 +142,7 @@ where
     /// [`ShardCtorError::ShardCountOverflow`] if `senders.len()` does not
     /// fit in `u16`. Both are bootstrap programming errors and the
     /// `u16` overflow check fires on every shard, not only shard 0.
-    pub fn build(self) -> Result<BuiltShard<B, MJ, S, M, T>, ShardCtorError> {
+    pub fn build(self) -> Result<BuiltShard<B, MJ, S, M, T, SB>, ShardCtorError> {
         let is_shard_zero = self.identity.id == 0;
 
         // Fail fast before installing forward closures: a misordered
@@ -188,7 +193,10 @@ where
                             client_id,
                             msg,
                         });
-                        sender.try_send(frame).map_err(|err| {
+                        // Reply lane: a forwarded client reply is terminal on
+                        // drop, so it must not compete with consensus frames
+                        // for main-lane capacity.
+                        sender.reply_sender().try_send(frame).map_err(|err| {
                             metrics_for_client.record_frame_drop(
                                 frame_drop_variant::FORWARD_CLIENT_SEND,
                                 classify_try_send_err(&err),
@@ -225,6 +233,7 @@ where
             self.partitions,
             self.senders,
             self.inbox,
+            self.reply_inbox,
             self.shards_table,
             self.partition_consensus,
             coordinator,

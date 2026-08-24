@@ -15,17 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod cache_indexes;
+//! On-disk config schema for the `iggy-server` binary.
+//!
+//! Composes the shared section vocabulary from [`crate::common`] with the
+//! transport, cluster, metadata and bus sections this server owns.
+//! [`server::ServerConfig`] is the root type the bootstrap loads.
+
 pub mod cluster;
 pub mod defaults;
 pub mod displays;
-pub mod http;
+pub mod message_bus;
+pub mod metadata;
+pub mod partition;
 pub mod quic;
 pub mod server;
 pub mod sharding;
-pub mod system;
 pub mod tcp;
 pub mod validators;
 pub mod websocket;
 
-pub const COMPONENT: &str = "CONFIG";
+pub use crate::common::COMPONENT;

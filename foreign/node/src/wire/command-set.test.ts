@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -23,7 +22,6 @@ import type { RawClient } from '../client/client.type.js';
 import { COMMAND_CODE } from './command.code.js';
 
 const mockRawClient = (): RawClient => ({
-  protocol: 'classic',
   sendCommand: async () => {
     throw new Error('sendCommand should not be called by the session-control guard');
   },

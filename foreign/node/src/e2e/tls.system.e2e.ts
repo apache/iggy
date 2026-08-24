@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 // TLS integration tests for the Node.js SDK.
 //
@@ -51,14 +50,10 @@ const caCertPath = process.env.E2E_ROOT_CA_CERT
 const getTlsClient = () => {
   const [, port] = getIggyAddress();
   const caCert = readFileSync(caCertPath);
-  const protocol = process.env.IGGY_TEST_PROTOCOL === 'vsr'
-    ? 'vsr'
-    : 'classic';
 
   // The server certificate SAN is DNS:localhost, so we connect via 'localhost'
   // for proper hostname verification (consistent with Python and C# TLS tests).
   return new Client({
-    protocol,
     transport: 'TLS',
     options: {
       port,

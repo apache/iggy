@@ -16,7 +16,8 @@
 // under the License.
 
 //! Checkpoint-shaped edge cases for metadata + client-table state transfer,
-//! metadata-plane commands only (`CreateStream` over the raw VSR wire).
+//! metadata-plane commands only (`CreateStream`). The 3-node cases drive the
+//! raw VSR wire; the solo case at the bottom uses the regular TCP client.
 //!
 //! `metadata_state_transfer` pins the base case: one checkpoint, a live
 //! post-checkpoint tail, one restart. This file covers the shapes around it:
@@ -30,22 +31,25 @@
 //!   from the TRANSFERRED reply ring - the WAL entry that produced the reply
 //!   was drained on every node, so nothing but the shipped table can answer;
 //! - a second restart of the same node (the installed snapshot must persist
-//!   and serve as the local floor for another transfer round).
+//!   and serve as the local floor for another transfer round);
+//! - a SOLO replica restarting after its own checkpoint: no transfer in the
+//!   picture, so recovery has to fold the local snapshot back in as the floor
+//!   and replay the WAL suffix on top.
 //!
-//! Checkpoint placement is config-driven: with `metadata.journal_slots = 256`
-//! and the built-in checkpoint margin (64), a checkpoint fires when the
-//! journal holds 192 committed ops, i.e. at op 192, 384, ... The register
-//! commits at op 1 and request K at op K + 1, so request 191 lands checkpoint
-//! one and request 383 lands checkpoint two. Requests here are sequential
-//! with one in flight, which keeps that arithmetic exact; the
-//! `forced checkpoint completed` markers below pin it rather than trust it.
-
-#![cfg(feature = "vsr")]
+//! Checkpoint placement in the 3-node cases is config-driven: with
+//! `metadata.journal_slots = 256` and the built-in checkpoint margin (64), a
+//! checkpoint fires when the journal holds 192 committed ops, i.e. at op 192,
+//! 384, ... The register commits at op 1 and request K at op K + 1, so request
+//! 191 lands checkpoint one and request 383 lands checkpoint two. Requests
+//! here are sequential with one in flight, which keeps that arithmetic exact;
+//! the `forced checkpoint completed` markers below pin it rather than trust
+//! it.
 
 use super::client_table_restart::{
     commit_request, create_stream_payload, register, resume_request, tcp_addr, tcp_addrs,
 };
-use integration::harness::TestHarness;
+use iggy::prelude::*;
+use integration::harness::{TestBinary, TestHarness};
 use integration::iggy_harness;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
@@ -113,8 +117,10 @@ async fn await_checkpoint_on_all_nodes(harness: &TestHarness, generation: usize)
 // a checkpoint, so the transfer descriptor's `commit_op == snapshot_seq` and
 // the post-install tail repair has nothing to fetch (`commit_min ==
 // commit_max` skips it). The below-floor retry then proves the reply ring
-// rode the transferred table: request 191's reply was minted at op 192, which
-// every node drained out of its WAL at that same checkpoint.
+// rode the transferred table: request 191's reply was minted at op 192, and
+// replay starts at `snapshot_seq + 1`, so no node re-executes it. The
+// checkpoint drain keeps op 192's entry as the commit-point header a
+// `DoViewChange` needs, but never replays it.
 #[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
 async fn given_drained_journal_when_node_restarts_should_install_snapshot_only(
     harness: &mut TestHarness,
@@ -273,4 +279,116 @@ async fn given_installed_snapshot_when_node_restarts_again_should_transfer_again
         None,
     )
     .await;
+}
+
+/// The prepare WAL has `SLOT_COUNT = 1024` slots and the coordinator checkpoints at
+/// `<= CHECKPOINT_MARGIN` (64) remaining, so after ~960 uncheckpointed ops. 1024
+/// stream creates clears that with room for a WAL suffix above the checkpoint, and
+/// stays under `MAX_STREAMS`.
+const STREAMS: u32 = 1024;
+
+const RECOVER_TIMEOUT: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+fn stream_name(index: u32) -> String {
+    format!("ckpt-stream-{index}")
+}
+
+/// Connect a root-authenticated TCP client to the solo node.
+async fn connect(harness: &TestHarness) -> IggyClient {
+    harness
+        .node(0)
+        .tcp_client()
+        .expect("tcp client builder")
+        .with_root_login()
+        .connect()
+        .await
+        .expect("connect to the solo node")
+}
+
+/// Poll the solo node until it is back up and serving `stream`, returning the connected
+/// client. Panics on timeout.
+async fn wait_for_stream(harness: &TestHarness, stream: &str) -> IggyClient {
+    let stream_id = Identifier::named(stream).unwrap();
+    let deadline = Instant::now() + RECOVER_TIMEOUT;
+    loop {
+        if let Ok(builder) = harness.node(0).tcp_client()
+            && let Ok(client) = builder.with_root_login().connect().await
+            && matches!(client.get_stream(&stream_id).await, Ok(Some(_)))
+        {
+            return client;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "solo node did not recover and serve {stream} within {RECOVER_TIMEOUT:?}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+// Metadata checkpoint-fold recovery across a solo restart, over
+// `iggy-server`'s production snapshot and WAL path.
+//
+// Between checkpoints a replica recovers its metadata by replaying the WAL. Once the
+// WAL fills, the `SnapshotCoordinator` checkpoints: it persists `snapshot.bin`, pairs
+// it in the superblock, and DRAINS the snapshotted prefix from the WAL. A restart
+// after that must fold the snapshot back in as the recovery floor and replay only the
+// committed suffix on top, rather than rely on a full WAL replay, which no longer
+// holds the drained ops. This drives a real checkpoint by pushing the metadata WAL
+// past `CHECKPOINT_MARGIN`, restarts the process, and asserts that a stream from the
+// drained prefix, recoverable only from the snapshot, and one from the WAL suffix
+// both survive.
+//
+// Solo on purpose: 1-of-1 quorum commits every op the instant it is journaled, so
+// bulk creation is fast and the WAL is fully committed with no uncommitted suffix to
+// reconcile, exercising checkpoint and snapshot-fold recovery in isolation without an
+// election in the mix.
+#[iggy_harness(cluster_nodes = 1, server(system.sharding.cpu_allocation = "0..1"))]
+async fn given_checkpointed_metadata_when_solo_replica_restarts_should_recover_from_snapshot_and_wal(
+    harness: &mut TestHarness,
+) {
+    let client = connect(harness).await;
+    for index in 0..STREAMS {
+        client
+            .create_stream(&stream_name(index))
+            .await
+            .unwrap_or_else(|e| panic!("create stream {index}: {e}"));
+    }
+    drop(client);
+
+    // Crossing CHECKPOINT_MARGIN must have driven the coordinator to persist a snapshot
+    // and drain the WAL prefix behind it.
+    let snapshot_path = harness
+        .node(0)
+        .data_path()
+        .join("metadata")
+        .join("snapshot.bin");
+    let snapshot_len = std::fs::metadata(&snapshot_path).map(|m| m.len()).ok();
+    assert!(
+        snapshot_len.is_some_and(|len| len > 0),
+        "{STREAMS} committed metadata ops must cross CHECKPOINT_MARGIN and persist a \
+         non-empty snapshot at {}, got {snapshot_len:?}",
+        snapshot_path.display()
+    );
+
+    // Restart the solo node: recovery loads the snapshot, holding the drained prefix,
+    // and replays the committed WAL suffix on top.
+    harness.node_mut(0).stop().expect("stop the solo node");
+    harness.node_mut(0).start().expect("restart the solo node");
+
+    // The first stream sits far below the checkpoint op, so it was drained from the WAL
+    // and can come back only from the snapshot; the last stream is in the WAL suffix
+    // above the checkpoint. Both surviving proves snapshot-fold plus suffix recovery,
+    // not a bare WAL replay.
+    let client = wait_for_stream(harness, &stream_name(0)).await;
+    for name in [stream_name(0), stream_name(STREAMS - 1)] {
+        assert!(
+            client
+                .get_stream(&Identifier::named(&name).unwrap())
+                .await
+                .expect("get stream after restart")
+                .is_some(),
+            "stream {name} must survive the checkpointed restart"
+        );
+    }
 }

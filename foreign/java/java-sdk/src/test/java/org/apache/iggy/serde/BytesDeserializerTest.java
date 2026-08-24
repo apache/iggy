@@ -22,8 +22,13 @@ package org.apache.iggy.serde;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.iggy.cluster.ClusterNodeRole;
+import org.apache.iggy.cluster.ClusterNodeStatus;
+import org.apache.iggy.cluster.TransportEndpoints;
+import org.apache.iggy.exception.IggyMalformedResponseException;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.system.CacheMetricsKey;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.user.UserStatus;
@@ -33,10 +38,13 @@ import org.junit.jupiter.api.Test;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
+import java.util.Map;
 
 import static org.apache.iggy.serde.BytesDeserializer.readClientInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readClientInfoDetails;
+import static org.apache.iggy.serde.BytesDeserializer.readClusterMetadata;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroup;
+import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupAssignment;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupDetails;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readConsumerGroupMember;
@@ -45,9 +53,8 @@ import static org.apache.iggy.serde.BytesDeserializer.readGlobalPermissions;
 import static org.apache.iggy.serde.BytesDeserializer.readPartition;
 import static org.apache.iggy.serde.BytesDeserializer.readPermissions;
 import static org.apache.iggy.serde.BytesDeserializer.readPersonalAccessTokenInfo;
-import static org.apache.iggy.serde.BytesDeserializer.readPolledMessage;
-import static org.apache.iggy.serde.BytesDeserializer.readPolledMessages;
 import static org.apache.iggy.serde.BytesDeserializer.readRawPersonalAccessToken;
+import static org.apache.iggy.serde.BytesDeserializer.readSendMessagesResponse;
 import static org.apache.iggy.serde.BytesDeserializer.readStats;
 import static org.apache.iggy.serde.BytesDeserializer.readStreamBase;
 import static org.apache.iggy.serde.BytesDeserializer.readStreamDetails;
@@ -59,6 +66,7 @@ import static org.apache.iggy.serde.BytesDeserializer.readU64AsBigInteger;
 import static org.apache.iggy.serde.BytesDeserializer.readUserInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readUserInfoDetails;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class BytesDeserializerTest {
 
@@ -79,11 +87,48 @@ class BytesDeserializerTest {
         writeU64(buffer, BigInteger.ZERO); // message expiry
         buffer.writeByte(CompressionAlgorithm.None.asCode()); // compression
         writeU64(buffer, BigInteger.valueOf(10000)); // max topic size
-        buffer.writeByte(1); // replication factor
         writeU64(buffer, BigInteger.valueOf(500)); // size
         writeU64(buffer, BigInteger.valueOf(50)); // messages count
         buffer.writeByte(4); // name length
         buffer.writeBytes("test".getBytes());
+        writeOptionsBlock(
+                buffer, Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)));
+        writeOptionsBlock(buffer, Map.of(HeaderKey.fromString("segment_size"), HeaderValue.fromString("1 GiB")));
+    }
+
+    private static void writeTopicDataWithUnknownOptionKind(ByteBuf buffer) {
+        buffer.writeIntLE(10);
+        writeU64(buffer, BigInteger.valueOf(1000));
+        buffer.writeIntLE(4);
+        writeU64(buffer, BigInteger.ZERO);
+        buffer.writeByte(CompressionAlgorithm.None.asCode());
+        writeU64(buffer, BigInteger.valueOf(10000));
+        writeU64(buffer, BigInteger.valueOf(500));
+        writeU64(buffer, BigInteger.valueOf(50));
+        buffer.writeByte(4);
+        buffer.writeBytes("test".getBytes());
+
+        ByteBuf options = Unpooled.buffer();
+        var known = BytesSerializer.toBytes(
+                Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)));
+        options.writeBytes(known);
+        // Hand-rolled entry: a string key with a value kind no `HeaderKind` names.
+        options.writeByte(HeaderKind.String.asCode());
+        options.writeIntLE("from_the_future".length());
+        options.writeBytes("from_the_future".getBytes());
+        options.writeByte(200);
+        options.writeIntLE(2);
+        options.writeBytes(new byte[] {1, 2});
+        buffer.writeIntLE(options.readableBytes());
+        buffer.writeBytes(options);
+
+        writeOptionsBlock(buffer, Map.of());
+    }
+
+    private static void writeOptionsBlock(ByteBuf buffer, Map<HeaderKey, HeaderValue> options) {
+        var optionsTlv = BytesSerializer.toBytes(options);
+        buffer.writeIntLE(optionsTlv.readableBytes());
+        buffer.writeBytes(optionsTlv);
     }
 
     private static void writePartitionData(ByteBuf buffer) {
@@ -155,6 +200,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(100)); // messages count
             buffer.writeByte(11); // name length
             buffer.writeBytes("test-stream".getBytes(StandardCharsets.UTF_8));
+            writeOptionsBlock(buffer, Map.of());
 
             // when
             var stream = readStreamBase(buffer);
@@ -178,6 +224,7 @@ class BytesDeserializerTest {
             writeU64(buffer, BigInteger.valueOf(100));
             buffer.writeByte(6);
             buffer.writeBytes("stream".getBytes());
+            writeOptionsBlock(buffer, Map.of());
             // Write one topic
             writeTopicData(buffer);
 
@@ -206,6 +253,23 @@ class BytesDeserializerTest {
             assertThat(topic.id()).isEqualTo(10L);
             assertThat(topic.name()).isEqualTo("test");
             assertThat(topic.partitionsCount()).isEqualTo(4L);
+            assertThat(topic.options()).containsOnlyKeys("max_topic_size");
+            assertThat(topic.options().get("max_topic_size").kind()).isEqualTo(HeaderKind.Uint64);
+            assertThat(topic.derivedOptions()).containsOnlyKeys("segment_size");
+            assertThat(new String(topic.derivedOptions().get("segment_size").value()))
+                    .isEqualTo("1 GiB");
+        }
+
+        @Test
+        void shouldKeepReadableOptionsWhenOneValueKindIsUnknown() {
+            // The wire contract forwards value kinds a client build has no name
+            // for, so one of them must not cost the whole response.
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicDataWithUnknownOptionKind(buffer);
+
+            var topic = readTopic(buffer);
+
+            assertThat(topic.options()).containsOnlyKeys("max_topic_size");
         }
 
         @Test
@@ -309,6 +373,55 @@ class BytesDeserializerTest {
     }
 
     @Nested
+    class ConsumerGroupAssignmentDeserialization {
+
+        @Test
+        void shouldDeserializeAssignment() {
+            // given — [generation:8][partitions_count:4][partition_id:4]*
+            ByteBuf buffer = Unpooled.buffer();
+            writeU64(buffer, BigInteger.valueOf(7)); // generation
+            buffer.writeIntLE(3); // partitions count
+            buffer.writeIntLE(0);
+            buffer.writeIntLE(1);
+            buffer.writeIntLE(2);
+
+            // when
+            var assignment = readConsumerGroupAssignment(buffer);
+
+            // then
+            assertThat(assignment.generation()).isEqualTo(7L);
+            assertThat(assignment.partitions()).containsExactly(0L, 1L, 2L);
+            assertThat(buffer.isReadable()).isFalse();
+        }
+
+        @Test
+        void shouldDeserializeMemberWithoutPartitions() {
+            // given — distinct from an empty body, which means "not a member"
+            ByteBuf buffer = Unpooled.buffer();
+            writeU64(buffer, BigInteger.valueOf(2)); // generation
+            buffer.writeIntLE(0); // partitions count
+
+            // when
+            var assignment = readConsumerGroupAssignment(buffer);
+
+            // then
+            assertThat(assignment.generation()).isEqualTo(2L);
+            assertThat(assignment.partitions()).isEmpty();
+        }
+
+        @Test
+        void shouldRejectPartitionCountLargerThanPayload() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeLongLE(2);
+            buffer.writeIntLE(Integer.MAX_VALUE);
+
+            assertThatThrownBy(() -> readConsumerGroupAssignment(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("partitions count");
+        }
+    }
+
+    @Nested
     class ConsumerOffsetDeserialization {
 
         @Test
@@ -330,92 +443,97 @@ class BytesDeserializerTest {
     }
 
     @Nested
-    class MessageDeserialization {
+    class SendMessagesResponseDeserialization {
 
-        @Test
-        void shouldDeserializePolledMessageWithoutUserHeaders() {
-            // given
+        private ByteBuf singleConfirmation() {
             ByteBuf buffer = Unpooled.buffer();
-            writeU64(buffer, BigInteger.valueOf(123)); // checksum
-            buffer.writeBytes(new byte[16]); // message ID
-            writeU64(buffer, BigInteger.ZERO); // offset
-            writeU64(buffer, BigInteger.valueOf(1000)); // timestamp
-            writeU64(buffer, BigInteger.valueOf(1000)); // origin timestamp
-            buffer.writeIntLE(0); // user headers length
-            buffer.writeIntLE(5); // payload length
-            writeU64(buffer, BigInteger.ZERO); // reserved
-            buffer.writeBytes("hello".getBytes()); // payload
-
-            // when
-            var message = readPolledMessage(buffer);
-
-            // then
-            assertThat(message.header().checksum()).isEqualTo(BigInteger.valueOf(123));
-            assertThat(message.header().payloadLength()).isEqualTo(5L);
-            assertThat(message.payload()).isEqualTo("hello".getBytes());
-            assertThat(message.userHeaders()).isEmpty();
+            buffer.writeIntLE(1); // confirmations count
+            buffer.writeIntLE(3); // stream ID
+            buffer.writeIntLE(5); // topic ID
+            buffer.writeIntLE(7); // partition ID
+            writeU64(buffer, BigInteger.valueOf(41)); // base offset
+            return buffer;
         }
 
         @Test
-        void shouldDeserializePolledMessageWithUserHeaders() {
+        void shouldDeserializeSingleConfirmation() {
             // given
-            ByteBuf buffer = Unpooled.buffer();
-            writeU64(buffer, BigInteger.ZERO);
-            buffer.writeBytes(new byte[16]);
-            writeU64(buffer, BigInteger.ZERO);
-            writeU64(buffer, BigInteger.valueOf(1000));
-            writeU64(buffer, BigInteger.valueOf(1000));
-
-            // Calculate and write user headers
-            ByteBuf headersBuffer = Unpooled.buffer();
-            headersBuffer.writeByte(HeaderKind.String.asCode());
-            headersBuffer.writeIntLE(3);
-            headersBuffer.writeBytes("key".getBytes());
-            headersBuffer.writeByte(HeaderKind.Raw.asCode());
-            headersBuffer.writeIntLE(3);
-            headersBuffer.writeBytes("val".getBytes());
-
-            buffer.writeIntLE(headersBuffer.readableBytes()); // user headers length
-            buffer.writeIntLE(3); // payload length
-            writeU64(buffer, BigInteger.ZERO); // reserved
-            buffer.writeBytes("abc".getBytes()); // payload
-            buffer.writeBytes(headersBuffer); // user headers
+            ByteBuf buffer = singleConfirmation();
 
             // when
-            var message = readPolledMessage(buffer);
+            var response = readSendMessagesResponse(buffer);
 
             // then
-            assertThat(message.userHeaders()).hasSize(1);
-            assertThat(message.userHeaders().get(HeaderKey.fromString("key")).asRaw())
-                    .isEqualTo("val".getBytes());
+            assertThat(response.confirmations()).hasSize(1);
+            var confirmation = response.confirmations().get(0);
+            assertThat(confirmation.streamId()).isEqualTo(3L);
+            assertThat(confirmation.topicId()).isEqualTo(5L);
+            assertThat(confirmation.partitionId()).isEqualTo(7L);
+            assertThat(confirmation.baseOffset()).isEqualTo(BigInteger.valueOf(41));
         }
 
         @Test
-        void shouldDeserializePolledMessages() {
-            // given
+        void shouldDeserializeEmptyBodyAsNoConfirmations() {
+            // given — legacy servers ack a send with an empty body
             ByteBuf buffer = Unpooled.buffer();
-            buffer.writeIntLE(1); // partition ID
-            writeU64(buffer, BigInteger.valueOf(10)); // current offset
-            buffer.writeIntLE(1); // messages count
-            // Write one message
-            writeU64(buffer, BigInteger.ZERO);
-            buffer.writeBytes(new byte[16]);
-            writeU64(buffer, BigInteger.ZERO);
-            writeU64(buffer, BigInteger.valueOf(1000));
-            writeU64(buffer, BigInteger.valueOf(1000));
+
+            // when
+            var response = readSendMessagesResponse(buffer);
+
+            // then
+            assertThat(response.confirmations()).isEmpty();
+        }
+
+        @Test
+        void shouldDeserializeZeroCountAsNoConfirmations() {
+            // given — the server sends count = 0 when it could not decode the batch
+            ByteBuf buffer = Unpooled.buffer();
             buffer.writeIntLE(0);
-            buffer.writeIntLE(2);
-            writeU64(buffer, BigInteger.ZERO); // reserved
-            buffer.writeBytes("hi".getBytes());
 
             // when
-            var polledMessages = readPolledMessages(buffer);
+            var response = readSendMessagesResponse(buffer);
 
             // then
-            assertThat(polledMessages.partitionId()).isEqualTo(1L);
-            assertThat(polledMessages.currentOffset()).isEqualTo(BigInteger.valueOf(10));
-            assertThat(polledMessages.count()).isEqualTo(1L);
-            assertThat(polledMessages.messages()).hasSize(1);
+            assertThat(response.confirmations()).isEmpty();
+        }
+
+        @Test
+        void shouldRejectConfirmationCountLargerThanPayload() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeIntLE(Integer.MAX_VALUE);
+
+            assertThatThrownBy(() -> readSendMessagesResponse(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("confirmations count");
+        }
+
+        @Test
+        void shouldFailOnTrailingBytes() {
+            // given
+            ByteBuf buffer = singleConfirmation();
+            buffer.writeByte(0xAB);
+
+            // when / then
+            assertThatThrownBy(() -> readSendMessagesResponse(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("trailing");
+        }
+
+        @Test
+        void shouldFailOnTruncationAtEveryByte() {
+            // given
+            ByteBuf complete = singleConfirmation();
+            byte[] bytes = new byte[complete.readableBytes()];
+            complete.getBytes(0, bytes);
+
+            for (int length = 1; length < bytes.length; length++) {
+                ByteBuf truncated = Unpooled.wrappedBuffer(bytes, 0, length);
+
+                // when / then
+                assertThatThrownBy(() -> readSendMessagesResponse(truncated))
+                        .as("truncated at byte %d", length)
+                        .isInstanceOf(RuntimeException.class);
+            }
         }
     }
 
@@ -651,6 +769,7 @@ class BytesDeserializerTest {
             buffer.writeByte(UserStatus.Active.asCode()); // status
             buffer.writeByte(4); // username length
             buffer.writeBytes("user".getBytes());
+            writeOptionsBlock(buffer, Map.of());
 
             // when
             var userInfo = readUserInfo(buffer);
@@ -671,7 +790,8 @@ class BytesDeserializerTest {
             buffer.writeByte(UserStatus.Active.asCode());
             buffer.writeByte(5);
             buffer.writeBytes("admin".getBytes());
-            buffer.writeBoolean(false); // no permissions
+            writeOptionsBlock(buffer, Map.of());
+            buffer.writeIntLE(0); // no-permissions marker: u32_le(0)
 
             // when
             var userInfoDetails = readUserInfoDetails(buffer);
@@ -690,6 +810,7 @@ class BytesDeserializerTest {
             buffer.writeByte(UserStatus.Active.asCode());
             buffer.writeByte(5);
             buffer.writeBytes("admin".getBytes());
+            writeOptionsBlock(buffer, Map.of());
             buffer.writeBoolean(true); // has permissions
             buffer.writeIntLE(10); // permissions length (ignored but required)
             // Write global permissions (10 booleans)
@@ -887,6 +1008,177 @@ class BytesDeserializerTest {
             // then
             assertThat(tokenInfo.name()).isEqualTo("mytoken");
             assertThat(tokenInfo.expiryAt()).isEmpty();
+        }
+    }
+
+    @Nested
+    class ClusterMetadataDeserialization {
+
+        private void writeU32PrefixedString(ByteBuf buffer, String value) {
+            byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+            buffer.writeIntLE(bytes.length);
+            buffer.writeBytes(bytes);
+        }
+
+        private void writeClusterNode(ByteBuf buffer, String name, String ip, int tcpPort, int role, int status) {
+            writeU32PrefixedString(buffer, name);
+            writeU32PrefixedString(buffer, ip);
+            buffer.writeShortLE(tcpPort);
+            buffer.writeShortLE(8080); // quic
+            buffer.writeShortLE(3000); // http
+            buffer.writeShortLE(8070); // websocket
+            buffer.writeByte(role);
+            buffer.writeByte(status);
+        }
+
+        private ByteBuf twoNodeCluster() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeU32PrefixedString(buffer, "test-cluster");
+            buffer.writeIntLE(2);
+            writeClusterNode(buffer, "leader-node", "iggy-leader", 8091, 0, 0);
+            writeClusterNode(buffer, "follower-node", "iggy-follower", 8092, 1, 3);
+            return buffer;
+        }
+
+        @Test
+        void shouldDeserializeMultiNodeCluster() {
+            // given
+            ByteBuf buffer = twoNodeCluster();
+
+            // when
+            var metadata = readClusterMetadata(buffer);
+
+            // then
+            assertThat(metadata.name()).isEqualTo("test-cluster");
+            assertThat(metadata.nodes()).hasSize(2);
+            var leader = metadata.nodes().get(0);
+            assertThat(leader.name()).isEqualTo("leader-node");
+            assertThat(leader.ip()).isEqualTo("iggy-leader");
+            assertThat(leader.endpoints()).isEqualTo(new TransportEndpoints(8091, 8080, 3000, 8070));
+            assertThat(leader.role()).isEqualTo(ClusterNodeRole.Leader);
+            assertThat(leader.status()).isEqualTo(ClusterNodeStatus.Healthy);
+            var follower = metadata.nodes().get(1);
+            assertThat(follower.name()).isEqualTo("follower-node");
+            assertThat(follower.role()).isEqualTo(ClusterNodeRole.Follower);
+            assertThat(follower.status()).isEqualTo(ClusterNodeStatus.Unreachable);
+            assertThat(buffer.isReadable()).isFalse();
+        }
+
+        @Test
+        void shouldDeserializeClusterWithoutNodes() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeU32PrefixedString(buffer, "empty-cluster");
+            buffer.writeIntLE(0);
+
+            // when
+            var metadata = readClusterMetadata(buffer);
+
+            // then
+            assertThat(metadata.name()).isEqualTo("empty-cluster");
+            assertThat(metadata.nodes()).isEmpty();
+        }
+
+        @Test
+        void shouldDeserializeClusterWithEmptyName() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeU32PrefixedString(buffer, "");
+            buffer.writeIntLE(1);
+            writeClusterNode(buffer, "iggy-node", "localhost", 8090, 0, 0);
+
+            // when
+            var metadata = readClusterMetadata(buffer);
+
+            // then
+            assertThat(metadata.name()).isEmpty();
+            assertThat(metadata.nodes()).hasSize(1);
+        }
+
+        @Test
+        void shouldDeserializePortZeroAsDisabledTransport() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeU32PrefixedString(buffer, "test-cluster");
+            buffer.writeIntLE(2);
+            writeClusterNode(buffer, "leader-node", "iggy-leader", 0, 0, 0);
+            writeClusterNode(buffer, "follower-node", "iggy-follower", 8092, 1, 0);
+
+            // when
+            var metadata = readClusterMetadata(buffer);
+
+            // then
+            assertThat(metadata.nodes().get(0).endpoints().tcp()).isZero();
+        }
+
+        @Test
+        void shouldFailOnTruncationAtEveryByte() {
+            // given
+            ByteBuf complete = twoNodeCluster();
+            byte[] bytes = new byte[complete.readableBytes()];
+            complete.getBytes(0, bytes);
+
+            for (int length = 0; length < bytes.length; length++) {
+                ByteBuf truncated = Unpooled.wrappedBuffer(bytes, 0, length);
+
+                // when / then
+                assertThatThrownBy(() -> readClusterMetadata(truncated))
+                        .as("truncated at byte %d", length)
+                        .isInstanceOf(RuntimeException.class);
+            }
+        }
+
+        @Test
+        void shouldFailOnBogusNodesCountWithoutAllocating() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeU32PrefixedString(buffer, "test-cluster");
+            buffer.writeIntLE((int) 0xFFFFFFFFL); // u32::MAX nodes
+
+            // when / then
+            assertThatThrownBy(() -> readClusterMetadata(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("nodes count");
+        }
+
+        @Test
+        void shouldFailOnBogusStringLength() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeIntLE((int) 0xFFFFFFFFL); // u32::MAX name length
+
+            // when / then
+            assertThatThrownBy(() -> readClusterMetadata(buffer)).isInstanceOf(IggyMalformedResponseException.class);
+        }
+
+        @Test
+        void shouldFailOnUnknownRole() {
+            // given
+            ByteBuf buffer = Unpooled.buffer();
+            writeU32PrefixedString(buffer, "test-cluster");
+            buffer.writeIntLE(2);
+            writeClusterNode(buffer, "leader-node", "iggy-leader", 8091, 2, 0);
+            writeClusterNode(buffer, "follower-node", "iggy-follower", 8092, 1, 0);
+
+            // when / then
+            assertThatThrownBy(() -> readClusterMetadata(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("role");
+        }
+
+        @Test
+        void shouldFailOnUnknownStatus() {
+            // given — 5 maps to the Rust Unknown variant, which TryFrom rejects
+            ByteBuf buffer = Unpooled.buffer();
+            writeU32PrefixedString(buffer, "test-cluster");
+            buffer.writeIntLE(2);
+            writeClusterNode(buffer, "leader-node", "iggy-leader", 8091, 0, 5);
+            writeClusterNode(buffer, "follower-node", "iggy-follower", 8092, 1, 0);
+
+            // when / then
+            assertThatThrownBy(() -> readClusterMetadata(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("status");
         }
     }
 }

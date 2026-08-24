@@ -1,7 +1,7 @@
 {
   "name": "apache-iggy",
   "type": "module",
-  "version": "0.8.1-edge.4",
+  "version": "0.10.0-edge.4",
   "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
@@ -37,7 +37,6 @@
   "scripts": {
     "test:unit": "node --import @swc-node/register/esm-register --test --experimental-test-coverage './src/**/*.test.ts'",
     "test:e2e": "node --import @swc-node/register/esm-register --test --experimental-test-coverage --test-force-exit './src/e2e/*.e2e.ts'",
-    "test:e2e:vsr": "IGGY_TEST_PROTOCOL=vsr node --import @swc-node/register/esm-register --test --experimental-test-coverage --test-force-exit './src/e2e/tcp.*.e2e.ts'",
     "test:bdd": "cucumber-js --exit",
     "test": "npm run test:unit && npm run test:bdd && npm run test:e2e",
     "clean": "rm -Rf dist/",
@@ -51,17 +50,18 @@
   "author": "github.com/T1B0",
   "license": "Apache-2.0",
   "dependencies": {
+    "@node-rs/xxhash": "1.7.7",
     "debug": "4.4.3",
     "generic-pool": "3.9.0",
     "uuidv7": "1.2.1"
   },
   "devDependencies": {
-    "@commitlint/cli": "21.2.1",
-    "@commitlint/config-conventional": "21.2.0",
-    "@cucumber/cucumber": "13.2.0",
+    "@commitlint/cli": "21.2.2",
+    "@commitlint/config-conventional": "21.2.2",
+    "@cucumber/cucumber": "13.2.1",
     "@swc-node/register": "1.12.1",
     "@types/debug": "4.1.13",
-    "@types/node": "26.1.1",
+    "@types/node": "26.2.0",
     "c8": "^12.0.0",
     "husky": "9.1.7",
     "typescript": "6.0.3",

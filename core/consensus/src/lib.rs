@@ -27,12 +27,19 @@ pub trait Project<T, C: Consensus> {
 pub trait Pipeline {
     type Entry;
     /// Accepted-but-not-yet-prepared client request. For `LocalPipeline`,
-    /// `RequestEntry` wrapping `Message<RequestHeader>`.
+    /// `RequestEntry` wrapping `Message<RoutedRequestHeader>`.
     type Request;
 
     fn push(&mut self, entry: Self::Entry);
 
     fn pop(&mut self) -> Option<Self::Entry>;
+
+    /// Drop the newest entry when it is exactly `(op, checksum)`, returning it;
+    /// `None` and no mutation otherwise. Unwinds a push that proved not to be durable.
+    ///
+    /// The checksum is not redundant: op numbers repeat across views, so matching on
+    /// `op` alone can pop a live entry belonging to a later one.
+    fn remove_tail(&mut self, op: u64, checksum: u128) -> Option<Self::Entry>;
 
     fn clear(&mut self);
 
@@ -51,6 +58,9 @@ pub trait Pipeline {
     fn is_empty(&self) -> bool;
 
     fn len(&self) -> usize;
+
+    /// Requests parked waiting for a prepare slot (the second queue).
+    fn request_queue_len(&self) -> usize;
 
     /// In-flight prepare-queue capacity. `VsrConsensus` snapshots it at
     /// construction to size the loopback queue and to bound the uncommitted
@@ -93,16 +103,17 @@ pub trait Pipeline {
     }
 }
 
-pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RequestHeader>;
+pub type RequestMessage<C> = <C as Consensus>::Message<<C as Consensus>::RoutedRequestHeader>;
 pub type ReplicateMessage<C> = <C as Consensus>::Message<<C as Consensus>::ReplicateHeader>;
 pub type AckMessage<C> = <C as Consensus>::Message<<C as Consensus>::AckHeader>;
 
 pub trait Consensus: Sized {
     type MessageBus: MessageBus;
-    #[rustfmt::skip] // Scuffed formatter.
-    type Message<H>: ConsensusMessage<H> where H: ConsensusHeader;
+    type Message<H>: ConsensusMessage<H>
+    where
+        H: ConsensusHeader;
 
-    type RequestHeader: ConsensusHeader;
+    type RoutedRequestHeader: ConsensusHeader;
     type ReplicateHeader: ConsensusHeader;
     type AckHeader: ConsensusHeader;
 
@@ -155,12 +166,20 @@ pub use client_table::{
 };
 pub mod state_manifest;
 pub use state_manifest::{
-    StateArtifact, StateManifestError, artifact_kind, decode_state_manifest, encode_state_manifest,
-    state_artifact_checksum,
+    StateArtifact, StateArtifactHasher, StateManifestError, artifact_kind, decode_state_manifest,
+    encode_state_manifest, state_artifact_checksum,
+};
+pub mod state_transfer;
+pub use state_transfer::{
+    ArtifactProgress, ChunkProgress, STATE_TRANSFER_MAX_DECODE_RETRIES,
+    STATE_TRANSFER_MAX_STALL_RETRIES, append_chunk, next_pending_chunk, verify_state_artifact,
 };
 // One-shot per `PipelineEntry` for in-process commit awaiters.
 pub(crate) mod oneshot;
 pub use oneshot::{Canceled, Receiver};
+
+mod fatal;
+pub use fatal::{FatalReason, fatal};
 
 mod impls;
 pub use impls::*;
@@ -175,7 +194,10 @@ pub use observability::*;
 
 mod view_change_quorum;
 pub use view_change_quorum::*;
+
+mod dvc_merge;
+pub use dvc_merge::*;
 mod vsr_state;
 pub use vsr_state::{VsrState, VsrStateError};
 mod vsr_timeout;
-pub use vsr_timeout::TimeoutManager;
+pub use vsr_timeout::{TICK_INTERVAL, TimeoutManager};

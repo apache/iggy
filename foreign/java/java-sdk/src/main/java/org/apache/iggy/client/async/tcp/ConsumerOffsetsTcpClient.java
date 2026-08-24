@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /**
  * Async TCP implementation of consumer offsets client.
@@ -40,10 +41,16 @@ import java.util.concurrent.CompletableFuture;
 public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerOffsetsTcpClient.class);
 
-    private final AsyncTcpConnection connection;
+    private static final byte ACK_QUORUM = 1;
 
-    public ConsumerOffsetsTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
+
+    public ConsumerOffsetsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this.connectionSupplier = connectionSupplier;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
@@ -54,6 +61,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
         payload.writeBytes(BytesSerializer.toBytes(topicId));
         payload.writeBytes(BytesSerializer.toBytes(partitionId));
         payload.writeBytes(BytesSerializer.toBytesAsU64(offset));
+        payload.writeByte(ACK_QUORUM);
 
         log.debug(
                 "Storing consumer offset - Stream: {}, Topic: {}, Partition: {}, Consumer: {}, Offset: {}",
@@ -63,7 +71,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 consumer,
                 offset);
 
-        return connection
+        return connection()
                 .send(CommandCode.ConsumerOffset.STORE.getValue(), payload)
                 .thenAccept(response -> {
                     response.release();
@@ -85,7 +93,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
                 partitionId,
                 consumer);
 
-        return connection
+        return connection()
                 .send(CommandCode.ConsumerOffset.GET.getValue(), payload)
                 .thenApply(response -> {
                     try {

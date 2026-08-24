@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use iggy_common::TopicClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
+    Identifier, IggyError, Topic, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
 };
 
 #[async_trait]
@@ -45,24 +45,12 @@ impl TopicClient for IggyClient {
         &self,
         stream_id: &Identifier,
         name: &str,
-        partitions_count: u32,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicCreateOptions,
     ) -> Result<TopicDetails, IggyError> {
         self.client
             .read()
             .await
-            .create_topic(
-                stream_id,
-                name,
-                partitions_count,
-                compression_algorithm,
-                replication_factor,
-                message_expiry,
-                max_topic_size,
-            )
+            .create_topic(stream_id, name, options)
             .await
     }
 
@@ -71,23 +59,12 @@ impl TopicClient for IggyClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
+        options: &TopicUpdateOptions,
     ) -> Result<(), IggyError> {
         self.client
             .read()
             .await
-            .update_topic(
-                stream_id,
-                topic_id,
-                name,
-                compression_algorithm,
-                replication_factor,
-                message_expiry,
-                max_topic_size,
-            )
+            .update_topic(stream_id, topic_id, name, options)
             .await
     }
 

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_common"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.4"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
 rust-version.workspace = true
@@ -28,9 +28,6 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "README.md"
-
-[features]
-vsr = []
 
 [dependencies]
 aes-gcm = { workspace = true }
@@ -47,7 +44,6 @@ comfy-table = { workspace = true }
 derive_more = { workspace = true }
 humantime = { workspace = true }
 iggy_binary_protocol = { workspace = true }
-lending-iterator = { workspace = true }
 papaya = { workspace = true }
 ring = { workspace = true }
 secrecy = { workspace = true }
@@ -63,3 +59,6 @@ twox-hash = { workspace = true }
 ulid = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
+
+[lints]
+workspace = true

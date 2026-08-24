@@ -37,8 +37,8 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -47,8 +47,14 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessagesRoundTrip) {
         messages.push_back(std::move(msg));
     }
 
-    ASSERT_NO_THROW(client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
-                                          "partition_id", partition_id_bytes(0), std::move(messages)));
+    iggy::ffi::SendMessagesResponse sent;
+    ASSERT_NO_THROW(sent = client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                                 "partition_id", partition_id_bytes(0), std::move(messages)));
+
+    ASSERT_EQ(sent.confirmations.size(), 1u)
+        << "The VSR server reports the written partition's offsets, so a single-partition send "
+        << "must carry exactly one confirmation";
+    EXPECT_EQ(sent.confirmations.front().partition_id, 0u);
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                         make_numeric_identifier(1), "offset", 0, 100, false);
@@ -73,8 +79,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesVerifyMessageIds) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     auto msg  = iggy::ffi::make_message(to_payload("id-test-message"), rust::Vec<iggy::ffi::HeaderEntry>());
@@ -102,8 +108,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesFromEmptyPartition) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                         make_numeric_identifier(1), "offset", 0, 100, false);
@@ -175,8 +181,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningKind) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
@@ -196,8 +202,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithInvalidPartitioningValue) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
@@ -222,8 +228,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesToSpecificPartitionVerified) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 3, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 3, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -255,8 +261,8 @@ TEST_F(LowLevelE2E_Message, SendEmptyMessageVectorThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> empty_messages;
 
@@ -274,8 +280,8 @@ TEST_F(LowLevelE2E_Message, SendMessageWithEmptyPayloadThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     rust::Vec<std::uint8_t> empty_payload;
@@ -296,8 +302,8 @@ TEST_F(LowLevelE2E_Message, SendMessageWithOversizedPayloadThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     // Build a payload one byte over the SDK's max payload size (64 MB).
     constexpr std::uint32_t kOversizedPayloadBytes = 64'000'001u;
@@ -325,8 +331,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesPreservesOrder) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 50; i++) {
@@ -359,8 +365,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithDuplicateIds) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; i++) {
@@ -393,8 +399,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesWithVariousPayloads) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<std::uint8_t> payload_null;
     payload_null.push_back(0x00);
@@ -460,8 +466,8 @@ TEST_F(LowLevelE2E_Message, SendAndPollMessageWithTypedHeadersRoundTrip) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     struct ExpectedHeaderMessage {
         const char *key;
@@ -549,8 +555,8 @@ TEST_F(LowLevelE2E_Message, SendMessageWithDuplicateTypedHeaderKeysThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::HeaderEntry> headers;
     headers.push_back(make_header_entry(make_header_field(iggy::ffi::HeaderKind::String, to_payload("dup-key")),
@@ -575,8 +581,8 @@ TEST_F(LowLevelE2E_Message, SendMessageWithWrongFixedWidthHeaderBytesThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     struct FixedWidthHeaderCase {
         const char *key;
@@ -621,8 +627,8 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderKindThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     iggy::ffi::HeaderField invalid_key;
     invalid_key.kind  = 255;
@@ -649,8 +655,8 @@ TEST_F(LowLevelE2E_Message, SendMessageWithInvalidTypedHeaderSizesThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::HeaderEntry> empty_key_headers;
     empty_key_headers.push_back(
@@ -714,8 +720,8 @@ TEST_F(LowLevelE2E_Message, SendMessageAtUserHeadersSizeBoundary) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     constexpr std::uint32_t kMaxUserHeadersBytes     = 100'000u;
     constexpr std::uint32_t kFullHeaderEncodedBytes  = 267u;  // 10 bytes framing + 2-byte key + 255-byte value
@@ -844,8 +850,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerKindThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "invalid",
                                        make_numeric_identifier(1), "offset", 0, 10, false),
@@ -861,8 +867,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidStrategyKindThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                        make_numeric_identifier(1), "invalid", 0, 10, false),
@@ -878,8 +884,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesCountLessThanAvailable) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -906,8 +912,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithLargeOffset) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -934,8 +940,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesFirstStrategy) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -969,8 +975,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesLastStrategy) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -1005,8 +1011,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyNoAutoCommit) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1047,8 +1053,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesNextStrategyAutoCommit) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 10; i++) {
@@ -1095,8 +1101,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesConsumerIdIndependence) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1129,8 +1135,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleSendsThenPollOrder) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch1;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1178,8 +1184,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesMultipleCustomIds) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     const std::uint64_t id_values[] = {100, 200, 300, 400, 500};
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
@@ -1212,8 +1218,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesAfterStreamDeletedThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     auto msg = iggy::ffi::make_message(to_payload("test"), rust::Vec<iggy::ffi::HeaderEntry>());
@@ -1240,8 +1246,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidPartitionIdThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 9999, "consumer",
                                        make_numeric_identifier(1), "offset", 0, 10, false),
@@ -1257,8 +1263,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithCountZeroThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     ASSERT_THROW(client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0, "consumer",
                                        make_numeric_identifier(1), "offset", 0, 0, false),
@@ -1275,8 +1281,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithoutSpecifyingPartition) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1311,8 +1317,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesTimestampStrategy) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> batch1;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -1374,8 +1380,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesMonotonicOffsets) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 20; i++) {
@@ -1413,8 +1419,8 @@ TEST_F(LowLevelE2E_Message, SendMessagesLargeBatch) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 1000; i++) {
@@ -1474,8 +1480,8 @@ TEST_F(LowLevelE2E_Message, PollMessagesWithInvalidConsumerIdThrows) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     iggy::ffi::Identifier invalid_id;
     invalid_id.kind   = "invalid";
@@ -1496,8 +1502,8 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
     auto stream = client->get_stream(make_string_identifier(stream_name));
     TrackStream(stream.id);
     const std::string topic_name = GetRandomName();
-    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", 0, "never_expire", 0,
-                         "server_default");
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
 
     const std::string group_name = GetRandomName();
     auto group =

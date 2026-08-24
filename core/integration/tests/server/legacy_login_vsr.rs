@@ -15,24 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Legacy login codes against server-ng (vsr). server-ng authenticates only
+//! Legacy login codes against the server (vsr). The server authenticates only
 //! through the Register handshake, so the pre-register `LOGIN_USER` (38) and
 //! `LOGIN_WITH_PERSONAL_ACCESS_TOKEN` (44) codes -- which the vsr SDK never
 //! emits (its typed login methods send the register codes, its raw path
 //! rejects session-control codes) -- must be rejected with a typed
-//! `MalformedLogin` eviction, instead of the misleading `NoSession` eviction
-//! the pre-auth guard would send unbound, or the silent empty-ok reply the
-//! bound non-replicated path would send.
+//! `MalformedLogin` eviction, instead of the generic `Unauthenticated` deny
+//! reply the pre-auth guard would send unbound, or the silent empty-ok reply
+//! the bound non-replicated path would send.
 //! Since the SDK cannot send these codes, the frames are hand-crafted on a raw
 //! TCP socket: a header-only non-replicated frame carrying the code in the
 //! reserved command slot.
 
-#![cfg(feature = "vsr")]
-
 use iggy_binary_protocol::HEADER_SIZE;
 use iggy_binary_protocol::codes::{LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE};
-use iggy_binary_protocol::consensus::{Command2, Operation, RequestHeader};
-use iggy_binary_protocol::namespace::METADATA_CONSENSUS_NAMESPACE;
+use iggy_binary_protocol::consensus::{Command, Operation, RequestHeader};
 use integration::harness::TestHarness;
 use integration::iggy_harness;
 use std::mem::offset_of;
@@ -64,7 +61,7 @@ async fn given_legacy_pat_login_code_when_sent_raw_should_evict_malformed_login(
 /// exercises the same path a bound connection would.
 async fn assert_legacy_login_code_evicted(harness: &TestHarness, code: u32) {
     let mut header = RequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation: Operation::NonReplicated,
         size: u32::try_from(HEADER_SIZE).unwrap(),
         // NonReplicated leaves session / request unchecked, but the header
@@ -72,7 +69,6 @@ async fn assert_legacy_login_code_evicted(harness: &TestHarness, code: u32) {
         client: 0xC0FFEE,
         session: 0,
         request: 0,
-        namespace: METADATA_CONSENSUS_NAMESPACE,
         ..Default::default()
     };
     // A non-replicated command code travels in the first 4 reserved bytes.
@@ -97,7 +93,7 @@ async fn assert_legacy_login_code_evicted(harness: &TestHarness, code: u32) {
     let command_offset = offset_of!(RequestHeader, command);
     assert_eq!(
         reply[command_offset],
-        Command2::Eviction as u8,
+        Command::Eviction as u8,
         "expected an Eviction frame for legacy login code {code}, not a Reply"
     );
     assert_eq!(

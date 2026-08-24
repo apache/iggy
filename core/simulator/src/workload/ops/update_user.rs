@@ -18,7 +18,7 @@
 //! `UpdateUser` op. Targets `Ok` (rename live user to fresh name) or
 //! `UserNotFound` (fabricated user). `UsernameAlreadyExists` not targeted.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -70,11 +70,14 @@ pub fn sample(
         Outcome::InvalidUsername => {
             unreachable!("update_user does not target InvalidUsername")
         }
+        Outcome::InvalidOptionValue => {
+            unreachable!("the simulator only sends an empty update options block")
+        }
     }
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.update_user(&input.user, input.new_username.as_deref(), input.status)
 }
 
@@ -98,8 +101,9 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
                 new: new.clone(),
                 password: input.current_password.clone(),
             }),
-        Outcome::UserNotFound | Outcome::UsernameAlreadyExists | Outcome::InvalidUsername => {
-            Effect::None
-        }
+        Outcome::UserNotFound
+        | Outcome::UsernameAlreadyExists
+        | Outcome::InvalidUsername
+        | Outcome::InvalidOptionValue => Effect::None,
     }
 }

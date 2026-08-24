@@ -123,18 +123,22 @@ namespace Iggy {
         /**
          * Creates a topic.
          *
-         * message_expiry_micros is null for server default.
+         * Every option left null resolves against the server default at admission.
          *
          * @param mixed $stream
          * @param string $name
          * @param int $partitions_count
          * @param string|null $compression_algorithm
-         * @param int|null $replication_factor
          * @param int|null $message_expiry_micros
          * @param int|null $max_topic_size
+         * @param int|null $segment_size
+         * @param bool|null $enforce_fsync
+         * @param int|null $messages_required_to_save
+         * @param int|null $size_of_messages_required_to_save
+         * @param bool|null $preallocate_segments
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $replication_factor = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, ?int $message_expiry_micros = null, ?int $max_topic_size = null, ?int $segment_size = null, ?bool $enforce_fsync = null, ?int $messages_required_to_save = null, ?int $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null): void {}
 
         /**
          * Deletes a stream by id or name.
@@ -218,15 +222,16 @@ namespace Iggy {
         public function sendBinaryRequest(int $code, string $payload): string {}
 
         /**
-         * Sends messages to a topic.
+         * Sends messages to a topic and returns the commit confirmations, one per
+         * partition the batch landed in.
          *
          * @param mixed $stream
          * @param mixed $topic
          * @param int $partition_id
          * @param array $messages
-         * @return void
+         * @return \Iggy\SendMessagesResponse
          */
-        public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): void {}
+        public function sendMessages(mixed $stream, mixed $topic, int $partition_id, array $messages): \Iggy\SendMessagesResponse {}
     }
 
     /**
@@ -495,6 +500,54 @@ namespace Iggy {
          * @param string $data
          */
         public function __construct(string $data) {}
+    }
+
+    /**
+     * A PHP class representing where one partition's batch was committed.
+     */
+    class SendMessagesConfirmation {
+        /**
+         * The offset assigned to the first message of the batch in this partition.
+         *
+         * Delivery is at-least-once, so an earlier retry may already have committed the
+         * same batch at a lower offset. The value never implies uniqueness.
+         *
+         * A batch is confirmed once it is committed in memory, not once it is fsynced. A
+         * crash-restart can stamp a later batch with an offset a client has already
+         * recorded.
+         *
+         * @var int
+         */
+        public readonly int $base_offset;
+
+        public readonly int $partition_id;
+
+        public readonly int $stream_id;
+
+        public readonly int $topic_id;
+
+        public function __construct() {}
+    }
+
+    /**
+     * A PHP class representing the commit confirmations of a send.
+     */
+    class SendMessagesResponse {
+        /**
+         * One confirmation per partition the batch landed in.
+         *
+         * The list is empty when the server reports no offsets. A server can commit a
+         * batch it has no offsets to describe, so check for an empty array instead of
+         * indexing.
+         *
+         * The confirmations are rebuilt on each getter call; cache the result in PHP if
+         * they will be read repeatedly.
+         *
+         * @var array
+         */
+        public readonly array $confirmations;
+
+        public function __construct() {}
     }
 
     class StreamDetails {

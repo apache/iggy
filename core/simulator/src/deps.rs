@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::executor::TimerHandle;
+use crate::executor::{TimerHandle, yield_once};
 use clock::Clock;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::{IggyTimestamp, variadic};
@@ -168,13 +168,44 @@ impl Drop for JournalAccessGuard<'_> {
 }
 
 #[allow(clippy::future_not_send)]
-impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
+impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
     type HeaderRef<'a>
         = &'a PrepareHeader
     where
         Self: 'a;
+
+    fn last_op(&self) -> Option<u64> {
+        self.last_op.get()
+    }
+
+    /// Drop the suffix, so a simulated backup whose entries disagree with a started
+    /// view reconciles the way a real one does. Mirrors
+    /// `PrepareJournal::truncate_from`, whose watermark stays put; here it never moves.
+    async fn truncate_from(&self, from_op: u64) -> std::io::Result<usize> {
+        if from_op == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "truncate_from: ops are 1-based, so 0 would discard the whole journal",
+            ));
+        }
+        #[cfg(debug_assertions)]
+        let _guard = JournalAccessGuard::new(&self.accessing);
+        let headers = unsafe { &mut *self.headers.get() };
+        let offsets = unsafe { &mut *self.offsets.get() };
+        let doomed: Vec<u64> = headers
+            .keys()
+            .copied()
+            .filter(|op| *op >= from_op)
+            .collect();
+        for op in &doomed {
+            headers.remove(op);
+            offsets.remove(op);
+        }
+        self.last_op.set(headers.keys().copied().max());
+        Ok(doomed.len())
+    }
 
     /// The simulated journal retains everything for the run, so nothing is
     /// ever superseded by a snapshot. Answered explicitly (the trait has no
@@ -252,7 +283,6 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
 }
 
 impl JournalHandle for SimJournal<MemStorage> {
-    type Storage = MemStorage;
     type Target = Self;
 
     fn handle(&self) -> &Self::Target {
@@ -266,6 +296,24 @@ impl SimJournal<MemStorage> {
     #[must_use]
     pub const fn last_op(&self) -> Option<u64> {
         self.last_op.get()
+    }
+
+    /// Forget one op, leaving a hole exactly where a lost prepare would.
+    ///
+    /// Tests only. The alternative is choreographing `Prepare`, `Commit` and
+    /// `RepairPrepare` drops on a directed link until a replica falls behind, which
+    /// is fragile to tune; the scenarios are about what a replica does with a hole,
+    /// not how it got one.
+    ///
+    /// `last_op` is deliberately left alone: a hole below the head must not look like
+    /// a shorter log, since that is the state a view change has to survive.
+    pub fn forget_op(&self, op: u64) -> bool {
+        #[cfg(debug_assertions)]
+        let _guard = JournalAccessGuard::new(&self.accessing);
+        let headers = unsafe { &mut *self.headers.get() };
+        let offsets = unsafe { &mut *self.offsets.get() };
+        offsets.remove(&op);
+        headers.remove(&op).is_some()
     }
 
     /// The committed watermark to restore after a restart, mirroring
@@ -299,7 +347,7 @@ impl SimJournal<MemStorage> {
 
     /// Read the entry at `op` synchronously, for off-executor WAL replay at restart.
     /// Mirrors [`Journal::entry`] without the never-suspending `MemStorage` await, so
-    /// it needs no [`JournalAccessGuard`]: a synchronous read offers no suspension
+    /// it needs no `JournalAccessGuard`: a synchronous read offers no suspension
     /// point for another task to interleave on.
     ///
     /// # Panics
@@ -336,6 +384,12 @@ pub struct SimSuperblock {
     /// shard withholds the view-scoped send. Proves the split-brain gate, that a
     /// replica never sends in a view it has not durably recorded.
     fail_writes: Cell<bool>,
+    /// Fault injection: when set, every [`SuperblockStore::write`] suspends once
+    /// before completing. A real superblock persist is an fsync-wide suspension
+    /// point; the default in-memory write completes on first poll, so nothing can
+    /// interleave with a persist and every schedule-sensitive bug behind one is
+    /// invisible to the simulator. The yield restores the window.
+    yield_writes: Cell<bool>,
 }
 
 impl SimSuperblock {
@@ -347,9 +401,15 @@ impl SimSuperblock {
     }
 
     /// Make every subsequent write fail, a persistent write fault, so the durability
-    /// gate withholds view-scoped sends. See [`Self::fail_writes`].
+    /// gate withholds view-scoped sends. See `Self::fail_writes`.
     pub fn set_fail_writes(&self) {
         self.fail_writes.set(true);
+    }
+
+    /// Make every subsequent write suspend once before completing, so tasks that
+    /// are ready at persist time interleave with it. See `Self::yield_writes`.
+    pub fn set_yield_writes(&self) {
+        self.yield_writes.set(true);
     }
 }
 
@@ -358,6 +418,9 @@ impl SuperblockStore for SimSuperblock {
     async fn write(&self, payload: &[u8]) -> std::io::Result<()> {
         if self.fail_writes.get() {
             return Err(std::io::Error::other("sim superblock write fault"));
+        }
+        if self.yield_writes.get() {
+            yield_once().await;
         }
         *self.latest.borrow_mut() = Some(payload.to_vec());
         Ok(())

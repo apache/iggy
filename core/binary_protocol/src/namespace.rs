@@ -15,16 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Wire-format namespace routing constants.
+//! Consensus group-id packing constants.
 //!
-//! Both the SDK encoder (which writes `RequestHeader.namespace`) and the
-//! server-side sharding layer (which hashes it to a shard) must agree on
-//! how stream/topic/partition triples pack into the namespace `u64`. Any
-//! drift between the two silently routes writes to the wrong shard, so the
-//! single source of truth lives here in the wire-format crate that both
-//! sides already depend on.
+//! Clients send no group or namespace at all -- the server derives the
+//! target from the operation and the request payload, stamps it into
+//! `RoutedRequestHeader.group` at the dispatch boundary, and every internal
+//! layer (sharding hash, consensus demux, repair replay) routes on that
+//! stamped value. How stream/topic/partition triples pack into the `u64`
+//! is therefore a server-side agreement between the resolver and the
+//! sharding layer; the single source of truth lives here in the wire-format
+//! crate both already depend on.
 
-pub const MAX_STREAMS: usize = 4096;
+/// Only the HIGHEST field widens for free.
+///
+/// `STREAM_SHIFT` derives from `TOPIC_SHIFT + TOPIC_BITS`, so growing
+/// `MAX_STREAMS` leaves packed values bit-identical. Growing the others shifts
+/// the fields above them and rewrites every group id on the wire, needing a
+/// version fence and a re-shard.
+pub const MAX_STREAMS: usize = 1 << 20;
 pub const MAX_TOPICS: usize = 4096;
 pub const MAX_PARTITIONS: usize = 1_000_000;
 
@@ -61,20 +69,36 @@ pub const PACKED_NAMESPACE_BITS: u32 = STREAM_BITS + TOPIC_BITS + PARTITION_BITS
 /// Equivalent to `(1 << PACKED_NAMESPACE_BITS) - 1`.
 pub const PACKED_NAMESPACE_MAX: u64 = (1u64 << PACKED_NAMESPACE_BITS) - 1;
 
-/// Reserved consensus-namespace identifier for the cluster's metadata replica.
+/// Reserved consensus GROUP id for the cluster's metadata plane.
 ///
-/// The packed layout uses only bits `0..PACKED_NAMESPACE_BITS`, so the top
-/// bit is unreachable from any packed namespace value. Routers distinguish
-/// metadata's single global consensus group from per-partition consensus
-/// groups by value alone.
-pub const METADATA_CONSENSUS_NAMESPACE: u64 = 1u64 << 63;
+/// The group-id space is not a free namespace: values inside the packed
+/// range are partition groups (the packed stream-topic-partition key), the
+/// top bit is the control plane, and 0 is "unset", legal only on client
+/// request headers. The packed layout uses only bits
+/// `0..PACKED_NAMESPACE_BITS` (compile-asserted below), so the top bit is
+/// unreachable from any packed value and routers distinguish metadata's
+/// single global consensus group from per-partition groups by value alone.
+/// Reserving the BOTTOM of the range instead (Redpanda's raft group 0)
+/// only works for allocated ids; ours are derived, and packed 0 is the
+/// legal partition `(0, 0, 0)`.
+pub const METADATA_GROUP: u64 = 1u64 << 63;
 
 // Compile-time invariants. Bumping `MAX_STREAMS`/`MAX_TOPICS`/`MAX_PARTITIONS`
 // past the values here would silently collapse the sentinel-above-packed-range
 // guarantee and route writes to the wrong shard; the assertions guard against
 // that in every build (release included), not only under `cargo test`.
 const _: () = {
-    assert!(METADATA_CONSENSUS_NAMESPACE > PACKED_NAMESPACE_MAX);
+    assert!(METADATA_GROUP > PACKED_NAMESPACE_MAX);
     assert!(PACKED_NAMESPACE_BITS == STREAM_BITS + TOPIC_BITS + PARTITION_BITS);
     assert!(PACKED_NAMESPACE_MAX == (1u64 << PACKED_NAMESPACE_BITS) - 1);
+    // Guards the ENCODING: any width change re-encodes every group id on the wire.
+    assert!(STREAM_BITS == 20 && TOPIC_BITS == 12 && PARTITION_BITS == 20);
+    // Guards the ADMITTED SET. `bits_required` rounds up, so narrowing a maximum
+    // inside its current width keeps the widths (and the assert above) intact
+    // while turning already-committed ids above the new ceiling into a panic.
+    assert!(MAX_STREAMS == 1 << 20 && MAX_TOPICS == 4096 && MAX_PARTITIONS == 1_000_000);
 };
+
+// `PARTITION_MASK` admits 48,576 ids `MAX_PARTITIONS` forbids, since only the
+// former rounds to a power of two. Bound checks compare against the `MAX_*`
+// constants: a mask is the looser bound and re-opens the aliasing.

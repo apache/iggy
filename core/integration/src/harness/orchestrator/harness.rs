@@ -26,16 +26,12 @@ use crate::harness::handle::{
 use crate::harness::traits::{Restartable, TestBinary};
 use futures::executor::block_on;
 use iggy::prelude::{ClientWrapper, IggyClient};
-#[cfg(feature = "vsr")]
 use iggy_common::Client;
 use iggy_common::TransportProtocol;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(feature = "vsr")]
 use std::time::{Duration, Instant};
-#[cfg(feature = "vsr")]
 use tokio::time::{sleep, timeout};
-#[cfg(feature = "vsr")]
 use tracing::warn;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -154,20 +150,13 @@ impl TestHarness {
             self.jwks_server = Some(mock_server);
         }
 
-        // Legacy single-server harness: plain start, no cluster readiness.
-        #[cfg(not(feature = "vsr"))]
-        for server in &mut self.servers {
-            server.start()?;
-        }
-
-        // Cluster startup (vsr) can hit a transient replica-handshake blip that
+        // Cluster startup can hit a transient replica-handshake blip that
         // leaves the mesh incomplete (a peer link drops mid-handshake, so a
         // node never reaches "all peers connected"). Rather than fail the whole
         // test on a startup blip, retry spawn + mesh-readiness a few times,
         // tearing down and respawning between attempts. `ServerHandle::start`
         // truncates the captured stdout (`File::create`), so the readiness
         // log-grep never matches a stale marker from a prior attempt.
-        #[cfg(feature = "vsr")]
         {
             const CLUSTER_STARTUP_ATTEMPTS: usize = 3;
             for attempt in 1..=CLUSTER_STARTUP_ATTEMPTS {
@@ -219,7 +208,6 @@ impl TestHarness {
         Ok(())
     }
 
-    #[cfg(feature = "vsr")]
     async fn wait_for_cluster_ready(&self) -> Result<(), TestBinaryError> {
         {
             if self.servers.len() <= 1 {
@@ -330,6 +318,20 @@ impl TestHarness {
         Ok(())
     }
 
+    /// Restart node `index` with its data directory INTACT, so it rejoins the
+    /// still-live cluster from its own recovered state (superblock, segments,
+    /// offset files). The counterpart of
+    /// [`Self::restart_node_from_clean_slate`] for the crash-and-return
+    /// shape rather than the provisioned-replacement one.
+    pub fn restart_node(&mut self, index: usize) -> Result<(), TestBinaryError> {
+        let server = self
+            .servers
+            .get_mut(index)
+            .ok_or(TestBinaryError::MissingServer)?;
+        server.stop()?;
+        server.start()
+    }
+
     /// Restart node `index` with its data directory wiped, so it rejoins the
     /// still-live cluster as a fresh replica with no local history. The other
     /// nodes stay up throughout (they hold quorum and keep committing), which
@@ -354,6 +356,34 @@ impl TestHarness {
             .get_mut(index)
             .ok_or(TestBinaryError::MissingServer)?;
         server.stop()
+    }
+
+    /// SIGKILL node `index` and leave it down: the crash counterpart of
+    /// [`Self::stop_node`]. No shutdown hook runs, so nothing buffered in
+    /// process memory reaches disk. Restart via [`Self::restart_node`] to
+    /// exercise crash recovery.
+    pub fn kill_node(&mut self, index: usize) -> Result<(), TestBinaryError> {
+        let server = self
+            .servers
+            .get_mut(index)
+            .ok_or(TestBinaryError::MissingServer)?;
+        server.kill()
+    }
+
+    /// SIGKILL EVERY node, in ascending index order: the whole-cluster
+    /// power-loss shape, versus [`Self::restart_cluster`]'s graceful
+    /// stop-all-then-start-all. The kills spread over at most a couple hundred
+    /// milliseconds (a watchdog join plus a reap each), far below the 5s
+    /// heartbeat timeout, so no election starts between them. Restart via
+    /// [`Self::restart_cluster`].
+    pub fn kill_cluster(&mut self) -> Result<(), TestBinaryError> {
+        if self.servers.is_empty() {
+            return Err(TestBinaryError::MissingServer);
+        }
+        for server in &mut self.servers {
+            server.kill()?;
+        }
+        Ok(())
     }
 
     /// Restart EVERY node and reconnect all clients: the full-cluster
@@ -499,6 +529,23 @@ impl TestHarness {
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
         self.client_builder_for(transport)?
+            .with_root_login()
+            .connect()
+            .await
+    }
+
+    /// Root-authenticated TCP client bound to ONE node of a cluster, unlike
+    /// [`Self::root_client_for`], which always targets node 0.
+    ///
+    /// # Errors
+    ///
+    /// [`TestBinaryError::MissingServer`] when `index` is out of range, or the
+    /// underlying connect/login failure.
+    pub async fn root_client_for_node(&self, index: usize) -> Result<IggyClient, TestBinaryError> {
+        self.servers
+            .get(index)
+            .ok_or(TestBinaryError::MissingServer)?
+            .tcp_client()?
             .with_root_login()
             .connect()
             .await

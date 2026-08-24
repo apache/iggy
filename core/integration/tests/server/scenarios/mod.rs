@@ -16,8 +16,6 @@
 // under the License.
 
 pub mod authentication_scenario;
-#[cfg(not(feature = "vsr"))]
-pub mod bench_scenario;
 pub mod concurrent_produce_consume_scenario;
 pub mod concurrent_scenario;
 pub mod consumer_group_auto_commit_reconnection_scenario;
@@ -28,9 +26,8 @@ pub mod consumer_group_offset_cleanup_scenario;
 pub mod consumer_group_with_multiple_clients_polling_messages_scenario;
 pub mod consumer_group_with_single_client_polling_messages_scenario;
 pub mod consumer_timestamp_polling_scenario;
-pub mod create_message_payload;
 // Cross-protocol PAT visibility (create via HTTP, list via TCP across shards,
-// and the reverse). Runs under vsr too: server-ng serves the PAT routes on its
+// and the reverse). Runs under vsr too: the server serves the PAT routes on its
 // shard-0 HTTP listener and the create/delete commit through the metadata STM,
 // so the token replicates to every shard a TCP client may land on.
 pub mod cross_protocol_pat_scenario;
@@ -51,8 +48,6 @@ pub mod single_message_per_batch_scenario;
 pub mod snapshot_scenario;
 pub mod stale_client_consumer_group_scenario;
 pub mod stream_size_validation_scenario;
-#[cfg(feature = "vsr")]
-pub mod stress_produce_consume_scenario;
 pub mod system_scenario;
 pub mod tcp_tls_scenario;
 pub mod timestamp_scenario;
@@ -82,7 +77,7 @@ const MESSAGES_COUNT: u32 = 1337;
 ///
 /// `send_messages` acks at consensus commit while the owning shard applies
 /// the batch asynchronously (see the materialisation race note at the top
-/// of `server-ng/src/partition_reconciler.rs`), so the first read after a
+/// of `server/src/partition_reconciler.rs`), so the first read after a
 /// send burst can observe fewer messages than were acked. Retrying absorbs
 /// that convergence window without weakening the caller's assertion: real
 /// message loss still returns short and fails it once the deadline expires.

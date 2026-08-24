@@ -23,7 +23,7 @@ use crate::actors::{
     },
 };
 
-use crate::utils::{ClientFactory, authenticate};
+use crate::utils::ClientFactory;
 use futures_util::StreamExt;
 use iggy::prelude::*;
 use std::{sync::Arc, time::Duration};
@@ -33,6 +33,14 @@ use tracing::{error, warn};
 pub struct HighLevelConsumerClient {
     client_factory: Arc<dyn ClientFactory>,
     config: BenchmarkConsumerConfig,
+    /// `IggyConsumer` only borrows the transport, so the owning client has to
+    /// outlive it: dropping the client aborts the SDK heartbeat task, and the
+    /// consumer stops being pinged for the rest of the run. Boxed because the
+    /// low-level client is the smaller of `TypedBenchmarkConsumer`'s two
+    /// variants, and inlining the client here spreads them past what
+    /// `clippy::large_enum_variant` allows.
+    #[allow(dead_code)]
+    client: Option<Box<IggyClient>>,
     consumer: Option<IggyConsumer>,
 }
 
@@ -41,6 +49,7 @@ impl HighLevelConsumerClient {
         Self {
             client_factory,
             config,
+            client: None,
             consumer: None,
         }
     }
@@ -101,14 +110,7 @@ impl ConsumerClient for HighLevelConsumerClient {
 impl BenchmarkInit for HighLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let topic_id_str = "topic-1";
-        let client = self.client_factory.create_client().await;
-        let client = IggyClient::create(client, None, None);
-        authenticate(
-            &client,
-            self.client_factory.username(),
-            self.client_factory.password(),
-        )
-        .await;
+        let client = self.client_factory.create_authenticated_client().await?;
 
         let stream_id_str = self.config.stream_id.clone();
 
@@ -140,6 +142,7 @@ impl BenchmarkInit for HighLevelConsumerClient {
 
         consumer.init().await?;
         self.consumer = Some(consumer);
+        self.client = Some(Box::new(client));
         Ok(())
     }
 }

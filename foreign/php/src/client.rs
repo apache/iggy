@@ -31,7 +31,7 @@ use crate::error::to_php_exception;
 use crate::identifier::PhpIdentifier;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::runtime::runtime;
-use crate::send_message::SendMessage;
+use crate::send_message::{SendMessage, SendMessagesResponse};
 use crate::stream::StreamDetails;
 use crate::topic::TopicDetails;
 
@@ -125,7 +125,7 @@ impl IggyClient {
 
     /// Creates a topic.
     ///
-    /// message_expiry_micros is null for server default.
+    /// Every option left null resolves against the server default at admission.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -133,9 +133,13 @@ impl IggyClient {
         name: String,
         partitions_count: u32,
         compression_algorithm: Option<String>,
-        replication_factor: Option<u8>,
         message_expiry_micros: Option<u64>,
         max_topic_size: Option<u64>,
+        segment_size: Option<u64>,
+        enforce_fsync: Option<bool>,
+        messages_required_to_save: Option<u32>,
+        size_of_messages_required_to_save: Option<u64>,
+        preallocate_segments: Option<bool>,
     ) -> PhpResult {
         let compression_algorithm = match compression_algorithm {
             Some(value) => CompressionAlgorithm::from_str(&value).map_err(to_php_exception)?,
@@ -148,17 +152,26 @@ impl IggyClient {
         let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
 
+        // `None` is what tells admission to resolve the server default, so the
+        // sentinels above must collapse back to it.
+        let options = TopicCreateOptions {
+            partitions_count: Some(partitions_count),
+            compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
+                .then_some(compression_algorithm),
+            message_expiry: (expiry != IggyExpiry::ServerDefault).then_some(expiry),
+            max_topic_size: (max_size != MaxTopicSize::ServerDefault).then_some(max_size),
+            segment_size: segment_size.map(IggyByteSize::from),
+            enforce_fsync,
+            messages_required_to_save,
+            size_of_messages_required_to_save: size_of_messages_required_to_save
+                .map(IggyByteSize::from),
+            preallocate_segments,
+            ..TopicCreateOptions::default()
+        };
+
         runtime().block_on(async move {
             inner
-                .create_topic(
-                    &stream,
-                    &name,
-                    partitions_count,
-                    compression_algorithm,
-                    replication_factor,
-                    expiry,
-                    max_size,
-                )
+                .create_topic(&stream, &name, &options)
                 .await
                 .map(|_| ())
                 .map_err(to_php_exception)
@@ -184,14 +197,15 @@ impl IggyClient {
         })
     }
 
-    /// Sends messages to a topic.
+    /// Sends messages to a topic and returns the commit confirmations, one per
+    /// partition the batch landed in.
     pub fn send_messages(
         &self,
         stream: PhpIdentifier,
         topic: PhpIdentifier,
         partition_id: u32,
         messages: Vec<&SendMessage>,
-    ) -> PhpResult {
+    ) -> PhpResult<SendMessagesResponse> {
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
         let partitioning = Partitioning::partition_id(partition_id);
@@ -205,6 +219,7 @@ impl IggyClient {
             inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
+                .map(SendMessagesResponse::from)
                 .map_err(to_php_exception)
         })
     }

@@ -19,13 +19,14 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(
-    author = "Apache Iggy (Incubating)",
+    author = "Apache Iggy",
     version,
     about = "Apache Iggy: Hyper-Efficient Message Streaming at Laser Speed",
-    long_about = r#"Apache Iggy (Incubating) - A persistent message streaming platform written in Rust
+    long_about = r#"Apache Iggy - a persistent message streaming platform written in Rust
 
-Apache Iggy is a high-performance message streaming platform that supports QUIC, TCP, and HTTP
-transport protocols, capable of processing millions of messages per second with low latency.
+Iggy stores every stream in a replicated log kept consistent by Viewstamped
+Replication. One binary serves both the single-node and the clustered
+deployment; the loaded configuration decides which one you get.
 
 WEBSITE:
     https://iggy.apache.org
@@ -37,102 +38,89 @@ DOCUMENTATION:
     https://iggy.apache.org/docs
 
 CONFIGURATION:
-    The server uses a TOML configuration file. By default, it looks for 'core/server/config.toml'
-    in the current working directory. You can override this with the IGGY_CONFIG_PATH environment
-    variable or use the --config-provider flag.
+    The server reads a TOML configuration file, by default 'core/server/config.toml'
+    resolved against the current working directory. Point IGGY_CONFIG_PATH at
+    another file to override it.
 
     Examples:
-        iggy-server                                    # Uses default file provider (core/server/config.toml)
-        iggy-server --config-provider file             # Explicitly use file provider
-        IGGY_CONFIG_PATH=custom.toml iggy-server       # Use custom config file path
+        iggy-server                                    # Default config file
+        IGGY_CONFIG_PATH=custom.toml iggy-server       # Custom config file path
 
 ENVIRONMENT VARIABLES:
-    Any configuration value can be overridden using environment variables with the IGGY_ prefix.
-    Use underscores to separate nested configuration keys (e.g., IGGY_TCP_ADDRESS=127.0.0.1:8090).
+    Any configuration value can be overridden with an IGGY_ prefixed variable;
+    underscores separate the nested keys (IGGY_TCP_ADDRESS sets [tcp] address).
+    A '.env' file in the working directory is loaded during startup, or the one
+    named by IGGY_ENV_PATH.
 
     Common examples:
-        IGGY_TCP_ADDRESS=0.0.0.0:8090                  # Override TCP server address
-        IGGY_HTTP_ENABLED=true                         # Enable HTTP transport
-        IGGY_SYSTEM_PATH=/data/iggy                    # Set data storage path
-        IGGY_SYSTEM_LOGGING_LEVEL=debug                # Set log level to debug
+        IGGY_SYSTEM_PATH=/data/iggy                    # Data directory
+        IGGY_TCP_ADDRESS=0.0.0.0:8090                  # TCP listener address
+        IGGY_HTTP_ADDRESS=0.0.0.0:3000                 # HTTP listener address
+        IGGY_SYSTEM_LOGGING_LEVEL=debug                # Log level
+        IGGY_ROOT_USERNAME=iggy                        # Root user, set with the password
+        IGGY_ROOT_PASSWORD=secret                      # Root password, set with the username
 
 TRANSPORT PROTOCOLS:
-    - TCP (binary protocol): High-performance, low-latency (default: 127.0.0.1:8090)
-    - QUIC: Modern UDP-based protocol with built-in encryption (default: 127.0.0.1:8080)
-    - HTTP: RESTful API for web integration (default: 127.0.0.1:3000, disabled by default)
+    - TCP (binary protocol)                            (default: 127.0.0.1:8090)
+    - QUIC                                             (default: 127.0.0.1:8080)
+    - WebSocket                                        (default: 127.0.0.1:8092)
+    - HTTP (REST API)                                  (default: 127.0.0.1:3000)
 
 GETTING STARTED:
-    1. Start the server: iggy-server
-    2. Install CLI: cargo install iggy-cli
-    3. Create a stream: iggy stream create my-stream
-    4. Create a topic: iggy topic create my-stream my-topic 1 none
-    5. Send messages: echo "Hello, Iggy!" | iggy message send my-stream my-topic
+    1. Start the server: iggy-server --fresh --with-default-root-credentials
+    2. Install the CLI:  cargo install iggy-cli
+    3. Create a stream:  iggy stream create my-stream
+    4. Create a topic:   iggy topic create my-stream my-topic 1 none
+    5. Send messages:    echo "Hello, Iggy!" | iggy message send my-stream my-topic
+
+CLUSTER:
+    Every node runs the same configuration file with cluster.enabled = true and
+    is told apart only by --replica-id, which selects its own cluster.nodes entry:
+
+        iggy-server --replica-id 0
 
 For more information, visit: https://iggy.apache.org/docs/introduction/getting-started/"#
 )]
+// These doc comments are rendered verbatim as `--help` output, so environment
+// variable names and paths must stay unquoted rather than wear rustdoc backticks.
+#[allow(clippy::doc_markdown)]
 pub struct Args {
-    /// Configuration provider type
+    /// Remove the system path before starting (WARNING: THIS WILL DELETE ALL DATA!)
     ///
-    /// Currently only 'file' provider is supported, which loads configuration from a TOML file.
-    /// The file path can be specified via IGGY_CONFIG_PATH environment variable.
-    #[arg(short, long, default_value = "file", verbatim_doc_comment)]
-    pub config_provider: String,
-
-    /// Remove system path before starting (WARNING: THIS WILL DELETE ALL DATA!)
+    /// Deletes the configured system data directory ('local_data' by default,
+    /// see IGGY_SYSTEM_PATH) before the server boots, so it starts on empty
+    /// state. Intended for clean development setups and testing.
     ///
-    /// This flag will completely remove the system data directory (local_data by default)
-    /// before starting the server. Use this for clean development setups or testing.
+    /// In cluster mode this wipes THIS replica only; it rejoins and refills by
+    /// state transfer from the others. Wiping a quorum at the same time destroys
+    /// committed data, and a service unit file carrying --fresh re-transfers the
+    /// whole dataset on every restart.
     ///
     /// Examples:
-    ///   iggy-server --fresh                          # Start with fresh data directory
-    ///   iggy-server -f                               # Short form
+    ///   iggy-server --fresh                             # Start with a fresh data directory
+    ///   iggy-server -f                                  # Short form
     #[arg(short, long, default_value_t = false, verbatim_doc_comment)]
     pub fresh: bool,
 
     /// Use default root credentials (INSECURE - FOR DEVELOPMENT ONLY!)
     ///
-    /// When this flag is set, the root user will be created with username 'iggy'
-    /// and password 'iggy' if it doesn't exist. If the root user already exists,
-    /// this flag has no effect.
+    /// Sets IGGY_ROOT_USERNAME and IGGY_ROOT_PASSWORD to 'iggy' unless they are
+    /// already present in the environment, so the flag is equivalent to
+    /// exporting both by hand and the environment always takes precedence.
     ///
-    /// This flag is equivalent to setting IGGY_ROOT_USERNAME=iggy and IGGY_ROOT_PASSWORD=iggy,
-    /// but environment variables take precedence over this flag.
-    ///
-    /// WARNING: This is insecure and should only be used for development and testing!
+    /// Only the first creation of the root user reads these values. On an
+    /// existing data directory the stored root user is recovered as it is and
+    /// the flag has no effect.
     ///
     /// Examples:
-    ///   iggy-server --with-default-root-credentials     # Use 'iggy/iggy' as root credentials
+    ///   iggy-server --with-default-root-credentials     # Root logs in as iggy/iggy
     #[arg(long, default_value_t = false, verbatim_doc_comment)]
     pub with_default_root_credentials: bool,
-
-    /// Run server as a follower node (FOR TESTING LEADER REDIRECTION)
-    ///
-    /// When this flag is set, the server will report itself as a follower node
-    /// in cluster metadata responses. This is useful for testing leader-aware
-    /// client connections and redirection logic.
-    ///
-    /// The server will return cluster metadata showing this server as a follower node.
-    ///
-    /// Examples:
-    ///   iggy-server                                      # Run as leader (default)
-    ///   iggy-server --follower                           # Run as follower
-    ///   IGGY_TCP_ADDRESS=127.0.0.1:8091 iggy-server --follower  # Follower on port 8091
-    #[arg(long, default_value_t = false, verbatim_doc_comment)]
-    pub follower: bool,
 
     /// Identifies this node within `cluster.nodes` by its replica ID.
     ///
     /// Required when `cluster.enabled = true`. The value must match exactly
-    /// one `cluster.nodes[*].replica_id` entry in the loaded configuration;
-    /// that entry describes the current node, and all other entries are
-    /// treated as remote peers.
-    ///
-    /// Supplying the identity on the command line lets operators ship a
-    /// single byte-identical `config.toml` to every node in the cluster
-    /// and differ only in this CLI flag.
-    ///
-    /// Examples:
-    ///   iggy-server --replica-id 0                       # This node is replica 0
+    /// one `cluster.nodes[*].replica_id` entry in the loaded configuration.
     #[arg(long, verbatim_doc_comment)]
     pub replica_id: Option<u8>,
 }

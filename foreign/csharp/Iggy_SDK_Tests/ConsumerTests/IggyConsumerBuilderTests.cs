@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
@@ -68,5 +69,45 @@ public class IggyConsumerBuilderTests
             .Build();
 
         Assert.NotNull(consumer);
+    }
+
+    [Fact]
+    public void Build_WithPersonalAccessToken_CreatesTheClient()
+    {
+        var consumer = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "token")
+            .Build();
+
+        Assert.NotNull(consumer);
+    }
+
+    [Fact]
+    public void Build_WithoutCredentials_Throws()
+    {
+        var builder = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", string.Empty);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => builder.Build());
+        Assert.Contains("PersonalAccessToken", ex.Message);
+    }
+
+    [Fact]
+    public void TypedBuild_OverTcp_CreatesTheClient()
+    {
+        IggyConsumerBuilder<string> builder = IggyConsumerBuilder<string>
+            .Create(StreamId, TopicId, Consumer.New(1), new StringDeserializer());
+        builder.WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass");
+
+        Assert.NotNull(builder.Build());
+    }
+
+    private sealed class StringDeserializer : IDeserializer<string>
+    {
+        public string Deserialize(ReadOnlyMemory<byte> data)
+        {
+            return Encoding.UTF8.GetString(data.Span);
+        }
     }
 }

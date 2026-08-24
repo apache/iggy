@@ -21,10 +21,13 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.client.async.SystemClient;
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.apache.iggy.system.OptionSpec;
+import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.Stats;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +35,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /**
  * Async TCP implementation of system client.
@@ -39,10 +43,14 @@ import java.util.concurrent.CompletableFuture;
 public class SystemTcpClient implements SystemClient {
     private static final Logger log = LoggerFactory.getLogger(SystemTcpClient.class);
 
-    private final AsyncTcpConnection connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
 
-    public SystemTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    public SystemTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this.connectionSupplier = connectionSupplier;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
@@ -51,13 +59,49 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting server statistics");
 
-        return connection.send(CommandCode.System.GET_STATS.getValue(), payload).thenApply(response -> {
-            try {
-                return BytesDeserializer.readStats(response);
-            } finally {
-                response.release();
-            }
-        });
+        return connection()
+                .send(CommandCode.System.GET_STATS.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        return BytesDeserializer.readStats(response);
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<List<OptionSpec>> describeOptions(OptionsScope scope) {
+        var payload = Unpooled.buffer(1).writeByte(scope.asCode());
+
+        log.debug("Describing {} options", scope);
+
+        return connection()
+                .send(CommandCode.System.DESCRIBE_OPTIONS.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        return BytesDeserializer.readOptionSpecs(response);
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<ClusterMetadata> getClusterMetadata() {
+        var payload = Unpooled.EMPTY_BUFFER;
+
+        log.debug("Getting cluster metadata");
+
+        return connection()
+                .send(CommandCode.System.GET_CLUSTER_METADATA.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        return BytesDeserializer.readClusterMetadata(response);
+                    } finally {
+                        response.release();
+                    }
+                });
     }
 
     @Override
@@ -66,7 +110,7 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting current client info");
 
-        return connection.send(CommandCode.System.GET_ME.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.System.GET_ME.getValue(), payload).thenApply(response -> {
             try {
                 return BytesDeserializer.readClientInfoDetails(response);
             } finally {
@@ -82,7 +126,7 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting client info for client ID: {}", clientId);
 
-        return connection
+        return connection()
                 .send(CommandCode.System.GET_CLIENT.getValue(), payload)
                 .thenApply(response -> {
                     try {
@@ -99,7 +143,7 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Getting all clients");
 
-        return connection
+        return connection()
                 .send(CommandCode.System.GET_ALL_CLIENTS.getValue(), payload)
                 .thenApply(response -> {
                     try {
@@ -120,7 +164,7 @@ public class SystemTcpClient implements SystemClient {
 
         log.debug("Pinging server");
 
-        return connection.send(CommandCode.System.PING.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.System.PING.getValue(), payload).thenApply(response -> {
             response.release();
             return "pong";
         });

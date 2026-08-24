@@ -62,11 +62,15 @@ pub async fn run(harness: &mut TestHarness) {
         .create_topic(
             &stream_id,
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            // High flush threshold so post-restart messages accumulate in the
+            // journal (which is what exposed the base_offset=0 bug).
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                messages_required_to_save: Some(10_000),
+                enforce_fsync: Some(false),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -95,17 +99,9 @@ pub async fn run(harness: &mut TestHarness) {
         .await
         .unwrap();
 
-    // Explicitly flush to disk, then wait for message_saver to persist.
-    // server-ng has no flush primitive (FLUSH_UNSAVED_BUFFER denies typed);
-    // its graceful shutdown flushes the committed journal, which this
-    // scenario's restart exercises instead.
-    #[cfg(not(feature = "vsr"))]
-    setup_client
-        .flush_unsaved_buffer(
-            &stream_id, &topic_id, 0, true, // fsync
-        )
-        .await
-        .unwrap();
+    // No flush primitive exists (FLUSH_UNSAVED_BUFFER denies typed); graceful
+    // shutdown flushes the committed journal, which this scenario's restart
+    // exercises instead.
     tokio::time::sleep(Duration::from_secs(2)).await;
     drop(setup_client);
 

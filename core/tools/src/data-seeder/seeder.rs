@@ -51,11 +51,11 @@ async fn create_topics(client: &IggyClient, streams: &[(String, u32)]) -> Result
             .create_topic(
                 &Identifier::named(stream_name).unwrap(),
                 "orders",
-                1,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await?;
 
@@ -63,11 +63,11 @@ async fn create_topics(client: &IggyClient, streams: &[(String, u32)]) -> Result
             .create_topic(
                 &Identifier::named(stream_name).unwrap(),
                 "users",
-                2,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(2),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await?;
 
@@ -75,11 +75,11 @@ async fn create_topics(client: &IggyClient, streams: &[(String, u32)]) -> Result
             .create_topic(
                 &Identifier::named(stream_name).unwrap(),
                 "notifications",
-                3,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(3),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await?;
 
@@ -87,11 +87,11 @@ async fn create_topics(client: &IggyClient, streams: &[(String, u32)]) -> Result
             .create_topic(
                 &Identifier::named(stream_name).unwrap(),
                 "payments",
-                2,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(2),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await?;
 
@@ -99,11 +99,11 @@ async fn create_topics(client: &IggyClient, streams: &[(String, u32)]) -> Result
             .create_topic(
                 &Identifier::named(stream_name).unwrap(),
                 "deliveries",
-                1,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await?;
     }

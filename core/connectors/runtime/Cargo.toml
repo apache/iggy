@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-connectors"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 description = "Connectors runtime for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -29,13 +29,11 @@ repository = "https://github.com/apache/iggy"
 readme = "README.md"
 publish = false
 
-[features]
-vsr = ["iggy/vsr"]
-
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true }
 configs = { workspace = true }
 configs_derive = { workspace = true }
@@ -69,6 +67,7 @@ serde_json = { workspace = true }
 serde_with = { workspace = true }
 serde_yaml_ng = { workspace = true }
 strum = { workspace = true }
+subtle = { workspace = true }
 sysinfo = { workspace = true }
 system_stats = { workspace = true }
 thiserror = { workspace = true }
@@ -78,6 +77,11 @@ tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

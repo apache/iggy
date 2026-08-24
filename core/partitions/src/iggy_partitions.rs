@@ -23,10 +23,11 @@ use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RequestHeader,
+    Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
 };
+use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
-use server_common::send_messages2::{ChecksumMode, convert_request_message, encrypt_batch_request};
+use server_common::send_messages::{ChecksumMode, convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 #[cfg(debug_assertions)]
 use std::cell::Cell;
@@ -65,7 +66,7 @@ impl Drop for BorrowGuard<'_> {
 /// For example, shard 0 might have `partition_ids` [0, 2, 4] while shard 1
 /// has `partition_ids` [1, 3, 5]. The `LocalIdx` provides the actual index
 /// into the `partitions` Vec.
-pub struct IggyPartitions<B>
+pub struct IggyPartitions<B, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
@@ -79,7 +80,7 @@ where
     /// only on the shard's pump task. Reconciler routes mutations
     /// through `ReconcileOp` + `ReconcileApply`. Cross-task
     /// access would be UB under cooperative `.await` interleaving.
-    partitions: UnsafeCell<Vec<IggyPartition<B>>>,
+    partitions: UnsafeCell<Vec<IggyPartition<B, SB>>>,
     /// Same single-pump invariant as `partitions`.
     ///
     /// `BTreeMap`, not `HashMap`: iteration order via [`Self::namespaces`] must
@@ -112,9 +113,10 @@ where
     borrow_active: Cell<u32>,
 }
 
-impl<B> IggyPartitions<B>
+impl<B, SB> IggyPartitions<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     #[must_use]
     pub fn new(shard_id: ShardId, config: PartitionsConfig) -> Self {
@@ -147,7 +149,7 @@ where
         &self.config
     }
 
-    fn partitions(&self) -> &Vec<IggyPartition<B>> {
+    fn partitions(&self) -> &Vec<IggyPartition<B, SB>> {
         // SAFETY: see the `partitions` field doc. The returned `&` is sound only
         // while not held across an `.await` on a non-pump task (a sibling
         // reconcile could realloc); single-threadedness alone is not enough.
@@ -179,13 +181,13 @@ where
     }
 
     /// Get partition by local index.
-    pub fn get(&self, local_idx: LocalIdx) -> Option<&IggyPartition<B>> {
+    pub fn get(&self, local_idx: LocalIdx) -> Option<&IggyPartition<B, SB>> {
         self.partitions().get(*local_idx)
     }
 
     /// Get mutable partition by local index.
     #[allow(clippy::mut_from_ref)]
-    fn get_mut(&self, local_idx: LocalIdx) -> Option<&mut IggyPartition<B>> {
+    fn get_mut(&self, local_idx: LocalIdx) -> Option<&mut IggyPartition<B, SB>> {
         // SAFETY: `&mut` is sound on the pump task only (the sole mutator); see
         // `namespace_map_mut`. Single-threadedness alone is not enough.
         unsafe { (&mut *self.partitions.get()).get_mut(*local_idx) }
@@ -197,6 +199,12 @@ where
     }
 
     /// Insert a new partition and return its local index.
+    ///
+    /// Insertion is the moment a build becomes the addressable incarnation,
+    /// so this is also where its offset counter is published into the shared
+    /// `PartitionStats` ([`IggyPartition::publish_current_offset`]). No
+    /// earlier point is safe: a build that is never adopted must leave the
+    /// live incarnation's counters alone.
     ///
     /// # Safety discipline (compiler cannot enforce)
     ///
@@ -211,13 +219,14 @@ where
     /// [`Self::with_partition`]; the `&mut` path above is uncounted (it is
     /// pump-only, so it cannot alias this same-task mutation).
     #[doc(hidden)]
-    pub fn insert(&self, namespace: IggyNamespace, partition: IggyPartition<B>) -> LocalIdx {
+    pub fn insert(&self, namespace: IggyNamespace, partition: IggyPartition<B, SB>) -> LocalIdx {
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.borrow_active.get(),
             0,
             "IggyPartitions::insert while a with_partition borrow is live"
         );
+        partition.publish_current_offset();
         // Safety: pump-only invariant, caller responsibility.
         let partitions = unsafe { &mut *self.partitions.get() };
         let local_idx = LocalIdx::new(partitions.len());
@@ -247,7 +256,7 @@ where
     /// the borrow to a synchronous closure, and must never hold the reference
     /// across an `.await` (a sibling task's reconcile could reallocate the vec
     /// mid-await).
-    pub fn get_by_ns(&self, namespace: &IggyNamespace) -> Option<&IggyPartition<B>> {
+    pub fn get_by_ns(&self, namespace: &IggyNamespace) -> Option<&IggyPartition<B, SB>> {
         if self.is_tombstoned(namespace) {
             return None;
         }
@@ -264,7 +273,7 @@ where
     pub fn with_partition<R>(
         &self,
         namespace: &IggyNamespace,
-        f: impl FnOnce(&IggyPartition<B>) -> R,
+        f: impl FnOnce(&IggyPartition<B, SB>) -> R,
     ) -> Option<R> {
         let partition = self.get_by_ns(namespace)?;
         #[cfg(debug_assertions)]
@@ -292,10 +301,31 @@ where
         suspend.await;
     }
 
+    /// TEST / SIMULATOR ONLY. Address of the partitions vec's heap buffer.
+    ///
+    /// Lets a test prove that an [`Self::insert`] actually REALLOCATED rather
+    /// than landing in spare capacity. The distinction is the whole point of the
+    /// realloc half of PR #3557: `swap_remove` invalidates one slot's reference,
+    /// while a growing `push` moves every element and invalidates all of them. A
+    /// test that only checked "insert happened" would pass on a push into spare
+    /// capacity, which moves nothing and proves nothing.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn buffer_addr(&self) -> usize {
+        // SAFETY: forms a shared reference into the `UnsafeCell` for this expression.
+        // Read-only-ness is not what makes that sound, since a shared reborrow
+        // aliasing a live `&mut` is UB whether or not it reads. What makes it sound
+        // is that no
+        // `&mut` from `get_mut_by_ns` / `namespace_map_mut` is live across the call:
+        // those are pump-only, and these callers run on the pump. Only the pointer
+        // value escapes.
+        unsafe { (*self.partitions.get()).as_ptr() as usize }
+    }
+
     /// Get mutable partition by namespace directly. Tombstone-gated like
     /// [`Self::get_by_ns`].
     #[allow(clippy::mut_from_ref)]
-    pub fn get_mut_by_ns(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition<B>> {
+    pub fn get_mut_by_ns(&self, namespace: &IggyNamespace) -> Option<&mut IggyPartition<B, SB>> {
         if self.is_tombstoned(namespace) {
             return None;
         }
@@ -325,7 +355,7 @@ where
     /// [`Self::with_partition`]; the `&mut` path above is uncounted (it is
     /// pump-only, so it cannot alias this same-task mutation).
     #[doc(hidden)]
-    pub fn remove(&self, namespace: &IggyNamespace) -> Option<IggyPartition<B>> {
+    pub fn remove(&self, namespace: &IggyNamespace) -> Option<IggyPartition<B, SB>> {
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.borrow_active.get(),
@@ -350,7 +380,7 @@ where
             // by the moved partition's namespace key in O(1); the previous
             // linear value-scan turned bulk DeleteStream into O(K²) on the
             // pump task, stalling client traffic for ~10k-partition topics.
-            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().namespace());
+            let moved_ns = IggyNamespace::from_raw(partitions[idx].consensus().group());
             let entry = self.namespace_map_mut().get_mut(&moved_ns).expect(
                 "IggyPartitions invariant: swapped-in partition missing namespace_to_local entry",
             );
@@ -364,7 +394,7 @@ where
     ///
     /// Same pump-only safety discipline as [`Self::remove`].
     #[doc(hidden)]
-    pub fn remove_many(&self, namespaces: &[IggyNamespace]) -> Vec<IggyPartition<B>> {
+    pub fn remove_many(&self, namespaces: &[IggyNamespace]) -> Vec<IggyPartition<B, SB>> {
         namespaces.iter().filter_map(|ns| self.remove(ns)).collect()
     }
 
@@ -375,6 +405,13 @@ where
 
     pub fn is_tombstoned(&self, namespace: &IggyNamespace) -> bool {
         self.tombstoned.borrow().contains(namespace)
+    }
+
+    /// Snapshot every tombstoned namespace, including ones never
+    /// materialised: a boot-time damage verdict fences a namespace before
+    /// any partition exists, so it appears in no other view of this map.
+    pub fn tombstoned_namespaces(&self) -> Vec<IggyNamespace> {
+        self.tombstoned.borrow().iter().copied().collect()
     }
 
     /// Mark a namespace as tombstoned. Callable from any task on the
@@ -410,8 +447,10 @@ where
         // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
         // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
         // inside), so no sibling task can realloc the partitions vec under it.
+        // Read the knob first: the `&mut` borrow below covers `self.config` too.
+        let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_by_ns(namespace)?;
-        Some(partition.build_poll_plan(consumer, args))
+        Some(partition.build_poll_plan(consumer, args, validate_checksum))
     }
 
     /// Read a consumer's stored offset + the partition commit offset. Fully
@@ -489,12 +528,16 @@ where
     }
 }
 
-impl<B> Plane<VsrConsensus<B>> for IggyPartitions<B>
+impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
-    async fn on_request(&self, message: <VsrConsensus<B> as Consensus>::Message<RequestHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
+    async fn on_request(
+        &self,
+        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+    ) {
+        let namespace = IggyNamespace::from_raw(message.header().group);
         if self.is_tombstoned(&namespace) {
             warn!(
                 target: "iggy.partitions.diag",
@@ -547,20 +590,20 @@ where
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
-        if self.is_tombstoned(&namespace) {
+        let group = IggyNamespace::from_raw(message.header().group);
+        if self.is_tombstoned(&group) {
             warn!(
                 target: "iggy.partitions.diag",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 "dropping prepare: namespace tombstoned"
             );
             return;
         }
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+        let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 op = message.header().op,
                 operation = ?message.header().operation,
                 "partition not initialized for namespace"
@@ -572,21 +615,21 @@ where
 
     #[allow(clippy::too_many_lines)]
     async fn on_ack(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareOkHeader>) {
-        let namespace = IggyNamespace::from_raw(message.header().namespace);
-        if self.is_tombstoned(&namespace) {
+        let group = IggyNamespace::from_raw(message.header().group);
+        if self.is_tombstoned(&group) {
             warn!(
                 target: "iggy.partitions.diag",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 "dropping prepare-ok: namespace tombstoned"
             );
             return;
         }
         let config = self.config.clone();
-        let Some(partition) = self.get_mut_by_ns(&namespace) else {
+        let Some(partition) = self.get_mut_by_ns(&group) else {
             warn!(
                 target: "iggy.partitions.diag",
                 plane = "partitions",
-                namespace_raw = namespace.inner(),
+                namespace_raw = group.inner(),
                 op = message.header().op,
                 "partition not initialized for namespace"
             );
@@ -596,9 +639,10 @@ where
     }
 }
 
-impl<B> PlaneIdentity<VsrConsensus<B>> for IggyPartitions<B>
+impl<B, SB> PlaneIdentity<VsrConsensus<B>> for IggyPartitions<B, SB>
 where
     B: MessageBus,
+    SB: SuperblockStore,
 {
     fn is_applicable<H>(&self, message: &<VsrConsensus<B> as Consensus>::Message<H>) -> bool
     where
@@ -606,7 +650,7 @@ where
     {
         assert!(matches!(
             message.header().command(),
-            Command2::Request | Command2::Prepare | Command2::PrepareOk
+            Command::Request | Command::Prepare | Command::PrepareOk
         ));
         message.header().operation().is_partition()
     }
@@ -622,8 +666,8 @@ mod tests {
     use iggy_common::{IggyByteSize, PartitionStats};
     use journal::Journal as _;
     use message_bus::IggyMessageBus;
-    use server_common::send_messages2::{
-        IggyMessage2, IggyMessage2Header, IggyMessages2, PREPARE_SPLIT_POINT, SendMessages2Owned,
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, PREPARE_SPLIT_POINT, SendMessagesOwned,
         stamp_prepare_for_persistence,
     };
     use server_common::{Message, iobuf::Frozen};
@@ -650,6 +694,28 @@ mod tests {
         )
     }
 
+    /// `build_partition` for a replicated group. The replica count is what
+    /// decides whether the journal retains evicted entries for repair, so a
+    /// single-replica partition cannot exercise anything that reads the ring.
+    fn build_replicated_partition() -> IggyPartition<IggyMessageBus> {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let consensus = VsrConsensus::new(
+            TEST_CLUSTER,
+            0,
+            3,
+            namespace.inner(),
+            IggyMessageBus::new(0),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(1024 * 1024),
+            false,
+        )
+    }
+
     /// One-message `SendMessages` journal entry stamped at `op` / `base_offset`.
     /// Reuses the production blob builder + checksum stamping so the entry
     /// decodes through `decode_prepare_slice` and indexes into `offset_to_op`,
@@ -659,22 +725,22 @@ mod tests {
         op: u64,
         base_offset: u64,
     ) -> Frozen<4096> {
-        let mut batch = IggyMessages2::with_capacity(1);
-        batch.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        let mut batch = IggyMessages::with_capacity(1);
+        batch.push(IggyMessage {
+            header: IggyMessageHeader {
                 payload_length: 8,
                 ..Default::default()
             },
             payload: Bytes::from_static(b"abcdefgh"),
             user_headers: None,
         });
-        let owned = SendMessages2Owned::from_messages(namespace, &batch)
-            .expect("build send_messages batch");
+        let owned =
+            SendMessagesOwned::from_messages(namespace, &batch).expect("build send_messages batch");
 
         let total_size = PREPARE_SPLIT_POINT + owned.blob.len();
         let prepare = Message::<PrepareHeader>::new(total_size).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.operation = Operation::SendMessages;
                 header.op = op;
                 header.size = u32::try_from(total_size).expect("size fits u32");
@@ -790,6 +856,67 @@ mod tests {
             Some(3),
             "contiguous continuation returns the resident tail starting at 3",
         );
+    }
+
+    /// A flush evicts the committed prefix up to and INCLUDING `commit_max`, so
+    /// a caught-up replica keeps no resident header at its own commit point. The
+    /// `DoViewChange` suffix is floored there and cannot nack it, so reading the
+    /// resident headers alone sends the commit point out blank, which a quorum of
+    /// senders turns into a view change that never starts.
+    ///
+    /// The entry is still servable (`repair_entry` answers from the evicted
+    /// ring), so the suffix reads through `repair_header`, over the same range.
+    #[compio::test]
+    async fn evicted_commit_point_still_answers_for_the_view_change_suffix() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let partition = build_replicated_partition();
+
+        for offset in 0..=2u64 {
+            partition
+                .log
+                .journal()
+                .inner
+                .append(build_send_messages_entry(namespace, offset + 1, offset))
+                .await
+                .expect("append journal entry");
+        }
+
+        let commit_max = 3;
+        let prefix = partition.log.journal().inner.committed_prefix(commit_max);
+        assert_eq!(prefix.len(), 3, "the whole log is committed and flushable");
+        partition
+            .log
+            .journal()
+            .inner
+            .evict_prefix(prefix.len())
+            .await;
+
+        assert!(
+            partition
+                .log
+                .journal()
+                .inner
+                .header_by_op(commit_max)
+                .is_none(),
+            "the flush evicted the commit point from the resident headers",
+        );
+        assert!(
+            partition
+                .log
+                .journal()
+                .inner
+                .repair_entry(commit_max)
+                .is_some(),
+            "yet the entry is still servable from the evicted ring",
+        );
+
+        let header = partition
+            .log
+            .journal()
+            .inner
+            .repair_header(commit_max)
+            .expect("the commit point must stay describable for the DVC suffix");
+        assert_eq!(header.op, commit_max);
     }
 
     /// The resident journal holds replicated-but-uncommitted prepares ahead of

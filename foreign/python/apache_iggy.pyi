@@ -29,27 +29,37 @@ __all__ = [
     "AutoCommit",
     "AutoCommitAfter",
     "AutoCommitWhen",
+    "AutoLogin",
+    "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
-    "GlobalPermissions",
     "IggyClient",
     "IggyConsumer",
+    "IggyExpiry",
+    "MaxTopicSize",
+    "OptionSpec",
+    "Partition",
     "Permissions",
     "PollingStrategy",
     "ReceiveMessage",
     "SendMessage",
+    "SendMessagesConfirmation",
+    "SendMessagesResponse",
     "StreamDetails",
     "StreamPermissions",
+    "TcpConfig",
+    "TcpReconnectionConfig",
     "Topic",
     "TopicDetails",
     "TopicPermissions",
+    "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
-    "UserHeaders",
 ]
 
 class AutoCommit:
@@ -246,6 +256,70 @@ class AutoCommitWhen:
     ...
 
 @typing.final
+class AutoLogin:
+    r"""
+    The credentials replayed by the client every time it (re)connects.
+
+    `IggyClient` only recovers a lost session when it has credentials to replay,
+    so a long-running consumer should pass one of the enabled variants.
+    """
+    @property
+    def enabled(self) -> builtins.bool:
+        r"""
+        Whether automatic login is enabled.
+        """
+    @property
+    def username(self) -> builtins.str | None:
+        r"""
+        The username to log in with, or `None` for the disabled and token variants.
+        """
+    @staticmethod
+    def disabled() -> AutoLogin:
+        r"""
+        No automatic login. `login_user()` must be called by hand after every connect.
+        """
+    @staticmethod
+    def username_password(username: builtins.str, password: builtins.str) -> AutoLogin:
+        r"""
+        Log in with the given username and password on every connect.
+        """
+    @staticmethod
+    def personal_access_token(token: builtins.str) -> AutoLogin:
+        r"""
+        Log in with the given personal access token on every connect.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+class Consumer:
+    r"""
+    The consumer polling the messages. It selects both the consumer kind and the
+    identifier the server keys the stored offset on.
+    """
+    @typing.final
+    class Single(Consumer):
+        r"""
+        A regular consumer, owning its offset on the polled partition.
+        """
+
+        __match_args__ = ("id",)
+        @property
+        def id(self) -> builtins.str | builtins.int: ...
+        def __new__(cls, id: builtins.str | builtins.int) -> Consumer.Single: ...
+
+    @typing.final
+    class Group(Consumer):
+        r"""
+        A member of the consumer group, sharing the group's offset.
+        """
+
+        __match_args__ = ("id",)
+        @property
+        def id(self) -> builtins.str | builtins.int: ...
+        def __new__(cls, id: builtins.str | builtins.int) -> Consumer.Group: ...
+
+    ...
+
+@typing.final
 class ConsumerGroup:
     @property
     def id(self) -> builtins.int:
@@ -312,6 +386,105 @@ class ConsumerGroupMember:
     def partitions(self) -> builtins.list[builtins.int]:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
+        """
+
+@typing.final
+class GlobalPermissions:
+    r"""
+    Global permissions, applied to all streams without specifying them one by one.
+    """
+    @property
+    def manage_servers(self) -> builtins.bool:
+        r"""
+        Whether managing servers is allowed; includes `read_servers`.
+        """
+    @property
+    def read_servers(self) -> builtins.bool:
+        r"""
+        Whether reading server info (stats, clients) is allowed.
+        """
+    @property
+    def manage_users(self) -> builtins.bool:
+        r"""
+        Whether managing users is allowed; includes `read_users`.
+        """
+    @property
+    def read_users(self) -> builtins.bool:
+        r"""
+        Whether reading user info is allowed.
+        """
+    @property
+    def manage_streams(self) -> builtins.bool:
+        r"""
+        Whether managing all streams is allowed; includes `read_streams` and
+        `manage_topics`.
+        """
+    @property
+    def read_streams(self) -> builtins.bool:
+        r"""
+        Whether reading all streams is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing all topics is allowed; includes `read_topics` and
+        `send_messages`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading all topics and managing consumer groups is allowed;
+        includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from all streams and managing consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to all streams is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_servers: builtins.bool = False,
+        read_servers: builtins.bool = False,
+        manage_users: builtins.bool = False,
+        read_users: builtins.bool = False,
+        manage_streams: builtins.bool = False,
+        read_streams: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> GlobalPermissions:
+        r"""
+        Create global permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_streams` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
+        Args:
+            manage_servers: Allow managing servers; includes `read_servers`.
+            read_servers: Allow reading server info (stats, clients).
+            manage_users: Allow managing users; includes `read_users`.
+            read_users: Allow reading user info.
+            manage_streams: Allow managing all streams; includes `read_streams`
+                and `manage_topics`.
+            read_streams: Allow reading all streams; includes `read_topics`.
+            manage_topics: Allow managing all topics; includes `read_topics`
+                and `send_messages`.
+            read_topics: Allow reading all topics and managing consumer groups
+                (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from all streams and managing
+                consumer offsets.
+            send_messages: Allow sending messages to all streams.
         """
 
 class HeaderKey:
@@ -665,116 +838,28 @@ class HeaderValue:
         def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
 
 @typing.final
-class GlobalPermissions:
-    r"""
-    Global permissions, applied to all streams without specifying them one by one.
-    """
-    @property
-    def manage_servers(self) -> builtins.bool:
-        r"""
-        Whether managing servers is allowed; includes `read_servers`.
-        """
-    @property
-    def read_servers(self) -> builtins.bool:
-        r"""
-        Whether reading server info (stats, clients) is allowed.
-        """
-    @property
-    def manage_users(self) -> builtins.bool:
-        r"""
-        Whether managing users is allowed; includes `read_users`.
-        """
-    @property
-    def read_users(self) -> builtins.bool:
-        r"""
-        Whether reading user info is allowed.
-        """
-    @property
-    def manage_streams(self) -> builtins.bool:
-        r"""
-        Whether managing all streams is allowed; includes `read_streams` and
-        `manage_topics`.
-        """
-    @property
-    def read_streams(self) -> builtins.bool:
-        r"""
-        Whether reading all streams is allowed; includes `read_topics`.
-        """
-    @property
-    def manage_topics(self) -> builtins.bool:
-        r"""
-        Whether managing all topics is allowed; includes `read_topics` and
-        `send_messages`.
-        """
-    @property
-    def read_topics(self) -> builtins.bool:
-        r"""
-        Whether reading all topics and managing consumer groups is allowed;
-        includes `poll_messages`.
-        """
-    @property
-    def poll_messages(self) -> builtins.bool:
-        r"""
-        Whether polling messages from all streams and managing consumer
-        offsets is allowed.
-        """
-    @property
-    def send_messages(self) -> builtins.bool:
-        r"""
-        Whether sending messages to all streams is allowed.
-        """
-    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
-    def __new__(
-        cls,
-        *,
-        manage_servers: builtins.bool = False,
-        read_servers: builtins.bool = False,
-        manage_users: builtins.bool = False,
-        read_users: builtins.bool = False,
-        manage_streams: builtins.bool = False,
-        read_streams: builtins.bool = False,
-        manage_topics: builtins.bool = False,
-        read_topics: builtins.bool = False,
-        poll_messages: builtins.bool = False,
-        send_messages: builtins.bool = False,
-    ) -> GlobalPermissions:
-        r"""
-        Create global permissions. Every flag defaults to `False`.
-
-        The `includes` notes below are transitive: a flag also grants everything
-        its included flags grant. For example `manage_streams` includes
-        `manage_topics`, and through it `read_topics`, `poll_messages`, and
-        `send_messages`.
-
-        Args:
-            manage_servers: Allow managing servers; includes `read_servers`.
-            read_servers: Allow reading server info (stats, clients).
-            manage_users: Allow managing users; includes `read_users`.
-            read_users: Allow reading user info.
-            manage_streams: Allow managing all streams; includes `read_streams`
-                and `manage_topics`.
-            read_streams: Allow reading all streams; includes `read_topics`.
-            manage_topics: Allow managing all topics; includes `read_topics`
-                and `send_messages`.
-            read_topics: Allow reading all topics and managing consumer groups
-                (including create and delete); includes `poll_messages`.
-            poll_messages: Allow polling messages from all streams and managing
-                consumer offsets.
-            send_messages: Allow sending messages to all streams.
-        """
-
-@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
-    It wraps the RustIggyClient and provides asynchronous functionality
-    through the contained runtime.
+    It provides asynchronous functionality through the contained runtime.
     """
-    def __new__(cls, conn: builtins.str | None = None) -> IggyClient:
+    def __new__(cls, conn: TcpConfig | builtins.str | None = None) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address.
+        Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
         This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
+
+        Args:
+            conn: Either a `host:port` address, or a `TcpConfig` carrying the full
+                transport configuration. Defaults to `127.0.0.1:8090` with auto-login
+                disabled. A malformed address is reported differently by the two
+                forms: the string form raises `RuntimeError` here, while `TcpConfig`
+                raises `ValueError` when it is constructed, before it ever reaches
+                this call. Neither exception is a subclass of the other.
+
+        Raises:
+            RuntimeError: If the address passed as a string is not a valid
+                `host:port` pair.
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
@@ -785,15 +870,14 @@ class IggyClient:
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
         Sends a ping request to the server to check connectivity.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-        if the connection fails.
+        Raises `RuntimeError` if the connection fails.
         """
     def login_user(
         self, username: builtins.str, password: builtins.str
     ) -> collections.abc.Awaitable[None]:
         r"""
         Logs in the user with the given credentials.
-        Returns `Ok(())` on success, or a PyRuntimeError on failure.
+        Raises `RuntimeError` on failure.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
@@ -809,8 +893,8 @@ class IggyClient:
             or `None` otherwise.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def get_users(self) -> collections.abc.Awaitable[list[UserInfo]]:
         r"""
@@ -820,7 +904,7 @@ class IggyClient:
             An awaitable that resolves to `list[UserInfo]`.
 
         Raises:
-            PyRuntimeError: If the request fails.
+            RuntimeError: If the request fails.
         """
     def create_user(
         self,
@@ -842,7 +926,7 @@ class IggyClient:
             An awaitable that resolves to the created `UserInfoDetails`.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the request fails.
+            RuntimeError: If an argument is invalid or the request fails.
         """
     def update_user(
         self,
@@ -862,8 +946,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the user is updated.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def delete_user(
         self, user_id: builtins.str | builtins.int
@@ -878,8 +962,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the user is deleted.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def update_permissions(
         self, user_id: builtins.str | builtins.int, permissions: Permissions | None
@@ -898,8 +982,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the permissions are updated.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def change_password(
         self,
@@ -919,8 +1003,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the password is changed.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the current password is wrong or the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the current password is wrong or the request fails.
         """
     def logout_user(self) -> collections.abc.Awaitable[None]:
         r"""
@@ -930,24 +1014,46 @@ class IggyClient:
             An awaitable that resolves to `None` when the user is logged out.
 
         Raises:
-            PyRuntimeError: If the request fails.
+            RuntimeError: If the request fails.
         """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.
-        Returns Ok(()) on successful connection or a PyRuntimeError on failure.
+        Raises `RuntimeError` if the connection fails.
         """
     def create_stream(self, name: builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.
-        Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
+        Raises `RuntimeError` if the stream cannot be created.
         """
     def get_stream(
         self, stream_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[StreamDetails | None]:
         r"""
         Gets stream by id.
-        Returns Option of stream details or a PyRuntimeError on failure.
+        Returns the stream details, or `None` if the stream does not exist.
+        Raises `RuntimeError` on failure.
+        """
+    def describe_options(
+        self, scope: builtins.str
+    ) -> collections.abc.Awaitable[builtins.list[OptionSpec]]:
+        r"""
+        Describe the option catalog for a resource scope.
+
+        This is the discovery surface for the `options` argument on
+        `create_topic`/`update_topic`: a key outside the catalog is refused at
+        create, and the binary transports carry only the error code back.
+
+        Args:
+            scope: One of `"topic"`, `"stream"`, `"user"`.
+
+        Returns:
+            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+            with no keys yet.
+
+        Raises:
+            ValueError: If the scope name is not one of the three above.
+            RuntimeError: If the request fails.
         """
     def create_topic(
         self,
@@ -955,13 +1061,42 @@ class IggyClient:
         name: builtins.str,
         partitions_count: builtins.int,
         compression_algorithm: builtins.str | None = None,
-        replication_factor: builtins.int | None = None,
-        message_expiry: datetime.timedelta | None = None,
-        max_topic_size: builtins.int | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
+        segment_size: builtins.int | None = None,
+        enforce_fsync: builtins.bool | None = None,
+        messages_required_to_save: builtins.int | None = None,
+        size_of_messages_required_to_save: builtins.int | None = None,
+        preallocate_segments: builtins.bool | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
-        Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+
+        Args:
+            stream: Stream identifier as `str | int`.
+            name: Topic name as `str`.
+            partitions_count: Number of partitions as `int`.
+            compression_algorithm: Compression algorithm as `str | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            segment_size: Per-topic segment size in bytes as `int | None`.
+            enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+            messages_required_to_save: Message-count flush threshold as `int | None`.
+            size_of_messages_required_to_save: Byte flush threshold as `int | None`.
+            preallocate_segments: Reserve segment bytes on open as `bool | None`.
+            options: Additional option keys as `dict[str, str] | None`, sent
+                verbatim so a newer server key can be set from this build.
+
+        Every option left as `None` resolves against the server default at
+        admission.
+
+        Returns:
+            An awaitable that resolves to `None` when the topic is created.
+
+        Raises:
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def get_topic(
         self,
@@ -970,7 +1105,8 @@ class IggyClient:
     ) -> collections.abc.Awaitable[TopicDetails | None]:
         r"""
         Gets topic by stream and id.
-        Returns Option of topic details or a PyRuntimeError on failure.
+        Returns the topic details, or `None` if the topic does not exist.
+        Raises `RuntimeError` on failure.
         """
     def get_topics(
         self, stream_id: builtins.str | builtins.int
@@ -985,7 +1121,7 @@ class IggyClient:
             An awaitable that resolves to `list[Topic]`.
 
         Raises:
-            PyRuntimeError: If the identifier is invalid or the request fails.
+            RuntimeError: If the identifier is invalid or the request fails.
         """
     def update_topic(
         self,
@@ -993,30 +1129,34 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
         name: builtins.str,
         compression_algorithm: builtins.str | None = None,
-        replication_factor: builtins.int | None = None,
-        message_expiry: datetime.timedelta | None = None,
-        max_topic_size: builtins.int | None = None,
+        message_expiry: IggyExpiry | None = None,
+        max_topic_size: MaxTopicSize | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
 
-        This is a full replacement: any optional parameter left unset is reset to
-        its server default rather than preserved.
+        A patch, not a replacement: every setting rides the options block, so a
+        field left unset keeps the topic's current value rather than resetting
+        it to a server default.
 
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
             name: New topic name as `str`.
             compression_algorithm: Compression algorithm as `str | None`.
-            replication_factor: Replication factor as `int | None`.
-            message_expiry: Message expiry as `datetime.timedelta | None`.
-            max_topic_size: Maximum topic size in bytes as `int | None`.
+            message_expiry: Message expiry as `IggyExpiry | None`.
+            max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            options: Additional option keys as `dict[str, str] | None`, sent
+                verbatim so an updatable server key can be set from this build.
+                A create-only key is refused by name.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
-            PyRuntimeError: If an argument is invalid or the request fails.
+            ValueError: If `message_expiry` or `max_topic_size` is out of range.
+            PyRuntimeError: If another argument is invalid or the request fails.
         """
     def delete_topic(
         self,
@@ -1034,7 +1174,7 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is deleted.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            RuntimeError: If an identifier is invalid or the request fails.
         """
     def purge_topic(
         self,
@@ -1052,7 +1192,7 @@ class IggyClient:
             An awaitable that resolves to `None` when the topic is purged.
 
         Raises:
-            PyRuntimeError: If an identifier is invalid or the request fails.
+            RuntimeError: If an identifier is invalid or the request fails.
         """
     def create_consumer_group(
         self,
@@ -1072,8 +1212,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the consumer group is created.
 
         Raises:
-            PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If an identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def get_consumer_group(
         self,
@@ -1094,8 +1234,8 @@ class IggyClient:
             or `None` otherwise.
 
         Raises:
-            PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If an identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def get_consumer_groups(
         self,
@@ -1113,8 +1253,8 @@ class IggyClient:
             An awaitable that resolves to `list[ConsumerGroup]`.
 
         Raises:
-            PyValueError: If an identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If an identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def delete_consumer_group(
         self,
@@ -1134,8 +1274,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the consumer group is deleted.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def join_consumer_group(
         self,
@@ -1158,8 +1298,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the client joins the consumer group.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
         """
     def leave_consumer_group(
         self,
@@ -1184,8 +1324,8 @@ class IggyClient:
             rejoin on their next poll.
 
         Raises:
-            PyValueError: If a string identifier is invalid.
-            PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+            ValueError: If a string identifier is invalid.
+            RuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
         """
     def send_messages(
         self,
@@ -1193,23 +1333,30 @@ class IggyClient:
         topic: builtins.str | builtins.int,
         partitioning: builtins.int,
         messages: list[SendMessage],
-    ) -> collections.abc.Awaitable[None]:
+    ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
         Sends a list of messages to the specified topic.
-        Returns Ok(()) on successful sending or a PyRuntimeError on failure.
+        Returns a SendMessagesResponse carrying the per-partition commit
+        confirmations, or a PyRuntimeError on failure. The confirmation list is
+        empty when the server reports no offsets, and the legacy server never
+        reports any.
         """
     def poll_messages(
         self,
         stream: builtins.str | builtins.int,
         topic: builtins.str | builtins.int,
-        partition_id: builtins.int,
+        *,
+        consumer: Consumer,
         polling_strategy: PollingStrategy,
         count: builtins.int,
         auto_commit: builtins.bool,
+        partition_id: builtins.int | None = None,
     ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
-        Polls for messages from the specified topic and partition.
-        Returns a list of received messages or a PyRuntimeError on failure.
+        Polls for messages from the specified topic on behalf of the given consumer.
+        Omitting `partition_id` reads partition 0 for a regular consumer, and
+        polls the member's assigned partitions for a consumer group.
+        Returns a list of received messages or a RuntimeError on failure.
         """
     def consumer_group(
         self,
@@ -1230,7 +1377,10 @@ class IggyClient:
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
-        Returns the consumer or a PyRuntimeError on failure.
+        Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
+        `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
+        `AutoCommit` interval is negative, or if any of those except `poll_interval`
+        is zero.
         """
     def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes
@@ -1249,15 +1399,14 @@ class IggyClient:
             An awaitable that resolves to the raw response `bytes`.
 
         Raises:
-            PyRuntimeError: If the command cannot be sent or the server returns an error.
+            RuntimeError: If the command cannot be sent or the server returns an error.
         """
 
 @typing.final
 class IggyConsumer:
     r"""
     A Python class representing the Iggy consumer.
-    It wraps the RustIggyConsumer and provides asynchronous functionality
-    through the contained runtime.
+    It provides asynchronous functionality through the contained runtime.
     """
     def get_last_consumed_offset(
         self, partition_id: builtins.int
@@ -1291,8 +1440,7 @@ class IggyConsumer:
         r"""
         Stores the provided offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-        if the operation fails.
+        Raises `RuntimeError` if the operation fails.
         """
     def delete_offset(
         self, partition_id: builtins.int | None
@@ -1300,14 +1448,13 @@ class IggyConsumer:
         r"""
         Deletes the offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-        if the operation fails.
+        Raises `RuntimeError` if the operation fails.
         """
     def iter_messages(self) -> collections.abc.AsyncIterator[ReceiveMessage]:
         r"""
         Asynchronously iterate over `ReceiveMessage`s.
         Returns an async iterator that raises `StopAsyncIteration` when no more messages are available
-        or a `PyRuntimeError` on failure.
+        or a `RuntimeError` on failure.
         Note: This method does not currently support `AutoCommit.After`.
         For `AutoCommit.IntervalOrAfter(datetime.timedelta, AutoCommitAfter)`,
         only the interval part is applied; the `after` mode is ignored.
@@ -1322,7 +1469,170 @@ class IggyConsumer:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-        Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
+        Returns an awaitable that completes when shutdown is signaled or a RuntimeError on failure.
+        """
+
+class IggyExpiry:
+    r"""
+    The expiry of the messages in a topic.
+    """
+    @typing.final
+    class ServerDefault(IggyExpiry):
+        r"""
+        Use the message expiry configured on the server for this topic,
+        rather than an explicit value set by the client.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> IggyExpiry.ServerDefault: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class ExpireDuration(IggyExpiry):
+        r"""
+        Expire messages this long after they are appended to the topic.
+
+        `duration` must be greater than zero and less than the maximum
+        microsecond count a `u64` can hold (about 584,542 years): those two
+        values are reserved on the wire for `ServerDefault` and `NeverExpire`
+        respectively, so a `duration` at either boundary raises `ValueError`
+        when passed to `create_topic`/`update_topic`. A negative `timedelta`
+        also raises `ValueError`.
+        """
+
+        __match_args__ = ("duration",)
+        @property
+        def duration(self) -> datetime.timedelta: ...
+        def __new__(cls, duration: datetime.timedelta) -> IggyExpiry.ExpireDuration: ...
+
+    @typing.final
+    class NeverExpire(IggyExpiry):
+        r"""
+        Retain messages indefinitely; they never expire.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> IggyExpiry.NeverExpire: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+class MaxTopicSize:
+    r"""
+    The maximum size of a topic.
+    """
+    @typing.final
+    class ServerDefault(MaxTopicSize):
+        r"""
+        Use the maximum topic size configured on the server, rather than an
+        explicit value set by the client.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MaxTopicSize.ServerDefault: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    @typing.final
+    class Custom(MaxTopicSize):
+        r"""
+        Cap the topic at this many bytes; as the topic approaches this size,
+        the server deletes the oldest sealed segments to make room for new
+        messages.
+
+        `bytes` must be greater than zero and less than the maximum value of
+        an unsigned 64-bit integer: those two values are reserved on the wire
+        for `ServerDefault` and `Unlimited` respectively, so a `Custom` size
+        at either boundary raises `ValueError` when passed to
+        `create_topic`/`update_topic`.
+        """
+
+        __match_args__ = ("bytes",)
+        @property
+        def bytes(self) -> builtins.int: ...
+        def __new__(cls, bytes: builtins.int) -> MaxTopicSize.Custom: ...
+
+    @typing.final
+    class Unlimited(MaxTopicSize):
+        r"""
+        Do not cap the topic size; it may grow without bound.
+        """
+
+        __match_args__ = ()
+        def __new__(cls) -> MaxTopicSize.Unlimited: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
+
+    ...
+
+@typing.final
+class OptionSpec:
+    r"""
+    One entry of a resource's option catalog, as served by `describe_options`.
+    """
+    @property
+    def key(self) -> builtins.str:
+        r"""
+        The option key a create command accepts.
+        """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        Name of this key's canonical kind: what the server encodes its default
+        under, and what a value set by `create_topic` is stored as whatever kind
+        it was sent in, since create admission re-encodes the block from its own
+        parse. `update_topic` stores what the client sent verbatim and is the
+        exception.
+        """
+    @property
+    def default_value(self) -> HeaderValue | None:
+        r"""
+        The key's default as a `HeaderValue`, or `None` when the key has no
+        default.
+
+        The same type message user headers use, so the usual accessors read it;
+        options ride that codec.
+        """
+    @property
+    def description(self) -> builtins.str:
+        r"""
+        What the option does, including the bounds its value is checked against.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class Partition:
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the partition.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp of the partition creation, in microseconds.
+        """
+    @property
+    def segments_count(self) -> builtins.int:
+        r"""
+        The number of segments in the partition.
+        """
+    @property
+    def current_offset(self) -> builtins.int:
+        r"""
+        The current offset of the partition.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The size of the partition in bytes.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        The number of messages in the partition.
         """
 
 @typing.final
@@ -1394,7 +1704,7 @@ class PollingStrategy:
 class ReceiveMessage:
     r"""
     A Python class representing a received message.
-    This class wraps a Rust message, allowing for access to its payload and offset from Python.
+    It provides access to the message payload and offset.
     """
     def payload(self) -> bytes:
         r"""
@@ -1438,14 +1748,16 @@ class ReceiveMessage:
     def user_headers(self) -> UserHeaders | None:
         r"""
         Retrieves user headers attached to the received message.
+
+        Returns `None` when no headers are present or when the headers
+        on the wire are structurally malformed (those errors are logged
+        internally). Only known semantic decode errors raise `ValueError`.
         """
 
 @typing.final
 class SendMessage:
     r"""
     A Python class representing a message to be sent.
-    This class wraps a Rust message meant for sending, facilitating
-    the creation of such messages from Python and their subsequent use in Rust.
     """
     def __new__(
         cls,
@@ -1457,6 +1769,65 @@ class SendMessage:
         Constructs a new `SendMessage` instance from a string or bytes.
         This method allows for the creation of a `SendMessage` instance
         directly from Python using the provided string or bytes data.
+        """
+
+@typing.final
+class SendMessagesConfirmation:
+    r"""
+    A Python class representing the commit confirmation for one partition
+    written by a send.
+    """
+    @property
+    def stream_id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the stream the batch was written to.
+        """
+    @property
+    def topic_id(self) -> builtins.int:
+        r"""
+        Gets the unique identifier (numeric) of the topic the batch was written to.
+        """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        Gets the identifier of the partition the batch was written to.
+        """
+    @property
+    def base_offset(self) -> builtins.int:
+        r"""
+        Gets the offset assigned to the first message of the batch in this partition.
+
+        The offset locates the batch, it does not identify it. Delivery is
+        at-least-once, so an earlier retry may already have committed these
+        messages at a lower offset.
+
+        A batch is confirmed once it is committed in memory, not once it is
+        fsynced. A crash-restart can stamp a later batch with an offset a client
+        has already recorded.
+
+        The legacy server confirms nothing, so its confirmation list is empty
+        and this value is never reached.
+        """
+
+@typing.final
+class SendMessagesResponse:
+    r"""
+    A Python class representing the outcome of a successful send.
+    """
+    @property
+    def confirmations(self) -> builtins.list[SendMessagesConfirmation]:
+        r"""
+        Gets the commit confirmations, one per partition the batch was written to.
+
+        The list is empty when the server reports no offsets, and the legacy
+        server never reports any, so branch on it being empty rather than
+        indexing into it.
+
+        A reported `base_offset` never implies uniqueness, because delivery is
+        at-least-once and an earlier retry may already have committed the same
+        messages at a lower offset. A batch is confirmed once it is committed in
+        memory, not once it is fsynced. A crash-restart can stamp a later batch
+        with an offset a client has already recorded.
         """
 
 @typing.final
@@ -1553,6 +1924,115 @@ class StreamPermissions:
         """
 
 @typing.final
+class TcpConfig:
+    r"""
+    Configuration for the TCP transport, accepted by `IggyClient(...)`.
+
+    Every field is keyword-only and optional.
+    """
+    @property
+    def server_address(self) -> builtins.str: ...
+    @property
+    def auto_login(self) -> AutoLogin: ...
+    @property
+    def reconnection(self) -> TcpReconnectionConfig: ...
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    @property
+    def tls_enabled(self) -> builtins.bool: ...
+    @property
+    def tls_domain(self) -> builtins.str: ...
+    @property
+    def tls_ca_file(self) -> builtins.str | None: ...
+    @property
+    def tls_validate_certificate(self) -> builtins.bool: ...
+    @property
+    def nodelay(self) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        server_address: builtins.str | None = None,
+        auto_login: AutoLogin | None = None,
+        reconnection: TcpReconnectionConfig | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+        tls_enabled: builtins.bool | None = None,
+        tls_domain: builtins.str | None = None,
+        tls_ca_file: builtins.str | None = None,
+        tls_validate_certificate: builtins.bool | None = None,
+        nodelay: builtins.bool | None = None,
+    ) -> TcpConfig:
+        r"""
+        Constructs a TCP configuration.
+
+        Args:
+            server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
+            auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
+            heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+            tls_enabled: Whether to connect over TLS. Defaults to disabled.
+            tls_domain: Domain to validate the certificate against. Empty means it is
+                taken from `server_address`.
+            tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
+                and `tls_validate_certificate` are both on; with either one off it
+                is kept but never consulted, so pairing it with
+                `tls_validate_certificate=False` pins nothing.
+            tls_validate_certificate: Whether to validate the server certificate.
+                Defaults to validating. Disabling this accepts any certificate the
+                server presents, including self-signed and mismatched ones, and
+                takes precedence over `tls_ca_file`; intended for local development
+                only.
+            nodelay: Disable the Nagle algorithm for the TCP socket. Defaults to
+                leaving it on.
+
+        Raises:
+            ValueError: If `server_address` is not a valid `host:port` pair, if a
+                duration is negative, or if `heartbeat_interval` is zero.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class TcpReconnectionConfig:
+    r"""
+    How the TCP client reconnects after the connection to the server is lost.
+    """
+    @property
+    def enabled(self) -> builtins.bool: ...
+    @property
+    def max_retries(self) -> builtins.int | None: ...
+    @property
+    def interval(self) -> datetime.timedelta: ...
+    @property
+    def reestablish_after(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        enabled: builtins.bool | None = None,
+        max_retries: builtins.int | None = None,
+        interval: datetime.timedelta | None = None,
+        reestablish_after: datetime.timedelta | None = None,
+    ) -> TcpReconnectionConfig:
+        r"""
+        Constructs a reconnection policy.
+
+        Args:
+            enabled: Whether to reconnect at all. Defaults to enabled.
+            max_retries: Attempts before giving up, or `None` for unlimited.
+                Defaults to unlimited, which means a call awaited while the server
+                is down never returns: `connect()`, `send_messages()` and
+                `poll_messages()` all wait inside the retry loop. Set a finite
+                number for request/reply style usage, so a call fails instead.
+            interval: Delay between attempts. Defaults to 1 second.
+            reestablish_after: Cooldown before reconnecting after a previously
+                successful connection. Defaults to 5 seconds.
+
+        Raises:
+            ValueError: If a duration is negative, if `max_retries` is outside the
+                range of an unsigned 32-bit integer, or if `interval` is zero while
+                reconnection is enabled and `max_retries` is unlimited.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class Topic:
     @property
     def id(self) -> builtins.int:
@@ -1573,6 +2053,48 @@ class Topic:
     def partitions_count(self) -> builtins.int:
         r"""
         The total number of partitions in the topic.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the topic was created, in microseconds.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The total size of the topic in bytes.
+        """
+    @property
+    def message_expiry(self) -> IggyExpiry:
+        r"""
+        The expiry of the messages in the topic.
+        """
+    @property
+    def compression_algorithm(self) -> builtins.str:
+        r"""
+        Compression algorithm for the topic.
+        """
+    @property
+    def max_topic_size(self) -> MaxTopicSize:
+        r"""
+        The maximum size of the topic.
+        """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec; call `to_scalar_dict()` for the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options admission resolved for the keys the client did not send.
+
+        Same shape as `options`. These would have resolved differently under
+        another server configuration.
         """
 
 @typing.final
@@ -1598,14 +2120,54 @@ class TopicDetails:
         The total number of partitions in the topic.
         """
     @property
+    def created_at(self) -> builtins.int:
+        r"""
+        The timestamp when the topic was created, in microseconds.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        The total size of the topic in bytes.
+        """
+    @property
+    def message_expiry(self) -> IggyExpiry:
+        r"""
+        The expiry of the messages in the topic.
+        """
+    @property
     def compression_algorithm(self) -> builtins.str:
         r"""
         Compression algorithm for the topic.
         """
     @property
-    def replication_factor(self) -> builtins.int:
+    def max_topic_size(self) -> MaxTopicSize:
         r"""
-        Replication factor for the topic.
+        The maximum size of the topic.
+        """
+    @property
+    def options(self) -> UserHeaders:
+        r"""
+        Options the creating client set explicitly.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec; call `to_scalar_dict()` for the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options admission resolved for the keys the client did not send.
+
+        Same shape as `options`. These would have resolved differently under
+        another server configuration.
+        """
+    @property
+    def partitions(self) -> builtins.list[Partition]:
+        r"""
+        The collection of partitions in the topic.
+
+        Rebuilds the list from scratch on every access; cache the result
+        rather than reading this repeatedly in a loop.
         """
 
 @typing.final
@@ -1662,6 +2224,36 @@ class TopicPermissions:
             poll_messages: Allow polling messages from the topic and managing
                 its consumer offsets.
             send_messages: Allow sending messages to the topic.
+        """
+
+@typing.final
+class UserHeaders(dict):
+    r"""
+    User headers dictionary returned by `ReceiveMessage.user_headers`.
+
+    This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
+    operations work) that additionally exposes `to_scalar_dict` for the convenient
+    scalar form.
+    """
+    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
+        r"""
+        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
+
+        Accepts a dict whose keys and values can each independently be
+        `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
+        int | float`). The inherited `dict` initializer copies the provided
+        mapping.
+        """
+    def __setitem__(self, key: typing.Any, value: typing.Any) -> None: ...
+    def to_scalar_dict(
+        self,
+    ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
+        r"""
+        Converts these headers into the convenient plain dictionary form.
+
+        Returns an error if two distinct typed keys map to the same plain
+        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
+        become `int(1)`), or if a stored field cannot be decoded.
         """
 
 @typing.final
@@ -1729,31 +2321,3 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
-
-class UserHeaders(dict):
-    r"""
-    User headers dictionary returned by `ReceiveMessage.user_headers`.
-
-    This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
-    operations work) that additionally exposes `to_scalar_dict` for the convenient
-    scalar form.
-    """
-    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
-        r"""
-        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
-
-        Accepts a dict whose keys and values can each independently be
-        `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
-        int | float`). The inherited `dict` initializer copies the provided
-        mapping.
-        """
-    def to_scalar_dict(
-        self,
-    ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
-        r"""
-        Converts these headers into the convenient plain dictionary form.
-
-        Returns an error if two distinct typed keys map to the same plain
-        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
-        become `int(1)`), or if a stored field cannot be decoded.
-        """

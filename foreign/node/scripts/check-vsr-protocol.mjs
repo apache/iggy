@@ -31,11 +31,9 @@ const [
   rustHeader,
   rustCommand,
   rustOperation,
-  rustNamespace,
   rustProtocolCargo,
   nodeCodes,
   nodeHeader,
-  nodeNamespace,
   nodeOperation,
   nodeRegister,
 ] = await Promise.all([
@@ -44,11 +42,9 @@ const [
   read('core/binary_protocol/src/consensus/header.rs'),
   read('core/binary_protocol/src/consensus/command.rs'),
   read('core/binary_protocol/src/consensus/operation.rs'),
-  read('core/binary_protocol/src/namespace.rs'),
   read('core/binary_protocol/Cargo.toml'),
   readNode('src/wire/command.code.ts'),
   readNode('src/wire/vsr/header.ts'),
-  readNode('src/wire/vsr/namespace.ts'),
   readNode('src/wire/vsr/operation.ts'),
   readNode('src/wire/vsr/register.ts'),
 ]);
@@ -125,46 +121,14 @@ assert.deepEqual(
   'Node replicated code-to-operation map differs from Rust dispatch'
 );
 
-const rustNamespaceValue = (name) => Number(
-  rustNamespace.match(
-    new RegExp(`pub const ${name}: usize = ([0-9_]+);`)
-  )?.[1].replaceAll('_', '')
-);
-const nodeNamespaceValue = (name) => Number(
-  nodeNamespace.match(
-    new RegExp(`const ${name} = ([0-9_]+);`)
-  )?.[1].replaceAll('_', '')
-);
-const namespaceLimits = new Map(
-  ['MAX_STREAMS', 'MAX_TOPICS', 'MAX_PARTITIONS'].map((name) => [
-    name,
-    rustNamespaceValue(name)
-  ])
-);
-for (const [name, value] of namespaceLimits) {
-  assert.ok(Number.isSafeInteger(value), `Rust ${name} was not found`);
-  assert.equal(
-    nodeNamespaceValue(name),
-    value,
-    `Node ${name} differs from Rust namespace layout`
-  );
-}
-
-const bitsRequired = (value) => BigInt(value).toString(2).length;
-const expectedTopicShift = bitsRequired(
-  namespaceLimits.get('MAX_PARTITIONS') - 1
-);
-const expectedStreamShift = expectedTopicShift +
-  bitsRequired(namespaceLimits.get('MAX_TOPICS') - 1);
-const namespaceModule = await import(
-  pathToFileURL(resolve(nodeRoot, 'dist/wire/vsr/namespace.js')).href
-);
-assert.equal(
-  namespaceModule.packNamespace(1, 1, 1),
-  (1n << BigInt(expectedStreamShift)) |
-    (1n << BigInt(expectedTopicShift)) |
-    1n,
-  'Node namespace shifts differ from Rust namespace layout'
+// No namespace-packing parity to check: the client wire carries no routing
+// namespace, so the packing rules stay entirely server-side and this SDK has
+// nothing to mirror. What still matters is that the client never grows a
+// namespace field back -- the offset recomputation below catches that, since
+// reintroducing one would move every field after it.
+assert.ok(
+  !/namespace/i.test(nodeHeader.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '')),
+  'Node request header must not carry a namespace field'
 );
 
 const rustEvictionBlock =
@@ -186,22 +150,22 @@ assert.deepEqual(
   'Node EvictionReason differs from the Rust consensus enum'
 );
 
-const rustCommand2Block =
-  rustCommand.match(/pub enum Command2 \{([\s\S]*?)\n\}/)?.[1] ?? '';
-const rustCommand2 = enumValues(
-  rustCommand2Block,
+const rustCommandBlock =
+  rustCommand.match(/pub enum Command \{([\s\S]*?)\n\}/)?.[1] ?? '';
+const rustCommandTable = enumValues(
+  rustCommandBlock,
   /^\s+([A-Za-z0-9]+)\s*=\s*([0-9]+),$/gm
 );
-const nodeCommand2 = enumValues(
-  nodeHeader.match(/export const Command2 = \{([\s\S]*?)\n\}/)?.[1] ?? '',
+const nodeCommandTable = enumValues(
+  nodeHeader.match(/export const Command = \{([\s\S]*?)\n\}/)?.[1] ?? '',
   /^\s+([A-Za-z0-9]+):\s*([0-9]+),?$/gm
 );
-assert.ok(nodeCommand2.size > 0, 'Node Command2 table was not found');
-for (const [name, value] of nodeCommand2)
+assert.ok(nodeCommandTable.size > 0, 'Node Command table was not found');
+for (const [name, value] of nodeCommandTable)
   assert.equal(
-    rustCommand2.get(name),
+    rustCommandTable.get(name),
     value,
-    `Node Command2.${name} differs from Rust`
+    `Node Command.${name} differs from Rust`
   );
 
 const rustHeaderSize = Number(
@@ -221,7 +185,7 @@ const FIELD_LAYOUT = new Map([
   ['u32', [4, 4]],
   ['u64', [8, 8]],
   ['u128', [16, 16]],
-  ['Command2', [1, 1]],
+  ['Command', [1, 1]],
   ['Operation', [1, 1]],
   ['EvictionReason', [1, 1]]
 ]);

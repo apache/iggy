@@ -26,6 +26,11 @@ Requirements:
     - Docker running locally
     - testcontainers[docker] installed (in [testing-docker] extras)
     - CA certificate available at core/certs/iggy_ca_cert.pem
+    - server image built locally (or IGGY_SERVER_DOCKER_IMAGE set):
+      docker build -f core/server/Dockerfile --target runtime-prebuilt \
+        --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
+        --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+        -t iggy-server:local .
 """
 
 import asyncio
@@ -35,7 +40,7 @@ import pytest
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
-from apache_iggy import IggyClient, PollingStrategy
+from apache_iggy import Consumer, IggyClient, PollingStrategy
 from apache_iggy import SendMessage as Message
 
 from .utils import wait_for_ping, wait_for_server
@@ -45,7 +50,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", 
 CERTS_DIR = os.path.join(REPO_ROOT, "core", "certs")
 CA_FILE = os.path.join(CERTS_DIR, "iggy_ca_cert.pem")
 
-IGGY_IMAGE = os.environ.get("IGGY_SERVER_DOCKER_IMAGE", "apache/iggy:edge")
+IGGY_IMAGE = os.environ.get("IGGY_SERVER_DOCKER_IMAGE", "iggy-server:local")
 CONTAINER_TCP_PORT = 8090
 
 
@@ -66,7 +71,7 @@ def tls_container():
     )
     container.start()
     # Wait for the server to be ready inside the container
-    wait_for_logs(container, "Iggy server is running", timeout=60)
+    wait_for_logs(container, "server running", timeout=60)
     yield container
     container.stop()
 
@@ -138,6 +143,7 @@ class TestTlsConnectivity:
         polled = await tls_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,

@@ -25,6 +25,9 @@ pub trait Source: Send + Sync {
     /// Invoked every time a batch of messages is produced to the configured stream and topic.
     async fn poll(&self) -> Result<ProducedMessages, Error>;
 
+    /// Invoked after the runtime sends the batch and persists its candidate state.
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error>;
+
     /// Invoked when the source is closed, allowing it to perform any necessary cleanup.
     async fn close(&mut self) -> Result<(), Error>;
 }
@@ -132,7 +135,8 @@ struct State {
 pub struct RandomSource {
     id: u32,
     messages_count: u32,
-    state: Mutex<State>
+    state: Mutex<State>,
+    pending_state: Mutex<Option<State>>,
 }
 ```
 
@@ -163,8 +167,9 @@ impl RandomSource {
 
         RandomSource {
             id,
-            payload_size: config.payload_size.unwrap_or(100),
+            messages_count: config.messages_count.unwrap_or(10),
             state: Mutex::new(State { current_id }),
+            pending_state: Mutex::new(None),
         }
     }
 }
@@ -173,7 +178,7 @@ impl RandomSource {
 We can invoke the expected macro to expose the FFI interface and allow the connector runtime to register the source within the runtime.
 
 ```rust
-source_connector!(TestSource);
+source_connector!(RandomSource);
 ```
 
 At a bare minimum, we need to add the following dependencies to the `Cargo.toml` file to compile the plugin at all:
@@ -206,8 +211,7 @@ impl Source for RandomSource {
 
     async fn poll(&self) -> Result<ProducedMessages, iggy_connector_sdk::Error> {
         sleep(Duration::from_millis(100)).await;
-        let mut state = self.state.lock().await;
-        let current_id = state.current_id;
+        let mut current_id = self.state.lock().await.current_id;
 
         let mut messages = Vec::new();
         for _ in 0..self.messages_count {
@@ -235,17 +239,28 @@ impl Source for RandomSource {
             messages.push(message);
         }
 
-        state.current_id += current_id;
+        let candidate_state = State { current_id };
+        *self.pending_state.lock().await = Some(candidate_state);
         info!(
-            "Generated {} messages by random source connector with ID: {}"
+            "Generated {} messages by random source connector with ID: {}",
             messages.len(),
             self.id,
         );
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: Some(ConnectorState(state.current_id.to_le_bytes().to_vec())),
+            state: Some(ConnectorState(current_id.to_le_bytes().to_vec())),
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let candidate_state = self.pending_state.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(candidate_state) = candidate_state
+        {
+            *self.state.lock().await = candidate_state;
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -254,6 +269,8 @@ impl Source for RandomSource {
     }
 }
 ```
+
+The source keeps its committed cursor unchanged while the batch is in flight. An ACK commits the staged cursor; a NACK discards it so the same range can be polled again. Sources that delete or mark upstream rows should stage those operations in the same way.
 
 As you can see, the `ProducedMessage` can be customized to fit your needs, as all the fields will be directly mapped to the existing Iggy message struct.
 

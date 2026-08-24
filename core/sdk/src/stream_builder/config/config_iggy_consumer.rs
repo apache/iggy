@@ -50,7 +50,6 @@ pub struct IggyConsumerConfig {
     /// Sets the number of partitions for ConsumerKind `Consumer`. Does not apply to `ConsumerGroup`.
     partitions_count: u32,
     /// Sets the replication factor for the consumed topic.
-    replication_factor: Option<u8>,
     /// The polling interval for messages.
     polling_interval: IggyDuration,
     /// `PollingStrategy` specifies from where to start polling messages. See `PollingStrategy` for details.
@@ -85,7 +84,6 @@ impl Default for IggyConsumerConfig {
             polling_interval: IggyDuration::from_str("5ms").unwrap(),
             polling_strategy: PollingStrategy::last(),
             partitions_count: 1,
-            replication_factor: None,
             encryptor: None,
             polling_retry_interval: IggyDuration::new_from_secs(1),
             init_retries: Some(5),
@@ -112,7 +110,6 @@ impl IggyConsumerConfig {
     /// * `polling_interval` - The interval between polling for new messages.
     /// * `polling_strategy` - The polling strategy.
     /// * `partitions_count` - The number of partitions.
-    /// * `replication_factor` - The replication factor.
     /// * `encryptor` - The encryptor.
     /// * `polling_retry_interval` - The polling retry interval.
     /// * `init_retries` - The number of init retries.
@@ -137,7 +134,6 @@ impl IggyConsumerConfig {
         polling_interval: IggyDuration,
         polling_strategy: PollingStrategy,
         partitions_count: u32,
-        replication_factor: Option<u8>,
         encryptor: Option<Arc<EncryptorKind>>,
         polling_retry_interval: IggyDuration,
         init_retries: Option<u32>,
@@ -157,7 +153,6 @@ impl IggyConsumerConfig {
             polling_interval,
             polling_strategy,
             partitions_count,
-            replication_factor,
             encryptor,
             polling_retry_interval,
             init_retries,
@@ -200,7 +195,6 @@ impl IggyConsumerConfig {
             polling_interval,
             polling_strategy: PollingStrategy::last(),
             partitions_count: 1,
-            replication_factor: None,
             encryptor: None,
             polling_retry_interval: IggyDuration::new_from_secs(1),
             init_retries: Some(5),
@@ -259,10 +253,6 @@ impl IggyConsumerConfig {
 
     pub fn partitions_count(&self) -> u32 {
         self.partitions_count
-    }
-
-    pub fn replication_factor(&self) -> Option<u8> {
-        self.replication_factor
     }
 
     pub fn encryptor(&self) -> Option<Arc<EncryptorKind>> {
@@ -371,7 +361,6 @@ mod tests {
         );
         assert_eq!(config.polling_strategy(), PollingStrategy::last());
         assert_eq!(config.partitions_count(), 1);
-        assert_eq!(config.replication_factor(), None);
 
         assert_eq!(config.polling_retry_interval(), IggyDuration::ONE_SECOND);
         assert_eq!(config.init_retries(), Some(5));
@@ -394,7 +383,6 @@ mod tests {
             IggyDuration::from_str("5ms").unwrap(),
             PollingStrategy::last(),
             1,
-            None,
             None,
             IggyDuration::new_from_secs(1),
             Some(3),
@@ -425,7 +413,6 @@ mod tests {
         );
         assert_eq!(config.polling_strategy(), PollingStrategy::last());
         assert_eq!(config.partitions_count(), 1);
-        assert_eq!(config.replication_factor(), None);
 
         assert_eq!(
             config.polling_retry_interval(),
@@ -459,6 +446,5 @@ mod tests {
         );
         assert_eq!(config.polling_strategy(), PollingStrategy::last());
         assert_eq!(config.partitions_count(), 1);
-        assert_eq!(config.replication_factor(), None);
     }
 }

@@ -14,12 +14,6 @@ The Apache Iggy C# SDK provides a comprehensive client library for interacting w
 offers a modern, async-first API with support for multiple transport protocols and comprehensive message streaming
 capabilities.
 
-> Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
->
-> Incubation is required of all newly accepted projects until a further review indicates that the infrastructure, communications, and decision making process have stabilized in a manner consistent with other successful ASF projects.
->
-> While incubation status is not necessarily a reflection of the completeness or stability of the code, it does indicate that the project has yet to be fully endorsed by the ASF.
-
 ## Getting Started
 
 ### Installation
@@ -37,6 +31,10 @@ The SDK supports two transport protocols:
 - **TCP** - Binary protocol for optimal performance and lower latency (recommended)
 - **HTTP** - RESTful JSON API for stateless operations
 
+Over TCP the SDK speaks the VSR consensus framing, which is the only wire protocol the server accepts.
+
+See [Viewstamped Replication (VSR)](#viewstamped-replication-vsr) for what that means for the client API.
+
 ### Creating a Client
 
 The SDK is built around the `IIggyClient` interface. To create a client instance:
@@ -51,7 +49,8 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 await client.ConnectAsync();
 ```
 
-Optionally, you can provide an `ILoggerFactory` for diagnostics and debugging (defaults to `NullLoggerFactory.Instance`):
+Optionally, you can provide an `ILoggerFactory` for diagnostics and debugging (defaults to
+`NullLoggerFactory.Instance`):
 
 ```c#
 var loggerFactory = LoggerFactory.Create(builder =>
@@ -93,11 +92,15 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         CertificatePath = "/path/to/cert"
     },
 
-    // Automatic reconnection with exponential backoff
+    // Idle ping keeping the session alive under server-side heartbeat verification (TCP only).
+    // Default 5 seconds, must be between 1 millisecond and about 49 days. Init-only.
+    HeartbeatInterval = TimeSpan.FromSeconds(5),
+
+    // Automatic reconnection with exponential backoff (enabled by default, infinite retries)
     ReconnectionSettings = new ReconnectionSettings
     {
         Enabled = true,
-        MaxRetries = 3,              // 0 = infinite retries
+        MaxRetries = 0,              // 0 = infinite retries
         InitialDelay = TimeSpan.FromSeconds(5),
         MaxDelay = TimeSpan.FromSeconds(30),
         WaitAfterReconnect = TimeSpan.FromSeconds(1),
@@ -105,13 +108,10 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         BackoffMultiplier = 2.0
     },
 
-    // Auto-login after connection
-    AutoLoginSettings = new AutoLoginSettings
-    {
-        Enabled = true,
-        Username = "your_username",
-        Password = "your_password"
-    },
+    // Auto-login after connection. Reconnection needs it: without credentials to replay a reconnect cannot
+    // restore the session, so a lost connection fails the request instead
+    AutoLoginSettings = AutoLoginSettings.For("your_username", "your_password"),
+    // or AutoLoginSettings.ForPersonalAccessToken("your_token")
 
     // Optional: logging
     LoggerFactory = loggerFactory
@@ -119,6 +119,101 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 
 await client.ConnectAsync();
 ```
+
+## Viewstamped Replication (VSR)
+
+Over TCP every request is wrapped in a 256-byte consensus header, the client registers a consensus session at
+login, and writes are replicated before they are acknowledged. The `IIggyClient` surface is unchanged, with the
+few exceptions listed under [Limitations](#limitations).
+
+```c#
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
+{
+    BaseAddress = "127.0.0.1:8090",
+    Protocol = Protocol.Tcp,
+
+    // Upper bound on a reply frame the server announces, 64 MiB by default.
+    MaxResponseFrameSize = 64 * 1024 * 1024,
+
+    AutoLoginSettings = AutoLoginSettings.For("iggy", "iggy")
+});
+
+await client.ConnectAsync();
+```
+
+### What changes under VSR
+
+- **Login binds a session.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync` run the register handshake
+  at connect time, and the session lives for as long as the connection. Logging out, being evicted
+  or losing the connection ends it, and the next login registers a fresh one.
+- **Leader redirection is automatic.** The client reads the cluster roster, follows the current leader and
+  re-checks it when a request is refused because the node stopped being primary.
+- **The client picks partitions.** The broker never routes: balanced and message-key partitioning are resolved
+  client-side (the message-key hash matches the Rust SDK byte for byte), and consumer-group polls round-robin
+  over the partitions the coordinator assigned to this client.
+- **Consumer groups are assignment-based.** `JoinConsumerGroupAsync` makes this client a member; the assignment
+  is synced on demand and refreshed on every `PingAsync`. Partition counts are cached for 30 seconds, so a topic
+  another client widens is picked up without waiting for a ping.
+- **Credentials are bounds-checked locally.** A username outside 3-50 bytes, a password outside 3-100 bytes or a
+  personal access token outside 1-255 bytes is rejected before the register body is framed.
+- **`PingAsync` costs more than a ping.** Besides the ping it re-syncs the assignment of every consumer group
+  this client has joined, so it makes one extra round trip per joined group. The TCP client pings on its own
+  every `HeartbeatInterval` (5 seconds by default) while connected, so an idle session survives the server's
+  heartbeat verification and assignments stay fresh; a lost session is repaired by the regular reconnect and
+  auto login.
+
+### Retries and failed requests
+
+The SDK replays a request whenever the server says it never admitted it. Two cases surface to the caller:
+
+- `IggyInvalidStatusCodeException` carries the server status code, with `FromServer` telling apart a verdict the
+  cluster reported from a failure the client raised itself.
+- `VsrRequestOutcomeUnknownException` means no server verdict arrived after the request was written - the
+  connection was lost, the call was cancelled, or the server evicted the session while the request was in
+  flight - so the cluster may or may not have committed it. The SDK will not replay it on a new session,
+  because that would bypass server-side deduplication - re-issuing it is the caller's decision.
+  `IggyPublisher` will not retry it either: it reports the batch through the message-batch-failed event, and
+  `IggyConsumer` rethrows it rather than swallowing it, because an auto-committing poll may have advanced the
+  offset already. Rethrowing ends the consumer's polling loop: catch it around the enumeration, decide whether
+  the operation is safe to re-issue, and start consuming again.
+
+### Limitations
+
+- VSR requires `Protocol.Tcp`; configuring it with `Protocol.Http` throws at client creation.
+- `StoreOffsetAsync` / `DeleteOffsetAsync` need an explicit partition id under VSR: the broker does not
+  resolve a `null` partition for a consumer-offset request, so passing one throws client-side.
+- `FlushUnsavedBufferAsync` is not available under VSR; the server refuses it.
+- Polling a topic that does not exist returns an empty poll rather than throwing. The server
+  answers an unresolved topic with the empty-poll reply shape, so the client cannot tell it apart from a topic
+  with no messages. Check the topic exists first if the distinction matters.
+
+### Behaviour changes for existing clients
+
+- `MaxResponseFrameSize` bounds the reply frames the **VSR** reader accepts. A reply larger than the 64 MiB
+  default is refused and the connection is dropped, so raise it if a single response legitimately exceeds that
+  - a large `GetSnapshotAsync` is the usual case.
+- Clients built with `IggyConsumerBuilder` / `IggyPublisherBuilder` now auto-login with the credentials passed
+  to `WithConnection`. Before, a builder-created client came back from a
+  reconnect unauthenticated; now the credentials are held for the lifetime of the connection and replayed.
+- The TCP client now pings the server every `HeartbeatInterval` (5 seconds, always on) on its own, and
+  reconnection is on by default (it was off before) with unlimited retries, like the Rust client. Only a
+  failed dial is retried; a rejected certificate, bad credentials or a missing leader is thrown right away.
+  A dropped connection fails every in-flight request at once; they share a single reconnect and are replayed
+  on the connection it establishes. With the default `MaxRetries = 0` an unreachable server is retried
+  forever, so a request that passes no `CancellationToken` waits for as long as the server stays down - set
+  `MaxRetries` or pass a token to bound it. Reconnection only replays a request when `AutoLoginSettings` can
+  restore the session; a client that logged in by hand fails fast on a lost connection. Set
+  `ReconnectionSettings.Enabled = false` to opt out of reconnection.
+- `AutoLoginSettings` properties are now `init`-only, as is `IggyClientConfigurator.HeartbeatInterval`. Build
+  them with an object initializer or the `AutoLoginSettings.For` / `AutoLoginSettings.ForPersonalAccessToken`
+  factories instead of assigning after construction.
+- `IggyConsumerBuilder` / `IggyPublisherBuilder` accept a personal access token through the
+  `WithConnection(protocol, address, personalAccessToken, ...)` overload, as an alternative to a username and
+  password.
+- The SDK now ships a dependency on `System.IO.Hashing`, used for the client-side message-key partitioner.
+- TCP sockets are opened with `NoDelay`. The protocol is request/reply, so a write is
+  always the last one before the client waits for the answer and Nagle has nothing to coalesce it with - it
+  only held back the trailing segment of a large request until the previous one was acked.
 
 ## Authentication
 
@@ -197,7 +292,6 @@ await client.CreateTopicAsync(
     name: "my-topic",
     partitionsCount: 3,
     compressionAlgorithm: CompressionAlgorithm.None,
-    replicationFactor: 1,
     messageExpiry: 0,  // 0 = never expire
     maxTopicSize: 0    // 0 = unlimited
 );
@@ -473,7 +567,8 @@ var fullSnapshot = await client.GetSnapshotAsync(
 
 Available compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `Xz`.
 
-Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`, `All`.
+Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`,
+`All`.
 
 ### Segment Management
 
@@ -694,10 +789,14 @@ Integration tests are located in `Iggy_SDK.Tests.Integration/`. Tests can run ag
 
 #### 1. Dockerization
 
-```bash
-cargo build
+The suite runs against `iggy-server`. TCP only: the SDK frames TCP with the
+VSR wire protocol, the cluster serves reads from the primary, and the HTTP surface has no equivalent path to
+route them through.
 
-docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t local-iggy-server .
+```bash
+cargo build --bin iggy-server --bin iggy
+
+docker build --no-cache -f core/server/Dockerfile --platform linux/amd64 --target runtime-prebuilt --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server --build-arg PREBUILT_IGGY_CLI=target/debug/iggy -t iggy-server:test .
 ```
 
 #### 2. Build the Test Project
@@ -710,9 +809,12 @@ dotnet build foreign/csharp/Iggy_SDK.Tests.Integration
 
 ```bash
 cd foreign/csharp
-export IGGY_SERVER_DOCKER_IMAGE=local-iggy-server
+export IGGY_SERVER_DOCKER_IMAGE=iggy-server:test
 dotnet test -f net10.0 --project Iggy_SDK.Tests.Integration --no-build --verbosity diagnostic
 ```
+
+`IGGY_SERVER_DOCKER_IMAGE` defaults to `iggy-server:test`, so the export above is only needed to point
+at a different image. Rider and Visual Studio need nothing configured.
 
 ## Useful Resources
 

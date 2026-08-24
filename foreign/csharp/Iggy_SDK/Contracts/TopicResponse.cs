@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
+using Apache.Iggy.Headers;
 using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
@@ -75,13 +75,43 @@ public sealed class TopicResponse
     /// </summary>
     public required uint PartitionsCount { get; init; }
 
-    /// <summary>
-    ///     Replication factor of the topic.
-    /// </summary>
-    public required byte? ReplicationFactor { get; init; }
 
     /// <summary>
     ///     List of partitions in the topic.
     /// </summary>
     public IEnumerable<PartitionResponse>? Partitions { get; init; }
+
+    /// <summary>
+    ///     Options explicitly set by the client at topic creation. Over REST the values arrive in
+    ///     their readable string form, so every one of them is <see cref="HeaderKind.String" />;
+    ///     the binary transports carry the server's canonical kind per key.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
+
+    /// <summary>
+    ///     Options resolved from server defaults at topic creation. Over REST the values arrive in
+    ///     their readable string form, so every one of them is <see cref="HeaderKind.String" />;
+    ///     the binary transports carry the server's canonical kind per key.
+    /// </summary>
+    [JsonIgnore]
+    public Dictionary<HeaderKey, HeaderValue>? DerivedOptions { get; init; }
+
+    /// <summary>
+    ///     REST renders both provenances into one object keyed by option name, so one JSON property
+    ///     fills <see cref="Options" /> and <see cref="DerivedOptions" />. Those two stay ignored by
+    ///     the serializer: a <see cref="HeaderKey" /> is not a JSON string key, and one of them would
+    ///     claim this property's name.
+    /// </summary>
+    [JsonInclude]
+    [JsonPropertyName("options")]
+    [JsonConverter(typeof(ResourceOptionsConverter))]
+    internal ResourceOptions RestOptions
+    {
+        init
+        {
+            Options = value.Explicit;
+            DerivedOptions = value.Derived;
+        }
+    }
 }

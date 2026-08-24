@@ -156,14 +156,10 @@ class IggyErrorCodeTest {
         "1, ERROR",
         "3, INVALID_COMMAND",
         "4, INVALID_FORMAT",
-        "6, FEATURE_UNAVAILABLE",
-        "7, CANNOT_PARSE_INT",
-        "8, CANNOT_PARSE_SLICE",
-        "9, CANNOT_PARSE_UTF8",
-
-        // Resource errors
+        "5, FEATURE_UNAVAILABLE",
+        "6, INVALID_IDENTIFIER",
         "20, RESOURCE_NOT_FOUND",
-        "100, CANNOT_LOAD_RESOURCE",
+        "30, STALE_CLIENT",
 
         // Authentication/Authorization errors
         "40, UNAUTHENTICATED",
@@ -171,58 +167,77 @@ class IggyErrorCodeTest {
         "42, INVALID_CREDENTIALS",
         "43, INVALID_USERNAME",
         "44, INVALID_PASSWORD",
-        "45, CLEAR_TEXT_PASSWORD_REQUIRED",
+        "45, INVALID_USER_STATUS",
         "46, USER_ALREADY_EXISTS",
         "47, USER_INACTIVE",
-        "48, CANNOT_DELETE_USER_WITH_ACTIVE_PAT",
-        "49, CANNOT_UPDATE_OWN_PERMISSIONS",
-        "50, CANNOT_DELETE_YOURSELF",
-        "51, CLIENT_ALREADY_EXISTS",
-        "52, CLIENT_NOT_FOUND",
-        "53, INVALID_PAT_TOKEN",
-        "54, PAT_NAME_ALREADY_EXISTS",
-        "77, PASSWORD_DOES_NOT_MATCH",
-        "78, PASSWORD_HASH_INTERNAL_ERROR",
+        "48, CANNOT_DELETE_USER",
+        "49, CANNOT_CHANGE_PERMISSIONS",
+        "50, INVALID_PERSONAL_ACCESS_TOKEN_NAME",
+        "51, PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS",
+        "52, PERSONAL_ACCESS_TOKENS_LIMIT_REACHED",
+        "53, INVALID_PERSONAL_ACCESS_TOKEN",
+        "54, PERSONAL_ACCESS_TOKEN_EXPIRED",
+        "57, TRANSIENT_NOT_COMMITTED",
+        "58, TRANSIENT_NOT_ACCEPTED",
+        "77, ACCESS_TOKEN_MISSING",
+        "78, INVALID_ACCESS_TOKEN",
+
+        // Wire decoding errors
+        "80, INVALID_SIZE_BYTES",
+        "81, INVALID_UTF8",
+        "82, INVALID_NUMBER_ENCODING",
+        "83, INVALID_BOOLEAN_VALUE",
+        "84, INVALID_NUMBER_VALUE",
+
+        // Client errors
+        "100, CLIENT_NOT_FOUND",
 
         // Stream errors
+        "1001, CANNOT_CREATE_STREAM_DIRECTORY",
         "1009, STREAM_ID_NOT_FOUND",
         "1010, STREAM_NAME_NOT_FOUND",
-        "1012, STREAM_ALREADY_EXISTS",
+        "1012, STREAM_NAME_ALREADY_EXISTS",
         "1013, INVALID_STREAM_NAME",
-        "1014, CANNOT_CREATE_STREAM_DIRECTORY",
+        "1014, INVALID_STREAM_ID",
+        "1020, TOO_MANY_STREAMS",
 
         // Topic errors
+        "2001, CANNOT_CREATE_TOPIC_DIRECTORY",
         "2010, TOPIC_ID_NOT_FOUND",
         "2011, TOPIC_NAME_NOT_FOUND",
-        "2012, TOPICS_COUNT_EXCEEDED",
-        "2013, TOPIC_ALREADY_EXISTS",
+        "2013, TOPIC_NAME_ALREADY_EXISTS",
         "2014, INVALID_TOPIC_NAME",
-        "2015, INVALID_REPLICATION_FACTOR",
-        "2016, CANNOT_CREATE_TOPIC_DIRECTORY",
+        "2015, TOO_MANY_PARTITIONS",
+        "2016, INVALID_TOPIC_ID",
+        "2018, INVALID_REPLICATION_FACTOR",
+        "2021, TOO_MANY_TOPICS",
 
         // Partition errors
         "3007, PARTITION_NOT_FOUND",
-
-        // Consumer group errors
-        "5000, CONSUMER_GROUP_ID_NOT_FOUND",
-        "5002, CONSUMER_GROUP_MEMBER_NOT_FOUND",
-        "5003, CONSUMER_GROUP_NAME_NOT_FOUND",
-        "5004, CONSUMER_GROUP_ALREADY_EXISTS",
-        "5005, INVALID_CONSUMER_GROUP_NAME",
-        "5006, CONSUMER_GROUP_NOT_JOINED",
+        "3013, PARTITION_ID_SPACE_EXHAUSTED",
 
         // Segment errors
         "4000, SEGMENT_NOT_FOUND",
         "4001, SEGMENT_CLOSED",
-        "4002, CANNOT_READ_SEGMENT",
-        "4003, CANNOT_SAVE_SEGMENT",
+        "4002, INVALID_SEGMENT_SIZE",
+        "4003, CANNOT_CREATE_SEGMENT_LOG_FILE",
 
         // Message errors
-        "7000, TOO_MANY_MESSAGES",
-        "7001, EMPTY_MESSAGES",
-        "7002, TOO_BIG_MESSAGE",
-        "7003, INVALID_MESSAGE_CHECKSUM",
-        "7004, MESSAGE_NOT_FOUND",
+        "4022, TOO_BIG_MESSAGE_PAYLOAD",
+        "4023, TOO_MANY_MESSAGES",
+        "4024, EMPTY_MESSAGE_PAYLOAD",
+        "4027, INVALID_MESSAGE_CHECKSUM",
+
+        // Consumer group errors
+        "5000, CONSUMER_GROUP_ID_NOT_FOUND",
+        "5002, INVALID_CONSUMER_GROUP_ID",
+        "5003, CONSUMER_GROUP_NAME_NOT_FOUND",
+        "5004, CONSUMER_GROUP_NAME_ALREADY_EXISTS",
+        "5005, INVALID_CONSUMER_GROUP_NAME",
+        "5006, CONSUMER_GROUP_MEMBER_NOT_FOUND",
+
+        // VSR protocol errors
+        "14003, INCOMPATIBLE_PROTOCOL_VERSION",
     })
     void fromCodeReturnsExpectedIggyErrorCodeWhenCodeIsValid(int code, IggyErrorCode expected) {
         var iggyErrorCode = IggyErrorCode.fromCode(code);

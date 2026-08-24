@@ -21,6 +21,7 @@ import uuid
 import pytest
 
 from apache_iggy import (
+    Consumer,
     HeaderKey,
     HeaderValue,
     IggyClient,
@@ -58,6 +59,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -67,6 +69,48 @@ class TestMessageOperations:
         assert [message.payload().decode() for message in polled_messages] == (
             test_messages
         )
+
+    @pytest.mark.asyncio
+    async def test_send_messages_reports_committed_confirmation(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the send response reports the committed partition and offset."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        payloads = [f"Confirmation test {i}" for i in range(3)]
+        response = await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message(payload) for payload in payloads],
+        )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Single(1),
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.First(),
+            count=10,
+            auto_commit=True,
+        )
+
+        assert [message.payload().decode() for message in polled_messages] == payloads
+
+        # The server confirms committed sends with the partition and the base
+        # offset of the batch; the whole send targeted one partition, so a
+        # single confirmation covers it.
+        assert len(response.confirmations) == 1
+        confirmation = response.confirmations[0]
+        assert confirmation.partition_id == partition_id
+        assert confirmation.base_offset == polled_messages[0].offset()
 
     @pytest.mark.asyncio
     async def test_send_and_poll_messages_as_bytes(
@@ -95,6 +139,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -129,6 +174,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -185,6 +231,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -235,6 +282,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -277,6 +325,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -578,6 +627,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -619,6 +669,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -658,6 +709,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -694,6 +746,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=1,
@@ -728,6 +781,7 @@ class TestMessageOperations:
         polled_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -765,6 +819,7 @@ class TestMessageOperations:
             await iggy_client.poll_messages(
                 stream=stream_name,
                 topic=topic_name,
+                consumer=Consumer.Single(1),
                 partition_id=partition_id,
                 polling_strategy=PollingStrategy.First(),
                 count=0,
@@ -802,6 +857,7 @@ class TestMessageOperations:
             await iggy_client.poll_messages(
                 stream=stream_name,
                 topic=topic_name,
+                consumer=Consumer.Single(1),
                 partition_id=1,
                 polling_strategy=PollingStrategy.First(),
                 count=1,
@@ -834,6 +890,7 @@ class TestMessageOperations:
         last_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
@@ -868,6 +925,7 @@ class TestMessageOperations:
         last_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=2,
@@ -904,6 +962,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -914,6 +973,7 @@ class TestMessageOperations:
         offset_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Offset(value=start_offset),
             count=10,
@@ -950,6 +1010,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -960,6 +1021,7 @@ class TestMessageOperations:
         offset_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Offset(value=offset_beyond_newest),
             count=10,
@@ -995,6 +1057,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1005,6 +1068,7 @@ class TestMessageOperations:
         timestamp_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Timestamp(value=start_timestamp),
             count=10,
@@ -1043,6 +1107,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1053,6 +1118,7 @@ class TestMessageOperations:
         timestamp_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Timestamp(value=timestamp_after_newest),
             count=10,
@@ -1089,6 +1155,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1109,6 +1176,7 @@ class TestMessageOperations:
         next_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Next(),
             count=10,
@@ -1147,6 +1215,7 @@ class TestMessageOperations:
         first_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
@@ -1167,6 +1236,7 @@ class TestMessageOperations:
         next_messages = await iggy_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Next(),
             count=10,
@@ -1176,3 +1246,351 @@ class TestMessageOperations:
         assert [
             message.payload().decode("utf-8") for message in next_messages
         ] == existing_messages + new_messages
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_distinct_consumers_keeps_offsets_independent(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test each consumer owns its offset, so both see the whole partition."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        test_messages = [f"Consumer isolation {i} - {unique_name()}" for i in range(3)]
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message(message) for message in test_messages],
+        )
+
+        for consumer_name in ("isolation-consumer-a", "isolation-consumer-b"):
+            polled_messages = await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=Consumer.Single(consumer_name),
+                partition_id=partition_id,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+            assert [
+                message.payload().decode("utf-8") for message in polled_messages
+            ] == test_messages
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_shared_consumer_shares_the_partition(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test two polls under the same consumer share one stored offset."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        test_messages = [f"Shared consumer {i} - {unique_name()}" for i in range(3)]
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=[Message(message) for message in test_messages],
+        )
+
+        first_poll = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Single("shared-consumer"),
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.Next(),
+            count=10,
+            auto_commit=True,
+        )
+        assert [
+            message.payload().decode("utf-8") for message in first_poll
+        ] == test_messages
+
+        second_poll = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Single("shared-consumer"),
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.Next(),
+            count=10,
+            auto_commit=True,
+        )
+        assert second_poll == []
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_without_a_consumer_raises_type_error(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test the consumer argument is required."""
+        # Argument binding fails before the call reaches the server, so the
+        # stream and topic never have to exist.
+        with pytest.raises(TypeError, match="consumer"):
+            # pyrefly: ignore  # missing-argument
+            await iggy_client.poll_messages(
+                stream=unique_name(),
+                topic=unique_name(),
+                partition_id=0,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "consumer", ["single", 1, None], ids=["str", "int", "none"]
+    )
+    async def test_poll_messages_with_a_non_consumer_raises_type_error(
+        self, iggy_client: IggyClient, unique_name, consumer
+    ):
+        """Test the consumer argument only accepts a Consumer."""
+        # Argument binding fails before the call reaches the server, so the
+        # stream and topic never have to exist.
+        with pytest.raises(TypeError, match="not an instance of 'Consumer'"):
+            # pyrefly: ignore  # bad-argument-type
+            await iggy_client.poll_messages(
+                stream=unique_name(),
+                topic=unique_name(),
+                consumer=consumer,
+                partition_id=0,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+
+    @pytest.mark.parametrize("identifier", [-1, 2**32], ids=["negative", "above-u32"])
+    def test_consumer_rejects_numeric_ids_outside_u32(self, identifier):
+        """Test an out-of-range numeric id is refused when the consumer is built."""
+        with pytest.raises(TypeError):
+            Consumer.Single(identifier)
+        with pytest.raises(TypeError):
+            Consumer.Group(identifier)
+
+    def test_consumer_accepts_valid_numeric_ids(self):
+        """Test both consumer kinds keep the numeric id they were given."""
+        assert Consumer.Single(1).id == 1
+        assert Consumer.Group(4294967295).id == 4294967295
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("identifier", ["", "a" * 256], ids=["empty", "too-long"])
+    @pytest.mark.parametrize(
+        "consumer_kind", [Consumer.Single, Consumer.Group], ids=["single", "group"]
+    )
+    async def test_poll_messages_with_an_invalid_string_identifier_raises_value_error(
+        self, iggy_client: IggyClient, unique_name, identifier, consumer_kind
+    ):
+        """Test a string id is validated when it is converted, not when it is built."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+
+        with pytest.raises(ValueError, match="Invalid identifier"):
+            await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=consumer_kind(identifier),
+                partition_id=0,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_without_partition_id_reads_partition_zero(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a regular consumer falls back to partition 0, not the whole topic."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partitions_count = 3
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=partitions_count
+        )
+        for partition_id in range(partitions_count):
+            await iggy_client.send_messages(
+                stream=stream_name,
+                topic=topic_name,
+                partitioning=partition_id,
+                messages=[Message(f"Partition {partition_id}")],
+            )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Single("partition-zero-consumer"),
+            polling_strategy=PollingStrategy.Next(),
+            count=10,
+            auto_commit=True,
+        )
+
+        assert [
+            (message.partition_id(), message.payload().decode("utf-8"))
+            for message in polled_messages
+        ] == [(0, "Partition 0")]
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_consumer_group_rotates_assigned_partitions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a sole group member reaches every partition over repeated polls."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+        partitions_count = 3
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=partitions_count
+        )
+        await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        for partition_id in range(partitions_count):
+            await iggy_client.send_messages(
+                stream=stream_name,
+                topic=topic_name,
+                partitioning=partition_id,
+                messages=[Message(f"Partition {partition_id}")],
+            )
+
+        polled = []
+        for _ in range(partitions_count):
+            polled_messages = await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=Consumer.Group(group_name),
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+            polled.extend(
+                (message.partition_id(), message.payload().decode("utf-8"))
+                for message in polled_messages
+            )
+
+        assert polled == [
+            (partition_id, f"Partition {partition_id}")
+            for partition_id in range(partitions_count)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_an_unjoined_consumer_group_fails(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a group poll needs membership, since it has no assignment without it."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=0,
+            messages=[Message("Unjoined group")],
+        )
+
+        # The group exists; only the join is missing.
+        with pytest.raises(RuntimeError, match="was not found"):
+            await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=Consumer.Group(group_name),
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_consumer_group_honours_an_explicit_partition(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test an explicit partition overrides the rotation for a group member."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+        partitions_count = 3
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=partitions_count
+        )
+        await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        for partition_id in range(partitions_count):
+            await iggy_client.send_messages(
+                stream=stream_name,
+                topic=topic_name,
+                partitioning=partition_id,
+                messages=[Message(f"Partition {partition_id}")],
+            )
+
+        # Partition 0 is the fallback, so asking for the others is what proves
+        # the explicit id is honoured.
+        for requested_partition in (1, 2):
+            polled_messages = await iggy_client.poll_messages(
+                stream=stream_name,
+                topic=topic_name,
+                consumer=Consumer.Group(group_name),
+                partition_id=requested_partition,
+                polling_strategy=PollingStrategy.Next(),
+                count=10,
+                auto_commit=True,
+            )
+            assert [
+                (message.partition_id(), message.payload().decode("utf-8"))
+                for message in polled_messages
+            ] == [(requested_partition, f"Partition {requested_partition}")]
+
+    @pytest.mark.asyncio
+    async def test_poll_messages_with_consumer_group_reads_assigned_partitions(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test a group member polls its assignment when no partition is given."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        group_name = unique_name()
+        test_messages = [f"Group polling {i} - {unique_name()}" for i in range(3)]
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await iggy_client.create_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.join_consumer_group(stream_name, topic_name, group_name)
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=0,
+            messages=[Message(message) for message in test_messages],
+        )
+
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Group(group_name),
+            polling_strategy=PollingStrategy.Next(),
+            count=10,
+            auto_commit=True,
+        )
+        assert [
+            message.payload().decode("utf-8") for message in polled_messages
+        ] == test_messages

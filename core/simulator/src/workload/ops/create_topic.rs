@@ -19,7 +19,7 @@
 //! `StreamNotFound` (a fabricated parent stream), or `NameAlreadyExists` (an
 //! existing topic name under its live stream).
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
@@ -80,11 +80,19 @@ pub fn sample(
                 partitions_count,
             })
         }
+        // Not targeted (absent from `OUTCOMES`): the sim client sends only valid
+        // catalog keys, the slab ceiling needs `MAX_TOPICS` creates under one
+        // stream, and the primary mints dense 0-based partition ids, so neither
+        // partition guard is reachable from the wire.
+        Outcome::InvalidOptionValue
+        | Outcome::TooManyTopics
+        | Outcome::InvalidPartitionsCount
+        | Outcome::PartitionIdSpaceExhausted => None,
     }
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.create_topic(&input.stream, &input.name, input.partitions_count)
 }
 

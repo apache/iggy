@@ -14,21 +14,19 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { EventEmitter } from 'node:events';
 import type { Socket } from 'node:net';
 import { createConnection } from 'node:net';
 import { connect as TLSConnect } from 'node:tls';
 import type { ClientConfig, TlsOption, TcpOption, ReconnectOption } from "./client.type.js"
-import { serializeCommand } from './client.utils.js';
 import { debug } from './client.debug.js';
 import { DEFAULT_MAX_RESPONSE_FRAME_SIZE } from './client.config.js';
 import {
   ProtocolFrameError,
   ResponseFrameDecoder
 } from './client.frame.js';
-import { Command2, peekCommand } from '../wire/vsr/header.js';
+import { Command, peekCommand } from '../wire/vsr/header.js';
 import { evictionError } from '../wire/vsr/reply.js';
 
 
@@ -141,7 +139,6 @@ export class IggyConnection extends EventEmitter {
     this.connectPromise = undefined;
     this.reconnectPromise = undefined;
     this.responseDecoder = new ResponseFrameDecoder(
-      config.protocol ?? 'classic',
       config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE
     );
     this.socket = this._installSocket(getTransport(config));
@@ -427,8 +424,7 @@ export class IggyConnection extends EventEmitter {
 
     try {
       for (const response of this.responseDecoder.push(data)) {
-        if (this.config.protocol === 'vsr' &&
-            peekCommand(response) === Command2.Eviction)
+        if (peekCommand(response) === Command.Eviction)
           this.emit('eviction', evictionError(response));
         else
           this.emit('response', response);
@@ -441,18 +437,6 @@ export class IggyConnection extends EventEmitter {
       );
       this.socket.destroy();
     }
-  }
-
-  /**
-   * Writes a command to the socket.
-   *
-   * @param command - Command code
-   * @param payload - Command payload
-   * @returns True if the write was successful
-   */
-  writeCommand(command: number, payload: Buffer): void {
-    const cmd = serializeCommand(command, payload);
-    this.socket.write(cmd);
   }
 
   writeFrame(frame: Buffer): void {

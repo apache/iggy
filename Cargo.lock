@@ -1950,7 +1950,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "bench-dashboard-frontend"
-version = "0.7.1-edge.1"
+version = "0.8.0-edge.3"
 dependencies = [
  "bench-dashboard-shared",
  "bench-report",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "bench-report"
-version = "0.3.1-edge.1"
+version = "0.4.0-edge.3"
 dependencies = [
  "charming",
  "colored",
@@ -3195,15 +3195,14 @@ dependencies = [
  "err_trail",
  "figment",
  "iggy_common",
+ "ipnet",
  "jsonwebtoken",
  "serde",
  "serde_json",
  "serde_with",
  "server_common",
  "static-toml",
- "strum 0.28.0",
  "tracing",
- "tungstenite 0.30.0",
 ]
 
 [[package]]
@@ -3220,6 +3219,7 @@ dependencies = [
 name = "consensus"
 version = "0.1.0"
 dependencies = [
+ "aligned-vec",
  "bit-set 0.11.1",
  "bytemuck",
  "bytes",
@@ -4851,35 +4851,6 @@ dependencies = [
  "rayon-core",
  "smallvec",
  "zune-inflate",
-]
-
-[[package]]
-name = "ext-trait"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d772df1c1a777963712fb68e014235e80863d6a91a85c4e06ba2d16243a310e5"
-dependencies = [
- "ext-trait-proc_macros",
-]
-
-[[package]]
-name = "ext-trait-proc_macros"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ab7934152eaf26aa5aa9f7371408ad5af4c31357073c9e84c3b9d7f11ad639a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "extension-traits"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a296e5a895621edf9fa8329c83aa1cb69a964643e36cf54d8d7a69b789089537"
-dependencies = [
- "ext-trait",
 ]
 
 [[package]]
@@ -6628,7 +6599,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.4"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -6651,6 +6622,7 @@ dependencies = [
  "rustls",
  "secrecy",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
@@ -6661,7 +6633,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.5.1-edge.1"
+version = "0.6.0-edge.4"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -6690,7 +6662,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.7.1-edge.1"
+version = "0.8.0-edge.3"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -6718,7 +6690,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.13.1-edge.1"
+version = "0.14.0-edge.4"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6752,11 +6724,12 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "bytes",
  "clap",
  "configs",
  "configs_derive",
@@ -6790,6 +6763,7 @@ dependencies = [
  "serde_with",
  "serde_yaml_ng",
  "strum 0.28.0",
+ "subtle",
  "sysinfo 0.39.6",
  "system_stats",
  "tempfile",
@@ -6800,11 +6774,13 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
 name = "iggy-mcp"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.3"
 dependencies = [
  "axum",
  "axum-server",
@@ -6838,7 +6814,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.4"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -6846,11 +6822,12 @@ dependencies = [
  "enumset",
  "secrecy",
  "thiserror 2.0.19",
+ "twox-hash",
 ]
 
 [[package]]
 name = "iggy_common"
-version = "0.10.3-edge.3"
+version = "0.11.0-edge.4"
 dependencies = [
  "aes-gcm",
  "async-broadcast",
@@ -6866,7 +6843,6 @@ dependencies = [
  "derive_more",
  "humantime",
  "iggy_binary_protocol",
- "lending-iterator",
  "papaya",
  "ring",
  "secrecy",
@@ -6886,7 +6862,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_clickhouse_sink"
-version = "0.1.0"
+version = "0.2.0-edge.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6904,7 +6880,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_delta_sink"
-version = "0.1.1-edge.1"
+version = "0.2.0-edge.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -6921,7 +6897,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_doris_sink"
-version = "0.1.0"
+version = "0.2.0-edge.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -6941,7 +6917,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -6959,7 +6935,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_elasticsearch_source"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -6977,7 +6953,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_http_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -6999,7 +6975,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_iceberg_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "arrow-json 57.3.1",
  "async-trait",
@@ -7018,7 +6994,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -7039,7 +7015,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_influxdb_source"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "ahash 0.8.12",
  "async-trait",
@@ -7086,7 +7062,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_meilisearch_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -7104,7 +7080,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_mongodb_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "humantime",
@@ -7120,7 +7096,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7139,7 +7115,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_postgres_source"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -7161,7 +7137,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_quickwit_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7175,7 +7151,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_random_source"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7192,7 +7168,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_s3_sink"
-version = "0.4.0"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -7213,7 +7189,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.3.1-edge.1"
+version = "0.4.0-edge.3"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -7249,7 +7225,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_stdout_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "dashmap",
@@ -7261,7 +7237,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_surrealdb_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -7512,7 +7488,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "server",
  "sqlx",
  "sysinfo 0.39.6",
  "tempfile",
@@ -7910,31 +7885,6 @@ dependencies = [
  "crossbeam-utils",
  "loom",
  "slab",
-]
-
-[[package]]
-name = "lending-iterator"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc07588c853b50689205fb5c00498aa681d89828e0ce8cbd965ebc7a5d8ae260"
-dependencies = [
- "extension-traits",
- "lending-iterator-proc_macros",
- "macro_rules_attribute",
- "never-say-never",
- "nougat",
- "polonius-the-crab",
-]
-
-[[package]]
-name = "lending-iterator-proc_macros"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5445dd1c0deb1e97b8a16561d17fc686ca83e8411128fb036e9668a72d51b1d"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -8367,22 +8317,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "macro_rules_attribute"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf0c9b980bf4f3a37fd7b1c066941dd1b1d0152ce6ee6e8fe8c49b9f6810d862"
-dependencies = [
- "macro_rules_attribute-proc_macro",
- "paste",
-]
-
-[[package]]
-name = "macro_rules_attribute-proc_macro"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58093314a45e00c77d5c508f76e77c3396afbbc0d01506e7fae47b018bac2b1d"
-
-[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8559,10 +8493,10 @@ dependencies = [
  "left-right",
  "message_bus",
  "paste",
+ "rmp",
  "rmp-serde",
  "serde",
  "server_common",
- "slab",
  "tempfile",
  "tracing",
 ]
@@ -8802,12 +8736,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
-name = "never-say-never"
-version = "6.6.666"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf5a574dadd7941adeaa71823ecba5e28331b8313fb2e1c6a5c7e5981ea53ad6"
-
-[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8913,27 +8841,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
 dependencies = [
  "bitflags 2.13.1",
-]
-
-[[package]]
-name = "nougat"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97b57b9ced431322f054fc673f1d3c7fa52d80efd9df74ad2fc759f044742510"
-dependencies = [
- "macro_rules_attribute",
- "nougat-proc_macros",
-]
-
-[[package]]
-name = "nougat-proc_macros"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c84f77a45e99a2f9b492695d99e1c23844619caa5f3e57647cffacad773ca257"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -9619,14 +9526,17 @@ dependencies = [
  "bytes",
  "compio",
  "consensus",
+ "futures",
  "iggy_binary_protocol",
  "iggy_common",
  "journal",
  "message_bus",
+ "nix",
  "papaya",
  "ringbuffer",
  "server_common",
  "smallvec",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -9952,12 +9862,6 @@ dependencies = [
  "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "polonius-the-crab"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a69ee997a6282f8462abf1e0d8c38c965e968799e912b3bed8c9e8a28c2f9f"
 
 [[package]]
 name = "polyval"
@@ -11907,72 +11811,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.8.2-edge.1"
-dependencies = [
- "ahash 0.8.12",
- "anyhow",
- "async-channel",
- "async_zip",
- "axum",
- "axum-server",
- "bytes",
- "chrono",
- "clap",
- "compio",
- "configs",
- "ctrlc",
- "cyper",
- "cyper-axum",
- "dashmap",
- "dotenvy",
- "err_trail",
- "error_set",
- "figlet-rs",
- "flume",
- "fs2",
- "futures",
- "hash32 1.0.0",
- "human-repr",
- "iggy_binary_protocol",
- "iggy_common",
- "jsonwebtoken",
- "left-right",
- "mimalloc",
- "mime_guess",
- "nix",
- "papaya",
- "prometheus-client",
- "ringbuffer",
- "rmp-serde",
- "rust-embed",
- "rustls",
- "rustls-pemfile",
- "sd-notify",
- "secrecy",
- "send_wrapper",
- "serde",
- "serde_json",
- "server_common",
- "shard_allocator",
- "slab",
- "socket2 0.6.5",
- "strum 0.28.0",
- "sysinfo 0.39.6",
- "system_stats",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "toml 1.1.3+spec-1.1.0",
- "tower-http 0.7.0",
- "tracing",
- "ulid",
- "uuid",
- "vergen-git2",
-]
-
-[[package]]
-name = "server-ng"
-version = "0.9.0-edge.1"
+version = "0.9.0-edge.5"
 dependencies = [
  "ahash 0.8.12",
  "argon2",
@@ -12006,7 +11845,6 @@ dependencies = [
  "hwlocality",
  "hyper",
  "hyper-util",
- "iggy",
  "iggy_binary_protocol",
  "iggy_common",
  "journal",
@@ -12032,6 +11870,7 @@ dependencies = [
  "rust-embed",
  "rustls",
  "rustls-pemfile",
+ "sd-notify",
  "secrecy",
  "send_wrapper",
  "serde",
@@ -12039,7 +11878,6 @@ dependencies = [
  "server_common",
  "shard",
  "shard_allocator",
- "slab",
  "socket2 0.6.5",
  "strum 0.28.0",
  "sysinfo 0.39.6",
@@ -12075,8 +11913,6 @@ dependencies = [
  "human-repr",
  "iggy_binary_protocol",
  "iggy_common",
- "lending-iterator",
- "moka",
  "nix",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -12093,7 +11929,6 @@ dependencies = [
  "smallvec",
  "tempfile",
  "thiserror 2.0.19",
- "tokio",
  "tracing",
  "tracing-appender",
  "tracing-opentelemetry",
@@ -12318,7 +12153,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_xoshiro",
  "secrecy",
- "server-ng",
+ "server",
  "server_common",
  "shard",
  "strum 0.28.0",

@@ -19,12 +19,10 @@
 set -Eeuo pipefail
 
 COVERAGE=0
-VSR=0
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --coverage) COVERAGE=1 ;;
-    --vsr) VSR=1 ;;
     *) ARGS+=("$arg") ;;
   esac
 done
@@ -35,34 +33,23 @@ FEATURE="${ARGS[1]:-all}"
 log(){ printf "%b\n" "$*"; }
 
 usage(){
-  log "Usage: $0 [--coverage] [--vsr] <sdk> [feature]"
+  log "Usage: $0 [--coverage] <sdk> [feature]"
   log ""
   log "  sdk:     rust | python | php | go | go-race | node | csharp | java | cpp | all | clean (default: all)"
-  log "  feature: basic_messaging | leader_redirection | raw_command | all  (default: all)"
-  log "  --vsr:   run against iggy-server-ng built with --features vsr (rust only);"
-  log "           expects IGGY_SERVER_NG_PATH (default: target/debug/iggy-server-ng)"
-  log "           and a vsr-built iggy CLI at IGGY_CLI_PATH"
+  log "  feature: basic_messaging | leader_redirection | raw_command | stream_crud | all  (default: all)"
+  log ""
+  log "  Every suite runs against iggy-server, taken from IGGY_SERVER_PATH"
+  log "  (default: target/debug/iggy-server) with an iggy CLI at IGGY_CLI_PATH."
   log ""
   log "Examples:"
   log "  $0 rust                         # run all features for Rust"
   log "  $0 rust basic_messaging         # run only basic_messaging for Rust"
   log "  $0 all leader_redirection       # run leader_redirection for all supporting SDKs"
-  log "  $0 --vsr rust                   # run all features for Rust against server-ng"
   log "  $0 --coverage go basic_messaging"
 }
 
-if [ "$VSR" = "1" ]; then
-  case "$SDK" in
-    rust|clean) ;;
-    *)
-      log "❌ --vsr supports only the Rust SDK (server-ng speaks the VSR wire protocol)"
-      usage
-      exit 2 ;;
-  esac
-fi
-
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|all) ;;
+  basic_messaging|leader_redirection|raw_command|stream_crud|all) ;;
   *)
     log "Unknown feature: ${FEATURE}"
     usage
@@ -78,12 +65,11 @@ ALL_COMPOSE_FILES=(
   -f docker-compose.server.yml
   -f docker-compose.cluster.yml
   -f docker-compose.coverage.yml
-  -f docker-compose.vsr.yml
 )
 
 COMPOSE_FILES=(-f docker-compose.yml)
 case "$FEATURE" in
-  basic_messaging|leader_redirection|raw_command|all)
+  basic_messaging|leader_redirection|raw_command|stream_crud|all)
     COMPOSE_FILES+=(-f docker-compose.server.yml) ;;
 esac
 case "$FEATURE" in
@@ -94,11 +80,6 @@ if [ "$COVERAGE" = "1" ]; then
   COMPOSE_FILES+=(-f docker-compose.coverage.yml)
   mkdir -p ../reports
 fi
-# vsr overrides must come last to win over the server/cluster/coverage files.
-if [ "$VSR" = "1" ]; then
-  COMPOSE_FILES+=(-f docker-compose.vsr.yml)
-  export BDD_RUST_FEATURES="bdd,vsr"
-fi
 
 cleanup(){
   log "🧹  cleaning up containers & volumes…"
@@ -108,27 +89,39 @@ trap cleanup EXIT INT TERM
 
 log "🧪 Running BDD tests for SDK: ${SDK}"
 log "📁 Feature file: ${FEATURE}"
-if [ "$VSR" = "1" ]; then
-  log "🗳️ Server: iggy-server-ng (--features vsr)"
-fi
+log "🗳️ Server: iggy-server"
 if [ "$COVERAGE" = "1" ]; then
   log "📊 Coverage collection enabled → reports will be in ./reports/"
 fi
+
+unsupported(){
+  local feature="$1" svc="$2"
+  if [ "$SDK" = "all" ]; then
+    log "⚠️ skipping ${svc%-bdd} (does not support ${feature})"
+    return 0
+  else
+    log "❌ ${SDK} does not support feature '${feature}'"
+    return 1
+  fi
+}
 
 run_suite(){
   local svc="$1" emoji="$2" label="$3"
   if [ "$FEATURE" = "leader_redirection" ]; then
     case "$svc" in
-      rust-bdd|go-bdd|csharp-bdd) ;;
+      rust-bdd|go-bdd|csharp-bdd|java-bdd) ;;
       *)
-        if [ "$SDK" = "all" ]; then
-          log "⚠️ skipping ${svc%-bdd} (does not support ${FEATURE})"
-          return 0
-        else
-          log "❌ ${SDK} does not support feature '${FEATURE}'"
-          return 1
-        fi
-        ;;
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
+    esac
+  fi
+
+  if [ "$FEATURE" = "stream_crud" ]; then
+    case "$svc" in
+      rust-bdd|java-bdd) ;;
+      *)
+        unsupported "$FEATURE" "$svc" || return 1
+        return 0 ;;
     esac
   fi
 

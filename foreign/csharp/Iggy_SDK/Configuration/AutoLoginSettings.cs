@@ -23,17 +23,54 @@ namespace Apache.Iggy.Configuration;
 public class AutoLoginSettings
 {
     /// <summary>
-    ///     Enable automatic login on connection establishment
+    ///     Enable automatic login on connection establishment.
     /// </summary>
-    public bool Enabled { get; set; }
+    public bool Enabled { get; init; }
 
     /// <summary>
     ///     Specifies the username for auto-login configuration.
     /// </summary>
-    public string Username { get; set; } = string.Empty;
+    public string Username { get; init; } = string.Empty;
 
     /// <summary>
     ///     Specifies the password for auto-login authentication
     /// </summary>
-    public string Password { get; set; } = string.Empty;
+    public string Password { get; init; } = string.Empty;
+
+    /// <summary>
+    ///     Personal access token to sign in with instead of a username and password. Takes precedence over them
+    ///     when set.
+    /// </summary>
+    public string PersonalAccessToken { get; init; } = string.Empty;
+
+    /// <summary>
+    ///     Auto login with a username and password.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown when the username is empty.</exception>
+    public static AutoLoginSettings For(string username, string password)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(username);
+
+        return new AutoLoginSettings
+        {
+            Enabled = true,
+            Username = username,
+            Password = password
+        };
+    }
+
+    /// <summary>
+    ///     Auto login with a personal access token.
+    /// </summary>
+    /// <exception cref="ArgumentException">Thrown when the token is empty.</exception>
+    public static AutoLoginSettings ForPersonalAccessToken(string token)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+
+        return new AutoLoginSettings
+        {
+            Enabled = true,
+            PersonalAccessToken = token
+        };
+    }
 }

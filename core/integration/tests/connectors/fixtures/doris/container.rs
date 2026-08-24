@@ -108,6 +108,7 @@ const ENV_SINK_PASSWORD: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_PASSWO
 const ENV_SINK_LABEL_PREFIX: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_LABEL_PREFIX";
 const ENV_SINK_MAX_FILTER_RATIO: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_MAX_FILTER_RATIO";
 const ENV_SINK_COLUMNS: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_COLUMNS";
+const ENV_SINK_FORMAT: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_OUTPUT_FORMAT";
 const ENV_SINK_BATCH_SIZE: &str = "IGGY_CONNECTORS_SINK_DORIS_PLUGIN_CONFIG_BATCH_SIZE";
 const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_DORIS_STREAMS_0_STREAM";
 const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_DORIS_STREAMS_0_TOPICS";
@@ -166,6 +167,11 @@ PROPERTIES (
 pub const COLUMNS_MAPPING_HEADER: &str =
     "id, name, count, amount, active, timestamp, calculated = count + 1";
 
+/// Stream Load `columns` header for `DorisSinkCsvFixture`. CSV is positional, so
+/// the connector needs the explicit column order to map each message's JSON
+/// values into the right CSV fields. Matches `TEST_TABLE_DDL_TEMPLATE`'s order.
+const CSV_COLUMNS_HEADER: &str = "id, name, count, amount, active, timestamp";
+
 /// Linux-only host precheck. macOS / Windows have no `/proc/sys/vm/max_map_count`
 /// (and the all-in-one image is already unusable on macOS for the BE-redirect
 /// routing reason — see the file header). Treat the check as a no-op there; the
@@ -192,6 +198,88 @@ fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
 #[cfg(not(target_os = "linux"))]
 fn check_vm_max_map_count() -> Result<(), TestBinaryError> {
     Ok(())
+}
+
+/// Attempts to create-or-attach the shared container before giving up. Only
+/// name conflicts are retried, and each one means another process already
+/// created it, so the bound is about how many tests can be racing at once
+/// rather than about how long Doris takes to boot.
+const CONTAINER_START_ATTEMPTS: u32 = 30;
+const CONTAINER_START_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Creates the shared Doris container, or attaches to it if another test won
+/// the race.
+///
+/// `ReuseDirective::Always` resolves reuse by inspecting the daemon and then
+/// creating when nothing matches, with no lock spanning the two steps. On a
+/// cold daemon with several doris tests in flight, every one of them inspects
+/// before any of them creates, so one wins and the rest get
+/// `409 Conflict: name already in use`. Retrying is what turns those losers
+/// into attachers: by the next attempt the winner's container exists, so the
+/// inspect half succeeds. Any other failure is returned as-is.
+async fn start_shared_container(
+    entrypoint_cmd: &str,
+) -> Result<ContainerAsync<GenericImage>, TestBinaryError> {
+    let mut conflict = String::new();
+    for attempt in 1..=CONTAINER_START_ATTEMPTS {
+        // FE HTTP and FE MySQL get ephemeral host ports (the connector and
+        // tests connect via the resolved mapping). BE HTTP must be pinned
+        // 1:1 — the FE always returns Location: http://127.0.0.1:8040/...
+        // for the Stream Load redirect, and that's only reachable from the
+        // host if container:8040 is bound to host:8040.
+        //
+        // `with_container_name` + `with_reuse(Always)` is what makes the
+        // container survive across nextest's per-test processes: the first
+        // test creates `iggy-test-doris`, every later test (in any process)
+        // attaches to it. The 1:1 BE port is therefore held continuously by
+        // one container, never racing with itself across container restarts.
+        //
+        // Rebuilt per attempt because `start` consumes the request.
+        let result = GenericImage::new(DORIS_IMAGE, DORIS_TAG)
+            // GenericImage's own with_entrypoint/with_wait_for must come before
+            // any ImageExt method, which turns GenericImage into ContainerRequest.
+            .with_entrypoint("bash")
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new(FE_HEALTH_ENDPOINT)
+                    .with_port(FE_HTTP_PORT.tcp())
+                    .with_expected_status_code(200u16),
+            ))
+            .with_env_var("SKIP_CHECK_ULIMIT", "true")
+            .with_cmd(["-c", entrypoint_cmd])
+            .with_mapped_port(0, FE_HTTP_PORT.tcp())
+            .with_mapped_port(0, FE_MYSQL_PORT.tcp())
+            .with_mapped_port(BE_HTTP_PORT, BE_HTTP_PORT.tcp())
+            .with_container_name(DORIS_CONTAINER_NAME)
+            .with_reuse(ReuseDirective::Always)
+            .start()
+            .await;
+
+        match result {
+            Ok(container) => return Ok(container),
+            Err(error) => {
+                let message = error.to_string();
+                if !message.contains("is already in use") {
+                    return Err(TestBinaryError::FixtureSetup {
+                        fixture_type: "DorisContainer".to_string(),
+                        message: format!("Failed to start container: {message}"),
+                    });
+                }
+                info!(
+                    "Doris container name taken by another test (attempt {attempt}), retrying to attach"
+                );
+                conflict = message;
+                sleep(CONTAINER_START_RETRY_DELAY).await;
+            }
+        }
+    }
+
+    Err(TestBinaryError::FixtureSetup {
+        fixture_type: "DorisContainer".to_string(),
+        message: format!(
+            "Failed to attach to container '{DORIS_CONTAINER_NAME}' after \
+             {CONTAINER_START_ATTEMPTS} attempts: {conflict}"
+        ),
+    })
 }
 
 pub struct DorisContainer {
@@ -222,39 +310,7 @@ impl DorisContainer {
              exec bash /usr/local/bin/entry_point.sh"
         );
 
-        // FE HTTP and FE MySQL get ephemeral host ports (the connector and
-        // tests connect via the resolved mapping). BE HTTP must be pinned
-        // 1:1 — the FE always returns Location: http://127.0.0.1:8040/...
-        // for the Stream Load redirect, and that's only reachable from the
-        // host if container:8040 is bound to host:8040.
-        //
-        // `with_container_name` + `with_reuse(Always)` is what makes the
-        // container survive across nextest's per-test processes: the first
-        // test creates `iggy-test-doris`, every later test (in any process)
-        // attaches to it. The 1:1 BE port is therefore held continuously by
-        // one container, never racing with itself across container restarts.
-        let container = GenericImage::new(DORIS_IMAGE, DORIS_TAG)
-            // GenericImage's own with_entrypoint/with_wait_for must come before
-            // any ImageExt method, which turns GenericImage into ContainerRequest.
-            .with_entrypoint("bash")
-            .with_wait_for(WaitFor::http(
-                HttpWaitStrategy::new(FE_HEALTH_ENDPOINT)
-                    .with_port(FE_HTTP_PORT.tcp())
-                    .with_expected_status_code(200u16),
-            ))
-            .with_env_var("SKIP_CHECK_ULIMIT", "true")
-            .with_cmd(["-c", entrypoint_cmd.as_str()])
-            .with_mapped_port(0, FE_HTTP_PORT.tcp())
-            .with_mapped_port(0, FE_MYSQL_PORT.tcp())
-            .with_mapped_port(BE_HTTP_PORT, BE_HTTP_PORT.tcp())
-            .with_container_name(DORIS_CONTAINER_NAME)
-            .with_reuse(ReuseDirective::Always)
-            .start()
-            .await
-            .map_err(|e| TestBinaryError::FixtureSetup {
-                fixture_type: "DorisContainer".to_string(),
-                message: format!("Failed to start container: {e}"),
-            })?;
+        let container = start_shared_container(&entrypoint_cmd).await?;
 
         let ports = container
             .ports()
@@ -710,6 +766,45 @@ impl TestFixture for DorisSinkColumnsMappingFixture {
             ENV_SINK_COLUMNS.to_string(),
             COLUMNS_MAPPING_HEADER.to_string(),
         );
+        envs
+    }
+}
+
+/// Pre-creates the standard test table and configures the connector to emit
+/// `format = "csv"`. CSV is positional, so it also sets the matching `columns`
+/// header; a passing load proves the connector's JSON->CSV serialization
+/// (control-char framing, enclose/escape, column order) round-trips through Doris.
+pub struct DorisSinkCsvFixture {
+    inner: DorisSinkFixture,
+}
+
+impl std::ops::Deref for DorisSinkCsvFixture {
+    type Target = DorisSinkFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DorisOps for DorisSinkCsvFixture {
+    fn container(&self) -> &DorisContainer {
+        self.inner.container()
+    }
+}
+
+#[async_trait]
+impl TestFixture for DorisSinkCsvFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let inner = DorisSinkFixture::setup().await?;
+        inner
+            .create_table(inner.container.database(), DEFAULT_TEST_TABLE)
+            .await?;
+        Ok(Self { inner })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_FORMAT.to_string(), "csv".to_string());
+        envs.insert(ENV_SINK_COLUMNS.to_string(), CSV_COLUMNS_HEADER.to_string());
         envs
     }
 }

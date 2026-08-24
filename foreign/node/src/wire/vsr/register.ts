@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 /**
  * The Register (login) handshake bodies and reply, ported from
@@ -28,10 +27,10 @@ import { DeserializeError } from '../error.utils.js';
 
 /**
  * Packed protocol semver of the wire contract this port implements,
- * `pack(0, 10, 3)` per `core/binary_protocol/src/version.rs`. Bump together
+ * `pack(0, 11, 0)` per `core/binary_protocol/src/version.rs`. Bump together
  * with the Rust `IGGY_PROTOCOL_VERSION` on any wire-incompatible change.
  */
-export const IGGY_PROTOCOL_VERSION = (0 << 20) | (10 << 10) | 3;
+export const IGGY_PROTOCOL_VERSION = (0 << 20) | (11 << 10) | 0;
 
 const SDK_NAME = 'node-sdk';
 

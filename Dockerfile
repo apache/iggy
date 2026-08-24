@@ -15,18 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Apache Iggy (Incubating) is an effort undergoing incubation at the Apache
-# Software Foundation (ASF), sponsored by the Apache Incubator PMC.
-#
-# Incubation is required of all newly accepted projects until a further review
-# indicates that the infrastructure, communications, and decision making
-# process have stabilized in a manner consistent with other successful ASF
-# projects.
-#
-# While incubation status is not necessarily a reflection of the completeness
-# or stability of the code, it does indicate that the project has yet to be
-# fully endorsed by the ASF.
-
 ARG RUST_VERSION=1.97.1
 FROM rust:${RUST_VERSION}-slim-trixie AS builder
 
@@ -43,7 +31,7 @@ RUN apt-get update && apt-get install -y \
 COPY . .
 RUN npm --prefix web ci && npm --prefix web run build:static
 RUN cargo build --bin iggy --release
-RUN cargo build --bin iggy-server --release
+RUN cargo build --bin iggy-server -p server --release
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y \
@@ -51,7 +39,6 @@ RUN apt-get update && apt-get install -y \
     liblzma5 \
     libhwloc15 \
     && rm -rf /var/lib/apt/lists/*
-COPY ./core/configs ./configs
 COPY --from=builder /build/target/release/iggy .
 COPY --from=builder /build/target/release/iggy-server .
 

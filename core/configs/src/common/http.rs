@@ -1,0 +1,228 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use configs::ConfigEnv;
+use iggy_common::IggyByteSize;
+use iggy_common::IggyDuration;
+use iggy_common::IggyError;
+use iggy_common::IggyExpiry;
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
+use serde::{Deserialize, Serialize};
+use serde_with::DisplayFromStr;
+use serde_with::serde_as;
+
+/// Every `http.jwt.algorithm` the server can sign and verify with, and the
+/// `jsonwebtoken` algorithm each names.
+///
+/// HMAC only, because [`HttpJwtConfig::get_encoding_key`] builds its key from a
+/// shared secret and there is no PEM loading path. `jsonwebtoken::encode`
+/// refuses a header algorithm whose family does not match the key, so an
+/// asymmetric algorithm would boot clean and then fail every login.
+pub const HMAC_JWT_ALGORITHMS: [(&str, Algorithm); 3] = [
+    ("HS256", Algorithm::HS256),
+    ("HS384", Algorithm::HS384),
+    ("HS512", Algorithm::HS512),
+];
+
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct TrustedIssuerConfig {
+    pub issuer: String,
+    pub audience: String,
+    pub jwks_url: String,
+    #[serde(default)]
+    pub user_id: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct HttpConfig {
+    pub enabled: bool,
+    pub address: String,
+    #[config_env(leaf)]
+    pub max_request_size: IggyByteSize,
+    pub web_ui: bool,
+    pub cors: HttpCorsConfig,
+    pub jwt: HttpJwtConfig,
+    pub metrics: HttpMetricsConfig,
+    pub tls: HttpTlsConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct HttpCorsConfig {
+    pub enabled: bool,
+    pub allowed_methods: Vec<String>,
+    pub allowed_origins: Vec<String>,
+    pub allowed_headers: Vec<String>,
+    pub exposed_headers: Vec<String>,
+    pub allow_credentials: bool,
+    pub allow_private_network: bool,
+}
+
+#[serde_as]
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct HttpJwtConfig {
+    pub algorithm: String,
+    pub issuer: String,
+    pub audience: String,
+    pub valid_issuers: Vec<String>,
+    pub valid_audiences: Vec<String>,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub access_token_expiry: IggyExpiry,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub clock_skew: IggyDuration,
+    #[config_env(leaf)]
+    #[serde_as(as = "DisplayFromStr")]
+    pub not_before: IggyDuration,
+    // skip_serializing keeps the secrets out of the runtime current_config.toml
+    // (and the diagnostic snapshot that cats it). The live secrets are read from
+    // env / on-disk config at boot, never from the snapshot.
+    #[serde(default, skip_serializing)]
+    #[config_env(secret)]
+    pub encoding_secret: String,
+    #[serde(default, skip_serializing)]
+    #[config_env(secret)]
+    pub decoding_secret: String,
+    pub use_base64_secret: bool,
+    #[serde(default)]
+    pub trusted_issuers: Option<Vec<TrustedIssuerConfig>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct HttpMetricsConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+}
+
+#[derive(Debug)]
+pub enum JwtSecret {
+    Default(String),
+    Base64(String),
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
+pub struct HttpTlsConfig {
+    pub enabled: bool,
+    pub cert_file: String,
+    pub key_file: String,
+}
+
+impl HttpJwtConfig {
+    pub fn get_algorithm(&self) -> Result<Algorithm, IggyError> {
+        HMAC_JWT_ALGORITHMS
+            .iter()
+            .find(|(name, _)| *name == self.algorithm)
+            .map(|(_, algorithm)| *algorithm)
+            .ok_or_else(|| IggyError::InvalidJwtAlgorithm(self.algorithm.clone()))
+    }
+
+    pub fn get_decoding_secret(&self) -> JwtSecret {
+        self.get_secret(&self.decoding_secret)
+    }
+
+    pub fn get_encoding_secret(&self) -> JwtSecret {
+        self.get_secret(&self.encoding_secret)
+    }
+
+    pub fn get_decoding_key(&self) -> Result<DecodingKey, IggyError> {
+        if self.decoding_secret.is_empty() {
+            return Err(IggyError::InvalidJwtSecret);
+        }
+
+        Ok(match self.get_decoding_secret() {
+            JwtSecret::Default(ref secret) => DecodingKey::from_secret(secret.as_ref()),
+            JwtSecret::Base64(ref secret) => {
+                DecodingKey::from_base64_secret(secret).map_err(|_| IggyError::InvalidJwtSecret)?
+            }
+        })
+    }
+
+    pub fn get_encoding_key(&self) -> Result<EncodingKey, IggyError> {
+        if self.encoding_secret.is_empty() {
+            return Err(IggyError::InvalidJwtSecret);
+        }
+
+        Ok(match self.get_encoding_secret() {
+            JwtSecret::Default(ref secret) => EncodingKey::from_secret(secret.as_ref()),
+            JwtSecret::Base64(ref secret) => {
+                EncodingKey::from_base64_secret(secret).map_err(|_| IggyError::InvalidJwtSecret)?
+            }
+        })
+    }
+
+    fn get_secret(&self, secret: &str) -> JwtSecret {
+        if self.use_base64_secret {
+            JwtSecret::Base64(secret.to_string())
+        } else {
+            JwtSecret::Default(secret.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_algorithm_accepts_only_hmac() {
+        for (name, expected) in HMAC_JWT_ALGORITHMS {
+            let config = HttpJwtConfig {
+                algorithm: name.to_string(),
+                ..HttpJwtConfig::default()
+            };
+            assert_eq!(config.get_algorithm(), Ok(expected));
+        }
+        for asymmetric in ["RS256", "RS384", "RS512", "ES256", "EdDSA"] {
+            let config = HttpJwtConfig {
+                algorithm: asymmetric.to_string(),
+                ..HttpJwtConfig::default()
+            };
+            assert!(
+                config.get_algorithm().is_err(),
+                "{asymmetric} has no key material and must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn jwt_secrets_are_never_serialized() {
+        // current_config.toml (and the diagnostic snapshot that cats it) is
+        // produced by serializing this struct, so the JWT secrets must not
+        // survive a serialize. Built via deserialize to skip enumerating the
+        // duration fields; skip_serializing is format-agnostic, so a JSON dump
+        // proves the toml path too.
+        let json = r#"{
+            "algorithm": "HS256",
+            "issuer": "iggy.apache.org",
+            "audience": "iggy.apache.org",
+            "valid_issuers": ["iggy.apache.org"],
+            "valid_audiences": ["iggy.apache.org"],
+            "access_token_expiry": "1 h",
+            "clock_skew": "5 s",
+            "not_before": "0 s",
+            "encoding_secret": "encoding-MUST-NOT-be-persisted",
+            "decoding_secret": "decoding-MUST-NOT-be-persisted",
+            "use_base64_secret": false
+        }"#;
+        let config: HttpJwtConfig = serde_json::from_str(json).expect("deserialize jwt config");
+        let serialized = serde_json::to_string(&config).expect("serialize jwt config");
+        assert!(
+            !serialized.contains("MUST-NOT-be-persisted"),
+            "JWT secret leaked into serialized config: {serialized}"
+        );
+    }
+}

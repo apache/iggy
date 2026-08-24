@@ -61,11 +61,11 @@ impl IggyCmdTestCase for TestStreamPurgeCmd {
             .create_topic(
                 &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
-                10,
-                Default::default(),
-                None,
-                IggyExpiry::NeverExpire,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(10),
+                    message_expiry: Some(IggyExpiry::NeverExpire),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await;
         assert!(topic.is_ok());
@@ -115,7 +115,7 @@ impl IggyCmdTestCase for TestStreamPurgeCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        // server-ng purge is eventually consistent: the partition reset (and
+        // The server purge is eventually consistent: the partition reset (and
         // its stats zeroing) runs in the reconciler after the metadata commit
         // the purge command awaited. Legacy is synchronous and satisfies this
         // on the first poll.

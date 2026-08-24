@@ -18,14 +18,12 @@
 use iggy::prelude::*;
 use integration::iggy_harness;
 
-#[cfg(not(feature = "vsr"))]
 #[iggy_harness]
 async fn hello_world(harness: &TestHarness) {
     let client = harness.root_client().await.unwrap();
     client.ping().await.unwrap();
 }
 
-#[cfg(feature = "vsr")]
 #[iggy_harness(test_client_transport = [Tcp, WebSocket, Quic])]
 async fn hello_world(harness: &TestHarness) {
     let client = harness.new_client().await.unwrap();

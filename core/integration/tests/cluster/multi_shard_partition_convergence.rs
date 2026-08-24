@@ -48,8 +48,6 @@
 //! owner, a park queue that never drains, or a fence that denies forever --
 //! since every one of those surfaces as a failed send or a short poll.
 
-#![cfg(feature = "vsr")]
-
 use iggy::prelude::*;
 use integration::harness::TestHarness;
 use integration::iggy_harness;
@@ -69,11 +67,11 @@ async fn create_topic(client: &IggyClient, stream: &Identifier, name: &str) {
         .create_topic(
             stream,
             name,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("create_topic {name}: {error}"));

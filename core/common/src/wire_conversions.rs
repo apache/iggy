@@ -26,10 +26,13 @@ use crate::{
     ClusterNodeRole, ClusterNodeStatus, CompressionAlgorithm, Consumer, ConsumerGroup,
     ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, ConsumerOffsetInfo,
     GlobalPermissions, HeaderKey, HeaderKind, HeaderValue, IdKind, IdentityInfo, IggyByteSize,
-    IggyError, IggyExpiry, MaxTopicSize, Partition, Permissions, PersonalAccessTokenInfo,
-    RawPersonalAccessToken, Stats, Stream, StreamDetails, StreamPermissions, Topic, TopicDetails,
-    TopicPermissions, TransportEndpoints, UserInfo, UserInfoDetails, UserStatus,
+    IggyError, IggyExpiry, MaxTopicSize, OptionSpec, OptionValue, OptionsProvenance, Partition,
+    Permissions, PersonalAccessTokenInfo, RawPersonalAccessToken, ResourceOptions, Stats, Stream,
+    StreamDetails, StreamPermissions, Topic, TopicDetails, TopicPermissions, TransportEndpoints,
+    UserInfo, UserInfoDetails, UserStatus,
 };
+use bytes::{BufMut, BytesMut};
+use iggy_binary_protocol::primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions};
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
 };
@@ -70,16 +73,19 @@ const WIRE_NO_USER_ID: u32 = u32::MAX;
 // Streams
 // ---------------------------------------------------------------------------
 
-impl From<StreamResponse> for Stream {
-    fn from(w: StreamResponse) -> Self {
-        Self {
+impl TryFrom<StreamResponse> for Stream {
+    type Error = IggyError;
+
+    fn try_from(w: StreamResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
             id: w.id,
             created_at: w.created_at.into(),
             name: w.name.to_string(),
             size: IggyByteSize::from(w.size_bytes),
             messages_count: w.messages_count,
             topics_count: w.topics_count,
-        }
+            options: resource_options_from_wire(&w.options, true)?,
+        })
     }
 }
 
@@ -101,14 +107,19 @@ impl TryFrom<GetStreamResponse> for StreamDetails {
             messages_count: w.stream.messages_count,
             topics_count: w.stream.topics_count,
             topics,
+            options: resource_options_from_wire(&w.stream.options, true)?,
         })
     }
 }
 
-pub fn streams_from_wire(w: GetStreamsResponse) -> Vec<Stream> {
-    let mut streams: Vec<Stream> = w.streams.into_iter().map(Stream::from).collect();
+pub fn streams_from_wire(w: GetStreamsResponse) -> Result<Vec<Stream>, IggyError> {
+    let mut streams: Vec<Stream> = w
+        .streams
+        .into_iter()
+        .map(Stream::try_from)
+        .collect::<Result<_, _>>()?;
     streams.sort_by_key(|s| s.id);
-    streams
+    Ok(streams)
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +135,7 @@ impl TryFrom<TopicHeader> for Topic {
             v => v.into(),
         };
         let max_topic_size: MaxTopicSize = w.max_topic_size.into();
+        let options = resource_options_from_wire_split(&w.options, &w.derived_options)?;
         Ok(Self {
             id: w.id,
             created_at: w.created_at.into(),
@@ -134,7 +146,7 @@ impl TryFrom<TopicHeader> for Topic {
             message_expiry,
             compression_algorithm: CompressionAlgorithm::from_code(w.compression_algorithm)?,
             max_topic_size,
-            replication_factor: w.replication_factor,
+            options,
         })
     }
 }
@@ -169,9 +181,9 @@ impl TryFrom<GetTopicResponse> for TopicDetails {
             message_expiry: topic.message_expiry,
             compression_algorithm: topic.compression_algorithm,
             max_topic_size: topic.max_topic_size,
-            replication_factor: topic.replication_factor,
             partitions_count: topic.partitions_count,
             partitions,
+            options: topic.options,
         })
     }
 }
@@ -199,6 +211,7 @@ impl TryFrom<UserResponse> for UserInfo {
             created_at: w.created_at.into(),
             status: UserStatus::from_code(w.status)?,
             username: w.username.to_string(),
+            options: resource_options_from_wire(&w.options, true)?,
         })
     }
 }
@@ -215,6 +228,7 @@ impl TryFrom<UserDetailsResponse> for UserInfoDetails {
             status: user.status,
             username: user.username,
             permissions,
+            options: user.options,
         })
     }
 }
@@ -718,7 +732,7 @@ fn topic_permissions_to_wire(topic_id: usize, tp: &TopicPermissions) -> WireTopi
 
 // -- User Headers conversions --
 
-/// Encode domain user headers into a [`WireUserHeaders`] wrapper.
+/// Encode domain user headers into a [`WireUserHeaders`](iggy_binary_protocol::WireUserHeaders) wrapper.
 pub fn user_headers_to_wire(
     headers: &BTreeMap<HeaderKey, HeaderValue>,
 ) -> iggy_binary_protocol::WireUserHeaders {
@@ -748,7 +762,7 @@ pub fn user_headers_to_wire(
     WireUserHeaders::from_validated(buf.freeze())
 }
 
-/// Decode a [`WireUserHeaders`] wrapper into domain user headers.
+/// Decode a [`WireUserHeaders`](iggy_binary_protocol::WireUserHeaders) wrapper into domain user headers.
 ///
 /// Wire-level validation accepts unknown kind codes for forward compatibility
 /// (VSR rolling upgrades). Domain-level `from_code()` rejects them - the wire
@@ -772,19 +786,45 @@ pub fn user_headers_from_wire(
 pub(crate) fn user_headers_from_validated_slice(
     buf: &[u8],
 ) -> Result<BTreeMap<HeaderKey, HeaderValue>, IggyError> {
+    headers_from_validated_slice(buf, UnknownKinds::Reject)
+}
+
+/// What a decode does with an entry whose kind code has no domain meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnknownKinds {
+    /// Fail the whole decode. A message header the reader cannot interpret is
+    /// the caller's problem, not something to hide from it.
+    Reject,
+    /// Drop the entry and keep the rest.
+    Skip,
+}
+
+fn headers_from_validated_slice(
+    buf: &[u8],
+    unknown: UnknownKinds,
+) -> Result<BTreeMap<HeaderKey, HeaderValue>, IggyError> {
     if buf.is_empty() {
         return Ok(BTreeMap::new());
     }
     let mut headers = BTreeMap::new();
     for entry in WireUserHeaderIterator::new(buf) {
-        let key_kind = HeaderKind::from_code(entry.key_kind.0)?;
+        let (key_kind, value_kind) = match (
+            HeaderKind::from_code(entry.key_kind.0),
+            HeaderKind::from_code(entry.value_kind.0),
+        ) {
+            (Ok(key_kind), Ok(value_kind)) => (key_kind, value_kind),
+            (Err(error), _) | (Ok(_), Err(error)) => {
+                if unknown == UnknownKinds::Skip {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
         if let Some(expected) = key_kind.expected_size()
             && entry.key.len() != expected
         {
             return Err(IggyError::InvalidHeaderKey);
         }
-
-        let value_kind = HeaderKind::from_code(entry.value_kind.0)?;
         if let Some(expected) = value_kind.expected_size()
             && entry.value.len() != expected
         {
@@ -797,6 +837,159 @@ pub(crate) fn user_headers_from_validated_slice(
         );
     }
     Ok(headers)
+}
+
+// -- Options conversions --
+
+/// Decode a `DescribeOptions` response into domain option specs.
+///
+/// # Errors
+///
+/// Returns `IggyError::InvalidHeaderKind` when an entry carries an unknown
+/// canonical kind code.
+pub fn option_specs_from_wire(
+    wire: iggy_binary_protocol::responses::system::DescribeOptionsResponse,
+) -> Result<Vec<OptionSpec>, IggyError> {
+    wire.entries
+        .into_iter()
+        .map(|entry| {
+            Ok(OptionSpec {
+                key: entry.key.to_string(),
+                kind: HeaderKind::from_code(entry.kind)?,
+                default_value: entry.default_value.to_vec(),
+                description: entry.description,
+            })
+        })
+        .collect()
+}
+
+/// Decode a [`WireOptions`] block into domain resource options.
+///
+/// Every decoded entry is marked with the given `explicit` flag; the wire
+/// block carries no per-entry provenance. Admission calls this once for the
+/// client block (`explicit == true`) and fills defaults separately.
+///
+/// Entries whose kind code has no domain meaning are skipped, not rejected.
+/// The wire layer forwards unknown kinds verbatim so a mixed-version cluster
+/// can round-trip them, and this decode sits on the apply path, on the SDK's
+/// list-decode and on the server's own reads: refusing the entry would mean an
+/// old replica rejecting a commit a new one accepted, one unreadable entry
+/// failing a whole `get_topics()`, and a topic that cannot be read back.
+///
+/// # Errors
+///
+/// Returns `IggyError::InvalidHeaderKey` / `InvalidHeaderValue` when a known
+/// fixed-size kind carries a mismatched payload.
+pub fn resource_options_from_wire(
+    wire: &iggy_binary_protocol::WireOptions,
+    explicit: bool,
+) -> Result<ResourceOptions, IggyError> {
+    let headers = headers_from_validated_slice(wire.as_bytes(), UnknownKinds::Skip)?;
+    Ok(headers
+        .into_iter()
+        .map(|(key, value)| (key, OptionValue { value, explicit }))
+        .collect())
+}
+
+/// Merge response-side `(explicit, derived)` wire blocks back into domain
+/// resource options, restoring per-key provenance. Explicit wins on a key
+/// collision (which a well-formed response never produces).
+///
+/// # Errors
+///
+/// Same contract as [`resource_options_from_wire`].
+pub fn resource_options_from_wire_split(
+    explicit: &iggy_binary_protocol::WireOptions,
+    derived: &iggy_binary_protocol::WireOptions,
+) -> Result<ResourceOptions, IggyError> {
+    let mut options = resource_options_from_wire(derived, false)?;
+    options.extend(resource_options_from_wire(explicit, true)?);
+    Ok(options)
+}
+
+/// Split domain resource options into `(explicit, derived)` wire blocks,
+/// the response-side layout that preserves per-key provenance.
+///
+/// # Errors
+///
+/// Same contract as [`resource_options_to_wire`].
+pub fn resource_options_to_wire_split(
+    options: &ResourceOptions,
+) -> Result<(WireOptions, WireOptions), IggyError> {
+    Ok((
+        resource_options_to_wire(options, OptionsProvenance::Explicit)?,
+        resource_options_to_wire(options, OptionsProvenance::Derived)?,
+    ))
+}
+
+/// Fixed per-entry cost of the TLV encoding: a kind byte and a `u32` length
+/// for the key and for the value.
+const OPTION_ENTRY_OVERHEAD: usize = 2 * (1 + 4);
+
+/// Encode domain resource options into a [`WireOptions`] block, keeping only
+/// the entries matching `provenance`. Encoding just the explicit ones is what
+/// lets a client round-trip a create without pinning server defaults.
+///
+/// # Errors
+///
+/// Returns `IggyError::OptionsBlockTooLarge` when the selected entries exceed
+/// `MAX_OPTIONS` or `MAX_OPTIONS_BYTES`. [`WireOptions::from_validated`] skips
+/// revalidation, so the two caps have to hold here: a block written past them
+/// is one the receiving peer's `decode_options_prefixed` refuses, which would
+/// make the resource permanently unreadable rather than merely oversized.
+pub fn resource_options_to_wire(
+    options: &ResourceOptions,
+    provenance: OptionsProvenance,
+) -> Result<WireOptions, IggyError> {
+    let entries: Vec<(&HeaderKey, &OptionValue)> = options
+        .iter()
+        .filter(|(_, option)| option.matches(provenance))
+        .collect();
+    if entries.is_empty() {
+        return Ok(WireOptions::empty());
+    }
+    if entries.len() > MAX_OPTIONS as usize {
+        return Err(IggyError::OptionsBlockTooLarge(format!(
+            "{} entries, maximum {MAX_OPTIONS}",
+            entries.len()
+        )));
+    }
+    let size: usize = entries
+        .iter()
+        .map(|(key, option)| {
+            OPTION_ENTRY_OVERHEAD + key.as_bytes().len() + option.value.as_bytes().len()
+        })
+        .sum();
+    if size > MAX_OPTIONS_BYTES {
+        return Err(IggyError::OptionsBlockTooLarge(format!(
+            "{size} bytes, maximum {MAX_OPTIONS_BYTES}"
+        )));
+    }
+    let mut buf = BytesMut::with_capacity(size);
+    for (key, option) in entries {
+        // A non-string key would encode a block the receiving peer refuses,
+        // making the resource permanently unreadable. It holds because every
+        // producer went through `validate_options`, not because `HeaderKey`
+        // guarantees it, so the invariant is asserted where it is relied on.
+        debug_assert_eq!(
+            key.kind(),
+            HeaderKind::String,
+            "option key must be a string"
+        );
+        buf.put_u8(key.kind().as_code());
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u32_le(key.as_bytes().len() as u32);
+        buf.put_slice(key.as_bytes());
+        buf.put_u8(option.value.kind().as_code());
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u32_le(option.value.as_bytes().len() as u32);
+        buf.put_slice(option.value.as_bytes());
+    }
+    // Structural validity holds by construction: entries come from valid
+    // `HeaderKey`s walked in `BTreeMap` order, so keys are sorted and unique,
+    // and the loop above asserts they are string-kinded. The caps cover what
+    // construction cannot.
+    Ok(WireOptions::from_validated(buf.freeze()))
 }
 
 #[cfg(test)]
@@ -867,5 +1060,36 @@ mod tests {
         assert!(iggy_binary_protocol::validate_user_headers(&buf).is_ok());
         assert!(user_headers_from_validated_slice(&buf).is_err());
         assert!(user_headers_from_wire(&WireUserHeaders::from_slice(&buf).unwrap()).is_err());
+    }
+
+    fn put_option_entry(buf: &mut Vec<u8>, key: &str, value_kind: u8, value: &[u8]) {
+        buf.push(HeaderKind::String.as_code());
+        buf.extend_from_slice(&u32::try_from(key.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(key.as_bytes());
+        buf.push(value_kind);
+        buf.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+        buf.extend_from_slice(value);
+    }
+
+    #[test]
+    fn given_option_with_unknown_value_kind_when_decoded_should_skip_only_that_entry() {
+        // A newer peer's option value kind. The wire layer forwards it, so the
+        // domain decode has to drop the entry rather than fail the block: this
+        // decode runs on the apply path, where an error means one replica
+        // rejecting a commit another accepted.
+        let mut buf = Vec::new();
+        put_option_entry(&mut buf, "from_the_future", 200, b"opaque");
+        put_option_entry(
+            &mut buf,
+            "segment_size",
+            HeaderKind::String.as_code(),
+            b"1MB",
+        );
+        let wire = WireOptions::from_slice(&buf).expect("unknown value kinds stay wire-valid");
+
+        let options = resource_options_from_wire(&wire, true).unwrap();
+
+        assert_eq!(options.len(), 1);
+        assert!(options.contains_key(&HeaderKey::from_str("segment_size").unwrap()));
     }
 }

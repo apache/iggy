@@ -22,7 +22,7 @@ Basic messaging BDD test implementation for Python SDK
 import asyncio
 import socket
 
-from apache_iggy import IggyClient, PollingStrategy, SendMessage
+from apache_iggy import Consumer, IggyClient, PollingStrategy, SendMessage
 from pytest_bdd import given, parsers, scenarios, then, when
 
 # Load scenarios from the shared feature file
@@ -64,8 +64,7 @@ def authenticated_root_user(context):
 @given("I have no streams in the system")
 def no_streams_in_system(context):
     """Ensure no streams exist in the system"""
-    # With --fresh flag on server, this should already be clean
-    # Just verify by attempting to get a stream that shouldn't exist
+    # Every run gets a new server container, so the system starts empty
     pass
 
 
@@ -222,6 +221,7 @@ def poll_messages(context, stream_id, topic_id, partition_id, start_offset):
         context.last_polled_messages = await context.client.poll_messages(
             stream=stream_id,
             topic=topic_id,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Offset(value=start_offset),
             count=100,  # Poll up to 100 messages

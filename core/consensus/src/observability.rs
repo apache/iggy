@@ -249,7 +249,7 @@ impl ReplicaLogContext {
             plane,
             cluster_id: consensus.cluster(),
             replica_id: consensus.replica(),
-            namespace: NamespaceLogContext::from_raw(plane, consensus.namespace()),
+            namespace: NamespaceLogContext::from_raw(plane, consensus.group()),
             view: consensus.view(),
             log_view: consensus.log_view(),
             commit: consensus.commit_max(),
@@ -671,8 +671,6 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::SendMessages => "send_messages",
         Operation::StoreConsumerOffset => "store_consumer_offset",
         Operation::DeleteConsumerOffset => "delete_consumer_offset",
-        Operation::StoreConsumerOffset2 => "store_consumer_offset_2",
-        Operation::DeleteConsumerOffset2 => "delete_consumer_offset_2",
     }
 }
 

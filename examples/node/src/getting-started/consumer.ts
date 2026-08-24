@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Client, PollingStrategy, Consumer } from 'apache-iggy';
 import { BATCHES_LIMIT, log, MESSAGES_PER_BATCH, PARTITION_ID, STREAM_ID, TOPIC_ID } from '../utils';

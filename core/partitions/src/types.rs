@@ -87,7 +87,6 @@ pub struct SendMessagesResult {
 }
 
 /// Consumer identification for offset operations.
-// TODO(hubcio): unify with server's `PollingConsumer` in `streaming/polling_consumer.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollingConsumer {
     /// Regular consumer with (`consumer_id`, `partition_id`)
@@ -236,6 +235,53 @@ pub struct RepairSession {
     pub idle_ticks: u32,
 }
 
+/// How a repair-window commit walk concluded, decided by
+/// `IggyPartition::complete_repair`.
+///
+/// `#[must_use]` because `FloorRefused` is the partition plane's
+/// state-transfer trigger: repair proved the gap below the floor is neither
+/// locally durable nor repairable, so ignoring it wedges the replica
+/// gap-stopped forever.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairConclusion {
+    /// The walk fell short of `to_op`; the session stays armed and the stall
+    /// retry re-requests the remains.
+    InProgress,
+    /// The walk reached the requested frontier; the session was dropped.
+    Done,
+    /// The floor's continuity check failed: ops below it are neither locally
+    /// durable nor repaired. The session was dropped here -- state transfer
+    /// supersedes repair -- and the caller arms the transfer.
+    FloorRefused { floor: u64, to_op: u64 },
+}
+
+/// Where partition directories live on disk, mirroring the server's
+/// `SystemConfig` path scheme so segment files created by the partition plane
+/// land next to the ones the server bootstrap created.
+#[derive(Debug, Clone)]
+pub struct PartitionPathLayout {
+    /// `{system.path}/{stream.path}`: the directory holding per-stream dirs.
+    pub streams_root: String,
+    /// Directory name of the per-topic level (`topic.path`).
+    pub topics_dir: String,
+    /// Directory name of the per-partition level (`partition.path`).
+    pub partitions_dir: String,
+}
+
+/// Synthetic layout for tests and the simulator, where paths only key the
+/// sim storage and never touch a real filesystem. The server always wires
+/// the real layout from its `SystemConfig`.
+impl Default for PartitionPathLayout {
+    fn default() -> Self {
+        Self {
+            streams_root: "/tmp/iggy_stub/streams".to_string(),
+            topics_dir: "topics".to_string(),
+            partitions_dir: "partitions".to_string(),
+        }
+    }
+}
+
 /// Configuration for partition operations.
 ///
 /// Mirrors the relevant fields from the server's `PartitionConfig` and
@@ -248,8 +294,17 @@ pub struct PartitionsConfig {
     pub size_of_messages_required_to_save: IggyByteSize,
     /// Whether to enforce fsync after writes.
     pub enforce_fsync: bool,
+    /// Whether a disk poll verifies each batch's `batch_checksum` against the bytes
+    /// it just read.
+    ///
+    /// Detection only: a mismatch fails the poll closed and is reported, with no
+    /// attempt to repair. The alternative is serving bytes provably not the ones
+    /// written, which reads to a consumer as ordinary data.
+    pub validate_checksum: bool,
     /// Maximum size of a single segment before rotation.
     pub segment_size: IggyByteSize,
+    /// Whether local message files reserve the configured segment size on open.
+    pub preallocate_segments: bool,
     /// Server-side at-rest encryption. Applied ONCE, on the primary at
     /// ingestion, so the ciphertext replicates verbatim: every replica
     /// journals, acks, and persists identical bytes (checksums and the
@@ -257,6 +312,8 @@ pub struct PartitionsConfig {
     /// decrypts uniformly whether a fragment came from the resident journal
     /// or from disk.
     pub encryptor: Option<Arc<EncryptorKind>>,
+    /// On-disk location scheme for partition directories.
+    pub path_layout: PartitionPathLayout,
 }
 
 impl PartitionsConfig {
@@ -267,14 +324,15 @@ impl PartitionsConfig {
         topic_id: usize,
         partition_id: usize,
     ) -> String {
-        format!("/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}")
+        format!(
+            "{}/{stream_id}/{}/{topic_id}/{}/{partition_id}",
+            self.path_layout.streams_root,
+            self.path_layout.topics_dir,
+            self.path_layout.partitions_dir,
+        )
     }
 
     /// Constructs the file path for segment messages.
-    ///
-    /// TODO: This is a stub waiting for completion of issue to move server config
-    /// to shared module. Real implementation should use:
-    /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.log`
     #[must_use]
     pub fn get_messages_path(
         &self,
@@ -290,10 +348,6 @@ impl PartitionsConfig {
     }
 
     /// Constructs the file path for segment indexes.
-    ///
-    /// TODO: This is a stub waiting for completion of issue to move server config
-    /// to shared module. Real implementation should use:
-    /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.index`
     #[must_use]
     pub fn get_index_path(
         &self,
@@ -305,45 +359,6 @@ impl PartitionsConfig {
         format!(
             "{}/{start_offset:0>20}.index",
             self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    #[must_use]
-    pub fn get_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/offsets",
-            self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    #[must_use]
-    pub fn get_consumer_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/consumers",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    #[must_use]
-    pub fn get_consumer_group_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/groups",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
         )
     }
 }

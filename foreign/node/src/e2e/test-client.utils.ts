@@ -14,17 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Client } from '../client/client.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 
 const credentials = { username: 'iggy', password: 'iggy' };
 const [host, port] = getIggyAddress();
-const protocol = process.env.IGGY_TEST_PROTOCOL === 'vsr' ? 'vsr' : 'classic';
 
 export const getTestClient = () => new Client({
-  protocol,
   transport: 'TCP',
   options: { host, port },
   credentials

@@ -37,7 +37,7 @@ use tracing::warn;
 /// then run inside the transport's `run` body on the per-connection
 /// install task; the install path stays thin. No subprotocol
 /// negotiation: client identity is established post-handshake by the
-/// LOGIN command on the caller (server-ng).
+/// LOGIN command on the caller (the server).
 ///
 /// `TCP_NODELAY` is applied pre-handshake for symmetry with
 /// [`super::tcp_tls::install_client_tcp_tls`]. `SO_KEEPALIVE` is

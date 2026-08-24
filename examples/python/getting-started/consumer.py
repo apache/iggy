@@ -19,8 +19,17 @@ import argparse
 import asyncio
 import typing
 import urllib.parse
+from datetime import timedelta
 
-from apache_iggy import IggyClient, PollingStrategy, ReceiveMessage
+from apache_iggy import (
+    AutoLogin,
+    Consumer,
+    IggyClient,
+    PollingStrategy,
+    ReceiveMessage,
+    TcpConfig,
+    TcpReconnectionConfig,
+)
 from loguru import logger
 
 STREAM_NAME = "sample-stream"
@@ -28,6 +37,7 @@ TOPIC_NAME = "sample-topic"
 STREAM_ID = 0
 TOPIC_ID = 0
 PARTITION_ID = 0
+CONSUMER_NAME = "sample-consumer"
 BATCHES_LIMIT = 5
 
 
@@ -91,34 +101,34 @@ def parse_args() -> ArgNamespace:
     return ArgNamespace(**vars(args))
 
 
-def build_connection_string(args) -> str:
-    """Build a connection string with TLS support."""
+def build_config(args: ArgNamespace) -> TcpConfig:
+    """Build a TCP client configuration with auto-login and reconnection."""
 
-    conn_str = f"iggy://{args.username}:{args.password}@{args.tcp_server_address}"
-
-    if args.tls:
-        # Extract domain from server address (host:port -> host)
-        host = args.tcp_server_address.split(":")[0]
-        query_params = ["tls=true", f"tls_domain={host}"]
-
-        # Add CA file if provided
-        if args.tls_ca_file:
-            query_params.append(f"tls_ca_file={args.tls_ca_file}")
-        conn_str += "?" + "&".join(query_params)
-
-    return conn_str
+    return TcpConfig(
+        server_address=args.tcp_server_address,
+        auto_login=AutoLogin.username_password(args.username, args.password),
+        reconnection=TcpReconnectionConfig(
+            enabled=True,
+            interval=timedelta(seconds=1),
+        ),
+        tls_enabled=args.tls,
+        tls_ca_file=args.tls_ca_file or None,
+    )
 
 
 async def main():
     args: ArgNamespace = parse_args()
+    try:
+        config = build_config(args)
+    except ValueError as error:
+        logger.error(f"Invalid client configuration: {error}")
+        return
+    logger.info(f"Connecting to {args.tcp_server_address} (TLS: {args.tls})")
 
-    # Build connection string with TLS support
-    connection_string = build_connection_string(args)
-    logger.info(f"Connection string: {connection_string}")
-
-    client = IggyClient.from_connection_string(connection_string)
+    client = IggyClient(config)
     try:
         logger.info("Connecting to IggyClient...")
+        # No login_user() call: auto_login replays the credentials on every connect.
         await client.connect()
         logger.info("Connected.")
         await consume_messages(client)
@@ -142,6 +152,7 @@ async def consume_messages(client: IggyClient):
             polled_messages = await client.poll_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
+                consumer=Consumer.Single(CONSUMER_NAME),
                 partition_id=PARTITION_ID,
                 polling_strategy=PollingStrategy.Next(),
                 count=messages_per_batch,

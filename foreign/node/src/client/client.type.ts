@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import type { Readable } from 'stream';
 import { type TcpSocketConnectOpts } from 'node:net';
@@ -56,8 +55,6 @@ export type SendCommandOptions = {
  * Provides direct access to command sending and event handling.
  */
 export type RawClient = {
-  /** Server wire protocol used by this connection */
-  readonly protocol: Protocol,
   /** Sends a command to the server and returns the response */
   sendCommand: (
     code: number,
@@ -114,9 +111,6 @@ export type ReconnectOption = {
  */
 export type TransportOption = TcpOption | TlsOption;
 
-/** Server wire protocol. */
-export type Protocol = 'classic' | 'vsr';
-
 /**
  * Token-based authentication credentials.
  */
@@ -155,8 +149,6 @@ export type PoolSizeOption = {
  * Complete client configuration for connecting to the Iggy server.
  */
 export type ClientConfig = {
-  /** Server wire protocol (default: classic) */
-  protocol?: Protocol,
   /** Transport protocol to use (TCP or TLS) */
   transport: TransportType,
   /** Transport-specific connection options */
@@ -167,7 +159,12 @@ export type ClientConfig = {
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,
-  /** Interval for sending heartbeat pings in milliseconds */
+  /**
+   * Interval for sending heartbeat pings in milliseconds, as an integer
+   * between 0 and Node's timer ceiling. Defaults to 5000. Set to 0 to disable
+   * client heartbeats; any other unusable value is rejected rather than
+   * silently disabling them.
+   */
   heartbeatInterval?: number,
   /** Maximum accepted response frame size in bytes */
   maxResponseFrameSize?: number

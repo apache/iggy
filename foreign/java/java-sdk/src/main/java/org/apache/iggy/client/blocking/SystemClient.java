@@ -19,8 +19,11 @@
 
 package org.apache.iggy.client.blocking;
 
+import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.apache.iggy.system.OptionSpec;
+import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.Stats;
 
 import java.util.List;
@@ -28,6 +31,18 @@ import java.util.List;
 public interface SystemClient {
 
     Stats getStats();
+
+    ClusterMetadata getClusterMetadata();
+
+    /**
+     * Describes the option catalog for a resource scope: every key its create command accepts, with
+     * the kind, default and bounds of each.
+     *
+     * <p>A key outside the catalog is refused at create and the binary transports carry only the
+     * error code back, so this is the only way to learn which keys a server knows. A scope with no
+     * keys yet returns an empty list.
+     */
+    List<OptionSpec> describeOptions(OptionsScope scope);
 
     ClientInfoDetails getMe();
 

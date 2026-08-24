@@ -111,6 +111,18 @@ pub trait Source: Send + Sync {
     /// Invoked every time a batch of messages is produced to the configured stream and topic.
     async fn poll(&self) -> Result<ProducedMessages, Error>;
 
+    /// Invoked after the runtime has finished processing the most recently polled batch.
+    ///
+    /// Sources that track cursors or perform destructive operations should stage those changes
+    /// in [`Source::poll`] and apply them only after receiving [`source::SourceBatchResult::Ack`].
+    /// A [`source::SourceBatchResult::Nack`] means the staged changes must be discarded so the
+    /// batch can be polled again. The SDK allows only one batch to be in flight at a time and
+    /// stops polling if this method returns an error. The default no-op is suitable only for
+    /// sources that have no staged cursor changes or destructive work.
+    async fn on_batch_result(&self, _result: source::SourceBatchResult) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Invoked when the source is closed, allowing it to perform any necessary cleanup.
     async fn close(&mut self) -> Result<(), Error>;
 }
@@ -443,4 +455,19 @@ pub enum Error {
     /// be duplicated.
     #[error("Catalog commit error: {0}")]
     CatalogCommitError(String),
+    /// The state store is temporarily unavailable (5xx, timeout, connect
+    /// failure) and bounded retries were exhausted. The operation may succeed
+    /// later; the batch-ack path Nacks and the plugin re-polls.
+    #[error("Transient state error: {0}")]
+    TransientState(String),
+    /// The state store rejected the operation in a way retrying cannot fix
+    /// (version conflict, revoked authorization, protocol violation). No
+    /// write from this process can be expected to succeed again.
+    #[error("Permanent state error: {0}")]
+    PermanentState(String),
+    /// A previous save failed permanently, so the state provider refuses
+    /// further saves without touching the network. Fail-fast marker, never
+    /// retried.
+    #[error("State provider latched after a permanent state error")]
+    StateLatched,
 }

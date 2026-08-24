@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,10 +25,8 @@ import { getIggyAddress } from '../tcp.sm.utils.js';
 describe('e2e -> consumer-group', async () => {
 
   const [host, port] = getIggyAddress();
-  const vsr = process.env.IGGY_TEST_PROTOCOL === 'vsr';
 
   const c = new SingleClient({
-    protocol: vsr ? 'vsr' : 'classic',
     transport: 'TCP',
     options: { host, port },
     credentials: { username: 'iggy', password: 'iggy' }
@@ -95,9 +92,7 @@ describe('e2e -> consumer-group', async () => {
         streamId: streamName,
         topicId: topicName,
         messages: generateMessages(mn),
-        partition: vsr
-          ? Partitioning.PartitionId((i / mn) % 3)
-          : Partitioning.MessageKey(`key-${ i % 300 }`)
+        partition: Partitioning.PartitionId((i / mn) % 3)
       }));
     }
     payloadLength = ct;

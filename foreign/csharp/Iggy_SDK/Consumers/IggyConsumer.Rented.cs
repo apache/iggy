@@ -198,13 +198,7 @@ public partial class IggyConsumer
             LogFailedToDecryptMessage(ex, ex.Offset, ex.PartitionId);
             throw;
         }
-        catch (MalformedResponseException)
-        {
-            // Non-transient poison: rethrow so the generic catch below does not swallow it and re-poll forever.
-            // Base InvalidResponseException (server error status, possibly transient) falls through to retry.
-            throw;
-        }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is not (MalformedResponseException or VsrRequestOutcomeUnknownException))
         {
             LogFailedToPollMessages(ex);
             _consumerErrorEvents.Publish(new ConsumerErrorEventArgs(ex, "Failed to poll messages"));

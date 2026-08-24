@@ -29,8 +29,7 @@ runs:
     - name: Install PHP build dependencies
       shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        ./scripts/ci/apt-install.sh --no-install-recommends \
           clang \
           composer \
           libclang-dev \
@@ -88,6 +87,7 @@ runs:
       run: |
         "${PHP}" -r 'json_decode(file_get_contents("foreign/php/composer.json"), true, 512, JSON_THROW_ON_ERROR);'
         cargo fmt --manifest-path foreign/php/Cargo.toml -- --check
+        cargo clippy --manifest-path foreign/php/Cargo.toml --all-targets --all-features -- -D warnings
         cargo install cargo-php --locked --version 0.1.21
         cargo build --manifest-path foreign/php/Cargo.toml
         extension="$(find "${CARGO_TARGET_DIR}/debug" -maxdepth 1 -name 'libiggy_php.so' -print -quit)"
@@ -153,6 +153,8 @@ runs:
       if: inputs.task == 'test'
       id: iggy
       uses: ./.github/actions/utils/server-start
+      with:
+        cargo-bin: iggy-server
 
     - name: Run PHP SDK tests
       if: inputs.task == 'test'
@@ -179,6 +181,7 @@ runs:
       id: iggy-tls
       uses: ./.github/actions/utils/server-start
       with:
+        cargo-bin: iggy-server
         pid-file: ${{ runner.temp }}/iggy-server-tls.pid
         log-file: ${{ runner.temp }}/iggy-server-tls.log
       env:

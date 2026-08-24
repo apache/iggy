@@ -19,12 +19,11 @@
 [consumer_group]
 # Maximum time a partition can remain in pending revocation before being force-transferred to the target member.
 rebalancing_timeout = "30s"
-# How often the periodic checker scans for timed-out pending revocations.
-rebalancing_check_interval = "5s"
 
 [data_maintenance.messages]
-# Enables or disables the expired message cleaner process.
-cleaner_enabled = false
+# Enables or disables the segment cleaner. It deletes the oldest sealed segments of
+# topics with a finite message_expiry or max_topic_size, per partition, best-effort.
+cleaner_enabled = true
 
 # Interval for running the message cleaner.
 interval = "1 m"
@@ -34,13 +33,27 @@ interval = "1 m"
 # Determines if the HTTP server is active.
 # `true` enables the server, allowing it to handle HTTP requests.
 # `false` disables the server, preventing it from handling HTTP requests.
+# In cluster mode, followers forward control-plane requests (streams, topics,
+# users, ...) to the current primary when a cluster-wide JWT key exists (see
+# http.jwt / cluster.auth below).
+# TODO: forwarding does not cover the partition-plane APIs yet - message
+# produce and consumer-offset writes are never forwarded and must reach the
+# partition's primary node directly (message polls read locally on any node).
 enabled = true
 
 # Specifies the network address and port for the HTTP server.
 # The format is "HOST:PORT". For example, "127.0.0.1:3000" listens on localhost only on port 3000.
+# In cluster mode the HOST still picks the bind interface, while the port
+# comes from this node's cluster.nodes ports.http entry.
 address = "127.0.0.1:3000"
 
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
+# HTTP produce requests are not framed by the message bus, so this body cap is
+# what bounds the widest batch record the HTTP path can persist. Boot refuses a
+# value above the frozen 256 MiB recovery ceiling (see
+# message_bus.max_message_size), and a body above message_bus.max_message_size
+# can still admit a batch that no peer accepts a replication frame for -- keep
+# this at or below that cap unless replica_count = 1.
 max_request_size = "2 MB"
 
 # Enables the embedded Web UI dashboard at '/ui'.
@@ -65,7 +78,9 @@ enabled = true
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 
 # Defines which origins are permitted to make cross-origin requests.
-# An asterisk "*" allows all origins. Specific domains can be listed to restrict access.
+# An asterisk "*" as the first entry allows all origins (any entries after it
+# are ignored); "*" in any other position fails the config. Specific domains
+# can be listed to restrict access.
 allowed_origins = ["*"]
 
 # Lists allowed headers that can be used in CORS requests.
@@ -73,11 +88,14 @@ allowed_origins = ["*"]
 allowed_headers = ["content-type", "authorization"]
 
 # Headers that browsers are allowed to access in CORS responses.
-# An empty array means no additional headers are exposed to browsers.
-exposed_headers = [""]
+# `iggy-view` carries the current VSR view number; exposing it lets browser
+# clients read it on cross-origin responses.
+exposed_headers = ["iggy-view"]
 
 # Determines if credentials like cookies or HTTP auth can be included in CORS requests.
-# `true` allows credentials to be included, useful for authenticated sessions.
+# `true` allows credentials to be included, useful for authenticated sessions;
+# it requires explicit (non-wildcard) allowed_origins, allowed_headers, and
+# exposed_headers.
 # `false` prevents credentials, enhancing privacy and security.
 allow_credentials = false
 
@@ -115,6 +133,10 @@ not_before = "0 s"
 
 # Secret key for encoding JWTs.
 # If left empty, a secure random secret will be generated on each server start.
+# In cluster mode a configured secret (identical on every node) makes bearers
+# valid cluster-wide and activates follower-to-primary HTTP forwarding; with
+# cluster.auth enabled the key is instead derived from the shared PSK. Without
+# either, tokens are node-local and forwarding stays disabled.
 encoding_secret = ""
 
 # Secret key for decoding JWTs.
@@ -153,6 +175,8 @@ use_base64_secret = false
 enabled = true
 
 # Specifies the endpoint for accessing metrics, e.g., "/metrics".
+# This route requires authentication like every other read: scrapers must
+# present a bearer credential (JWT or personal access token).
 endpoint = "/metrics"
 
 # TLS (Transport Layer Security) configuration for HTTP.
@@ -179,12 +203,6 @@ enabled = true
 # For example, "127.0.0.1:8090" listens on localhost only on port 8090.
 address = "127.0.0.1:8090"
 
-# Enable TCP socket migration across shards.
-socket_migration = true
-
-# Whether to use ipv4 or ipv6
-ipv6 = false
-
 # TLS configuration for the TCP server.
 [tcp.tls]
 # Enables or disables TLS for TCP connections.
@@ -192,37 +210,19 @@ ipv6 = false
 # `false` leaves TCP connections unencrypted.
 enabled = false
 
-# Enables or disables self-signed certificate generation.
-# `true` generates a self-signed certificate if cert files don't exist.
-# `false` requires certificate files to exist at the specified paths.
+# Certificate source for the TCP TLS listener.
+# `true` generates an ephemeral loopback certificate, but only while cert_file
+# does not exist on disk: an existing PEM pair is loaded instead (the server
+# logs which way it went).
+# `false` loads cert_file / key_file, which must both exist.
 self_signed = true
 
-# Path to the TLS certificate file.
+# Path to the TLS certificate file. Loaded when the file exists or
+# self_signed = false.
 cert_file = "core/certs/iggy_cert.pem"
 
-# Path to the TLS key file.
+# Path to the TLS key file. Read together with cert_file.
 key_file = "core/certs/iggy_key.pem"
-
-# Configuration for the TCP socket
-[tcp.socket]
-# Whether to overwrite the OS-default socket parameters
-override_defaults = false
-
-# SO_RCVBUF: maximum size of the receive buffer, can be clamped by the OS
-recv_buffer_size = "100 KB"
-
-# SO_SNDBUF: maximum size of the send buffer, can be clamped by the OS
-send_buffer_size = "100 KB"
-
-# SO_KEEPALIVE: whether to regularly send a keepalive packet maintaining the connection
-keepalive = false
-
-# TCP_NODELAY: enable/disable the Nagle algorithm which buffers data before sending segments
-nodelay = false
-
-# SO_LINGER: delay to wait for while data is being transmitted before closing the socket after a
-# close or shutdown call has been received
-linger = "0 s"
 
 # QUIC protocol configuration.
 [quic]
@@ -235,68 +235,66 @@ enabled = true
 # For example, "127.0.0.1:8080" binds to localhost on port 8080.
 address = "127.0.0.1:8080"
 
-# Maximum number of simultaneous bidirectional streams in QUIC.
-max_concurrent_bidi_streams = 10_000
+# How many bidirectional streams a client may keep open at once on a single
+# QUIC connection. The SDK opens a fresh stream per command, so 1 caps a
+# connection at one in-flight command: commands do not pipeline, and the next
+# one waits for the current reply. The known cost is one stream-credit round
+# trip between back-to-back requests on the same connection. Raising it is a
+# transport decision only: the server's accept loop takes one bidi at a time
+# and waits for its reply before accepting the next, which is what keeps
+# partition operations (they all share the connection's current request id)
+# distinguishable, and a higher cap does not make the handlers concurrent.
+max_concurrent_bidi_streams = 1
 
-# Size of the buffer for sending datagrams in QUIC.
-datagram_send_buffer_size = "100 KB"
+# Initial path MTU for QUIC connections, before MTU discovery has run.
+# 1200 bytes is the QUIC minimum and quinn's own default: safe on every
+# path, and MTU discovery probes upward from it automatically. Values
+# above the real path MTU cause packet loss until black-hole detection
+# resets the connection back to 1200.
+initial_mtu = "1200 B"
 
-# Initial Maximum Transmission Unit (MTU) for QUIC connections.
-initial_mtu = "8 KB"
+# Server-side flow-control budget for unacknowledged data the server may have
+# in flight on one connection. A ceiling, not a reservation, and rarely the
+# operative limit: the receiver's own window binds first, and the Rust SDK's
+# QUIC client sets both of its windows to about 100 KB.
+send_window = "64 MiB"
 
-# Size of the sending window in QUIC, controlling data flow.
-send_window = "100 KB"
+# Server-side flow-control budget for data the server will buffer from one
+# connection, shared by all of its streams. Symmetric with `send_window`.
+receive_window = "64 MiB"
 
-# Size of the receiving window in QUIC, controlling data flow.
-receive_window = "100 KB"
+# Per-stream slice of `receive_window`. Equal to it, because
+# `max_concurrent_bidi_streams` is 1: with a single stream per connection a
+# smaller carve-out protects nothing, it only caps the one stream early.
+# Lower it below `receive_window` if that cap is ever raised, so one unread
+# stream cannot pin the whole connection window. Must not exceed
+# `receive_window`; equality is allowed.
+stream_receive_window = "64 MiB"
 
-# Interval for sending keep-alive messages in QUIC.
-keep_alive_interval = "5 s"
+# Interval for sending QUIC keep-alive PINGs. One third of
+# `max_idle_timeout` so up to two consecutive losses fit before the
+# idle timer closes the connection. Set to "0 s" to disable.
+keep_alive_interval = "10 s"
 
-# Maximum idle time before a QUIC connection is closed.
-max_idle_timeout = "10 s"
+# Maximum idle time before a QUIC connection is closed. Set to
+# "0 s" to disable (not recommended).
+max_idle_timeout = "30 s"
 
 # QUIC certificate configuration.
 [quic.certificate]
-# Indicates whether the QUIC certificate is self-signed.
-# `true` for self-signed certificates, often used in internal or testing environments.
-# `false` for certificates issued by a certificate authority, common in production.
+# Certificate source for the QUIC listener.
+# `true` always generates an ephemeral loopback certificate and ignores
+# cert_file / key_file even when those files exist on disk; the server logs a
+# warning naming the files it skipped.
+# `false` loads cert_file / key_file, which must both exist.
 self_signed = true
 
-# Path to the QUIC TLS certificate file.
-cert_file = "core/certs/iggy_cert.pem"
+# Path to the QUIC TLS certificate file. Required when self_signed = false,
+# left empty here so the shipped self-signed default has nothing to skip.
+cert_file = ""
 
-# Path to the QUIC TLS key file.
-key_file = "core/certs/iggy_key.pem"
-
-# Configuration for the QUIC socket
-[quic.socket]
-# Whether to override the OS-default socket parameters
-override_defaults = false
-
-# SO_RCVBUF: maximum size of the receive buffer, can be clamped by the OS
-recv_buffer_size = "64 KB"
-
-# SO_SNDBUF: maximum size of the send buffer, can be clamped by the OS
-send_buffer_size = "64 KB"
-
-# SO_KEEPALIVE: whether to regularly send a keepalive packet maintaining the connection
-keepalive = false
-
-# Message saver configuration.
-[message_saver]
-# Enables or disables the background process for saving buffered data to disk.
-# `true` ensures data is periodically written to disk.
-# `false` turns off automatic saving, relying on other triggers for data persistence.
-enabled = true
-
-# Controls whether data saving is synchronous (enforce fsync) or asynchronous.
-# `true` for synchronous saving, ensuring data integrity at the cost of performance.
-# `false` for asynchronous saving, improving performance but with delayed data writing.
-enforce_fsync = true
-
-# Interval for running the message saver.
-interval = "30 s"
+# Path to the QUIC TLS key file. Required when self_signed = false.
+key_file = ""
 
 # Personal access token configuration.
 [personal_access_token]
@@ -315,10 +313,22 @@ interval = "1 m"
 
 # Heartbeat configuration
 [heartbeat]
-# Enables or disables the client heartbeat verification process.
-enabled = false
-# Interval for expected client heartbeats
-interval = "5 s"
+# Enables or disables the client heartbeat verification process. When
+# enabled, a connection that sends nothing (no request, no PING) for
+# 1.2 x interval has its session released so its consumer groups
+# rebalance off it. Only a connection that still holds a group
+# membership is evicted; one that holds none is left alone and is
+# reaped when its socket closes.
+enabled = true
+# Interval for expected client heartbeats. The Rust, Go, Python, Node and
+# async Java SDKs ping automatically every 5 s, well inside the resulting 36 s
+# staleness window, but only from a connected high-level client: the Rust and
+# async Java pingers are armed by connect(), so a session that logs in without
+# it never pings. The blocking Java and the C# SDK have no automatic heartbeat
+# at all, only a manual ping. Wherever nothing pings, an idle consumer-group
+# member is evicted, and only the application can keep it alive (ping) or
+# bring it back afterwards (reconnect).
+interval = "30 s"
 
 # OpenTelemetry configuration
 [telemetry]
@@ -345,30 +355,6 @@ endpoint = "http://localhost:7281/v1/traces"
 [system]
 # Base path for system data storage.
 path = "local_data"
-
-# Backup configuration
-[system.backup]
-# Path for storing backup.
-path = "backup"
-
-# Compatibility conversion configuration
-[system.backup.compatibility]
-# Subpath of the backup directory where converted segment data is stored after compatibility conversion.
-path = "compatibility"
-
-[system.state]
-# Determines whether to enforce file synchronization on state updates (boolean).
-# `true` ensures immediate writing of data to disk for durability.
-# `false` allows the OS to manage write operations, which can improve performance.
-enforce_fsync = false
-
-# Maximum number of retries for a failed file operation (e.g., append, overwrite).
-# This defines how many times the system will attempt the operation before failing.
-max_file_operation_retries = 1
-
-# Delay between retries in case of a failed file operation.
-# This helps to avoid immediate repeated attempts and can reduce load.
-retry_delay = "1 s"
 
 # Runtime configuration.
 [system.runtime]
@@ -411,9 +397,6 @@ rotation_check_interval = "1 h"
 # Time to retain log files before deletion. Avoid less than 1s, too.
 retention = "7 days"
 
-# Interval for printing system information to the log.
-sysinfo_print_interval = "10 s"
-
 # Encryption configuration
 [system.encryption]
 # Determines whether server-side data encryption for the messages payloads and state commands is enabled (boolean).
@@ -426,47 +409,24 @@ enabled = false
 # This key is required and used only if encryption is enabled.
 key = ""
 
-# Compression configuration
-[system.compression]
-# Reserved for future server-side compression support; use "none" today.
-# For manual compression, store the algorithm in message headers.
-# Allows overriding the default compression algorithm per data segment (boolean).
-# `true` will permit different compression algorithms for individual segments.
-# `false` will make all data segments use the default compression algorithm.
-allow_override = false
-
-# The default compression algorithm used for data storage (string).
-# "none" indicates no compression. Other values are reserved for future support.
-default_algorithm = "none"
-
 # Stream configuration
 [system.stream]
 # Path for storing stream-related data (string).
 # Specifies the directory where stream data is stored, relative to `system.path`.
 path = "streams"
 
-# Topic configuration - default settings for new topics
+# Topic configuration
 [system.topic]
 # Path for storing topic-related data, relative to `stream.path`.
 path = "topics"
 
-# Messages can be deleted based on two independent policies:
-# 1. Size-based: delete oldest segments when topic exceeds max_size
-# 2. Time-based: delete segments older than message_expiry
-# Both can be active simultaneously. Per-topic overrides via CreateTopic/UpdateTopic.
-
-# Maximum topic size before oldest segments are deleted.
-# "unlimited" or "0" = no size limit (messages kept indefinitely).
-# When 90% of this limit is reached, oldest segments are removed to make room.
-# Applies to sealed segments only (active segment is protected).
-# Example: "10 GiB"
-max_size = "unlimited"
-
-# Maximum age of messages before segments are deleted.
-# "none" = no time limit (messages kept indefinitely).
-# Applies to sealed segments only (active segment is protected).
-# Example: "7 days", "2 days 4 hours 15 minutes"
-message_expiry = "none"
+# Retention is per topic, set at CreateTopic and readable on GetTopic:
+#   max_topic_size   - delete oldest sealed segments past this size
+#                      ("unlimited" when unset)
+#   message_expiry   - delete sealed segments older than this ("none" when unset)
+# Both policies can be active at once; the active segment is never touched.
+# Call GET /options/topic (or the SDK's describe_options) for the full catalog
+# with this server's defaults.
 
 # Partition configuration
 [system.partition]
@@ -474,60 +434,98 @@ message_expiry = "none"
 # Specifies the directory where partition data is stored, relative to `topic.path`.
 path = "partitions"
 
-# Determines whether to enforce file synchronization on partition updates (boolean).
-# `true` ensures immediate writing of data to disk for durability.
-# `false` allows the OS to manage write operations, which can improve performance.
-enforce_fsync = false
-
 # Enables checksum validation for data integrity (boolean).
-# `true` activates CRC checks when loading data, guarding against corruption.
-# `false` skips these checks for faster loading at the risk of undetected corruption.
-validate_checksum = false
+# `true` re-hashes every batch a disk poll reads and fails the poll closed on a
+# mismatch, so a segment damaged at rest is reported instead of served.
+# `false` skips the re-hash and serves whatever decodes, which hands a consumer
+# bytes provably not the ones written. Only turn it off with a corruption guard
+# somewhere else in the stack.
+validate_checksum = true
 
-# The count threshold of buffered messages before triggering a save to disk.
-# Together with `size_of_messages_required_to_save` it defines the threshold.
-# This is a soft limit - actual count may be higher depending on last batch size.
-# Minimum value is 1.
-messages_required_to_save = 1024
-
-# The size threshold of buffered messages before triggering a save to disk.
-# Together with `messages_required_to_save` it defines the threshold.
-# This is a soft limit - actual size may be higher depending on last batch size.
-size_of_messages_required_to_save = "1 MiB"
+# Durability and flush cadence are per topic, set at CreateTopic:
+#   enforce_fsync                     - fsync each write (false when unset)
+#   messages_required_to_save         - flush after this many messages (1024)
+#   size_of_messages_required_to_save - flush after this many bytes (1 MiB)
 
 # Segment configuration
 [system.segment]
-# Defines the soft limit for the size of a storage segment.
-# When a segment reaches this size, a new segment is created for subsequent data.
-# Example: if `size` is set "1GiB", the actual segment size may be 1GiB + the size of remaining messages in received batch.
-# Maximum size is 1 GiB. Size has to be a multiple of 512 B.
-size = "1 GiB"
+# Segment size is per topic, set at CreateTopic as `segment_size` (1 GiB when
+# unset). It is a soft limit: a segment may close one whole batch past it.
+# Bounds are enforced at creation - a 512 B multiple, at least 1 MiB, and no
+# larger than 1 GiB.
+#
+# `preallocate_segments` is per topic too: it reserves exactly `segment_size`
+# up front where the filesystem supports it. Off unless a topic asks for it --
+# with the default 1 GiB segment size it costs 1 GiB of real disk per
+# partition at creation.
 
 # Configures whether expired segments are archived (boolean) or just deleted without archiving.
+# Unsupported: setting this to `true` aborts boot.
 archive_expired = false
-
-# Controls whether to cache indexes (time and positional) for segment access.
-# Possible values:
-# - "true" or "all": keeps indexes in memory, speeding up data retrieval at the cost of memory
-# - "open_segment": keeps indexes in memory only for the currently open segment
-# - "false" or "none": reads indexes from disk, which can conserve memory at the cost of access speed
-cache_indexes = "open_segment"
-
-# Message deduplication configuration
-[system.message_deduplication]
-# Controls whether message deduplication is enabled (boolean).
-# `true` activates deduplication, ignoring messages with duplicate IDs.
-# `false` treats each message as unique, even if IDs are duplicated.
-enabled = false
-# Maximum number of ID entries in the deduplication cache (u64).
-max_entries = 10000
-# Maximum age of ID entries in the deduplication cache in human-readable format.
-expiry = "1 m"
 
 # Recovery configuration in case of lost data
 [system.recovery]
 # Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).
+# Unsupported: setting this to `true` aborts boot.
 recreate_missing_state = false
+
+# At boot, segment recovery walks each partition's segments: bytes after the
+# last decodable batch of a genuinely torn tail are physically truncated from
+# the .log/.index files. A LOST index is rebuilt from the batches the walk
+# proves -- lost meaning absent altogether, or holding no whole 24-byte
+# entry. An index that still holds whole entries is NEVER rebuilt, only
+# floored to whole entries, or the partition is refused when its entries
+# contradict the log. Only the walk of a segment whose index was lost
+# re-checksums every batch; with an intact index the walk trusts batch
+# headers, except that a batch contradicting the walk (see below) must pass
+# its batch checksum before the contradiction is believed. Bytes before the
+# last index entry are not re-examined at boot at all -- at-rest damage
+# there surfaces on the read path via validate_checksum.
+#
+# A restore that dropped every .index therefore boots by re-reading and
+# re-checksumming every byte of every segment and rebuilding each index
+# durably, two fsyncs per segment: budget minutes, not seconds, on a
+# partition holding thousands of segments. A boot that looks hung after such
+# a restore is doing that work. Before, that same shape refused the boot
+# outright.
+#
+# Either walk refuses a batch whose base offset does not continue the chain,
+# or whose partition_id stamp is not this partition's. A contradiction whose
+# batch fails its own checksum is damage rather than data: the walk stops
+# there and the residue goes through the damage probe like any other torn
+# tail, so a bit flip in a tail batch's offset truncates instead of refusing
+# the partition, regardless of the flip's direction.
+#
+# Damage in the middle of a segment is never silently truncated: the
+# partition is refused, as is trailing residue whose verification cost
+# exhausts the probe's residue-derived work budgets while walked batches
+# exist (residue after a walk that proved nothing recovers the segment as
+# empty instead, fencing the file pair aside whole). With peer replicas the
+# refused files are moved to a .fenced.N directory beside the partition,
+# which is rebuilt empty and refilled from a peer. With replica_count = 1
+# there is no peer, so nothing is moved and nothing is rebuilt: the refused
+# files stay at their original paths, the partition is tombstoned (unrouted,
+# clients get the retriable transient status, never an empty poll that would
+# read as a healthy empty partition), and the same refusal is re-derived and
+# re-logged on every boot. The tombstone lifts in exactly two ways: a
+# chain-shape refusal whose planned chain provably holds ZERO recoverable
+# bytes rebuilds through .fenced.N at boot, and deleting the
+# stream/topic/partition removes the refused files and clears the fence, so
+# a recreate of the same ids starts clean. One refusal is not durable: a
+# length divergence found when a writer reopens a file recovery just
+# truncated clears on the next boot, so that tombstone lasts only for the
+# life of the process.
+#
+# .fenced.N has a second producer, on a partition that recovers FINE: a tail
+# segment holding bytes that decode to nothing anywhere is moved there and
+# the segment recovered empty, so the partition serves without those bytes.
+# One fresh directory per such segment, so .fenced.0, .fenced.1, ... can
+# accumulate under a healthy partition. .fenced.N alone therefore does not
+# mean a partition was refused -- grep the boot log for "refusing the
+# recovered segment chain", which names the directory and the reason.
+#
+# The metadata WAL truncates genuinely torn tails too; interior WAL damage
+# or oversized trailing bytes refuse boot instead.
 
 # Memory pool configuration
 [system.memory_pool]
@@ -558,28 +556,224 @@ enabled = false
 # Unique cluster name (string).
 # All nodes in the same cluster must share the same name.
 # This prevents accidental cross-cluster communication.
+# Permanent on-disk identity: the name is hashed into the cluster id stamped
+# into every metadata and partition superblock on first boot. Changing it later
+# makes the server refuse to start against existing data, since the recovered id
+# no longer matches the configured one. Renaming means starting from an empty
+# data directory.
 name = "iggy-cluster"
 
-# Full roster of cluster members. This list must be byte-identical on every
-# node so operators can ship a single config.toml. The running node's
-# identity is resolved at launch from the '--replica-id <N>' CLI flag,
-# which selects the entry in this list that describes the current node.
-# All other entries are treated as remote peers.
+# Consensus runs on a fixed 10ms tick, so every duration below is converted to
+# whole ticks: values are rounded down to a multiple of 10ms, and anything under
+# 10ms is raised to a single tick rather than firing sooner.
+
+# Backup-side liveness window for a consensus plane's primary (duration).
+# A replica that sees no primary traffic for this long starts a view change.
+# Raise it on oversubscribed hosts where scheduling stalls fake primary
+# death. Must be at least "2s" and at least 4x commit_broadcast_interval: the
+# primary signals liveness through its commit broadcast, and the window must
+# span several broadcasts so one delayed broadcast never trips an election.
+heartbeat_timeout = "5s"
+
+# How often the primary broadcasts its commit point to every backup (duration).
+# This is the cluster's liveness signal: each broadcast resets every backup's
+# heartbeat_timeout window and carries the latest commit point forward. Must be
+# nonzero and, with heartbeat_timeout, satisfy heartbeat_timeout >= 4x this
+# value. Drives the consensus CommitMessage timer.
+commit_broadcast_interval = "500ms"
+
+# How often the primary retransmits prepares that backups have not yet acked
+# (duration). Lower values recover faster from a dropped prepare at the cost of
+# more replica traffic; must be nonzero. Drives the consensus Prepare timer.
+prepare_retransmit_interval = "250ms"
+
+# How often a replica retransmits its StartViewChange / DoViewChange while a
+# view change is in progress (duration). Lower values converge a healthy
+# election faster at the cost of more replica traffic; must be nonzero. Drives
+# both consensus view-change retransmit timers.
+view_change_retransmit_interval = "500ms"
+
+# Backstop for a stalled view change (duration): one that does not conclude
+# within this window escalates to a fresh cluster-wide election. Must be nonzero
+# and at least 4x view_change_retransmit_interval, so a few dropped view-change
+# messages retransmit rather than prematurely escalate.
+view_change_status_timeout = "5s"
+
+# How often a recovering or view-change backup re-requests the current view's
+# StartView from its primary (duration); must be nonzero. Drives the consensus
+# RequestStartView timer.
+request_start_view_retransmit_interval = "1s"
+
+# How many consecutive unanswered RequestStartView probes a recovering replica
+# tolerates before falling back to an election (integer). A full-cluster restart
+# leaves nobody settled to answer, so the replica elects on its recovered log.
+# Must be between 1 and 100.
+view_probe_attempts_max = 5
+
+# How long a stalled journal-repair stream waits before re-requesting its
+# remaining window from the serving peer (duration). Repair frames are
+# fire-and-forget over the lossy bus, so a session with no retry wedges forever
+# on a single dropped frame. Paces both the metadata and partition repair loops;
+# must be nonzero.
+repair_retry_interval = "1s"
+
+# Prepares a peer serves per repair round before the requester walks to the next
+# chunk (integer). Each frame rides the per-peer message-bus queue, so this must
+# stay strictly below message_bus.peer_queue_capacity or a full round overruns
+# the queue and drops frames. Must be > 0 and <= 1024.
+repair_chunk_max = 128
+
+# How long the metadata superblock may stay unwritable before the replica
+# fail-stops (duration). A replica that cannot persist its view is already
+# fenced quorum-invisible and retries with capped backoff; past this window the
+# process exits with a distinct status so a supervisor restarts or replaces it
+# instead of an operator finding the wedge in logs. "0" disables the fail-stop
+# and leaves the replica fenced indefinitely. Nonzero values must be at least
+# 30s so a transient disk hiccup cannot kill the process.
+superblock_wedged_fatal_timeout = "2m"
+
+# Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
+[cluster.auth]
+# When true, every replica peer must complete the authenticated handshake or be
+# rejected, and shared_secret becomes mandatory. Off by default = legacy
+# unauthenticated replica traffic. Enabling it is a coordinated-restart change.
+# With http enabled and no http.jwt secrets configured, the PSK also becomes
+# the JWT key source, making bearers valid cluster-wide and activating
+# follower-to-primary HTTP forwarding.
+enabled = false
+
+# Cluster-wide pre-shared key, >= 32 bytes of CSPRNG output, byte-identical on
+# every node. Prefer the IGGY_CLUSTER_AUTH_SHARED_SECRET env var (masked in
+# logs, never persisted) over storing it on disk. Ignored when enabled = false.
+shared_secret = ""
+
+# Retiring pre-shared key, accepted for verification only during a rolling key
+# rotation (this node keeps signing with shared_secret). Rotate in three rolls:
+# 1) shared_secret = old + previous_shared_secret = new on every node,
+# 2) shared_secret = new + previous_shared_secret = old on every node,
+# 3) shared_secret = new alone. Leave empty outside a rotation. Same length
+# floor and env-var preference as shared_secret
+# (IGGY_CLUSTER_AUTH_PREVIOUS_SHARED_SECRET).
+previous_shared_secret = ""
+
+# Replica-to-replica TLS for the consensus (tcp_replica) port.
+[cluster.tls]
+# When true every replica connection is wrapped in TLS 1.3 (ALPN
+# "iggy-replica") before the replica handshake runs. Requires
+# cluster.auth.enabled: TLS carries no client certificates, so it
+# authenticates the acceptor only; the PSK handshake authenticates the
+# peer, TLS supplies confidentiality. Off by default = plaintext replica
+# traffic. Enabling it is a coordinated-restart change: a TLS dialer
+# cannot talk to a plaintext acceptor or vice versa.
+enabled = false
+
+# When true the node auto-generates a self-signed certificate at boot and
+# the dialer accepts ANY peer certificate. When false (default),
+# cert_file / key_file / ca_file are all required.
+self_signed = false
+
+# PEM certificate chain presented by this node's acceptor side.
+cert_file = ""
+
+# PEM private key matching cert_file.
+key_file = ""
+
+# PEM trust anchor(s) the dialer verifies peer certificates against.
+# Unused when self_signed = true.
+# The dialer verifies each peer against the 'ip' string from that peer's
+# cluster.nodes entry, so a roster of literal IPs needs peer certificates
+# carrying matching IP SANs. Hostname-only certificates fail verification;
+# use hostnames in the roster if the certificates only have DNS SANs.
+ca_file = ""
+
+# Shard-0 coordinator placement.
+[cluster.coordinator]
+# When the server runs more than one shard, exclude shard 0 from replica
+# placement. Shard 0 already hosts the coordinator, the metadata writer, and
+# both listeners; replica connections are long-lived steady flows, so they are
+# offloaded to peer shards by default.
+skip_shard_zero_for_replicas = true
+
+# When the server runs more than one shard, exclude shard 0 from client
+# placement. Off by default: client connections are short-lived and benefit
+# from shard-0 parallelism more than replicas do.
+skip_shard_zero_for_clients = false
+
+# Full roster of cluster members. Byte-identical on every node. The running
+# node's identity is resolved at launch from the '--replica-id <N>' CLI
+# flag, which selects the entry in this list that describes the current
+# node. All other entries are remote peers.
 #
-# Requirements (enforced at startup):
-#  - replica_id values must be unique and strictly less than nodes.len(),
-#  - replica_id for this node must be set via `--replica-id <N>` command line argument
-#  - node names and IPs must be non-empty
-#  - (ip, port) pairs must be unique across the list
+# 'ip' is the node's roster address. Replica-to-replica traffic and
+# follower-to-primary HTTP forwarding use it. It is not the bind interface for
+# tcp/quic/http/websocket, which comes from each transport's own 'address'
+# setting above; the roster supplies those transports their port only. A
+# cluster spread across hosts therefore needs each transport's 'address' set to
+# '0.0.0.0' or the routable NIC; the defaults below listen on loopback only,
+# and a bind that cannot serve the advertised 'ip' is warned about at startup.
 #
-# Each field in 'ports' is optional. If omitted, the transport's primary
-# port (tcp.address, quic.address, etc.) configured on the running node is
-# used as the fallback when computing peer endpoints for cluster metadata.
+# Each node may also set 'advertised_address': the client-facing address
+# handed out in cluster metadata and leader redirects. Set it when 'ip' is
+# a private replica-network address unreachable by clients (Docker,
+# Kubernetes, NAT). Accepts a literal IPv4/IPv6 address or a DNS hostname
+# (RFC 1123: ASCII letters, digits, '-' and '.'; no port, no trailing dot).
+# When unset, clients receive 'ip'.
+#
+# When different client networks need different addresses (a public
+# 'advertised_address' would route in-VPC clients out through the public
+# side), add per-network 'advertised_addresses' selectors: clients whose
+# peer IP falls inside 'client_cidr' are handed 'address' instead of the
+# catch-all. 'address' takes the same forms as 'advertised_address'
+# (literal IP or RFC 1123 hostname, never a port - ports always come from
+# 'ports'). At most 16 selectors per node; boot also rejects duplicate
+# 'client_cidr' entries on one node (compared truncated, so '10.0.1.0/16'
+# duplicates '10.0.0.0/16') and any two nodes advertising one host:port
+# to overlapping client sets - reusing a host:port across nodes is legal
+# only when no client would resolve both nodes to it.
+#
+# The longest matching prefix wins; clients matching no selector fall
+# back to 'advertised_address', then 'ip'. Matching is per address
+# family: '0.0.0.0/0' matches no IPv6 client and '::/0' matches no IPv4
+# client, so covering both families takes one selector per family (or the
+# catch-all). IPv4-mapped IPv6 CIDRs ('::ffff:10.0.0.0/104') match like
+# their IPv4 form only at prefix length 96 or longer; shorter ones match
+# native IPv6 clients only. Matching sees the transport-level peer
+# address, so clients behind a proxy or load balancer match the proxy's
+# network, not their own.
+#
+# Every 'address' must be routable from inside its own 'client_cidr':
+# leader-aware SDK clients redial whatever address metadata advertises,
+# so a selector pointing at a host its own clients cannot reach strands
+# them mid-redirect. Prefer literal IPs over hostnames - the SDKs differ
+# in how they compare an advertised hostname against the address they
+# dialed, and a mismatch costs a reconnect on every fresh connect.
+#
+# Note for rolling upgrades: older server binaries reject a TOML config
+# containing 'advertised_addresses' but silently ignore the equivalent
+# 'IGGY_CLUSTER_NODES_*_ADVERTISED_ADDRESSES_*' env vars; either way,
+# upgrade every binary first, then add selectors. Mid-upgrade, an env-var
+# roster would serve selector addresses from upgraded nodes and the
+# catch-all from the rest.
+#
+#   [[cluster.nodes]]
+#   name = "iggy-node-1"
+#   ip = "10.0.1.5"                        # replica plane + last-resort fallback
+#   advertised_address = "203.0.113.10"    # catch-all for unmatched clients
+#   replica_id = 0
+#   ports = { tcp = 8090, http = 3000, tcp_replica = 9090 }
+#
+#   [[cluster.nodes.advertised_addresses]]
+#   client_cidr = "10.0.0.0/16"            # in-VPC clients stay private
+#   address = "10.0.1.5"
+#
+# In cluster mode, 'ports' is the single source of listener ports: every
+# enabled transport needs an explicit per-node port, otherwise the server
+# refuses to start.
 [[cluster.nodes]]
 name = "iggy-node-1"
 ip = "127.0.0.1"
 replica_id = 0
-ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8070, tcp_replica = 9090 }
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8092, tcp_replica = 9090 }
 
 [[cluster.nodes]]
 name = "iggy-node-2"
@@ -587,12 +781,14 @@ ip = "127.0.0.1"
 replica_id = 1
 ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 9091 }
 
-# Example additional node (commented out):
+# Example additional node (commented out). tcp skips 8092-8094: those are the
+# websocket ports of the three nodes, which collide once nodes share a host.
 # [[cluster.nodes]]
 # name = "iggy-node-3"
 # ip = "192.168.1.100"
+# advertised_address = "iggy-node-3.example.com"
 # replica_id = 2
-# ports = { tcp = 8092, http = 3002 }
+# ports = { tcp = 8095, quic = 8082, http = 3002, websocket = 8094, tcp_replica = 9092 }
 
 # Sharding configuration
 [system.sharding]
@@ -605,6 +801,7 @@ ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8093, tcp_replica = 
 #     + "numa:auto": Use all available numa node, cores
 #     + "numa:nodes=0,1;cores=4;no_ht=true": Use NUMA node 0 and 1, each nodes use 4 cores, and no hyperthreads
 cpu_allocation = "numa:auto"
+
 # Whether shard threads are pinned to dedicated CPU cores (default: true).
 # Pinned cores are drawn from the process's allowed CPU set (affinity/cpuset
 # mask), so the server cooperates with systemd `AllowedCPUs=` and container
@@ -614,12 +811,223 @@ cpu_allocation = "numa:auto"
 # process onto the same low-numbered cores.
 pin_cores = true
 
+# Per-shard inter-shard inbox capacity (the main lane: consensus frames,
+# connection setup, reconcile wakes). Bounded by design; consensus-frame
+# drops recover via VSR retransmit. Size for the consensus working set:
+# ~ the prepare queue depth of the planes the shard hosts ([metadata] on
+# shard 0, [partition] elsewhere) times replica_count times directions.
+# Both depths are tunable, so raising either raises the capacity needed here.
+inbox_capacity = 1024
+
+# Capacity of the reply lane: a separate bounded channel for cross-shard
+# client-reply forwards, whose drops are terminal (no in-protocol
+# retransmit - the client never receives the reply). Split from
+# inbox_capacity so a consensus burst cannot evict reply forwards; size for
+# peak client-reply fan-out per shard.
+reply_inbox_capacity = 1024
+
+# Wall-clock budget for a single shard's bus drain on shutdown. Drives
+# the per-shard watchdog and the parallel-join survivor path; sized
+# larger than typical TCP RTT times in-flight write-batch so writers
+# receive their full last `write_vectored_all` budget before the
+# connection registry force-tears the bus. Slow-fsync hosts may need
+# to extend this past the default.
+shutdown_drain_timeout = "10 s"
+
+# Poll cadence for the cross-thread shutdown flag and for the
+# metadata-handoff loops. Trades off Ctrl-C latency against idle wakeup
+# cost; the default keeps shutdown observably prompt without measurable
+# scheduler overhead. Must be less than or equal to shutdown_drain_timeout.
+shutdown_poll_interval = "50 ms"
+
+# Hard wall-clock deadline for joining shard threads at process exit. A
+# shard whose pump or listener wedges past this budget is abandoned with
+# an error log instead of blocking exit forever. Must be at least
+# shutdown_drain_timeout, or shards would be abandoned mid-drain.
+shutdown_join_timeout = "30 s"
+
+# Safety-tick cadence for the partition reconciliation loop. The reconciler
+# also wakes on every metadata commit from shard 0, so this only covers
+# dropped wake-ups and the initial post-bootstrap convergence window.
+reconcile_periodic_interval = "1 s"
+
+# WebSocket listener configuration. The frame-tuning knobs below are the
+# live source for the server's WS / WSS plane; they are folded into a
+# compio-ws WebSocketConfig once at bus construction. Each size knob is
+# optional: commenting it out keeps the compio-ws (tungstenite) default
+# noted next to it. A malformed size string fails config load.
 [websocket]
 enabled = true
 address = "127.0.0.1:8092"
 
+# Target minimum size of the frame read buffer. compio-ws default: "128 KiB".
+# read_buffer_size = "128 KiB"
+
+# Target buffer size for batched writes before flush. compio-ws
+# default: "128 KiB".
+# write_buffer_size = "128 KiB"
+
+# Hard ceiling on the write buffer; writes past it error instead of
+# buffering, so it must exceed write_buffer_size by at least one message.
+# compio-ws default: unlimited.
+# max_write_buffer_size = "128 MiB"
+
+# Hard upper bound on a single inbound WebSocket message
+# (post-fragment-reassembly). Must not exceed message_bus.max_message_size.
+# compio-ws default: "64 MiB".
+# max_message_size = "64 MiB"
+
+# Hard upper bound on a single inbound WebSocket frame
+# (pre-fragment-reassembly). Must not exceed max_message_size.
+# compio-ws default: "16 MiB".
+# max_frame_size = "16 MiB"
+
+# Whether to accept unmasked frames from clients in violation of
+# RFC 6455 client-to-server framing rules. Strict (false) by default.
+accept_unmasked_frames = false
+
 [websocket.tls]
 enabled = false
+
+# Certificate source for the WSS listener.
+# `true` generates an ephemeral loopback certificate, but only while cert_file
+# does not exist on disk: an existing PEM pair is loaded instead (the server
+# logs which way it went).
+# `false` loads cert_file / key_file, which must both exist.
 self_signed = true
+
+# Loaded when the file exists or self_signed = false.
 cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
+
+# Metadata consensus plane tunables (shard 0's VSR replica: users,
+# streams, topics, sessions). Size these together: a deeper prepare queue
+# admits more concurrent in-flight metadata ops (e.g. login storms), and
+# the journal must hold enough slots that a forced checkpoint (triggered
+# when remaining slots fall to the checkpoint margin, which itself is
+# max(64, prepare_queue_depth)) stays rare. Validation enforces
+# journal_slots >= 4 * max(64, prepare_queue_depth).
+[metadata]
+# Depth of the metadata prepare queue: how many uncommitted metadata ops
+# may be in flight at once. Submits beyond it are rejected with the
+# transient "metadata prepare queue is full" and retried by the SDK.
+# Capped at 127 by the view-change wire format: a DoViewChange describes the
+# uncommitted suffix with one nack bit and one present bit per entry in a u128 each,
+# so a deeper queue produces entries a view change can neither adopt nor prove dead.
+prepare_queue_depth = 32
+
+# Size of the metadata WAL's in-memory index, in slots (one committed but
+# not-yet-snapshotted op per slot). Larger values buy more headroom
+# between forced checkpoints at the cost of memory and bigger WAL
+# rewrites per checkpoint.
+journal_slots = 1024
+
+# Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS
+# virtual clients and HTTP sessions together) hold live session state at once.
+# When full, the client whose last commit is oldest is evicted and its next
+# request re-registers. The HTTP session cap tracks this at half, so raising
+# it lifts both. Must be between 2 and 65536.
+clients_table_max = 8192
+
+# Per-partition consensus plane tunables. Unlike [metadata] (one shard-0
+# plane), a pipeline exists per partition, so raising this multiplies pinned
+# request-buffer memory by the partition count. Keep it modest.
+[partition]
+# Depth of a partition's prepare queue: how many uncommitted produce /
+# consumer-offset ops may be in flight at once for that partition. Submits past
+# it spill into a request queue of twice this depth; once both are full the
+# server drops the request without a reply and the client retries on its own
+# request timeout. Must be > 0 and <= 127: the ceiling is the view-change wire, not
+# memory. A DoViewChange describes the uncommitted suffix with one bit per op in a
+# u128 bitset, and this depth bounds that suffix.
+prepare_queue_depth = 32
+
+# Entries the evicted ring retains per multi-replica partition for journal
+# repair after a peer rejoins. Larger widens the window a restarting peer can be
+# served from the ring before falling back to bulk sync, at the cost of pinned
+# memory per partition. Must be > 0 and <= 65536. Single-replica partitions
+# retain nothing regardless.
+evicted_ring_capacity = 4096
+
+# Byte ceiling for the evicted ring per partition; whichever ring cap (this or
+# evicted_ring_capacity) trips first evicts. Bounds the ring memory a burst of
+# large batches can pin. Must be > 0 and <= "256 MiB".
+evicted_ring_bytes_max = "16 MiB"
+
+# Byte budget for segment payloads a SERVING shard keeps resident to answer
+# state-transfer chunk requests. PER SHARD, and shard count defaults to core
+# count, so the process-wide high-water is this times the core count on top of
+# page cache -- keep that product in mind before raising it. The default is a
+# FIXED 2176 MiB: two sealed segments at the built-in 1 GiB segment ceiling,
+# each of which can close one whole message_bus.max_message_size past its
+# target, which is why it is not 2 GiB. That ceiling is a compile-time
+# constant: no config key moves it, and a per-topic segment_size is refused
+# above it. How many groups this shard serves at once is
+# floor(this / max(partition.transfer_artifact_bytes_max, 1 GiB + 64 MiB)),
+# minimum one. So raising transfer_artifact_bytes_max without raising this
+# lowers concurrency and can take it to one, serialising rejoins; boot warns
+# when it drops below two.
+# Below one segment a single rejoining node thrashes the cache by itself and
+# every miss re-reads and re-hashes a whole segment to serve one 256 KiB chunk.
+# Running under the budget costs re-reads, not failures.
+# Must be > 0 and <= "64 GiB".
+transfer_served_cache_bytes_max = "2176 MiB"
+
+# Alloc ceiling for ONE received state-transfer artifact, per shard. The
+# receiver holds it resident through verify, walk and staging write, and up to
+# four transfers run at once. MUST cover the largest segment any topic may be
+# created with (a fixed 1 GiB, since segment_size is a per-topic option now)
+# plus message_bus.max_message_size, because a segment may close one whole batch
+# past its cap: under that, a legal segment is refused, the whole manifest with
+# it, and the partition livelocks re-requesting it from every peer. Boot
+# validates the floor.
+#
+# The shipped value sits EXACTLY at that floor: 1024 MiB + the shipped 64 MiB
+# max_message_size. Raising max_message_size alone therefore refuses boot --
+# raise this one by the same amount in the same edit (max_message_size itself
+# tops out at the frozen 256 MiB recovery ceiling; see its own note). Raising
+# this above the floor for headroom also DIVIDES the serving concurrency
+# derived from transfer_served_cache_bytes_max above, so raise that in step.
+# Must be > 0 and <= "64 GiB".
+transfer_artifact_bytes_max = "1088 MiB"
+
+# Message bus configuration.
+# Tunables for the inter-shard / inter-replica internal bus that ships
+# consensus traffic between replicas and SDK-client traffic between
+# shards. These knobs are consensus-liveness-critical (max_batch gates
+# throughput under backpressure). Defaults match
+# core::message_bus::config::MessageBusConfig::default().
+
+[message_bus]
+# Maximum number of BusMessage entries coalesced into a single writev(2)
+# call. Hard upper bound: IOV_MAX/2 = 512 on Linux.
+max_batch = 256
+
+# Wire-level cap on a single framed message. Boot refuses a value above the
+# frozen 256 MiB ceiling: segment recovery derives fixed scan and allocation
+# limits from the widest LEGAL record, so batches admitted above the ceiling
+# would be refused as implausible on a later boot. Raising it past 64 MiB
+# also breaks Go clients, whose frame cap is a hard 64 MiB constant.
+max_message_size = "64 MiB"
+
+# Bound on the per-peer mpsc queue. The writer task drains; the
+# send_to_* path enqueues.
+peer_queue_capacity = 256
+
+# Interval between outbound reconnect attempts to peers with peer_id > self_id.
+reconnect_period = "5 s"
+
+# Timeout for per-peer close drain (flush writer, tear down reader)
+# before force-cancellation.
+close_peer_timeout = "2 s"
+
+# Wall-clock bound on a single stream.shutdown() / ws.close() in the
+# safe-shutdown sequence of the TLS-family transports.
+close_grace = "2 s"
+
+# Wall-clock bound on a single connection's handshake phase. Threaded
+# into compio::time::timeout(handshake_grace, ...) at each accept site
+# (TCP-TLS rustls accept, WS HTTP-Upgrade, WSS combined TLS+WS, QUIC
+# connecting.await + accept_bi.await) so a slowloris peer cannot pin
+# per-conn channels + registry slot + spawned task indefinitely.
+handshake_grace = "10 s"

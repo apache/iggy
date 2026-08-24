@@ -23,6 +23,7 @@ internal static class CommandCodes
     internal const int GET_STATS_CODE = 10;
     internal const int GET_SNAPSHOT_CODE = 11;
     internal const int GET_CLUSTER_METADATA_CODE = 12;
+    internal const int DESCRIBE_OPTIONS_CODE = 13;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;
@@ -68,4 +69,5 @@ internal static class CommandCodes
     internal const int DELETE_CONSUMER_GROUP_CODE = 603;
     internal const int JOIN_CONSUMER_GROUP_CODE = 604;
     internal const int LEAVE_CONSUMER_GROUP_CODE = 605;
+    internal const int SYNC_CONSUMER_GROUP_CODE = 606;
 }

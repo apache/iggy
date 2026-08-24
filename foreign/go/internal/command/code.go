@@ -24,6 +24,7 @@ const (
 	GetStatsCode             Code = 10
 	GetSnapshotFileCode      Code = 11
 	GetClusterMetadataCode   Code = 12
+	DescribeOptionsCode      Code = 13
 	GetMeCode                Code = 20
 	GetClientCode            Code = 21
 	GetClientsCode           Code = 22
@@ -52,11 +53,13 @@ const (
 	CreateStreamCode         Code = 202
 	DeleteStreamCode         Code = 203
 	UpdateStreamCode         Code = 204
+	PurgeStreamCode          Code = 205
 	GetTopicCode             Code = 300
 	GetTopicsCode            Code = 301
 	CreateTopicCode          Code = 302
 	DeleteTopicCode          Code = 303
 	UpdateTopicCode          Code = 304
+	PurgeTopicCode           Code = 305
 	CreatePartitionsCode     Code = 402
 	DeletePartitionsCode     Code = 403
 	DeleteSegmentsCode       Code = 503
@@ -66,6 +69,7 @@ const (
 	DeleteGroupCode          Code = 603
 	JoinGroupCode            Code = 604
 	LeaveGroupCode           Code = 605
+	SyncGroupCode            Code = 606
 )
 
 //    internal const int GET_PERSONAL_ACCESS_TOKENS_CODE = 41;

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -179,11 +179,12 @@ run_language_examples() {
 
 # shellcheck disable=SC2329
 run_rust_examples() {
-    resolve_server_binary "${TARGET}"
+    resolve_server_binary "${TARGET}" "iggy-server"
     resolve_cli_binary "${TARGET}"
 
     # The README documents credentials as <iggy_username>/<iggy_password>
-    # placeholders; the test server starts with iggy/iggy.
+    # placeholders; the test server starts with iggy/iggy. The README keeps
+    # plain cargo run commands, so the cross-compile target is injected here.
     if [ -n "${TARGET}" ]; then
         TRANSFORM_COMMAND() {
             echo "$1" | sed "s|<iggy_username>|iggy|g; s|<iggy_password>|iggy|g; s|cargo run |cargo run --target ${TARGET} |g"
@@ -217,7 +218,8 @@ run_rust_examples() {
 
 # shellcheck disable=SC2329
 run_node_examples() {
-    resolve_server_binary "${TARGET}"
+    # The Node SDK is vsr-only, so examples run against the vsr server.
+    resolve_server_binary "${TARGET}" iggy-server
 
     export DEBUG=iggy:examples
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
@@ -235,7 +237,10 @@ run_node_examples() {
 
 # shellcheck disable=SC2329
 run_go_examples() {
-    resolve_server_binary "${TARGET}"
+    # The Go SDK speaks only the VSR wire protocol.
+    resolve_server_binary "${TARGET}" "iggy-server"
+    # The VSR server logs no startup line, so readiness is a connect poll.
+    SERVER_READY_PROBE="tcp"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     run_language_examples \
@@ -247,11 +252,16 @@ run_go_examples() {
         "^go run.*--tls" \
         0 \
         ""
+
+    SERVER_READY_PROBE="log"
 }
 
 # shellcheck disable=SC2329
 run_python_examples() {
-    resolve_server_binary "${TARGET}"
+    # The Python SDK speaks only the VSR wire protocol, so examples run
+    # against the VSR server, started fresh by cleanup_server_state wiping
+    # local_data rather than by passing --fresh.
+    resolve_server_binary "${TARGET}" iggy-server
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     echo ""
@@ -264,7 +274,7 @@ run_python_examples() {
 
     # --- Non-TLS pass ---
     cleanup_server_state
-    start_plain_server --fresh
+    start_plain_server
     wait_for_server_ready "Python"
 
     cd examples/python || exit 1
@@ -284,7 +294,7 @@ run_python_examples() {
             echo "=== Running Python TLS examples ==="
             echo ""
             cleanup_server_state
-            start_tls_server --fresh
+            start_tls_server
             wait_for_server_ready "Python TLS"
 
             cd examples/python || exit 1
@@ -300,7 +310,10 @@ run_python_examples() {
 
 # shellcheck disable=SC2329
 run_php_examples() {
-    resolve_server_binary "${TARGET}"
+    # The PHP extension speaks only the VSR wire protocol, so examples run
+    # against the VSR server, started fresh by cleanup_server_state wiping
+    # local_data rather than by passing --fresh.
+    resolve_server_binary "${TARGET}" iggy-server
 
     local php_bin="${PHP:-php}"
     if [ -z "${PHP_IGGY_EXTENSION:-}" ]; then
@@ -336,12 +349,14 @@ run_php_examples() {
         "" \
         "" \
         0 \
-        "--fresh"
+        ""
 }
 
 # shellcheck disable=SC2329
 run_java_examples() {
-    resolve_server_binary "${TARGET}"
+    # Java examples run against the VSR server.
+    resolve_server_binary "${TARGET}" "iggy-server"
+    SERVER_READY_PATTERN="client listeners started"
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     run_language_examples \
@@ -357,7 +372,10 @@ run_java_examples() {
 
 # shellcheck disable=SC2329
 run_csharp_examples() {
-    resolve_server_binary "${TARGET}"
+    # The .NET SDK speaks only the VSR wire protocol, so examples run against
+    # the VSR server, started fresh by cleanup_server_state wiping local_data
+    # rather than by passing --fresh.
+    resolve_server_binary "${TARGET}" iggy-server
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
 
     run_language_examples \
@@ -383,6 +401,7 @@ run_one() {
 
     EXAMPLES_EXIT_CODE=0
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
+    unset SERVER_READY_PATTERN 2>/dev/null || true
 
     set +e
     ${lang_fn}
@@ -390,6 +409,7 @@ run_one() {
     set -e
 
     unset -f TRANSFORM_COMMAND 2>/dev/null || true
+    unset SERVER_READY_PATTERN 2>/dev/null || true
 
     if [ ${rc} -ne 0 ]; then
         echo ""

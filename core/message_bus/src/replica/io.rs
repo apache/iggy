@@ -59,7 +59,7 @@ use crate::{
 /// The cert chain is the leaf-first sequence rustls expects; the key
 /// is the server's private key in DER form. Tests use rcgen to mint a
 /// throwaway pair; production callers load real PKI material via
-/// `core/server-ng`'s `[quic.certificate]` config section.
+/// `core/server`'s `[quic.certificate]` config section.
 pub struct QuicServerCredentials {
     pub cert_chain: Vec<CertificateDer<'static>>,
     pub key_der: PrivateKeyDer<'static>,
@@ -331,7 +331,7 @@ pub async fn start_on_shard_zero(
 /// Leaves the WS, QUIC, TCP-TLS, and WSS listener slots unconfigured
 /// (`None`). Convenience entry for TCP-only deployments and existing
 /// tests; prefer the full [`start_on_shard_zero`] in production where
-/// the optional planes come from `core/server-ng`'s config.
+/// the optional planes come from `core/server`'s config.
 ///
 /// # Errors
 ///

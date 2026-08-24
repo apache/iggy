@@ -25,7 +25,7 @@ publish = false
 [features]
 # Simulator-only test hook (`IggyShard::init_partition`): bypasses the
 # reconciler's `ReconcileOp::InsertOwned` funnel, mutating `IggyPartitions`
-# off the pump task. A `-p iggy-server-ng` build excludes it; `cargo build
+# off the pump task. A `-p iggy-server` build excludes it; `cargo build
 # --workspace` unifies features and compiles it into the shared `shard`
 # unit (simulator requests it). Benign: no production caller.
 simulator = []
@@ -52,3 +52,6 @@ tracing = { workspace = true }
 enum_glob_use = "deny"
 pedantic = "deny"
 nursery = "warn"
+
+[lints.rust]
+warnings = "deny"

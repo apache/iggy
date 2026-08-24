@@ -18,14 +18,18 @@
 use crate::WireError;
 use crate::WireIdentifier;
 use crate::codec::{WireDecode, WireEncode, read_u8, read_u32_le};
+use crate::primitives::ack_level::AckLevel;
 use crate::primitives::consumer::WireConsumer;
 use bytes::{BufMut, BytesMut};
 
 /// `DeleteConsumerOffset` request.
 ///
+/// Adds an `ack` byte: `NoAck` = leader-local fast path, `Quorum` = VSR
+/// pipeline.
+///
 /// Wire format:
 /// ```text
-/// [consumer][stream_id][topic_id][partition_flag:1][partition_id:4 LE]
+/// [consumer][stream_id][topic_id][partition_flag:1][partition_id:4 LE][ack:1]
 /// ```
 ///
 /// `partition_id` encoding: a u8 flag (1=Some, 0=None) followed by 4 bytes
@@ -36,6 +40,7 @@ pub struct DeleteConsumerOffsetRequest {
     pub stream_id: WireIdentifier,
     pub topic_id: WireIdentifier,
     pub partition_id: Option<u32>,
+    pub ack: AckLevel,
 }
 
 impl WireEncode for DeleteConsumerOffsetRequest {
@@ -45,6 +50,7 @@ impl WireEncode for DeleteConsumerOffsetRequest {
             + self.topic_id.encoded_size()
             + 1
             + 4
+            + 1
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -58,6 +64,7 @@ impl WireEncode for DeleteConsumerOffsetRequest {
             buf.put_u8(0);
             buf.put_u32_le(0);
         }
+        buf.put_u8(self.ack.as_u8());
     }
 }
 
@@ -79,12 +86,16 @@ impl WireDecode for DeleteConsumerOffsetRequest {
         } else {
             None
         };
+        let ack_code = read_u8(buf, pos)?;
+        pos += 1;
+        let ack = AckLevel::from_code(ack_code)?;
         Ok((
             Self {
                 consumer,
                 stream_id,
                 topic_id,
                 partition_id,
+                ack,
             },
             pos,
         ))
@@ -96,12 +107,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_with_partition() {
+    fn roundtrip_with_partition_quorum() {
         let req = DeleteConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(10),
             topic_id: WireIdentifier::numeric(20),
             partition_id: Some(5),
+            ack: AckLevel::Quorum,
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = DeleteConsumerOffsetRequest::decode(&bytes).unwrap();
@@ -110,12 +122,13 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_without_partition() {
+    fn roundtrip_without_partition_no_ack() {
         let req = DeleteConsumerOffsetRequest {
             consumer: WireConsumer::consumer_group(WireIdentifier::numeric(3)),
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(1),
             partition_id: None,
+            ack: AckLevel::NoAck,
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = DeleteConsumerOffsetRequest::decode(&bytes).unwrap();
@@ -130,6 +143,7 @@ mod tests {
             stream_id: WireIdentifier::named("stream-1").unwrap(),
             topic_id: WireIdentifier::named("topic-1").unwrap(),
             partition_id: Some(0),
+            ack: AckLevel::Quorum,
         };
         let bytes = req.to_bytes();
         let (decoded, consumed) = DeleteConsumerOffsetRequest::decode(&bytes).unwrap();
@@ -138,22 +152,31 @@ mod tests {
     }
 
     #[test]
-    fn partition_none_encodes_zero_bytes() {
+    fn ack_byte_is_last() {
         let req = DeleteConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(1),
-            partition_id: None,
+            partition_id: Some(0),
+            ack: AckLevel::NoAck,
         };
         let bytes = req.to_bytes();
-        let partition_offset = req.consumer.encoded_size()
-            + req.stream_id.encoded_size()
-            + req.topic_id.encoded_size();
-        assert_eq!(bytes[partition_offset], 0);
-        assert_eq!(
-            &bytes[partition_offset + 1..partition_offset + 5],
-            &[0, 0, 0, 0]
-        );
+        assert_eq!(*bytes.last().unwrap(), AckLevel::NoAck.as_u8());
+    }
+
+    #[test]
+    fn unknown_ack_rejected() {
+        let req = DeleteConsumerOffsetRequest {
+            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            stream_id: WireIdentifier::numeric(1),
+            topic_id: WireIdentifier::numeric(1),
+            partition_id: Some(0),
+            ack: AckLevel::Quorum,
+        };
+        let mut bytes = req.to_bytes().to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] = 0xFF;
+        assert!(DeleteConsumerOffsetRequest::decode(&bytes).is_err());
     }
 
     #[test]
@@ -163,6 +186,7 @@ mod tests {
             stream_id: WireIdentifier::numeric(1),
             topic_id: WireIdentifier::numeric(1),
             partition_id: Some(1),
+            ack: AckLevel::Quorum,
         };
         let bytes = req.to_bytes();
         for i in 0..bytes.len() {

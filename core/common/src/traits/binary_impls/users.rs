@@ -19,32 +19,22 @@ use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::{identifier_to_wire, permissions_to_wire, users_from_wire};
 use crate::{
     BinaryClient, ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions,
-    UserClient, UserInfo, UserInfoDetails, UserStatus,
+    UserClient, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
 };
-use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
-#[cfg(feature = "vsr")]
 use iggy_binary_protocol::codes::LOGIN_REGISTER_CODE;
-#[cfg(not(feature = "vsr"))]
-use iggy_binary_protocol::codes::LOGIN_USER_CODE;
 use iggy_binary_protocol::codes::{
     CHANGE_PASSWORD_CODE, CREATE_USER_CODE, DELETE_USER_CODE, GET_USER_CODE, GET_USERS_CODE,
     LOGOUT_USER_CODE, UPDATE_PERMISSIONS_CODE, UPDATE_USER_CODE,
 };
-#[cfg(feature = "vsr")]
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
-#[cfg(not(feature = "vsr"))]
-use iggy_binary_protocol::requests::users::LoginUserRequest;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
     LogoutUserRequest, UpdatePermissionsRequest, UpdateUserRequest,
 };
-#[cfg(feature = "vsr")]
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-#[cfg(not(feature = "vsr"))]
-use iggy_binary_protocol::responses::users::login_user::IdentityResponse;
 use iggy_binary_protocol::responses::users::{GetUsersResponse, UserDetailsResponse};
-#[cfg(feature = "vsr")]
+use iggy_binary_protocol::{WireName, WireOptions};
 use secrecy::SecretString;
 
 #[async_trait::async_trait]
@@ -97,6 +87,7 @@ impl<B: BinaryClient> UserClient for B {
                     password: password.to_string(),
                     status: status.as_code(),
                     permissions: wire_perms,
+                    options: WireOptions::empty(),
                 }
                 .to_bytes(),
             )
@@ -121,6 +112,7 @@ impl<B: BinaryClient> UserClient for B {
         user_id: &Identifier,
         username: Option<&str>,
         status: Option<UserStatus>,
+        options: &UserUpdateOptions,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
         let wire_id = identifier_to_wire(user_id)?;
@@ -134,6 +126,7 @@ impl<B: BinaryClient> UserClient for B {
                 user_id: wire_id,
                 username: wire_username,
                 status: status.map(|s| s.as_code()),
+                options: options.to_wire()?,
             }
             .to_bytes(),
         )
@@ -187,83 +180,55 @@ impl<B: BinaryClient> UserClient for B {
     async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
         super::validate_username(username)?;
         super::validate_password(password)?;
-        #[cfg(feature = "vsr")]
-        {
-            super::logout_before_relogin(self).await?;
-            let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
-            let response = match self
-                .send_raw_with_response(
-                    LOGIN_REGISTER_CODE,
-                    LoginRegisterRequest {
-                        version_info: super::rust_sdk_version_info(self.sdk_version())?,
-                        username: wire_name,
-                        password: SecretString::from(password.to_string()),
-                        client_context: None,
-                    }
-                    .to_bytes(),
-                )
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    self.reset_vsr_session().await?;
-                    return Err(error);
-                }
-            };
-            let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
-                Ok(wire_resp) => wire_resp,
-                Err(error) => {
-                    self.reset_vsr_session().await?;
-                    return Err(error);
-                }
-            };
-            if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
-                self.reset_vsr_session().await?;
-                return Err(error);
-            }
-            tracing::debug!(
-                server_version = %wire_resp.server_version,
-                server_protocol_version = wire_resp.server_protocol_version,
-                "authenticated against iggy server"
-            );
-            self.set_state(ClientState::Authenticated).await;
-            self.publish_event(DiagnosticEvent::SignedIn).await;
-            return Ok(IdentityInfo {
-                user_id: wire_resp.user_id,
-                access_token: None,
-            });
-        }
-
-        #[cfg(not(feature = "vsr"))]
+        super::logout_before_relogin(self).await?;
         let wire_name = WireName::new(username).map_err(|_| IggyError::InvalidFormat)?;
-        #[cfg(not(feature = "vsr"))]
-        let response = self
+        let response = match self
             .send_raw_with_response(
-                LOGIN_USER_CODE,
-                LoginUserRequest {
+                LOGIN_REGISTER_CODE,
+                LoginRegisterRequest {
+                    version_info: super::rust_sdk_version_info(self.sdk_version())?,
                     username: wire_name,
-                    password: password.to_string(),
-                    version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    context: Some(String::new()),
+                    password: SecretString::from(password.to_string()),
+                    client_context: None,
                 }
                 .to_bytes(),
             )
-            .await?;
-        #[cfg(not(feature = "vsr"))]
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.reset_vsr_session().await?;
+                return Err(error);
+            }
+        };
+        let wire_resp = match super::decode_response::<LoginRegisterResponse>(&response) {
+            Ok(wire_resp) => wire_resp,
+            Err(error) => {
+                self.reset_vsr_session().await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.bind_vsr_session(wire_resp.session).await {
+            self.reset_vsr_session().await?;
+            return Err(error);
+        }
+        tracing::debug!(
+            server_version = %wire_resp.server_version,
+            server_protocol_version = wire_resp.server_protocol_version,
+            "authenticated against iggy server"
+        );
         self.set_state(ClientState::Authenticated).await;
-        #[cfg(not(feature = "vsr"))]
         self.publish_event(DiagnosticEvent::SignedIn).await;
-        #[cfg(not(feature = "vsr"))]
-        let wire_resp = super::decode_response::<IdentityResponse>(&response)?;
-        #[cfg(not(feature = "vsr"))]
-        Ok(IdentityInfo::from(wire_resp))
+        Ok(IdentityInfo {
+            user_id: wire_resp.user_id,
+            access_token: None,
+        })
     }
 
     async fn logout_user(&self) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
         self.send_raw_with_response(LOGOUT_USER_CODE, LogoutUserRequest.to_bytes())
             .await?;
-        #[cfg(feature = "vsr")]
         self.reset_vsr_session().await?;
         self.set_state(ClientState::Connected).await;
         self.publish_event(DiagnosticEvent::SignedOut).await;

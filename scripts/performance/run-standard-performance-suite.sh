@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -68,8 +68,12 @@ get_env_vars() {
 
     # Specific env vars based on bench type
     case "$bench_type" in
+    # fsync is a topic creation option (`enforce_fsync`) now, not server config,
+    # so the bench command carries `--enforce-fsync` (added by
+    # `construct_bench_command` off the same remark) and only the cache setting
+    # is left to the server environment.
     *"no_cache_fsync"*)
-        env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC=true")
+        env_vars+=("IGGY_SYSTEM_CACHE_ENABLED=false")
         ;;
     *"only_cache"*)
         env_vars+=("IGGY_SYSTEM_CACHE_SIZE=9GB")

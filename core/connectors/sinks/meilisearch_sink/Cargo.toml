@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_meilisearch_sink"
-version = "0.4.1-edge.1"
+version = "0.5.0-edge.4"
 description = "Iggy Meilisearch sink connector"
 edition = "2024"
 license = "Apache-2.0"
@@ -45,3 +45,6 @@ simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+
+[lints]
+workspace = true

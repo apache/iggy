@@ -19,18 +19,15 @@ package command
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"math"
 
 	"github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/internal/batch"
+	"github.com/google/uuid"
 	"github.com/klauspost/compress/s2"
-)
-
-const (
-	partitionPresenceSize = 1
-	partitionFieldSize    = 4
-	partitionStrategySize = partitionPresenceSize + partitionFieldSize + 1
-	offsetSize            = 12
-	commitFlagSize        = 1
-	indexSize             = 16
+	"github.com/zeebo/xxh3"
 )
 
 type SendMessages struct {
@@ -46,109 +43,132 @@ func (s *SendMessages) Code() Code {
 	return SendMessagesCode
 }
 
+// zeroBatchHeader is the blank batch header reserved ahead of the message
+// frames and backpatched once every frame checksum is known.
+var zeroBatchHeader [batch.HeaderSize]byte
+
 func (s *SendMessages) MarshalBinary() ([]byte, error) {
-	for i, message := range s.Messages {
-		switch s.Compression {
-		case iggcon.MESSAGE_COMPRESSION_S2:
-			if len(message.Payload) < 32 {
-				break
-			}
-			s.Messages[i].Payload = s2.Encode(nil, message.Payload)
-			message.Header.PayloadLength = uint32(len(message.Payload))
-		case iggcon.MESSAGE_COMPRESSION_S2_BETTER:
-			if len(message.Payload) < 32 {
-				break
-			}
-			s.Messages[i].Payload = s2.EncodeBetter(nil, message.Payload)
-			message.Header.PayloadLength = uint32(len(message.Payload))
-		case iggcon.MESSAGE_COMPRESSION_S2_BEST:
-			if len(message.Payload) < 32 {
-				break
-			}
-			s.Messages[i].Payload = s2.EncodeBest(nil, message.Payload)
-			message.Header.PayloadLength = uint32(len(message.Payload))
+	return s.AppendBinary(nil)
+}
+
+// AppendBinary encodes the batch straight into b: [metadata_length u32]
+// [stream id][topic id][partitioning][messages_count u32], then one canonical
+// batch record: a 256-byte batch header followed by one frame per message.
+func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
+	// The server rejects an empty batch at admission. Refuse it before the
+	// wire, matching every other SDK encoder.
+	if len(s.Messages) == 0 {
+		return b, errors.New("cannot encode an empty message batch")
+	}
+
+	s.compressPayloads()
+
+	metadataStart := len(b)
+	b = binary.LittleEndian.AppendUint32(b, 0)
+	var err error
+	if b, err = s.StreamId.AppendBinary(b); err != nil {
+		return b, err
+	}
+	if b, err = s.TopicId.AppendBinary(b); err != nil {
+		return b, err
+	}
+	if b, err = s.Partitioning.AppendBinary(b); err != nil {
+		return b, err
+	}
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(s.Messages)))
+	metadataLength := len(b) - metadataStart - 4
+	binary.LittleEndian.PutUint32(b[metadataStart:], uint32(metadataLength))
+
+	var originTimestamp uint64
+	for i := range s.Messages {
+		if i == 0 || s.Messages[i].Header.OriginTimestamp < originTimestamp {
+			originTimestamp = s.Messages[i].Header.OriginTimestamp
 		}
 	}
 
-	streamIdBytes, err := s.StreamId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	topicIdBytes, err := s.TopicId.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	partitioningBytes, err := s.Partitioning.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	metadataLenFieldSize := 4 // uint32
-	messageCount := len(s.Messages)
-	messagesCountFieldSize := 4 // uint32
-	metadataLen := len(streamIdBytes) +
-		len(topicIdBytes) +
-		len(partitioningBytes) +
-		messagesCountFieldSize
-	indexesSize := messageCount * indexSize
-	messageBytesCount := calculateMessageBytesCount(s.Messages)
-	totalSize := metadataLenFieldSize +
-		len(streamIdBytes) +
-		len(topicIdBytes) +
-		len(partitioningBytes) +
-		messagesCountFieldSize +
-		indexesSize +
-		messageBytesCount
+	headerStart := len(b)
+	b = append(b, zeroBatchHeader[:]...)
 
-	bytes := make([]byte, totalSize)
+	blobStart := len(b)
+	frameChecksums := make([]byte, 0, len(s.Messages)*8)
+	for i := range s.Messages {
+		message := &s.Messages[i]
+		// The id sits under the frame checksum, so it must exist before the
+		// frame is hashed; the server never mints ids.
+		if message.Header.Id == (iggcon.MessageID{}) {
+			id, err := uuid.NewRandom()
+			if err != nil {
+				return b, err
+			}
+			message.Header.Id = iggcon.MessageID(id)
+		}
+		// The header lengths and the appended slices must agree, or every
+		// message boundary after a mismatch mis-frames; deriving both from
+		// the same slice makes the disagreement impossible.
+		message.Header.PayloadLength = uint32(len(message.Payload))
+		message.Header.UserHeaderLength = uint32(len(message.UserHeaders))
+		timestampDelta := message.Header.OriginTimestamp - originTimestamp
+		if timestampDelta > math.MaxUint32 {
+			return b, fmt.Errorf(
+				"message origin timestamp %d runs more than %d microseconds past the batch's earliest %d",
+				message.Header.OriginTimestamp, uint64(math.MaxUint32), originTimestamp)
+		}
 
-	position := 0
+		frameStart := len(b)
+		b = binary.LittleEndian.AppendUint64(b, 0)
+		b = append(b, message.Header.Id[:]...)
+		b = binary.LittleEndian.AppendUint32(b, uint32(i))
+		b = binary.LittleEndian.AppendUint32(b, uint32(timestampDelta))
+		b = binary.LittleEndian.AppendUint32(b, message.Header.UserHeaderLength)
+		b = binary.LittleEndian.AppendUint32(b, message.Header.PayloadLength)
+		b = binary.LittleEndian.AppendUint64(b, 0)
+		b = append(b, message.Payload...)
+		b = append(b, message.UserHeaders...)
 
-	//metadata
-	binary.LittleEndian.PutUint32(bytes[:4], uint32(metadataLen))
-	position = 4
-	//ids
-	copy(bytes[position:position+len(streamIdBytes)], streamIdBytes)
-	position += len(streamIdBytes)
-	copy(bytes[position:position+len(topicIdBytes)], topicIdBytes)
-	position += len(topicIdBytes)
-
-	//partitioning
-	copy(bytes[position:position+len(partitioningBytes)], partitioningBytes)
-	position += len(partitioningBytes)
-	binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(messageCount))
-	position += 4
-
-	currentIndexPosition := position
-	for i := 0; i < indexesSize; i++ {
-		bytes[position+i] = 0
-	}
-	position += indexesSize
-
-	msgSize := uint32(0)
-	for _, message := range s.Messages {
-		copy(bytes[position:position+iggcon.MessageHeaderSize], message.Header.ToBytes())
-		copy(bytes[position+iggcon.MessageHeaderSize:position+iggcon.MessageHeaderSize+int(message.Header.PayloadLength)], message.Payload)
-		position += iggcon.MessageHeaderSize + int(message.Header.PayloadLength)
-		copy(bytes[position:position+int(message.Header.UserHeaderLength)], message.UserHeaders)
-		position += int(message.Header.UserHeaderLength)
-
-		msgSize += iggcon.MessageHeaderSize + message.Header.PayloadLength + message.Header.UserHeaderLength
-
-		binary.LittleEndian.PutUint32(bytes[currentIndexPosition:currentIndexPosition+4], 0)
-		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+4:currentIndexPosition+8], uint32(msgSize))
-		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+8:currentIndexPosition+12], 0)
-		currentIndexPosition += indexSize
+		checksum := xxh3.Hash(b[frameStart+8:])
+		binary.LittleEndian.PutUint64(b[frameStart:], checksum)
+		message.Header.Checksum = checksum
+		frameChecksums = binary.LittleEndian.AppendUint64(frameChecksums, checksum)
 	}
 
-	return bytes, nil
+	batchHeader := batch.Header{
+		OriginTimestamp: originTimestamp,
+		BatchLength:     uint64(batch.HeaderSize + len(b) - blobStart),
+		MessageCount:    uint32(len(s.Messages)),
+	}
+	batchHeader.BatchChecksum = batchHeader.Checksum(frameChecksums)
+	batchHeader.EncodeInto(b[headerStart:blobStart])
+	return b, nil
 }
 
-func calculateMessageBytesCount(messages []iggcon.IggyMessage) int {
-	count := 0
-	for _, msg := range messages {
-		count += iggcon.MessageHeaderSize + len(msg.Payload) + len(msg.UserHeaders)
+// compressPayloads compresses each payload in place. The header length is
+// updated through the slice index: writing it to a range copy would leave the
+// wire header claiming the uncompressed length, and the encoder would then
+// mis-frame every message that follows.
+func (s *SendMessages) compressPayloads() {
+	switch s.Compression {
+	case iggcon.MESSAGE_COMPRESSION_S2,
+		iggcon.MESSAGE_COMPRESSION_S2_BETTER,
+		iggcon.MESSAGE_COMPRESSION_S2_BEST:
+	default:
+		return
 	}
-	return count
+
+	for i := range s.Messages {
+		payload := s.Messages[i].Payload
+		if len(payload) < 32 {
+			continue
+		}
+		switch s.Compression {
+		case iggcon.MESSAGE_COMPRESSION_S2:
+			s.Messages[i].Payload = s2.Encode(nil, payload)
+		case iggcon.MESSAGE_COMPRESSION_S2_BETTER:
+			s.Messages[i].Payload = s2.EncodeBetter(nil, payload)
+		case iggcon.MESSAGE_COMPRESSION_S2_BEST:
+			s.Messages[i].Payload = s2.EncodeBest(nil, payload)
+		}
+		s.Messages[i].Header.PayloadLength = uint32(len(s.Messages[i].Payload))
+	}
 }
 
 type PollMessages struct {

@@ -53,6 +53,30 @@ pub use time::{SimInstant, TimerHandle};
 /// streams keep scheduling draws from perturbing network or workload traces.
 pub const EXECUTOR_SEED_SALT: u64 = 0x5A1A_F0E5_FACE_0002;
 
+/// Ready on the second poll; the first re-queues the task behind every other
+/// ready task, exactly like a wake arriving mid-await. Lets a task give the
+/// executor a turn without parking on a timer, which would only wake it at
+/// the next step.
+pub(crate) struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+pub(crate) const fn yield_once() -> YieldOnce {
+    YieldOnce(false)
+}
+
 /// A type-erased, `!Send` task future: what the executor stores and what
 /// [`PendingSpawns`] stages.
 type BoxedTask = Pin<Box<dyn Future<Output = ()>>>;
@@ -470,29 +494,6 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
-
-    /// Completes on the second poll; self-wakes on the first.
-    struct YieldOnce {
-        yielded: bool,
-    }
-
-    impl Future for YieldOnce {
-        type Output = ();
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            if self.yielded {
-                Poll::Ready(())
-            } else {
-                self.yielded = true;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
-
-    fn yield_once() -> YieldOnce {
-        YieldOnce { yielded: false }
-    }
 
     #[test]
     fn spawn_and_complete() {

@@ -43,6 +43,7 @@ dependencies {
     implementation(libs.httpclient5)
     implementation(libs.jackson.databind)
     implementation(libs.commons.lang3)
+    implementation(libs.hash4j)
     implementation(libs.slf4j.api)
     implementation(libs.spotbugs.annotations)
     implementation(libs.netty.buffer)
@@ -62,9 +63,7 @@ publishing {
         named<MavenPublication>("maven") {
             pom {
                 name = "Apache Iggy Java Client SDK"
-                description = "Official Java client SDK for Apache Iggy.\n" +
-                        "Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), " +
-                        "sponsored by the Apache Incubator PMC."
+                description = "Official Java client SDK for Apache Iggy."
                 packaging = "jar"
             }
         }

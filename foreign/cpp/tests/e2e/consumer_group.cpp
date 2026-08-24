@@ -36,8 +36,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupSucceeds) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     ASSERT_NO_THROW({
         const auto group = client->create_consumer_group(make_string_identifier(stream_name),
@@ -59,8 +59,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupOnNonExistentResourcesThrow
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     ASSERT_THROW(client->create_consumer_group(make_string_identifier(missing_stream_name),
                                                make_string_identifier(topic_name), GetRandomName()),
@@ -79,8 +79,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupTwiceOnSameInputThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -97,8 +97,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupWithInvalidNamesThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     const std::string invalid_names[] = {"", std::string(256, 'a')};
     for (const std::string &invalid_name : invalid_names) {
@@ -118,8 +118,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupAfterStreamDeletionThrows) 
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
     ForgetTrackedStream(stream_name);
 
@@ -138,8 +138,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, CreateConsumerGroupBeforeLoginThrows) {
     iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                               "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
+                                               "server_default", 0, "server_default", {}));
 
     iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
@@ -167,8 +167,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupReturnsSameInfoAsCreateConsume
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     const auto created_group = client->create_consumer_group(make_string_identifier(stream_name),
                                                              make_string_identifier(topic_name), group_name);
@@ -194,8 +194,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReturnsCreatedGroups) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), first_group_name));
@@ -220,8 +220,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsBeforeLoginThrows) {
     iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                               "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
+                                               "server_default", 0, "server_default", {}));
 
     iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
 
@@ -248,8 +248,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupSucceeds) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -267,8 +267,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupBeforeLoginThrows) {
     iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                               "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
+                                               "server_default", 0, "server_default", {}));
     ASSERT_NO_THROW(setup_client->create_consumer_group(make_string_identifier(stream_name),
                                                         make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -304,8 +304,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupOnNonExistentResourcesThrows)
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), created_group_name));
     TrackConsumerGroup(stream_name, topic_name, created_group_name);
@@ -332,8 +332,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupAfterStreamDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -354,8 +354,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupAfterTopicDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -375,8 +375,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupReflectsInGetConsumerGroup) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     iggy::ffi::ConsumerGroupDetails created_group;
     ASSERT_NO_THROW({
@@ -407,8 +407,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupTwiceKeepsSingleMember) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -434,8 +434,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupFromTwoClientsIncreasesMember
 
     ASSERT_NO_THROW(first->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(first->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "server_default",
-                                        0, "server_default"));
+    ASSERT_NO_THROW(first->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default", 0,
+                                        "server_default", {}));
     ASSERT_NO_THROW(first->create_consumer_group(make_string_identifier(stream_name),
                                                  make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -460,8 +460,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, JoinConsumerGroupThenLeaveRestoresMembersCount
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -492,8 +492,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupReducesMembersCount) {
 
     ASSERT_NO_THROW(first->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(first->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0, "server_default",
-                                        0, "server_default"));
+    ASSERT_NO_THROW(first->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default", 0,
+                                        "server_default", {}));
     ASSERT_NO_THROW(first->create_consumer_group(make_string_identifier(stream_name),
                                                  make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -526,8 +526,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupBeforeLoginThrows) {
     iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                               "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
+                                               "server_default", 0, "server_default", {}));
     ASSERT_NO_THROW(setup_client->create_consumer_group(make_string_identifier(stream_name),
                                                         make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -565,8 +565,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupOnNonExistentResourcesThrows
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), created_group_name));
     TrackConsumerGroup(stream_name, topic_name, created_group_name);
@@ -595,8 +595,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupAfterStreamDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -619,8 +619,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupAfterTopicDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -643,8 +643,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupTwiceThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -667,8 +667,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, LeaveConsumerGroupWithoutJoiningThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -688,8 +688,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReflectsJoinedGroupMembersCou
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     iggy::ffi::ConsumerGroupDetails joined_group;
     iggy::ffi::ConsumerGroupDetails other_group;
@@ -722,19 +722,21 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReflectsJoinedGroupMembersCou
     EXPECT_NE(groups[0].members_count, groups[1].members_count);
 }
 
-TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentStreamReturnsEmpty) {
-    RecordProperty("description", "Returns an empty list when the stream does not exist.");
+// The VSR server rejects consumer-group reads whose parent stream or topic is
+// absent with the legacy typed not-found; the legacy server answered them with
+// an empty list.
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentStreamThrows) {
+    RecordProperty("description", "Throws when the stream does not exist.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
 
-    const auto groups =
-        client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
-    EXPECT_TRUE(groups.empty());
+    ASSERT_THROW(client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
 }
 
-TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentTopicReturnsEmpty) {
-    RecordProperty("description", "Returns an empty list when the topic does not exist.");
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentTopicThrows) {
+    RecordProperty("description", "Throws when the topic does not exist.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
     iggy::ffi::Client *client     = GetLoggedInClient();
@@ -742,9 +744,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsOnNonExistentTopicReturnsEmpt
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
 
-    const auto groups =
-        client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
-    EXPECT_TRUE(groups.empty());
+    ASSERT_THROW(client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsIsStableAcrossBackToBackCalls) {
@@ -757,8 +758,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsIsStableAcrossBackToBackCalls
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), first_group_name));
@@ -794,8 +795,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReturnsCorrectNumberOfGroups)
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), deleted_group_name));
@@ -836,8 +837,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsReturnsCorrectNumberOfGroups)
     EXPECT_TRUE(groups_after_delete.empty());
 }
 
-TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterStreamDeletionReturnsEmpty) {
-    RecordProperty("description", "Returns an empty list after deleting the stream that owned the groups.");
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterStreamDeletionThrows) {
+    RecordProperty("description", "Throws after deleting the stream that owned the groups.");
     const std::string stream_name       = GetRandomName();
     const std::string topic_name        = GetRandomName();
     const std::string first_group_name  = GetRandomName();
@@ -846,8 +847,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterStreamDeletionReturnsEmp
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), first_group_name));
     TrackConsumerGroup(stream_name, topic_name, first_group_name);
@@ -859,13 +860,12 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterStreamDeletionReturnsEmp
     ForgetTrackedConsumerGroup(stream_name, topic_name, second_group_name);
     ForgetTrackedStream(stream_name);
 
-    const auto groups =
-        client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
-    EXPECT_TRUE(groups.empty());
+    ASSERT_THROW(client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
 }
 
-TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterTopicDeletionReturnsEmpty) {
-    RecordProperty("description", "Returns an empty list after deleting the topic that owned the groups.");
+TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterTopicDeletionThrows) {
+    RecordProperty("description", "Throws after deleting the topic that owned the groups.");
     const std::string stream_name       = GetRandomName();
     const std::string topic_name        = GetRandomName();
     const std::string first_group_name  = GetRandomName();
@@ -874,8 +874,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterTopicDeletionReturnsEmpt
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), first_group_name));
     TrackConsumerGroup(stream_name, topic_name, first_group_name);
@@ -887,9 +887,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupsAfterTopicDeletionReturnsEmpt
     ForgetTrackedConsumerGroup(stream_name, topic_name, first_group_name);
     ForgetTrackedConsumerGroup(stream_name, topic_name, second_group_name);
 
-    const auto groups =
-        client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name));
-    EXPECT_TRUE(groups.empty());
+    ASSERT_THROW(client->get_consumer_groups(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+                 std::exception);
 }
 
 TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupBeforeLoginThrows) {
@@ -901,8 +900,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupBeforeLoginThrows) {
     iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                               "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
+                                               "server_default", 0, "server_default", {}));
     ASSERT_NO_THROW(setup_client->create_consumer_group(make_string_identifier(stream_name),
                                                         make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -938,8 +937,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupOnNonExistentResourcesThrows) 
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), created_group_name));
     TrackConsumerGroup(stream_name, topic_name, created_group_name);
@@ -966,8 +965,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, GetConsumerGroupAfterStreamDeletionThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
@@ -987,8 +986,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupSucceeds) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -1011,8 +1010,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupBeforeLoginThrows) {
     iggy::ffi::Client *setup_client = GetLoggedInClient();
     ASSERT_NO_THROW(setup_client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                               "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(setup_client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none",
+                                               "server_default", 0, "server_default", {}));
     ASSERT_NO_THROW(setup_client->create_consumer_group(make_string_identifier(stream_name),
                                                         make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -1048,8 +1047,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupOnNonExistentResourcesThrow
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), created_group_name));
     TrackConsumerGroup(stream_name, topic_name, created_group_name);
@@ -1075,8 +1074,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupTwiceThrows) {
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -1098,8 +1097,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAfterStreamDeletionThrows) 
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
     TrackConsumerGroup(stream_name, topic_name, group_name);
@@ -1122,8 +1121,8 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSucc
 
     ASSERT_NO_THROW(client->create_stream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", 0,
-                                         "server_default", 0, "server_default"));
+    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
+                                         0, "server_default", {}));
 
     ASSERT_NO_THROW(client->create_consumer_group(make_string_identifier(stream_name),
                                                   make_string_identifier(topic_name), group_name));
@@ -1134,7 +1133,10 @@ TEST_F(LowLevelE2E_ConsumerGroup, DeleteConsumerGroupAndRecreateWithSameNameSucc
         const auto recreated_group = client->create_consumer_group(make_string_identifier(stream_name),
                                                                    make_string_identifier(topic_name), group_name);
         TrackConsumerGroup(stream_name, topic_name, group_name);
-        ASSERT_EQ(recreated_group.id, 0u);
+        // The VSR server mints group ids monotonically; a recreate gets a
+        // fresh id (the deleted group held 0), unlike the legacy server which
+        // reused the freed slot.
+        ASSERT_GT(recreated_group.id, 0u);
         ASSERT_EQ(recreated_group.name, group_name);
         ASSERT_EQ(recreated_group.members_count, 0u);
         ASSERT_TRUE(recreated_group.members.empty());

@@ -30,6 +30,8 @@ public interface CommandCode {
     enum System implements CommandCode {
         PING(1),
         GET_STATS(10),
+        GET_CLUSTER_METADATA(12),
+        DESCRIBE_OPTIONS(13),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);
@@ -182,7 +184,8 @@ public interface CommandCode {
         CREATE(602),
         DELETE(603),
         JOIN(604),
-        LEAVE(605);
+        LEAVE(605),
+        SYNC(606);
 
         private final int value;
 

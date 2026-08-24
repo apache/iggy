@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 /**
  * VSR consensus header layout, ported from
@@ -27,7 +26,15 @@
 /** Size of every consensus header, both directions. */
 export const HEADER_SIZE = 256;
 
-/** `RequestHeader` field offsets the client writes. */
+/**
+ * `RequestHeader` field offsets the client writes.
+ *
+ * The client wire carries no routing namespace: the server derives the
+ * consensus group (plane from `operation`, partition target from the payload)
+ * and stamps it into its own internal header. Everything that followed the
+ * removed field therefore sits eight bytes earlier than in the pre-derivation
+ * layout.
+ */
 export const REQUEST_OFFSET = {
   size: 48,
   command: 60,
@@ -35,9 +42,8 @@ export const REQUEST_OFFSET = {
   timestamp: 160,
   request: 168,
   operation: 176,
-  namespace: 184,
-  session: 192,
-  reserved: 204
+  session: 184,
+  reserved: 196
 } as const;
 
 /** `ReplyHeader` field offsets the client reads. */
@@ -45,8 +51,7 @@ export const REPLY_OFFSET = {
   size: 48,
   command: 60,
   operation: 208,
-  namespace: 216,
-  status: 224
+  status: 216
 } as const;
 
 /** `EvictionHeader` field offsets the client reads. */
@@ -58,8 +63,8 @@ export const EVICTION_OFFSET = {
   reason: 255
 } as const;
 
-/** `Command2` frame discriminants a client encounters. */
-export const Command2 = {
+/** `Command` frame discriminants a client encounters. */
+export const Command = {
   Request: 5,
   Reply: 8,
   Eviction: 13
@@ -98,8 +103,6 @@ export type RequestHeaderFields = {
   request: bigint,
   /** `Operation` discriminant. */
   operation: number,
-  /** Routing namespace (u64). */
-  namespace: bigint,
   /** Bound session (u64), or 0n. */
   session: bigint,
   /** Command code for `NonReplicated`, placed in `reserved[0..4]`. */
@@ -109,20 +112,19 @@ export type RequestHeaderFields = {
 const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
 
 /**
- * Encodes a 256-byte request header. Only the seven fields the server reads
+ * Encodes a 256-byte request header. Only the six fields the server reads
  * are written; the checksums stay zero, matching the Rust SDK's contract
  * with the VSR server.
  */
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32LE(fields.size, REQUEST_OFFSET.size);
-  header.writeUInt8(Command2.Request, REQUEST_OFFSET.command);
+  header.writeUInt8(Command.Request, REQUEST_OFFSET.command);
   // u128 client id: two little-endian u64 halves, low half first.
   header.writeBigUInt64LE(fields.client & U64_MASK, REQUEST_OFFSET.client);
   header.writeBigUInt64LE(fields.client >> 64n, REQUEST_OFFSET.client + 8);
   header.writeBigUInt64LE(fields.request, REQUEST_OFFSET.request);
   header.writeUInt8(fields.operation, REQUEST_OFFSET.operation);
-  header.writeBigUInt64LE(fields.namespace, REQUEST_OFFSET.namespace);
   header.writeBigUInt64LE(fields.session, REQUEST_OFFSET.session);
   if (fields.nonReplicatedCode !== undefined)
     header.writeUInt32LE(fields.nonReplicatedCode, REQUEST_OFFSET.reserved);

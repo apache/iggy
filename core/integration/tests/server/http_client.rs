@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared HTTP transport plumbing for the server-ng REST suites (`http_vsr`,
+//! Shared HTTP transport plumbing for the server REST suites (`http_vsr`,
 //! `http_rbac`): one authenticated `reqwest` session with the login-retry gate
 //! and the generic verb helpers. Each suite keeps its own request shapes and
 //! assertions as extension methods on [`HttpClient`], so the wire-contract and
@@ -38,7 +38,7 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One authenticated HTTP session against the test server's shard-0 listener: a
 /// `reqwest` client, the listener base URL, and the bearer to send. The bearer
-/// is either a login JWT or a raw personal access token (server-ng resolves
+/// is either a login JWT or a raw personal access token (the server resolves
 /// either on the `Authorization: Bearer` header).
 pub struct HttpClient {
     pub client: reqwest::Client,
@@ -53,12 +53,29 @@ impl HttpClient {
             .server()
             .http_addr()
             .expect("HTTP transport not configured on test server");
-        let base_url = format!("http://{addr}");
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("build reqwest client");
+        Self::login_root_with(client, format!("http://{addr}")).await
+    }
 
+    /// Log in as root against an explicit listener base URL, with redirects
+    /// surfaced instead of followed - for suites that assert on `Location`
+    /// (reqwest follows a 307 transparently by default). The explicit URL also
+    /// reaches a follower node, which [`Self::login_root`] (pinned to node 0)
+    /// cannot.
+    pub async fn login_root_no_redirect(base_url: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build reqwest client");
+        Self::login_root_with(client, base_url).await
+    }
+
+    /// Shared root-login retry loop over an arbitrary client + base URL.
+    async fn login_root_with(client: reqwest::Client, base_url: String) -> Self {
         let body = json!({
             "username": DEFAULT_ROOT_USERNAME,
             "password": DEFAULT_ROOT_PASSWORD,
@@ -139,7 +156,8 @@ impl HttpClient {
             .expect("get request")
     }
 
-    /// Unauthenticated GET (no bearer) for the public `/ping` probe.
+    /// Unauthenticated GET (no bearer): the public `/ping` probe and 401
+    /// assertions on protected routes.
     pub async fn get_anonymous(&self, path: &str) -> Response {
         self.client
             .get(self.url(path))

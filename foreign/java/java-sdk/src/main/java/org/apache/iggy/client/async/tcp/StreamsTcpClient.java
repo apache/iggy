@@ -23,6 +23,8 @@ import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCounted;
 import org.apache.iggy.client.async.StreamsClient;
 import org.apache.iggy.identifier.StreamId;
+import org.apache.iggy.message.HeaderKey;
+import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesSerializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.stream.StreamBase;
@@ -30,8 +32,10 @@ import org.apache.iggy.stream.StreamDetails;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 import static org.apache.iggy.serde.BytesDeserializer.readStreamBase;
 import static org.apache.iggy.serde.BytesDeserializer.readStreamDetails;
@@ -42,10 +46,14 @@ import static org.apache.iggy.serde.BytesSerializer.toBytes;
  */
 public class StreamsTcpClient implements StreamsClient {
 
-    private final AsyncTcpConnection connection;
+    private final Supplier<AsyncTcpConnection> connectionSupplier;
 
-    public StreamsTcpClient(AsyncTcpConnection connection) {
-        this.connection = connection;
+    public StreamsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
+        this.connectionSupplier = connectionSupplier;
+    }
+
+    private AsyncTcpConnection connection() {
+        return connectionSupplier.get();
     }
 
     @Override
@@ -55,7 +63,7 @@ public class StreamsTcpClient implements StreamsClient {
 
         payload.writeBytes(BytesSerializer.toBytes(name));
 
-        return connection.send(CommandCode.Stream.CREATE.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.Stream.CREATE.getValue(), payload).thenApply(response -> {
             StreamDetails details = readStreamDetails(response);
             response.release();
             return details;
@@ -66,7 +74,7 @@ public class StreamsTcpClient implements StreamsClient {
     public CompletableFuture<Optional<StreamDetails>> getStream(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection.send(CommandCode.Stream.GET.getValue(), payload).thenApply(response -> {
+        return connection().send(CommandCode.Stream.GET.getValue(), payload).thenApply(response -> {
             Optional<StreamDetails> result;
             if (response.isReadable()) {
                 result = Optional.of(readStreamDetails(response));
@@ -80,7 +88,7 @@ public class StreamsTcpClient implements StreamsClient {
 
     @Override
     public CompletableFuture<List<StreamBase>> getStreams() {
-        return connection
+        return connection()
                 .send(CommandCode.Stream.GET_ALL.getValue(), Unpooled.EMPTY_BUFFER)
                 .thenApply(response -> {
                     List<StreamBase> streams = new ArrayList<>();
@@ -100,14 +108,17 @@ public class StreamsTcpClient implements StreamsClient {
 
         payload.writeBytes(idBytes);
         payload.writeBytes(BytesSerializer.toBytes(name));
+        // Trailing options block. Streams have no catalog keys yet, so the
+        // server rejects every key; the empty block is the extension point.
+        payload.writeBytes(BytesSerializer.toBytes(Map.<HeaderKey, HeaderValue>of()));
 
-        return connection.send(CommandCode.Stream.UPDATE.getValue(), payload).thenAccept(ReferenceCounted::release);
+        return connection().send(CommandCode.Stream.UPDATE.getValue(), payload).thenAccept(ReferenceCounted::release);
     }
 
     @Override
     public CompletableFuture<Void> deleteStream(StreamId streamId) {
         var payload = toBytes(streamId);
 
-        return connection.send(CommandCode.Stream.DELETE.getValue(), payload).thenAccept(ReferenceCounted::release);
+        return connection().send(CommandCode.Stream.DELETE.getValue(), payload).thenAccept(ReferenceCounted::release);
     }
 }

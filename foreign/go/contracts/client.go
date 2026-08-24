@@ -61,8 +61,17 @@ type Client interface {
 	// Authentication is required, and the permission to read the topics.
 	GetTopics(ctx context.Context, streamId Identifier) ([]Topic, error)
 
+	// DescribeOptions get the option catalog for a resource scope: every key its
+	// create command accepts, with the kind, default and bounds of each.
+	// Authentication is required.
+	DescribeOptions(ctx context.Context, scope OptionsScope) ([]OptionSpec, error)
+
 	// CreateTopic create a new topic.
 	// Authentication is required, and the permission to manage the topics.
+	//
+	// options carries topic option keys with no parameter of their own, for a key
+	// the server catalog gained after this build shipped; call DescribeOptions to
+	// see which keys a server accepts. A parameter above wins on collision.
 	CreateTopic(
 		ctx context.Context,
 		streamId Identifier,
@@ -71,11 +80,14 @@ type Client interface {
 		compressionAlgorithm CompressionAlgorithm,
 		messageExpiry Duration,
 		maxTopicSize uint64,
-		replicationFactor *uint8,
+		options ...HeaderEntry,
 	) (*TopicDetails, error)
 
 	// UpdateTopic update a topic by unique ID or name.
 	// Authentication is required, and the permission to manage the topics.
+	//
+	// options carries keys with no parameter of their own. The server refuses any
+	// key an update may not change, by name.
 	UpdateTopic(
 		ctx context.Context,
 		streamId Identifier,
@@ -84,7 +96,7 @@ type Client interface {
 		compressionAlgorithm CompressionAlgorithm,
 		messageExpiry Duration,
 		maxTopicSize uint64,
-		replicationFactor *uint8,
+		options ...HeaderEntry,
 	) error
 
 	// DeleteTopic delete a topic by unique ID or name.
@@ -93,16 +105,37 @@ type Client interface {
 
 	// SendMessages sends messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to send the messages.
+	//
+	// The returned confirmations report where the server committed the batch.
+	// A send whose reply is lost to a dropped connection returns
+	// ErrDisconnected without a replay: a reconnect registers a fresh client
+	// identity, so the server could not deduplicate the replay against a
+	// batch that may have already committed. Retrying such a send is the
+	// caller's decision and may write the batch twice.
 	SendMessages(
 		ctx context.Context,
 		streamId Identifier,
 		topicId Identifier,
 		partitioning Partitioning,
 		messages []IggyMessage,
-	) error
+	) (*SendMessagesResponse, error)
 
 	// PollMessages poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	//
+	// A group poll that names no partition is orchestrated client-side and
+	// has three outcomes:
+	//   - err == nil with PartitionId == NoAssignedPartition and an empty
+	//     batch: nothing to read right now, poll again. This covers a member
+	//     that owns no partition and a rebalance still settling.
+	//   - ErrConsumerGroupMemberNotFound: the client is not a member, for
+	//     example after an explicit LeaveConsumerGroup. JoinConsumerGroup
+	//     restores membership.
+	//   - err == nil with a real partition id: messages were read.
+	//
+	// The returned message payloads and user headers alias the reply buffer,
+	// so retaining one message pins the whole reply; copy the bytes out when
+	// they outlive the poll.
 	PollMessages(
 		ctx context.Context,
 		streamId Identifier,
@@ -193,6 +226,19 @@ type Client interface {
 		topicId Identifier,
 		groupId Identifier,
 	) error
+
+	// SyncConsumerGroup fetch the partitions this client currently owns in a consumer group,
+	// together with the group generation, for the given stream and topic by unique IDs or names.
+	// Returns ErrConsumerGroupMemberNotFound when the client is not a member
+	// of the group. A member that owns no partition gets a non-nil assignment
+	// with an empty Partitions slice.
+	// Authentication is required, and the permission to read the streams or topics.
+	SyncConsumerGroup(
+		ctx context.Context,
+		streamId Identifier,
+		topicId Identifier,
+		groupId Identifier,
+	) (*ConsumerGroupAssignment, error)
 
 	// CreatePartitions create new N partitions for a topic by unique ID or name.
 	// For example, given a topic with 3 partitions, if you create 2 partitions, the topic will have 5 partitions (from 1 to 5).

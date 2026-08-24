@@ -18,7 +18,7 @@
 //! `CreateStream` op. Targets `Ok` with a fresh name, or `NameAlreadyExists`
 //! by reusing a live stream name from the shadow.
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -49,11 +49,15 @@ pub fn sample(
         Outcome::NameAlreadyExists => Some(Input {
             name: shadow.pick_stream_name(prng)?,
         }),
+        // Not targeted (absent from `OUTCOMES`): the sim client sends no options
+        // block, and the slab ceiling needs `MAX_STREAMS` surviving creates in
+        // one run, far past any workload length.
+        Outcome::InvalidOptionValue | Outcome::TooManyStreams => None,
     }
 }
 
 #[must_use]
-pub fn build_message(client: &SimClient, input: &Input) -> Message<RequestHeader> {
+pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
     client.create_stream(&input.name)
 }
 
@@ -72,6 +76,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::AddStream {
             name: input.name.clone(),
         },
-        Outcome::NameAlreadyExists => Effect::None,
+        Outcome::NameAlreadyExists | Outcome::InvalidOptionValue | Outcome::TooManyStreams => {
+            Effect::None
+        }
     }
 }

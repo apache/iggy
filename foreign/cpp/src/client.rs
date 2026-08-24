@@ -22,10 +22,12 @@ use iggy::prelude::{
     CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
     ConsumerOffsetClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyExpiry as RustIggyExpiry, IggyMessage,
-    IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient, Partitioning,
+    IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient,
+    OptionsScope as RustOptionsScope, PartitionClient, Partitioning,
     Permissions as RustPermissions, PollingStrategy, SegmentClient,
-    SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
-    SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
+    SnapshotCompression as RustSnapshotCompression, StreamClient, StreamUpdateOptions,
+    SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
+    TopicCreateOptions, TopicUpdateOptions, UserClient,
 };
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -179,7 +181,12 @@ impl Client {
 
         RUNTIME.block_on(async {
             self.inner
-                .update_stream(&rust_stream_id, &stream_name)
+                // Streams have no option keys yet.
+                .update_stream(
+                    &rust_stream_id,
+                    &stream_name,
+                    &StreamUpdateOptions::default(),
+                )
                 .await
                 .map_err(|error| {
                     format!(
@@ -240,7 +247,7 @@ impl Client {
         partitioning_kind: String,
         partitioning_value: Vec<u8>,
         messages: Vec<ffi::IggyMessageToSend>,
-    ) -> Result<(), String> {
+    ) -> Result<ffi::SendMessagesResponse, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not send messages: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
@@ -285,7 +292,8 @@ impl Client {
             .collect::<Result<Vec<_>, _>>()?;
 
         RUNTIME.block_on(async {
-            self.inner
+            let response = self
+                .inner
                 .send_messages(
                     &rust_stream_id,
                     &rust_topic_id,
@@ -294,7 +302,7 @@ impl Client {
                 )
                 .await
                 .map_err(|error| format!("Could not send messages: {error}"))?;
-            Ok(())
+            Ok(ffi::SendMessagesResponse::from(response))
         })
     }
 
@@ -383,10 +391,10 @@ impl Client {
         topic_name: String,
         partitions_count: u32,
         compression_algorithm: String,
-        replication_factor: u8,
         message_expiry_kind: String,
         message_expiry_value: u64,
         max_topic_size: String,
+        options: Vec<ffi::HeaderEntry>,
     ) -> Result<ffi::TopicDetails, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
@@ -398,7 +406,6 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -420,18 +427,28 @@ impl Client {
             })?,
         };
 
+        let raw = crate::type_conversion::ffi_options_to_raw(options)
+            .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
+
+        // `None` is what tells admission to resolve the server default, so the
+        // sentinels the string parsers produce must collapse back to it.
+        let options = TopicCreateOptions {
+            partitions_count: Some(partitions_count),
+            compression_algorithm: (rust_compression_algorithm
+                != RustCompressionAlgorithm::default())
+            .then_some(rust_compression_algorithm),
+            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
+                .then_some(rust_message_expiry),
+            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
+                .then_some(rust_max_topic_size),
+            raw,
+            ..TopicCreateOptions::default()
+        };
+
         RUNTIME.block_on(async {
             let topic_details = self
                 .inner
-                .create_topic(
-                    &rust_stream_id,
-                    &topic_name,
-                    partitions_count,
-                    rust_compression_algorithm,
-                    rust_replication_factor,
-                    rust_message_expiry,
-                    rust_max_topic_size,
-                )
+                .create_topic(&rust_stream_id, &topic_name, &options)
                 .await
                 .map_err(|error| {
                     format!(
@@ -494,10 +511,10 @@ impl Client {
         topic_id: ffi::Identifier,
         topic_name: String,
         compression_algorithm: String,
-        replication_factor: u8,
         message_expiry_kind: String,
         message_expiry_value: u64,
         max_topic_size: String,
+        options: Vec<ffi::HeaderEntry>,
     ) -> Result<(), String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
@@ -511,7 +528,6 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -533,17 +549,25 @@ impl Client {
             })?,
         };
 
+        let raw = crate::type_conversion::ffi_options_to_raw(options)
+            .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
+
+        // Settings ride the options block; a server-default sentinel means the
+        // caller did not set the key, so the topic keeps its current value.
+        let update_options = TopicUpdateOptions {
+            compression_algorithm: (rust_compression_algorithm
+                != RustCompressionAlgorithm::default())
+            .then_some(rust_compression_algorithm),
+            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
+                .then_some(rust_message_expiry),
+            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
+                .then_some(rust_max_topic_size),
+            raw,
+        };
+
         RUNTIME.block_on(async {
             self.inner
-                .update_topic(
-                    &rust_stream_id,
-                    &rust_topic_id,
-                    &topic_name,
-                    rust_compression_algorithm,
-                    rust_replication_factor,
-                    rust_message_expiry,
-                    rust_max_topic_size,
-                )
+                .update_topic(&rust_stream_id, &rust_topic_id, &topic_name, &update_options)
                 .await
                 .map_err(|error| {
                     format!(
@@ -982,6 +1006,34 @@ impl Client {
                 .await
                 .map_err(|error| format!("Could not get clients: {error}"))?;
             Ok(clients.into_iter().map(ffi::ClientInfo::from).collect())
+        })
+    }
+
+    /// Serves the option catalog of one scope: "topic", "stream" or "user".
+    ///
+    /// A caller learns the keys `create_topic` accepts from here and nowhere
+    /// else. A key outside the catalog is refused at create, and the binary
+    /// transports answer that refusal with an error code alone, so the
+    /// rejection never names the keys that would have worked.
+    ///
+    /// A scope whose catalog is still empty answers with an empty vector, so an
+    /// empty result means the scope takes no keys yet, not that the call failed.
+    pub fn describe_options(&self, scope: String) -> Result<Vec<ffi::OptionSpec>, String> {
+        let rust_scope = RustOptionsScope::from_str(&scope).map_err(|_| {
+            format!(
+                "Could not describe options: invalid scope '{scope}'. Expected 'topic', 'stream' or 'user'."
+            )
+        })?;
+
+        RUNTIME.block_on(async {
+            let specs = self
+                .inner
+                .describe_options(rust_scope)
+                .await
+                .map_err(|error| {
+                    format!("Could not describe options for scope '{rust_scope}': {error}")
+                })?;
+            Ok(specs.into_iter().map(ffi::OptionSpec::from).collect())
         })
     }
 

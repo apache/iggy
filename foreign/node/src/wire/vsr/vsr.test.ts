@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -35,23 +34,6 @@ describe('VSR custom request framing', () => {
     assert.equal(frame.readUInt8(REQUEST_OFFSET.operation), Operation.NonReplicated);
     assert.equal(frame.readUInt32LE(REQUEST_OFFSET.reserved), 60_000);
     assert.deepEqual(frame.subarray(256), payload);
-  });
-
-  it('does not consume a request ID when local routing fails', () => {
-    const session = new VsrSession(7n);
-    session.bind(42n);
-    assert.throws(
-      () => session.encode(
-        COMMAND_CODE.SendMessages,
-        Buffer.alloc(0)
-      )
-    );
-
-    const frame = session.encode(
-      COMMAND_CODE.CreateStream,
-      Buffer.alloc(0)
-    );
-    assert.equal(frame.readBigUInt64LE(REQUEST_OFFSET.request), 1n);
   });
 
   it('rejects an unbound replicated request with a typed error', () => {
@@ -111,7 +93,7 @@ describe('VSR custom request framing', () => {
       serializeSendMessages(
         1,
         2,
-        [],
+        [{ payload: 'x' }],
         Partitioning.PartitionId(3)
       )
     );

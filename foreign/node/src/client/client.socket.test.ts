@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
@@ -26,7 +25,7 @@ import { createServer as createTlsServer } from 'node:tls';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { ResponseError } from '../wire/error.utils.js';
 import {
-  Command2,
+  Command,
   EVICTION_OFFSET,
   EvictionReason,
   HEADER_SIZE,
@@ -100,7 +99,7 @@ const replyFrame = (
 ): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE + body.length);
   frame.writeUInt32LE(frame.length, REPLY_OFFSET.size);
-  frame.writeUInt8(Command2.Reply, REPLY_OFFSET.command);
+  frame.writeUInt8(Command.Reply, REPLY_OFFSET.command);
   frame.writeUInt8(operation, REPLY_OFFSET.operation);
   frame.writeUInt32LE(status, REPLY_OFFSET.status);
   body.copy(frame, HEADER_SIZE);
@@ -110,7 +109,7 @@ const replyFrame = (
 const evictionFrame = (reason: number): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE);
   frame.writeUInt32LE(HEADER_SIZE, REPLY_OFFSET.size);
-  frame.writeUInt8(Command2.Eviction, REPLY_OFFSET.command);
+  frame.writeUInt8(Command.Eviction, REPLY_OFFSET.command);
   frame.writeUInt8(reason, EVICTION_OFFSET.reason);
   return frame;
 };
@@ -203,12 +202,24 @@ const singleNodeHandler = (port: number): FrameHandler =>
   };
 
 const vsrConfig = (port: number): ClientConfig => ({
-  protocol: 'vsr',
   transport: 'TCP',
   options: { host: '127.0.0.1', port },
   credentials: { username: 'iggy', password: 'iggy' },
   reconnect: { enabled: false, interval: 100, maxRetries: 1 }
 });
+
+/** Shrinks the leaderless poll so a test observes it without waiting on it. */
+const compressLeaderlessPoll = (
+  client: CommandResponseStream,
+  budget: number
+): void => {
+  const settlement = client as unknown as {
+    leaderlessWaitBudget: number,
+    leaderlessPollInterval: number
+  };
+  settlement.leaderlessWaitBudget = budget;
+  settlement.leaderlessPollInterval = 1;
+};
 
 describe('VSR client socket', () => {
   it('exchanges VSR frames over TLS', async () => {
@@ -253,13 +264,18 @@ describe('VSR client socket', () => {
         (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
       );
       assert.deepEqual(operations, [
-        Operation.NonReplicated,
         Operation.Register,
+        Operation.NonReplicated,
         Operation.NonReplicated
       ]);
-      const register = server.frames[1];
+      const register = server.frames[0];
       assert.equal(register.readBigUInt64LE(REQUEST_OFFSET.request), 0n);
       assert.equal(register.readBigUInt64LE(REQUEST_OFFSET.session), 0n);
+      const settlement = server.frames[1];
+      assert.equal(
+        settlement.readUInt32LE(REQUEST_OFFSET.reserved),
+        COMMAND_CODE.GetClusterMetadata
+      );
       const request = server.frames[2];
       assert.equal(
         request.readBigUInt64LE(REQUEST_OFFSET.session),
@@ -372,29 +388,31 @@ describe('VSR client socket', () => {
     }
   });
 
-  it('redirects a direct login to the advertised leader before registering',
+  it('redirects a login to the advertised leader and registers there',
     async () => {
       const leader = await startVsrServer(
         (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
       );
       const follower = await startVsrServer((frame, socket) => {
-        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
-        if (code === COMMAND_CODE.GetClusterMetadata) {
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        if (operation === Operation.Register) {
+          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          return;
+        }
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) ===
+            COMMAND_CODE.GetClusterMetadata) {
           socket.write(replyFrame(
             Operation.NonReplicated,
             twoNodeMetadataBody(follower.port, leader.port)
           ));
           return;
         }
-        socket.write(replyFrame(
-          frame.readUInt8(REQUEST_OFFSET.operation),
-          Buffer.alloc(0),
-          3
-        ));
+        socket.write(replyFrame(operation, Buffer.alloc(0), 58));
       });
       const client = new CommandResponseStream(vsrConfig(follower.port));
       try {
-        const response = await client.sendCommand(COMMAND_CODE.LoginUser,
+        const response = await client.sendCommand(
+          COMMAND_CODE.LoginUser,
           Buffer.concat([
             Buffer.from([4]),
             Buffer.from('iggy'),
@@ -406,18 +424,228 @@ describe('VSR client socket', () => {
         const followerOperations = follower.frames.map(
           (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
         );
-        assert.deepEqual(followerOperations, [Operation.NonReplicated]);
+        assert.deepEqual(followerOperations, [
+          Operation.Register,
+          Operation.NonReplicated
+        ]);
+
+        await client.sendCommand(60_018, Buffer.alloc(0));
+
         const leaderOperations = leader.frames.map(
           (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
         );
         assert.deepEqual(leaderOperations, [
+          Operation.Register,
           Operation.NonReplicated,
-          Operation.Register
+          Operation.NonReplicated
         ]);
+        assert.equal(
+          leader.frames[2].readUInt32LE(REQUEST_OFFSET.reserved),
+          60_018
+        );
+        assert.equal(follower.frames.length, 2);
       } finally {
         client.destroy();
         await leader.close();
         await follower.close();
+      }
+    });
+
+  it('rechecks leadership after a redirected login', async () => {
+    const leader = await startVsrServer(
+      (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
+    );
+    const intermediate = await startVsrServer((frame, socket) => {
+      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+      if (operation === Operation.Register) {
+        socket.write(replyFrame(Operation.Register, registerReplyBody()));
+        return;
+      }
+      socket.write(replyFrame(
+        Operation.NonReplicated,
+        twoNodeMetadataBody(intermediate.port, leader.port)
+      ));
+    });
+    const follower = await startVsrServer((frame, socket) => {
+      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+      if (operation === Operation.Register) {
+        socket.write(replyFrame(Operation.Register, registerReplyBody()));
+        return;
+      }
+      socket.write(replyFrame(
+        Operation.NonReplicated,
+        twoNodeMetadataBody(follower.port, intermediate.port)
+      ));
+    });
+    const client = new CommandResponseStream(vsrConfig(follower.port));
+    try {
+      await client.authenticate(vsrConfig(follower.port).credentials);
+      await client.sendCommand(60_019, Buffer.alloc(0));
+
+      assert.deepEqual(
+        follower.frames.map((frame) => frame.readUInt8(REQUEST_OFFSET.operation)),
+        [Operation.Register, Operation.NonReplicated]
+      );
+      assert.deepEqual(
+        intermediate.frames.map(
+          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+        ),
+        [Operation.Register, Operation.NonReplicated]
+      );
+      assert.equal(
+        leader.frames[2].readUInt32LE(REQUEST_OFFSET.reserved),
+        60_019
+      );
+    } finally {
+      client.destroy();
+      await follower.close();
+      await intermediate.close();
+      await leader.close();
+    }
+  });
+
+  it('keeps a single-node login on its node', async () => {
+    const server = await startVsrServer(
+      (frame, socket) => singleNodeHandler(server.port)(frame, socket)
+    );
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+
+      const operations = server.frames.map(
+        (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+      );
+      assert.deepEqual(operations, [
+        Operation.Register,
+        Operation.NonReplicated
+      ]);
+      assert.equal(
+        server.frames[1].readUInt32LE(REQUEST_OFFSET.reserved),
+        COMMAND_CODE.GetClusterMetadata
+      );
+      assert.equal(client.isAuthenticated, true);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('polls a leaderless roster before redirecting to the elected leader',
+    async () => {
+      const leader = await startVsrServer(
+        (frame, socket) => singleNodeHandler(leader.port)(frame, socket)
+      );
+      let rosterReads = 0;
+      const follower = await startVsrServer((frame, socket) => {
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        if (operation === Operation.Register) {
+          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          return;
+        }
+        rosterReads += 1;
+        // The first answer is mid-election: neither node holds the leader role.
+        socket.write(replyFrame(
+          Operation.NonReplicated,
+          rosterReads === 1
+            ? twoNodeMetadataBody(follower.port, leader.port, 1)
+            : twoNodeMetadataBody(follower.port, leader.port)
+        ));
+      });
+      const client = new CommandResponseStream(vsrConfig(follower.port));
+      compressLeaderlessPoll(client, 1_000);
+      try {
+        await client.authenticate(vsrConfig(follower.port).credentials);
+
+        assert.equal(rosterReads, 2);
+        const leaderOperations = leader.frames.map(
+          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+        );
+        assert.deepEqual(leaderOperations, [
+          Operation.Register,
+          Operation.NonReplicated
+        ]);
+        assert.equal(client.isAuthenticated, true);
+      } finally {
+        client.destroy();
+        await leader.close();
+        await follower.close();
+      }
+    });
+
+  it('keeps a login alive when the session dies mid-poll', async () => {
+    let rosterReads = 0;
+    const server = await startVsrServer((frame, socket) => {
+      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+      if (operation === Operation.Register) {
+        socket.write(replyFrame(Operation.Register, registerReplyBody()));
+        return;
+      }
+      rosterReads += 1;
+      // The roster stays leaderless and the session dies in the same breath.
+      // Polling on without a session would re-enter authentication, which
+      // awaits the login being settled, and the login would never return.
+      socket.write(Buffer.concat([
+        replyFrame(
+          Operation.NonReplicated,
+          twoNodeMetadataBody(server.port, server.port, 1)
+        ),
+        evictionFrame(EvictionReason.NoSession)
+      ]));
+    });
+    const client = new CommandResponseStream(vsrConfig(server.port));
+    compressLeaderlessPoll(client, 1_000);
+    try {
+      const outcome = await Promise.race([
+        client.authenticate(vsrConfig(server.port).credentials)
+          .then(() => 'authenticated'),
+        // Unreferenced so a passing run is not held open by the stall timer.
+        new Promise((resolve) => {
+          setTimeout(() => resolve('stalled'), 500).unref();
+        })
+      ]);
+
+      assert.equal(outcome, 'authenticated');
+      assert.equal(rosterReads, 1);
+    } finally {
+      client.destroy();
+      await server.close();
+    }
+  });
+
+  it('keeps a login on its node when no leader appears in the budget',
+    async () => {
+      const unavailable = await startVsrServer(() => {});
+      const unavailablePort = unavailable.port;
+      await unavailable.close();
+      // The roster marks its leader-role node unhealthy on a dead port, so a
+      // redirect would fail the dial instead of passing unnoticed.
+      const server = await startVsrServer((frame, socket) => {
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        if (operation === Operation.Register) {
+          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          return;
+        }
+        socket.write(replyFrame(
+          Operation.NonReplicated,
+          twoNodeMetadataBody(server.port, unavailablePort, 0, 1)
+        ));
+      });
+      const client = new CommandResponseStream(vsrConfig(server.port));
+      compressLeaderlessPoll(client, 0);
+      try {
+        await client.authenticate(vsrConfig(server.port).credentials);
+
+        const operations = server.frames.map(
+          (frame) => frame.readUInt8(REQUEST_OFFSET.operation)
+        );
+        assert.deepEqual(operations, [
+          Operation.Register,
+          Operation.NonReplicated
+        ]);
+        assert.equal(client.isAuthenticated, true);
+      } finally {
+        client.destroy();
+        await server.close();
       }
     });
 
@@ -672,25 +900,6 @@ describe('VSR client socket', () => {
       }
     }
   );
-
-  it('rejects a cluster without a healthy leader', async () => {
-    const server = await startVsrServer((frame, socket) => {
-      socket.write(replyFrame(
-        frame.readUInt8(REQUEST_OFFSET.operation),
-        twoNodeMetadataBody(server.port, server.port, 1)
-      ));
-    });
-    const client = new CommandResponseStream(vsrConfig(server.port));
-    try {
-      await assert.rejects(
-        () => client.sendCommand(60_010, Buffer.alloc(0)),
-        /VSR cluster has no healthy leader/
-      );
-    } finally {
-      client.destroy();
-      await server.close();
-    }
-  });
 
   it('shares token authentication between concurrent callers', async () => {
     const server = await startVsrServer(

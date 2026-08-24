@@ -20,33 +20,17 @@ mod buffer;
 mod certificates;
 mod consensus_message;
 pub mod crypto;
-mod deduplication;
 pub mod diagnostics;
 pub mod executor;
 pub mod fs_utils;
-mod in_flight;
-mod indexes_mut;
-// TODO(hubcio): iobuf was relocated verbatim from `core/binary_protocol/src/consensus/iobuf.rs`
-// during the sans-io split. Its implementation is intentionally untouched; the
-// lints below predate the move and are tracked as tech debt for a 0.9.x cleanup pass.
-#[allow(
-    private_interfaces,
-    clippy::missing_errors_doc,
-    clippy::missing_panics_doc,
-    clippy::must_use_candidate,
-    clippy::return_self_not_must_use,
-    clippy::missing_const_for_fn,
-    clippy::non_send_fields_in_send_ty,
-    clippy::use_self
-)]
 pub mod iobuf;
 pub mod log;
 mod memory_pool;
-mod messages_batch_mut;
-mod messages_batch_set;
+mod reactor_yield;
 mod segment_storage;
-pub mod send_messages2;
+pub mod send_messages;
 pub mod sharding;
+mod storage;
 
 pub use bootstrap::create_directories;
 pub use buffer::PooledBuffer;
@@ -55,13 +39,10 @@ pub use consensus_message::{
     ConsensusMessage, FragmentedBacking, MESSAGE_ALIGN, Message, MessageBacking, MessageBag,
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
 };
-pub use deduplication::MessageDeduplicator;
 pub use executor::create_shard_executor;
-pub use in_flight::IggyMessagesBatchSetInFlight;
-pub use indexes_mut::IggyIndexesMut;
-pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
-pub use messages_batch_mut::IggyMessagesBatchMut;
-pub use messages_batch_set::IggyMessagesBatchSet;
+pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};
+pub use reactor_yield::yield_to_reactor;
 pub use segment_storage::{
     IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
 };
+pub use storage::Storage;

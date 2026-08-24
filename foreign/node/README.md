@@ -10,12 +10,6 @@
 
 Apache Iggy Node.js client written in typescript, it currently only supports tcp & tls transports.
 
-> Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
->
-> Incubation is required of all newly accepted projects until a further review indicates that the infrastructure, communications, and decision making process have stabilized in a manner consistent with other successful ASF projects.
->
-> While incubation status is not necessarily a reflection of the completeness or stability of the code, it does indicate that the project has yet to be fully endorsed by the ASF.
-
 diclaimer: although all iggy commands & basic client/stream are implemented this is still a WIP, provided as is, and has still a long way to go to be considered "battle tested".
 
 note: This lib started as _iggy-bin_ ( [github](https://github.com/T1B0/iggy-bin) / [npm](https://www.npmjs.com/package/iggy-bin)) before migrating under iggy-rs org. package iggy-bin@v1.3.4 is equivalent to @iggy.rs/sdk@v1.0.3 and migrating again under apache iggy monorepo ( [github](https://github.com/apache/iggy/tree/master/foreign/node) and is now published on npmjs as apache-iggy
@@ -32,18 +26,17 @@ npm i --save apache-iggy
 
 ### Response frame limit
 
-**Compatibility note:** response frames larger than `maxResponseFrameSize` (default 64 MiB) are now rejected and close the connection under both framing modes. This is a behavior change for existing classic-framing clients. Raise the limit in the client configuration when polling very large batches.
+**Compatibility note:** response frames larger than `maxResponseFrameSize` (default 64 MiB) are rejected and close the connection. Raise the limit in the client configuration when polling very large batches.
 
 ### VSR framing
 
-Classic framing remains the default. Select VSR explicitly when connecting to
-an Iggy VSR server:
+The SDK speaks the VSR wire protocol exclusively and requires an Iggy VSR
+server:
 
 ```typescript
 import { SimpleClient, getRawClient } from "apache-iggy";
 
 const config = {
-  protocol: "vsr" as const,
   transport: "TCP" as const,
   options: { host: "127.0.0.1", port: 8090 },
   credentials: { username: "iggy", password: "iggy" },
@@ -52,12 +45,18 @@ const client = new SimpleClient(getRawClient(config));
 const stats = await client.system.getStats();
 ```
 
-VSR is a runtime protocol choice in Node.js, not a build feature. Codes absent
-from the SDK command table use `Operation::NonReplicated` and carry the command
-code in the request header's reserved field. The server remains authoritative
-for classifying or rejecting extension commands.
+Codes absent from the SDK command table use `Operation::NonReplicated` and
+carry the command code in the request header's reserved field. The server
+remains authoritative for classifying or rejecting extension commands.
 
-The same npm package supports both framing modes over TCP and TLS. VSR restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
+Sends must use explicit `Partitioning.PartitionId` partitioning: the client
+routes each request to a partition-scoped namespace, so broker-side balancing
+(`Partitioning.Balanced`) and key hashing (`Partitioning.MessageKey`) are
+rejected before the request is sent.
+<!-- TODO(hubcio): Balanced and MessageKey partitioning to be implemented;
+not decided yet whether it'll be on server side or client side. -->
+
+VSR works over TCP and TLS. It restricts `Client` to one pooled connection because authentication, request sequencing, and consumer-group assignments belong to one consensus session. Configurations requesting more than one pooled connection fail before a socket is opened.
 
 VSR authentication translates the existing password and personal-access-token
 login APIs into the register handshake required by the consensus protocol. A
@@ -66,9 +65,15 @@ new session. Transient not-committed responses retry the exact encoded request
 within one bounded deadline. A disconnected mutation is never replayed under a
 new session.
 
-When the server's `[heartbeat]` eviction is enabled, configure the client's `heartbeatInterval` below the server heartbeat interval. Client heartbeats are disabled when `heartbeatInterval` is unset.
+The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
+keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
+The server evicts a connection silent for 36 s, which is 1.2 x its 30 s
+heartbeat interval. Raising the client interval past that window, or setting it
+to 0 to disable client heartbeats, exposes an idle consumer-group member to
+eviction; a connection holding no group membership is left alone. Any other
+unusable value is rejected instead of silently disabling the heartbeat.
 
-`sendBinaryRequest(code, payload)` has the same signature under classic and VSR framing. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them. Classic request bytes remain unchanged.
+`sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 
 ```typescript
 import { ResponseError } from "apache-iggy";

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 /**
  * `Operation` values and classification, ported from
@@ -59,9 +58,7 @@ export const Operation = {
   LeaveConsumerGroup: 149,
   SendMessages: 160,
   StoreConsumerOffset: 161,
-  DeleteConsumerOffset: 162,
-  StoreConsumerOffset2: 164,
-  DeleteConsumerOffset2: 165
+  DeleteConsumerOffset: 162
 } as const;
 
 const INTERNAL_START = 64;
@@ -84,8 +81,6 @@ const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.SendMessages, Operation.SendMessages],
   [COMMAND_CODE.StoreOffset, Operation.StoreConsumerOffset],
   [COMMAND_CODE.DeleteConsumerOffset, Operation.DeleteConsumerOffset],
-  [COMMAND_CODE.StoreOffset2, Operation.StoreConsumerOffset2],
-  [COMMAND_CODE.DeleteConsumerOffset2, Operation.DeleteConsumerOffset2],
   [COMMAND_CODE.CreateStream, Operation.CreateStream],
   [COMMAND_CODE.DeleteStream, Operation.DeleteStream],
   [COMMAND_CODE.UpdateStream, Operation.UpdateStream],
@@ -139,9 +134,7 @@ export const isPartition = (operation: number): boolean =>
 export const isResultFramed = (operation: number): boolean =>
   isMetadata(operation) ||
   operation === Operation.StoreConsumerOffset ||
-  operation === Operation.StoreConsumerOffset2 ||
-  operation === Operation.DeleteConsumerOffset ||
-  operation === Operation.DeleteConsumerOffset2;
+  operation === Operation.DeleteConsumerOffset;
 
 /**
  * Picks the header operation for a command code. Unknown extension codes are

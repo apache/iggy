@@ -26,7 +26,7 @@
 //! - `classify_reply`: decode reply into a declared outcome
 //! - `predicted_effect`: predicted shadow mutation on commit
 //!
-//! Dispatch via the [`op_dispatch!`] macro; missing variants are a compile
+//! Dispatch via the `op_dispatch!` macro; missing variants are a compile
 //! error.
 
 pub mod change_password;
@@ -38,7 +38,6 @@ pub mod create_topic;
 pub mod create_user;
 pub mod delete_consumer_group;
 pub mod delete_consumer_offset;
-pub mod delete_consumer_offset_2;
 pub mod delete_partitions;
 pub mod delete_personal_access_token;
 pub mod delete_segments;
@@ -49,13 +48,12 @@ pub mod purge_stream;
 pub mod purge_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
-pub mod store_consumer_offset_2;
 pub mod update_permissions;
 pub mod update_stream;
 pub mod update_topic;
 pub mod update_user;
 
-use iggy_binary_protocol::RequestHeader;
+use iggy_binary_protocol::RoutedRequestHeader;
 use rand_xoshiro::Xoshiro256Plus;
 use server_common::Message;
 
@@ -84,7 +82,7 @@ macro_rules! op_dispatch {
 
         /// In-flight entry recorded on submit, removed on reply.
         ///
-        /// `request_namespace` is the `header.namespace` the request was
+        /// `request_namespace` is the `header.group` the request was
         /// submitted with; the auditor cross-checks it against the
         /// reply's namespace so a misrouted reply cannot update the
         /// wrong VSR group's bookkeeping.
@@ -130,7 +128,7 @@ macro_rules! op_dispatch {
         }
 
         #[must_use]
-        pub fn build_message(client: &SimClient, input: &InFlightInput) -> Message<RequestHeader> {
+        pub fn build_message(client: &SimClient, input: &InFlightInput) -> Message<RoutedRequestHeader> {
             match input {
                 $( InFlightInput::$variant(i) => $module::build_message(client, i), )*
             }
@@ -172,7 +170,7 @@ op_dispatch! {
     // First three positions lock the hash baseline (do not reorder).
     CreateStream              => create_stream,
     SendMessages              => send_messages,
-    StoreConsumerOffset2      => store_consumer_offset_2,
+    StoreConsumerOffset       => store_consumer_offset,
     // Append-only; mirrors actions::Action declaration order.
     DeleteStream              => delete_stream,
     UpdateStream              => update_stream,
@@ -193,7 +191,5 @@ op_dispatch! {
     UpdatePermissions         => update_permissions,
     CreatePersonalAccessToken => create_personal_access_token,
     DeletePersonalAccessToken => delete_personal_access_token,
-    StoreConsumerOffset       => store_consumer_offset,
     DeleteConsumerOffset      => delete_consumer_offset,
-    DeleteConsumerOffset2     => delete_consumer_offset_2,
 }

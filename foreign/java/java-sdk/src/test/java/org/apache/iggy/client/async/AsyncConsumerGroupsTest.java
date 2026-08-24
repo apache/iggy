@@ -71,7 +71,10 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
     @BeforeAll
     public static void setup() throws Exception {
         log.info("Setting up async consumer groups test");
-        client = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
+        client = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
 
         client.connect()
                 .thenCompose(v -> client.users().login(USERNAME, PASSWORD))
@@ -79,14 +82,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
 
         client.streams().createStream(TEST_STREAM).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         client.topics()
-                .createTopic(
-                        STREAM_ID,
-                        1L,
-                        CompressionAlgorithm.None,
-                        BigInteger.ZERO,
-                        BigInteger.ZERO,
-                        Optional.empty(),
-                        TEST_TOPIC)
+                .createTopic(STREAM_ID, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, TEST_TOPIC)
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
@@ -166,7 +162,10 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         ConsumerId groupId = ConsumerId.of(created.id());
 
-        AsyncIggyTcpClient secondClient = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
+        AsyncIggyTcpClient secondClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
         try {
             secondClient
                     .connect()
@@ -262,14 +261,7 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
         try {
             client.streams().createStream(streamName).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
             client.topics()
-                    .createTopic(
-                            streamId,
-                            1L,
-                            CompressionAlgorithm.None,
-                            BigInteger.ZERO,
-                            BigInteger.ZERO,
-                            Optional.empty(),
-                            topicName)
+                    .createTopic(streamId, 1L, CompressionAlgorithm.None, BigInteger.ZERO, BigInteger.ZERO, topicName)
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
             // when
@@ -311,8 +303,14 @@ public class AsyncConsumerGroupsTest extends BaseIntegrationTest {
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         ConsumerId groupId = ConsumerId.of(created.id());
 
-        AsyncIggyTcpClient secondClient = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
-        AsyncIggyTcpClient thirdClient = new AsyncIggyTcpClient(serverHost(), serverTcpPort());
+        AsyncIggyTcpClient secondClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
+        AsyncIggyTcpClient thirdClient = AsyncIggyTcpClient.builder()
+                .host(serverHost())
+                .port(serverTcpPort())
+                .build();
         try {
             secondClient
                     .connect()

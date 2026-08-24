@@ -31,7 +31,7 @@ use common::{
     install_dialed_replicas_locally, install_replicas_locally, loopback, set_replica_ctx,
 };
 use compio::net::TcpStream;
-use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
 use iggy_common::IggyError;
 use message_bus::connector::start as start_connector;
 use message_bus::framing::{self, MAX_MESSAGE_SIZE};
@@ -220,7 +220,7 @@ async fn acceptor_nacks_authenticated_dialer_on_cluster_mismatch() {
     let resp = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
         .await
         .expect("read reject");
-    assert_eq!(resp.header().command, Command2::ReplicaChallenge);
+    assert_eq!(resp.header().command, Command::ReplicaChallenge);
     assert_eq!(
         auth::read_status(&resp.header().reserved_command),
         HandshakeStatus::ClusterMismatch,
@@ -269,14 +269,14 @@ async fn acceptor_rejects_wrong_command_on_frame3() {
     let challenge = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
         .await
         .expect("read challenge");
-    assert_eq!(challenge.header().command, Command2::ReplicaChallenge);
+    assert_eq!(challenge.header().command, Command::ReplicaChallenge);
     assert_eq!(
         auth::read_status(&challenge.header().reserved_command),
         HandshakeStatus::Ok,
     );
 
     // Wrong command in the finish slot (Prepare instead of ReplicaFinish).
-    framing::write_message(&mut stream, build_raw(CLUSTER, 0, Command2::Prepare))
+    framing::write_message(&mut stream, build_raw(CLUSTER, 0, Command::Prepare))
         .await
         .expect("write wrong finish");
 
@@ -303,7 +303,7 @@ fn build_hello(
     nonce: Option<&[u8; auth::NONCE_LEN]>,
 ) -> Message<GenericHeader> {
     Message::<GenericHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut GenericHeader| {
-        h.command = Command2::ReplicaHello;
+        h.command = Command::ReplicaHello;
         h.cluster = cluster_id;
         h.replica = replica_id;
         h.size = HEADER_SIZE as u32;
@@ -316,7 +316,7 @@ fn build_hello(
 /// Build a raw frame with an arbitrary command for the wire-level tests (used to
 /// send a wrong-command third frame in place of a `ReplicaFinish`).
 #[allow(clippy::cast_possible_truncation)]
-fn build_raw(cluster_id: u128, replica_id: u8, command: Command2) -> Message<GenericHeader> {
+fn build_raw(cluster_id: u128, replica_id: u8, command: Command) -> Message<GenericHeader> {
     Message::<GenericHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut GenericHeader| {
         h.command = command;
         h.cluster = cluster_id;

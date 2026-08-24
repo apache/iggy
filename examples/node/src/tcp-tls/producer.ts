@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 // TCP/TLS Producer Example
 //
@@ -23,6 +22,7 @@
 //
 // Prerequisites:
 //   Start the Iggy server with TLS enabled:
+//     IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
 //     IGGY_TCP_TLS_ENABLED=true \
 //     IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //     IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
@@ -33,7 +33,15 @@
 
 import { readFileSync } from 'node:fs';
 import { Client, Partitioning } from 'apache-iggy';
-import { BATCHES_LIMIT, cleanup, initSystem, log, MESSAGES_PER_BATCH, sleep } from '../utils';
+import {
+  BATCHES_LIMIT,
+  cleanup,
+  initSystem,
+  log,
+  MESSAGES_PER_BATCH,
+  PARTITION_ID,
+  sleep
+} from '../utils';
 
 async function produceMessages(
   client: Client,
@@ -62,11 +70,14 @@ async function produceMessages(
     });
 
     try {
+      // The VSR client routes each send to an explicit partition.
+      // TODO(hubcio): Balanced partitioning to be implemented; not decided
+      // yet whether it'll be on server side or client side.
       await client.message.send({
         streamId,
         topicId,
         messages,
-        partition: Partitioning.Balanced,
+        partition: Partitioning.PartitionId(PARTITION_ID),
       });
     } catch (error) {
       log('Error sending messages: %o', error);

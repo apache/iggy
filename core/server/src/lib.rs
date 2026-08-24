@@ -15,39 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(not(feature = "disable-mimalloc"))]
-use mimalloc::MiMalloc;
+#![allow(clippy::future_not_send)]
 
 use iggy_common::SemanticVersion;
 
-#[cfg(not(feature = "disable-mimalloc"))]
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
-#[cfg(windows)]
-compile_error!("iggy-server doesn't support windows.");
-
-pub mod args;
-pub mod binary;
-pub mod bootstrap;
-pub(crate) mod compat;
-pub mod configs;
-pub mod diagnostics;
-pub mod http;
-pub mod io;
-pub mod metadata;
-pub mod quic;
-pub mod sender;
-pub mod server_error;
-pub mod shard;
-pub mod state;
-pub mod streaming;
-pub mod tcp;
-pub mod websocket;
-
-pub use server_common::log;
-
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
-pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
-pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
+
+pub mod auth;
+pub mod bootstrap;
+pub(crate) mod cluster_meta;
+pub mod config_writer;
+pub mod consumer_group;
+pub mod dispatch;
+pub(crate) mod http;
+pub mod login_register;
+pub(crate) mod offset_recovery;
+pub mod partition_helpers;
+pub mod partition_reconciler;
+pub mod pat;
+pub(crate) mod personal_access_token_cleaner;
+pub mod responses;
+pub(crate) mod segment_cleaner;
+pub(crate) mod segment_recovery;
+pub mod server_error;
+pub mod session_manager;
+pub(crate) mod snapshot;
+#[cfg(feature = "systemd")]
+pub mod systemd;
+pub mod users;
+#[cfg(feature = "iggy-web")]
+pub(crate) mod web;
+pub mod wire;

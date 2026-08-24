@@ -70,7 +70,7 @@ docker run --rm --name iggy-php-test \
 You can also run a local server from the repository root:
 
 ```sh
-cargo run --bin iggy-server --fresh --with-default-root-credentials
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
 ```
 
 The tests assume:

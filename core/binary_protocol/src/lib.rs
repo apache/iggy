@@ -55,14 +55,13 @@
 //!   [`StartViewHeader`]
 //! - Dispatch: [`GenericHeader`] for type-erased initial parsing
 
+pub mod batch;
 pub mod codec;
 pub mod codes;
 pub mod consensus;
 pub mod dispatch;
 pub mod error;
 pub mod framing;
-pub mod message_layout;
-pub mod message_view;
 pub mod namespace;
 pub mod primitives;
 pub mod requests;
@@ -71,22 +70,23 @@ pub mod version;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
-    Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
-    EvictionReason, GenericHeader, HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader,
-    RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
-    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-    RequestStateTransferHeader, SIZE_FIELD_OFFSET, StartViewChangeHeader, StartViewHeader,
-    StateChunkHeader, StateTransferTargetHeader, read_size_field, result_code, result_section_len,
+    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusError, ConsensusHeader, DVC_HEADERS_MAX,
+    DoViewChangeHeader, EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
+    ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
+    PrepareOkHeader, RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader,
+    ReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
+    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET,
+    StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
+    frame_body, frame_checksum_bytes, read_size_field, result_code, result_section_len,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;
-pub use framing::{RequestFrame, RequestFrame2, ResponseFrame, ResponseFrame2, STATUS_OK};
-pub use message_view::{
-    WireMessageIterator, WireMessageIteratorMut, WireMessageView, WireMessageViewMut,
-};
+pub use framing::{RequestFrame, ResponseFrame, STATUS_OK};
 pub use primitives::ack_level::AckLevel;
 pub use primitives::consumer::{KIND_CONSUMER_GROUP, WireConsumer};
 pub use primitives::identifier::{MAX_WIRE_NAME_LENGTH, WireIdentifier, WireName};
+pub use primitives::options::{MAX_OPTIONS, MAX_OPTIONS_BYTES, WireOptions, validate_options};
 pub use primitives::partition_assignment::CreatedPartitionAssignment;
 pub use primitives::partitioning::{MAX_MESSAGES_KEY_LENGTH, WirePartitioning};
 pub use primitives::permissions::{

@@ -71,20 +71,19 @@
 //! work later settles on an explicit resume handshake, adjust `resume_request`
 //! to speak it -- but it must stay credential-bearing.
 
-#![cfg(feature = "vsr")]
-
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
 use iggy_binary_protocol::consensus::{
-    Command2, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
+    Command, Operation, ReplyHeader, RequestHeader, read_size_field, result_code,
     result_section_len,
 };
-use iggy_binary_protocol::namespace::METADATA_CONSENSUS_NAMESPACE;
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::users::LoginRegisterRequest;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
-use iggy_binary_protocol::{ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireName};
+use iggy_binary_protocol::{
+    ClientVersionInfo, HEADER_SIZE, IGGY_PROTOCOL_VERSION, WireName, WireOptions,
+};
 use integration::harness::TestHarness;
 use integration::iggy_harness;
 use secrecy::SecretString;
@@ -261,6 +260,7 @@ pub(super) fn tcp_addrs(harness: &TestHarness) -> Vec<SocketAddr> {
 pub(super) fn create_stream_payload(name: &str) -> Bytes {
     CreateStreamRequest {
         name: WireName::new(name).unwrap(),
+        options: WireOptions::empty(),
     }
     .to_bytes()
 }
@@ -272,16 +272,12 @@ fn request_header(
     body_len: usize,
 ) -> RequestHeader {
     RequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation,
         size: u32::try_from(HEADER_SIZE + body_len).unwrap(),
         client: CLIENT_ID,
         session,
         request,
-        namespace: match operation {
-            Operation::Register => METADATA_CONSENSUS_NAMESPACE,
-            _ => 0,
-        },
         ..Default::default()
     }
 }
@@ -383,6 +379,7 @@ pub(super) async fn resume_request(
     let deadline = Instant::now() + RESUME_BUDGET;
     let mut last_failure = "the listener never came back".to_string();
     let mut attempt = 0usize;
+    let mut authenticated_attempts = Vec::new();
     while Instant::now() < deadline {
         let addr = addrs[attempt % addrs.len()];
         attempt += 1;
@@ -445,6 +442,10 @@ pub(super) async fn resume_request(
                 );
             }
         }
+        // Backups can forward Register even though they cannot serve the
+        // following metadata write. Keep each authenticated socket alive so
+        // its disconnect cleanup cannot race the next rebind with a Logout.
+        authenticated_attempts.push(stream);
         sleep(RETRY_PAUSE).await;
     }
     panic!(
@@ -571,14 +572,14 @@ async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) 
     }
 
     let command_offset = offset_of!(RequestHeader, command);
-    if reply_header[command_offset] == Command2::Eviction as u8 {
+    if reply_header[command_offset] == Command::Eviction as u8 {
         return Exchange::Eviction {
             reason: reply_header[HEADER_SIZE - 1],
         };
     }
     assert_eq!(
         reply_header[command_offset],
-        Command2::Reply as u8,
+        Command::Reply as u8,
         "expected a Reply frame"
     );
 
