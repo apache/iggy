@@ -324,7 +324,7 @@ pub enum PurgeError {
     /// so the reconciler's `committed > applied` gate re-issues this purge on
     /// its next pass. Retry, do not fence.
     ///
-    /// Sets [`Self::purge_deferred`], which withholds `PrepareOk` for this
+    /// Sets `purge_deferred`, which withholds `PrepareOk` for this
     /// group until the purge lands, so the replica goes quorum-invisible THERE
     /// while every other partition on the node keeps serving. Without that
     /// fence the counter would still name the pre-purge offset space and every
@@ -347,7 +347,7 @@ pub enum PurgeError {
     /// reconciler re-issues the purge. Retry, do not fence: the partition is
     /// serviceable and re-purging an already-empty chain is cheap.
     ///
-    /// Sets [`Self::purge_deferred`] for the same reason as
+    /// Sets `purge_deferred` for the same reason as
     /// [`Self::FrontierNotRecorded`]: an op acked between this failure and the
     /// retry would be wiped by that retry while every peer that recorded the
     /// generation keeps it.
@@ -2095,7 +2095,7 @@ where
     /// against view-change-reset flipping status across `on_replicate` await.
     ///
     /// View-change safety: `reset_view_change_state` calls
-    /// [`crate::Pipeline::clear_request_queue`]; resumed loop breaks via
+    /// [`consensus::Pipeline::clear_request_queue`]; resumed loop breaks via
     /// `else { break }`.
     ///
     /// # Panics

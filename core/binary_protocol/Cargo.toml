@@ -44,3 +44,6 @@ aligned-vec = { workspace = true }
 enum_glob_use = "deny"
 nursery = "warn"
 pedantic = "deny"
+
+[lints.rust]
+warnings = "deny"

@@ -20,7 +20,7 @@
 //! Assemble `get_me` / `get_clients` / `get_stream(s)` / `get_topic(s)` /
 //! `get_user(s)` / `get_personal_access_tokens` / stats / cluster-metadata
 //! responses from per-shard session state and the metadata state machine, plus the
-//! [`NonReplicatedResponse`] dispatch shim and the partition-namespace
+//! `NonReplicatedResponse` dispatch shim and the partition-namespace
 //! resolvers.
 
 use crate::bootstrap::{ShellBus, ShellShard};

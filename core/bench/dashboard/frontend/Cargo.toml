@@ -40,3 +40,6 @@ wasm-bindgen = { workspace = true }
 web-sys = { workspace = true }
 yew = { workspace = true }
 yew-router = { workspace = true }
+
+[lints]
+workspace = true

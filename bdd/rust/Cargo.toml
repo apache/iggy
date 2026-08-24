@@ -54,3 +54,6 @@ required-features = ["bdd"]
 name = "stream_crud"
 harness = false
 required-features = ["bdd"]
+
+[lints]
+workspace = true
