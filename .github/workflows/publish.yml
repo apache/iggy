@@ -743,6 +743,7 @@ jobs:
           libc: ${{ steps.libc.outputs.libc }}
           component: ${{ matrix.key }}
           target: ${{ matrix.flavor_target }}
+          flavor_suffix: ${{ matrix.flavor_suffix }}
           version: ${{ steps.ver.outputs.version }}
           platform: ${{ matrix.platform }}
           dry_run: ${{ inputs.dry_run }}

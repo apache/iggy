@@ -31,6 +31,7 @@ COPY . .
 # license steps below stay in sync with the workspace without a hardcoded list.
 RUN cargo chef prepare --recipe-path recipe.json && \
     scripts/ci/connector-plugins.sh --names > connector-plugins.txt && \
+    scripts/ci/connector-plugins.sh --package-flags > connector-packages.txt && \
     scripts/ci/connector-plugins.sh --manifests > connector-manifests.txt
 
 #
@@ -40,6 +41,14 @@ RUN cargo chef prepare --recipe-path recipe.json && \
 FROM --platform=$BUILDPLATFORM chef AS toolchain
 ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
+
+# The base image tag and rust-toolchain.toml agree only while the pinned
+# channel is an x.y.z with z > 0: scripts/ci/sync-rustc-version.sh rewrites an
+# x.y.0 channel to the floating x.y tag, which then resolves to whatever patch
+# the base image publishes. Bring the pin in before rustup runs so the cross
+# targets land on the toolchain cargo selects once the sources arrive, whichever
+# of the two it turns out to be.
+COPY rust-toolchain.toml rust-toolchain.toml
 
 RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static && \
     cargo install cargo-zigbuild --version '=0.22.1' --locked && \
@@ -130,8 +139,10 @@ ARG TARGETPLATFORM
 ARG LIBC=glibc
 
 # Only this branch reads the derived plugin set, so adding a connector leaves
-# the slim branch's cooked dependency layer untouched.
+# the slim branch's cooked dependency layer untouched. Two lists, because cargo
+# selects a plugin by package name while the artifact is lib<target name>.so.
 COPY --from=planner /app/connector-plugins.txt connector-plugins.txt
+COPY --from=planner /app/connector-packages.txt connector-packages.txt
 COPY --from=planner /app/connector-manifests.txt connector-manifests.txt
 
 #
@@ -147,7 +158,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     "linux/arm64:glibc") RUST_TARGET="aarch64-unknown-linux-gnu" ;; \
     *) echo "Unsupported platform/libc combination: $TARGETPLATFORM/$LIBC" && exit 1 ;; \
     esac && \
-    PLUGIN_FLAGS="$(sed 's/^/-p /' connector-plugins.txt | tr '\n' ' ')" && \
+    PLUGIN_FLAGS="$(cat connector-packages.txt)" && \
     if [ "$PROFILE" = "debug" ]; then \
     cargo chef cook --recipe-path recipe.json --target ${RUST_TARGET} --zigbuild \
       -p iggy-connectors $PLUGIN_FLAGS; \
@@ -171,7 +182,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARG
     "linux/arm64:glibc") RUST_TARGET="aarch64-unknown-linux-gnu" ;; \
     *) echo "Unsupported platform/libc combination: $TARGETPLATFORM/$LIBC" && exit 1 ;; \
     esac && \
-    PLUGIN_FLAGS="$(sed 's/^/-p /' connector-plugins.txt | tr '\n' ' ')" && \
+    PLUGIN_FLAGS="$(cat connector-packages.txt)" && \
     if [ "$PROFILE" = "debug" ]; then PROFILE_DIR=debug; PROFILE_FLAG=""; else PROFILE_DIR=release; PROFILE_FLAG="--release"; fi && \
     cargo zigbuild --locked --target ${RUST_TARGET} -p iggy-connectors $PLUGIN_FLAGS $PROFILE_FLAG && \
     cp /app/target/${RUST_TARGET}/${PROFILE_DIR}/iggy-connectors /app/iggy-connectors && \

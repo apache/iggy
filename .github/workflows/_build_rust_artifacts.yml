@@ -220,21 +220,28 @@ jobs:
         env:
           OVERRIDE: ${{ inputs.connector_plugins }}
         run: |
+          # Two lists: cargo selects a plugin by package name, and writes the
+          # artifact as lib<cdylib target name>.so. The override supplies one
+          # list and is taken as both, which is the caller's responsibility.
           if [[ -n "$OVERRIDE" ]]; then
+            packages="$OVERRIDE"
             plugins="$OVERRIDE"
             echo "Using connector plugin list from workflow input (override)"
           else
+            packages="$(scripts/ci/connector-plugins.sh --comma-packages)"
             plugins="$(scripts/ci/connector-plugins.sh --comma-names)"
             echo "Derived connector plugin list from cargo metadata"
           fi
+          echo "Packages: $packages"
           echo "Plugins: $plugins"
+          echo "CONNECTOR_PACKAGES=$packages" >> "$GITHUB_ENV"
           echo "CONNECTOR_PLUGINS=$plugins" >> "$GITHUB_ENV"
 
       - name: Build connector plugins
         run: |
           pkg_flags=()
 
-          IFS=',' read -ra pkgs <<< "$CONNECTOR_PLUGINS"
+          IFS=',' read -ra pkgs <<< "$CONNECTOR_PACKAGES"
           for pkg in "${pkgs[@]}"; do
             name="$(echo "$pkg" | xargs)"
             [[ -z "$name" ]] && continue
@@ -257,7 +264,7 @@ jobs:
             [[ -z "$lib_name" ]] && continue
             so_file="target/${target}/release/lib${lib_name}.so"
             if [[ ! -f "$so_file" ]]; then
-              echo "::error::expected connector plugin artifact missing: ${so_file}. The plugin crate built no cdylib, or its name does not match lib<crate>.so." >&2
+              echo "::error::expected connector plugin artifact missing: ${so_file}. The plugin crate built no cdylib for this target." >&2
               exit 1
             fi
             cp "$so_file" "${outdir}/"
