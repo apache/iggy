@@ -81,7 +81,7 @@ internal static class VsrHeader
         var totalSize = HEADER_SIZE + payload.Length;
 
         BinaryPrimitives.WriteUInt32LittleEndian(header[SIZE_OFFSET..], (uint)totalSize);
-        header[COMMAND_OFFSET] = (byte)Command2.Request;
+        header[COMMAND_OFFSET] = (byte)Command.Request;
         WriteUInt128(header[REQUEST_CLIENT_OFFSET..], frame.ClientId);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_TIMESTAMP_OFFSET..], 0);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_ID_OFFSET..], frame.RequestId);
@@ -96,13 +96,13 @@ internal static class VsrHeader
         return totalSize;
     }
 
-    internal static Command2 PeekCommand(ReadOnlySpan<byte> header)
+    internal static Command PeekCommand(ReadOnlySpan<byte> header)
     {
         return header[COMMAND_OFFSET] switch
         {
-            (byte)Command2.Reply => Command2.Reply,
-            (byte)Command2.Eviction => Command2.Eviction,
-            _ => Command2.Reserved
+            (byte)Command.Reply => Command.Reply,
+            (byte)Command.Eviction => Command.Eviction,
+            _ => Command.Reserved
         };
     }
 

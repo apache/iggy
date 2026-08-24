@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
@@ -28,7 +27,7 @@ import { describe, it } from 'node:test';
 import { ProtocolFrameError } from './client.frame.js';
 import { IggyConnection } from './client.connection.js';
 import type { ClientConfig } from './client.type.js';
-import { Command2, HEADER_SIZE, REPLY_OFFSET } from '../wire/vsr/header.js';
+import { Command, HEADER_SIZE, REPLY_OFFSET } from '../wire/vsr/header.js';
 
 const FRAME_LIMIT = 2 * HEADER_SIZE;
 
@@ -53,7 +52,7 @@ const connectionConfig = (server: Server): ClientConfig => ({
 const replyFrame = (body: Buffer): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE + body.length);
   frame.writeUInt32LE(frame.length, REPLY_OFFSET.size);
-  frame.writeUInt8(Command2.Reply, REPLY_OFFSET.command);
+  frame.writeUInt8(Command.Reply, REPLY_OFFSET.command);
   body.copy(frame, HEADER_SIZE);
   return frame;
 };

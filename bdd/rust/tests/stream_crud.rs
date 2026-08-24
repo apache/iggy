@@ -15,5 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// `StoreConsumerOffset2` response is empty.
-pub type StoreConsumerOffset2Response = super::EmptyResponse;
+pub(crate) mod common;
+pub(crate) mod helpers;
+pub(crate) mod steps;
+
+use crate::common::global_context::GlobalContext;
+use cucumber::World;
+
+#[tokio::main]
+async fn main() {
+    GlobalContext::cucumber()
+        .fail_on_skipped()
+        .run_and_exit("../../bdd/scenarios/stream_crud.feature")
+        .await;
+}

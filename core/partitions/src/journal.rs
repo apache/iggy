@@ -19,7 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
-    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice_trusted},
+    send_messages::{self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice_trusted},
 };
 use std::io;
 use std::{
@@ -929,7 +929,7 @@ where
     }
 }
 
-impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMemStorage> {
+impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     type Header = PrepareHeader;
     type Entry = JournalBuffer;
     #[rustfmt::skip]
@@ -1023,7 +1023,7 @@ impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMe
 }
 
 pub fn select_batch_slice(
-    batch: &SendMessages2Ref<'_>,
+    batch: &BatchRef<'_>,
     query: MessageLookup,
     already_matched: u32,
 ) -> Option<SelectedBatchSlice> {
@@ -1087,7 +1087,7 @@ pub fn select_batch_slice(
 
 /// Push the fragments for one selected batch, shared by the resident-journal
 /// walk and the disk-chunk walk. `source` holds a stamped
-/// `[256B SendMessages2Header][blob]` batch starting at byte `batch_base`
+/// `[256B BatchHeader][blob]` batch starting at byte `batch_base`
 /// (the disk walk passes the chunk cursor; the resident walk passes
 /// `size_of::<PrepareHeader>()`, the batch's offset past the prepare header).
 /// A full-body selection forwards the original batch bytes by reference; a
@@ -1099,7 +1099,7 @@ pub fn push_selected_batch_fragments(
     matched_messages: &mut u32,
     source: &Frozen<4096>,
     batch_base: usize,
-    batch: &SendMessages2Ref<'_>,
+    batch: &BatchRef<'_>,
     selection: SelectedBatchSlice,
 ) {
     let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
@@ -1122,7 +1122,9 @@ pub fn push_selected_batch_fragments(
                 .get(selection.start..selection.end)
                 .expect("selected batch slice must stay within blob bounds"),
         );
-        fragments.push(Fragment::whole(rewritten.into_frozen()));
+        fragments.push(Fragment::whole(send_messages::frozen_batch_header(
+            &rewritten,
+        )));
         fragments.push(Fragment::slice(
             source.clone(),
             batch_base + COMMAND_HEADER_SIZE + selection.start,
@@ -1228,17 +1230,17 @@ pub fn select_resident(
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use iggy_binary_protocol::{Command2, HEADER_SIZE};
+    use iggy_binary_protocol::{Command, HEADER_SIZE};
     use journal::Journal;
     use server_common::Message;
-    use server_common::send_messages2::{
-        IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned, decode_batch_slice,
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned, decode_batch_slice,
     };
     use server_common::sharding::IggyNamespace;
 
     fn build_prepare(op: u64, size: usize) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size).transmute_header(|_, h: &mut PrepareHeader| {
-            h.command = Command2::Prepare;
+            h.command = Command::Prepare;
             h.op = op;
             h.size = u32::try_from(size).expect("size fits in u32");
         })
@@ -1468,10 +1470,10 @@ mod tests {
     /// producer). Timestamp polls filter on the broker time because that is
     /// the timestamp replies surface per message.
     fn build_timestamped_batch(base_timestamp: u64, origin_timestamp: u64) -> Vec<u8> {
-        let mut messages = IggyMessages2::with_capacity(3);
+        let mut messages = IggyMessages::with_capacity(3);
         for index in 0..3u64 {
-            messages.push(IggyMessage2 {
-                header: IggyMessage2Header {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
                     origin_timestamp: origin_timestamp + index,
                     payload_length: 8,
                     ..Default::default()
@@ -1480,7 +1482,7 @@ mod tests {
                 user_headers: None,
             });
         }
-        let mut owned = SendMessages2Owned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
+        let mut owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
             .expect("build send_messages batch");
         owned.header.base_timestamp = base_timestamp;
         owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);

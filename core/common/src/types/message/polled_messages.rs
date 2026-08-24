@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{IGGY_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, error::IggyError};
+use crate::{IggyMessage, IggyMessageHeader, error::IggyError};
 use bytes::Bytes;
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchMessageHeader};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
@@ -50,7 +51,17 @@ impl PolledMessages {
 }
 
 impl PolledMessages {
+    /// Decode a `PollMessages` response body: the 16-byte prefix followed by
+    /// the served batch records (`[256B batch header][frames]`, deltas
+    /// resolved against the stamped bases).
+    ///
+    /// # Errors
+    /// [`IggyError::InvalidNumberEncoding`] on a short prefix;
+    /// [`IggyError::InvalidMessagePayloadLength`] on a malformed record.
     pub fn from_bytes(bytes: Bytes) -> Result<Self, IggyError> {
+        if bytes.len() < 16 {
+            return Err(IggyError::InvalidNumberEncoding);
+        }
         let partition_id = u32::from_le_bytes(
             bytes[0..4]
                 .try_into()
@@ -67,7 +78,7 @@ impl PolledMessages {
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
 
-        let messages = messages_from_bytes_and_count(bytes.slice(16..), count)?;
+        let messages = messages_from_batches(bytes.slice(16..), count)?;
 
         Ok(Self {
             partition_id,
@@ -78,48 +89,61 @@ impl PolledMessages {
     }
 }
 
-/// Convert Bytes to messages
-fn messages_from_bytes_and_count(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, IggyError> {
+/// Walk the served batch records, resolving each frame's deltas to absolute
+/// values. Payload and user-header `Bytes` are zero-copy slices of the
+/// response buffer.
+fn messages_from_batches(buffer: Bytes, count: u32) -> Result<Vec<IggyMessage>, IggyError> {
     let mut messages = Vec::with_capacity(count as usize);
-    let mut position = 0;
-    let buf_len = buffer.len();
-    while position < buf_len {
-        if position + IGGY_MESSAGE_HEADER_SIZE > buf_len {
-            break;
-        }
-        let header_bytes = buffer.slice(position..position + IGGY_MESSAGE_HEADER_SIZE);
-        let header = match IggyMessageHeader::from_bytes(header_bytes) {
-            Ok(h) => h,
-            Err(e) => {
-                error!("Failed to deserialize message header: {}", e);
-                return Err(e);
+    let mut position = 0usize;
+    while position < buffer.len() {
+        let batch = BatchHeader::decode(&buffer[position..]).map_err(|decode_error| {
+            error!("Failed to decode polled batch header: {decode_error}");
+            IggyError::InvalidMessagePayloadLength
+        })?;
+        let batch_end = position
+            .checked_add(batch.total_size())
+            .filter(|end| *end <= buffer.len())
+            .ok_or(IggyError::InvalidMessagePayloadLength)?;
+        let mut cursor = position + BATCH_HEADER_SIZE;
+        while cursor < batch_end {
+            let frame =
+                BatchMessageHeader::decode(&buffer[cursor..batch_end]).map_err(|decode_error| {
+                    error!("Failed to decode polled message frame: {decode_error}");
+                    IggyError::InvalidMessagePayloadLength
+                })?;
+            let payload_start = cursor + iggy_binary_protocol::batch::BATCH_MESSAGE_HEADER_SIZE;
+            let payload_end = payload_start + frame.payload_length as usize;
+            let user_headers_end = payload_end + frame.user_headers_length as usize;
+            if user_headers_end > batch_end {
+                return Err(IggyError::InvalidMessagePayloadLength);
             }
-        };
-        position += IGGY_MESSAGE_HEADER_SIZE;
 
-        let payload_end = position + header.payload_length as usize;
-        if payload_end > buf_len {
-            break;
+            let header = IggyMessageHeader {
+                checksum: frame.checksum,
+                id: frame.id,
+                offset: batch.base_offset + u64::from(frame.offset_delta),
+                // Broker append time is stamped once per batch; the
+                // per-message delta applies to `origin_timestamp` only.
+                timestamp: batch.base_timestamp,
+                origin_timestamp: batch.origin_timestamp + u64::from(frame.timestamp_delta),
+                user_headers_length: frame.user_headers_length,
+                payload_length: frame.payload_length,
+                reserved: 0,
+            };
+            let payload = buffer.slice(payload_start..payload_end);
+            let user_headers = if frame.user_headers_length > 0 {
+                Some(buffer.slice(payload_end..user_headers_end))
+            } else {
+                None
+            };
+            messages.push(IggyMessage {
+                header,
+                payload,
+                user_headers,
+            });
+            cursor = user_headers_end;
         }
-        let payload = buffer.slice(position..payload_end);
-        position = payload_end;
-
-        let user_headers_end = position + header.user_headers_length as usize;
-        if user_headers_end > buf_len {
-            break;
-        }
-        let user_headers = if header.user_headers_length > 0 {
-            Some(buffer.slice(position..user_headers_end))
-        } else {
-            None
-        };
-        position = user_headers_end;
-
-        messages.push(IggyMessage {
-            header,
-            payload,
-            user_headers,
-        });
+        position = batch_end;
     }
 
     Ok(messages)

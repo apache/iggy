@@ -52,12 +52,12 @@ const (
 	rootPassword = "iggy"
 
 	// Command codes the raw-request cases drive directly.
-	getSnapshotCode           = 11
-	storeConsumerOffset2Code  = 123
-	deleteConsumerOffset2Code = 124
-	vendorCode                = 60000
+	getSnapshotCode          = 11
+	storeConsumerOffsetCode  = 121
+	deleteConsumerOffsetCode = 122
+	vendorCode               = 60000
 
-	// AckLevel values of the v2 consumer-offset requests.
+	// AckLevel values of the consumer-offset requests.
 	ackNoAck  = 0
 	ackQuorum = 1
 )
@@ -158,9 +158,9 @@ func testMessages(t *testing.T, count int) []iggcon.IggyMessage {
 	return messages
 }
 
-// consumerOffsetV2Payload builds the shared prefix of the v2 consumer-offset
+// consumerOffsetPayload builds the shared prefix of the consumer-offset
 // requests: [consumer][stream][topic][partition flag][partition].
-func consumerOffsetV2Payload(
+func consumerOffsetPayload(
 	t *testing.T,
 	consumer iggcon.Consumer,
 	streamId, topicId iggcon.Identifier,

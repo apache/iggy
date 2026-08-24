@@ -41,6 +41,8 @@ import java.util.function.Supplier;
 public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
     private static final Logger log = LoggerFactory.getLogger(ConsumerOffsetsTcpClient.class);
 
+    private static final byte ACK_QUORUM = 1;
+
     private final Supplier<AsyncTcpConnection> connectionSupplier;
 
     public ConsumerOffsetsTcpClient(Supplier<AsyncTcpConnection> connectionSupplier) {
@@ -59,6 +61,7 @@ public class ConsumerOffsetsTcpClient implements ConsumerOffsetsClient {
         payload.writeBytes(BytesSerializer.toBytes(topicId));
         payload.writeBytes(BytesSerializer.toBytes(partitionId));
         payload.writeBytes(BytesSerializer.toBytesAsU64(offset));
+        payload.writeByte(ACK_QUORUM);
 
         log.debug(
                 "Storing consumer offset - Stream: {}, Topic: {}, Partition: {}, Consumer: {}, Offset: {}",

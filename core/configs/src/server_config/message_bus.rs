@@ -54,7 +54,7 @@
 use super::COMPONENT;
 use crate::ConfigurationError;
 use configs::ConfigEnv;
-use iggy_common::{IggyByteSize, IggyDuration, Validatable};
+use iggy_common::{IggyByteSize, IggyDuration, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 
@@ -145,6 +145,16 @@ impl Validatable<ConfigurationError> for MessageBusConfig {
             eprintln!("{COMPONENT} message_bus.max_message_size must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.max_message_size.as_bytes_u64() > MAX_MESSAGE_SIZE_UPPER_BYTES {
+            eprintln!(
+                "{COMPONENT} message_bus.max_message_size ({}) exceeds the frozen ceiling of \
+                 {MAX_MESSAGE_SIZE_UPPER_BYTES} bytes: boot-time segment recovery derives fixed \
+                 scan and allocation limits from the widest legal wire frame, so batches admitted \
+                 above the ceiling would be refused as implausible by recovery on a later boot",
+                self.max_message_size.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.handshake_grace.as_micros() == 0 {
             eprintln!("{COMPONENT} message_bus.handshake_grace must be > 0");
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -211,6 +221,20 @@ mod tests {
         let mut c = baseline();
         c.max_message_size = IggyByteSize::from(0_u64);
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_max_message_size_above_frozen_ceiling() {
+        let mut c = baseline();
+        c.max_message_size = IggyByteSize::from(MAX_MESSAGE_SIZE_UPPER_BYTES + 1);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_max_message_size_at_frozen_ceiling() {
+        let mut c = baseline();
+        c.max_message_size = IggyByteSize::from(MAX_MESSAGE_SIZE_UPPER_BYTES);
+        assert!(c.validate().is_ok());
     }
 
     /// Tripwire: pins the local copy of `IOV_MAX_LIMIT` against the

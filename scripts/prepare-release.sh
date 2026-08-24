@@ -42,14 +42,13 @@ VERSION=$(grep '^version' "core/server/Cargo.toml" | head -n 1 | cut -d '"' -f2)
 
 echo "Preparing release for version: $VERSION"
 
-TAR_NAME="iggy-${VERSION}-incubating-src.tar"
-ARCHIVE_NAME="iggy-${VERSION}-incubating-src.tar.gz"
+TAR_NAME="iggy-${VERSION}-src.tar"
+ARCHIVE_NAME="iggy-${VERSION}-src.tar.gz"
 
 # Files/directories to include in the release
 RELEASE_PATHS=(
   "Cargo.lock"
   "Cargo.toml"
-  "DISCLAIMER"
   "Dockerfile"
   "LICENSE"
   "NOTICE"
@@ -69,7 +68,7 @@ RELEASE_PATHS=(
 # Create tar using git archive for consistent output
 git archive \
   --format=tar \
-  --prefix="iggy-${VERSION}-incubating-src/" \
+  --prefix="iggy-${VERSION}-src/" \
   -o "$RELEASE_DIR/$TAR_NAME" \
   HEAD \
   "${RELEASE_PATHS[@]}"

@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -94,7 +93,7 @@ describe('VSR custom request framing', () => {
       serializeSendMessages(
         1,
         2,
-        [],
+        [{ payload: 'x' }],
         Partitioning.PartitionId(3)
       )
     );

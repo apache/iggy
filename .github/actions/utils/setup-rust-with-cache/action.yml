@@ -64,9 +64,7 @@ runs:
 
     - name: Install system dependencies (Linux)
       if: runner.os == 'Linux' && inputs.install-system-dependencies == 'true'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libhwloc-dev pkg-config libudev-dev
+      run: ./scripts/ci/apt-install.sh libhwloc-dev pkg-config libudev-dev
       shell: bash
 
     - name: Install system dependencies (macOS)

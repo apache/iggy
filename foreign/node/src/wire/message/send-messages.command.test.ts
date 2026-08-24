@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -76,7 +75,9 @@ describe("SendMessages", () => {
     };
 
     it("serialize SendMessages into a buffer", () => {
-      assert.deepEqual(SEND_MESSAGES.serialize(t1).length, 589);
+      // metadata length prefix (4) + metadata (18) + batch header (256) +
+      // 7 frames of 48-byte header + 1-byte payload (343)
+      assert.deepEqual(SEND_MESSAGES.serialize(t1).length, 621);
     });
 
     it("serialize all kinds of messageId", () => {

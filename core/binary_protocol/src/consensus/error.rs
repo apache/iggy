@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::command::Command2;
+use super::command::Command;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ConsensusError {
     #[error("invalid command: expected {expected:?}, found {found:?}")]
-    InvalidCommand { expected: Command2, found: Command2 },
+    InvalidCommand { expected: Command, found: Command },
 
     #[error("invalid size: expected {expected:?}, found {found:?}")]
     InvalidSize { expected: u32, found: u32 },
@@ -41,7 +41,7 @@ pub enum ConsensusError {
         }
     )]
     FrameChecksumMismatch {
-        command: Command2,
+        command: Command,
         expected: u128,
         found: u128,
     },
@@ -62,13 +62,13 @@ pub enum ConsensusError {
     PrepareRequestChecksumPaddingNonZero,
 
     #[error("command must be Commit")]
-    CommitInvalidCommand2,
+    CommitInvalidCommand,
 
     #[error("size must be 256, found {0}")]
     CommitInvalidSize(u32),
 
     #[error("command must be Reply")]
-    ReplyInvalidCommand2,
+    ReplyInvalidCommand,
 
     #[error("request_checksum_padding must be 0")]
     ReplyRequestChecksumPaddingNonZero,
@@ -80,5 +80,5 @@ pub enum ConsensusError {
     InvalidBitPattern,
 
     #[error("client-bound command {0:?} cannot be dispatched on inbound path")]
-    ClientBoundCommand(Command2),
+    ClientBoundCommand(Command),
 }

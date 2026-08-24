@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { EventEmitter } from 'node:events';
 import type { Socket } from 'node:net';
@@ -27,7 +26,7 @@ import {
   ProtocolFrameError,
   ResponseFrameDecoder
 } from './client.frame.js';
-import { Command2, peekCommand } from '../wire/vsr/header.js';
+import { Command, peekCommand } from '../wire/vsr/header.js';
 import { evictionError } from '../wire/vsr/reply.js';
 
 
@@ -425,7 +424,7 @@ export class IggyConnection extends EventEmitter {
 
     try {
       for (const response of this.responseDecoder.push(data)) {
-        if (peekCommand(response) === Command2.Eviction)
+        if (peekCommand(response) === Command.Eviction)
           this.emit('eviction', evictionError(response));
         else
           this.emit('response', response);

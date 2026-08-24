@@ -25,7 +25,7 @@ mod common;
 
 use common::{header_only, loopback, test_client_meta};
 use compio::net::{TcpListener, TcpStream};
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use message_bus::client_listener::RequestHandler;
 use message_bus::framing::write_message;
 use message_bus::installer::install_client_tcp;
@@ -145,7 +145,7 @@ async fn orphan_reader_from_losing_install_does_not_invoke_on_request() {
     // Push a valid Request frame down the orphan reader's wire. Before
     // the fix, the orphan would call `on_request(client_id, msg)` and
     // bump the counter; with the fix the `aborted` guard skips it.
-    let msg = header_only(Command2::Request, 0, 0);
+    let msg = header_only(Command::Request, 0, 0);
     write_message(&mut second_peer, msg)
         .await
         .expect("write Request");

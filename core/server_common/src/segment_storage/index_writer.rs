@@ -15,16 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::PooledBuffer;
 use compio::fs::File;
 use compio::fs::OpenOptions;
-use compio::io::AsyncWriteAtExt;
 use err_trail::ErrContext;
-use iggy_common::INDEX_SIZE;
 use iggy_common::IggyError;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::trace;
+use tracing::{error, trace};
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]
@@ -32,7 +29,6 @@ pub struct IndexWriter {
     file_path: String,
     file: File,
     index_size_bytes: Rc<AtomicU64>,
-    fsync: bool,
 }
 
 // Safety: We are guaranteeing that IndexWriter will never be used from multiple threads
@@ -43,7 +39,6 @@ impl IndexWriter {
     pub async fn new(
         file_path: &str,
         index_size_bytes: Rc<AtomicU64>,
-        fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
@@ -59,10 +54,6 @@ impl IndexWriter {
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await.error(|e: &std::io::Error| {
-                format!("Failed to fsync index file after creation: {file_path}. {e}",)
-            });
-
             let actual_index_size = file
                 .metadata()
                 .await
@@ -72,7 +63,17 @@ impl IndexWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            index_size_bytes.store(actual_index_size, Ordering::Relaxed);
+            // Refusal rationale documented on `IggyError::SegmentSizeMismatchAtOpen`.
+            let expected_index_size = index_size_bytes.load(Ordering::Relaxed);
+            if actual_index_size != expected_index_size {
+                error!(
+                    "Index file size on disk: {actual_index_size} does not match expected size: {expected_index_size}, file: {file_path}"
+                );
+                return Err(IggyError::SegmentSizeMismatchAtOpen(
+                    actual_index_size,
+                    expected_index_size,
+                ));
+            }
         }
 
         let size = index_size_bytes.load(Ordering::Relaxed);
@@ -82,46 +83,7 @@ impl IndexWriter {
             file_path: file_path.to_string(),
             file,
             index_size_bytes,
-            fsync,
         })
-    }
-
-    /// Appends multiple index buffer to the index file in a single operation.
-    pub async fn save_indexes(&self, indexes: PooledBuffer) -> Result<(), IggyError> {
-        if indexes.is_empty() {
-            return Ok(());
-        }
-
-        let count = indexes.len() / INDEX_SIZE;
-        let len = indexes.len();
-
-        let position = self.index_size_bytes.load(Ordering::Relaxed);
-        let file = &self.file;
-        (&*file)
-            .write_all_at(indexes, position)
-            .await
-            .0
-            .error(|e: &std::io::Error| {
-                format!(
-                    "Failed to write {} indexes to file: {}. {e}",
-                    count, self.file_path
-                )
-            })
-            .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
-
-        self.index_size_bytes
-            .fetch_add(len as u64, Ordering::Release);
-
-        if self.fsync {
-            let _ = self.fsync().await;
-        }
-        trace!(
-            "Saved {count} indexes of size {} to file: {}",
-            INDEX_SIZE * count,
-            self.file_path
-        );
-
-        Ok(())
     }
 
     pub fn size_counter(&self) -> Rc<AtomicU64> {

@@ -17,11 +17,10 @@
 
 //! Runtime tunables for the shard-0 coordinator.
 //!
-//! TODO: move this module into `core/configs` (as a `CoordinatorConfig`
-//! section nested under `ClusterConfig`) once downstream bootstrap
-//! wiring that constructs [`crate::coordinator::ShardZeroCoordinator`]
-//! from `ServerConfig` lands. Kept in-crate for now to avoid churning
-//! the configs crate ahead of that wiring.
+//! The serde-facing section lives in `core/configs` as
+//! `[cluster.coordinator]` (`ClusterCoordinatorConfig`); the server's
+//! bootstrap converts it into this domain type. The split exists because
+//! `configs` and `shard` share no dependency edge.
 
 /// Tunables for [`crate::coordinator::ShardZeroCoordinator`].
 #[derive(Debug, Clone)]

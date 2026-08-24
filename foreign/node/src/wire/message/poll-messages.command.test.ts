@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
@@ -120,7 +119,7 @@ describe('VSR consumer-group polling', () => {
       (error: unknown) =>
         error instanceof ResponseError &&
         error.errorCode === 5006 &&
-        error.message.includes('message: Consumer group member not found')
+        error.message.includes('message: Consumer group member with client ID:')
     );
   });
 

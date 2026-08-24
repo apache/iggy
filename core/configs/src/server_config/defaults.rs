@@ -24,14 +24,15 @@
 //! [`crate::common::defaults`].
 
 use super::cluster::{
-    ClusterAuthConfig, ClusterConfig, ClusterNodeConfig, ClusterTlsConfig, TransportPorts,
+    ClusterAuthConfig, ClusterConfig, ClusterCoordinatorConfig, ClusterNodeConfig,
+    ClusterTlsConfig, TransportPorts,
 };
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
+use super::server::ServerConfig;
 use super::server::ServerSystemConfig;
-use super::server::{ExtraConfig, ServerConfig};
 use super::tcp::{TcpConfig, TcpTlsConfig};
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
@@ -50,7 +51,6 @@ impl Default for ServerConfig {
         ServerConfig {
             consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
-            extra: ExtraConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
             system: Arc::new(ServerSystemConfig::default()),
@@ -91,6 +91,11 @@ impl Default for ClusterConfig {
             view_change_status_timeout: SERVER_CONFIG
                 .cluster
                 .view_change_status_timeout
+                .parse()
+                .unwrap(),
+            superblock_wedged_fatal_timeout: SERVER_CONFIG
+                .cluster
+                .superblock_wedged_fatal_timeout
                 .parse()
                 .unwrap(),
             request_start_view_retransmit_interval: SERVER_CONFIG
@@ -144,6 +149,7 @@ impl Default for ClusterConfig {
                 .collect(),
             auth: ClusterAuthConfig::default(),
             tls: ClusterTlsConfig::default(),
+            coordinator: ClusterCoordinatorConfig::default(),
         }
     }
 }

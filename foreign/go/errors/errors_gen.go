@@ -222,6 +222,15 @@ func (e ResourceNotFound) Is(target error) bool {
 	return ok
 }
 
+type CannotCloseWebSocketConnection struct{}
+
+func (e CannotCloseWebSocketConnection) Error() string { return "cannot close websocket connection" }
+func (e CannotCloseWebSocketConnection) Code() Code    { return 21 }
+func (e CannotCloseWebSocketConnection) Is(target error) bool {
+	_, ok := target.(CannotCloseWebSocketConnection)
+	return ok
+}
+
 type StaleClient struct{}
 
 func (e StaleClient) Error() string { return "stale client" }
@@ -278,6 +287,32 @@ func (e InvalidIpAddress) Error() string {
 func (e InvalidIpAddress) Code() Code { return 35 }
 func (e InvalidIpAddress) Is(target error) bool {
 	_, ok := target.(InvalidIpAddress)
+	return ok
+}
+
+type HttpError struct {
+	Message string
+}
+
+func (e HttpError) Error() string {
+	return fmt.Sprintf("http error %s", e.Message)
+}
+func (e HttpError) Code() Code { return 36 }
+func (e HttpError) Is(target error) bool {
+	_, ok := target.(HttpError)
+	return ok
+}
+
+type InvalidApiUrl struct {
+	Url string
+}
+
+func (e InvalidApiUrl) Error() string {
+	return fmt.Sprintf("invalid api url: %s", e.Url)
+}
+func (e InvalidApiUrl) Code() Code { return 37 }
+func (e InvalidApiUrl) Is(target error) bool {
+	_, ok := target.(InvalidApiUrl)
 	return ok
 }
 
@@ -448,6 +483,17 @@ func (e UsersLimitReached) Is(target error) bool {
 	return ok
 }
 
+type InvalidPersonalAccessTokenExpiry struct{}
+
+func (e InvalidPersonalAccessTokenExpiry) Error() string {
+	return "invalid personal access token expiry"
+}
+func (e InvalidPersonalAccessTokenExpiry) Code() Code { return 56 }
+func (e InvalidPersonalAccessTokenExpiry) Is(target error) bool {
+	_, ok := target.(InvalidPersonalAccessTokenExpiry)
+	return ok
+}
+
 type TransientNotCommitted struct{}
 
 func (e TransientNotCommitted) Error() string { return "request transiently not committed; retry" }
@@ -465,6 +511,17 @@ func (e TransientNotAccepted) Error() string {
 func (e TransientNotAccepted) Code() Code { return 58 }
 func (e TransientNotAccepted) Is(target error) bool {
 	_, ok := target.(TransientNotAccepted)
+	return ok
+}
+
+type RequestAlreadyApplied struct{}
+
+func (e RequestAlreadyApplied) Error() string {
+	return "request already applied; its reply is no longer available"
+}
+func (e RequestAlreadyApplied) Code() Code { return 59 }
+func (e RequestAlreadyApplied) Is(target error) bool {
+	_, ok := target.(RequestAlreadyApplied)
 	return ok
 }
 
@@ -604,6 +661,19 @@ func (e InvalidAccessToken) Error() string { return "invalid access token" }
 func (e InvalidAccessToken) Code() Code    { return 78 }
 func (e InvalidAccessToken) Is(target error) bool {
 	_, ok := target.(InvalidAccessToken)
+	return ok
+}
+
+type CannotFetchJwks struct {
+	Url string
+}
+
+func (e CannotFetchJwks) Error() string {
+	return fmt.Sprintf("cannot fetch jwks from url: %s", e.Url)
+}
+func (e CannotFetchJwks) Code() Code { return 79 }
+func (e CannotFetchJwks) Is(target error) bool {
+	_, ok := target.(CannotFetchJwks)
 	return ok
 }
 
@@ -764,6 +834,51 @@ func (e CannotParseUrl) Is(target error) bool {
 	return ok
 }
 
+type WebSocketError struct{}
+
+func (e WebSocketError) Error() string { return "websocket error" }
+func (e WebSocketError) Code() Code    { return 400 }
+func (e WebSocketError) Is(target error) bool {
+	_, ok := target.(WebSocketError)
+	return ok
+}
+
+type WebSocketConnectionError struct{}
+
+func (e WebSocketConnectionError) Error() string { return "websocket connection error" }
+func (e WebSocketConnectionError) Code() Code    { return 401 }
+func (e WebSocketConnectionError) Is(target error) bool {
+	_, ok := target.(WebSocketConnectionError)
+	return ok
+}
+
+type WebSocketCloseError struct{}
+
+func (e WebSocketCloseError) Error() string { return "websocket close error" }
+func (e WebSocketCloseError) Code() Code    { return 402 }
+func (e WebSocketCloseError) Is(target error) bool {
+	_, ok := target.(WebSocketCloseError)
+	return ok
+}
+
+type WebSocketReceiveError struct{}
+
+func (e WebSocketReceiveError) Error() string { return "websocket receive error" }
+func (e WebSocketReceiveError) Code() Code    { return 403 }
+func (e WebSocketReceiveError) Is(target error) bool {
+	_, ok := target.(WebSocketReceiveError)
+	return ok
+}
+
+type WebSocketSendError struct{}
+
+func (e WebSocketSendError) Error() string { return "websocket send error" }
+func (e WebSocketSendError) Code() Code    { return 404 }
+func (e WebSocketSendError) Is(target error) bool {
+	_, ok := target.(WebSocketSendError)
+	return ok
+}
+
 type CannotCreateStreamsDirectory struct {
 	Path string
 }
@@ -908,16 +1023,16 @@ func (e StreamNameNotFound) Is(target error) bool {
 	return ok
 }
 
-type StreamIdAlreadyExists struct {
-	ID uint32
+type StreamDirectoryNotFound struct {
+	Path string
 }
 
-func (e StreamIdAlreadyExists) Error() string {
-	return fmt.Sprintf("stream with id: %d already exists.", e.ID)
+func (e StreamDirectoryNotFound) Error() string {
+	return fmt.Sprintf("stream with directory %s was not found.", e.Path)
 }
-func (e StreamIdAlreadyExists) Code() Code { return 1011 }
-func (e StreamIdAlreadyExists) Is(target error) bool {
-	_, ok := target.(StreamIdAlreadyExists)
+func (e StreamDirectoryNotFound) Code() Code { return 1011 }
+func (e StreamDirectoryNotFound) Is(target error) bool {
+	_, ok := target.(StreamDirectoryNotFound)
 	return ok
 }
 
@@ -972,6 +1087,15 @@ func (e InvalidTopicSize) Error() string {
 func (e InvalidTopicSize) Code() Code { return 1019 }
 func (e InvalidTopicSize) Is(target error) bool {
 	_, ok := target.(InvalidTopicSize)
+	return ok
+}
+
+type TooManyStreams struct{}
+
+func (e TooManyStreams) Error() string { return "too many streams" }
+func (e TooManyStreams) Code() Code    { return 1020 }
+func (e TooManyStreams) Is(target error) bool {
+	_, ok := target.(TooManyStreams)
 	return ok
 }
 
@@ -1140,20 +1264,6 @@ func (e TopicNameNotFound) Is(target error) bool {
 	return ok
 }
 
-type TopicIdAlreadyExists struct {
-	TopicId  uint32
-	StreamId uint32
-}
-
-func (e TopicIdAlreadyExists) Error() string {
-	return fmt.Sprintf("topic with id: %d for stream with id: %d already exists.", e.TopicId, e.StreamId)
-}
-func (e TopicIdAlreadyExists) Code() Code { return 2012 }
-func (e TopicIdAlreadyExists) Is(target error) bool {
-	_, ok := target.(TopicIdAlreadyExists)
-	return ok
-}
-
 type TopicNameAlreadyExists struct {
 	TopicName string
 	StreamId  uint32
@@ -1214,6 +1324,37 @@ func (e InvalidReplicationFactor) Error() string { return "invalid replication f
 func (e InvalidReplicationFactor) Code() Code    { return 2018 }
 func (e InvalidReplicationFactor) Is(target error) bool {
 	_, ok := target.(InvalidReplicationFactor)
+	return ok
+}
+
+type InvalidPartitionsCount struct{}
+
+func (e InvalidPartitionsCount) Error() string { return "invalid partitions count" }
+func (e InvalidPartitionsCount) Code() Code    { return 2019 }
+func (e InvalidPartitionsCount) Is(target error) bool {
+	_, ok := target.(InvalidPartitionsCount)
+	return ok
+}
+
+type TopicDirectoryNotFound struct {
+	Path string
+}
+
+func (e TopicDirectoryNotFound) Error() string {
+	return fmt.Sprintf("topic directory: %s not found", e.Path)
+}
+func (e TopicDirectoryNotFound) Code() Code { return 2020 }
+func (e TopicDirectoryNotFound) Is(target error) bool {
+	_, ok := target.(TopicDirectoryNotFound)
+	return ok
+}
+
+type TooManyTopics struct{}
+
+func (e TooManyTopics) Error() string { return "too many topics" }
+func (e TooManyTopics) Code() Code    { return 2021 }
+func (e TooManyTopics) Is(target error) bool {
+	_, ok := target.(TooManyTopics)
 	return ok
 }
 
@@ -1414,6 +1555,43 @@ func (e ConsumerOffsetNotFound) Error() string {
 func (e ConsumerOffsetNotFound) Code() Code { return 3021 }
 func (e ConsumerOffsetNotFound) Is(target error) bool {
 	_, ok := target.(ConsumerOffsetNotFound)
+	return ok
+}
+
+type NotResolvedConsumer struct {
+	ID uint32
+}
+
+func (e NotResolvedConsumer) Error() string {
+	return fmt.Sprintf("failed to resolve consumer with id: %d", e.ID)
+}
+func (e NotResolvedConsumer) Code() Code { return 3022 }
+func (e NotResolvedConsumer) Is(target error) bool {
+	_, ok := target.(NotResolvedConsumer)
+	return ok
+}
+
+type CannotOpenConsumerOffsetsFile struct {
+	Path string
+}
+
+func (e CannotOpenConsumerOffsetsFile) Error() string {
+	return fmt.Sprintf("cannot open consumer offsets file for path: %s", e.Path)
+}
+func (e CannotOpenConsumerOffsetsFile) Code() Code { return 3023 }
+func (e CannotOpenConsumerOffsetsFile) Is(target error) bool {
+	_, ok := target.(CannotOpenConsumerOffsetsFile)
+	return ok
+}
+
+type PartitionIdSpaceExhausted struct{}
+
+func (e PartitionIdSpaceExhausted) Error() string {
+	return "partition id space exhausted for this topic"
+}
+func (e PartitionIdSpaceExhausted) Code() Code { return 3013 }
+func (e PartitionIdSpaceExhausted) Is(target error) bool {
+	_, ok := target.(PartitionIdSpaceExhausted)
 	return ok
 }
 
@@ -1823,6 +2001,86 @@ func (e TooSmallMessage) Is(target error) bool {
 	return ok
 }
 
+type InvalidMessageTimestampDelta struct {
+	Delta uint64
+}
+
+func (e InvalidMessageTimestampDelta) Error() string {
+	return fmt.Sprintf("invalid message timestamp delta: %d microseconds exceeds the per-batch limit", e.Delta)
+}
+func (e InvalidMessageTimestampDelta) Code() Code { return 4038 }
+func (e InvalidMessageTimestampDelta) Is(target error) bool {
+	_, ok := target.(InvalidMessageTimestampDelta)
+	return ok
+}
+
+type InvalidBatchChecksum struct {
+	Stored     uint64
+	Computed   uint64
+	BaseOffset uint64
+}
+
+func (e InvalidBatchChecksum) Error() string {
+	return fmt.Sprintf("invalid batch checksum: %d, expected: %d, for base offset: %d", e.Stored, e.Computed, e.BaseOffset)
+}
+func (e InvalidBatchChecksum) Code() Code { return 4039 }
+func (e InvalidBatchChecksum) Is(target error) bool {
+	_, ok := target.(InvalidBatchChecksum)
+	return ok
+}
+
+type InvalidHeaderKind struct {
+	Kind uint8
+}
+
+func (e InvalidHeaderKind) Error() string {
+	return fmt.Sprintf("invalid header kind code: %d", e.Kind)
+}
+func (e InvalidHeaderKind) Code() Code { return 4040 }
+func (e InvalidHeaderKind) Is(target error) bool {
+	_, ok := target.(InvalidHeaderKind)
+	return ok
+}
+
+type UnsupportedOptionKey struct {
+	Key string
+}
+
+func (e UnsupportedOptionKey) Error() string {
+	return fmt.Sprintf("unsupported option key: %s", e.Key)
+}
+func (e UnsupportedOptionKey) Code() Code { return 4041 }
+func (e UnsupportedOptionKey) Is(target error) bool {
+	_, ok := target.(UnsupportedOptionKey)
+	return ok
+}
+
+type InvalidOptionValue struct {
+	Key string
+}
+
+func (e InvalidOptionValue) Error() string {
+	return fmt.Sprintf("invalid option value for key: %s", e.Key)
+}
+func (e InvalidOptionValue) Code() Code { return 4042 }
+func (e InvalidOptionValue) Is(target error) bool {
+	_, ok := target.(InvalidOptionValue)
+	return ok
+}
+
+type OptionsBlockTooLarge struct {
+	Details string
+}
+
+func (e OptionsBlockTooLarge) Error() string {
+	return fmt.Sprintf("options block exceeds its limits: %s", e.Details)
+}
+func (e OptionsBlockTooLarge) Code() Code { return 4043 }
+func (e OptionsBlockTooLarge) Is(target error) bool {
+	_, ok := target.(OptionsBlockTooLarge)
+	return ok
+}
+
 type CannotSendMessagesDueToClientDisconnection struct{}
 
 func (e CannotSendMessagesDueToClientDisconnection) Error() string {
@@ -1879,15 +2137,6 @@ func (e BackgroundSendBufferOverflow) Is(target error) bool {
 	return ok
 }
 
-type ProducerSendFailed struct{}
-
-func (e ProducerSendFailed) Error() string { return "producer send failed" }
-func (e ProducerSendFailed) Code() Code    { return 4056 }
-func (e ProducerSendFailed) Is(target error) bool {
-	_, ok := target.(ProducerSendFailed)
-	return ok
-}
-
 type ProducerClosed struct{}
 
 func (e ProducerClosed) Error() string { return "producer closed" }
@@ -1910,6 +2159,33 @@ func (e InvalidOffset) Is(target error) bool {
 	return ok
 }
 
+type InvalidReservedField struct {
+	Value uint64
+}
+
+func (e InvalidReservedField) Error() string {
+	return fmt.Sprintf("invalid reserved field value: %d, expected: 0", e.Value)
+}
+func (e InvalidReservedField) Code() Code { return 4101 }
+func (e InvalidReservedField) Is(target error) bool {
+	_, ok := target.(InvalidReservedField)
+	return ok
+}
+
+type SegmentSizeMismatchAtOpen struct {
+	OnDisk   uint64
+	Expected uint64
+}
+
+func (e SegmentSizeMismatchAtOpen) Error() string {
+	return fmt.Sprintf("segment file size on disk: %d does not match expected size: %d", e.OnDisk, e.Expected)
+}
+func (e SegmentSizeMismatchAtOpen) Code() Code { return 4102 }
+func (e SegmentSizeMismatchAtOpen) Is(target error) bool {
+	_, ok := target.(SegmentSizeMismatchAtOpen)
+	return ok
+}
+
 type ConsumerGroupIdNotFound struct {
 	GroupId uint32
 	TopicId uint32
@@ -1921,20 +2197,6 @@ func (e ConsumerGroupIdNotFound) Error() string {
 func (e ConsumerGroupIdNotFound) Code() Code { return 5000 }
 func (e ConsumerGroupIdNotFound) Is(target error) bool {
 	_, ok := target.(ConsumerGroupIdNotFound)
-	return ok
-}
-
-type ConsumerGroupIdAlreadyExists struct {
-	GroupId uint32
-	TopicId uint32
-}
-
-func (e ConsumerGroupIdAlreadyExists) Error() string {
-	return fmt.Sprintf("consumer group with id: %d for topic with id: %d already exists.", e.GroupId, e.TopicId)
-}
-func (e ConsumerGroupIdAlreadyExists) Code() Code { return 5001 }
-func (e ConsumerGroupIdAlreadyExists) Is(target error) bool {
-	_, ok := target.(ConsumerGroupIdAlreadyExists)
 	return ok
 }
 
@@ -2270,6 +2532,102 @@ func (e CannotReadIndexTimestamp) Is(target error) bool {
 	return ok
 }
 
+type TimestampOutOfRange struct {
+	Timestamp uint64
+}
+
+func (e TimestampOutOfRange) Error() string {
+	return fmt.Sprintf("timestamp out of range: %d", e.Timestamp)
+}
+func (e TimestampOutOfRange) Code() Code { return 10013 }
+func (e TimestampOutOfRange) Is(target error) bool {
+	_, ok := target.(TimestampOutOfRange)
+	return ok
+}
+
+type ShardNotFound struct {
+	StreamId    uint32
+	TopicId     uint32
+	PartitionId uint32
+}
+
+func (e ShardNotFound) Error() string {
+	return fmt.Sprintf("shard not found for stream id: %d, topic id: %d, partition id: %d", e.StreamId, e.TopicId, e.PartitionId)
+}
+func (e ShardNotFound) Code() Code { return 11000 }
+func (e ShardNotFound) Is(target error) bool {
+	_, ok := target.(ShardNotFound)
+	return ok
+}
+
+type ShardCommunicationError struct{}
+
+func (e ShardCommunicationError) Error() string { return "shard communication error" }
+func (e ShardCommunicationError) Code() Code    { return 11001 }
+func (e ShardCommunicationError) Is(target error) bool {
+	_, ok := target.(ShardCommunicationError)
+	return ok
+}
+
+type CannotBindToSocket struct {
+	Addr string
+}
+
+func (e CannotBindToSocket) Error() string {
+	return fmt.Sprintf("cannot bind to socket with addr: %s", e.Addr)
+}
+func (e CannotBindToSocket) Code() Code { return 12000 }
+func (e CannotBindToSocket) Is(target error) bool {
+	_, ok := target.(CannotBindToSocket)
+	return ok
+}
+
+type TaskTimeout struct{}
+
+func (e TaskTimeout) Error() string { return "task execution timeout" }
+func (e TaskTimeout) Code() Code    { return 12001 }
+func (e TaskTimeout) Is(target error) bool {
+	_, ok := target.(TaskTimeout)
+	return ok
+}
+
+type IoError struct {
+	Message string
+}
+
+func (e IoError) Error() string {
+	return fmt.Sprintf("io error: %s", e.Message)
+}
+func (e IoError) Code() Code { return 13000 }
+func (e IoError) Is(target error) bool {
+	_, ok := target.(IoError)
+	return ok
+}
+
+type AlreadyAuthenticated struct{}
+
+func (e AlreadyAuthenticated) Error() string {
+	return "vsr session already bound; reset before re-binding"
+}
+func (e AlreadyAuthenticated) Code() Code { return 14000 }
+func (e AlreadyAuthenticated) Is(target error) bool {
+	_, ok := target.(AlreadyAuthenticated)
+	return ok
+}
+
+type InvalidSession struct {
+	Session uint64
+}
+
+func (e InvalidSession) Error() string {
+	return fmt.Sprintf("vsr session value %d is invalid (must be non-zero)", e.Session)
+}
+func (e InvalidSession) Code() Code { return 14001 }
+func (e InvalidSession) Is(target error) bool {
+	_, ok := target.(InvalidSession)
+	return ok
+}
+
 type IncompatibleProtocolVersion struct {
 	ClientVersion    uint32
 	ServerVersionMin uint32
@@ -2304,12 +2662,15 @@ var (
 	ErrInvalidStateEntryChecksum                  = InvalidStateEntryChecksum{}
 	ErrCannotOpenDatabase                         = CannotOpenDatabase{}
 	ErrResourceNotFound                           = ResourceNotFound{}
+	ErrCannotCloseWebSocketConnection             = CannotCloseWebSocketConnection{}
 	ErrStaleClient                                = StaleClient{}
 	ErrTcpError                                   = TcpError{}
 	ErrQuicError                                  = QuicError{}
 	ErrInvalidServerAddress                       = InvalidServerAddress{}
 	ErrInvalidClientAddress                       = InvalidClientAddress{}
 	ErrInvalidIpAddress                           = InvalidIpAddress{}
+	ErrHttpError                                  = HttpError{}
+	ErrInvalidApiUrl                              = InvalidApiUrl{}
 	ErrUnauthenticated                            = Unauthenticated{}
 	ErrUnauthorized                               = Unauthorized{}
 	ErrInvalidCredentials                         = InvalidCredentials{}
@@ -2326,8 +2687,10 @@ var (
 	ErrInvalidPersonalAccessToken                 = InvalidPersonalAccessToken{}
 	ErrPersonalAccessTokenExpired                 = PersonalAccessTokenExpired{}
 	ErrUsersLimitReached                          = UsersLimitReached{}
+	ErrInvalidPersonalAccessTokenExpiry           = InvalidPersonalAccessTokenExpiry{}
 	ErrTransientNotCommitted                      = TransientNotCommitted{}
 	ErrTransientNotAccepted                       = TransientNotAccepted{}
+	ErrRequestAlreadyApplied                      = RequestAlreadyApplied{}
 	ErrNotConnected                               = NotConnected{}
 	ErrClientShutdown                             = ClientShutdown{}
 	ErrInvalidTlsDomain                           = InvalidTlsDomain{}
@@ -2343,6 +2706,7 @@ var (
 	ErrCannotGenerateJwt                          = CannotGenerateJwt{}
 	ErrAccessTokenMissing                         = AccessTokenMissing{}
 	ErrInvalidAccessToken                         = InvalidAccessToken{}
+	ErrCannotFetchJwks                            = CannotFetchJwks{}
 	ErrInvalidSizeBytes                           = InvalidSizeBytes{}
 	ErrInvalidUtf8                                = InvalidUtf8{}
 	ErrInvalidNumberEncoding                      = InvalidNumberEncoding{}
@@ -2359,6 +2723,11 @@ var (
 	ErrEmptyResponse                              = EmptyResponse{}
 	ErrCannotCreateEndpoint                       = CannotCreateEndpoint{}
 	ErrCannotParseUrl                             = CannotParseUrl{}
+	ErrWebSocketError                             = WebSocketError{}
+	ErrWebSocketConnectionError                   = WebSocketConnectionError{}
+	ErrWebSocketCloseError                        = WebSocketCloseError{}
+	ErrWebSocketReceiveError                      = WebSocketReceiveError{}
+	ErrWebSocketSendError                         = WebSocketSendError{}
 	ErrCannotCreateStreamsDirectory               = CannotCreateStreamsDirectory{}
 	ErrCannotCreateStreamDirectory                = CannotCreateStreamDirectory{}
 	ErrCannotCreateStreamInfo                     = CannotCreateStreamInfo{}
@@ -2370,12 +2739,13 @@ var (
 	ErrCannotDeleteStreamDirectory                = CannotDeleteStreamDirectory{}
 	ErrStreamIdNotFound                           = StreamIdNotFound{}
 	ErrStreamNameNotFound                         = StreamNameNotFound{}
-	ErrStreamIdAlreadyExists                      = StreamIdAlreadyExists{}
+	ErrStreamDirectoryNotFound                    = StreamDirectoryNotFound{}
 	ErrStreamNameAlreadyExists                    = StreamNameAlreadyExists{}
 	ErrInvalidStreamName                          = InvalidStreamName{}
 	ErrInvalidStreamId                            = InvalidStreamId{}
 	ErrCannotReadStreams                          = CannotReadStreams{}
 	ErrInvalidTopicSize                           = InvalidTopicSize{}
+	ErrTooManyStreams                             = TooManyStreams{}
 	ErrCannotCreateTopicsDirectory                = CannotCreateTopicsDirectory{}
 	ErrCannotCreateTopicDirectory                 = CannotCreateTopicDirectory{}
 	ErrCannotCreateTopicInfo                      = CannotCreateTopicInfo{}
@@ -2388,13 +2758,15 @@ var (
 	ErrCannotPollTopic                            = CannotPollTopic{}
 	ErrTopicIdNotFound                            = TopicIdNotFound{}
 	ErrTopicNameNotFound                          = TopicNameNotFound{}
-	ErrTopicIdAlreadyExists                       = TopicIdAlreadyExists{}
 	ErrTopicNameAlreadyExists                     = TopicNameAlreadyExists{}
 	ErrInvalidTopicName                           = InvalidTopicName{}
 	ErrTooManyPartitions                          = TooManyPartitions{}
 	ErrInvalidTopicId                             = InvalidTopicId{}
 	ErrCannotReadTopics                           = CannotReadTopics{}
 	ErrInvalidReplicationFactor                   = InvalidReplicationFactor{}
+	ErrInvalidPartitionsCount                     = InvalidPartitionsCount{}
+	ErrTopicDirectoryNotFound                     = TopicDirectoryNotFound{}
+	ErrTooManyTopics                              = TooManyTopics{}
 	ErrCannotCreatePartition                      = CannotCreatePartition{}
 	ErrCannotCreatePartitionsDirectory            = CannotCreatePartitionsDirectory{}
 	ErrCannotCreatePartitionDirectory             = CannotCreatePartitionDirectory{}
@@ -2410,6 +2782,9 @@ var (
 	ErrCannotCreateConsumerOffsetsDirectory       = CannotCreateConsumerOffsetsDirectory{}
 	ErrCannotReadConsumerOffsets                  = CannotReadConsumerOffsets{}
 	ErrConsumerOffsetNotFound                     = ConsumerOffsetNotFound{}
+	ErrNotResolvedConsumer                        = NotResolvedConsumer{}
+	ErrCannotOpenConsumerOffsetsFile              = CannotOpenConsumerOffsetsFile{}
+	ErrPartitionIdSpaceExhausted                  = PartitionIdSpaceExhausted{}
 	ErrSegmentNotFound                            = SegmentNotFound{}
 	ErrSegmentClosed                              = SegmentClosed{}
 	ErrInvalidSegmentSize                         = InvalidSegmentSize{}
@@ -2448,17 +2823,23 @@ var (
 	ErrInvalidIndexesCount                        = InvalidIndexesCount{}
 	ErrInvalidMessagesSize                        = InvalidMessagesSize{}
 	ErrTooSmallMessage                            = TooSmallMessage{}
+	ErrInvalidMessageTimestampDelta               = InvalidMessageTimestampDelta{}
+	ErrInvalidBatchChecksum                       = InvalidBatchChecksum{}
+	ErrInvalidHeaderKind                          = InvalidHeaderKind{}
+	ErrUnsupportedOptionKey                       = UnsupportedOptionKey{}
+	ErrInvalidOptionValue                         = InvalidOptionValue{}
+	ErrOptionsBlockTooLarge                       = OptionsBlockTooLarge{}
 	ErrCannotSendMessagesDueToClientDisconnection = CannotSendMessagesDueToClientDisconnection{}
 	ErrBackgroundSendError                        = BackgroundSendError{}
 	ErrBackgroundSendTimeout                      = BackgroundSendTimeout{}
 	ErrBackgroundSendBufferFull                   = BackgroundSendBufferFull{}
 	ErrBackgroundWorkerDisconnected               = BackgroundWorkerDisconnected{}
 	ErrBackgroundSendBufferOverflow               = BackgroundSendBufferOverflow{}
-	ErrProducerSendFailed                         = ProducerSendFailed{}
 	ErrProducerClosed                             = ProducerClosed{}
 	ErrInvalidOffset                              = InvalidOffset{}
+	ErrInvalidReservedField                       = InvalidReservedField{}
+	ErrSegmentSizeMismatchAtOpen                  = SegmentSizeMismatchAtOpen{}
 	ErrConsumerGroupIdNotFound                    = ConsumerGroupIdNotFound{}
-	ErrConsumerGroupIdAlreadyExists               = ConsumerGroupIdAlreadyExists{}
 	ErrInvalidConsumerGroupId                     = InvalidConsumerGroupId{}
 	ErrConsumerGroupNameNotFound                  = ConsumerGroupNameNotFound{}
 	ErrConsumerGroupNameAlreadyExists             = ConsumerGroupNameAlreadyExists{}
@@ -2492,6 +2873,14 @@ var (
 	ErrCannotReadIndexOffset                      = CannotReadIndexOffset{}
 	ErrCannotReadIndexPosition                    = CannotReadIndexPosition{}
 	ErrCannotReadIndexTimestamp                   = CannotReadIndexTimestamp{}
+	ErrTimestampOutOfRange                        = TimestampOutOfRange{}
+	ErrShardNotFound                              = ShardNotFound{}
+	ErrShardCommunicationError                    = ShardCommunicationError{}
+	ErrCannotBindToSocket                         = CannotBindToSocket{}
+	ErrTaskTimeout                                = TaskTimeout{}
+	ErrIoError                                    = IoError{}
+	ErrAlreadyAuthenticated                       = AlreadyAuthenticated{}
+	ErrInvalidSession                             = InvalidSession{}
 	ErrIncompatibleProtocolVersion                = IncompatibleProtocolVersion{}
 )
 
@@ -2516,12 +2905,15 @@ const (
 	InvalidStateEntryChecksumCode                  Code = 16
 	CannotOpenDatabaseCode                         Code = 19
 	ResourceNotFoundCode                           Code = 20
+	CannotCloseWebSocketConnectionCode             Code = 21
 	StaleClientCode                                Code = 30
 	TcpErrorCode                                   Code = 31
 	QuicErrorCode                                  Code = 32
 	InvalidServerAddressCode                       Code = 33
 	InvalidClientAddressCode                       Code = 34
 	InvalidIpAddressCode                           Code = 35
+	HttpErrorCode                                  Code = 36
+	InvalidApiUrlCode                              Code = 37
 	UnauthenticatedCode                            Code = 40
 	UnauthorizedCode                               Code = 41
 	InvalidCredentialsCode                         Code = 42
@@ -2538,8 +2930,10 @@ const (
 	InvalidPersonalAccessTokenCode                 Code = 53
 	PersonalAccessTokenExpiredCode                 Code = 54
 	UsersLimitReachedCode                          Code = 55
+	InvalidPersonalAccessTokenExpiryCode           Code = 56
 	TransientNotCommittedCode                      Code = 57
 	TransientNotAcceptedCode                       Code = 58
+	RequestAlreadyAppliedCode                      Code = 59
 	NotConnectedCode                               Code = 61
 	ClientShutdownCode                             Code = 63
 	InvalidTlsDomainCode                           Code = 64
@@ -2555,6 +2949,7 @@ const (
 	CannotGenerateJwtCode                          Code = 76
 	AccessTokenMissingCode                         Code = 77
 	InvalidAccessTokenCode                         Code = 78
+	CannotFetchJwksCode                            Code = 79
 	InvalidSizeBytesCode                           Code = 80
 	InvalidUtf8Code                                Code = 81
 	InvalidNumberEncodingCode                      Code = 82
@@ -2571,6 +2966,11 @@ const (
 	EmptyResponseCode                              Code = 304
 	CannotCreateEndpointCode                       Code = 305
 	CannotParseUrlCode                             Code = 306
+	WebSocketErrorCode                             Code = 400
+	WebSocketConnectionErrorCode                   Code = 401
+	WebSocketCloseErrorCode                        Code = 402
+	WebSocketReceiveErrorCode                      Code = 403
+	WebSocketSendErrorCode                         Code = 404
 	CannotCreateStreamsDirectoryCode               Code = 1000
 	CannotCreateStreamDirectoryCode                Code = 1001
 	CannotCreateStreamInfoCode                     Code = 1002
@@ -2582,12 +2982,13 @@ const (
 	CannotDeleteStreamDirectoryCode                Code = 1008
 	StreamIdNotFoundCode                           Code = 1009
 	StreamNameNotFoundCode                         Code = 1010
-	StreamIdAlreadyExistsCode                      Code = 1011
+	StreamDirectoryNotFoundCode                    Code = 1011
 	StreamNameAlreadyExistsCode                    Code = 1012
 	InvalidStreamNameCode                          Code = 1013
 	InvalidStreamIdCode                            Code = 1014
 	CannotReadStreamsCode                          Code = 1015
 	InvalidTopicSizeCode                           Code = 1019
+	TooManyStreamsCode                             Code = 1020
 	CannotCreateTopicsDirectoryCode                Code = 2000
 	CannotCreateTopicDirectoryCode                 Code = 2001
 	CannotCreateTopicInfoCode                      Code = 2002
@@ -2600,13 +3001,15 @@ const (
 	CannotPollTopicCode                            Code = 2009
 	TopicIdNotFoundCode                            Code = 2010
 	TopicNameNotFoundCode                          Code = 2011
-	TopicIdAlreadyExistsCode                       Code = 2012
 	TopicNameAlreadyExistsCode                     Code = 2013
 	InvalidTopicNameCode                           Code = 2014
 	TooManyPartitionsCode                          Code = 2015
 	InvalidTopicIdCode                             Code = 2016
 	CannotReadTopicsCode                           Code = 2017
 	InvalidReplicationFactorCode                   Code = 2018
+	InvalidPartitionsCountCode                     Code = 2019
+	TopicDirectoryNotFoundCode                     Code = 2020
+	TooManyTopicsCode                              Code = 2021
 	CannotCreatePartitionCode                      Code = 3000
 	CannotCreatePartitionsDirectoryCode            Code = 3001
 	CannotCreatePartitionDirectoryCode             Code = 3002
@@ -2622,6 +3025,9 @@ const (
 	CannotCreateConsumerOffsetsDirectoryCode       Code = 3012
 	CannotReadConsumerOffsetsCode                  Code = 3020
 	ConsumerOffsetNotFoundCode                     Code = 3021
+	NotResolvedConsumerCode                        Code = 3022
+	CannotOpenConsumerOffsetsFileCode              Code = 3023
+	PartitionIdSpaceExhaustedCode                  Code = 3013
 	SegmentNotFoundCode                            Code = 4000
 	SegmentClosedCode                              Code = 4001
 	InvalidSegmentSizeCode                         Code = 4002
@@ -2660,17 +3066,23 @@ const (
 	InvalidIndexesCountCode                        Code = 4035
 	InvalidMessagesSizeCode                        Code = 4036
 	TooSmallMessageCode                            Code = 4037
+	InvalidMessageTimestampDeltaCode               Code = 4038
+	InvalidBatchChecksumCode                       Code = 4039
+	InvalidHeaderKindCode                          Code = 4040
+	UnsupportedOptionKeyCode                       Code = 4041
+	InvalidOptionValueCode                         Code = 4042
+	OptionsBlockTooLargeCode                       Code = 4043
 	CannotSendMessagesDueToClientDisconnectionCode Code = 4050
 	BackgroundSendErrorCode                        Code = 4051
 	BackgroundSendTimeoutCode                      Code = 4052
 	BackgroundSendBufferFullCode                   Code = 4053
 	BackgroundWorkerDisconnectedCode               Code = 4054
 	BackgroundSendBufferOverflowCode               Code = 4055
-	ProducerSendFailedCode                         Code = 4056
 	ProducerClosedCode                             Code = 4057
 	InvalidOffsetCode                              Code = 4100
+	InvalidReservedFieldCode                       Code = 4101
+	SegmentSizeMismatchAtOpenCode                  Code = 4102
 	ConsumerGroupIdNotFoundCode                    Code = 5000
-	ConsumerGroupIdAlreadyExistsCode               Code = 5001
 	InvalidConsumerGroupIdCode                     Code = 5002
 	ConsumerGroupNameNotFoundCode                  Code = 5003
 	ConsumerGroupNameAlreadyExistsCode             Code = 5004
@@ -2704,6 +3116,14 @@ const (
 	CannotReadIndexOffsetCode                      Code = 10010
 	CannotReadIndexPositionCode                    Code = 10011
 	CannotReadIndexTimestampCode                   Code = 10012
+	TimestampOutOfRangeCode                        Code = 10013
+	ShardNotFoundCode                              Code = 11000
+	ShardCommunicationErrorCode                    Code = 11001
+	CannotBindToSocketCode                         Code = 12000
+	TaskTimeoutCode                                Code = 12001
+	IoErrorCode                                    Code = 13000
+	AlreadyAuthenticatedCode                       Code = 14000
+	InvalidSessionCode                             Code = 14001
 	IncompatibleProtocolVersionCode                Code = 14003
 )
 
@@ -2745,6 +3165,8 @@ func (c Code) String() string {
 		return "CannotOpenDatabase"
 	case ResourceNotFoundCode:
 		return "ResourceNotFound"
+	case CannotCloseWebSocketConnectionCode:
+		return "CannotCloseWebSocketConnection"
 	case StaleClientCode:
 		return "StaleClient"
 	case TcpErrorCode:
@@ -2757,6 +3179,10 @@ func (c Code) String() string {
 		return "InvalidClientAddress"
 	case InvalidIpAddressCode:
 		return "InvalidIpAddress"
+	case HttpErrorCode:
+		return "HttpError"
+	case InvalidApiUrlCode:
+		return "InvalidApiUrl"
 	case UnauthenticatedCode:
 		return "Unauthenticated"
 	case UnauthorizedCode:
@@ -2789,10 +3215,14 @@ func (c Code) String() string {
 		return "PersonalAccessTokenExpired"
 	case UsersLimitReachedCode:
 		return "UsersLimitReached"
+	case InvalidPersonalAccessTokenExpiryCode:
+		return "InvalidPersonalAccessTokenExpiry"
 	case TransientNotCommittedCode:
 		return "TransientNotCommitted"
 	case TransientNotAcceptedCode:
 		return "TransientNotAccepted"
+	case RequestAlreadyAppliedCode:
+		return "RequestAlreadyApplied"
 	case NotConnectedCode:
 		return "NotConnected"
 	case ClientShutdownCode:
@@ -2823,6 +3253,8 @@ func (c Code) String() string {
 		return "AccessTokenMissing"
 	case InvalidAccessTokenCode:
 		return "InvalidAccessToken"
+	case CannotFetchJwksCode:
+		return "CannotFetchJwks"
 	case InvalidSizeBytesCode:
 		return "InvalidSizeBytes"
 	case InvalidUtf8Code:
@@ -2855,6 +3287,16 @@ func (c Code) String() string {
 		return "CannotCreateEndpoint"
 	case CannotParseUrlCode:
 		return "CannotParseUrl"
+	case WebSocketErrorCode:
+		return "WebSocketError"
+	case WebSocketConnectionErrorCode:
+		return "WebSocketConnectionError"
+	case WebSocketCloseErrorCode:
+		return "WebSocketCloseError"
+	case WebSocketReceiveErrorCode:
+		return "WebSocketReceiveError"
+	case WebSocketSendErrorCode:
+		return "WebSocketSendError"
 	case CannotCreateStreamsDirectoryCode:
 		return "CannotCreateStreamsDirectory"
 	case CannotCreateStreamDirectoryCode:
@@ -2877,8 +3319,8 @@ func (c Code) String() string {
 		return "StreamIdNotFound"
 	case StreamNameNotFoundCode:
 		return "StreamNameNotFound"
-	case StreamIdAlreadyExistsCode:
-		return "StreamIdAlreadyExists"
+	case StreamDirectoryNotFoundCode:
+		return "StreamDirectoryNotFound"
 	case StreamNameAlreadyExistsCode:
 		return "StreamNameAlreadyExists"
 	case InvalidStreamNameCode:
@@ -2889,6 +3331,8 @@ func (c Code) String() string {
 		return "CannotReadStreams"
 	case InvalidTopicSizeCode:
 		return "InvalidTopicSize"
+	case TooManyStreamsCode:
+		return "TooManyStreams"
 	case CannotCreateTopicsDirectoryCode:
 		return "CannotCreateTopicsDirectory"
 	case CannotCreateTopicDirectoryCode:
@@ -2913,8 +3357,6 @@ func (c Code) String() string {
 		return "TopicIdNotFound"
 	case TopicNameNotFoundCode:
 		return "TopicNameNotFound"
-	case TopicIdAlreadyExistsCode:
-		return "TopicIdAlreadyExists"
 	case TopicNameAlreadyExistsCode:
 		return "TopicNameAlreadyExists"
 	case InvalidTopicNameCode:
@@ -2927,6 +3369,12 @@ func (c Code) String() string {
 		return "CannotReadTopics"
 	case InvalidReplicationFactorCode:
 		return "InvalidReplicationFactor"
+	case InvalidPartitionsCountCode:
+		return "InvalidPartitionsCount"
+	case TopicDirectoryNotFoundCode:
+		return "TopicDirectoryNotFound"
+	case TooManyTopicsCode:
+		return "TooManyTopics"
 	case CannotCreatePartitionCode:
 		return "CannotCreatePartition"
 	case CannotCreatePartitionsDirectoryCode:
@@ -2957,6 +3405,12 @@ func (c Code) String() string {
 		return "CannotReadConsumerOffsets"
 	case ConsumerOffsetNotFoundCode:
 		return "ConsumerOffsetNotFound"
+	case NotResolvedConsumerCode:
+		return "NotResolvedConsumer"
+	case CannotOpenConsumerOffsetsFileCode:
+		return "CannotOpenConsumerOffsetsFile"
+	case PartitionIdSpaceExhaustedCode:
+		return "PartitionIdSpaceExhausted"
 	case SegmentNotFoundCode:
 		return "SegmentNotFound"
 	case SegmentClosedCode:
@@ -3033,6 +3487,18 @@ func (c Code) String() string {
 		return "InvalidMessagesSize"
 	case TooSmallMessageCode:
 		return "TooSmallMessage"
+	case InvalidMessageTimestampDeltaCode:
+		return "InvalidMessageTimestampDelta"
+	case InvalidBatchChecksumCode:
+		return "InvalidBatchChecksum"
+	case InvalidHeaderKindCode:
+		return "InvalidHeaderKind"
+	case UnsupportedOptionKeyCode:
+		return "UnsupportedOptionKey"
+	case InvalidOptionValueCode:
+		return "InvalidOptionValue"
+	case OptionsBlockTooLargeCode:
+		return "OptionsBlockTooLarge"
 	case CannotSendMessagesDueToClientDisconnectionCode:
 		return "CannotSendMessagesDueToClientDisconnection"
 	case BackgroundSendErrorCode:
@@ -3045,16 +3511,16 @@ func (c Code) String() string {
 		return "BackgroundWorkerDisconnected"
 	case BackgroundSendBufferOverflowCode:
 		return "BackgroundSendBufferOverflow"
-	case ProducerSendFailedCode:
-		return "ProducerSendFailed"
 	case ProducerClosedCode:
 		return "ProducerClosed"
 	case InvalidOffsetCode:
 		return "InvalidOffset"
+	case InvalidReservedFieldCode:
+		return "InvalidReservedField"
+	case SegmentSizeMismatchAtOpenCode:
+		return "SegmentSizeMismatchAtOpen"
 	case ConsumerGroupIdNotFoundCode:
 		return "ConsumerGroupIdNotFound"
-	case ConsumerGroupIdAlreadyExistsCode:
-		return "ConsumerGroupIdAlreadyExists"
 	case InvalidConsumerGroupIdCode:
 		return "InvalidConsumerGroupId"
 	case ConsumerGroupNameNotFoundCode:
@@ -3121,6 +3587,22 @@ func (c Code) String() string {
 		return "CannotReadIndexPosition"
 	case CannotReadIndexTimestampCode:
 		return "CannotReadIndexTimestamp"
+	case TimestampOutOfRangeCode:
+		return "TimestampOutOfRange"
+	case ShardNotFoundCode:
+		return "ShardNotFound"
+	case ShardCommunicationErrorCode:
+		return "ShardCommunicationError"
+	case CannotBindToSocketCode:
+		return "CannotBindToSocket"
+	case TaskTimeoutCode:
+		return "TaskTimeout"
+	case IoErrorCode:
+		return "IoError"
+	case AlreadyAuthenticatedCode:
+		return "AlreadyAuthenticated"
+	case InvalidSessionCode:
+		return "InvalidSession"
 	case IncompatibleProtocolVersionCode:
 		return "IncompatibleProtocolVersion"
 	default:
@@ -3166,6 +3648,8 @@ func FromCode(code Code) IggyError {
 		return ErrCannotOpenDatabase
 	case ResourceNotFoundCode:
 		return ErrResourceNotFound
+	case CannotCloseWebSocketConnectionCode:
+		return ErrCannotCloseWebSocketConnection
 	case StaleClientCode:
 		return ErrStaleClient
 	case TcpErrorCode:
@@ -3178,6 +3662,10 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidClientAddress
 	case InvalidIpAddressCode:
 		return ErrInvalidIpAddress
+	case HttpErrorCode:
+		return ErrHttpError
+	case InvalidApiUrlCode:
+		return ErrInvalidApiUrl
 	case UnauthenticatedCode:
 		return ErrUnauthenticated
 	case UnauthorizedCode:
@@ -3210,10 +3698,14 @@ func FromCode(code Code) IggyError {
 		return ErrPersonalAccessTokenExpired
 	case UsersLimitReachedCode:
 		return ErrUsersLimitReached
+	case InvalidPersonalAccessTokenExpiryCode:
+		return ErrInvalidPersonalAccessTokenExpiry
 	case TransientNotCommittedCode:
 		return ErrTransientNotCommitted
 	case TransientNotAcceptedCode:
 		return ErrTransientNotAccepted
+	case RequestAlreadyAppliedCode:
+		return ErrRequestAlreadyApplied
 	case NotConnectedCode:
 		return ErrNotConnected
 	case ClientShutdownCode:
@@ -3244,6 +3736,8 @@ func FromCode(code Code) IggyError {
 		return ErrAccessTokenMissing
 	case InvalidAccessTokenCode:
 		return ErrInvalidAccessToken
+	case CannotFetchJwksCode:
+		return ErrCannotFetchJwks
 	case InvalidSizeBytesCode:
 		return ErrInvalidSizeBytes
 	case InvalidUtf8Code:
@@ -3276,6 +3770,16 @@ func FromCode(code Code) IggyError {
 		return ErrCannotCreateEndpoint
 	case CannotParseUrlCode:
 		return ErrCannotParseUrl
+	case WebSocketErrorCode:
+		return ErrWebSocketError
+	case WebSocketConnectionErrorCode:
+		return ErrWebSocketConnectionError
+	case WebSocketCloseErrorCode:
+		return ErrWebSocketCloseError
+	case WebSocketReceiveErrorCode:
+		return ErrWebSocketReceiveError
+	case WebSocketSendErrorCode:
+		return ErrWebSocketSendError
 	case CannotCreateStreamsDirectoryCode:
 		return ErrCannotCreateStreamsDirectory
 	case CannotCreateStreamDirectoryCode:
@@ -3298,8 +3802,8 @@ func FromCode(code Code) IggyError {
 		return ErrStreamIdNotFound
 	case StreamNameNotFoundCode:
 		return ErrStreamNameNotFound
-	case StreamIdAlreadyExistsCode:
-		return ErrStreamIdAlreadyExists
+	case StreamDirectoryNotFoundCode:
+		return ErrStreamDirectoryNotFound
 	case StreamNameAlreadyExistsCode:
 		return ErrStreamNameAlreadyExists
 	case InvalidStreamNameCode:
@@ -3310,6 +3814,8 @@ func FromCode(code Code) IggyError {
 		return ErrCannotReadStreams
 	case InvalidTopicSizeCode:
 		return ErrInvalidTopicSize
+	case TooManyStreamsCode:
+		return ErrTooManyStreams
 	case CannotCreateTopicsDirectoryCode:
 		return ErrCannotCreateTopicsDirectory
 	case CannotCreateTopicDirectoryCode:
@@ -3334,8 +3840,6 @@ func FromCode(code Code) IggyError {
 		return ErrTopicIdNotFound
 	case TopicNameNotFoundCode:
 		return ErrTopicNameNotFound
-	case TopicIdAlreadyExistsCode:
-		return ErrTopicIdAlreadyExists
 	case TopicNameAlreadyExistsCode:
 		return ErrTopicNameAlreadyExists
 	case InvalidTopicNameCode:
@@ -3348,6 +3852,12 @@ func FromCode(code Code) IggyError {
 		return ErrCannotReadTopics
 	case InvalidReplicationFactorCode:
 		return ErrInvalidReplicationFactor
+	case InvalidPartitionsCountCode:
+		return ErrInvalidPartitionsCount
+	case TopicDirectoryNotFoundCode:
+		return ErrTopicDirectoryNotFound
+	case TooManyTopicsCode:
+		return ErrTooManyTopics
 	case CannotCreatePartitionCode:
 		return ErrCannotCreatePartition
 	case CannotCreatePartitionsDirectoryCode:
@@ -3378,6 +3888,12 @@ func FromCode(code Code) IggyError {
 		return ErrCannotReadConsumerOffsets
 	case ConsumerOffsetNotFoundCode:
 		return ErrConsumerOffsetNotFound
+	case NotResolvedConsumerCode:
+		return ErrNotResolvedConsumer
+	case CannotOpenConsumerOffsetsFileCode:
+		return ErrCannotOpenConsumerOffsetsFile
+	case PartitionIdSpaceExhaustedCode:
+		return ErrPartitionIdSpaceExhausted
 	case SegmentNotFoundCode:
 		return ErrSegmentNotFound
 	case SegmentClosedCode:
@@ -3454,6 +3970,18 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidMessagesSize
 	case TooSmallMessageCode:
 		return ErrTooSmallMessage
+	case InvalidMessageTimestampDeltaCode:
+		return ErrInvalidMessageTimestampDelta
+	case InvalidBatchChecksumCode:
+		return ErrInvalidBatchChecksum
+	case InvalidHeaderKindCode:
+		return ErrInvalidHeaderKind
+	case UnsupportedOptionKeyCode:
+		return ErrUnsupportedOptionKey
+	case InvalidOptionValueCode:
+		return ErrInvalidOptionValue
+	case OptionsBlockTooLargeCode:
+		return ErrOptionsBlockTooLarge
 	case CannotSendMessagesDueToClientDisconnectionCode:
 		return ErrCannotSendMessagesDueToClientDisconnection
 	case BackgroundSendErrorCode:
@@ -3466,16 +3994,16 @@ func FromCode(code Code) IggyError {
 		return ErrBackgroundWorkerDisconnected
 	case BackgroundSendBufferOverflowCode:
 		return ErrBackgroundSendBufferOverflow
-	case ProducerSendFailedCode:
-		return ErrProducerSendFailed
 	case ProducerClosedCode:
 		return ErrProducerClosed
 	case InvalidOffsetCode:
 		return ErrInvalidOffset
+	case InvalidReservedFieldCode:
+		return ErrInvalidReservedField
+	case SegmentSizeMismatchAtOpenCode:
+		return ErrSegmentSizeMismatchAtOpen
 	case ConsumerGroupIdNotFoundCode:
 		return ErrConsumerGroupIdNotFound
-	case ConsumerGroupIdAlreadyExistsCode:
-		return ErrConsumerGroupIdAlreadyExists
 	case InvalidConsumerGroupIdCode:
 		return ErrInvalidConsumerGroupId
 	case ConsumerGroupNameNotFoundCode:
@@ -3542,6 +4070,22 @@ func FromCode(code Code) IggyError {
 		return ErrCannotReadIndexPosition
 	case CannotReadIndexTimestampCode:
 		return ErrCannotReadIndexTimestamp
+	case TimestampOutOfRangeCode:
+		return ErrTimestampOutOfRange
+	case ShardNotFoundCode:
+		return ErrShardNotFound
+	case ShardCommunicationErrorCode:
+		return ErrShardCommunicationError
+	case CannotBindToSocketCode:
+		return ErrCannotBindToSocket
+	case TaskTimeoutCode:
+		return ErrTaskTimeout
+	case IoErrorCode:
+		return ErrIoError
+	case AlreadyAuthenticatedCode:
+		return ErrAlreadyAuthenticated
+	case InvalidSessionCode:
+		return ErrInvalidSession
 	case IncompatibleProtocolVersionCode:
 		return ErrIncompatibleProtocolVersion
 	default:

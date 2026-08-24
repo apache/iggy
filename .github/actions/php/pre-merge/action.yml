@@ -29,8 +29,7 @@ runs:
     - name: Install PHP build dependencies
       shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        ./scripts/ci/apt-install.sh --no-install-recommends \
           clang \
           composer \
           libclang-dev \

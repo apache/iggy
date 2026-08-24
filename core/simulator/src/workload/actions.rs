@@ -27,7 +27,7 @@ pub enum Action {
     // DO NOT REORDER (hash baseline depends on these indices).
     CreateStream,
     SendMessages,
-    StoreConsumerOffset2,
+    StoreConsumerOffset,
     DeleteStream,
     UpdateStream,
     PurgeStream,
@@ -47,9 +47,7 @@ pub enum Action {
     UpdatePermissions,
     CreatePersonalAccessToken,
     DeletePersonalAccessToken,
-    StoreConsumerOffset,
     DeleteConsumerOffset,
-    DeleteConsumerOffset2,
 }
 
 // Lock the discriminants of the first three variants. Inserting a new variant before
@@ -58,5 +56,5 @@ pub enum Action {
 const _: () = {
     assert!(Action::CreateStream as u8 == 0);
     assert!(Action::SendMessages as u8 == 1);
-    assert!(Action::StoreConsumerOffset2 as u8 == 2);
+    assert!(Action::StoreConsumerOffset as u8 == 2);
 };

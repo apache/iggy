@@ -18,7 +18,7 @@
 use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
-use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command2, PrepareHeader};
+use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command, PrepareHeader};
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
@@ -287,7 +287,7 @@ async fn find_complete_entry(
 
         let last_start = want - HEADER_SIZE;
         for offset in 0..=last_start {
-            if buf[offset + COMMAND_OFFSET] != Command2::Prepare as u8 {
+            if buf[offset + COMMAND_OFFSET] != Command::Prepare as u8 {
                 continue;
             }
             let candidate = &buf[offset..offset + HEADER_SIZE];
@@ -310,7 +310,7 @@ async fn find_complete_entry(
 fn valid_entry_header(scratch: &mut Owned<16>, bytes: &[u8]) -> Option<PrepareHeader> {
     scratch.as_mut_slice().copy_from_slice(bytes);
     let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(scratch.as_slice()).ok()?;
-    if header.command != Command2::Prepare
+    if header.command != Command::Prepare
         || (header.size as usize) < HEADER_SIZE
         || u64::from(header.size) > MAX_ENTRY_SIZE
     {
@@ -454,7 +454,7 @@ impl PrepareJournal {
             let header: PrepareHeader = *header_ref;
 
             // Validate: must be a Prepare command with sane size
-            if header.command != Command2::Prepare
+            if header.command != Command::Prepare
                 || (header.size as usize) < HEADER_SIZE
                 || u64::from(header.size) > MAX_ENTRY_SIZE
             {
@@ -629,7 +629,7 @@ impl PrepareJournal {
     }
 
     /// How many entries the opening scan replayed unverified
-    /// ([`CHECKSUM_BODY_UNSEALED`]). `0` once every producer seals; the boot path
+    /// (`CHECKSUM_BODY_UNSEALED`). `0` once every producer seals; the boot path
     /// warns while it is not, so the fail-open stretch is visible to an operator.
     pub const fn unsealed_entry_count(&self) -> u64 {
         self.unsealed_entries
@@ -741,7 +741,7 @@ impl PrepareJournal {
     clippy::cast_sign_loss,
     clippy::future_not_send
 )]
-impl Journal<FileStorage> for PrepareJournal {
+impl Journal for PrepareJournal {
     fn last_op(&self) -> Option<u64> {
         self.last_op.get()
     }
@@ -1162,7 +1162,6 @@ impl Journal<FileStorage> for PrepareJournal {
 }
 
 impl JournalHandle for PrepareJournal {
-    type Storage = FileStorage;
     type Target = Self;
 
     fn handle(&self) -> &Self::Target {
@@ -1206,7 +1205,7 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.operation = Operation::CreateStream;
         header.checksum_body = checksum_body;
@@ -1699,7 +1698,7 @@ mod tests {
 
     #[compio::test]
     async fn corrupt_command_byte_truncates_on_reopen() {
-        // Bit-flipped `Command2` discriminant: must truncate, not panic.
+        // Bit-flipped `Command` discriminant: must truncate, not panic.
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
 
@@ -1719,7 +1718,7 @@ mod tests {
             use std::io::{Seek, SeekFrom, Write};
             let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.seek(SeekFrom::Start(command_byte_offset)).unwrap();
-            file.write_all(&[99u8]).unwrap(); // out of range for Command2
+            file.write_all(&[99u8]).unwrap(); // out of range for Command
             file.sync_all().unwrap();
         }
 
@@ -1810,7 +1809,7 @@ mod tests {
         {
             use std::io::Write;
             let mut file = std::fs::File::create(&path).unwrap();
-            // All-0xFF is not a valid `Command2`/`Operation` bit pattern,
+            // All-0xFF is not a valid `Command`/`Operation` bit pattern,
             // so `try_from_bytes` rejects the header.
             file.write_all(&[0xFF_u8; HEADER_SIZE]).unwrap();
             // Sparse-extend past MAX_ENTRY_SIZE so the corruption at pos 0
@@ -1857,7 +1856,7 @@ mod tests {
             use std::io::{Seek, SeekFrom, Write};
             let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.seek(SeekFrom::Start(command_byte_offset)).unwrap();
-            file.write_all(&[99u8]).unwrap(); // out of range for Command2
+            file.write_all(&[99u8]).unwrap(); // out of range for Command
             file.sync_all().unwrap();
         }
 
@@ -1890,7 +1889,7 @@ mod tests {
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = 1;
         header.operation = Operation::CreateStream;
         header.size = (HEADER_SIZE + 48) as u32; // 16 bytes of slack

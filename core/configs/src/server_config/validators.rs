@@ -25,13 +25,12 @@
 use super::COMPONENT;
 use super::cluster::STATE_CHUNK_HEADER_LEN;
 use super::partition::{CONCURRENT_SERVED_SEGMENTS, SEGMENT_SIZE_OVERSHOOT_BYTES};
-use super::server::{ExtraConfig, NamespaceConfig, ServerConfig};
+use super::server::ServerConfig;
 use crate::ConfigurationError;
 use crate::common::http::HMAC_JWT_ALGORITHMS;
 use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
 use err_trail::ErrContext;
-use iggy_common::{IggyExpiry, Validatable};
-use server_common::sharding::IggyNamespace;
+use iggy_common::{IggyExpiry, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
 
 /// compio-ws (tungstenite 0.29) `write_buffer_size` default. Used to
 /// evaluate the `max_write_buffer_size > write_buffer_size` invariant
@@ -59,9 +58,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
                     "{COMPONENT} (error: {e}) - failed to validate personal access token config"
                 )
             })?;
-        self.extra.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate extra config")
-        })?;
         self.system
             .segment
             .validate()
@@ -155,6 +151,39 @@ impl Validatable<ConfigurationError> for ServerConfig {
             }
         }
 
+        // Validate the bus knobs BEFORE any cross-section bound derived from
+        // them: `max_message_size` has a frozen ceiling in there, and an
+        // operator who raised it past the ceiling must meet that error first
+        // -- not the artifact-floor error below, which would send them off
+        // to raise `transfer_artifact_bytes_max` and only then learn the
+        // edit was impossible.
+        self.message_bus
+            .validate()
+            .error(|e: &ConfigurationError| {
+                format!("{COMPONENT} (error: {e}) - failed to validate message_bus config")
+            })?;
+
+        // The HTTP produce path builds its bus message in-process, so the
+        // framing decoder's `max_message_size` cap never runs on it: the
+        // request body is the only bound on the widest batch record that
+        // path can persist. A produce request carries at most one batch and
+        // base64 leaves ~25% slack, so bounding the body above the frozen
+        // recovery ceiling would let a legally admitted, checksum-valid
+        // batch be refused as implausible by boot-time segment recovery.
+        if self.http.enabled
+            && self.http.max_request_size.as_bytes_u64() > MAX_MESSAGE_SIZE_UPPER_BYTES
+        {
+            eprintln!(
+                "{COMPONENT} http.max_request_size ({}) exceeds the frozen ceiling of \
+                 {MAX_MESSAGE_SIZE_UPPER_BYTES} bytes: the HTTP produce path is not framed by \
+                 the message bus, so its body size is what bounds the widest persistable batch \
+                 record, and records above the ceiling are refused as implausible by boot-time \
+                 segment recovery",
+                self.http.max_request_size.as_bytes_u64()
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
         // A received segment artifact can be one whole batch larger than the
         // segment cap (rotation checks the cap AFTER appending), and the real
         // batch bound is the BUS frame cap -- the server never enforces
@@ -205,12 +234,6 @@ impl Validatable<ConfigurationError> for ServerConfig {
                 resident_len.saturating_mul(CONCURRENT_SERVED_SEGMENTS)
             );
         }
-
-        self.message_bus
-            .validate()
-            .error(|e: &ConfigurationError| {
-                format!("{COMPONENT} (error: {e}) - failed to validate message_bus config")
-            })?;
 
         // Repair frames ride the bounded per-peer message-bus queue. A repair
         // round of cluster.repair_chunk_max frames that meets or overruns
@@ -401,26 +424,6 @@ fn reject_unsupported(config: &ServerConfig) -> Result<(), ConfigurationError> {
     Ok(())
 }
 
-impl Validatable<ConfigurationError> for ExtraConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        self.namespace.validate().error(|e: &ConfigurationError| {
-            format!("{COMPONENT} (error: {e}) - failed to validate namespace config")
-        })?;
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigurationError> for NamespaceConfig {
-    fn validate(&self) -> Result<(), ConfigurationError> {
-        IggyNamespace::validate_capacity(self.max_streams, self.max_topics, self.max_partitions)
-            .map_err(|error| {
-                eprintln!("extra.namespace is invalid: {error}");
-                ConfigurationError::InvalidConfigurationValue
-            })?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::cluster::{ClusterNodeConfig, TransportPorts};
@@ -606,6 +609,27 @@ mod tests {
     fn given_ws_frame_size_above_bus_max_message_size_when_validating_should_reject() {
         let config = config_with_override("[websocket]\nmax_frame_size = \"128 MiB\"\n");
         assert!(config.validate().is_err());
+    }
+
+    // The HTTP produce path is not bus-framed, so its body cap is the only
+    // bound on the widest record that path can persist.
+    #[test]
+    fn given_http_max_request_size_above_recovery_ceiling_when_validating_should_reject() {
+        let config = config_with_override("[http]\nmax_request_size = \"257 MiB\"\n");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_http_max_request_size_at_recovery_ceiling_when_validating_should_pass() {
+        let config = config_with_override("[http]\nmax_request_size = \"256 MiB\"\n");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_http_disabled_when_max_request_size_above_ceiling_should_pass() {
+        let config =
+            config_with_override("[http]\nenabled = false\nmax_request_size = \"257 MiB\"\n");
+        assert!(config.validate().is_ok());
     }
 
     #[test]

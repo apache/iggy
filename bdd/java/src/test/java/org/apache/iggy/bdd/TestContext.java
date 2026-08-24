@@ -27,6 +27,7 @@ class TestContext {
     String serverAddr;
     Long lastStreamId;
     String lastStreamName;
+    boolean lastStreamWasFound;
     Long lastTopicId;
     String lastTopicName;
     Long lastTopicPartitions;

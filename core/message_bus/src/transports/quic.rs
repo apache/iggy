@@ -49,7 +49,7 @@
 //! connection share ONE request id (only metadata ops advance the dedup
 //! counter), so a stranded reply would be consumed by the NEXT partition
 //! op's bidi and shift the connection's data-plane stream off by one,
-//! permanently. Instead, [`REPLY_WAIT_BACKSTOP`] (longer than the SDK's
+//! permanently. Instead, `REPLY_WAIT_BACKSTOP` (longer than the SDK's
 //! whole-request deadline, so the client always gives up first and
 //! reconnects) closes the CONNECTION, which drops the mailbox and every
 //! pending reply with it -- nothing can strand or cross request ids. A
@@ -90,7 +90,7 @@ use compio_quic::{
     crypto::rustls::QuicServerConfig,
 };
 use futures::FutureExt;
-use iggy_binary_protocol::{Command2, HEADER_SIZE, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::{Command, HEADER_SIZE, ReplyHeader, RequestHeader};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -300,7 +300,7 @@ pub(crate) const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// Closing the connection drops the mailbox and any late reply with it.
 const REPLY_WAIT_BACKSTOP: Duration = Duration::from_mins(1);
 
-/// `Command2` byte offset shared by every consensus header (after the
+/// `Command` byte offset shared by every consensus header (after the
 /// fixed checksum/cluster/size/view/release prefix).
 const COMMAND_OFFSET: usize = 60;
 
@@ -316,13 +316,13 @@ enum ReplyRoute {
     Unkeyed,
 }
 
-/// Decide how to route an outbound frame. Only `Command2::Reply` carries a
+/// Decide how to route an outbound frame. Only `Command::Reply` carries a
 /// `request` id; everything else must pass through unfiltered.
 fn reply_route(frame: &BusMessage) -> ReplyRoute {
     let bytes = frame.as_slice();
     let is_reply = bytes
         .get(COMMAND_OFFSET)
-        .is_some_and(|&command| command == Command2::Reply as u8);
+        .is_some_and(|&command| command == Command::Reply as u8);
     if !is_reply {
         return ReplyRoute::Unkeyed;
     }
@@ -554,7 +554,7 @@ mod tests {
     use async_channel::bounded;
     use compio::io::AsyncWrite;
     use compio_quic::ClientBuilder;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use server_common::iobuf::Frozen;
     use server_common::{MESSAGE_ALIGN, Message};
@@ -566,7 +566,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    fn header_only(command: Command2) -> Frozen<MESSAGE_ALIGN> {
+    fn header_only(command: Command) -> Frozen<MESSAGE_ALIGN> {
         #[allow(clippy::cast_possible_truncation)]
         Message::<GenericHeader>::new(HEADER_SIZE)
             .transmute_header(|_, h: &mut GenericHeader| {
@@ -654,11 +654,11 @@ mod tests {
             // and then awaits exactly one reply on `rx` before
             // accepting the next bidi. Feed three replies in step.
             let a = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command2::Reply)).await.unwrap();
+            out_tx.send(header_only(Command::Reply)).await.unwrap();
             let b = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command2::Reply)).await.unwrap();
+            out_tx.send(header_only(Command::Reply)).await.unwrap();
             let c = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command2::Reply)).await.unwrap();
+            out_tx.send(header_only(Command::Reply)).await.unwrap();
             shutdown.trigger();
             let _ = handle.await;
             (a.header().command, b.header().command, c.header().command)
@@ -671,7 +671,7 @@ mod tests {
         let connection = connecting.await.expect("client handshake");
 
         // Three sequential bidis, one frame each.
-        for command in [Command2::Ping, Command2::Prepare, Command2::Request] {
+        for command in [Command::Ping, Command::Prepare, Command::Request] {
             let (mut send, _recv) = connection.open_bi_wait().await.expect("open_bi");
             let BufResult(result, _) = send.write_all(header_only(command)).await;
             result.expect("write");
@@ -682,9 +682,9 @@ mod tests {
             .await
             .expect("server task within 5s")
             .unwrap();
-        assert_eq!(a, Command2::Ping);
-        assert_eq!(b, Command2::Prepare);
-        assert_eq!(c, Command2::Request);
+        assert_eq!(a, Command::Ping);
+        assert_eq!(b, Command::Prepare);
+        assert_eq!(c, Command::Request);
     }
 
     /// An oversize size field in the request header makes

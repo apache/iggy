@@ -56,7 +56,7 @@ public final class VsrHeaders {
     static final int EVICTION_PROTOCOL_VERSION_MIN_OFFSET = 148;
     static final int EVICTION_REASON_OFFSET = 255;
 
-    // Command2 discriminants
+    // Command discriminants
     static final int COMMAND_REQUEST = 5;
     static final int COMMAND_REPLY = 8;
     static final int COMMAND_EVICTION = 13;

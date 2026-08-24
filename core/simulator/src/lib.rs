@@ -270,8 +270,11 @@ impl Simulator {
 
             // One crossfire mesh per replica; every shard gets a clone of
             // the canonical senders vec and exclusively takes its inbox.
-            let (senders, mut inboxes) =
-                shard::shard_mesh_channels(shards_per_replica, SIM_INBOX_CAPACITY);
+            let (senders, mut inboxes, mut reply_inboxes) = shard::shard_mesh_channels(
+                shards_per_replica,
+                SIM_INBOX_CAPACITY,
+                SIM_INBOX_CAPACITY,
+            );
 
             let mut shards = Vec::with_capacity(usize::from(shards_per_replica));
             let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
@@ -286,6 +289,9 @@ impl Simulator {
                 let inbox = inboxes[usize::from(shard_idx)]
                     .take()
                     .expect("mesh yields exactly one inbox per shard");
+                let reply_inbox = reply_inboxes[usize::from(shard_idx)]
+                    .take()
+                    .expect("mesh yields exactly one reply inbox per shard");
                 // Only shard 0 owns metadata consensus, so only it carries the
                 // superblock. Peer shards persist nothing.
                 let shard_superblock = if shard_idx == 0 {
@@ -302,6 +308,7 @@ impl Simulator {
                     rc,
                     senders.clone(),
                     inbox,
+                    reply_inbox,
                     consensus_clock.clone(),
                     shell,
                     metadata_bundle.clone(),
@@ -366,6 +373,10 @@ impl Simulator {
     /// # Panics
     /// Panics if a replica's shard count does not fit `u32` (impossible:
     /// mesh construction caps it at `u16`).
+    // TODO(hubcio): partitions created down this path are built via
+    // `IggyPartition::with_in_memory_storage` and rely on the writer-less
+    // persist branch in `IggyPartition`; give them first-class in-memory
+    // segment storage so that branch can be deleted.
     #[allow(clippy::cast_possible_truncation)]
     pub fn init_partition(&mut self, namespace: IggyNamespace) {
         for (i, replica) in self.replicas.iter().enumerate() {
@@ -609,6 +620,16 @@ impl Simulator {
                     self.seed,
                     self.executor.schedule_hash(),
                 );
+                let pending_replies = shard.reply_inbox_len();
+                assert_eq!(
+                    pending_replies,
+                    0,
+                    "lost wakeup: replica {replica_id} shard {} reply lane holds \
+                     {pending_replies} frame(s) at quiescence (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
             }
         }
     }
@@ -755,8 +776,8 @@ impl Simulator {
 
         let consensus_clock = ConsensusClock::new(Rc::new(SimClock::new(self.executor.timer())));
         let outbox = Rc::clone(&self.outboxes[idx]);
-        let (senders, mut inboxes) =
-            shard::shard_mesh_channels(shards_per_replica, SIM_INBOX_CAPACITY);
+        let (senders, mut inboxes, mut reply_inboxes) =
+            shard::shard_mesh_channels(shards_per_replica, SIM_INBOX_CAPACITY, SIM_INBOX_CAPACITY);
 
         let mut shards = Vec::with_capacity(usize::from(shards_per_replica));
         let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
@@ -766,6 +787,9 @@ impl Simulator {
             let inbox = inboxes[usize::from(shard_idx)]
                 .take()
                 .expect("mesh yields exactly one inbox per shard");
+            let reply_inbox = reply_inboxes[usize::from(shard_idx)]
+                .take()
+                .expect("mesh yields exactly one reply inbox per shard");
             let shard_superblock = if shard_idx == 0 {
                 Some(superblock.clone())
             } else {
@@ -780,6 +804,7 @@ impl Simulator {
                 self.replica_count,
                 senders.clone(),
                 inbox,
+                reply_inbox,
                 consensus_clock.clone(),
                 self.shell,
                 metadata_bundle.clone(),
@@ -994,7 +1019,7 @@ mod tests {
     /// heartbeat timeout and elect a new primary via view change.
     #[test]
     fn view_change_after_primary_crash() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1092,7 +1117,7 @@ mod tests {
     /// Impossible before the superblock, since a rebuilt consensus starts at view 0.
     #[test]
     fn given_advanced_view_when_metadata_replica_restarts_should_recover_view_from_superblock() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1202,7 +1227,7 @@ mod tests {
 
     #[test]
     fn given_committed_metadata_when_solo_replica_restarts_should_recover_from_own_wal() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1300,7 +1325,7 @@ mod tests {
 
     #[test]
     fn given_registered_client_when_solo_replica_restarts_should_recover_session_from_own_wal() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1367,7 +1392,7 @@ mod tests {
         // split-brain on its restart. The positive control is
         // `given_advanced_view_when_metadata_replica_restarts_...`, which elects a new
         // primary from the same crash with healthy superblocks.
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1456,7 +1481,7 @@ mod tests {
     /// dedup if they need at-most-once-per-payload.
     #[test]
     fn failover_retry_re_executes_under_at_least_once() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1571,7 +1596,7 @@ mod tests {
     /// `handle_commit_message_timeout` used to assert `commit_min == commit_max`.
     #[test]
     fn view_change_behind_backup_becomes_primary() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1639,7 +1664,7 @@ mod tests {
     /// and workload) produces an identical reply-header sequence.
     #[test]
     fn workload_replay_is_deterministic() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1674,14 +1699,16 @@ mod tests {
         // correctly because `hash % 1 == 0` at one shard per replica.
         // Re-locked again when replies stopped echoing a group id (the
         // client wire lost its namespace field): the reply-hash tuple
-        // dropped that component.
+        // dropped that component. Re-locked when the v1 consumer-offset ops
+        // were removed and the v2 pair became the only store/delete actions:
+        // `Action` lost two variants, shifting discriminants and draw order.
         assert_eq!(
-            h1, 0xCF1F_BC79_B44A_65F7,
+            h1, 0x14BF_3C3F_41D4_F69D,
             "workload reply hash drifted from locked baseline"
         );
     }
 
-    /// Drive workload with uniform weights across all 25 `Action` variants.
+    /// Drive workload with near-uniform weights across all 23 `Action` variants.
     /// Assert it runs without panic and observes at least one reply.
     /// Per-op coverage not asserted: some ops can starve the in-flight slot
     /// at single-client / 1-slot pipeline limits.
@@ -1694,7 +1721,7 @@ mod tests {
         };
         use strum::{EnumCount, IntoEnumIterator};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1720,9 +1747,12 @@ mod tests {
         sim.init_partition(ns_b);
         sim.register_client_with_primary(&client);
 
-        // 25 variants × 4 = 100.
-        assert_eq!(Action::COUNT, 25, "Action::COUNT changed; adjust weights");
-        let entries: Vec<(Action, u8)> = Action::iter().map(|a| (a, 4)).collect();
+        // 23 variants: 8 x 5 + 15 x 4 = 100 (weights must sum to 100).
+        assert_eq!(Action::COUNT, 23, "Action::COUNT changed; adjust weights");
+        let entries: Vec<(Action, u8)> = Action::iter()
+            .enumerate()
+            .map(|(index, action)| (action, if index < 8 { 5 } else { 4 }))
+            .collect();
         let weights = ActionWeights::new(&entries);
 
         let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a, ns_b]);
@@ -1761,7 +1791,7 @@ mod tests {
         };
         use strum::{EnumCount, IntoEnumIterator};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1787,8 +1817,11 @@ mod tests {
         sim.init_partition(ns_b);
         sim.register_client_with_primary(&client);
 
-        assert_eq!(Action::COUNT, 25, "Action::COUNT changed; adjust weights");
-        let entries: Vec<(Action, u8)> = Action::iter().map(|a| (a, 4)).collect();
+        assert_eq!(Action::COUNT, 23, "Action::COUNT changed; adjust weights");
+        let entries: Vec<(Action, u8)> = Action::iter()
+            .enumerate()
+            .map(|(index, action)| (action, if index < 8 { 5 } else { 4 }))
+            .collect();
         let mut options = WorkloadOptions::new(0xC0FF_EE00, replica_count, vec![ns_a, ns_b]);
         options.weights = ActionWeights::new(&entries);
         let mut wl = Workload::new(options);
@@ -1824,7 +1857,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1897,7 +1930,7 @@ mod tests {
             oracle,
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -1955,7 +1988,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
             oracle,
         };
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2021,7 +2054,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2111,7 +2144,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2148,7 +2181,7 @@ mod tests {
         options.weights = ActionWeights::new(&[
             (Action::CreateStream, 5),
             (Action::SendMessages, 70),
-            (Action::StoreConsumerOffset2, 25),
+            (Action::StoreConsumerOffset, 25),
         ]);
         let mut wl = Workload::new(options);
 
@@ -2204,7 +2237,7 @@ mod tests {
             options::{ActionWeights, WorkloadOptions},
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2305,7 +2338,7 @@ mod tests {
         options.weights = ActionWeights::new(&[
             (Action::CreateStream, 5),
             (Action::SendMessages, 70),
-            (Action::StoreConsumerOffset2, 25),
+            (Action::StoreConsumerOffset, 25),
         ]);
 
         let mut wl = Workload::new(options);
@@ -2386,7 +2419,7 @@ mod tests {
         use consensus::MetadataHandle;
         use shard::shards_table::{ShardsTable, calculate_shard_assignment};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2437,7 +2470,7 @@ mod tests {
     fn peer_shard_resolves_namespace_via_shard0_read_handle() {
         use iggy_binary_protocol::WireIdentifier;
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2491,7 +2524,7 @@ mod tests {
     /// post-change send commits through the mesh.
     #[test]
     fn multi_shard_view_change_after_primary_crash() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2590,7 +2623,7 @@ mod tests {
     /// Schedule hash for `seed` after stepping the consensus plane with no
     /// client traffic, with the dispatch shell on or off.
     fn consensus_schedule_hash(seed: u64, shell: bool) -> u64 {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2642,7 +2675,7 @@ mod tests {
     /// plus its metadata, log a client in against root, produce one message,
     /// then poll. Returns the poll reply's raw bytes and the schedule hash.
     fn shell_produce_poll(seed: u64) -> (Vec<u8>, u64) {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2752,7 +2785,7 @@ mod tests {
         use consensus::PartitionsHandle;
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2851,7 +2884,7 @@ mod tests {
         use consensus::PartitionsHandle;
         use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -2949,7 +2982,7 @@ mod tests {
         use consensus::MetadataHandle;
         use journal::{Journal, JournalHandle};
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -3042,7 +3075,7 @@ mod tests {
     #[test]
     fn per_partition_consensus_independence() {
         use consensus::PIPELINE_PREPARE_QUEUE_MAX;
-        use iggy_binary_protocol::{Command2, PrepareOkHeader};
+        use iggy_binary_protocol::{Command, PrepareOkHeader};
         use packet::Packet;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3052,7 +3085,7 @@ mod tests {
         static BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
 
         fn drop_blocked_prepare_ok(packet: &Packet) -> bool {
-            if packet.message.header().command != Command2::PrepareOk {
+            if packet.message.header().command != Command::PrepareOk {
                 return false;
             }
             let header: &PrepareOkHeader = bytemuck::checked::from_bytes(
@@ -3061,7 +3094,7 @@ mod tests {
             header.group == BLOCKED_NS.load(Ordering::Relaxed)
         }
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -3169,7 +3202,7 @@ mod tests {
             oracle,
         };
 
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -3287,7 +3320,7 @@ mod view_change_data_loss_tests {
     #[test]
     fn given_committed_op_missing_on_next_primary_when_primary_crashes_should_survive_view_change()
     {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,
@@ -3385,7 +3418,7 @@ mod view_change_data_loss_tests {
     #[test]
     fn given_a_register_inside_the_view_start_persist_when_the_pipeline_rebuilds_should_commit_once()
      {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
             bucket_capacity: 1,

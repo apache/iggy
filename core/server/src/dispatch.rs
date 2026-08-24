@@ -68,7 +68,7 @@ use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::consumer_offsets::{
-    GetConsumerOffsetRequest, StoreConsumerOffset2Request,
+    GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::partitions::{
@@ -88,7 +88,7 @@ use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{
-    AckLevel, ClientVersionInfo, Command2, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
+    AckLevel, ClientVersionInfo, Command, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
     ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, KIND_CONSUMER_GROUP,
     MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader, RoutedRequestHeader,
@@ -141,7 +141,7 @@ pub(crate) fn make_client_request_handler<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -203,7 +203,7 @@ pub(crate) fn make_partition_read_handler<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -295,7 +295,7 @@ fn spawn_poll_io<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -351,7 +351,7 @@ fn submit_auto_commit<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -404,7 +404,7 @@ fn submit_auto_commit<B, MJ, S, SB>(
     shard.dispatch(message.into_generic());
 }
 
-/// Build the synthetic `StoreConsumerOffset2` request for an auto-commit, keyed
+/// Build the synthetic `StoreConsumerOffset` request for an auto-commit, keyed
 /// to the resolved numeric consumer/group id and stamped with the reserved
 /// [`AUTO_COMMIT_CLIENT_ID`] so the commit path skips the (unwaited) reply. The
 /// wire stream/topic ids are cosmetic here -- admission and apply key off the
@@ -414,7 +414,7 @@ fn build_auto_commit_request(
     namespace: IggyNamespace,
     applied: &AutoCommitApplied,
 ) -> Result<Message<RoutedRequestHeader>, IggyError> {
-    let request = StoreConsumerOffset2Request {
+    let request = StoreConsumerOffsetRequest {
         consumer: WireConsumer {
             kind: applied.kind.as_code(),
             id: WireIdentifier::Numeric(applied.consumer_id),
@@ -434,8 +434,8 @@ fn build_auto_commit_request(
     Ok(
         message.transmute_header(|_, header: &mut RoutedRequestHeader| {
             *header = RoutedRequestHeader {
-                command: Command2::Request,
-                operation: Operation::StoreConsumerOffset2,
+                command: Command::Request,
+                operation: Operation::StoreConsumerOffset,
                 size,
                 client: AUTO_COMMIT_CLIENT_ID,
                 // The partition plane is sessionless (no `ClientTable` dedup); a
@@ -456,7 +456,7 @@ pub(crate) fn make_deferred_replica_message_handler<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -478,7 +478,7 @@ pub(crate) fn make_deferred_client_request_handler<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -543,7 +543,7 @@ pub(crate) fn make_metadata_submit_handler<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -700,7 +700,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -740,7 +740,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -944,7 +944,7 @@ async fn send_pre_consensus_deny<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -982,7 +982,7 @@ async fn handle_client_request<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1407,7 +1407,7 @@ async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1434,7 +1434,7 @@ async fn handle_get_me<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1477,7 +1477,7 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1615,7 +1615,7 @@ async fn handle_non_replicated_request<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1772,7 +1772,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1850,7 +1850,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1932,7 +1932,7 @@ async fn send_non_replicated_bytes<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1969,7 +1969,7 @@ async fn send_unauthenticated_eviction<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2013,7 +2013,7 @@ pub(crate) async fn run_heartbeat_verifier<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2076,7 +2076,7 @@ async fn evict_stale_client<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2130,7 +2130,7 @@ async fn handle_poll_messages<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2251,7 +2251,7 @@ async fn handle_get_consumer_offset<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2337,7 +2337,7 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2391,7 +2391,7 @@ async fn send_empty_partition_reply<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2439,7 +2439,7 @@ async fn wait_for_partition_routable<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2487,7 +2487,7 @@ pub(crate) fn resolve_poll_request<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2553,7 +2553,7 @@ pub(crate) fn resolve_consumer_offset_request<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2638,7 +2638,7 @@ async fn answer_forwarded_register<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2730,7 +2730,7 @@ async fn submit_register_local_or_forward<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2840,7 +2840,7 @@ fn build_forward_register_message(
 ) -> Message<ForwardRegisterHeader> {
     Message::<ForwardRegisterHeader>::new(HEADER_SIZE).transmute_header(
         |_, header: &mut ForwardRegisterHeader| {
-            header.command = Command2::ForwardRegister;
+            header.command = Command::ForwardRegister;
             header.cluster = cluster;
             header.view = view;
             header.replica = replica;
@@ -2865,7 +2865,7 @@ fn build_forward_register_result_message(
     let (session, outcome) = forward_register_outcome(bound);
     Message::<ForwardRegisterResultHeader>::new(HEADER_SIZE).transmute_header(
         |_, header: &mut ForwardRegisterResultHeader| {
-            header.command = Command2::ForwardRegisterResult;
+            header.command = Command::ForwardRegisterResult;
             header.cluster = cluster;
             header.view = view;
             header.replica = replica;
@@ -2892,7 +2892,7 @@ async fn answer_forwarded_logout<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -2938,7 +2938,7 @@ async fn submit_logout_local_or_forward<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3029,7 +3029,7 @@ fn build_forward_logout_message(
 ) -> Message<ForwardLogoutHeader> {
     Message::<ForwardLogoutHeader>::new(HEADER_SIZE).transmute_header(
         |_, header: &mut ForwardLogoutHeader| {
-            header.command = Command2::ForwardLogout;
+            header.command = Command::ForwardLogout;
             header.cluster = cluster;
             header.view = view;
             header.replica = replica;
@@ -3055,7 +3055,7 @@ fn build_forward_logout_result_message(
     let (commit, outcome) = forward_logout_outcome(result);
     Message::<ForwardLogoutResultHeader>::new(HEADER_SIZE).transmute_header(
         |_, header: &mut ForwardLogoutResultHeader| {
-            header.command = Command2::ForwardLogoutResult;
+            header.command = Command::ForwardLogoutResult;
             header.cluster = cluster;
             header.view = view;
             header.replica = replica;
@@ -3088,7 +3088,7 @@ pub(crate) async fn submit_register_on_owner<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3119,7 +3119,7 @@ pub(crate) async fn submit_logout_on_owner<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3157,7 +3157,7 @@ async fn handle_delete_segments_request<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3291,7 +3291,7 @@ pub(crate) async fn resolve_delete_segments_truncate<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3411,7 +3411,7 @@ fn submit_disconnect_logout<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3453,7 +3453,7 @@ pub(crate) async fn submit_client_request_on_owner<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3482,7 +3482,7 @@ async fn handle_logout_request<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3577,7 +3577,7 @@ fn ensure_transport_connection<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3598,7 +3598,7 @@ async fn handle_login_register_request<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3768,7 +3768,7 @@ pub(crate) async fn send_login_eviction<B, MJ, S, SB>(
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3806,7 +3806,7 @@ pub(crate) fn upgrade_shard_handle<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -3842,7 +3842,7 @@ mod tests {
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
     use metadata::{IggyMetadata, MuxStateMachine};
-    use partitions::{IggyPartitions, PartitionsConfig};
+    use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::iobuf::Frozen;
     use server_common::sharding::ShardId;
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
@@ -3999,6 +3999,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         TestShard::without_inbox(
@@ -4028,7 +4029,7 @@ mod tests {
             client,
             request: 0,
             commit: session,
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::Register,
             ..Default::default()
         };
@@ -4051,7 +4052,7 @@ mod tests {
             let header =
                 bytemuck::checked::from_bytes_mut::<RoutedRequestHeader>(&mut slice[..header_size]);
             *header = RoutedRequestHeader {
-                command: Command2::Request,
+                command: Command::Request,
                 operation,
                 size: u32::try_from(total).expect("test request fits u32"),
                 client,
@@ -4083,7 +4084,7 @@ mod tests {
             let header =
                 bytemuck::checked::from_bytes_mut::<PrepareHeader>(&mut slice[..header_size]);
             *header = PrepareHeader {
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 operation,
                 size: u32::try_from(total).expect("test prepare fits u32"),
                 op: 1,
@@ -4165,6 +4166,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         let shard = Rc::new(TestShard::without_inbox(
@@ -4286,6 +4288,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         let shard = Rc::new(TestShard::without_inbox(
@@ -4410,6 +4413,7 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         let shard = Rc::new(TestShard::without_inbox(
@@ -4450,6 +4454,128 @@ mod tests {
         );
     }
 
+    /// A test shard wired to its own lanes (the held sender feeds them),
+    /// for the reply-lane pump tests below.
+    fn reply_lane_test_shard(name: &str) -> (SpyBus, shard::TaggedSender, Rc<TestShard>) {
+        let bus = SpyBus::default();
+        let metadata = IggyMetadata::new(None, None, None, None, TestMux::default(), None);
+        let partitions = IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: iggy_common::IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                validate_checksum: true,
+                segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        );
+        let (sender, inbox_rx, reply_inbox_rx) = shard_channel(0, 16, 16);
+        let lane_sender = sender.clone();
+        let shard = TestShard::new(
+            ShardIdentity::new(0, name.to_string()),
+            bus.clone(),
+            Rc::new(|_, _| {}),
+            Rc::new(|_, _| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_, _, _| {}),
+            metadata,
+            partitions,
+            vec![sender],
+            inbox_rx,
+            reply_inbox_rx,
+            PapayaShardsTable::new(),
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
+            None,
+            ShardMetrics::for_shard(),
+        )
+        .expect("single-sender ring is canonically ordered");
+        (bus, lane_sender, Rc::new(shard))
+    }
+
+    fn reply_lane_forward(client_id: u128) -> ShardFrame {
+        ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
+            client_id,
+            msg: server_common::iobuf::Owned::<MESSAGE_ALIGN>::zeroed(64).into(),
+        })
+    }
+
+    /// A frame on the reply lane must reach the client through the RUNNING
+    /// pump's reply arm: the lane split moved `ForwardClientSend` off the
+    /// main inbox, so a pump that forgot to service the new lane would
+    /// strand every cross-shard reply while the send sites happily report
+    /// success.
+    #[compio::test]
+    async fn pump_live_arm_delivers_reply_lane_forwards() {
+        const TRANSPORT: u128 = 92;
+        let (bus, lane_sender, shard) = reply_lane_test_shard("reply-lane-live-arm-test");
+
+        let (stop_tx, stop_rx) = shard::channel::<()>(1);
+        let pump_shard = Rc::clone(&shard);
+        let pump = compio::runtime::spawn(async move {
+            pump_shard.run_message_pump(stop_rx).await;
+        });
+
+        lane_sender
+            .reply_sender()
+            .try_send(reply_lane_forward(TRANSPORT))
+            .expect("reply lane has capacity");
+
+        // The pump is idle on the main lane, so its bottom reply arm must
+        // serve the frame without any main-lane traffic or shutdown drain.
+        let mut delivered = false;
+        for _ in 0..500 {
+            if !bus.client_replies.borrow().is_empty() {
+                delivered = true;
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        stop_tx.try_send(()).expect("stop channel has capacity");
+        let _ = pump.await;
+
+        assert!(
+            delivered,
+            "the live reply arm must deliver a forward while the pump runs"
+        );
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies[0].0, TRANSPORT, "forward must reach its client");
+    }
+
+    /// The shutdown path must ALSO deliver reply-lane frames: a forward
+    /// already accepted by the lane when the stop signal wins the biased
+    /// select would otherwise be silently destroyed at teardown.
+    #[compio::test]
+    async fn pump_shutdown_drain_delivers_reply_lane_forwards() {
+        const TRANSPORT: u128 = 93;
+        let (bus, lane_sender, shard) = reply_lane_test_shard("reply-lane-drain-test");
+
+        lane_sender
+            .reply_sender()
+            .try_send(reply_lane_forward(TRANSPORT))
+            .expect("reply lane has capacity");
+
+        // Pre-armed stop: the pump exits through the biased stop arm and the
+        // post-loop drain must still deliver the reply-lane frame.
+        let (stop_tx, stop_rx) = shard::channel::<()>(1);
+        stop_tx.try_send(()).expect("stop channel has capacity");
+        shard.run_message_pump(stop_rx).await;
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            1,
+            "the pump's reply-lane drain must deliver the forwarded reply"
+        );
+        assert_eq!(
+            replies[0].0, TRANSPORT,
+            "the forward must reach the client it was addressed to"
+        );
+    }
+
     /// A send parked for a namespace that is torn down before materialising
     /// (create -> delete before the reconciler's `InsertOwned`) is discarded
     /// on `ConfirmRemove`. The discard must stage the same retriable
@@ -4474,12 +4600,14 @@ mod tests {
                 segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
                 preallocate_segments: false,
                 encryptor: None,
+                path_layout: PartitionPathLayout::default(),
             },
         );
         // Real sender ring so the staged deny is observable: the test holds
-        // the receiving end of this shard's own channel.
-        let (sender, pump_rx) = shard_channel(0, 16);
-        let (_inbox_tx, inbox_rx) = shard_channel(0, 1);
+        // the receiving ends of this shard's own lanes. The deny is a client
+        // Reply forward, so it lands on the REPLY lane.
+        let (sender, _pump_rx, reply_rx) = shard_channel(0, 16, 16);
+        let (_inbox_tx, inbox_rx, reply_inbox_rx) = shard_channel(0, 1, 1);
         let shard = TestShard::new(
             ShardIdentity::new(0, "discarded-parked-send-test".to_string()),
             bus.clone(),
@@ -4492,6 +4620,7 @@ mod tests {
             partitions,
             vec![sender],
             inbox_rx,
+            reply_inbox_rx,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
@@ -4512,7 +4641,7 @@ mod tests {
         shard.apply_reconcile_ops();
 
         let mut denies = Vec::new();
-        while let Ok(frame) = pump_rx.try_recv() {
+        while let Ok(frame) = reply_rx.try_recv() {
             if let ShardFrame::Lifecycle(LifecycleFrame::ForwardClientSend { client_id, msg }) =
                 frame
             {
@@ -4559,7 +4688,7 @@ mod tests {
         await_forward(&bus).await;
         let (target, forward) = bus.sole_replica_send::<ForwardRegisterHeader>();
         assert_eq!(target, 0, "forward must address the view's primary");
-        assert_eq!(forward.command, Command2::ForwardRegister);
+        assert_eq!(forward.command, Command::ForwardRegister);
         assert_eq!(forward.client, CLIENT);
         assert_eq!(
             forward.user_id, USER,
@@ -4605,7 +4734,7 @@ mod tests {
         await_forward(&bus).await;
         let (target, forward) = bus.sole_replica_send::<ForwardLogoutHeader>();
         assert_eq!(target, 0, "forward must address the view's primary");
-        assert_eq!(forward.command, Command2::ForwardLogout);
+        assert_eq!(forward.command, Command::ForwardLogout);
         assert_eq!(forward.client, CLIENT);
         assert_eq!(forward.session, SESSION);
         assert_eq!(forward.request, REQUEST);
@@ -4944,7 +5073,7 @@ mod tests {
                     &mut message.as_mut_slice()[..header_size],
                 );
                 *header = RequestHeader {
-                    command: Command2::Request,
+                    command: Command::Request,
                     operation: Operation::NonReplicated,
                     size: u32::try_from(header_size).expect("header fits u32"),
                     client: TRANSPORT,
@@ -5002,7 +5131,7 @@ mod tests {
             assert_eq!(*client, TRANSPORT);
             assert_eq!(
                 frame[COMMAND_OFFSET],
-                Command2::Reply as u8,
+                Command::Reply as u8,
                 "an unbound cluster-metadata read must be denied with a Reply, not evicted"
             );
             let status =
