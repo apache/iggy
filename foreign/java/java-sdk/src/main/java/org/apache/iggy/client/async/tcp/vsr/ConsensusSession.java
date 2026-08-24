@@ -71,7 +71,7 @@ public final class ConsensusSession {
         this.session = sessionEpoch;
     }
 
-    /** Replicated metadata ops consume the monotonic VSR dedup counter. */
+    /** Replicated ops (metadata and partition) consume the monotonic VSR dedup counter. */
     synchronized long nextRequestId() {
         if (session == null) {
             throw new IggyNotConnectedException("Not authenticated, call login first");
@@ -80,8 +80,8 @@ public final class ConsensusSession {
     }
 
     /**
-     * Partition and non-replicated ops use an independent sequence for reply
-     * correlation, so they do not create gaps in the metadata dedup sequence.
+     * Non-replicated ops use an independent sequence for reply correlation,
+     * so they do not create gaps in the dedup sequence.
      */
     synchronized long nextCorrelationId() {
         return correlationCounter++;
