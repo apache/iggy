@@ -29,10 +29,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(20);
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(20);
 
 pub struct ConnectorsRuntimeHandle {
     server_id: u32,
@@ -242,8 +246,6 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
         self.iggy_address = Some(addr);
     }
 
-    const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-    const HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(20);
 
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
         let health_url = format!("{}/health", self.http_url());
