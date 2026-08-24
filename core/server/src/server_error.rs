@@ -315,19 +315,23 @@ pub enum PartitionRecoveryRefusal {
         survivor_position: u64,
     },
     /// Bytes past the walked prefix that the damage probe could not
-    /// classify: it ran out of work budget before proving or disproving a
-    /// survivor. The budget is sized so a front-to-back scan of every
-    /// residue in the load always fits, so exhaustion means candidate
-    /// offsets were re-examined -- a probe defect, not an at-rest shape.
-    /// Truncation is only ever sound for a proven torn tail, so giving up
-    /// keeps the bytes. The residue width is diagnostic only; it is not a
-    /// gate.
+    /// classify: it ran out of a work budget before proving or disproving a
+    /// survivor. The candidate budget is sized so a front-to-back scan of
+    /// every residue in the load always fits (its exhaustion means offsets
+    /// were re-examined -- a probe defect); the verification budget bounds
+    /// the bytes handed to checksum verifies, whose claimed slices overlap,
+    /// so residue packed with plausible headers can exhaust it from an
+    /// on-disk shape. Truncation is only ever sound for a proven torn tail,
+    /// so giving up keeps the bytes. The residue width is diagnostic only;
+    /// it is not a gate.
     UnverifiedResidue {
         start_offset: u64,
         damage_position: u64,
         residue_bytes: u64,
         candidates_examined: u64,
         budget_units: u64,
+        verified_bytes: u64,
+        verify_budget_bytes: u64,
     },
     /// A batch whose checksum verifies does not continue the offset chain,
     /// so offsets are not contiguous inside one segment file. The verify is
@@ -420,13 +424,17 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 residue_bytes,
                 candidates_examined,
                 budget_units,
+                verified_bytes,
+                verify_budget_bytes,
             } => write!(
                 f,
                 "segment {start_offset} holds {residue_bytes} bytes past the walked \
                  prefix at {damage_position} that the damage probe could not \
-                 classify before exhausting its work budget ({candidates_examined} \
-                 candidate offsets examined of {budget_units} allowed); truncating \
-                 unproven bytes could destroy durable batches"
+                 classify before exhausting its work budgets ({candidates_examined} \
+                 candidate offsets examined of {budget_units} allowed; \
+                 {verified_bytes} bytes handed to verification of \
+                 {verify_budget_bytes} allowed); truncating unproven bytes could \
+                 destroy durable batches"
             ),
             Self::OffsetDiscontinuity {
                 start_offset,

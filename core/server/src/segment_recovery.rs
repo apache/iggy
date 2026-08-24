@@ -77,6 +77,21 @@ const REBUILT_INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 /// truncating no-survivor verdict.
 const PROBE_BUDGET_UNITS_PER_RESIDUE_BYTE: u64 = 2;
 
+/// Bytes the damage probes of one partition load may hand to checksum
+/// verification per byte of residue, charged BEFORE each slice is read.
+/// Candidate enumeration alone does not bound this cost: candidates advance
+/// one byte at a time, so the slices claimed by neighbouring plausible
+/// headers OVERLAP, and residue packed with them (admissible producer
+/// payload -- nothing has to be corrupted) would otherwise drive total
+/// verified bytes toward residue times [`MAX_RECOVERABLE_BATCH_BYTES`].
+/// An honest torn tail verifies almost nothing against this limit: zeros and
+/// garbage never decode a header, a batch torn mid-write fails the file
+/// bound before any verify, and the first batch that does verify ends the
+/// probe -- so the multiple is generous for every real shape while capping
+/// the crafted one at linear work. Residue-derived like the candidate
+/// budget, for the same knob immunity.
+const PROBE_VERIFY_BUDGET_BYTES_PER_RESIDUE_BYTE: u64 = 4;
+
 /// Largest on-disk batch record recovery treats as plausible: the frozen
 /// ceiling on `message_bus.max_message_size` -- the widest wire frame any
 /// legal configuration admits, validated at boot -- plus one batch header of
@@ -377,15 +392,20 @@ struct PlannedSegment {
     recovered_empty: bool,
 }
 
-/// Work bound shared by every damage probe in one partition load.
+/// Work bounds shared by every damage probe in one partition load.
 ///
-/// One unit is charged per candidate byte offset a probe examines, and the
-/// limit grows by [`PROBE_BUDGET_UNITS_PER_RESIDUE_BYTE`] units per residue
-/// byte a probe is asked to classify. Examining a candidate is flat-cost by
-/// construction -- the header decode bails on an undersized length or the
-/// first nonzero reserved byte, and the sizes a decoded header CLAIMS gate
-/// whether a verify runs at all -- so units track real work without scaling
-/// with file size or any knob.
+/// Two independent counters, because the probe pays for two different
+/// things. ENUMERATION: one unit per candidate byte offset examined, growing
+/// by [`PROBE_BUDGET_UNITS_PER_RESIDUE_BYTE`] per residue byte -- examining
+/// is flat-cost by construction (the header decode bails on an undersized
+/// length or the first nonzero reserved byte), so this only fires on a probe
+/// defect that re-examines offsets. VERIFICATION: the bytes of every slice
+/// handed to the checksum verify, in-window slices included (an in-window
+/// verify still hashes every message up to the first bad checksum), growing
+/// by [`PROBE_VERIFY_BUDGET_BYTES_PER_RESIDUE_BYTE`] per residue byte --
+/// candidate slices overlap, so nothing else bounds their total. Window
+/// refills are charged against neither; they advance strictly forward, so
+/// they are linear in the residue on their own.
 ///
 /// Scoped to the LOAD, not to one probe: pass A probes every segment before
 /// pass B can refuse the chain, so a per-probe budget would multiply the
@@ -394,6 +414,8 @@ struct PlannedSegment {
 struct ProbeBudget {
     limit_units: u64,
     spent_units: u64,
+    verify_limit_bytes: u64,
+    verify_spent_bytes: u64,
 }
 
 impl ProbeBudget {
@@ -401,6 +423,9 @@ impl ProbeBudget {
         self.limit_units = self
             .limit_units
             .saturating_add(residue_bytes.saturating_mul(PROBE_BUDGET_UNITS_PER_RESIDUE_BYTE));
+        self.verify_limit_bytes = self.verify_limit_bytes.saturating_add(
+            residue_bytes.saturating_mul(PROBE_VERIFY_BUDGET_BYTES_PER_RESIDUE_BYTE),
+        );
     }
 
     /// Charges one candidate; `false` means the budget is exhausted and the
@@ -408,6 +433,14 @@ impl ProbeBudget {
     const fn charge_candidate(&mut self) -> bool {
         self.spent_units = self.spent_units.saturating_add(1);
         self.spent_units <= self.limit_units
+    }
+
+    /// Charges one verify slice by the bytes it would hash. Called BEFORE
+    /// the slice is read, so exhaustion never pays for the slice that broke
+    /// the budget; `false` means the probe must give up without a verdict.
+    const fn charge_verify(&mut self, slice_bytes: u64) -> bool {
+        self.verify_spent_bytes = self.verify_spent_bytes.saturating_add(slice_bytes);
+        self.verify_spent_bytes <= self.verify_limit_bytes
     }
 }
 
@@ -1365,10 +1398,16 @@ fn scan_read_failure(
 /// delayed allocation routinely extends a file far past its written-back
 /// pages, leaving hundreds of MiB of zeros behind one crash. That is the
 /// canonical torn tail this module exists to truncate, so every residue is
-/// probed whole. What bounds the probe instead is the per-candidate work
-/// budget, whose exhaustion REFUSES and keeps the bytes rather than
-/// truncating: past the limit the probe has proven nothing, and the cheapest
-/// input to construct must never earn the destructive verdict.
+/// probed whole. What bounds the probe instead are the shared work budgets
+/// (candidates examined, bytes handed to verification), whose exhaustion
+/// REFUSES and keeps the bytes rather than truncating: past the limits the
+/// probe has proven nothing, and the cheapest input to construct must never
+/// earn the destructive verdict. One exception folds exhaustion forward
+/// instead: when the walk proved not a single batch (`chain_end_offset` is
+/// `None`), the refusal and the no-survivor verdict converge on the same
+/// recover-as-empty outcome -- the pair is fenced aside whole, bytes
+/// preserved either way -- so exhaustion there returns `Ok` rather than
+/// trading a fence for a tombstone.
 async fn refuse_if_survivor_past_damage(
     identity: PartitionIdentity<'_>,
     scanner: &mut FileScanner<'_>,
@@ -1396,6 +1435,7 @@ async fn refuse_if_survivor_past_damage(
                 survivor_position: position,
             }))
         }
+        ProbeOutcome::BudgetExhausted if chain_end_offset.is_none() => Ok(()),
         ProbeOutcome::BudgetExhausted => Err(identity.refusal(
             PartitionRecoveryRefusal::UnverifiedResidue {
                 start_offset,
@@ -1403,6 +1443,8 @@ async fn refuse_if_survivor_past_damage(
                 residue_bytes,
                 candidates_examined: scanner.budget.spent_units,
                 budget_units: scanner.budget.limit_units,
+                verified_bytes: scanner.budget.verify_spent_bytes,
+                verify_budget_bytes: scanner.budget.verify_limit_bytes,
             },
         )),
         ProbeOutcome::NoSurvivor => Ok(()),
@@ -1535,15 +1577,17 @@ impl<'scan> FileScanner<'scan> {
     /// on byte positions that already look like a plausible chain
     /// continuation.
     ///
-    /// Each candidate examined is charged one unit against the shared probe
-    /// budget -- examined, not verified: examining is flat-cost (zeros bail
-    /// on the undersized length, garbage on the first nonzero reserved
-    /// byte), so with the budget sized per residue byte an honest
-    /// front-to-back scan always fits, at any residue width, and total probe
-    /// work stays linear in the residue by construction. Window refills and
-    /// verify slices are deliberately not charged; they are already bounded
-    /// by the strictly-forward window advance and the plausibility cap on
-    /// claimed sizes. Exhaustion returns
+    /// Each candidate examined is charged one unit against the shared
+    /// enumeration budget -- examining is flat-cost (zeros bail on the
+    /// undersized length, garbage on the first nonzero reserved byte), so
+    /// with that budget sized per residue byte an honest front-to-back scan
+    /// always fits, at any residue width. Each slice handed to a verify is
+    /// charged its byte length against the shared verification budget BEFORE
+    /// it is read: candidates advance one byte at a time, so claimed slices
+    /// overlap and neither the window advance nor the plausibility cap
+    /// bounds their total. Window refills are charged against neither; they
+    /// advance strictly forward and are linear in the residue on their own.
+    /// Exhaustion of either budget returns
     /// [`ProbeOutcome::BudgetExhausted`], never `NoSurvivor`.
     async fn probe_for_survivor(
         &mut self,
@@ -1579,11 +1623,22 @@ impl<'scan> FileScanner<'scan> {
                     let fits = total_size as u64 <= MAX_RECOVERABLE_BATCH_BYTES
                         && candidate.saturating_add(total_size as u64) <= self.file_len;
                     if advances_chain && fits && header.message_count > 0 {
+                        if !self.budget.charge_verify(total_size as u64) {
+                            return Ok(ProbeOutcome::BudgetExhausted);
+                        }
                         let batch = self.verify_slice(candidate, total_size)?;
                         if decode_batch_slice(batch).is_ok() {
                             return Ok(ProbeOutcome::Survivor {
                                 position: candidate,
                             });
+                        }
+                        // Yield per spill read, not only per window: N spill
+                        // verifies inside one window would otherwise land in
+                        // one un-preemptible synchronous stretch. `take_refilled`
+                        // is a take, so this and the outer per-window yield
+                        // can never double-fire on the same read.
+                        if self.take_refilled() {
+                            yield_to_reactor().await;
                         }
                     }
                 }
@@ -1690,9 +1745,20 @@ mod tests {
         partition_path
     }
 
-    // Batch header wire offsets the zero-padded fixture plants values at.
+    // Batch header wire offsets the zero-padded fixtures plant values at.
     const HEADER_BATCH_LENGTH_OFFSET: usize = 32;
     const HEADER_MESSAGE_COUNT_OFFSET: usize = 48;
+
+    /// A zero-padded record that also plants a `base_offset`, so probe
+    /// candidates that hit it look like a plausible chain continuation and
+    /// pay a checksum verify over the whole claimed slice (which never
+    /// verifies: the stored batch checksum stays zero).
+    fn bait_record(base_offset: u64, claimed_batch_length: u64, sequence: u32) -> Vec<u8> {
+        let mut record = zero_padded_record(claimed_batch_length, sequence);
+        record[HEADER_BASE_OFFSET_OFFSET..HEADER_BASE_OFFSET_OFFSET + 8]
+            .copy_from_slice(&base_offset.to_le_bytes());
+        record
+    }
 
     /// One fixed-width zero-padded record of the shape foreign storage
     /// formats emit: a monotone u64 where the batch header keeps
@@ -2350,9 +2416,11 @@ mod tests {
         // Torn index forces the index-less walk, and the garbage head keeps
         // it from decoding anything, so the whole file is probe residue.
         // Each record's header decodes and claims an 8 KiB batch that fits,
-        // so aligned candidates pay a (fast-failing) verify -- and none of
-        // that exhausts the residue-sized budget, so the probe classifies
-        // the whole file as survivor-free and the empty recovery fences it.
+        // so aligned candidates pay a (fast-failing) verify. Whether the
+        // verify budget survives all 128 claims or gives up partway, the
+        // outcome is the same by design: with no walked batch, exhaustion
+        // converges with survivor-free on recover-as-empty, and the empty
+        // recovery fences the pair whole.
         let mut log = GARBAGE.to_vec();
         for record in 0..128u32 {
             log.extend_from_slice(&zero_padded_record(
@@ -2409,6 +2477,111 @@ mod tests {
             "the zero-filled residue must be gone from disk"
         );
         assert_eq!(len_of(&index_path), SPARSE_INDEX_ENTRY_SIZE as u64);
+    }
+
+    #[compio::test]
+    async fn given_overlapping_verify_claims_when_probing_should_refuse_on_verify_budget() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // Residue packed with back-to-back plausible headers, each claiming
+        // a slice 32x wider than its own 256-byte pitch: claimed slices
+        // overlap, so unbounded verification would hash close to residue x
+        // claim bytes. The verify budget must give up and refuse -- with a
+        // walked prefix this is a refusal, never a truncation -- and its
+        // limit must be the residue-derived multiple, which is the guard
+        // that keeps the bound from being silently deleted again.
+        let mut log = encoded_batch(0, 2);
+        for sequence in 0..64u32 {
+            log.extend_from_slice(&bait_record(100, 8 * 1024, sequence + 1));
+        }
+        let residue = u64::from(64u32) * COMMAND_HEADER_SIZE as u64;
+        let (messages_path, _index_path) = write_segment(&config, 0, &log, &GARBAGE[..10]);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("exhausting the verify budget over a walked prefix must refuse");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::UnverifiedResidue {
+                        residue_bytes,
+                        verified_bytes,
+                        verify_budget_bytes,
+                        ..
+                    },
+                    ..
+                } if *residue_bytes == residue
+                    && *verify_budget_bytes
+                        == residue * PROBE_VERIFY_BUDGET_BYTES_PER_RESIDUE_BYTE
+                    && verified_bytes > verify_budget_bytes
+            ),
+            "expected a verify-budget refusal, got {error:?}"
+        );
+        assert_eq!(
+            bytes_of(&messages_path),
+            log,
+            "a refusal must leave the log byte-identical"
+        );
+    }
+
+    #[compio::test]
+    async fn given_overlapping_verify_claims_with_no_walked_batch_when_probing_should_recover_empty()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        let partition_path = prepare_partition_dir(&config);
+        // Same bait with a garbage head, so the walk proves not one batch:
+        // exhaustion and survivor-free converge on recover-as-empty here,
+        // and the pair is fenced whole -- bytes preserved without minting a
+        // tombstone for a file that provably serves nothing.
+        let mut log = GARBAGE.to_vec();
+        for sequence in 0..64u32 {
+            log.extend_from_slice(&bait_record(100, 8 * 1024, sequence + 1));
+        }
+        let (messages_path, _index_path) = write_segment(&config, 0, &log, &GARBAGE[..10]);
+
+        let recovered = recover(&config)
+            .await
+            .expect("verify-budget exhaustion with no walked batch must recover as empty");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.size, IggyByteSize::default());
+        assert_eq!(len_of(&messages_path), 0, "the served log must be empty");
+        let fenced_log = Path::new(&format!("{partition_path}.fenced.0")).join(
+            Path::new(&messages_path)
+                .file_name()
+                .expect("log file name"),
+        );
+        assert_eq!(
+            fs::read(fenced_log).expect("read fenced log"),
+            log,
+            "the unclassifiable bytes must survive in the fence directory"
+        );
+    }
+
+    #[test]
+    fn probe_budget_charges_verify_bytes_before_the_read() {
+        let mut budget = ProbeBudget::default();
+        budget.grow_for_residue(1024);
+        // 4 KiB of verify allowance: three 1 KiB slices fit, the fifth does
+        // not, and the failing charge is already counted (the caller must
+        // not read the slice that broke the budget).
+        for _ in 0..4 {
+            assert!(budget.charge_verify(1024), "in-budget verifies must pass");
+        }
+        assert!(
+            !budget.charge_verify(1024),
+            "the fifth 1 KiB slice against a 4 KiB verify budget must exhaust"
+        );
+        // A later probe widens the shared limit; the failed charge above
+        // stays counted, so the widened budget must cover it plus the next
+        // slice.
+        budget.grow_for_residue(512);
+        assert!(budget.charge_verify(1024));
     }
 
     #[test]
