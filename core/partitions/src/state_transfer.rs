@@ -2800,8 +2800,12 @@ const INDEX_STRIDE_BYTES: usize = 64 * 1024;
 
 /// Chunk size for the offer build's streaming checksum pass. Large enough
 /// that per-chunk overhead is noise, small enough that the pump yields to
-/// the reactor many times per segment.
-const OFFER_HASH_CHUNK_LEN: usize = 1 << 20;
+/// the reactor many times per segment. Sized against the yield's real cost:
+/// `yield_to_reactor` is ~12 us per call, so at 1 MiB (~21 us of hashing per
+/// chunk) the yields would add over half the pass again; 4 MiB keeps the
+/// un-yielded stretch a bounded ~80 us CPU pass at ~15% overhead, and
+/// matches the recovery walk's `SCAN_WINDOW_CAPACITY`.
+const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
 
 /// Bytes one offer-build round may read and hash before it refuses and resumes
 /// on the next request.

@@ -22,82 +22,63 @@
 //! a timer only when its deadline is still in the future at the wheel's OWN
 //! clock re-read, and its sleep future completes on the first poll without
 //! ever suspending when registration is refused -- so a fixed short duration
-//! is a race against the code path between the two clock reads, and the
-//! window is machine- and build-dependent (a debug-build cold path loses a
-//! 1 us head start essentially always). No constant wins that race; the only
+//! is a race against the code path between the two clock reads. A bare 1 us
+//! sleep wins that race ~99.8% of the time even on a cold debug build, but
+//! the losses are silent: at the walk's ~512 refills per GiB a 2e-3 loss
+//! rate skips a yield every few GiB and nothing notices, because the pass
+//! still completes. No constant wins the race deterministically; the only
 //! deterministic shape is to retry with a growing duration until one
 //! registration wins.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
+use tracing::error;
 
 /// First attempted timer duration. The common case: on a warm path one
 /// microsecond outlives the registration window and the first attempt wins.
 const YIELD_FIRST_ATTEMPT: Duration = Duration::from_micros(1);
 
-/// Ceiling for the attempt doubling. Reaching it would mean a whole-second
-/// deadline was already in the past by the time the wheel re-read the clock:
-/// a broken or frozen clock, not a lost race. Registration is guaranteed
-/// long before; the cap only keeps the retry loop's growth finite.
+/// Ceiling for the attempt doubling, so no single attempt parks the caller
+/// for more than a second even under a wildly stalling clock.
 const YIELD_ATTEMPT_CAP: Duration = Duration::from_secs(1);
 
-/// Hands the core back to the reactor: the first poll ALWAYS returns
-/// `Pending` with a real timer registered, on any machine, by construction.
+/// Attempts before giving up. Reaching it takes the clock advancing by the
+/// attempted duration between `sleep()`'s deadline capture and the wheel's
+/// re-read, 32 consecutive times with doubling durations -- a broken timer
+/// runtime, not a lost race. An unyieldable reactor must cost throughput,
+/// never wedge the boot, so the loop is bounded and the terminal case
+/// degrades to not yielding at all, loudly.
+const YIELD_MAX_ATTEMPTS: u32 = 32;
+
+/// Hands the core back to the reactor: a poll of a REGISTERED timer returns
+/// `Pending`, so awaiting it suspends, on any machine, by construction.
 ///
 /// A registered timer with a near-now deadline fires on the reactor's next
-/// turn, so the attempted duration does not throttle the caller; it only has
-/// to be long enough to register. A bare self-waking yield is no
-/// alternative: this runtime does not reliably re-poll a task that wakes
-/// itself from inside its own poll, and a task parked that way may never
-/// resume.
+/// turn, so the attempted duration barely throttles the caller at the 1 us
+/// first attempt (~12 us measured per yield); it does throttle roughly
+/// linearly once attempts grow past ~10 us, which only a lost race causes. A
+/// bare self-waking yield is no alternative: this runtime does not reliably
+/// re-poll a task that wakes itself from inside its own poll, and a task
+/// parked that way may never resume.
 pub async fn yield_to_reactor() {
-    RegisteredYield {
-        registered: None,
-        attempt: YIELD_FIRST_ATTEMPT,
-    }
-    .await;
-}
-
-struct RegisteredYield {
-    /// The timer that won registration; later polls delegate to it.
-    registered: Option<Pin<Box<dyn Future<Output = ()>>>>,
-    attempt: Duration,
-}
-
-impl Future for RegisteredYield {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        let this = self.get_mut();
-        if let Some(timer) = this.registered.as_mut() {
-            return timer.as_mut().poll(context);
+    let mut attempt = YIELD_FIRST_ATTEMPT;
+    for _ in 0..YIELD_MAX_ATTEMPTS {
+        let mut timer = std::pin::pin!(compio::time::sleep(attempt));
+        if futures::poll!(timer.as_mut()).is_pending() {
+            timer.await;
+            return;
         }
-        loop {
-            // One allocation per attempt; at the callers' once-per-window
-            // cadence that is noise against the work being yielded from.
-            let mut timer: Pin<Box<dyn Future<Output = ()>>> =
-                Box::pin(compio::time::sleep(this.attempt));
-            if timer.as_mut().poll(context).is_pending() {
-                this.registered = Some(timer);
-                return Poll::Pending;
-            }
-            debug_assert!(
-                this.attempt < YIELD_ATTEMPT_CAP,
-                "a {:?} timer deadline was already in the past at registration; \
-                 the runtime clock is broken or frozen",
-                this.attempt
-            );
-            this.attempt = (this.attempt * 2).min(YIELD_ATTEMPT_CAP);
-        }
+        attempt = (attempt * 2).min(YIELD_ATTEMPT_CAP);
     }
+    error!(
+        "no timer registration won in {YIELD_MAX_ATTEMPTS} attempts; \
+         continuing without yielding to the reactor"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::task::Waker;
+    use std::task::{Context, Waker};
 
     // Pins the suspension point itself: a yield whose future is Ready on its
     // first poll never hands the core back, and nothing else would notice
