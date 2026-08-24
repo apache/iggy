@@ -80,9 +80,10 @@ export class VsrSession {
     } else {
       if (this.state.session === null)
         throw responseError(command, UNAUTHENTICATED);
-      request = isPartition(operation)
-        ? this.state.currentRequestId()
-        : this.state.nextRequestId();
+      // Partition ops consume an id too, even though no partition-plane dedup
+      // exists yet: dedup needs each send to carry a distinct number, and the
+      // metadata watermark tolerates the gaps.
+      request = this.state.nextRequestId();
       session = this.state.session;
     }
 
