@@ -36,3 +36,6 @@ hwlocality = { workspace = true, features = ["vendored"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { workspace = true }
+
+[lints]
+workspace = true

@@ -151,7 +151,7 @@ pub async fn should_help_match() {
                 r#"Create a new context
 
 Creates a new named context in the contexts configuration file.
-After creating a context, use 'iggy context use <name>' to activate it.
+After creating a context, use `iggy context use <name>` to activate it.
 
 Examples
  iggy context create production --transport tcp --tcp-server-address 10.0.0.1:8090

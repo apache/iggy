@@ -77,7 +77,7 @@ impl ResponseExtractor {
 
     /// Navigates through a JSON structure using dot-notation path
     ///
-    /// Example: "data.config" navigates to json["data"]`"config"`
+    /// Example: `"data.config"` navigates to `json["data"]["config"]`
     fn navigate_path<'a>(&self, json: &'a Value, path: &str) -> Option<&'a Value> {
         let parts: Vec<&str> = path.split('.').collect();
         let mut current = json;

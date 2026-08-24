@@ -213,12 +213,12 @@ pub mod topic_option_keys {
     /// Must be non-zero.
     pub const MESSAGES_REQUIRED_TO_SAVE: &str = "messages_required_to_save";
     /// Flush the journal once it holds this many bytes: `Uint64` or a
-    /// byte-size string. Paired with `Self::MESSAGES_REQUIRED_TO_SAVE`;
+    /// byte-size string. Paired with [`MESSAGES_REQUIRED_TO_SAVE`];
     /// whichever threshold trips first flushes.
     pub const SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: &str = "size_of_messages_required_to_save";
     /// Reserve the segment's bytes up front on a filesystem that supports it:
     /// `Bool`, or the strings `true` / `false`. Pairs with
-    /// `Self::SEGMENT_SIZE` -- preallocation reserves exactly that much, so
+    /// [`SEGMENT_SIZE`] -- preallocation reserves exactly that much, so
     /// the two only make sense decided together.
     pub const PREALLOCATE_SEGMENTS: &str = "preallocate_segments";
 }

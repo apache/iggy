@@ -3455,7 +3455,7 @@ where
     ///
     /// `advance_commit_min(op)` and matching `client_table` mutation
     /// (`commit_register` / `commit_reply`) run back-to-back, no `.await`
-    /// between. `crate::metadata_helpers::is_caught_up_primary` reads
+    /// between. [`consensus::is_caught_up_primary`] reads
     /// `commit_min == commit_max` as proof the table is caught up; an await
     /// here lets another task observe transient equality with stale table,
     /// dispatch a fresh Register on an already-registered client, and bump

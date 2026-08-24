@@ -1455,7 +1455,7 @@ impl Streams {
     /// `s` / topic slab `t` means creating every slab below it too; those
     /// fillers carry no partitions and are inert. Each level is skipped when
     /// already present, so seeding sibling partitions of one topic adds only
-    /// the missing partition. Mirrors `Users::ensure_root_user`: a seed
+    /// the missing partition. Mirrors [`Users::ensure_root_user`](crate::stm::user::Users::ensure_root_user): a seed
     /// helper that bypasses consensus, never a production runtime path.
     ///
     /// # Panics

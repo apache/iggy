@@ -45,3 +45,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true, features = ["deflate"] }
+
+[lints]
+workspace = true
