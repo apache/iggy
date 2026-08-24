@@ -155,7 +155,7 @@ impl ReplyTarget {
     }
 }
 
-/// Outcome of routing a client reply through an [`Entry`]'s reply target.
+/// Outcome of routing a client reply through an `Entry`'s reply target.
 ///
 /// `Delivered` is the socket fast path: `try_send` was attempted and its
 /// result is carried through unchanged. `InProcess` hands the message back

@@ -61,7 +61,7 @@
 //!   frame's provenance, which is why the park stamp above is separate.
 //! - Nothing is left unanswered: a tombstoned namespace, an overflowing park
 //!   buffer, and a namespace this shard has given up materialising
-//!   ([`reconcile_parked_frames`]) all reply with a retriable status, so a
+//!   (`reconcile_parked_frames`) all reply with a retriable status, so a
 //!   lockstep transport never waits out its read timeout on silence.
 //!
 //! `shards_table` is therefore a **cache of a deterministic hash**, never a
@@ -527,6 +527,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     true
 }
 
+#[allow(clippy::too_many_lines)]
 async fn reconcile_additions(
     ctx: &ReconcilerCtx,
     target: Vec<(IggyNamespace, u64)>,
@@ -595,6 +596,27 @@ async fn reconcile_additions(
             );
             counters.stale += 1;
             tear_down_owned_partition(ctx, ns, counters).await;
+            continue;
+        }
+
+        // Tombstoned without ever being materialised: a boot-time damage
+        // verdict (a refused segment chain, an untrusted superblock) fenced
+        // the namespace before any partition existed, so no teardown ran and
+        // no `ConfirmRemove` is coming to lift the tombstone. Building fresh
+        // would plant segment 0 over the refused files, truncating the
+        // oldest one, and the partition would then serve empty, hiding
+        // exactly the loss the tombstone surfaces. Deliberately uncounted:
+        // while the namespace stays committed nothing lifts this state (the
+        // exit is `reconcile_removals`' fenced-ghost sweep, which fires only
+        // once an operator delete removes it from the target), and a commit
+        // bumps `Streams::revision`, which forces the next pass past the
+        // fast-skip.
+        if partitions.is_tombstoned(&ns) {
+            trace!(
+                shard = shard_id,
+                ns_raw = ns.inner(),
+                "additions: ns tombstoned before materialisation; refusing to rebuild over fenced files"
+            );
             continue;
         }
 
@@ -780,6 +802,29 @@ async fn reconcile_removals(
         .filter(|ns| !target_set.contains(ns))
         .collect();
     for ns in owned_ghosts {
+        tear_down_owned_partition(ctx, ns, counters).await;
+    }
+
+    // Boot-time damage verdicts tombstone a namespace BEFORE it is ever
+    // materialised, so it sits in neither `partitions.namespaces()` nor the
+    // shards table: the loop above can never reach it, and `ConfirmRemove`
+    // (the only untombstone) is never enqueued for it -- without this, a
+    // boot fence has no exit and a recreate of the recycled ids inherits it
+    // forever. Once committed metadata no longer names the namespace (the
+    // operator deleted it), route it through the same teardown: the disk
+    // delete removes the refused files the verdict left at their real paths
+    // FIRST, and only its success enqueues the `ConfirmRemove` that lifts
+    // the fence -- a bare untombstone would leave the cause in place for
+    // the next boot to re-derive, with a window where a fresh build
+    // truncates the refused files. While the namespace is still in the
+    // committed target the fence stands: only an operator delete authorises
+    // destroying the bytes it guards.
+    let fenced_ghosts: Vec<IggyNamespace> = partitions
+        .tombstoned_namespaces()
+        .into_iter()
+        .filter(|ns| !target_set.contains(ns) && !partitions.contains(ns))
+        .collect();
+    for ns in fenced_ghosts {
         tear_down_owned_partition(ctx, ns, counters).await;
     }
 
@@ -2656,6 +2701,193 @@ mod tests {
         assert!(
             std::path::Path::new(&partition_root).exists(),
             "defer must not re-drive teardown: the directory must remain"
+        );
+    }
+
+    /// A namespace tombstoned before it was ever materialised is a boot-time
+    /// damage verdict (a refused segment chain, an untrusted superblock): its
+    /// files are still on disk and no `ConfirmRemove` is coming. The
+    /// additions pass must not rebuild it -- `build_partition_fresh` would
+    /// plant segment 0 over the refused files and the partition would serve
+    /// empty -- and it must stay unrouted so the loss stays visible.
+    #[compio::test]
+    async fn reconcile_never_rebuilds_tombstoned_unmaterialised_namespace() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-fence");
+        seed_topic(&mux, 2, 0, "topic-fence", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        // Boot-fence shape: the verdict lands during partition load, before
+        // anything is inserted, so the namespace is tombstoned but absent
+        // from the map while still in the committed target.
+        partitions.tombstone(ns);
+
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            !partitions.contains(&ns),
+            "tombstoned namespace must not be rebuilt"
+        );
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the boot fence must survive the pass"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            None,
+            "tombstoned namespace must stay unrouted"
+        );
+        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        assert!(
+            !std::path::Path::new(&partition_root).exists(),
+            "no fresh build may touch the refused files' directory"
+        );
+    }
+
+    /// Boot-fence exit: once an operator DELETES the fenced namespace it
+    /// leaves the committed target, but it sits in neither `partitions` nor
+    /// `shards_table`, so neither ghost sweep used to reach it -- the fence
+    /// had no exit, and slab-key recycling made a recreate of the same ids
+    /// inherit it for bytes it never had. The removals pass must route it
+    /// through teardown: the refused files are deleted first (metadata says
+    /// the partition is gone, so nothing an operator kept is destroyed) and
+    /// only the delete's success enqueues the `ConfirmRemove` that lifts
+    /// the tombstone.
+    #[compio::test]
+    async fn reconcile_lifts_boot_fence_once_namespace_leaves_target() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-fence-exit");
+        seed_topic(&mux, 2, 0, "topic-fence-exit", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        // Boot-fence shape with the refused files still at their real paths.
+        partitions.tombstone(ns);
+        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        std::fs::create_dir_all(&partition_root).expect("plant partition dir");
+        let refused_log = format!("{partition_root}/00000000000000000000.log");
+        std::fs::write(&refused_log, b"refused bytes").expect("plant refused log");
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            !partitions.is_tombstoned(&ns),
+            "the fence must lift once the namespace leaves the committed target"
+        );
+        assert!(!partitions.contains(&ns));
+        assert!(
+            !std::path::Path::new(&partition_root).exists(),
+            "teardown must delete the refused files before lifting the fence"
+        );
+
+        // Recreate the same ids: slab keys recycle, so the fresh topic gets
+        // an identical namespace and must materialise cleanly.
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-fence-reborn",
+            vec![assignment(0, 1)],
+        );
+        reconcile_pass(&ctx).await;
+        assert!(
+            partitions.contains(&ns),
+            "a recreate of the recycled ids must not inherit the lifted fence"
+        );
+        assert!(!partitions.is_tombstoned(&ns));
+    }
+
+    /// The sibling guard: while the namespace is STILL in the committed
+    /// target, the fenced-ghost sweep must not touch it -- only an operator
+    /// delete authorises destroying the bytes the fence guards. (The
+    /// additions-pass half of this is covered by
+    /// `reconcile_never_rebuilds_tombstoned_unmaterialised_namespace`.)
+    #[compio::test]
+    async fn reconcile_keeps_boot_fence_while_namespace_in_target() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-fence-hold");
+        seed_topic(&mux, 2, 0, "topic-fence-hold", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        partitions.tombstone(ns);
+        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        std::fs::create_dir_all(&partition_root).expect("plant partition dir");
+        let refused_log = format!("{partition_root}/00000000000000000000.log");
+        std::fs::write(&refused_log, b"refused bytes").expect("plant refused log");
+
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the fence must hold while the namespace is committed"
+        );
+        assert!(
+            std::path::Path::new(&refused_log).exists(),
+            "the refused files must stay untouched while the fence holds"
+        );
+    }
+
+    /// Backstop at the pump: an `InsertOwned` staged before a tombstone
+    /// landed must be discarded at apply, not routed. Applying it would put
+    /// the namespace in `partitions` + `shards_table` while the tombstone
+    /// stands, and the plane drops requests for tombstoned namespaces
+    /// without replying, so every client would hang to its read timeout.
+    #[compio::test]
+    async fn apply_discards_insert_owned_for_tombstoned_namespace() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-race");
+        seed_topic(&mux, 2, 0, "topic-race", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+
+        // Stage the build without applying it, then fence: models a
+        // tombstone landing between the reconciler pass and the pump drain.
+        reconcile_once(&ctx).await;
+        assert!(shard.has_staged_insert_owned(ns));
+        partitions.tombstone(ns);
+        shard.apply_reconcile_ops();
+
+        assert!(
+            !partitions.contains(&ns),
+            "InsertOwned for a tombstoned namespace must be discarded"
+        );
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the discard must not clear the tombstone"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            None,
+            "the discarded build must not route the namespace"
+        );
+
+        // The follow-up pass sees the same tombstone before building, so the
+        // namespace stays dark instead of looping build-and-discard.
+        reconcile_pass(&ctx).await;
+        assert!(!partitions.contains(&ns));
+        assert!(
+            !shard.has_staged_insert_owned(ns),
+            "no second build may be staged while the tombstone stands"
         );
     }
 
