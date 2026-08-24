@@ -71,7 +71,9 @@ public sealed class EndpointFailoverTests
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings
             {
-                Enabled = true, MaxRetries = 4, InitialDelay = TimeSpan.FromMilliseconds(20)
+                Enabled = true,
+                MaxRetries = 4,
+                InitialDelay = TimeSpan.FromMilliseconds(20)
             }
         };
         using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
@@ -109,7 +111,9 @@ public sealed class EndpointFailoverTests
             Protocol = Protocol.Tcp,
             ReconnectionSettings = new ReconnectionSettings
             {
-                Enabled = true, MaxRetries = 2, InitialDelay = TimeSpan.FromMilliseconds(20)
+                Enabled = true,
+                MaxRetries = 2,
+                InitialDelay = TimeSpan.FromMilliseconds(20)
             }
         };
         using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);

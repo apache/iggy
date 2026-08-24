@@ -829,7 +829,9 @@ public sealed partial class TcpMessageStream : IIggyClient
             LoginRegister.Serialize(userName, password), token);
         _rememberedLogin = new AutoLoginSettings
         {
-            Enabled = true, Username = userName, Password = password
+            Enabled = true,
+            Username = userName,
+            Password = password
         };
 
         return identity;

@@ -36,7 +36,6 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -200,6 +199,12 @@ class AsyncIggyTcpClientEndpointFailoverTest {
      * A loopback VSR node that keeps serving every connection it accepts until
      * it is killed, which drops the live sockets and stops accepting so a
      * redial is refused the way a dead process refuses one.
+     *
+     * <p>Dedicated daemon threads, not {@code CompletableFuture.runAsync}: the
+     * accept loop and every connection handler block indefinitely, and parking
+     * them on the common pool starves it on a low-core CI runner (parallelism
+     * is cores minus one), which stalls the client's own async continuations
+     * and times the login out before the test does anything.
      */
     private static final class MockNode {
         private final ServerSocket server;
@@ -212,17 +217,23 @@ class AsyncIggyTcpClientEndpointFailoverTest {
 
         static MockNode serve(ServerSocket server, RequestHandler handler) {
             MockNode node = new MockNode(server);
-            CompletableFuture.runAsync(() -> {
-                while (!node.killed) {
-                    try {
-                        Socket socket = server.accept();
-                        node.accepted.add(socket);
-                        CompletableFuture.runAsync(() -> node.exchange(socket, handler));
-                    } catch (IOException accepted) {
-                        return;
-                    }
-                }
-            });
+            Thread acceptor = new Thread(
+                    () -> {
+                        while (!node.killed) {
+                            try {
+                                Socket socket = server.accept();
+                                node.accepted.add(socket);
+                                Thread exchange = new Thread(() -> node.exchange(socket, handler));
+                                exchange.setDaemon(true);
+                                exchange.start();
+                            } catch (IOException accepted) {
+                                return;
+                            }
+                        }
+                    },
+                    "mock-vsr-acceptor-" + server.getLocalPort());
+            acceptor.setDaemon(true);
+            acceptor.start();
             return node;
         }
 

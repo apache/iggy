@@ -120,7 +120,12 @@ impl Client for TcpClient {
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
-        TcpClient::disconnect(self).await
+        // An explicit disconnect is caller intent, like a logout: the session
+        // it ends must not be resurrected by the next reconnect, so the
+        // remembered sign-in goes with it. Involuntary drops (a dead socket,
+        // a failover) go through `disconnect_transport` and keep it.
+        self.forget_session_credentials().await;
+        TcpClient::disconnect_transport(self).await
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
@@ -187,7 +192,7 @@ impl BinaryTransport for TcpClient {
             return Err(error);
         }
 
-        self.disconnect().await?;
+        self.disconnect_transport().await?;
 
         let skip_auto_login = is_login_register_code(code);
         if skip_auto_login {
@@ -615,7 +620,7 @@ impl TcpClient {
 
             // Clear connected_at to avoid reestablish_after delay during redirection
             self.connected_at.lock().await.take();
-            self.disconnect().await?;
+            self.disconnect_transport().await?;
 
             *self.current_server_address.lock().await = new_leader_address;
             Ok(true)
@@ -688,7 +693,13 @@ impl TcpClient {
         (elapsed < interval).then(|| IggyDuration::from(interval - elapsed))
     }
 
-    async fn disconnect(&self) -> Result<(), IggyError> {
+    /// Tear down the connection without touching the remembered sign-in.
+    ///
+    /// The reconnect and redirect paths use this: their disconnect is not
+    /// caller intent, and forgetting the credentials here would strand the
+    /// failover unauthenticated. The public [`Client::disconnect`] wraps this
+    /// and forgets them first.
+    async fn disconnect_transport(&self) -> Result<(), IggyError> {
         if self.get_state().await == ClientState::Disconnected {
             return Ok(());
         }
@@ -1027,6 +1038,45 @@ mod tests {
         assert_eq!(
             client.dial_candidates().await,
             vec!["127.0.0.1:8090".to_string(), "127.0.0.1:8091".to_string()]
+        );
+    }
+
+    // The C++/Rust e2e contract: `login -> disconnect -> op` must fail until
+    // the caller signs in again. Only involuntary drops keep the sign-in.
+    #[tokio::test]
+    async fn an_explicit_disconnect_forgets_the_remembered_sign_in() {
+        let client = client_with("127.0.0.1:8090", Vec::new());
+        client
+            .remember_session_credentials(Credentials::UsernamePassword(
+                "iggy".to_string(),
+                "iggy".into(),
+            ))
+            .await;
+
+        Client::disconnect(&client).await.expect("disconnect");
+        assert!(
+            client.sign_in_credentials().await.is_none(),
+            "an explicit disconnect ends the session for good, like a logout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transport_drop_keeps_the_remembered_sign_in() {
+        let client = client_with("127.0.0.1:8090", Vec::new());
+        client
+            .remember_session_credentials(Credentials::UsernamePassword(
+                "iggy".to_string(),
+                "iggy".into(),
+            ))
+            .await;
+
+        client
+            .disconnect_transport()
+            .await
+            .expect("transport teardown");
+        assert!(
+            client.sign_in_credentials().await.is_some(),
+            "an involuntary drop is what the failover exists for; the sign-in survives it"
         );
     }
 
