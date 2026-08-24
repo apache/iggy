@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { PollingStrategy, singleConsumerStream, Consumer } from '../index.js';
 import { open } from 'node:fs/promises';
