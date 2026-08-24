@@ -438,9 +438,9 @@ fn build_auto_commit_request(
                 operation: Operation::StoreConsumerOffset,
                 size,
                 client: AUTO_COMMIT_CLIENT_ID,
-                // The partition plane is sessionless (no `ClientTable` dedup); a
-                // nonzero session + request just satisfy the wire header
-                // validation.
+                // The reserved sentinel client is never deduped and never
+                // replied to; a nonzero session + request just satisfy the wire
+                // header validation.
                 session: 1,
                 request: 1,
                 group: namespace.inner(),
@@ -1161,6 +1161,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             bound_session,
             transport_client_id,
             acting_user_id,
+            PartitionReplyMode::Awaited,
         )
         .await;
         return;
@@ -1449,13 +1450,26 @@ async fn handle_get_me<B, MJ, S, SB>(
     .await;
 }
 
+/// Whether a partition write waits for its committed reply.
+///
+/// `Awaited` attaches an in-process channel to the request, so the committed
+/// reply comes back to this shard instead of the bus and is written to the
+/// caller's socket here. `FireAndForget` attaches none: the reply takes the bus
+/// path and is shed when nothing is listening, which is what `?ack=none` asks
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartitionReplyMode {
+    Awaited,
+    FireAndForget,
+}
+
 /// Route a partition data-plane op (`SendMessages` / consumer-offset writes)
 /// through the shard mesh by namespace: the op belongs to the partition's
 /// own consensus group, not the metadata group. The owning shard's
-/// partitions plane runs at-least-once consensus and replies directly via
-/// `send_to_client`. `header.client` therefore stays the TRANSPORT id
-/// (home-shard routing bits), not the VSR session id -- partition ops are
-/// sessionless ("session lifecycle is metadata-only").
+/// partitions plane dedups the request against its group's slice and answers
+/// over the submit channel, so `header.client` carries the VSR consensus id
+/// (the dedup key) rather than the transport id -- replies cannot be routed by
+/// it and come back here instead.
 ///
 /// Callers must have authenticated the transport already: `vsr_client_id` /
 /// `bound_session` come from its bound VSR session. Every failure before
@@ -1474,6 +1488,7 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
     bound_session: u64,
     transport_client_id: u128,
     acting_user_id: Option<u32>,
+    reply_mode: PartitionReplyMode,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1593,16 +1608,67 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
     let request = request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
         *new_header = header;
         new_header.group = namespace;
-        new_header.client = transport_client_id;
-        // Header validation requires `session > 0 && request > 0` for
-        // non-register ops. The partition plane itself is sessionless
-        // (at-least-once, no `ClientTable` dedup), so the bound VSR
-        // session merely satisfies validation, and a zero request id
-        // (the SDK does not number data-plane ops) is normalized.
+        // The VSR consensus id, exactly as metadata ops are stamped: it is the
+        // dedup key every replica keys its slice by, and unlike the transport
+        // id it stays valid across nodes. Replies therefore cannot be routed
+        // by this field -- they ride the submit's channel back to this shard,
+        // which owns the socket.
+        new_header.client = vsr_client_id;
         new_header.session = bound_session;
+        // Header validation requires `request > 0` for non-register ops; a
+        // client that does not number its data-plane ops normalizes to 1 and
+        // is simply never deduplicated.
         new_header.request = new_header.request.max(1);
     });
-    shard.dispatch(request.into_generic());
+    if reply_mode == PartitionReplyMode::FireAndForget {
+        shard.dispatch(request.into_generic());
+        return;
+    }
+    relay_partition_reply(
+        shard,
+        IggyNamespace::from_raw(namespace),
+        request,
+        transport_client_id,
+        header.operation,
+    )
+    .await;
+}
+
+/// Await a partition write's committed reply and write it to the socket this
+/// shard holds. The reply cannot be routed by `RoutedRequestHeader.client` --
+/// that field carries the VSR consensus id, whose bits encode no home shard.
+#[allow(clippy::future_not_send)]
+async fn relay_partition_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    request: Message<RoutedRequestHeader>,
+    transport_client_id: u128,
+    operation: Operation,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(reply) = shard.partition_submit(namespace, request).await else {
+        // Unroutable, shed, or budget expiry. Deliberately silent: the outcome
+        // is unknown, and a synthesized failure could contradict a write that
+        // commits moments later. The client's read-timeout is the recovery.
+        return;
+    };
+    if let Err(error) = shard
+        .bus
+        .send_to_client(transport_client_id, reply.into_frozen())
+        .await
+    {
+        warn!(
+            transport_client_id,
+            operation = ?operation,
+            error = %error,
+            "failed to forward committed partition reply to its socket"
+        );
+    }
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -4371,6 +4437,7 @@ mod tests {
             SESSION,
             TRANSPORT,
             Some(DEFAULT_ROOT_USER_ID),
+            PartitionReplyMode::Awaited,
         )
         .await;
 

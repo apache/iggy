@@ -379,6 +379,12 @@ pub type PartitionReadHandler =
 /// deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Budget for a partition write's wait on its committed reply. Longer than a
+/// read: the wait spans replication quorum plus any park-and-promote the
+/// request rides through, and a view change mid-flight re-proposes under the
+/// new primary. Expiry leaves the client to its own read-timeout.
+const PARTITION_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Race `future` against a bus timer.
 ///
 /// `Some` if it finishes within `budget`, `None` if the timer fires first.
@@ -682,6 +688,17 @@ pub enum LifecycleFrame {
         namespace: IggyNamespace,
         read: PartitionRead,
         reply: Sender<PartitionReadReply>,
+    },
+    /// Admit a partition write (`SendMessages` / consumer-offset write) on
+    /// the shard owning its namespace, carrying the channel its committed
+    /// reply travels back on. The partition plane cannot route a reply by
+    /// `header.client` -- that field is the VSR consensus id, whose bits
+    /// carry no home-shard routing -- so the reply returns to the
+    /// connection-owning shard, which writes it to the socket it holds.
+    /// See [`IggyShard::partition_submit`].
+    PartitionSubmit {
+        request: Message<RoutedRequestHeader>,
+        reply: Sender<Option<Message<GenericHeader>>>,
     },
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
@@ -1838,6 +1855,69 @@ where
         }
     }
 
+    /// Admit a partition write on the shard owning `namespace` and await its
+    /// committed reply. Routes through the shards table exactly like
+    /// [`Self::partition_read`], self-sends included, so a locally-owned
+    /// partition takes the same path.
+    ///
+    /// `None` = unroutable namespace, full owning-shard inbox, dropped reply
+    /// sender (view-change reset, park eviction), or budget expiry. The caller
+    /// stays silent on `None`: the client's own response read-timeout is the
+    /// recovery, and a synthesized failure reply could contradict a write that
+    /// commits moments later.
+    #[allow(clippy::future_not_send)]
+    pub async fn partition_submit(
+        &self,
+        namespace: IggyNamespace,
+        request: Message<RoutedRequestHeader>,
+    ) -> Option<Message<GenericHeader>> {
+        let target = self.shards_table.shard_for(namespace).unwrap_or_else(|| {
+            // Same fallback as `route_typed`: a miss means "not seeded yet",
+            // not "unroutable", and the owning shard parks what arrives early.
+            crate::shards_table::calculate_shard_from_consensus_ns(
+                namespace.inner(),
+                self.shard_count,
+            )
+        });
+        let (reply_tx, reply_rx) = channel::<Option<Message<GenericHeader>>>(1);
+        let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+            request,
+            reply: reply_tx,
+        });
+        let sender = self.senders.get(target as usize)?;
+        if let Err(error) = sender.try_send(frame) {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::coordinator::classify_try_send_err(&error),
+            );
+            tracing::warn!(
+                shard = self.id,
+                target,
+                "partition_submit: inbox rejected PartitionSubmit frame: {error:?}"
+            );
+            return None;
+        }
+        match bus_timeout(&self.bus, PARTITION_SUBMIT_TIMEOUT, reply_rx.recv()).await {
+            Some(Ok(reply)) => reply,
+            Some(Err(_)) => {
+                tracing::debug!(
+                    shard = self.id,
+                    target,
+                    "partition_submit: reply sender dropped before commit"
+                );
+                None
+            }
+            None => {
+                tracing::warn!(
+                    shard = self.id,
+                    target,
+                    "partition_submit: owning shard did not reply within budget"
+                );
+                None
+            }
+        }
+    }
+
     /// Return a clone of the shard-0 coordinator handle, if attached.
     /// Bootstrap uses this to wire the listener accept callbacks
     /// (replica + client) to coordinator-driven fd-delegation instead
@@ -2399,6 +2479,12 @@ struct ParkedFrame {
     /// the outcome from a reply rather than a timeout.
     passes: u32,
     message: Message<GenericHeader>,
+    /// Channel the committed reply travels back on, for a frame that arrived
+    /// as a [`LifecycleFrame::PartitionSubmit`]. `None` for replicated
+    /// prepares and for writes admitted without a waiter. Dropping the frame
+    /// (expiry, teardown, shutdown) drops this, which wakes the awaiting
+    /// dispatch with a receive error it maps to silence.
+    reply: Option<Sender<Option<Message<GenericHeader>>>>,
 }
 
 impl ParkedFrame {
@@ -2552,7 +2638,7 @@ where
                     let header = request.header();
                     (header.operation, header.group)
                 };
-                match self.park_if_unmaterialised(request, routing.0, routing.1) {
+                match self.park_if_unmaterialised(request, routing.0, routing.1, &mut None) {
                     // The incarnation fence runs only here, on client traffic.
                     // A backup denying what the primary admitted would diverge
                     // the replicas, so replicated frames are never fenced.
@@ -2583,7 +2669,7 @@ where
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
-                match self.park_if_unmaterialised(prepare, routing.0, routing.1) {
+                match self.park_if_unmaterialised(prepare, routing.0, routing.1, &mut None) {
                     ParkOutcome::Deliver(prepare) | ParkOutcome::Tombstoned(prepare) => {
                         self.on_replicate(prepare).await;
                         // A follower learns the cluster commit point from the
@@ -2932,9 +3018,10 @@ where
         };
         let mut refused_frames: Vec<ParkedFrame> = Vec::new();
         let mut remaining = servable.into_iter();
-        while let Some(frame) = remaining.next() {
+        while let Some(mut frame) = remaining.next() {
             let passes = frame.passes;
             let parked_epoch = frame.epoch;
+            let waiter = frame.reply.take();
             // Parked frames are stored generic (the buffer holds every variant
             // in one Vec), so re-entering the pump costs one classify. That is
             // the rare path -- a post-`CreateTopic` convergence window, not the
@@ -2955,20 +3042,32 @@ where
                     continue;
                 }
             };
-            let Err(error) = sender.try_send(ShardFrame::consensus(self.id, bag)) else {
+            let Some(outgoing) = self.reparked_frame(namespace, waiter, bag) else {
+                continue;
+            };
+            let Err(error) = sender.try_send(outgoing) else {
                 continue;
             };
             let (refused, disconnected) = match error {
                 TrySendError::Full(frame) => (frame, false),
                 TrySendError::Disconnected(frame) => (frame, true),
             };
-            let ShardFrame::Consensus { message, .. } = refused else {
-                unreachable!("try_send returns the frame it was handed");
-            };
-            let refused_frame = ParkedFrame {
-                epoch: parked_epoch,
-                passes,
-                message: message.into_generic(),
+            let refused_frame = match refused {
+                ShardFrame::Consensus { message, .. } => ParkedFrame {
+                    epoch: parked_epoch,
+                    passes,
+                    message: message.into_generic(),
+                    reply: None,
+                },
+                ShardFrame::Lifecycle(LifecycleFrame::PartitionSubmit { request, reply }) => {
+                    ParkedFrame {
+                        epoch: parked_epoch,
+                        passes,
+                        message: request.into_generic(),
+                        reply: Some(reply),
+                    }
+                }
+                _ => unreachable!("try_send returns the frame it was handed"),
             };
             if disconnected {
                 // Pump gone: re-parking holds the frame until process exit, and
@@ -3178,6 +3277,7 @@ where
         message: Message<H>,
         operation: Operation,
         namespace_raw: u64,
+        reply: &mut Option<Sender<Option<Message<GenericHeader>>>>,
     ) -> ParkOutcome<H>
     where
         H: iggy_binary_protocol::ConsensusHeader,
@@ -3301,6 +3401,7 @@ where
             epoch,
             passes: 0,
             message: message.into_generic(),
+            reply: reply.take(),
         });
         drop(pending);
         self.parked_partition_bytes
@@ -3381,6 +3482,105 @@ where
         }
         self.metrics.record_partition_request_denied_transient();
         true
+    }
+
+    /// Admit a `PartitionSubmit`: same gates as the [`MessageBag::Request`]
+    /// arm, but every refusal answers on `reply` instead of the bus, and the
+    /// admitted request carries an in-process reply channel down to the
+    /// pipeline entry so its committed reply comes back here rather than
+    /// being routed by `header.client`.
+    #[allow(clippy::future_not_send)]
+    pub async fn on_partition_submit(
+        &self,
+        request: Message<RoutedRequestHeader>,
+        reply: Sender<Option<Message<GenericHeader>>>,
+    ) where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+        T: ShardsTable,
+    {
+        let routing = {
+            let header = request.header();
+            (header.operation, header.group)
+        };
+        let mut parked_reply = Some(reply);
+        match self.park_if_unmaterialised(request, routing.0, routing.1, &mut parked_reply) {
+            ParkOutcome::Deliver(request)
+                if !self.serves_committed_incarnation(routing.0, routing.1) =>
+            {
+                Self::answer_partition_submit_transient(request.header(), parked_reply);
+            }
+            ParkOutcome::Deliver(request) => {
+                let (sender, receiver) = consensus::oneshot_channel();
+                self.plane
+                    .partitions()
+                    .on_request_with_reply(request, Some(sender))
+                    .await;
+                // Await OFF the pump: the commit that fires this receiver needs
+                // the pump to keep draining acks, so blocking here would
+                // deadlock the very reply being waited on. The task holds only
+                // owned channel halves, never a partitions borrow.
+                let Some(reply) = parked_reply else { return };
+                // Through the bus, not the runtime directly: the simulator
+                // supplies its own executor and virtual clock.
+                self.bus.spawn(async move {
+                    let committed = receiver.await.ok().map(Message::into_generic);
+                    let _ = reply.try_send(committed);
+                });
+            }
+            ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {
+                Self::answer_partition_submit_transient(request.header(), parked_reply);
+            }
+            // Sender moved into the parked frame; it answers on drain or wakes
+            // the awaiter with a receive error when the frame expires.
+            ParkOutcome::Parked => {}
+        }
+    }
+
+    /// Wrap a drained parked frame for its trip back through this shard's
+    /// inbox. A submit's waiter cannot ride the generic bag handoff, so it
+    /// re-enters through the lifecycle frame it arrived on and keeps its reply
+    /// channel attached. `None` = the frame is unusable and was dropped.
+    fn reparked_frame(
+        &self,
+        namespace: IggyNamespace,
+        waiter: Option<Sender<Option<Message<GenericHeader>>>>,
+        bag: MessageBag,
+    ) -> Option<ShardFrame> {
+        match (waiter, bag) {
+            (Some(reply), MessageBag::Request(request)) => {
+                Some(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+                    request,
+                    reply,
+                }))
+            }
+            (Some(_), _) => {
+                tracing::error!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    "parked frame carries a reply channel but is not a client request; dropping it"
+                );
+                None
+            }
+            (None, bag) => Some(ShardFrame::consensus(self.id, bag)),
+        }
+    }
+
+    /// Answer a refused `PartitionSubmit` with the same transient deny the bus
+    /// path sends, over the submit's own channel.
+    fn answer_partition_submit_transient(
+        request_header: &RoutedRequestHeader,
+        reply: Option<Sender<Option<Message<GenericHeader>>>>,
+    ) {
+        let Some(reply) = reply else { return };
+        let deny = build_deny_reply_from_request_header(
+            request_header,
+            IggyError::TransientNotAccepted.as_code(),
+        );
+        let _ = reply.try_send(Some(deny.into_generic()));
     }
 
     #[allow(clippy::future_not_send)]

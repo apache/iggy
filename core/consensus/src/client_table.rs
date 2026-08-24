@@ -352,6 +352,45 @@ pub enum CommitReply {
     SkippedRegression { stored: u64, received: u64 },
 }
 
+/// Which of the table's mechanisms an instance runs.
+///
+/// The metadata plane needs all of them. A partition group's slice needs only
+/// the watermark: it has no register to mint an epoch from, no result section
+/// worth caching, and one table per group rather than per node, so the
+/// preallocated slot array would reserve ~384 KiB per partition before a single
+/// client connects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientTableMode {
+    /// Keep committed replies so a duplicate replays the original bytes. Off:
+    /// duplicates answer [`RequestStatus::AlreadyApplied`] and the caller
+    /// synthesizes the reply.
+    pub cache_replies: bool,
+    /// Enforce the register-minted epoch fence. Off: entries carry no epoch,
+    /// `check_request` ignores the presented one, and a committed request may
+    /// create its own entry (there is no register to do it).
+    pub fence_epoch: bool,
+    /// Allocate every slot up front. Off: slots grow to the cap on demand.
+    /// Slot assignment is identical either way -- both hand out the lowest free
+    /// index -- so eviction order and the wire encoding are unchanged.
+    pub preallocate_slots: bool,
+}
+
+impl ClientTableMode {
+    /// Metadata plane: replies cached, epoch fenced, slots preallocated.
+    pub const METADATA: Self = Self {
+        cache_replies: true,
+        fence_epoch: true,
+        preallocate_slots: true,
+    };
+
+    /// One partition consensus group's slice: watermark only.
+    pub const PARTITION_SLICE: Self = Self {
+        cache_replies: false,
+        fence_epoch: false,
+        preallocate_slots: false,
+    };
+}
+
 /// VSR client table: per-session fence epoch + request-watermark dedup.
 ///
 /// Fixed-size slot array (source of truth) + `HashMap` index (O(1) lookup).
@@ -374,11 +413,11 @@ pub enum CommitReply {
 ///
 /// ## Plane
 ///
-/// Metadata-plane today. The design spans planes (one logical table,
-/// group-resident slices); partition-plane integration arrives once
-/// partition prepares carry real `(session_id, request)` instead of the
-/// transport id (data-plane request numbering, IGGY-137). Until then the
-/// partition plane stays at-least-once with no dedup.
+/// This table is the metadata plane's. The partition plane runs the same
+/// watermark rule in its own per-group slices
+/// (`partitions::dedup::PartitionDedupSlice`), which keep no reply ring and no
+/// epoch: partition prepares carry the VSR client id and request number but no
+/// session, so fencing a stale session waits on identity surviving reconnects.
 ///
 /// ## Tracking
 ///
@@ -404,9 +443,16 @@ pub enum CommitReply {
 #[derive(Debug)]
 pub struct ClientTable {
     /// `None` = free slot. Deterministic iteration for eviction + serialization.
+    ///
+    /// Under [`ClientTableMode::preallocate_slots`] this is sized to
+    /// `clients_max` at construction; otherwise it grows to that cap on demand.
     slots: Vec<Option<ClientEntry>>,
     /// `client_id` -> slot index. Rebuilt on decode.
     index: HashMap<u128, usize>,
+    /// Slot ceiling. Tracked explicitly because `slots.len()` is the allocated
+    /// length, which only equals the cap when slots are preallocated.
+    clients_max: usize,
+    mode: ClientTableMode,
 }
 
 /// Whether two integrity stamps for the same request number disagree.
@@ -418,15 +464,38 @@ const fn checksums_conflict(stored: u128, received: u128) -> bool {
 }
 
 impl ClientTable {
+    /// Client id that opts out of dedup entirely. Zero is reserved cluster-wide
+    /// and every mutating entry point refuses it.
+    pub const EXEMPT_CLIENT: u128 = 0;
+
     /// `max_clients` caps slots; index pre-sized to avoid rehash storms.
     #[must_use]
     pub fn new(max_clients: usize) -> Self {
-        let mut slots = Vec::with_capacity(max_clients);
-        slots.resize_with(max_clients, || None);
+        Self::with_mode(max_clients, ClientTableMode::METADATA)
+    }
+
+    /// `max_clients` caps slots; `mode` selects which mechanisms run.
+    #[must_use]
+    pub fn with_mode(max_clients: usize, mode: ClientTableMode) -> Self {
+        let (slots, index) = if mode.preallocate_slots {
+            let mut slots = Vec::with_capacity(max_clients);
+            slots.resize_with(max_clients, || None);
+            (slots, HashMap::with_capacity(max_clients))
+        } else {
+            (Vec::new(), HashMap::new())
+        };
         Self {
             slots,
-            index: HashMap::with_capacity(max_clients),
+            index,
+            clients_max: max_clients,
+            mode,
         }
+    }
+
+    /// The mechanisms this instance runs.
+    #[must_use]
+    pub const fn mode(&self) -> ClientTableMode {
+        self.mode
     }
 
     /// Resize the table to `max_clients` slots. Boot-only: reallocating a
@@ -441,7 +510,7 @@ impl ClientTable {
             self.index.is_empty(),
             "set_capacity must run before any client registers"
         );
-        *self = Self::new(max_clients);
+        *self = Self::with_mode(max_clients, self.mode);
     }
 
     /// Snapshot the table for the metadata checkpoint: every occupied slot with its
@@ -558,7 +627,13 @@ impl ClientTable {
                 latest_commit,
             });
         }
-        Ok(Self { slots, index })
+        let clients_max = slots.len();
+        Ok(Self {
+            slots,
+            index,
+            clients_max,
+            mode: ClientTableMode::METADATA,
+        })
     }
 
     /// Check a request against the table. Epoch fence first, then the
@@ -581,7 +656,10 @@ impl ClientTable {
     ) -> RequestStatus {
         assert!(client_id != 0, "client_id 0 is reserved for internal use");
         // Header validation guarantees both > 0 at wire layer.
-        debug_assert!(epoch > 0, "check_request: epoch must be > 0");
+        debug_assert!(
+            epoch > 0 || !self.mode.fence_epoch,
+            "check_request: epoch must be > 0 when fencing"
+        );
         debug_assert!(request > 0, "check_request: request must be > 0");
 
         // Epoch check before request: a fenced zombie must be rejected even
@@ -591,17 +669,21 @@ impl ClientTable {
         };
         let entry = self.slots[slot_idx].as_ref().expect("index/slot mismatch");
 
-        if epoch < entry.epoch {
-            return RequestStatus::Fenced {
-                current: entry.epoch,
-                received: epoch,
-            };
-        }
-        if epoch > entry.epoch {
-            return RequestStatus::EpochAhead {
-                current: entry.epoch,
-                received: epoch,
-            };
+        // A plane with no register mints no epoch, so there is nothing to
+        // fence against and the presented value is ignored.
+        if self.mode.fence_epoch {
+            if epoch < entry.epoch {
+                return RequestStatus::Fenced {
+                    current: entry.epoch,
+                    received: epoch,
+                };
+            }
+            if epoch > entry.epoch {
+                return RequestStatus::EpochAhead {
+                    current: entry.epoch,
+                    received: epoch,
+                };
+            }
         }
 
         if request > entry.watermark {
@@ -689,7 +771,7 @@ impl ClientTable {
                 .retain(|stored| stored.header().request != REGISTER_REQUEST_ID);
             entry.push_latest(cached);
         } else {
-            let freed = if self.index.len() >= self.slots.len() {
+            let freed = if self.index.len() >= self.clients_max {
                 self.evict_oldest()
             } else {
                 None
@@ -811,6 +893,118 @@ impl ClientTable {
         CommitReply::Cached
     }
 
+    /// Watermark-only dedup check for a plane that mints no epoch.
+    ///
+    /// `true` means the request is at or below the client's watermark, i.e. it
+    /// already committed and must be answered rather than executed again.
+    ///
+    /// [`Self::EXEMPT_CLIENT`] always reads as new: zero is reserved
+    /// cluster-wide, so it doubles as the marker for a request whose id carries
+    /// no dedup meaning (an unbound caller, or a transport that numbers
+    /// requests without the one-in-flight-per-group discipline the watermark
+    /// assumes).
+    ///
+    /// # Panics
+    /// If called on a table that fences epochs -- that plane must go through
+    /// [`Self::check_request`], which enforces the fence.
+    #[must_use]
+    pub fn is_duplicate(&self, client_id: u128, request: u64) -> bool {
+        assert!(
+            !self.mode.fence_epoch,
+            "is_duplicate: an epoch-fencing table must use check_request"
+        );
+        if client_id == Self::EXEMPT_CLIENT {
+            return false;
+        }
+        !matches!(
+            self.check_request(client_id, 0, request, 0),
+            RequestStatus::New | RequestStatus::NoSession
+        )
+    }
+
+    /// Record a committed request without a reply to cache.
+    ///
+    /// The entry point for a plane that runs
+    /// [`ClientTableMode::PARTITION_SLICE`]: there is no register to create the
+    /// entry, so the first committed request creates it, and there is no result
+    /// section worth retaining, so a later duplicate answers
+    /// [`RequestStatus::AlreadyApplied`] and the caller synthesizes the reply.
+    ///
+    /// Idempotent and order-insensitive: the watermark only rises, so replaying
+    /// an already-folded op is a no-op and a state-transfer install followed by
+    /// a re-walk of the same commits converges.
+    ///
+    /// # Panics
+    /// If called on a table whose mode caches replies -- that plane must go
+    /// through [`Self::commit_reply`] so the ring stays populated.
+    pub fn commit_request(&mut self, client_id: u128, request: u64, commit_op: u64) {
+        assert!(
+            !self.mode.cache_replies,
+            "commit_request: a reply-caching table must use commit_reply"
+        );
+        if client_id == Self::EXEMPT_CLIENT {
+            return;
+        }
+
+        if let Some(&slot_idx) = self.index.get(&client_id) {
+            let entry = self.slots[slot_idx].as_mut().expect("index/slot mismatch");
+            if request > entry.watermark {
+                entry.watermark = request;
+                entry.latest_commit = commit_op;
+            }
+            return;
+        }
+
+        if self.index.len() >= self.clients_max {
+            self.evict_oldest();
+        }
+        let Some(slot_idx) = self.first_free_slot() else {
+            // Only reachable at a zero cap, which config validation rejects.
+            return;
+        };
+        self.index.insert(client_id, slot_idx);
+        self.slots[slot_idx] = Some(ClientEntry {
+            epoch: 0,
+            user_id: 0,
+            watermark: request,
+            watermark_checksum: 0,
+            ring: VecDeque::new(),
+            client_id,
+            latest_commit: commit_op,
+        });
+    }
+
+    /// Replace every entry, as a state-transfer install does.
+    ///
+    /// # Panics
+    /// If called on a table whose mode caches replies (those install through
+    /// the snapshot / wire codecs, which carry the rings).
+    pub fn install_watermarks(&mut self, entries: impl IntoIterator<Item = (u128, u64, u64)>) {
+        assert!(
+            !self.mode.cache_replies,
+            "install_watermarks: a reply-caching table installs via decode"
+        );
+        self.slots.clear();
+        self.index.clear();
+        for (client_id, watermark, latest_commit) in entries {
+            self.commit_request(client_id, watermark, latest_commit);
+        }
+    }
+
+    /// Every entry as `(client, watermark, latest_commit)`, ascending by
+    /// client: the deterministic form a wire encoding needs.
+    #[must_use]
+    pub fn watermarks_sorted(&self) -> Vec<(u128, u64, u64)> {
+        let mut entries: Vec<(u128, u64, u64)> = self
+            .slots
+            .iter()
+            .flatten()
+            .map(|entry| (entry.client_id, entry.watermark, entry.latest_commit))
+            .collect();
+        entries.sort_unstable_by_key(|(client_id, _, _)| *client_id);
+        entries
+    }
+
     /// Remove a client session and cached replies.
     ///
     /// **LOCAL ONLY -- does NOT replicate.** Two correct call sites:
@@ -883,8 +1077,18 @@ impl ClientTable {
         Some(slot_idx)
     }
 
-    fn first_free_slot(&self) -> Option<usize> {
-        self.slots.iter().position(Option::is_none)
+    /// Lowest free slot, growing the array when slots are allocated lazily.
+    /// Assignment is identical to the preallocated case: both hand out the
+    /// lowest free index, so eviction order and the wire encoding do not
+    /// depend on the mode.
+    fn first_free_slot(&mut self) -> Option<usize> {
+        if let Some(index) = self.slots.iter().position(Option::is_none) {
+            return Some(index);
+        }
+        (self.slots.len() < self.clients_max).then(|| {
+            self.slots.push(None);
+            self.slots.len() - 1
+        })
     }
 
     /// Latest cached reply for a client.
@@ -1200,7 +1404,7 @@ impl ClientTable {
     /// can exceed `[metadata] clients_table_max`.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        self.slots.len()
+        self.clients_max
     }
 }
 
@@ -1877,6 +2081,166 @@ mod tests {
     }
 
     // Capacity resize (boot-only)
+
+    // --- ClientTableMode::PARTITION_SLICE: watermark-only dedup ---
+    //
+    // One consensus group's slice. No register mints entries here, no reply is
+    // cached, and slots grow on demand, so these pin the behaviour the
+    // partition plane actually relies on.
+
+    fn slice(clients_max: usize) -> ClientTable {
+        ClientTable::with_mode(clients_max, ClientTableMode::PARTITION_SLICE)
+    }
+
+    #[test]
+    fn given_partition_slice_when_empty_should_admit_and_not_preallocate() {
+        // The reason this plane cannot use the metadata mode: one table per
+        // group, so preallocating the cap would reserve hundreds of KiB per
+        // partition before a single client connects.
+        let table = slice(4096);
+        assert_eq!(table.count(), 0);
+        assert_eq!(table.slots.len(), 0, "slots must grow on demand");
+        assert!(!table.is_duplicate(7, 1));
+    }
+
+    #[test]
+    fn given_partition_slice_when_request_replayed_should_report_duplicate() {
+        let mut table = slice(4);
+        table.commit_request(7, 5, 100);
+
+        assert!(table.is_duplicate(7, 5));
+        assert!(table.is_duplicate(7, 4));
+        assert!(!table.is_duplicate(7, 6));
+    }
+
+    #[test]
+    fn given_partition_slice_when_request_id_gaps_should_accept_the_jump() {
+        // One client counter feeds several groups, so a slice legitimately sees
+        // only a subset of the ids that client mints.
+        let mut table = slice(4);
+        table.commit_request(7, 5, 100);
+        table.commit_request(7, 9, 101);
+
+        assert!(table.is_duplicate(7, 7));
+        assert!(!table.is_duplicate(7, 10));
+    }
+
+    #[test]
+    fn given_partition_slice_when_commit_replayed_should_be_idempotent() {
+        let mut table = slice(4);
+        table.commit_request(7, 5, 100);
+        table.commit_request(7, 5, 100);
+        table.commit_request(7, 3, 99);
+
+        assert_eq!(table.watermarks_sorted(), vec![(7, 5, 100)]);
+    }
+
+    #[test]
+    fn given_partition_slice_when_full_should_evict_the_oldest_commit() {
+        let mut table = slice(2);
+        table.commit_request(1, 1, 10);
+        table.commit_request(2, 1, 20);
+        table.commit_request(3, 1, 30);
+
+        assert_eq!(table.count(), 2);
+        let clients: Vec<u128> = table
+            .watermarks_sorted()
+            .into_iter()
+            .map(|(client, _, _)| client)
+            .collect();
+        assert_eq!(clients, vec![2, 3], "oldest commit is the victim");
+    }
+
+    #[test]
+    fn given_partition_slice_when_entry_evicted_should_admit_its_replay_again() {
+        // Losing an entry costs dedup coverage, never correctness: the replay
+        // re-executes exactly as it would have before the slice existed.
+        let mut table = slice(1);
+        table.commit_request(1, 5, 10);
+        table.commit_request(2, 1, 20);
+
+        assert!(!table.is_duplicate(1, 5));
+    }
+
+    #[test]
+    fn given_partition_slice_when_entry_touched_should_spare_it_from_eviction() {
+        let mut table = slice(2);
+        table.commit_request(1, 1, 10);
+        table.commit_request(2, 1, 20);
+        // Client 1 commits again, so client 2 now holds the oldest commit.
+        table.commit_request(1, 2, 30);
+        table.commit_request(3, 1, 40);
+
+        let clients: Vec<u128> = table
+            .watermarks_sorted()
+            .into_iter()
+            .map(|(client, _, _)| client)
+            .collect();
+        assert_eq!(clients, vec![1, 3]);
+    }
+
+    #[test]
+    fn given_partition_slice_when_watermarks_installed_should_replace_not_merge() {
+        let mut table = slice(4);
+        table.commit_request(9, 3, 1);
+        table.install_watermarks([(1, 4, 50), (2, 7, 60)]);
+
+        assert_eq!(table.count(), 2);
+        assert!(
+            !table.is_duplicate(9, 3),
+            "install replaces rather than merges"
+        );
+        assert!(table.is_duplicate(1, 4));
+        assert!(!table.is_duplicate(2, 8));
+    }
+
+    #[test]
+    fn given_partition_slice_when_exported_should_sort_ascending_by_client() {
+        let mut table = slice(8);
+        for (commit_op, client) in [30u128, 10, 20].into_iter().enumerate() {
+            table.commit_request(client, 1, commit_op as u64);
+        }
+
+        let clients: Vec<u128> = table
+            .watermarks_sorted()
+            .into_iter()
+            .map(|(client, _, _)| client)
+            .collect();
+        assert_eq!(clients, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn given_partition_slice_when_cleared_should_admit_everything() {
+        let mut table = slice(4);
+        table.commit_request(7, 5, 100);
+        table.install_watermarks(std::iter::empty());
+
+        assert_eq!(table.count(), 0);
+        assert!(!table.is_duplicate(7, 5));
+    }
+
+    #[test]
+    fn given_partition_slice_when_client_is_exempt_should_record_nothing() {
+        // Zero is reserved cluster-wide; every mutating entry point refuses it
+        // rather than asserting, so it doubles as the opt-out marker.
+        let mut table = slice(4);
+        table.commit_request(ClientTable::EXEMPT_CLIENT, 5, 100);
+
+        assert_eq!(table.count(), 0);
+        assert!(!table.is_duplicate(ClientTable::EXEMPT_CLIENT, 5));
+    }
+
+    #[test]
+    #[should_panic(expected = "an epoch-fencing table must use check_request")]
+    fn given_metadata_table_when_is_duplicate_called_should_panic() {
+        let _ = ClientTable::new(4).is_duplicate(7, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "a reply-caching table must use commit_reply")]
+    fn given_metadata_table_when_commit_request_called_should_panic() {
+        ClientTable::new(4).commit_request(7, 1, 1);
+    }
 
     // Resizing an empty table swaps its slot count in: a smaller cap then
     // evicts once the new bound is reached.

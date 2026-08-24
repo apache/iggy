@@ -2169,6 +2169,10 @@ const _: () = assert!(
     configs::partition::DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH
         == consensus::PIPELINE_PREPARE_QUEUE_MAX
 );
+const _: () = assert!(
+    configs::partition::DEFAULT_PARTITION_DEDUP_CLIENTS_MAX
+        == consensus::PARTITION_DEDUP_CLIENTS_MAX
+);
 const _: () =
     assert!(configs::metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX);
 const _: () =
@@ -2665,6 +2669,7 @@ async fn load_partition(
         config.partition.evicted_ring_capacity,
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
+    partition.set_dedup_clients_max(config.partition.dedup_clients_max);
     partition.set_partition_dir(partition_dir.clone());
     // Before the hydrate: the durable record is keyed by incarnation, so a
     // `purge.gen` left behind by a previous life of this namespace reads 0.

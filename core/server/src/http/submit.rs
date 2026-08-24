@@ -35,8 +35,8 @@ use tracing::warn;
 
 use crate::bootstrap::ServerShard;
 use crate::dispatch::{
-    dispatch_partition_request, resolve_delete_segments_truncate, submit_client_request_on_owner,
-    submit_logout_on_owner,
+    PartitionReplyMode, dispatch_partition_request, resolve_delete_segments_truncate,
+    submit_client_request_on_owner, submit_logout_on_owner,
 };
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
@@ -407,6 +407,7 @@ pub(in crate::http) async fn partition_write_replicated(
         session.session,
         session.client_id,
         Some(session.user_id),
+        PartitionReplyMode::Awaited,
     )
     .await;
     let outcome = compio::time::timeout(PARTITION_WRITE_REPLY_TIMEOUT, receiver).await;
@@ -456,6 +457,7 @@ pub(in crate::http) async fn produce_unacked(
         session.session,
         session.client_id,
         Some(session.user_id),
+        PartitionReplyMode::FireAndForget,
     )
     .await;
     Ok(())

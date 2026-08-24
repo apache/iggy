@@ -23,10 +23,12 @@ use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
 use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
 use iggy_binary_protocol::{
-    Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
+    Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
+    RoutedRequestHeader,
 };
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
+use server_common::Message;
 use server_common::send_messages::{ChecksumMode, convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 #[cfg(debug_assertions)]
@@ -528,14 +530,17 @@ where
     }
 }
 
-impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>
+impl<B, SB> IggyPartitions<B, SB>
 where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    async fn on_request(
+    /// [`Plane::on_request`] carrying the in-process reply channel a
+    /// `PartitionSubmit` arrived with; `None` keeps the bus-reply path.
+    pub async fn on_request_with_reply(
         &self,
         message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+        reply: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
         let namespace = IggyNamespace::from_raw(message.header().group);
         if self.is_tombstoned(&namespace) {
@@ -586,7 +591,20 @@ where
             );
             return;
         };
-        partition.on_request(message).await;
+        partition.on_request(message, reply).await;
+    }
+}
+
+impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    async fn on_request(
+        &self,
+        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+    ) {
+        self.on_request_with_reply(message, None).await;
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {

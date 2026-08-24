@@ -414,6 +414,10 @@ where
     async fn process_lifecycle(&self, payload: LifecycleFrame)
     where
         B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
     {
         match payload {
             LifecycleFrame::ReplicaInboundSetup { fd, slot } => {
@@ -543,6 +547,14 @@ where
                 // sender means the read is skipped and the gather side
                 // times out.
                 (self.on_partition_read)(namespace, read, reply);
+            }
+            LifecycleFrame::PartitionSubmit { request, reply } => {
+                // Addressed to the shard owning the request's namespace (the
+                // sender resolved it via the shards table, same fallback as
+                // `route_typed`). Every refusal answers on `reply`, so the
+                // awaiting shard never waits out its budget on a decision
+                // already made.
+                self.on_partition_submit(request, reply).await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or

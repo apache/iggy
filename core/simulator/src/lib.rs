@@ -1475,12 +1475,14 @@ mod tests {
         );
     }
 
-    /// At-least-once failover: `SendMessages` retry on a new primary
-    /// re-executes. Retry reply carries a HIGHER `commit` op (re-execution
-    /// proof, not dedup). Duplicate payload lives at two offsets; consumers
-    /// dedup if they need at-most-once-per-payload.
+    /// Failover retry absorbed by the partition dedup slice: a `SendMessages`
+    /// replay of an already-committed `(client, request)` on a NEW primary is
+    /// answered without re-executing. The slice is folded in on every replica
+    /// at commit, so the promoted primary knows the watermark its predecessor
+    /// established -- that inheritance is what this test proves.
     #[test]
-    fn failover_retry_re_executes_under_at_least_once() {
+    #[allow(clippy::too_many_lines)]
+    fn failover_retry_absorbed_by_partition_dedup() {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
@@ -1523,6 +1525,15 @@ mod tests {
         }
         let original_reply = original_reply.expect("commit reply must arrive before primary crash");
         let original_commit_op = original_reply.header().commit;
+        // Offset after exactly one committed batch: the duplicate must not
+        // move it.
+        let offset_after_original = sim.replicas[1].shards[0]
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on a live replica")
+            .stats
+            .current_offset();
         assert_eq!(
             original_reply.header().request,
             original_request_id,
@@ -1556,7 +1567,8 @@ mod tests {
             "new primary must not be the crashed replica"
         );
 
-        // Replay SAME request to new primary. No dedup -> re-execution.
+        // Replay the SAME request to the new primary: the dedup slice it
+        // inherited at commit must absorb it.
         sim.submit_request(client_id, new_primary_idx, replay_req.into_generic());
 
         let mut retry_reply: Option<Message<ReplyHeader>> = None;
@@ -1567,27 +1579,42 @@ mod tests {
                 break;
             }
         }
-        let retry_reply = retry_reply.expect(
-            "reply must arrive after retry; new primary re-commits as \
-             fresh prepare (at-least-once)",
-        );
+        let retry_reply = retry_reply
+            .expect("reply must arrive after retry; the new primary absorbs it as a duplicate");
 
-        // At-least-once: same request id (correlation), HIGHER commit op
-        // (re-execution). No dedup absorbs the retry.
         assert_eq!(
             retry_reply.header().request,
             original_request_id,
             "retry's reply must correlate to the request id"
         );
-        assert!(
-            retry_reply.header().commit > original_commit_op,
-            "retry must re-execute (commit op > original={original_commit_op}, got {})",
-            retry_reply.header().commit
-        );
         assert_eq!(
             retry_reply.header().client,
             client_id,
             "retry must echo original client_id"
+        );
+        assert_eq!(
+            retry_reply.header().status,
+            0,
+            "an absorbed duplicate is a success, not an error"
+        );
+        // The absorbed answer is synthesized at admission, so it never earns a
+        // new op. Re-execution would have committed past the original.
+        assert!(
+            retry_reply.header().op <= original_commit_op,
+            "retry must NOT re-execute (original commit={original_commit_op}, reply op={})",
+            retry_reply.header().op
+        );
+        // The payload committed exactly once.
+        let committed = sim.replicas[usize::from(new_primary_idx)].shards[0]
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on the new primary")
+            .stats
+            .current_offset();
+        assert_eq!(
+            committed, offset_after_original,
+            "duplicate must not append a second copy"
         );
     }
 

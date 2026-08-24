@@ -64,9 +64,9 @@ pub struct SimClient {
     /// sequence the server's `ClientTable` dedups and requires gap-free.
     request_counter: Cell<u64>,
     /// Separate id sequence for partition-plane ops, offset into a disjoint
-    /// range ([`PARTITION_ID_BASE`]). The partition plane has no client-table
-    /// dedup and treats the id as an opaque echo, so a partition id never
-    /// collides with a metadata id, even under reply duplication. See
+    /// range ([`PARTITION_ID_BASE`]), so a partition id never collides with a
+    /// metadata id even under reply duplication. Monotone per client, which is
+    /// what the per-group dedup watermark requires. See
     /// [`SimClient::request_id_for`].
     partition_counter: Cell<u64>,
     /// Deterministic per-message id source for produced messages. The real SDK
@@ -123,9 +123,10 @@ impl SimClient {
     /// Metadata/replicated ops advance a contiguous `1, 2, 3, …` counter: the
     /// `ClientTable` dedups them and rejects anything but `committed + 1`, so a
     /// gap opens a permanent `RequestGap` and wedges the client's metadata
-    /// plane. Partition ops are at-least-once with no dedup and the server
-    /// treats their id as an opaque echo, so they draw from a separate counter
-    /// offset into a disjoint range ([`PARTITION_ID_BASE`]). A partition id can
+    /// plane. Partition ops are deduped against a per-group watermark, which
+    /// accepts gaps, so they draw from a separate counter offset into a
+    /// disjoint range ([`PARTITION_ID_BASE`]) -- still strictly monotone per
+    /// client, which is all the watermark needs. A partition id can
     /// therefore never equal a metadata id, so a delayed or duplicated partition
     /// reply is never misattributed to a metadata entry in the auditor's
     /// `(client, request)` map (which would trip the group guard and drop a

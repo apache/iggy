@@ -176,6 +176,14 @@ pub const PROBE_ATTEMPTS_MAX: u32 = 5;
 /// When exceeded, the client with the oldest committed request is evicted.
 pub const CLIENTS_TABLE_MAX: usize = 8192;
 
+/// Default live dedup entries per PARTITION consensus group.
+///
+/// Far below [`CLIENTS_TABLE_MAX`] because this budget is per group rather than
+/// per node: the worst case scales with partition count, so it is sized to the
+/// producers one partition sees. Pinned against the
+/// `[partition] dedup_clients_max` default by a bootstrap assert.
+pub const PARTITION_DEDUP_CLIENTS_MAX: usize = 4096;
+
 #[derive(Debug)]
 pub struct PipelineEntry {
     pub header: PrepareHeader,
@@ -311,6 +319,22 @@ impl RequestEntry {
             reply_sender: Some(sender),
         };
         (entry, receiver)
+    }
+
+    /// Queued request carrying a sender the caller already owns, for a submit
+    /// that parked before reaching a prepare slot. Mirrors
+    /// [`Self::with_subscriber`], except the receiver half lives with the
+    /// caller rather than being minted here.
+    #[must_use]
+    pub const fn with_sender(
+        message: Message<RoutedRequestHeader>,
+        reply_sender: Option<Sender<Message<ReplyHeader>>>,
+    ) -> Self {
+        Self {
+            message,
+            received_at: 0,
+            reply_sender,
+        }
     }
 
     /// Take the reply sender for hand-off to the promoted pipeline entry.
@@ -656,6 +680,24 @@ impl LocalPipeline {
                 .any(|r| r.message.header().client == client)
     }
 
+    /// True if either queue already holds this exact `(client, request)`.
+    ///
+    /// The partition-plane in-flight check. Narrower than
+    /// [`Self::has_message_from_client`] on purpose: the partition pipeline is
+    /// depth-`prepare_queue_depth` by design, so blocking every concurrent
+    /// request from one client would serialize it to one in-flight write per
+    /// group. Only an exact replay needs absorbing.
+    #[must_use]
+    pub fn has_message_from_client_request(&self, client: u128, request: u64) -> bool {
+        self.prepare_queue
+            .iter()
+            .any(|p| p.header.client == client && p.header.request == request)
+            || self.request_queue.iter().any(|r| {
+                let header = r.message.header();
+                header.client == client && header.request == request
+            })
+    }
+
     /// Verify pipeline invariants.
     ///
     /// # Panics
@@ -767,6 +809,10 @@ impl Pipeline for LocalPipeline {
 
     fn has_message_from_client(&self, client_id: u128) -> bool {
         Self::has_message_from_client(self, client_id)
+    }
+
+    fn has_message_from_client_request(&self, client_id: u128, request: u64) -> bool {
+        Self::has_message_from_client_request(self, client_id, request)
     }
 
     fn cancel_all_subscribers(&mut self) {
@@ -1683,6 +1729,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub fn pipeline_has_message_from_client(&self, client_id: u128) -> bool {
         self.pipeline.borrow().has_message_from_client(client_id)
+    }
+
+    /// True iff this exact `(client, request)` is already in flight. The
+    /// partition plane's in-flight dedup: absorbs a replay without serializing
+    /// a client's pipeline depth.
+    #[must_use]
+    pub fn pipeline_has_message_from_client_request(&self, client_id: u128, request: u64) -> bool {
+        self.pipeline
+            .borrow()
+            .has_message_from_client_request(client_id, request)
     }
 
     /// Header of the oldest in-flight prepare.
