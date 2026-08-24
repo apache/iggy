@@ -453,6 +453,11 @@ pub enum IggyError {
     InvalidOffset(u64) = 4100,
     #[error("Invalid reserved field value: {0}, expected: 0")]
     InvalidReservedField(u64) = 4101,
+    /// The on-disk segment file length disagrees with the recovered bounds the
+    /// writer was seeded with; appending would corrupt the segment, so the
+    /// open fails instead. Field order: `(on_disk, expected)`.
+    #[error("Segment file size on disk: {0} does not match expected size: {1}")]
+    SegmentSizeMismatchAtOpen(u64, u64) = 4102,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]

@@ -6789,6 +6789,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-server",
+ "bytes",
  "clap",
  "configs",
  "configs_derive",
@@ -6822,6 +6823,7 @@ dependencies = [
  "serde_with",
  "serde_yaml_ng",
  "strum 0.28.0",
+ "subtle",
  "sysinfo 0.39.6",
  "system_stats",
  "tempfile",
@@ -6832,6 +6834,8 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]
