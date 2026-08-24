@@ -194,7 +194,7 @@ pub struct ClientEntrySnapshot {
     pub watermark: u64,
     pub watermark_checksum: u128,
     /// Wire bytes of the entry's latest committed reply, round-tripped through
-    /// [`CachedReply::from_message`]. Never empty: registration seeds the ring.
+    /// `CachedReply::from_message`. Never empty: registration seeds the ring.
     ///
     /// Serialized as a msgpack `bin` blob, not the integer array a plain `Vec<u8>`
     /// produces, which spends 2 bytes on every byte >= 0x80 and runs a checkpoint's
@@ -697,11 +697,11 @@ impl ClientTable {
     /// previous register reply is dropped), and preserves the watermark -
     /// session resume keeps dedup history.
     ///
-    /// Full table evicts the oldest commit, see [`Self::evict_oldest`].
+    /// Full table evicts the oldest commit, see `Self::evict_oldest`.
     ///
     /// A key this table evicted for capacity re-registers as a fresh entry that
     /// RESTORES the evicted watermark (and the watermark reply when it survived)
-    /// from [`EvictedFence`], for the same `user_id` only. A committed `Logout`
+    /// from `EvictedFence`, for the same `user_id` only. A committed `Logout`
     /// forgets that fence, so a register after one starts clean.
     ///
     /// # Panics

@@ -45,6 +45,9 @@ public sealed class EndpointFailoverTests
     private const int ReplyStatusOffset = 216;
 
     private const byte CommandReply = 8;
+    private const byte CommandEviction = 13;
+    private const int EvictionReasonOffset = 255;
+    private const byte EvictionStaleClient = 13;
     private const byte OperationRegister = 1;
     private const byte OperationNonReplicated = 2;
     private const int GetClusterMetadataCode = 12;
@@ -95,6 +98,68 @@ public sealed class EndpointFailoverTests
             $"{survivor.Registrations} registrations and {survivor.Pings} pings)");
         Assert.True(survivor.Registrations >= 1, "the remembered credentials signed in again on the survivor");
         Assert.True(survivor.Pings >= 1, "the request landed on the survivor");
+    }
+
+    /// <summary>
+    ///     Mirrors the integration contract (HeartbeatTests
+    ///     EvictedClient_WithoutAutoLogin_Should_FailFast_And_NotReconnect): a server-side eviction ends the
+    ///     session authoritatively, so the credentials a manual sign-in remembered must not resurrect it - the
+    ///     evicted request surfaces the loss with no reconnect attempt.
+    /// </summary>
+    [Fact]
+    public async Task ServerEvictionForgetsTheRememberedSignIn()
+    {
+        using var node = new MockNode();
+        var evict = false;
+        node.Serve(request =>
+        {
+            if (request.Operation == OperationRegister)
+            {
+                return Reply(OperationRegister, RegisterBody(session: 128));
+            }
+
+            return evict
+                ? EvictionFrame(EvictionStaleClient)
+                : Reply(OperationNonReplicated, request.Code == GetClusterMetadataCode
+                    ? ClusterMetadata(node.Port, node.Port, node.Port)
+                    : []);
+        });
+
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{node.Port}",
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 2,
+                InitialDelay = TimeSpan.FromMilliseconds(20)
+            }
+        };
+        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        await client.PingAsync(TestContext.Current.CancellationToken);
+        var connectionsBeforeEviction = node.Connections;
+
+        evict = true;
+        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(TestContext.Current.CancellationToken));
+        Assert.Equal(connectionsBeforeEviction, node.Connections);
+
+        // The dropped connection leaves the next call transport-shaped, but the eviction forgot the remembered
+        // sign-in, so it must fail fast instead of reconnecting into a resurrected session.
+        await Assert.ThrowsAnyAsync<Exception>(() => client.PingAsync(TestContext.Current.CancellationToken));
+        Assert.Equal(connectionsBeforeEviction, node.Connections);
+    }
+
+    private static byte[] EvictionFrame(byte reason)
+    {
+        var frame = new byte[HeaderSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(SizeOffset, 4), HeaderSize);
+        frame[CommandOffset] = CommandEviction;
+        frame[EvictionReasonOffset] = reason;
+        return frame;
     }
 
     [Fact]
@@ -231,6 +296,7 @@ public sealed class EndpointFailoverTests
         private readonly TcpListener _listener;
         private readonly List<TcpClient> _accepted = [];
         private volatile bool _killed;
+        private int _connections;
         private int _pings;
         private int _registrations;
 
@@ -246,6 +312,17 @@ public sealed class EndpointFailoverTests
         public int Pings => Volatile.Read(ref _pings);
 
         public int Registrations => Volatile.Read(ref _registrations);
+
+        public int Connections
+        {
+            get
+            {
+                lock (_accepted)
+                {
+                    return _connections;
+                }
+            }
+        }
 
         public void Serve(Func<MockRequest, byte[]> handler)
         {
@@ -266,6 +343,7 @@ public sealed class EndpointFailoverTests
                     lock (_accepted)
                     {
                         _accepted.Add(connection);
+                        _connections++;
                     }
 
                     _ = Task.Run(() => Exchange(connection, handler));

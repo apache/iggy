@@ -88,7 +88,7 @@ pub trait Command {
 /// Per-command handler for a given state type.
 ///
 /// Each command implements it for the state it mutates, returning an
-/// [`ApplyReply`]: a `code` (0 = success) plus the typed reply `body` to thread
+/// `ApplyReply`: a `code` (0 = success) plus the typed reply `body` to thread
 /// into the Reply message.
 ///
 /// Apply MUST be deterministic across replicas: both left/right buffers recompute
@@ -335,9 +335,9 @@ macro_rules! define_state {
             }
 
             impl $state {
-                /// Mint a `Send + Sync` [`ReadHandleFactory`] for this state.
+                /// Mint a `Send + Sync` `ReadHandleFactory` for this state.
                 /// Allows the read side to be carried across shard threads
-                /// without sharing the underlying `!Sync` [`ReadHandle`].
+                /// without sharing the underlying `!Sync` `ReadHandle`.
                 #[must_use]
                 pub fn factory(&self) -> $crate::stm::LeftRightFactory<[<$state Inner>]> {
                     self.inner.factory()
@@ -345,7 +345,7 @@ macro_rules! define_state {
 
                 /// Construct a reader-only state wrapper from a factory minted
                 /// by the writer-side shard. The thread that calls this owns
-                /// the resulting [`ReadHandle`]; calling `apply` on the
+                /// the resulting `ReadHandle`; calling `apply` on the
                 /// returned wrapper panics because `write` is `None`.
                 #[must_use]
                 pub fn from_factory(

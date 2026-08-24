@@ -178,6 +178,15 @@ impl BinaryTransport for TcpClient {
             return Err(error);
         }
 
+        // A stale-client eviction is the server ending this session
+        // authoritatively, like a logout: the remembered sign-in ends with it,
+        // so only a configured auto-login may bring the session back.
+        // Remembered credentials exist for transport loss, where the session
+        // died with the socket rather than by anyone's decision.
+        if matches!(error, IggyError::StaleClient) {
+            self.forget_session_credentials().await;
+        }
+
         if !self.config.reconnection.enabled {
             return Err(IggyError::Disconnected);
         }

@@ -1443,6 +1443,16 @@ public sealed partial class TcpMessageStream : IIggyClient
         catch (Exception e) when (IsConnectionException(e) && !IsConnecting && !_disposed)
         {
             _logger.LogWarning("Connection lost");
+
+            // A server-side eviction is the server ending this session authoritatively, like a logout: the
+            // remembered sign-in ends with it, so only a configured auto login may bring the session back.
+            // Remembered credentials exist for transport loss, where the session died with the socket rather
+            // than by anyone's decision.
+            if (e is IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true })
+            {
+                _rememberedLogin = null;
+            }
+
             if (!_configuration.ReconnectionSettings.Enabled)
             {
                 _logger.LogWarning("Reconnection is disabled");

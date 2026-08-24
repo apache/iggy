@@ -213,12 +213,12 @@ pub mod topic_option_keys {
     /// Must be non-zero.
     pub const MESSAGES_REQUIRED_TO_SAVE: &str = "messages_required_to_save";
     /// Flush the journal once it holds this many bytes: `Uint64` or a
-    /// byte-size string. Paired with [`Self::MESSAGES_REQUIRED_TO_SAVE`];
+    /// byte-size string. Paired with `Self::MESSAGES_REQUIRED_TO_SAVE`;
     /// whichever threshold trips first flushes.
     pub const SIZE_OF_MESSAGES_REQUIRED_TO_SAVE: &str = "size_of_messages_required_to_save";
     /// Reserve the segment's bytes up front on a filesystem that supports it:
     /// `Bool`, or the strings `true` / `false`. Pairs with
-    /// [`Self::SEGMENT_SIZE`] -- preallocation reserves exactly that much, so
+    /// `Self::SEGMENT_SIZE` -- preallocation reserves exactly that much, so
     /// the two only make sense decided together.
     pub const PREALLOCATE_SEGMENTS: &str = "preallocate_segments";
 }
@@ -557,7 +557,7 @@ impl StreamUpdateOptions {
     ///
     /// # Errors
     ///
-    /// See [`raw_options_to_wire`].
+    /// See `raw_options_to_wire`.
     pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
         raw_options_to_wire(&self.raw)
     }
@@ -579,7 +579,7 @@ impl UserUpdateOptions {
     ///
     /// # Errors
     ///
-    /// See [`raw_options_to_wire`].
+    /// See `raw_options_to_wire`.
     pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
         raw_options_to_wire(&self.raw)
     }
@@ -658,7 +658,7 @@ impl TopicUpdateOptions {
     ///
     /// # Errors
     ///
-    /// See [`raw_options_map`].
+    /// See `raw_options_map`.
     pub fn to_wire(&self) -> Result<WireOptions, IggyError> {
         let mut options = raw_options_map(&self.raw)?;
         if let Some(compression_algorithm) = self.compression_algorithm {
@@ -875,7 +875,7 @@ impl TopicCreateOptions {
     ///
     /// # Errors
     ///
-    /// See [`raw_options_map`].
+    /// See `raw_options_map`.
     pub fn to_option_map(&self) -> Result<ResourceOptions, IggyError> {
         let mut options = raw_options_map(&self.raw)?;
         if let Some(compression_algorithm) = self.compression_algorithm {

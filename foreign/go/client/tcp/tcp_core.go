@@ -488,6 +488,15 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 		return nil, err
 	}
 
+	// A stale-client eviction is the server ending this session
+	// authoritatively, like a logout: the remembered sign-in ends with it, so
+	// only a configured auto-login may bring the session back. Remembered
+	// credentials exist for transport loss, where the session died with the
+	// socket rather than by anyone's decision.
+	if errors.Is(err, ierror.ErrStaleClient) {
+		c.forgetLogin()
+	}
+
 	// With no credentials -- neither configured nor remembered from a
 	// sign-in -- a reconnect cannot restore the session, so anything but a
 	// sign-in fails here instead of replaying unauthenticated. The sign-in

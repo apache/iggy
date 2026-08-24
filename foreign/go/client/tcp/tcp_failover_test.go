@@ -121,6 +121,41 @@ func TestFailover_FailsFastWhenNothingEverSignedIn(t *testing.T) {
 		"a client that never signed in cannot restore a session by reconnecting")
 }
 
+// A stale-client eviction is the server ending the session authoritatively,
+// like a logout: the remembered sign-in must not resurrect it, so the evicted
+// request surfaces the loss instead of reconnecting into a fresh session.
+func TestFailover_ServerEvictionForgetsTheRememberedSignIn(t *testing.T) {
+	var server *testListener
+	var evict atomic.Bool
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister {
+			return registerReplyFrame(7, 128)
+		}
+		if evict.Load() {
+			return evictionFrame(vsr.EvictionStaleClient, 0, 0)
+		}
+		if read.code() == uint32(command.GetClusterMetadataCode) {
+			return clusterMetadataFrame(t, 0, server.address())
+		}
+		return replyFrame(vsr.OperationNonReplicated, nil)
+	})
+
+	client := newDialingClient(t, server.address())
+	ctx := context.Background()
+	require.NoError(t, client.Connect(ctx))
+	_, err := client.LoginUser(ctx, "iggy", "iggy")
+	require.NoError(t, err)
+	connectionsBefore := server.connections()
+
+	evict.Store(true)
+	require.Error(t, client.Ping(ctx), "the evicted request surfaces the loss")
+
+	_, remembered := client.signInCredentials()
+	assert.False(t, remembered, "the eviction forgot the remembered sign-in")
+	assert.Equal(t, connectionsBefore, server.connections(),
+		"no reconnect dial resurrected the evicted session")
+}
+
 // An explicit sign-out is caller intent: the reconnect must not sign back in
 // with the credentials the earlier sign-in used.
 func TestFailover_DoesNotResurrectASignedOutSession(t *testing.T) {

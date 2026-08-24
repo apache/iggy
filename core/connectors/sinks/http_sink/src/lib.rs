@@ -150,7 +150,7 @@ struct EncodedHeader {
     iggy_header_encoding: &'static str,
 }
 
-/// Configuration for the HTTP sink connector, deserialized from [plugin_config] in config.toml.
+/// Configuration for the HTTP sink connector, deserialized from `plugin_config` in config.toml.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HttpSinkConfig {
     /// Target URL for HTTP requests (required).

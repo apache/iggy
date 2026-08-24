@@ -127,7 +127,7 @@ pub struct ReplicaTlsCtx {
 /// therefore binds `dialer_id = peer_id`, `acceptor_id = self_id`.
 ///
 /// On a rejection an authenticated, still-waiting dialer is answered
-/// with a nonzero-status [`build_challenge_message`] (see [`reject`]) so
+/// with a nonzero-status `build_challenge_message` (see `reject`) so
 /// it learns the cause from its own logs rather than seeing a bare
 /// connection close.
 ///

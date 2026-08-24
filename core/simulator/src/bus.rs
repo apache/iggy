@@ -65,7 +65,7 @@ pub struct Envelope {
 ///
 /// Consensus code calls `send_to_replica()` / `send_to_client()` which stage
 /// messages here. The simulator's tick loop drains each replica's outbox and
-/// feeds the messages into the [`Network`] for simulated delivery.
+/// feeds the messages into the `Network` for simulated delivery.
 pub struct SimOutbox {
     /// Replica id that owns this outbox. Populated as `from_replica` on every envelope.
     self_id: u8,

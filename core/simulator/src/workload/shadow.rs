@@ -178,7 +178,7 @@ impl Shadow {
         self.fresh_name(prefix)
     }
 
-    /// Apply a predicted effect. Returns [`SimCommand`]s for the driver
+    /// Apply a predicted effect. Returns `SimCommand`s for the driver
     /// plus an `applied` flag gating `auditor.note_committed`.
     ///
     /// `applied = false` when a precondition no longer holds (parent

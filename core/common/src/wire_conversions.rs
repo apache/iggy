@@ -732,7 +732,7 @@ fn topic_permissions_to_wire(topic_id: usize, tp: &TopicPermissions) -> WireTopi
 
 // -- User Headers conversions --
 
-/// Encode domain user headers into a [`WireUserHeaders`] wrapper.
+/// Encode domain user headers into a `WireUserHeaders` wrapper.
 pub fn user_headers_to_wire(
     headers: &BTreeMap<HeaderKey, HeaderValue>,
 ) -> iggy_binary_protocol::WireUserHeaders {
@@ -762,7 +762,7 @@ pub fn user_headers_to_wire(
     WireUserHeaders::from_validated(buf.freeze())
 }
 
-/// Decode a [`WireUserHeaders`] wrapper into domain user headers.
+/// Decode a `WireUserHeaders` wrapper into domain user headers.
 ///
 /// Wire-level validation accepts unknown kind codes for forward compatibility
 /// (VSR rolling upgrades). Domain-level `from_code()` rejects them - the wire
