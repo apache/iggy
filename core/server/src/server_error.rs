@@ -289,14 +289,21 @@ pub enum ServerError {
 /// by an upstream crash window as well as by damage.
 #[derive(Debug)]
 pub enum PartitionRecoveryRefusal {
+    /// `recoverable_bytes` on the two chain-shape refusals is the sum of
+    /// walked, decodable bytes across the whole planned chain: the evidence
+    /// the single-replica boot arm needs to decide whether fencing and
+    /// rebuilding empty loses anything (0 means the chain provably held
+    /// nothing servable; anything else is data a rebuild would hide).
     EmptyNonTailSegment {
         empty_start: u64,
         next_start: u64,
+        recoverable_bytes: u64,
     },
     Hole {
         previous_start: u64,
         previous_end: u64,
         next_start: u64,
+        recoverable_bytes: u64,
     },
     /// The index holds entries but no whole batch decodes AND verifies where
     /// its last entry points, so index and log describe different files. The
@@ -361,10 +368,7 @@ pub enum PartitionRecoveryRefusal {
     /// Index entries must ascend in offset and position (they are appended,
     /// one per flushed chunk, over a growing log); a regression means the
     /// file was written mis-strided or over foreign bytes.
-    IndexEntriesNotMonotone {
-        start_offset: u64,
-        entry_index: u64,
-    },
+    IndexEntriesNotMonotone { start_offset: u64, entry_index: u64 },
     IndexEntryBeforeSegmentStart {
         start_offset: u64,
         first_entry_offset: u64,
@@ -379,24 +383,30 @@ pub enum PartitionRecoveryRefusal {
 }
 
 impl std::fmt::Display for PartitionRecoveryRefusal {
+    // One arm per refusal shape; length tracks the enum, not complexity.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EmptyNonTailSegment {
                 empty_start,
                 next_start,
+                recoverable_bytes,
             } => write!(
                 f,
                 "segment {empty_start} is empty yet {next_start} follows it, so the \
-                 chain cannot be served past it"
+                 chain ({recoverable_bytes} recoverable bytes) cannot be served \
+                 past it"
             ),
             Self::Hole {
                 previous_start,
                 previous_end,
                 next_start,
+                recoverable_bytes,
             } => write!(
                 f,
                 "segment {previous_start} ends at offset {previous_end} but the next \
-                 starts at {next_start}, leaving a hole"
+                 starts at {next_start}, leaving a hole in a chain holding \
+                 {recoverable_bytes} recoverable bytes"
             ),
             Self::IndexLogDivergence {
                 start_offset,

@@ -1921,22 +1921,29 @@ async fn build_shard_for_thread(
             // aside (keeping the superblock so the group cannot re-enter
             // view 0), the group is materialised fresh, and the ordinary
             // rejoin path (repair, then state transfer on a refused floor)
-            // refills it. Single-replica, only the two directory-shape
-            // refusals (a hole from a stray or half-unlinked file, an
-            // orphaned empty segment) still fence and rebuild: their segment
-            // bytes sit intact in quarantine and no damage verdict needs
-            // surfacing. Every refusal that proved or suspects damage
-            // tombstones instead, leaving its files exactly where they are:
-            // a rebuilt empty partition answers polls exactly like a healthy
-            // empty one and hides the loss, while an unrouted namespace is a
-            // failure an operator can see.
+            // refills it. Single-replica, only a chain-shape refusal whose
+            // planned chain provably holds ZERO recoverable bytes still
+            // fences and rebuilds: nothing servable is at stake, so an empty
+            // rebuild hides no loss. The verdict variant alone is not that
+            // evidence -- a hole and an orphan empty segment both fire over
+            // fully populated chains -- which is why the gate reads the byte
+            // total the refusal carries. Every other refusal tombstones,
+            // leaving its files exactly where they are: a rebuilt empty
+            // partition answers polls exactly like a healthy empty one and
+            // hides the loss, while an unrouted namespace is a failure an
+            // operator can see.
             Err(ServerError::PartitionRecoveryRefused { dir, reason, .. }) => {
                 let partition_dir = dir.to_string_lossy().into_owned();
                 let rebuild_for_rejoin = topology.replica_count > 1
                     || matches!(
                         reason,
-                        PartitionRecoveryRefusal::Hole { .. }
-                            | PartitionRecoveryRefusal::EmptyNonTailSegment { .. }
+                        PartitionRecoveryRefusal::Hole {
+                            recoverable_bytes: 0,
+                            ..
+                        } | PartitionRecoveryRefusal::EmptyNonTailSegment {
+                            recoverable_bytes: 0,
+                            ..
+                        }
                     );
                 error!(
                     stream_id,

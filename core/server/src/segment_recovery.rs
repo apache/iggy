@@ -479,6 +479,15 @@ fn ensure_contiguous_chain(
     identity: PartitionIdentity<'_>,
     planned: &[PlannedSegment],
 ) -> Result<(), ServerError> {
+    // Walked, decodable bytes across the whole chain: the refusals carry it
+    // so the single-replica boot arm can tell a shape with nothing servable
+    // at stake (fence and rebuild empty) from one guarding real data
+    // (tombstone). The verdict variant alone cannot: both shapes here can
+    // fire over fully populated chains.
+    let recoverable_bytes = planned
+        .iter()
+        .map(|plan| plan.segment.size.as_bytes_u64())
+        .sum::<u64>();
     for pair in planned.windows(2) {
         let previous = &pair[0].segment;
         let next = &pair[1].segment;
@@ -492,6 +501,7 @@ fn ensure_contiguous_chain(
                 identity.refusal(PartitionRecoveryRefusal::EmptyNonTailSegment {
                     empty_start: previous.start_offset,
                     next_start: next.start_offset,
+                    recoverable_bytes,
                 }),
             );
         }
@@ -502,6 +512,7 @@ fn ensure_contiguous_chain(
                 previous_start: previous.start_offset,
                 previous_end: previous.end_offset,
                 next_start: next.start_offset,
+                recoverable_bytes,
             }));
         }
     }
