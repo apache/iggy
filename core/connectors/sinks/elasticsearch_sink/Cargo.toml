@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_elasticsearch_sink"
-version = "0.5.0-edge.2"
+version = "0.5.0-edge.4"
 description = "Iggy Elasticsearch sink connector"
 edition = "2024"
 license = "Apache-2.0"
@@ -48,3 +48,6 @@ serde_json = { workspace = true }
 simd-json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

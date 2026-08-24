@@ -36,15 +36,13 @@ use figment::value::Dict;
 use figment::{Metadata, Profile, Provider};
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
-use server_common::sharding::{MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
 use std::env;
 use std::sync::Arc;
 
 pub use crate::common::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, MemoryPoolConfig,
-    MessageSaverConfig, MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig,
-    PersonalAccessTokenConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
-    TelemetryTransport,
+    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
+    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig, TelemetryTransport,
 };
 
 const DEFAULT_CONFIG_PATH: &str = "core/server/config.toml";
@@ -89,6 +87,12 @@ const RELOCATED_CONFIG_KEYS: &[RelocatedKey] = &[
         path: "system.message_deduplication",
         replacement: None,
     },
+    // The whole table, not just its leaves. Caps are compile-time constants
+    // enforced at admission, so a per-node value could only diverge from them.
+    RelocatedKey {
+        path: "extra",
+        replacement: None,
+    },
 ];
 
 /// [`SystemConfig`] bound to this crate's own
@@ -98,17 +102,15 @@ pub type ServerSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
 
 /// Top-level on-disk config schema for the `iggy-server` binary.
 ///
-/// Composes the shared section types from [`crate::common`] with the
+/// Composes the shared section types from `crate::common` with the
 /// transport, cluster, metadata and [`MessageBusConfig`] sections owned
-/// by [`super`].
+/// by `super`.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[config_env(prefix = "IGGY_", name = "iggy-server-config")]
 pub struct ServerConfig {
     pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
     #[serde(default)]
-    pub extra: ExtraConfig,
-    pub message_saver: MessageSaverConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
     pub system: Arc<ServerSystemConfig>,
@@ -121,28 +123,6 @@ pub struct ServerConfig {
     pub metadata: MetadataConfig,
     pub partition: PartitionConfig,
     pub message_bus: MessageBusConfig,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct ExtraConfig {
-    pub namespace: NamespaceConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-pub struct NamespaceConfig {
-    pub max_streams: usize,
-    pub max_topics: usize,
-    pub max_partitions: usize,
-}
-
-impl Default for NamespaceConfig {
-    fn default() -> Self {
-        Self {
-            max_streams: MAX_STREAMS,
-            max_topics: MAX_TOPICS,
-            max_partitions: MAX_PARTITIONS,
-        }
-    }
 }
 
 impl ServerConfig {

@@ -63,18 +63,15 @@ use std::time::Duration;
 ///
 /// Hardcoded knobs the bus does NOT expose: `max_concurrent_uni_streams = 0`
 /// and the CUBIC congestion controller. Both are architectural
-/// invariants of the SDK-client plane (single bidi stream per peer,
-/// no datagram or unidirectional traffic).
+/// invariants of the SDK-client plane (no datagram or unidirectional
+/// traffic).
 #[derive(Debug, Clone)]
 pub struct QuicTuning {
     /// Maximum number of concurrent bidirectional streams per
-    /// connection. The bus opens exactly one per peer; setting this
-    /// above 1 just preallocates unused quinn-proto state.
+    /// connection. Each SDK command opens a fresh bidi stream, so
+    /// this caps how many commands one client connection may have
+    /// in flight; 1 disables pipelining.
     pub max_concurrent_bidi_streams: u32,
-
-    /// Buffer size handed to quinn's outbound datagram queue, in
-    /// bytes.
-    pub datagram_send_buffer_size: usize,
 
     /// Initial path MTU advertised to the peer, in bytes.
     pub initial_mtu: u16,
@@ -84,6 +81,13 @@ pub struct QuicTuning {
 
     /// Receive-flow control window per connection, in bytes.
     pub receive_window: u32,
+
+    /// Receive-flow control window per stream, in bytes. Never above
+    /// [`Self::receive_window`], and equal to it under the shipped
+    /// single-stream default. Setting it strictly below is what keeps
+    /// one unread stream from pinning the whole connection window, so
+    /// it only buys anything once several streams share a connection.
+    pub stream_receive_window: u32,
 
     /// Interval between QUIC keep-alive PINGs. `Duration::ZERO`
     /// disables keep-alive; the connection then relies entirely on
@@ -239,11 +243,11 @@ fn build_quic_tuning(quic: &configs::quic::QuicConfig) -> QuicTuning {
     QuicTuning {
         max_concurrent_bidi_streams: u32::try_from(quic.max_concurrent_bidi_streams)
             .unwrap_or(u32::MAX),
-        datagram_send_buffer_size: usize::try_from(quic.datagram_send_buffer_size.as_bytes_u64())
-            .unwrap_or(usize::MAX),
         initial_mtu: u16::try_from(quic.initial_mtu.as_bytes_u64()).unwrap_or(u16::MAX),
         send_window: quic.send_window.as_bytes_u64(),
         receive_window: u32::try_from(quic.receive_window.as_bytes_u64()).unwrap_or(u32::MAX),
+        stream_receive_window: u32::try_from(quic.stream_receive_window.as_bytes_u64())
+            .unwrap_or(u32::MAX),
         keep_alive_interval: quic.keep_alive_interval.get_duration(),
         max_idle_timeout: quic.max_idle_timeout.get_duration(),
     }
@@ -251,9 +255,9 @@ fn build_quic_tuning(quic: &configs::quic::QuicConfig) -> QuicTuning {
 
 impl Default for QuicTuning {
     /// Mirrors the `[quic]` defaults in
-    /// `core/server/config.toml`: 64 MiB send/receive windows,
-    /// 30 s idle timeout, 10 s keep-alive, 8 KiB initial MTU, 100 KiB
-    /// datagram send buffer, single bidi stream per peer.
+    /// `core/server/config.toml`: 64 MiB send/receive windows, a per-stream
+    /// window equal to the connection receive window, 30 s idle timeout, 10 s
+    /// keep-alive, 1200 B initial MTU, one in-flight command per connection.
     ///
     /// Intended for tests and direct callers; production builds
     /// derive the field from [`ServerConfig`] so the values stay in
@@ -261,10 +265,10 @@ impl Default for QuicTuning {
     fn default() -> Self {
         Self {
             max_concurrent_bidi_streams: 1,
-            datagram_send_buffer_size: 100 * 1024,
-            initial_mtu: 8 * 1024,
+            initial_mtu: 1200,
             send_window: 64 * 1024 * 1024,
             receive_window: 64 * 1024 * 1024,
+            stream_receive_window: 64 * 1024 * 1024,
             keep_alive_interval: Duration::from_secs(10),
             max_idle_timeout: Duration::from_secs(30),
         }
@@ -335,17 +339,16 @@ mod tests {
             literal.max_concurrent_bidi_streams
         );
         assert_eq!(
-            schema_quic.datagram_send_buffer_size, literal.datagram_send_buffer_size,
-            "schema datagram_send_buffer_size {} bytes vs literal {} bytes",
-            schema_quic.datagram_send_buffer_size, literal.datagram_send_buffer_size
-        );
-        assert_eq!(
             schema_quic.initial_mtu, literal.initial_mtu,
             "schema initial_mtu {} bytes vs literal {} bytes",
             schema_quic.initial_mtu, literal.initial_mtu
         );
         assert_eq!(schema_quic.send_window, literal.send_window);
         assert_eq!(schema_quic.receive_window, literal.receive_window);
+        assert_eq!(
+            schema_quic.stream_receive_window,
+            literal.stream_receive_window
+        );
         assert_eq!(schema_quic.keep_alive_interval, literal.keep_alive_interval);
         assert_eq!(schema_quic.max_idle_timeout, literal.max_idle_timeout);
     }

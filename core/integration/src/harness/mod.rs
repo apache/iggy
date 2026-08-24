@@ -42,6 +42,7 @@
 
 pub mod config;
 mod context;
+pub mod disk;
 mod error;
 mod fixture;
 pub mod handle;

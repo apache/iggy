@@ -476,7 +476,7 @@ mod tests {
     use crate::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
     use async_channel::{Receiver, Sender, bounded};
     use compio::net::TcpListener;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
     use rustls::RootCertStore;
     use server_common::MESSAGE_ALIGN;
     use server_common::Message;
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn header_only(command: Command2) -> Frozen<MESSAGE_ALIGN> {
+    fn header_only(command: Command) -> Frozen<MESSAGE_ALIGN> {
         Message::<GenericHeader>::new(HEADER_SIZE)
             .transmute_header(|_, h: &mut GenericHeader| {
                 h.command = command;
@@ -541,7 +541,7 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn padded(command: Command2, total_size: usize) -> Frozen<MESSAGE_ALIGN> {
+    fn padded(command: Command, total_size: usize) -> Frozen<MESSAGE_ALIGN> {
         Message::<GenericHeader>::new(total_size)
             .transmute_header(|_, h: &mut GenericHeader| {
                 h.command = command;
@@ -604,24 +604,24 @@ mod tests {
         let (client_out, client_in, client_shutdown, client_handle) = drive(client_conn);
 
         client_out
-            .send(header_only(Command2::Request))
+            .send(header_only(Command::Request))
             .await
             .expect("client send");
         let received = compio::time::timeout(Duration::from_secs(5), server_in.recv())
             .await
             .expect("server recv within 5 s")
             .expect("server frame");
-        assert_eq!(received.header().command, Command2::Request);
+        assert_eq!(received.header().command, Command::Request);
 
         server_out
-            .send(header_only(Command2::Reply))
+            .send(header_only(Command::Reply))
             .await
             .expect("server send");
         let reply = compio::time::timeout(Duration::from_secs(5), client_in.recv())
             .await
             .expect("client recv within 5 s")
             .expect("client frame");
-        assert_eq!(reply.header().command, Command2::Reply);
+        assert_eq!(reply.header().command, Command::Reply);
 
         server_shutdown.trigger();
         client_shutdown.trigger();
@@ -647,14 +647,14 @@ mod tests {
         let (client_out, _client_in, client_shutdown, client_handle) = drive(client_conn);
 
         client_out
-            .send(padded(Command2::Request, total))
+            .send(padded(Command::Request, total))
             .await
             .expect("client send 1 MiB");
         let received = compio::time::timeout(Duration::from_secs(15), server_in.recv())
             .await
             .expect("server recv within 15 s")
             .expect("server frame");
-        assert_eq!(received.header().command, Command2::Request);
+        assert_eq!(received.header().command, Command::Request);
         assert_eq!(received.header().size as usize, total);
 
         server_shutdown.trigger();
@@ -683,7 +683,7 @@ mod tests {
             drive_with_cap(client_conn, framing::MAX_MESSAGE_SIZE);
 
         client_out
-            .send(padded(Command2::Request, OVER_CAP))
+            .send(padded(Command::Request, OVER_CAP))
             .await
             .expect("client send oversize");
 

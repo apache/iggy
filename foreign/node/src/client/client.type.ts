@@ -160,7 +160,12 @@ export type ClientConfig = {
   poolSize?: PoolSizeOption,
   /** Automatic reconnection configuration */
   reconnect?: ReconnectOption,
-  /** Interval for sending heartbeat pings in milliseconds */
+  /**
+   * Interval for sending heartbeat pings in milliseconds, as an integer
+   * between 0 and Node's timer ceiling. Defaults to 5000. Set to 0 to disable
+   * client heartbeats; any other unusable value is rejected rather than
+   * silently disabling them.
+   */
   heartbeatInterval?: number,
   /** Maximum accepted response frame size in bytes */
   maxResponseFrameSize?: number

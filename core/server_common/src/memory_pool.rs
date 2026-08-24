@@ -70,12 +70,11 @@ pub fn memory_pool() -> &'static MemoryPool {
         .expect("Memory pool not initialized - MemoryPool::init_pool should be called first")
 }
 
-// TODO: Extract shared domain types (IggyByteSize, IggyDuration, etc.) into an `iggy_types`
-// leaf crate so `iggy_common` can depend on `configs` directly. That lets us delete this
-// duplicate and use `configs::server::MemoryPoolConfig` here instead.
-/// Configuration for the memory pool.
+/// Pool settings, converted from the serde-facing config type in
+/// `configs::server::MemoryPoolConfig` (which depends on this crate, so the
+/// domain type has to live here - same split as [`crate::log::TelemetrySettings`]).
 #[derive(Debug)]
-pub struct MemoryPoolConfigOther {
+pub struct MemoryPoolSettings {
     /// Whether the pool is enabled.
     pub enabled: bool,
     /// Maximum size of the pool.
@@ -162,11 +161,11 @@ impl MemoryPool {
         }
     }
 
-    /// Initialize the global pool from the given config.
-    pub fn init_pool(config: &MemoryPoolConfigOther) {
-        let is_enabled = config.enabled;
-        let memory_limit = config.size.as_bytes_usize();
-        let bucket_capacity = config.bucket_capacity as usize;
+    /// Initialize the global pool from the given settings.
+    pub fn init_pool(settings: &MemoryPoolSettings) {
+        let is_enabled = settings.enabled;
+        let memory_limit = settings.size.as_bytes_usize();
+        let bucket_capacity = settings.bucket_capacity as usize;
 
         let _ =
             MEMORY_POOL.get_or_init(|| MemoryPool::new(is_enabled, memory_limit, bucket_capacity));
@@ -502,12 +501,12 @@ mod tests {
 
     fn initialize_pool_for_tests() {
         TEST_INIT.call_once(|| {
-            let config = MemoryPoolConfigOther {
+            let settings = MemoryPoolSettings {
                 enabled: true,
                 size: IggyByteSize::from_str("4GiB").unwrap(),
                 bucket_capacity: 8192,
             };
-            MemoryPool::init_pool(&config);
+            MemoryPool::init_pool(&settings);
         });
     }
 

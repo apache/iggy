@@ -40,8 +40,9 @@ pub const NON_CONFIG_ENV_VARS: [&str; 4] = [
 ///
 /// # Implicit defaults
 ///
-/// - Setting any `tcp.socket.*` option automatically enables `tcp.socket.override_defaults`
-/// - Setting any `quic.socket.*` option automatically enables `quic.socket.override_defaults`
+/// - `encryption` is shorthand for `system.encryption.key`.
+/// - Setting that key also turns `system.encryption.enabled` on, unless the
+///   caller passed it explicitly.
 ///
 /// # Errors
 ///
@@ -50,8 +51,6 @@ pub fn resolve_config_paths(
     overrides: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, String> {
     let mut env_vars = HashMap::new();
-    let mut needs_tcp_socket_override = false;
-    let mut needs_quic_socket_override = false;
     let mut needs_encryption_enabled = false;
 
     for (path, value) in overrides {
@@ -69,13 +68,6 @@ pub fn resolve_config_paths(
             Some(m) => {
                 env_vars.insert(m.env_name.to_string(), value.clone());
 
-                // Track if we need to enable socket override_defaults
-                if path.starts_with("tcp.socket.") && path != "tcp.socket.override_defaults" {
-                    needs_tcp_socket_override = true;
-                }
-                if path.starts_with("quic.socket.") && path != "quic.socket.override_defaults" {
-                    needs_quic_socket_override = true;
-                }
                 // Track if encryption key is set (auto-enable encryption)
                 if path == "encryption"
                     || path == "encryption.key"
@@ -101,17 +93,6 @@ pub fn resolve_config_paths(
         }
     }
 
-    // Auto-enable override_defaults when socket settings are customized
-    if needs_tcp_socket_override && let Some(m) = find_mapping("tcp.socket.override_defaults") {
-        env_vars
-            .entry(m.env_name.to_string())
-            .or_insert_with(|| "true".to_string());
-    }
-    if needs_quic_socket_override && let Some(m) = find_mapping("quic.socket.override_defaults") {
-        env_vars
-            .entry(m.env_name.to_string())
-            .or_insert_with(|| "true".to_string());
-    }
     // Auto-enable encryption when key is set
     if needs_encryption_enabled && let Some(m) = find_mapping("system.encryption.enabled") {
         env_vars
@@ -138,7 +119,7 @@ fn find_mapping(path: &str) -> Option<&'static EnvVarMapping> {
 ///
 /// Names outside the `IGGY_` prefix are left alone: those address the process
 /// environment (`RUST_LOG`, test scaffolding), not the config schema.
-/// [`NON_CONFIG_ENV_VARS`] carries the `IGGY_`-prefixed names the server reads
+/// `NON_CONFIG_ENV_VARS` carries the `IGGY_`-prefixed names the server reads
 /// outside the config struct.
 ///
 /// # Errors

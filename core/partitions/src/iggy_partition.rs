@@ -45,8 +45,7 @@ use consensus::{
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::responses::messages::{
     SendMessagesConfirmationResponse, SendMessagesResponse,
@@ -70,8 +69,8 @@ use message_bus::{IggyMessageBus, MessageBus, is_auto_commit_client};
 use server_common::{
     MESSAGE_ALIGN, Message, SegmentStorage,
     iobuf::{Frozen, Owned},
-    send_messages2::{
-        ChecksumMode, SendMessages2Header, convert_request_message, decode_prepare_slice,
+    send_messages::{
+        BatchHeader, ChecksumMode, convert_request_message, decode_prepare_slice,
         decode_prepare_slice_trusted, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
@@ -92,13 +91,12 @@ use tracing::{debug, warn};
 // `SendMessages` retries are at-least-once and may commit multiple times.
 // Duplicate suppression is a consensus-layer concern: the VSR client table
 // dedups by request id (at-most-once), so the data plane needs no message-id set.
-// (message-id based) if they care.
 pub struct IggyPartition<B = IggyMessageBus, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
     consensus: VsrConsensus<B>,
-    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
+    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>,
     /// Highest durably persisted offset.
     pub offset: Arc<AtomicU64>,
     /// Highest offset assigned to prepares that may still only live in the in-memory journal.
@@ -326,7 +324,7 @@ pub enum PurgeError {
     /// so the reconciler's `committed > applied` gate re-issues this purge on
     /// its next pass. Retry, do not fence.
     ///
-    /// Sets [`Self::purge_deferred`], which withholds `PrepareOk` for this
+    /// Sets `purge_deferred`, which withholds `PrepareOk` for this
     /// group until the purge lands, so the replica goes quorum-invisible THERE
     /// while every other partition on the node keeps serving. Without that
     /// fence the counter would still name the pre-purge offset space and every
@@ -349,7 +347,7 @@ pub enum PurgeError {
     /// reconciler re-issues the purge. Retry, do not fence: the partition is
     /// serviceable and re-purging an already-empty chain is cheap.
     ///
-    /// Sets [`Self::purge_deferred`] for the same reason as
+    /// Sets `purge_deferred` for the same reason as
     /// [`Self::FrontierNotRecorded`]: an op acked between this failure and the
     /// retry would be wiped by that retry while every peer that recorded the
     /// generation keeps it.
@@ -1269,7 +1267,7 @@ where
             // primary is real divergence (log corruption / out-of-order apply)
             // and must surface rather than silently mask a split state. A
             // FOLLOWER may legitimately miss the offset: `AckLevel::NoAck`
-            // (v2) stores apply on the primary only and are never replicated,
+            // stores apply on the primary only and are never replicated,
             // so a later quorum delete finds nothing on the backups -- erroring
             // there would fail the committed apply, panic the replica as
             // divergent, and crash-loop on every journal replay. The
@@ -1895,9 +1893,9 @@ where
                 // Skip the batch-checksum pass: on the partition ingest path
                 // nothing reads it before `stamp_prepare_for_persistence`
                 // recomputes it over the stamped header. An already-canonical
-                // batch (native v2, or the plane's pre-encrypt convert output)
-                // returns early above, so Skip only affects the legacy
-                // transcode, whose output goes straight to project/stamp.
+                // batch (the plane's pre-encrypt convert output) returns early
+                // inside the convert, so Skip only affects the wire-form
+                // admission, whose output goes straight to project/stamp.
                 match convert_request_message(namespace, message, ChecksumMode::Skip) {
                     Ok(message) => message,
                     Err(error) => {
@@ -1919,10 +1917,7 @@ where
 
             // Parse once for both the delete-existence check and AckLevel dispatch.
             let consumer_offset = match message.header().operation {
-                Operation::StoreConsumerOffset
-                | Operation::StoreConsumerOffset2
-                | Operation::DeleteConsumerOffset
-                | Operation::DeleteConsumerOffset2 => {
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                     match Self::parse_consumer_offset_request(message.header().operation, &message)
                     {
                         Ok(parsed) => Some(parsed),
@@ -1946,10 +1941,8 @@ where
                 _ => None,
             };
 
-            if matches!(
-                message.header().operation,
-                Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2
-            ) && let Some((kind, consumer_id, _, _)) = consumer_offset
+            if matches!(message.header().operation, Operation::DeleteConsumerOffset)
+                && let Some((kind, consumer_id, _, _)) = consumer_offset
                 && let Err(error) = self.ensure_consumer_offset_exists(kind, consumer_id)
             {
                 emit_partition_diag(
@@ -1985,10 +1978,8 @@ where
             // `InvalidOffset` rides `ReplyHeader.status` (op=0, empty body): the
             // status-only `classify_partition_reply` would misread a result-body
             // code on this committed-shaped frame (op=commit_max) as success.
-            if matches!(
-                message.header().operation,
-                Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2
-            ) && let Some((_, _, Some(requested_offset), _)) = consumer_offset
+            if matches!(message.header().operation, Operation::StoreConsumerOffset)
+                && let Some((_, _, Some(requested_offset), _)) = consumer_offset
             {
                 let current_offset = self.stats.current_offset();
                 let partition_empty =
@@ -2040,11 +2031,11 @@ where
                 return;
             }
 
-            // NoAck v2 -> fast path. Quorum + v1 -> VSR pipeline.
+            // NoAck -> fast path. Quorum -> VSR pipeline.
             if let Some((kind, consumer_id, offset, AckLevel::NoAck)) = consumer_offset
                 && matches!(
                     message.header().operation,
-                    Operation::StoreConsumerOffset2 | Operation::DeleteConsumerOffset2,
+                    Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset,
                 )
             {
                 Disposition::NoAck {
@@ -2104,7 +2095,7 @@ where
     /// against view-change-reset flipping status across `on_replicate` await.
     ///
     /// View-change safety: `reset_view_change_state` calls
-    /// [`crate::Pipeline::clear_request_queue`]; resumed loop breaks via
+    /// [`consensus::Pipeline::clear_request_queue`]; resumed loop breaks via
     /// `else { break }`.
     ///
     /// # Panics
@@ -2547,10 +2538,7 @@ where
                 );
                 Ok(frozen)
             }
-            Operation::StoreConsumerOffset
-            | Operation::DeleteConsumerOffset
-            | Operation::StoreConsumerOffset2
-            | Operation::DeleteConsumerOffset2 => {
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 // Replicated path is Quorum-only by construction; ack ignored.
                 let (kind, consumer_id, offset, _ack) =
                     Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
@@ -2575,7 +2563,7 @@ where
                     .map_err(|_| IggyError::CannotAppendMessage)?;
 
                 match header.operation {
-                    Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+                    Operation::StoreConsumerOffset => {
                         self.stage_consumer_offset_upsert(
                             header.op,
                             kind,
@@ -2584,7 +2572,7 @@ where
                             is_auto_commit_client(header.client),
                         );
                     }
-                    Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                    Operation::DeleteConsumerOffset => {
                         self.stage_consumer_offset_delete(header.op, kind, consumer_id);
                     }
                     _ => unreachable!(),
@@ -2664,7 +2652,7 @@ where
     async fn append_stamped_messages(
         &mut self,
         message: Message<PrepareHeader>,
-        batch: SendMessages2Header,
+        batch: BatchHeader,
     ) -> Result<JournaledMessages, IggyError> {
         let batch_messages_count = batch.message_count;
         if batch_messages_count == 0 {
@@ -2893,10 +2881,13 @@ where
             }
             return Ok(());
         }
-        // Persist the prefix in segment-sized chunks: a segment seals exactly
-        // when its committed bytes reach `max_size`, no matter how many
-        // entries this flush happens to cover. A backup commits in bursts
-        // behind the primary, so any grouping- or timing-sensitive roll rule
+        // Persist the prefix in segment-sized chunks: a segment seals on the
+        // first flush whose committed bytes reach OR EXCEED `max_size`, no
+        // matter how many entries this flush happens to cover. The batch that
+        // crosses the cap is appended whole, so a sealed segment lands
+        // anywhere in `[max_size, max_size + one maximum batch)` and never
+        // exactly at `max_size`. A backup commits in bursts behind the
+        // primary, so any grouping- or timing-sensitive roll rule
         // (like keying rotation on the journal-position `is_full` above)
         // seals segments at per-replica offsets, and the offset-keyed segment
         // GC staged by the reconciler never converges across the cluster.
@@ -3365,10 +3356,7 @@ where
                 }
                 !*failed_commit
             }
-            Operation::StoreConsumerOffset
-            | Operation::DeleteConsumerOffset
-            | Operation::StoreConsumerOffset2
-            | Operation::DeleteConsumerOffset2 => {
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.commit_consumer_offset_entry(prepare_header, failed_commit)
                     .await
             }
@@ -3497,7 +3485,7 @@ where
         let (kind, consumer_id, offset, _ack) =
             Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
         match header.operation {
-            Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+            Operation::StoreConsumerOffset => {
                 let offset = offset.ok_or(IggyError::InvalidCommand)?;
                 Ok(if is_auto_commit_client(header.client) {
                     PendingConsumerOffsetCommit::upsert_auto_commit(kind, consumer_id, offset)
@@ -3505,7 +3493,7 @@ where
                     PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset)
                 })
             }
-            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+            Operation::DeleteConsumerOffset => {
                 Ok(PendingConsumerOffsetCommit::delete(kind, consumer_id))
             }
             _ => Err(IggyError::InvalidCommand),
@@ -3538,20 +3526,10 @@ where
             Operation::StoreConsumerOffset => {
                 let request = StoreConsumerOffsetRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                (request.consumer, Some(request.offset), AckLevel::Quorum)
-            }
-            Operation::StoreConsumerOffset2 => {
-                let request = StoreConsumerOffset2Request::decode_from(body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
                 (request.consumer, Some(request.offset), request.ack)
             }
             Operation::DeleteConsumerOffset => {
                 let request = DeleteConsumerOffsetRequest::decode_from(body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
-                (request.consumer, None, AckLevel::Quorum)
-            }
-            Operation::DeleteConsumerOffset2 => {
-                let request = DeleteConsumerOffset2Request::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
                 (request.consumer, None, request.ack)
             }
@@ -3661,7 +3639,6 @@ where
             let segment_index = self.log.segments().len() - 1;
             let segment = &mut self.log.segments_mut()[segment_index];
             segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved_bytes as u64);
-            self.log.clear_in_flight();
             return Ok(());
         }
 
@@ -3713,7 +3690,6 @@ where
         let segment = &mut self.log.segments_mut()[segment_index];
         segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
 
-        self.log.clear_in_flight();
         Ok(())
     }
 
@@ -3728,10 +3704,10 @@ where
         let enforce_fsync = self.effective_enforce_fsync(config);
         let preallocate_segments = self.effective_preallocate_segments(config);
         let segment = Segment::new(start_offset, segment_size);
-        // `PartitionsConfig::get_messages_path` is a stub (`/tmp/iggy_stub`);
-        // the partition's real directory is only known to the server config
-        // that created the initial segment, so derive the rotated paths from
-        // the active writer's location.
+        // Prefer the active writer's location: a per-topic path override or a
+        // config change after the initial segment was created must not scatter
+        // one partition's segments across two directories. The config layout
+        // only decides for a partition with no writer yet.
         let (messages_path, index_path) = self.partition_dir().map_or_else(
             || {
                 (
@@ -3757,17 +3733,9 @@ where
             },
         );
 
-        let storage = SegmentStorage::new(
-            &messages_path,
-            &index_path,
-            0,
-            0,
-            enforce_fsync,
-            enforce_fsync,
-            false,
-        )
-        .await
-        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
@@ -3844,19 +3812,22 @@ where
     }
 
     /// Time-expiry plus size-retention in one pass: remove the leading sealed
-    /// segments that have expired or that push the partition past `max_bytes`.
-    /// Returns the `(segments, messages)` removed.
+    /// segments that have expired or that push the partition's SEALED bytes
+    /// past `max_bytes`. Capped per call by
+    /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
+    /// [`SegmentRemoval::budget_spent`] tells the caller whether the rest is
+    /// still waiting.
     pub async fn clean_expired_segments(
         &mut self,
         now: IggyTimestamp,
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
-    ) -> (u64, u64) {
+    ) -> SegmentRemoval {
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
             max_bytes.and_then(|max_bytes| leading_oversized_end(self.log.segments(), max_bytes));
         let Some(up_to) = expired.into_iter().chain(oversized).max() else {
-            return (0, 0);
+            return SegmentRemoval::default();
         };
         self.remove_sealed_segments_up_to(up_to).await
     }
@@ -3865,12 +3836,20 @@ where
     /// never the active segment and never past the consumer barrier (the
     /// minimum committed consumer/group offset). Unlinks the messages and
     /// index files and decrements partition stats. Idempotent: an offset below
-    /// the oldest sealed segment removes nothing. Returns the
-    /// `(segments, messages)` removed.
+    /// the oldest sealed segment removes nothing.
+    ///
+    /// NOT exhaustive: at most `SEGMENT_REMOVAL_BUDGET_PER_PASS` segments go
+    /// per call, so a caller enforcing a retention decision has to re-issue it
+    /// until the layout converges rather than assume one call finished the job.
+    /// Both callers already do: the segment cleaner re-stages on
+    /// [`SegmentRemoval::budget_spent`] and again on its
+    /// `data_maintenance.messages.interval` tick, and the partition reconciler
+    /// re-stages a committed delete watermark on every pass while the first
+    /// local segment still starts below it.
     ///
     /// Holds `write_lock` to serialize against the commit/rotate path, which
     /// runs on the separate consensus-tick loop.
-    pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> (u64, u64) {
+    pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
@@ -3880,7 +3859,13 @@ where
             let segments = self.log.segments();
             let last_idx = segments.len().saturating_sub(1);
             let mut removable = 0usize;
-            for (idx, segment) in segments.iter().enumerate() {
+            // One past the budget: the extra slot separates a run that ends
+            // exactly on the budget from one with more still waiting.
+            for (idx, segment) in segments
+                .iter()
+                .enumerate()
+                .take(SEGMENT_REMOVAL_BUDGET_PER_PASS + 1)
+            {
                 if idx == last_idx || !segment.sealed || segment.end_offset > up_to_offset {
                     break;
                 }
@@ -3905,8 +3890,12 @@ where
             removable
         };
 
-        let mut deleted_segments = 0u64;
-        let mut deleted_messages = 0u64;
+        let budget_spent = removable > SEGMENT_REMOVAL_BUDGET_PER_PASS;
+        let removable = removable.min(SEGMENT_REMOVAL_BUDGET_PER_PASS);
+        let mut removal = SegmentRemoval {
+            budget_spent,
+            ..SegmentRemoval::default()
+        };
         for _ in 0..removable {
             // The removable run is always a prefix (oldest first), so the next
             // victim is the front once the previous one is gone.
@@ -3946,8 +3935,8 @@ where
             self.stats.decrement_segments_count(1);
             self.stats.decrement_messages_count(messages_in_segment);
 
-            deleted_segments += 1;
-            deleted_messages += messages_in_segment;
+            removal.segments += 1;
+            removal.messages += messages_in_segment;
 
             debug!(
                 target: "iggy.partitions.diag",
@@ -3959,7 +3948,7 @@ where
             );
         }
 
-        (deleted_segments, deleted_messages)
+        removal
     }
 
     /// Build and install a fresh empty segment starting at `start_offset` with
@@ -4012,17 +4001,9 @@ where
         let enforce_fsync = self.effective_enforce_fsync(config);
         let preallocate_segments = self.effective_preallocate_segments(config);
         let segment = Segment::new(start_offset, segment_size);
-        let storage = SegmentStorage::new(
-            &messages_path,
-            &index_path,
-            0,
-            0,
-            enforce_fsync,
-            enforce_fsync,
-            false,
-        )
-        .await
-        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
@@ -4736,7 +4717,9 @@ where
         // consumer-offset ops (via `apply_replicated_operation`) append
         // to that journal before `send_prepare_ok` fires, so every op
         // that reaches here is journal-backed and ACKs as durable.
-        send_prepare_ok_common(self.consensus(), header, Some(true)).await;
+        // (`header_by_op` is a linear scan, so re-proving that here would
+        // put O(journal) on every ack; the call-order invariant stands in.)
+        send_prepare_ok_common(self.consensus(), header, true).await;
     }
 }
 
@@ -4851,8 +4834,8 @@ fn send_messages_reply_body(
     let namespace = IggyNamespace::from_raw(namespace);
     SendMessagesResponse {
         confirmations: vec![SendMessagesConfirmationResponse {
-            // `IggyNamespace` packs the ids into 12/12/20 bits, so each
-            // component fits a `u32` by construction.
+            // Every field is narrower than a `u32` (widths compile-asserted in
+            // `iggy_binary_protocol`), so each component fits by construction.
             stream_id: namespace.stream_id() as u32,
             topic_id: namespace.topic_id() as u32,
             partition_id: namespace.partition_id() as u32,
@@ -4910,6 +4893,41 @@ fn accumulate_committed_info(
     info.max_timestamp = info.max_timestamp.max(base_timestamp);
 }
 
+/// Sealed segments one call to [`IggyPartition::remove_sealed_segments_up_to`]
+/// may unlink before it stops and leaves the rest to the next pass.
+///
+/// The removal loop runs inside ONE frame body on the shard pump, and this
+/// shard's consensus ticks are a sibling select arm that stays unpolled while
+/// that body awaits, so the budget is really a bound on how long every OTHER
+/// group on this core goes without a heartbeat. Uncapped it is a bound on the
+/// backlog instead: the first pass after the cleaner is switched on walks
+/// however many segments retention accumulated, which on a large log silences
+/// those groups long enough to lose them to a view change.
+///
+/// A SEGMENT budget standing in for a time bound, so the margin is filesystem
+/// specific: 16 segments is at most 32 unlinks (log plus index), a few hundred
+/// milliseconds on commodity `NVMe` against the shipped 5 s
+/// `cluster.heartbeat_timeout`, and still under 2 s if each unlink costs a
+/// pathological 50 ms on a contended journal. Large enough that steady-state
+/// retention, which reclaims a handful of segments per interval, never reaches
+/// it -- only a backlog does, and that one drains over several passes.
+const SEGMENT_REMOVAL_BUDGET_PER_PASS: usize = 16;
+
+/// What one call to [`IggyPartition::remove_sealed_segments_up_to`] reclaimed.
+///
+/// `budget_spent` reports that the pass stopped on
+/// `SEGMENT_REMOVAL_BUDGET_PER_PASS` rather than on the end of the removable
+/// run, so a caller can re-stage immediately instead of leaving the rest until
+/// its next interval tick. The budget itself stays private: the signal is what
+/// callers need, and reading the number would invite them to rebuild the
+/// comparison.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentRemoval {
+    pub segments: u64,
+    pub messages: u64,
+    pub budget_spent: bool,
+}
+
 /// Highest `end_offset` among the leading run of expired sealed segments, or
 /// `None` when none are expired. The last element is the active segment and is
 /// never considered. `expiry` must be resolved; a `ServerDefault` expires
@@ -4930,14 +4948,21 @@ fn leading_expired_end(
     up_to
 }
 
-/// Highest `end_offset` to drop so the resident size falls to `max_bytes`, or
-/// `None` when already under budget. The active segment (last element) is
-/// never dropped. The budget is per-partition: the cluster has no single owner
-/// of a topic-wide total, so each replica trims its own log.
+/// Highest `end_offset` to drop so the SEALED resident size falls to
+/// `max_bytes`, or `None` when already under budget. The active segment (last
+/// element) is never dropped. The budget is per-partition: the cluster has no
+/// single owner of a topic-wide total, so each replica trims its own log.
+///
+/// The active segment's bytes are excluded from the running total, not merely
+/// from the deletions. Counting bytes that can never be reclaimed lets them
+/// evict the sealed history instead: at a budget near one segment the active
+/// one alone exceeds it, and every sealed segment is dropped no matter how
+/// small the log is.
 fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut resident: u64 = segments
         .iter()
+        .take(last_idx)
         .map(|segment| segment.size.as_bytes_u64())
         .sum();
     let mut up_to = None;
@@ -4977,11 +5002,11 @@ mod tests {
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
-    use iggy_binary_protocol::{Command2, ReplyHeader, WireConsumer, WireEncode};
+    use iggy_binary_protocol::{Command, ReplyHeader, WireConsumer, WireEncode};
     use message_bus::SendError;
     use server_common::MESSAGE_ALIGN;
-    use server_common::send_messages2::{
-        COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
+    use server_common::send_messages::{
+        COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -5289,7 +5314,7 @@ mod tests {
         let size = std::mem::size_of::<PrepareHeader>();
         let prepare = Message::<PrepareHeader>::new(size).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = 1;
                 // Current view: an older-view prepare is fenced as deposed-primary
                 // traffic and would never reach the ack send under test.
@@ -5414,7 +5439,7 @@ mod tests {
         request_id: u64,
         consumer_id: u32,
     ) -> Message<RoutedRequestHeader> {
-        let body = DeleteConsumerOffset2Request {
+        let body = DeleteConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
             stream_id: WireIdentifier::Numeric(1),
             topic_id: WireIdentifier::Numeric(1),
@@ -5427,8 +5452,8 @@ mod tests {
         let mut message = Message::<RoutedRequestHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&body);
         message.transmute_header(|_, header: &mut RoutedRequestHeader| {
-            header.command = Command2::Request;
-            header.operation = Operation::DeleteConsumerOffset2;
+            header.command = Command::Request;
+            header.operation = Operation::DeleteConsumerOffset;
             header.client = client_id;
             header.session = 1;
             header.request = request_id;
@@ -5462,7 +5487,7 @@ mod tests {
                 &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
             )
             .expect("deny frame starts with a valid reply header");
-            assert_eq!(header.command, Command2::Reply);
+            assert_eq!(header.command, Command::Reply);
             assert_eq!(
                 header.status,
                 IggyError::ConsumerOffsetNotFound(0).as_code()
@@ -5719,17 +5744,17 @@ mod tests {
     /// stamped at `base_offset`, with a valid batch checksum so it decodes
     /// through `decode_batch_slice` and matches an `Offset` poll.
     pub(super) fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
-        let mut batch = IggyMessages2::with_capacity(1);
-        batch.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        let mut batch = IggyMessages::with_capacity(1);
+        batch.push(IggyMessage {
+            header: IggyMessageHeader {
                 payload_length: 8,
                 ..Default::default()
             },
             payload: Bytes::from_static(b"abcdefgh"),
             user_headers: None,
         });
-        let mut owned = SendMessages2Owned::from_messages(namespace, &batch)
-            .expect("build send_messages batch");
+        let mut owned =
+            SendMessagesOwned::from_messages(namespace, &batch).expect("build send_messages batch");
         owned.header.base_offset = base_offset;
         owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
 
@@ -6406,10 +6431,9 @@ mod tests {
         let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
         let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
         partition.log.segments_mut()[0].sealed = true;
-        partition.log.storages_mut()[0] =
-            SegmentStorage::new(&log_path, &index_path, 0, 0, false, false, false)
-                .await
-                .expect("create segment storage");
+        partition.log.storages_mut()[0] = SegmentStorage::new(&log_path, &index_path, 0, 0, false)
+            .await
+            .expect("create segment storage");
 
         let record = build_segment_record(namespace, 0);
         let record_len = record.len() as u64;
@@ -6507,6 +6531,7 @@ mod tests {
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,
             encryptor: None,
+            path_layout: crate::PartitionPathLayout::default(),
         }
     }
 
@@ -6529,7 +6554,7 @@ mod tests {
         let size = std::mem::size_of::<PrepareHeader>();
         let prepare = Message::<PrepareHeader>::new(size).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = op;
                 header.operation = operation;
                 header.size = u32::try_from(size).expect("prepare header size fits in u32");
@@ -6978,7 +7003,7 @@ mod tests {
     #[test]
     fn given_result_framed_operation_when_committed_should_reply_empty_result_section() {
         assert_eq!(
-            &committed_reply_body(Operation::StoreConsumerOffset2)[..],
+            &committed_reply_body(Operation::StoreConsumerOffset)[..],
             &[0, 0, 0, 0]
         );
     }
@@ -7006,6 +7031,68 @@ mod retention_tests {
 
     fn one_second() -> IggyExpiry {
         IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)))
+    }
+
+    /// Shape of one sealed segment in the [`partition_with_sealed_run`] fixture.
+    const MESSAGES_PER_SEGMENT: u64 = 10;
+    const BYTES_PER_SEGMENT: u64 = 100;
+
+    /// A topic's configured segment size, and the largest batch that can be
+    /// appended to it.
+    const SEGMENT_SIZE: u64 = 1_000;
+    const MAX_BATCH_SIZE: u64 = 100;
+    /// The size a sealed segment actually reaches. The batch that crosses
+    /// `SEGMENT_SIZE` is appended whole, so a sealed segment closes somewhere
+    /// in `[SEGMENT_SIZE, SEGMENT_SIZE + MAX_BATCH_SIZE)`. Retention asserted
+    /// at exactly `SEGMENT_SIZE` would miss that entirely.
+    const SEALED_SIZE: u64 = SEGMENT_SIZE + 40;
+    /// What the cleaner enforces for a cap of one segment: the per-partition
+    /// share, floored at the largest a sealed segment can be.
+    const FLOORED_BUDGET: u64 = SEGMENT_SIZE + MAX_BATCH_SIZE;
+
+    fn sealed_run_segment(start_offset: u64) -> Segment {
+        let mut segment = segment(
+            start_offset + MESSAGES_PER_SEGMENT - 1,
+            1,
+            BYTES_PER_SEGMENT,
+            true,
+        );
+        segment.start_offset = start_offset;
+        segment
+    }
+
+    /// Partition whose log is `sealed_count` sealed segments followed by the
+    /// active one, with stats seeded to match. Every storage is the in-memory
+    /// default (no reader, so no path), which is what lets retirement run its
+    /// full body here without touching the filesystem.
+    fn partition_with_sealed_run(sealed_count: u64) -> IggyPartition<IggyMessageBus> {
+        let mut partition = super::tests::test_partition();
+        // The fixture ships one unsealed segment: rewrite it as the head of the
+        // run and append a fresh active segment last, where the removal walk
+        // always stops.
+        partition.log.segments_mut()[0] = sealed_run_segment(0);
+        for index in 1..sealed_count {
+            partition.log.add_persisted_segment(
+                sealed_run_segment(index * MESSAGES_PER_SEGMENT),
+                SegmentStorage::default(),
+                None,
+                None,
+            );
+        }
+        partition.log.add_persisted_segment(
+            Segment::new(
+                sealed_count * MESSAGES_PER_SEGMENT,
+                IggyByteSize::from(0u64),
+            ),
+            SegmentStorage::default(),
+            None,
+            None,
+        );
+        let stats = &partition.stats;
+        stats.increment_segments_count(u32::try_from(sealed_count).expect("run fits a u32"));
+        stats.increment_messages_count(sealed_count * MESSAGES_PER_SEGMENT);
+        stats.increment_size_bytes(sealed_count * BYTES_PER_SEGMENT);
+        partition
     }
 
     #[test]
@@ -7055,15 +7142,15 @@ mod retention_tests {
 
     #[test]
     fn leading_oversized_end_trims_oldest_until_under_budget() {
-        // 4 x 100 = 400 resident, active excluded. Budget 250: drop seg0 (300
-        // left) then seg1 (200 <= 250, stop). up_to = seg1.end_offset.
+        // 3 x 100 = 300 SEALED resident, the active segment's bytes excluded.
+        // Budget 250: drop seg0 (200 <= 250, stop). up_to = seg0.end_offset.
         let segments = vec![
             segment(9, 1, 100, true),
             segment(19, 2, 100, true),
             segment(29, 3, 100, true),
             segment(39, 0, 100, false),
         ];
-        assert_eq!(leading_oversized_end(&segments, 250), Some(19));
+        assert_eq!(leading_oversized_end(&segments, 250), Some(9));
     }
 
     #[test]
@@ -7076,6 +7163,38 @@ mod retention_tests {
     fn leading_oversized_end_never_drops_active_segment() {
         let segments = vec![segment(9, 1, 1_000, false)];
         assert_eq!(leading_oversized_end(&segments, 10), None);
+    }
+
+    #[test]
+    fn leading_oversized_end_retains_an_overshot_sealed_segment_at_the_floored_budget() {
+        // The shape admission accepts at the floor: max_topic_size == one
+        // segment. The sealed segment overshot, and the active one holds far
+        // more than the budget. Counting the active segment, or dividing the
+        // cap without a floor, deletes the only history this partition has.
+        let segments = vec![
+            segment(9, 1, SEALED_SIZE, true),
+            segment(19, 0, SEGMENT_SIZE * 5, false),
+        ];
+        assert_eq!(leading_oversized_end(&segments, FLOORED_BUDGET), None);
+        // The same segments against the UNFLOORED share, which is what a cap of
+        // one segment divides into. It is under what a sealed segment reaches,
+        // so the history goes -- which is why the budget carries a floor.
+        assert_eq!(leading_oversized_end(&segments, SEGMENT_SIZE), Some(9));
+    }
+
+    #[test]
+    fn leading_oversized_end_still_drops_the_oldest_once_two_sealed_segments_exceed_the_budget() {
+        // Same budget, one sealed segment more: the cap is real, not disabled.
+        let segments = vec![
+            segment(9, 1, SEALED_SIZE, true),
+            segment(19, 2, SEALED_SIZE, true),
+            segment(29, 0, SEGMENT_SIZE * 5, false),
+        ];
+        assert_eq!(
+            leading_oversized_end(&segments, FLOORED_BUDGET),
+            Some(9),
+            "the oldest sealed segment goes, the newest one stays"
+        );
     }
 
     #[test]
@@ -7109,13 +7228,80 @@ mod retention_tests {
         let segments = vec![segment(9, 1, 100, false)];
         assert_eq!(nth_oldest_sealed_end(&segments, 1), None);
     }
+
+    #[compio::test]
+    async fn removal_spends_the_per_pass_budget_and_resumes_on_the_next_pass() {
+        let budget = u64::try_from(SEGMENT_REMOVAL_BUDGET_PER_PASS).expect("budget fits a u64");
+        let sealed_count = budget + 3;
+        let mut partition = partition_with_sealed_run(sealed_count);
+        // The whole run qualifies: every sealed segment ends at or below
+        // `up_to`, and a partition nobody has committed against has no barrier.
+        let up_to = sealed_count * MESSAGES_PER_SEGMENT - 1;
+        let segments_len = |partition: &IggyPartition<IggyMessageBus>| {
+            u64::try_from(partition.log.segments().len()).expect("log fits a u64")
+        };
+
+        let removal = partition.remove_sealed_segments_up_to(up_to).await;
+        assert_eq!(removal.segments, budget, "one pass stops at the budget");
+        assert_eq!(removal.messages, budget * MESSAGES_PER_SEGMENT);
+        assert!(
+            removal.budget_spent,
+            "a pass that stopped on the budget must ask to be re-staged"
+        );
+        assert_eq!(segments_len(&partition), sealed_count + 1 - budget);
+        assert_eq!(
+            partition.log.segments()[0].start_offset,
+            budget * MESSAGES_PER_SEGMENT,
+            "the surviving run starts where the budget stopped"
+        );
+
+        let remainder = sealed_count - budget;
+        let removal = partition.remove_sealed_segments_up_to(up_to).await;
+        assert_eq!(
+            removal.segments, remainder,
+            "a later pass finishes the run it was handed"
+        );
+        assert_eq!(removal.messages, remainder * MESSAGES_PER_SEGMENT);
+        assert!(
+            !removal.budget_spent,
+            "a pass that drained the run must not re-stage"
+        );
+        assert_eq!(
+            segments_len(&partition),
+            1,
+            "only the active segment survives"
+        );
+
+        let stats = &partition.stats;
+        assert_eq!(stats.segments_count_inconsistent(), 1);
+        assert_eq!(stats.messages_count_inconsistent(), 0);
+        assert_eq!(stats.size_bytes_inconsistent(), 0);
+        assert_eq!(
+            partition.remove_sealed_segments_up_to(up_to).await,
+            SegmentRemoval::default(),
+            "a converged partition removes nothing"
+        );
+
+        // A run that ends exactly on the budget is finished by the pass that
+        // spends it; re-staging would hand the pump a no-op frame.
+        let mut exact = partition_with_sealed_run(budget);
+        let removal = exact
+            .remove_sealed_segments_up_to(budget * MESSAGES_PER_SEGMENT - 1)
+            .await;
+        assert_eq!(removal.segments, budget, "the whole run goes in one pass");
+        assert!(
+            !removal.budget_spent,
+            "a run that ends on the budget has nothing left to re-stage"
+        );
+        assert_eq!(segments_len(&exact), 1, "only the active segment survives");
+    }
 }
 
 #[cfg(test)]
 mod purge_floor_tests {
     use super::tests::{build_segment_record, repair_config, test_partition};
     use super::*;
-    use iggy_binary_protocol::{Command2, WireConsumer, WireEncode};
+    use iggy_binary_protocol::{Command, WireConsumer, WireEncode};
 
     /// Fresh temp dir wired as the partition dir, so `purge()` can recreate
     /// real segment files and write `purge.gen`.
@@ -7145,7 +7331,7 @@ mod purge_floor_tests {
         let mut message = Message::<PrepareHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&record);
         let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = Operation::SendMessages;
             header.op = op;
             header.timestamp = op;
@@ -7159,7 +7345,7 @@ mod purge_floor_tests {
         partition.consensus().sequencer().set_sequence(op);
     }
 
-    /// A `StoreConsumerOffset2` prepare for `op`, journaled and staged through
+    /// A `StoreConsumerOffset` prepare for `op`, journaled and staged through
     /// the replicated-apply path.
     async fn journal_store_offset(
         partition: &mut IggyPartition<IggyMessageBus>,
@@ -7167,7 +7353,7 @@ mod purge_floor_tests {
         consumer_id: u32,
         offset: u64,
     ) {
-        let body = StoreConsumerOffset2Request {
+        let body = StoreConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
             stream_id: WireIdentifier::Numeric(1),
             topic_id: WireIdentifier::Numeric(1),
@@ -7181,8 +7367,8 @@ mod purge_floor_tests {
         let mut message = Message::<PrepareHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&body);
         let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
-            header.operation = Operation::StoreConsumerOffset2;
+            header.command = Command::Prepare;
+            header.operation = Operation::StoreConsumerOffset;
             header.op = op;
             header.group = IggyNamespace::new(1, 1, 0).inner();
             header.size = u32::try_from(total).expect("prepare size fits u32");
@@ -7511,7 +7697,7 @@ mod purge_floor_tests {
         let mut message = Message::<PrepareHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&record);
         let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = Operation::SendMessages;
             header.op = 1;
             header.group = namespace.inner();

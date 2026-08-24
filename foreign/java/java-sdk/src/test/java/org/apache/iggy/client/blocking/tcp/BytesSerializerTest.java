@@ -25,11 +25,8 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
-import org.apache.iggy.message.BytesMessageId;
 import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderValue;
-import org.apache.iggy.message.Message;
-import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.serde.BytesSerializer;
@@ -488,105 +485,6 @@ class BytesSerializerTest {
 
             // then - verify buffer contains data for both headers
             assertThat(result.readableBytes()).isEqualTo(28);
-        }
-    }
-
-    @Nested
-    class MessageSerialization {
-
-        @Test
-        void shouldSerializeMessageWithoutUserHeaders() {
-            // given
-            var messageId = new BytesMessageId(new byte[16]);
-            var header = new MessageHeader(
-                    BigInteger.valueOf(123), // checksum
-                    messageId,
-                    BigInteger.valueOf(0), // offset
-                    BigInteger.valueOf(1000), // timestamp
-                    BigInteger.valueOf(1000), // originTimestamp
-                    0L, // userHeadersLength
-                    5L, // payloadLength
-                    BigInteger.ZERO // reserved
-                    );
-            byte[] payload = "hello".getBytes();
-            var message = new Message(header, payload, new HashMap<>());
-
-            // when
-            ByteBuf result = BytesSerializer.toBytes(message);
-
-            // then
-            assertThat(result.readableBytes()).isEqualTo(MessageHeader.SIZE + 5); // header + payload, no user headers
-        }
-
-        @Test
-        void shouldSerializeMessageWithUserHeaders() {
-            // given
-            var messageId = new BytesMessageId(new byte[16]);
-            Map<HeaderKey, HeaderValue> userHeaders = new HashMap<>();
-            userHeaders.put(HeaderKey.fromString("key"), HeaderValue.fromRaw("val".getBytes()));
-
-            // Calculate user headers size
-            ByteBuf headersBuf = BytesSerializer.toBytes(userHeaders);
-            int userHeadersLength = headersBuf.readableBytes();
-
-            var header = new MessageHeader(
-                    BigInteger.ZERO,
-                    messageId,
-                    BigInteger.ZERO,
-                    BigInteger.valueOf(1000),
-                    BigInteger.valueOf(1000),
-                    (long) userHeadersLength,
-                    3L, // "abc".length()
-                    BigInteger.ZERO // reserved
-                    );
-            byte[] payload = "abc".getBytes();
-            var message = new Message(header, payload, userHeaders);
-
-            // when
-            ByteBuf result = BytesSerializer.toBytes(message);
-
-            // then
-            assertThat(result.readableBytes()).isEqualTo(MessageHeader.SIZE + 3 + userHeadersLength);
-        }
-    }
-
-    @Nested
-    class MessageHeaderSerialization {
-
-        @Test
-        void shouldSerializeMessageHeader() {
-            // given
-            var messageId = new BytesMessageId(new byte[16]);
-            var header = new MessageHeader(
-                    BigInteger.valueOf(999), // checksum
-                    messageId,
-                    BigInteger.valueOf(42), // offset
-                    BigInteger.valueOf(2000), // timestamp
-                    BigInteger.valueOf(1999), // originTimestamp
-                    10L, // userHeadersLength
-                    100L, // payloadLength
-                    BigInteger.ZERO // reserved
-                    );
-
-            // when
-            ByteBuf result = BytesSerializer.toBytes(header);
-
-            // then
-            assertThat(result.readableBytes()).isEqualTo(MessageHeader.SIZE);
-            // Read checksum (8 bytes)
-            result.skipBytes(8);
-            // Read message ID (16 bytes)
-            result.skipBytes(16);
-            // Read offset (8 bytes)
-            result.skipBytes(8);
-            // Read timestamp (8 bytes)
-            result.skipBytes(8);
-            // Read origin timestamp (8 bytes)
-            result.skipBytes(8);
-            // Read user headers length (4 bytes)
-            assertThat(result.readIntLE()).isEqualTo(10);
-            // Read payload length (4 bytes)
-            assertThat(result.readIntLE()).isEqualTo(100);
         }
     }
 

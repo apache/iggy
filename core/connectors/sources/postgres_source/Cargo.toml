@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_postgres_source"
-version = "0.5.0-edge.2"
+version = "0.5.0-edge.4"
 description = "Iggy PostgreSQL source connector supporting CDC and table polling for message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
@@ -56,3 +56,6 @@ sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[lints]
+workspace = true

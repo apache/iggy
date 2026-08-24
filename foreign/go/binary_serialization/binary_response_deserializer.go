@@ -26,6 +26,7 @@ import (
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/batch"
 	"github.com/klauspost/compress/s2"
 )
 
@@ -161,13 +162,16 @@ func deserializeOptions(payload []byte, position int) (map[string]iggcon.HeaderV
 	return options, consumed, nil
 }
 
-// pollBatchHeaderLength covers [partition_id u32][current_offset u64][count u32].
-const pollBatchHeaderLength = 16
+// pollPrefixLength covers [partition_id u32][current_offset u64][count u32].
+const pollPrefixLength = 16
 
-// DeserializeFetchMessagesResponse decodes a poll reply. A truncated body is
-// a decode error rather than a shorter batch: silently dropping the tail
-// would let a consumer that commits CurrentOffset skip messages it never saw.
-// The returned messages alias the reply buffer; a retained message pins it.
+// DeserializeFetchMessagesResponse decodes a poll reply: the 16-byte prefix
+// followed by batch records ([256-byte batch header][frames]) walked by their
+// batch length, with each frame's deltas resolved to absolute values. A
+// truncated body is a decode error rather than a shorter batch: silently
+// dropping the tail would let a consumer that commits CurrentOffset skip
+// messages it never saw. The returned messages alias the reply buffer; a
+// retained message pins it.
 func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMessageCompression) (*iggcon.PolledMessage, error) {
 	if len(payload) == 0 {
 		return &iggcon.PolledMessage{
@@ -178,63 +182,80 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 	}
 
 	length := len(payload)
-	if length < pollBatchHeaderLength {
-		return nil, fmt.Errorf("poll response: %d bytes is short of the batch header", length)
+	if length < pollPrefixLength {
+		return nil, fmt.Errorf("poll response: %d bytes is short of the reply prefix", length)
 	}
 	partitionId := binary.LittleEndian.Uint32(payload[0:4])
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	messagesCount := binary.LittleEndian.Uint32(payload[12:16])
-	position := pollBatchHeaderLength
+	position := pollPrefixLength
 
 	// The declared count is server-controlled; the allocation hint is capped
 	// by what the body could possibly hold.
-	maxMessages := (length - pollBatchHeaderLength) / iggcon.MessageHeaderSize
+	maxMessages := (length - pollPrefixLength) / batch.MessageHeaderSize
 	if int(messagesCount) < maxMessages {
 		maxMessages = int(messagesCount)
 	}
 	messages := make([]iggcon.IggyMessage, 0, maxMessages)
 	for position < length {
-		if position+iggcon.MessageHeaderSize > length {
-			return nil, fmt.Errorf("poll response: truncated message header at byte %d", position)
-		}
-		header, err := iggcon.MessageHeaderFromBytes(payload[position : position+iggcon.MessageHeaderSize])
+		record, err := batch.DecodeHeader(payload[position:])
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("poll response: %w", err)
 		}
-		position += iggcon.MessageHeaderSize
-		if uint64(header.PayloadLength) > uint64(length-position) {
+		if record.BatchLength > uint64(length-position) {
 			return nil, fmt.Errorf(
-				"poll response: message payload of %d bytes overruns the body", header.PayloadLength)
+				"poll response: batch record of %d bytes overruns the body", record.BatchLength)
 		}
-		payloadSlice := payload[position : position+int(header.PayloadLength)]
-		position += int(header.PayloadLength)
-
-		if uint64(header.UserHeaderLength) > uint64(length-position) {
-			return nil, fmt.Errorf(
-				"poll response: user headers of %d bytes overrun the body", header.UserHeaderLength)
-		}
-		var userHeaders []byte
-		if header.UserHeaderLength > 0 {
-			userHeaders = payload[position : position+int(header.UserHeaderLength)]
-		}
-		position += int(header.UserHeaderLength)
-
-		switch compression {
-		case iggcon.MESSAGE_COMPRESSION_S2, iggcon.MESSAGE_COMPRESSION_S2_BETTER, iggcon.MESSAGE_COMPRESSION_S2_BEST:
-			if length < 32 {
-				break
-			}
-			payloadSlice, err = s2.Decode(nil, payloadSlice)
+		recordEnd := position + int(record.BatchLength)
+		cursor := position + batch.HeaderSize
+		for cursor < recordEnd {
+			frame, err := batch.DecodeMessageHeader(payload[cursor:recordEnd])
 			if err != nil {
-				return nil, fmt.Errorf("failed to decode s2 payload: %w", err)
+				return nil, fmt.Errorf("poll response: %w", err)
 			}
-		}
+			payloadStart := cursor + batch.MessageHeaderSize
+			payloadEnd := payloadStart + int(frame.PayloadLength)
+			userHeadersEnd := payloadEnd + int(frame.UserHeadersLength)
+			if userHeadersEnd > recordEnd {
+				return nil, fmt.Errorf(
+					"poll response: message of %d payload and %d user-header bytes overruns the batch record",
+					frame.PayloadLength, frame.UserHeadersLength)
+			}
+			payloadSlice := payload[payloadStart:payloadEnd]
+			var userHeaders []byte
+			if frame.UserHeadersLength > 0 {
+				userHeaders = payload[payloadEnd:userHeadersEnd]
+			}
+			cursor = userHeadersEnd
 
-		messages = append(messages, iggcon.IggyMessage{
-			Header:      *header,
-			Payload:     payloadSlice,
-			UserHeaders: userHeaders,
-		})
+			switch compression {
+			case iggcon.MESSAGE_COMPRESSION_S2, iggcon.MESSAGE_COMPRESSION_S2_BETTER, iggcon.MESSAGE_COMPRESSION_S2_BEST:
+				payloadSlice, err = s2.Decode(nil, payloadSlice)
+				if err != nil {
+					return nil, fmt.Errorf("failed to decode s2 payload: %w", err)
+				}
+			}
+
+			messages = append(messages, iggcon.IggyMessage{
+				Header: iggcon.MessageHeader{
+					Checksum: frame.Checksum,
+					Id:       iggcon.MessageID(frame.Id),
+					// A record may be a server-sliced view of a larger stored
+					// batch: BaseOffset stays put and the first frame's delta
+					// positions it, so the sum is the absolute offset either way.
+					Offset: record.BaseOffset + uint64(frame.OffsetDelta),
+					// Broker append time is stamped once per batch; the
+					// per-message delta applies to OriginTimestamp only.
+					Timestamp:        record.BaseTimestamp,
+					OriginTimestamp:  record.OriginTimestamp + uint64(frame.TimestampDelta),
+					UserHeaderLength: frame.UserHeadersLength,
+					PayloadLength:    frame.PayloadLength,
+				},
+				Payload:     payloadSlice,
+				UserHeaders: userHeaders,
+			})
+		}
+		position = recordEnd
 	}
 	if uint32(len(messages)) != messagesCount {
 		return nil, fmt.Errorf(
@@ -242,7 +263,6 @@ func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMes
 			len(messages), messagesCount)
 	}
 
-	// !TODO: Add message offset ordering
 	return &iggcon.PolledMessage{
 		PartitionId:   partitionId,
 		CurrentOffset: currentOffset,

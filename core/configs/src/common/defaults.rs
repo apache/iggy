@@ -17,14 +17,13 @@
 
 use super::http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig};
 use super::server::{
-    ConsumerGroupConfig, HeartbeatConfig, MemoryPoolConfig, MessageSaverConfig,
-    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
-    TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
+    ConsumerGroupConfig, HeartbeatConfig, MemoryPoolConfig, MessagesMaintenanceConfig,
+    PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig, TelemetryConfig,
+    TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use super::system::{
-    BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
-    PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig, StateConfig, StreamConfig,
-    SystemConfig, TopicConfig,
+    EncryptionConfig, LoggingConfig, PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig,
+    StreamConfig, SystemConfig, TopicConfig,
 };
 use configs::ConfigEnvMappings;
 
@@ -150,16 +149,6 @@ impl Default for HttpTlsConfig {
     }
 }
 
-impl Default for MessageSaverConfig {
-    fn default() -> MessageSaverConfig {
-        MessageSaverConfig {
-            enabled: SERVER_CONFIG.message_saver.enabled,
-            enforce_fsync: SERVER_CONFIG.message_saver.enforce_fsync,
-            interval: SERVER_CONFIG.message_saver.interval.parse().unwrap(),
-        }
-    }
-}
-
 impl Default for PersonalAccessTokenConfig {
     fn default() -> PersonalAccessTokenConfig {
         PersonalAccessTokenConfig {
@@ -187,7 +176,6 @@ impl<S: ConfigEnvMappings + Default> Default for SystemConfig<S> {
     fn default() -> Self {
         Self {
             path: SERVER_CONFIG.system.path.parse().unwrap(),
-            backup: BackupConfig::default(),
             runtime: RuntimeConfig::default(),
             logging: LoggingConfig::default(),
             stream: StreamConfig::default(),
@@ -195,34 +183,9 @@ impl<S: ConfigEnvMappings + Default> Default for SystemConfig<S> {
             topic: TopicConfig::default(),
             partition: PartitionConfig::default(),
             segment: SegmentConfig::default(),
-            state: StateConfig::default(),
-            compression: CompressionConfig::default(),
             recovery: RecoveryConfig::default(),
             memory_pool: MemoryPoolConfig::default(),
             sharding: S::default(),
-        }
-    }
-}
-
-impl Default for BackupConfig {
-    fn default() -> BackupConfig {
-        BackupConfig {
-            path: SERVER_CONFIG.system.backup.path.parse().unwrap(),
-            compatibility: CompatibilityConfig::default(),
-        }
-    }
-}
-
-impl Default for CompatibilityConfig {
-    fn default() -> Self {
-        CompatibilityConfig {
-            path: SERVER_CONFIG
-                .system
-                .backup
-                .compatibility
-                .path
-                .parse()
-                .unwrap(),
         }
     }
 }
@@ -244,11 +207,6 @@ impl Default for ConsumerGroupConfig {
                 .rebalancing_timeout
                 .parse()
                 .unwrap(),
-            rebalancing_check_interval: SERVER_CONFIG
-                .consumer_group
-                .rebalancing_check_interval
-                .parse()
-                .unwrap(),
         }
     }
 }
@@ -257,20 +215,6 @@ impl Default for RuntimeConfig {
     fn default() -> RuntimeConfig {
         RuntimeConfig {
             path: SERVER_CONFIG.system.runtime.path.parse().unwrap(),
-        }
-    }
-}
-
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        CompressionConfig {
-            allow_override: SERVER_CONFIG.system.compression.allow_override,
-            default_algorithm: SERVER_CONFIG
-                .system
-                .compression
-                .default_algorithm
-                .parse()
-                .unwrap(),
         }
     }
 }
@@ -290,12 +234,6 @@ impl Default for LoggingConfig {
                 .parse()
                 .unwrap(),
             retention: SERVER_CONFIG.system.logging.retention.parse().unwrap(),
-            sysinfo_print_interval: SERVER_CONFIG
-                .system
-                .logging
-                .sysinfo_print_interval
-                .parse()
-                .unwrap(),
         }
     }
 }
@@ -337,19 +275,7 @@ impl Default for PartitionConfig {
 impl Default for SegmentConfig {
     fn default() -> SegmentConfig {
         SegmentConfig {
-            cache_indexes: SERVER_CONFIG.system.segment.cache_indexes.parse().unwrap(),
             archive_expired: SERVER_CONFIG.system.segment.archive_expired,
-        }
-    }
-}
-
-impl Default for StateConfig {
-    fn default() -> StateConfig {
-        StateConfig {
-            enforce_fsync: SERVER_CONFIG.system.state.enforce_fsync,
-            max_file_operation_retries: SERVER_CONFIG.system.state.max_file_operation_retries
-                as u32,
-            retry_delay: SERVER_CONFIG.system.state.retry_delay.parse().unwrap(),
         }
     }
 }

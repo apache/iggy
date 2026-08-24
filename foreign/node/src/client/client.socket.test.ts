@@ -26,7 +26,7 @@ import { createServer as createTlsServer } from 'node:tls';
 import { COMMAND_CODE } from '../wire/command.code.js';
 import { ResponseError } from '../wire/error.utils.js';
 import {
-  Command2,
+  Command,
   EVICTION_OFFSET,
   EvictionReason,
   HEADER_SIZE,
@@ -100,7 +100,7 @@ const replyFrame = (
 ): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE + body.length);
   frame.writeUInt32LE(frame.length, REPLY_OFFSET.size);
-  frame.writeUInt8(Command2.Reply, REPLY_OFFSET.command);
+  frame.writeUInt8(Command.Reply, REPLY_OFFSET.command);
   frame.writeUInt8(operation, REPLY_OFFSET.operation);
   frame.writeUInt32LE(status, REPLY_OFFSET.status);
   body.copy(frame, HEADER_SIZE);
@@ -110,7 +110,7 @@ const replyFrame = (
 const evictionFrame = (reason: number): Buffer => {
   const frame = Buffer.alloc(HEADER_SIZE);
   frame.writeUInt32LE(HEADER_SIZE, REPLY_OFFSET.size);
-  frame.writeUInt8(Command2.Eviction, REPLY_OFFSET.command);
+  frame.writeUInt8(Command.Eviction, REPLY_OFFSET.command);
   frame.writeUInt8(reason, EVICTION_OFFSET.reason);
   return frame;
 };

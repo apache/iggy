@@ -33,11 +33,10 @@ public class IggyConflictException extends IggyServerException {
 
     private static final Set<IggyErrorCode> CODES = EnumSet.of(
             IggyErrorCode.USER_ALREADY_EXISTS,
-            IggyErrorCode.CLIENT_ALREADY_EXISTS,
-            IggyErrorCode.STREAM_ALREADY_EXISTS,
-            IggyErrorCode.TOPIC_ALREADY_EXISTS,
-            IggyErrorCode.CONSUMER_GROUP_ALREADY_EXISTS,
-            IggyErrorCode.PAT_NAME_ALREADY_EXISTS);
+            IggyErrorCode.PERSONAL_ACCESS_TOKEN_ALREADY_EXISTS,
+            IggyErrorCode.STREAM_NAME_ALREADY_EXISTS,
+            IggyErrorCode.TOPIC_NAME_ALREADY_EXISTS,
+            IggyErrorCode.CONSUMER_GROUP_NAME_ALREADY_EXISTS);
 
     /**
      * Constructs a new IggyConflictException.

@@ -30,7 +30,7 @@ use common::{
     set_replica_ctx,
 };
 use compio::net::TcpListener;
-use iggy_binary_protocol::{Command2, HEADER_SIZE};
+use iggy_binary_protocol::{Command, HEADER_SIZE};
 use message_bus::connector::{DEFAULT_RECONNECT_PERIOD, start as start_connector};
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::{IggyMessageBus, MessageBus, SendError};
@@ -79,7 +79,7 @@ async fn slow_peer_does_not_block_other_peers() {
                 .await
                 .is_ok()
             {
-                let ack = header_only(Command2::Ping, CLUSTER, 2);
+                let ack = header_only(Command::Ping, CLUSTER, 2);
                 let _ = message_bus::framing::write_message(&mut stream, ack).await;
             }
             held_streams_clone.borrow_mut().push(stream);
@@ -108,7 +108,7 @@ async fn slow_peer_does_not_block_other_peers() {
 
     // Baseline: a single send to A before any saturation. Both peers are
     // healthy, both sends take try_send fast-path time.
-    bus0.send_to_replica(1, header_only(Command2::Prepare, 0, 0).into_frozen())
+    bus0.send_to_replica(1, header_only(Command::Prepare, 0, 0).into_frozen())
         .await
         .expect("send to A (baseline)");
 
@@ -119,7 +119,7 @@ async fn slow_peer_does_not_block_other_peers() {
     let mut b_saturated = false;
     for _ in 0..100_000 {
         match bus0
-            .send_to_replica(2, header_only(Command2::Prepare, 0, 0).into_frozen())
+            .send_to_replica(2, header_only(Command::Prepare, 0, 0).into_frozen())
             .await
         {
             Ok(()) => {}
@@ -140,14 +140,14 @@ async fn slow_peer_does_not_block_other_peers() {
     // against a freshly-timed B send that we expect to return Backpressure
     // instantly. HOL would manifest as A being as slow as a blocked writev.
     let send_a_start = Instant::now();
-    bus0.send_to_replica(1, header_only(Command2::Prepare, 0, 0).into_frozen())
+    bus0.send_to_replica(1, header_only(Command::Prepare, 0, 0).into_frozen())
         .await
         .expect("send to A while B is saturated");
     let send_a_elapsed = send_a_start.elapsed();
 
     let send_b_start = Instant::now();
     let send_b_result = bus0
-        .send_to_replica(2, header_only(Command2::Prepare, 0, 0).into_frozen())
+        .send_to_replica(2, header_only(Command::Prepare, 0, 0).into_frozen())
         .await;
     let send_b_elapsed = send_b_start.elapsed();
     let b_backpressured = matches!(send_b_result, Err(SendError::Backpressure));

@@ -17,6 +17,7 @@
 
 use crate::permissioner::Permissioner;
 use crate::stm::StateHandler;
+use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, ChangePasswordResult, CreatePersonalAccessTokenResult, CreateUserResult,
     DeletePersonalAccessTokenResult, DeleteUserResult, UpdatePermissionsResult, UpdateUserResult,
@@ -42,7 +43,6 @@ use iggy_common::{
     ResourceOptions, StreamPermissions, UserId, UserStatus,
 };
 use serde::{Deserialize, Serialize};
-use slab::Slab;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -99,7 +99,7 @@ impl User {
 define_state! {
     Users {
         index: AHashMap<Arc<str>, UserId>,
-        items: Slab<User>,
+        items: IdSlab<User>,
         personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
         // SAFETY: deterministic-apply invariant. `AHashMap` iteration order
         // differs across replicas (random seed), so this map MUST only be
@@ -129,7 +129,10 @@ collect_handlers! {
 }
 
 impl UsersInner {
-    pub(crate) fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+    /// Resolve a wire user identifier to its committed slab id, `None` when
+    /// the user does not exist.
+    #[must_use]
+    pub fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
                 let id = *id as usize;
@@ -897,7 +900,7 @@ impl UsersInner {
             user_entries.push((slab_key, user));
         }
 
-        let items: Slab<User> = user_entries.into_iter().collect();
+        let items: IdSlab<User> = user_entries.into_iter().collect();
 
         let mut personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>> =
             AHashMap::new();
@@ -1168,6 +1171,44 @@ mod tests {
         assert!(
             users.personal_access_tokens_of(42).is_empty(),
             "a user without tokens lists empty"
+        );
+    }
+
+    /// User ids come from `items.insert`, and the free list is not part of
+    /// `UsersSnapshot`, so the next `CreateUser` id depended on local delete
+    /// order rather than committed state. A restored replica would hand a
+    /// different id to the same log entry, forking the users table and every
+    /// permission keyed off it.
+    #[test]
+    fn given_descending_deletes_when_round_tripping_a_snapshot_should_keep_the_next_user_id() {
+        let mut users = UsersInner::new();
+        for username in ["alpha", "bravo", "charlie", "delta"] {
+            create_user(&mut users, username);
+        }
+        // Key 0 is the protected root user, so holes go above it. The highest
+        // key stays occupied, or the holes are trailing and a rebuild agrees.
+        let keys: Vec<usize> = users.items.iter().map(|(key, _)| key).collect();
+        let last = keys.len() - 1;
+        for user_id in [keys[last - 1], keys[last - 2]] {
+            let request = DeleteUserRequest {
+                user_id: WireIdentifier::numeric(u32::try_from(user_id).unwrap()),
+            };
+            assert_eq!(
+                StateHandler::apply(&request, &mut users, IggyTimestamp::now()).code,
+                0,
+                "user {user_id} must delete"
+            );
+        }
+        let before = users.items.vacant_key();
+
+        let snapshot = Users::from(users.clone()).to_snapshot();
+        let restored = UsersInner::inner_from_snapshot(snapshot);
+
+        assert_eq!(
+            restored.items.vacant_key(),
+            before,
+            "the id the next CreateUser is assigned must not depend on whether \
+             a snapshot was restored in between"
         );
     }
 

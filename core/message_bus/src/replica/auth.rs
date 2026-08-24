@@ -22,7 +22,7 @@
 //!
 //! The handshake is a 3-message mutual challenge-response riding the
 //! already-zeroed `reserved_command` bytes of the 256-byte `GenericHeader`.
-//! Each message has its own `Command2` discriminant (no Ping/Pong reuse):
+//! Each message has its own `Command` discriminant (no Ping/Pong reuse):
 //!
 //! 1. `ReplicaHello`     dialer -> acceptor: `nonce_d` (no MAC; the dialer has
 //!    no acceptor nonce yet);

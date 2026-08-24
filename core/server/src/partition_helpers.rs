@@ -28,7 +28,7 @@ use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets}
 use crate::server_error::ServerError;
 use compio::fs::create_dir_all;
 use configs::server::ServerConfig;
-use consensus::{LocalPipeline, VsrConsensus, VsrState};
+use consensus::{JoinMode, LocalPipeline, VsrConsensus, VsrRestore, VsrState};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
     TopicRuntimeOptions,
@@ -44,43 +44,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::{error, info, warn};
-
-/// Validate that a namespace fits within the static caps declared in
-/// `config.extra.namespace`.
-///
-/// Bootstrap calls this for every recovered namespace; the reconciler
-/// calls this before materialising a freshly committed partition. Same
-/// error variant either way so operators see one root cause label.
-///
-/// # Errors
-///
-/// Returns [`ServerError::RecoveredNamespaceOutOfBounds`] if any of
-/// `stream_id`, `topic_id`, or `partition_id` exceed the configured
-/// maxima.
-pub const fn validate_namespace_bounds(
-    config: &ServerConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<(), ServerError> {
-    let namespace = &config.extra.namespace;
-    if stream_id < namespace.max_streams
-        && topic_id < namespace.max_topics
-        && partition_id < namespace.max_partitions
-    {
-        return Ok(());
-    }
-
-    Err(ServerError::RecoveredNamespaceOutOfBounds {
-        stream_id,
-        topic_id,
-        partition_id,
-        max_streams: namespace.max_streams,
-        max_topics: namespace.max_topics,
-        max_partitions: namespace.max_partitions,
-    })
-}
+use tracing::{error, warn};
 
 /// Create the on-disk directory hierarchy for a partition.
 ///
@@ -377,26 +341,18 @@ pub async fn ensure_initial_segment(
     // this with a stale `.index` at offset 0 on disk. The `partitions`-side
     // writers with the same names do NOT truncate, so opening them directly
     // instead would read index entries from a previous generation.
-    let storage = SegmentStorage::new(
-        &messages_path,
-        &index_path,
-        0,
-        0,
-        enforce_fsync,
-        enforce_fsync,
-        false,
-    )
-    .await
-    .map_err(|source| {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            error = %source,
-            "failed to create initial segment storage"
-        );
-        source
-    })?;
+    let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+        .await
+        .map_err(|source| {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                error = %source,
+                "failed to create initial segment storage"
+            );
+            source
+        })?;
     // Share the storage's size counters so reads observe persisted bytes;
     // a writer with a private counter grows the file invisibly to readers.
     let messages_size_counter = storage
@@ -542,29 +498,6 @@ pub(crate) async fn open_partition_superblock(
     Ok((Rc::new(superblock), recovered_state))
 }
 
-/// Restore `(view, log_view)` from a recovered superblock record and mark
-/// them durable (read back from disk, durable by definition). Runs BEFORE
-/// `init` / `init_as_backup` so the join path never advertises a view older
-/// than the recorded one.
-pub(crate) fn restore_partition_view(
-    consensus: &mut VsrConsensus<Rc<IggyMessageBus>>,
-    state: &VsrState,
-) {
-    // The one line proving the durable record was READ BACK, not merely written:
-    // the group's whole anti-regression guarantee rests on this call running, and
-    // a replica that came back at view 0 is otherwise indistinguishable from one
-    // that resumed correctly until it votes.
-    info!(
-        namespace_raw = consensus.group(),
-        view = state.view,
-        log_view = state.log_view,
-        "restored partition view from its superblock"
-    );
-    consensus.set_view(state.view);
-    consensus.set_log_view(state.log_view);
-    consensus.mark_superblock_durable(state.view, state.log_view);
-}
-
 /// Materialise a brand-new [`IggyPartition`] for a namespace that has no on-disk state yet.
 ///
 /// Counterpart to bootstrap's `load_partition`, which hydrates from
@@ -574,11 +507,13 @@ pub(crate) fn restore_partition_view(
 /// the local shard has not yet materialised.
 ///
 /// Steps performed (all idempotent on retry after a partial failure):
-/// 1. Validate namespace fits within the configured caps.
-/// 2. Create directory hierarchy on disk.
-/// 3. Build per-partition VSR consensus group, resuming any superblock-recorded view.
-/// 4. Configure empty consumer-offset storage with the on-disk paths set.
-/// 5. Provision the initial segment + writers (offset 0).
+/// 1. Create directory hierarchy on disk.
+/// 2. Build per-partition VSR consensus group, resuming any superblock-recorded view.
+/// 3. Configure empty consumer-offset storage with the on-disk paths set.
+/// 4. Provision the initial segment + writers (offset 0).
+///
+/// The namespace arrives packed, so its components are in range by
+/// construction. Metadata admission is what bounds them.
 ///
 /// The returned partition's `offset` / `dirty_offset` are `0` and
 /// `should_increment_offset` is `false`, mirroring a clean append starting
@@ -586,8 +521,8 @@ pub(crate) fn restore_partition_view(
 ///
 /// # Errors
 ///
-/// Returns [`ServerError`] when bounds validation, directory creation,
-/// superblock recovery, or segment provisioning fails.
+/// Returns [`ServerError`] when directory creation, superblock recovery, or
+/// segment provisioning fails.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_partition_fresh(
     config: &ServerConfig,
@@ -604,7 +539,6 @@ pub async fn build_partition_fresh(
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
 
-    validate_namespace_bounds(config, stream_id, topic_id, partition_id)?;
     // Sampled BEFORE the hierarchy create: a pre-existing partition directory
     // is the marker of a prior life (the .log inside may legitimately be
     // empty -- committed-but-unflushed data dies with the journal), while a
@@ -629,26 +563,6 @@ pub async fn build_partition_fresh(
             source
         })?;
 
-    // Request queue holds 2x the prepare depth (buffered requests drain as
-    // prepares commit); depth is the per-partition `[partition]` knob.
-    let prepare_queue_depth = config.partition.prepare_queue_depth;
-    let mut consensus = VsrConsensus::new(
-        cluster_id,
-        self_replica_id,
-        replica_count,
-        namespace.inner(),
-        bus,
-        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
-    );
-    consensus.set_normal_heartbeat_ticks(crate::bootstrap::cluster_heartbeat_ticks(config));
-    consensus.set_commit_message_ticks(crate::bootstrap::commit_broadcast_ticks(config));
-    consensus.set_prepare_ticks(crate::bootstrap::prepare_retransmit_ticks(config));
-    consensus
-        .set_view_change_retransmit_ticks(crate::bootstrap::view_change_retransmit_ticks(config));
-    consensus.set_view_change_status_ticks(crate::bootstrap::view_change_status_ticks(config));
-    consensus.set_request_start_view_ticks(crate::bootstrap::request_start_view_ticks(config));
-    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
-
     // The hierarchy create above guarantees the directory exists; recover this
     // group's durable (view, log_view) before choosing how to join, so a
     // restart materialization resumes from the view it last recorded instead
@@ -665,9 +579,6 @@ pub async fn build_partition_fresh(
         },
     )
     .await?;
-    if let Some(state) = recovered_state.as_ref() {
-        restore_partition_view(&mut consensus, state);
-    }
 
     // A partition directory that already holds segment bytes is a RESTART
     // materialization, not a fresh create: this replica's group state died
@@ -678,12 +589,34 @@ pub async fn build_partition_fresh(
     // peer, byte-identical by the deterministic-roll/replicated-ciphertext
     // design. A truly fresh create keeps the plain init: every group needs
     // its view-0 primary to exist.
-    if restarted {
-        consensus.init_as_backup();
-        consensus.begin_view_probe();
+    let join = if restarted {
+        JoinMode::ProbeAsBackup {
+            await_state_transfer: false,
+        }
     } else {
-        consensus.init();
-    }
+        JoinMode::Init
+    };
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
+    let timers = crate::bootstrap::consensus_timers(config);
+    let consensus = VsrConsensus::restored(
+        cluster_id,
+        self_replica_id,
+        replica_count,
+        namespace.inner(),
+        bus,
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
+        VsrRestore {
+            timers: &timers,
+            durable_view: recovered_state
+                .as_ref()
+                .map(|state| (state.view, state.log_view)),
+            view_fallback: None,
+            incarnation: None,
+            join,
+        },
+    );
 
     let mut partition = IggyPartition::new(stats, consensus);
     partition.set_runtime_options(runtime_options);
