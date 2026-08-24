@@ -23,7 +23,7 @@ use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFra
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
-use iggy_binary_protocol::{ConsensusError, GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
@@ -60,29 +60,40 @@ where
     /// made every frame pay `bytemuck::checked::try_from_bytes` plus the
     /// header's `validate()` twice.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
+        let command = message.header().command;
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
             Err(ConsensusError::UnsupportedOperation { operation }) => {
-                // Terminal for this consensus group, not a per-frame hiccup:
-                // the op is never journaled, never acked, and every later
-                // prepare dies on the resulting gap while quorum hides the
-                // outage. Repair wraps the same typed header, so it cannot
-                // rescue this node either -- only upgrading it can. Nothing
-                // fences the sending peer, so the log and the counter are the
-                // whole signal an operator gets.
+                // For a replication frame this is terminal for its consensus
+                // group, not a per-frame hiccup: the op is never journaled,
+                // never acked, and every later prepare dies on the resulting
+                // gap while quorum hides the outage. Repair wraps the same
+                // typed header, so it cannot rescue this node either -- only
+                // upgrading it can. A routed request, by contrast, is dropped
+                // before journaling and stalls nothing; the consequence in the
+                // log follows the frame. Nothing fences the sending peer, so
+                // the log and the counter are the whole signal an operator
+                // gets.
                 self.metrics.record_frame_drop(
                     frame_drop_variant::CONSENSUS,
                     frame_drop_reason::UNSUPPORTED_OPERATION,
                 );
+                let consequence = match command {
+                    Command::Prepare | Command::RepairPrepare | Command::PrepareOk => {
+                        "this node cannot journal or ack it, so its consensus group stops \
+                         making progress until this node is upgraded"
+                    }
+                    _ => "the frame is dropped before journaling, with no reply to the sender",
+                };
                 tracing::error!(
                     shard = self.id,
                     operation = format_args!("{operation:#04x}"),
+                    command = ?command,
                     build_release = %iggy_binary_protocol::ProtocolVersion(
                         iggy_binary_protocol::IGGY_PROTOCOL_VERSION
                     ),
-                    "consensus frame carries an operation this build does not know; the sender \
-                     runs a newer release. This node cannot journal or ack it, so its consensus \
-                     group stops making progress until this node is upgraded"
+                    "frame carries an operation this build does not know; a newer release \
+                     likely added it. {consequence}"
                 );
                 return;
             }
@@ -816,7 +827,8 @@ enum ReplicaHandshakeOutcome {
 #[cfg(test)]
 mod tests {
     use iggy_binary_protocol::{
-        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader, frame_checksum_bytes,
+        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
+        prepare_identity_checksum_bytes,
     };
     use server_common::iobuf::Owned;
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
@@ -851,13 +863,15 @@ mod tests {
             let client_offset = offset_of!(PrepareHeader, client);
             frame[client_offset..client_offset + 16].copy_from_slice(&0xCAFE_u128.to_le_bytes());
             frame[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
-            // Seal the checksum the way a real sender does, so the frame's
-            // only anomaly is the operation byte itself.
+            // A prepare's `checksum` carries the identity checksum, computed
+            // over the operation byte among others; stamping it the way a real
+            // sender does leaves the unknown byte as the frame's only anomaly
+            // and is what lets the classifier trust that byte.
             let header: &[u8; HEADER_SIZE] = frame[..HEADER_SIZE]
                 .try_into()
                 .expect("frame spans a full header");
-            let checksum = frame_checksum_bytes(header);
-            frame[..size_of::<u128>()].copy_from_slice(&checksum.to_le_bytes());
+            let identity = prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
         }
 
         // The generic view carries no operation field, so the receive path
