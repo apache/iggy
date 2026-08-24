@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::configs::runtime::{HttpStateConfig, RetryConfig};
+use crate::configs::runtime::{HttpStateConfig, HttpStateMethod, RetryConfig};
 use crate::error::RuntimeError;
 use crate::state::{StateProvider, StateStorage, StateStorageFactory};
 use bytes::Bytes;
@@ -35,7 +35,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 const OCTET_STREAM: &str = "application/octet-stream";
 const ERROR_BODY_SNIPPET_CHARS: usize = 256;
 
@@ -46,6 +46,9 @@ const ERROR_BODY_SNIPPET_CHARS: usize = 256;
 pub struct HttpStateFactory {
     client: ClientWithMiddleware,
     base_url: Url,
+    base_url_label: String,
+    load_method: Method,
+    save_method: Method,
     retry: RetryPolicy,
 }
 
@@ -57,17 +60,27 @@ impl HttpStateFactory {
             ));
         }
         let base_url = Url::parse(&config.url).map_err(|parse_error| {
-            RuntimeError::InvalidConfiguration(format!(
-                "Invalid state.http.url '{}': {parse_error}",
-                config.url
-            ))
+            RuntimeError::InvalidConfiguration(format!("Invalid state.http.url: {parse_error}"))
         })?;
         if base_url.cannot_be_a_base() || !matches!(base_url.scheme(), "http" | "https") {
-            return Err(RuntimeError::InvalidConfiguration(format!(
-                "state.http.url must be an http(s) URL, got '{}'",
-                config.url
-            )));
+            return Err(RuntimeError::InvalidConfiguration(
+                "state.http.url must be an http(s) URL".to_string(),
+            ));
         }
+        if !base_url.username().is_empty() || base_url.password().is_some() {
+            return Err(RuntimeError::InvalidConfiguration(
+                "state.http.url must not contain user credentials; use request_headers instead"
+                    .to_string(),
+            ));
+        }
+        if base_url.fragment().is_some() {
+            return Err(RuntimeError::InvalidConfiguration(
+                "state.http.url must not contain a fragment".to_string(),
+            ));
+        }
+        let base_url_label = url_label(&base_url);
+        let load_method = load_method(config.load_method)?;
+        let save_method = save_method(config.save_method)?;
 
         let mut headers = HeaderMap::new();
         for (name, value) in &config.request_headers {
@@ -76,6 +89,11 @@ impl HttpStateFactory {
                     "Invalid state.http header name '{name}': {header_error}"
                 ))
             })?;
+            if is_runtime_managed_header(&header_name) {
+                return Err(RuntimeError::InvalidConfiguration(format!(
+                    "state.http.request_headers cannot override runtime-managed header '{name}'"
+                )));
+            }
             // The parse error never echoes the value, and marking it
             // sensitive keeps it out of any Debug output downstream.
             let mut header_value =
@@ -107,6 +125,9 @@ impl HttpStateFactory {
         Ok(Self {
             client,
             base_url,
+            base_url_label,
+            load_method,
+            save_method,
             retry: RetryPolicy::from(&config.retry),
         })
     }
@@ -119,7 +140,7 @@ impl StateStorageFactory for HttpStateFactory {
             let mut segments = resource_url.path_segments_mut().map_err(|_| {
                 RuntimeError::InvalidConfiguration(format!(
                     "State URL cannot host per-connector resources: {}",
-                    self.base_url
+                    self.base_url_label
                 ))
             })?;
             // push() percent-encodes the segment, so any connector key is safe
@@ -128,11 +149,14 @@ impl StateStorageFactory for HttpStateFactory {
             segments.pop_if_empty();
             segments.push(&format!("source_{connector_key}"));
         }
-        Ok(StateStorage::Http(HttpStateProvider::new(
+        Ok(StateStorage::Http(Box::new(HttpStateProvider::new(
             self.client.clone(),
+            url_label(&resource_url),
             resource_url,
+            self.load_method.clone(),
+            self.save_method.clone(),
             self.retry.clone(),
-        )))
+        ))))
     }
 }
 
@@ -140,7 +164,9 @@ impl fmt::Debug for HttpStateFactory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpStateFactory")
-            .field("base_url", &self.base_url.as_str())
+            .field("base_url", &self.base_url_label)
+            .field("load_method", &self.load_method)
+            .field("save_method", &self.save_method)
             .field("retry", &self.retry)
             .finish_non_exhaustive()
     }
@@ -160,42 +186,69 @@ impl fmt::Debug for HttpStateFactory {
 /// network.
 pub struct HttpStateProvider {
     client: ClientWithMiddleware,
+    resource_label: String,
     resource_url: Url,
+    load_method: Method,
+    save_method: Method,
     retry: RetryPolicy,
-    version: Mutex<TrackedVersion>,
+    tracker: Mutex<StateTracker>,
+    has_pending: AtomicBool,
     latched: AtomicBool,
 }
 
 impl HttpStateProvider {
-    pub(crate) fn new(client: ClientWithMiddleware, resource_url: Url, retry: RetryPolicy) -> Self {
+    pub(crate) fn new(
+        client: ClientWithMiddleware,
+        resource_label: String,
+        resource_url: Url,
+        load_method: Method,
+        save_method: Method,
+        retry: RetryPolicy,
+    ) -> Self {
         Self {
             client,
+            resource_label,
             resource_url,
+            load_method,
+            save_method,
             retry,
-            version: Mutex::new(TrackedVersion::Unknown),
+            tracker: Mutex::new(StateTracker::default()),
+            has_pending: AtomicBool::new(false),
             latched: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn is_latched(&self) -> bool {
+        self.latched.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn resolve_pending(&self) -> Result<(), Error> {
+        if self.is_latched() {
+            return Err(Error::StateLatched);
+        }
+        if !self.has_pending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut tracker = self.tracker.lock().await;
+        if self.is_latched() {
+            return Err(Error::StateLatched);
+        }
+        if tracker.pending.is_none() {
+            self.has_pending.store(false, Ordering::Release);
+            return Ok(());
+        }
+        self.commit_pending(&mut tracker).await
     }
 
     async fn load_with_version(
         &self,
         version: &mut TrackedVersion,
     ) -> Result<Option<ConnectorState>, Error> {
-        let response = self
-            .execute_with_retry(Method::GET, "load", |request| request)
-            .await?;
-        match response.status() {
-            StatusCode::OK => {
-                let etag = required_etag(&response, "load", &self.resource_url)?;
-                let bytes = response.bytes().await.map_err(|read_error| {
-                    Error::TransientState(format!(
-                        "load GET {} failed reading the state body: {read_error}",
-                        self.resource_url
-                    ))
-                })?;
+        match self.execute_load_with_retry().await? {
+            LoadResponse::Found { etag, bytes } => {
                 debug!(
                     "Loaded state from {} ({} bytes)",
-                    self.resource_url,
+                    self.resource_label,
                     bytes.len()
                 );
                 *version = TrackedVersion::Etag(etag);
@@ -203,14 +256,66 @@ impl HttpStateProvider {
                 // where an empty file means "no state yet".
                 Ok(Some(ConnectorState(bytes.to_vec())))
             }
-            StatusCode::NOT_FOUND => {
-                info!("No state stored at {}, starting fresh", self.resource_url);
+            LoadResponse::NotFound => {
+                info!("No state stored at {}, starting fresh", self.resource_label);
                 *version = TrackedVersion::Absent;
                 Ok(None)
             }
-            status => Err(Error::PermanentState(
-                describe_failure("load", status, &self.resource_url, response).await,
-            )),
+            LoadResponse::Failure(response) => {
+                let status = response.status();
+                Err(Error::PermanentState(
+                    describe_failure("load", status, &self.resource_label, response).await,
+                ))
+            }
+        }
+    }
+
+    async fn execute_load_with_retry(&self) -> Result<LoadResponse, Error> {
+        let max_attempts = if self.retry.enabled {
+            self.retry.max_attempts
+        } else {
+            0
+        };
+        let mut attempt = 0u32;
+        loop {
+            let failure = match self
+                .client
+                .request(self.load_method.clone(), self.resource_url.clone())
+                .send()
+                .await
+            {
+                Ok(response) if is_transient_status(response.status()) => {
+                    TransientFailure::Status(response)
+                }
+                Ok(response) if response.status() == StatusCode::OK => {
+                    let etag = required_etag(&response, "load", &self.resource_label)?;
+                    match response.bytes().await {
+                        Ok(bytes) => return Ok(LoadResponse::Found { etag, bytes }),
+                        Err(read_error) => TransientFailure::Read(read_error.to_string()),
+                    }
+                }
+                Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                    return Ok(LoadResponse::NotFound);
+                }
+                Ok(response) => return Ok(LoadResponse::Failure(response)),
+                Err(send_error) => TransientFailure::Send(send_error),
+            };
+            if attempt >= max_attempts {
+                return Err(Error::TransientState(failure.describe(
+                    "load",
+                    &self.resource_label,
+                    attempt + 1,
+                )));
+            }
+            let delay = self.retry.delay_for(attempt, failure.retry_after());
+            warn!(
+                "load against {} hit a transient failure, retrying in {delay:?} (attempt {} of {})",
+                self.resource_label,
+                attempt + 1,
+                max_attempts + 1
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
         }
     }
 
@@ -242,14 +347,14 @@ impl HttpStateProvider {
             if attempt >= max_attempts {
                 return Err(Error::TransientState(failure.describe(
                     operation,
-                    &self.resource_url,
+                    &self.resource_label,
                     attempt + 1,
                 )));
             }
             let delay = self.retry.delay_for(attempt, failure.retry_after());
             warn!(
                 "{operation} against {} hit a transient failure, retrying in {delay:?} (attempt {} of {})",
-                self.resource_url,
+                self.resource_label,
                 attempt + 1,
                 max_attempts + 1
             );
@@ -258,85 +363,41 @@ impl HttpStateProvider {
         }
     }
 
-    fn latch(&self) {
-        self.latched.store(true, Ordering::Release);
-        error!(
-            "State provider for {} latched after a permanent save error; further saves fail fast until restart",
-            self.resource_url
-        );
-    }
-}
-
-impl StateProvider for HttpStateProvider {
-    async fn load(&self) -> Result<Option<ConnectorState>, Error> {
-        let mut version = self.version.lock().await;
-        self.load_with_version(&mut version).await
-    }
-
-    async fn save(&self, state: ConnectorState) -> Result<(), Error> {
-        if self.latched.load(Ordering::Acquire) {
-            return Err(Error::StateLatched);
-        }
-        let mut version = self.version.lock().await;
-        // Re-check under the lock: a concurrent save may have latched while
-        // this one was waiting.
-        if self.latched.load(Ordering::Acquire) {
-            return Err(Error::StateLatched);
-        }
-        if matches!(*version, TrackedVersion::Unknown) {
-            // Never issue an unconditional write. The runtime always loads at
-            // init, so this safety net should not trigger in practice.
-            warn!(
-                "Saving state to {} before any load; loading first to resolve the stored version",
-                self.resource_url
-            );
-            self.load_with_version(&mut version).await?;
-        }
-        let (condition_name, condition_value) = match &*version {
-            TrackedVersion::Etag(etag) => (
-                IF_MATCH,
-                HeaderValue::from_str(etag).map_err(|_| {
-                    Error::PermanentState(format!(
-                        "Tracked ETag for {} is not a valid header value",
-                        self.resource_url
-                    ))
-                })?,
-            ),
-            TrackedVersion::Absent => (IF_NONE_MATCH, HeaderValue::from_static("*")),
-            TrackedVersion::Unknown => {
-                return Err(Error::PermanentState(format!(
-                    "State version for {} is unresolved after load",
-                    self.resource_url
-                )));
-            }
-        };
-
-        // One key per logical save, byte-identical across every retry of that
-        // save, so a server that committed the write but lost the response
-        // can replay the original outcome instead of failing the retry with a
-        // spurious 412.
-        let idempotency_key = Uuid::new_v4().to_string();
-        let body = Bytes::from(state.0);
+    async fn commit_pending(&self, tracker: &mut StateTracker) -> Result<(), Error> {
+        let pending = tracker.pending.clone().ok_or_else(|| {
+            Error::PermanentState(format!(
+                "No pending state write exists for {}",
+                self.resource_label
+            ))
+        })?;
         let response = self
-            .execute_with_retry(Method::PUT, "save", |request| {
+            .execute_with_retry(self.save_method.clone(), "save", |request| {
                 request
-                    .header(condition_name.clone(), condition_value.clone())
-                    .header(IDEMPOTENCY_KEY_HEADER, idempotency_key.as_str())
+                    .header(
+                        pending.condition_name.clone(),
+                        pending.condition_value.clone(),
+                    )
+                    .header(
+                        IDEMPOTENCY_KEY_HEADER.clone(),
+                        pending.idempotency_key.as_str(),
+                    )
                     .header(CONTENT_TYPE, OCTET_STREAM)
-                    .body(body.clone())
+                    .body(pending.body.clone())
             })
             .await?;
 
         match response.status() {
             StatusCode::OK | StatusCode::CREATED | StatusCode::NO_CONTENT => {
-                match required_etag(&response, "save", &self.resource_url) {
+                match required_etag(&response, "save", &self.resource_label) {
                     Ok(etag) => {
                         debug!(
                             "Saved state to {} ({} bytes)",
-                            self.resource_url,
-                            body.len()
+                            self.resource_label,
+                            pending.body.len()
                         );
-                        *version = TrackedVersion::Etag(etag);
+                        tracker.version = TrackedVersion::Etag(etag);
+                        tracker.pending = None;
+                        self.has_pending.store(false, Ordering::Release);
                         Ok(())
                     }
                     Err(etag_error) => {
@@ -347,7 +408,7 @@ impl StateProvider for HttpStateProvider {
             }
             status => {
                 let mut message =
-                    describe_failure("save", status, &self.resource_url, response).await;
+                    describe_failure("save", status, &self.resource_label, response).await;
                 if matches!(
                     status,
                     StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT
@@ -361,21 +422,127 @@ impl StateProvider for HttpStateProvider {
             }
         }
     }
+
+    fn latch(&self) {
+        self.latched.store(true, Ordering::Release);
+        error!(
+            "State provider for {} latched after a permanent save error; further saves fail fast until restart",
+            self.resource_label
+        );
+    }
+}
+
+impl StateProvider for HttpStateProvider {
+    async fn load(&self) -> Result<Option<ConnectorState>, Error> {
+        let mut tracker = self.tracker.lock().await;
+        let result = self.load_with_version(&mut tracker.version).await;
+        if result.is_ok() {
+            tracker.pending = None;
+            self.has_pending.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    async fn save(&self, state: ConnectorState) -> Result<(), Error> {
+        if self.is_latched() {
+            return Err(Error::StateLatched);
+        }
+        let mut tracker = self.tracker.lock().await;
+        // Re-check under the lock: a concurrent save may have latched while
+        // this one was waiting.
+        if self.is_latched() {
+            return Err(Error::StateLatched);
+        }
+        if matches!(tracker.version, TrackedVersion::Unknown) {
+            // Never issue an unconditional write. The runtime always loads at
+            // init, so this safety net should not trigger in practice.
+            warn!(
+                "Saving state to {} before any load; loading first to resolve the stored version",
+                self.resource_label
+            );
+            self.load_with_version(&mut tracker.version).await?;
+        }
+        let body = Bytes::from(state.0);
+        if let Some(pending) = tracker.pending.as_ref() {
+            if pending.body == body {
+                return self.commit_pending(&mut tracker).await;
+            }
+            self.commit_pending(&mut tracker).await?;
+        }
+        tracker.pending = Some(PendingSave::new(
+            &tracker.version,
+            body,
+            &self.resource_label,
+        )?);
+        self.has_pending.store(true, Ordering::Release);
+        self.commit_pending(&mut tracker).await
+    }
 }
 
 impl fmt::Debug for HttpStateProvider {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpStateProvider")
-            .field("resource_url", &self.resource_url.as_str())
+            .field("resource_url", &self.resource_label)
+            .field("load_method", &self.load_method)
+            .field("save_method", &self.save_method)
             .field("retry", &self.retry)
+            .field("has_pending", &self.has_pending.load(Ordering::Relaxed))
             .field("latched", &self.latched.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct StateTracker {
+    version: TrackedVersion,
+    pending: Option<PendingSave>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSave {
+    condition_name: HeaderName,
+    condition_value: HeaderValue,
+    idempotency_key: String,
+    body: Bytes,
+}
+
+impl PendingSave {
+    fn new(version: &TrackedVersion, body: Bytes, url: &str) -> Result<Self, Error> {
+        let (condition_name, condition_value) = match version {
+            TrackedVersion::Etag(etag) => (
+                IF_MATCH,
+                HeaderValue::from_str(etag).map_err(|_| {
+                    Error::PermanentState(format!(
+                        "Tracked ETag for {url} is not a valid header value"
+                    ))
+                })?,
+            ),
+            TrackedVersion::Absent => (IF_NONE_MATCH, HeaderValue::from_static("*")),
+            TrackedVersion::Unknown => {
+                return Err(Error::PermanentState(format!(
+                    "State version for {url} is unresolved after load"
+                )));
+            }
+        };
+        Ok(Self {
+            condition_name,
+            condition_value,
+            idempotency_key: Uuid::new_v4().to_string(),
+            body,
+        })
+    }
+}
+
+enum LoadResponse {
+    Found { etag: String, bytes: Bytes },
+    NotFound,
+    Failure(reqwest::Response),
+}
+
+#[derive(Debug, Default)]
 enum TrackedVersion {
+    #[default]
     Unknown,
     Absent,
     Etag(String),
@@ -422,6 +589,7 @@ impl From<&RetryConfig> for RetryPolicy {
 enum TransientFailure {
     Status(reqwest::Response),
     Send(reqwest_middleware::Error),
+    Read(String),
 }
 
 impl TransientFailure {
@@ -433,11 +601,11 @@ impl TransientFailure {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse::<u64>().ok())
                 .map(Duration::from_secs),
-            TransientFailure::Send(_) => None,
+            TransientFailure::Send(_) | TransientFailure::Read(_) => None,
         }
     }
 
-    fn describe(&self, operation: &str, url: &Url, attempts: u32) -> String {
+    fn describe(&self, operation: &str, url: &str, attempts: u32) -> String {
         match self {
             TransientFailure::Status(response) => format!(
                 "{operation} against {url} still failing with HTTP {} after {attempts} attempts",
@@ -448,7 +616,39 @@ impl TransientFailure {
                     "{operation} against {url} still failing after {attempts} attempts: {send_error}"
                 )
             }
+            TransientFailure::Read(read_error) => format!(
+                "{operation} against {url} still failing while reading the response body after {attempts} attempts: {read_error}"
+            ),
         }
+    }
+}
+
+fn url_label(url: &Url) -> String {
+    let mut label = url.clone();
+    if label.query().is_some() {
+        label.set_query(Some("redacted"));
+    }
+    label.to_string()
+}
+
+fn load_method(method: HttpStateMethod) -> Result<Method, RuntimeError> {
+    match method {
+        HttpStateMethod::Get => Ok(Method::GET),
+        HttpStateMethod::Post => Ok(Method::POST),
+        other => Err(RuntimeError::InvalidConfiguration(format!(
+            "state.http.load_method must be GET or POST, got {other}"
+        ))),
+    }
+}
+
+fn save_method(method: HttpStateMethod) -> Result<Method, RuntimeError> {
+    match method {
+        HttpStateMethod::Put => Ok(Method::PUT),
+        HttpStateMethod::Post => Ok(Method::POST),
+        HttpStateMethod::Patch => Ok(Method::PATCH),
+        other => Err(RuntimeError::InvalidConfiguration(format!(
+            "state.http.save_method must be PUT, POST, or PATCH, got {other}"
+        ))),
     }
 }
 
@@ -461,26 +661,49 @@ fn is_transient_status(status: StatusCode) -> bool {
 fn required_etag(
     response: &reqwest::Response,
     operation: &str,
-    url: &Url,
+    url: &str,
 ) -> Result<String, Error> {
-    response
+    let etag = response
         .headers()
         .get(ETAG)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned)
         .ok_or_else(|| {
             Error::PermanentState(format!(
                 "{operation} against {url} succeeded with HTTP {} but returned no usable ETag; \
                  the state server violates the protocol contract",
                 response.status()
             ))
-        })
+        })?;
+    if !is_strong_etag(etag) {
+        return Err(Error::PermanentState(format!(
+            "{operation} against {url} succeeded with HTTP {} but returned invalid strong ETag '{etag}'; the state server violates the protocol contract",
+            response.status()
+        )));
+    }
+    Ok(etag.to_owned())
+}
+
+fn is_strong_etag(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2
+        && bytes.first() == Some(&b'"')
+        && bytes.last() == Some(&b'"')
+        && bytes[1..bytes.len() - 1]
+            .iter()
+            .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte))
+}
+
+fn is_runtime_managed_header(name: &HeaderName) -> bool {
+    name == IF_MATCH
+        || name == IF_NONE_MATCH
+        || name == IDEMPOTENCY_KEY_HEADER
+        || name == CONTENT_TYPE
 }
 
 async fn describe_failure(
     operation: &str,
     status: StatusCode,
-    url: &Url,
+    url: &str,
     response: reqwest::Response,
 ) -> String {
     let detail = match response.text().await {
@@ -499,10 +722,10 @@ mod tests {
     use iggy_common::IggyDuration;
     use secrecy::SecretString;
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Instant;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     const RESOURCE_PATH: &str = "/source_test";
@@ -510,6 +733,8 @@ mod tests {
     fn test_config(url: &str) -> HttpStateConfig {
         HttpStateConfig {
             url: url.to_string(),
+            load_method: HttpStateMethod::Get,
+            save_method: HttpStateMethod::Put,
             timeout: IggyDuration::new(Duration::from_secs(5)),
             request_headers: HashMap::new(),
             retry: RetryConfig {
@@ -534,16 +759,16 @@ mod tests {
     }
 
     fn ok_with_etag(etag: &str) -> ResponseTemplate {
-        ResponseTemplate::new(200).insert_header("etag", etag)
+        ResponseTemplate::new(200).insert_header(ETAG, etag)
     }
 
-    async fn requests_of(server: &MockServer, http_method: &str) -> Vec<Request> {
+    async fn requests_of(server: &MockServer, http_method: Method) -> Vec<Request> {
         server
             .received_requests()
             .await
             .expect("request recording is enabled")
             .into_iter()
-            .filter(|request| request.method.as_str() == http_method)
+            .filter(|request| request.method == http_method)
             .collect()
     }
 
@@ -557,7 +782,7 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path(RESOURCE_PATH))
-            .and(header("if-match", "\"v1\""))
+            .and(header(IF_MATCH.as_str(), "\"v1\""))
             .respond_with(ok_with_etag("\"v2\""))
             .mount(&server)
             .await;
@@ -597,9 +822,9 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path(RESOURCE_PATH))
-            .and(header("if-none-match", "*"))
-            .and(header("content-type", OCTET_STREAM))
-            .respond_with(ResponseTemplate::new(201).insert_header("etag", "\"v1\""))
+            .and(header(IF_NONE_MATCH.as_str(), "*"))
+            .and(header(CONTENT_TYPE.as_str(), OCTET_STREAM))
+            .respond_with(ResponseTemplate::new(201).insert_header(ETAG, "\"v1\""))
             .mount(&server)
             .await;
 
@@ -609,9 +834,9 @@ mod tests {
             .save(ConnectorState(vec![7]))
             .await
             .expect("first save should create via If-None-Match: *");
-        let puts = requests_of(&server, "PUT").await;
+        let puts = requests_of(&server, Method::PUT).await;
         assert_eq!(puts.len(), 1);
-        assert!(puts[0].headers.get(IDEMPOTENCY_KEY_HEADER).is_some());
+        assert!(puts[0].headers.get(&IDEMPOTENCY_KEY_HEADER).is_some());
     }
 
     #[tokio::test]
@@ -628,6 +853,24 @@ mod tests {
             matches!(result, Err(Error::PermanentState(_))),
             "missing ETag on load must be a protocol violation, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn given_non_strong_etag_when_loaded_should_classify_permanent() {
+        for etag in ["W/\"v1\"", "*"] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(RESOURCE_PATH))
+                .respond_with(ResponseTemplate::new(200).insert_header(ETAG, etag))
+                .mount(&server)
+                .await;
+
+            let result = storage(&server).load().await;
+            assert!(
+                matches!(result, Err(Error::PermanentState(_))),
+                "ETag {etag} must not be accepted for optimistic concurrency, got {result:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -746,14 +989,14 @@ mod tests {
         let result = storage.save(ConnectorState(vec![1])).await;
         assert!(matches!(result, Err(Error::PermanentState(_))));
 
-        let requests_before = requests_of(&server, "PUT").await.len();
+        let requests_before = requests_of(&server, Method::PUT).await.len();
         let latched = storage.save(ConnectorState(vec![2])).await;
         assert!(
             matches!(latched, Err(Error::StateLatched)),
             "expected StateLatched, got {latched:?}"
         );
         assert_eq!(
-            requests_of(&server, "PUT").await.len(),
+            requests_of(&server, Method::PUT).await.len(),
             requests_before,
             "a latched save must not touch the network"
         );
@@ -835,25 +1078,89 @@ mod tests {
         storage.load().await.unwrap();
         storage.save(ConnectorState(vec![1, 2, 3])).await.unwrap();
 
-        let puts = requests_of(&server, "PUT").await;
+        let puts = requests_of(&server, Method::PUT).await;
         assert_eq!(puts.len(), 3, "one initial try plus two retries");
         let first_key = puts[0]
             .headers
-            .get(IDEMPOTENCY_KEY_HEADER)
+            .get(&IDEMPOTENCY_KEY_HEADER)
             .expect("idempotency key must be present")
             .clone();
         for put in &puts {
             assert_eq!(
-                put.headers.get(IDEMPOTENCY_KEY_HEADER),
+                put.headers.get(&IDEMPOTENCY_KEY_HEADER),
                 Some(&first_key),
                 "every retry of one logical save must reuse the same key"
             );
             assert_eq!(put.body, vec![1u8, 2, 3], "retries must be byte-identical");
             assert_eq!(
-                put.headers.get("if-none-match").map(|v| v.as_bytes()),
+                put.headers.get(IF_NONE_MATCH).map(|v| v.as_bytes()),
                 Some(b"*".as_slice())
             );
         }
+    }
+
+    struct CommitThenTimeout {
+        committed_key: StdMutex<Option<String>>,
+    }
+
+    impl Respond for CommitThenTimeout {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let key = request
+                .headers
+                .get(&IDEMPOTENCY_KEY_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .expect("idempotency key must be present")
+                .to_string();
+            let mut committed_key = self.committed_key.lock().expect("commit lock");
+            if committed_key.as_ref() == Some(&key) {
+                return ok_with_etag("\"v1\"");
+            }
+            assert!(
+                committed_key.is_none(),
+                "a new key must not overwrite the unresolved write"
+            );
+            *committed_key = Some(key);
+            ok_with_etag("\"v1\"").set_delay(Duration::from_millis(200))
+        }
+    }
+
+    #[tokio::test]
+    async fn given_committed_save_with_lost_response_when_resolved_should_reuse_pending_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(RESOURCE_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(RESOURCE_PATH))
+            .respond_with(CommitThenTimeout {
+                committed_key: StdMutex::new(None),
+            })
+            .mount(&server)
+            .await;
+
+        let mut config = test_config(&server.uri());
+        config.timeout = IggyDuration::new(Duration::from_millis(50));
+        config.retry.enabled = false;
+        let storage = storage_for(&config);
+        storage.load().await.unwrap();
+        assert!(matches!(
+            storage.save(ConnectorState(vec![1, 2, 3])).await,
+            Err(Error::TransientState(_))
+        ));
+        storage
+            .resolve_pending()
+            .await
+            .expect("pending resolution should replay the committed outcome");
+
+        let puts = requests_of(&server, Method::PUT).await;
+        assert_eq!(puts.len(), 2);
+        assert_eq!(
+            puts[0].headers.get(&IDEMPOTENCY_KEY_HEADER),
+            puts[1].headers.get(&IDEMPOTENCY_KEY_HEADER),
+            "the unresolved logical save must retain its idempotency key across calls"
+        );
     }
 
     #[tokio::test]
@@ -875,11 +1182,11 @@ mod tests {
         storage.save(ConnectorState(vec![1])).await.unwrap();
         storage.save(ConnectorState(vec![2])).await.unwrap();
 
-        let puts = requests_of(&server, "PUT").await;
+        let puts = requests_of(&server, Method::PUT).await;
         assert_eq!(puts.len(), 2);
         assert_ne!(
-            puts[0].headers.get(IDEMPOTENCY_KEY_HEADER),
-            puts[1].headers.get(IDEMPOTENCY_KEY_HEADER),
+            puts[0].headers.get(&IDEMPOTENCY_KEY_HEADER),
+            puts[1].headers.get(&IDEMPOTENCY_KEY_HEADER),
             "a new state value must get a new idempotency key"
         );
     }
@@ -904,16 +1211,16 @@ mod tests {
             storage.save(ConnectorState(vec![1])).await,
             Err(Error::TransientState(_))
         ));
-        let puts_after_first = requests_of(&server, "PUT").await.len();
+        let puts_after_first = requests_of(&server, Method::PUT).await.len();
         assert!(
             matches!(
-                storage.save(ConnectorState(vec![2])).await,
+                storage.save(ConnectorState(vec![1])).await,
                 Err(Error::TransientState(_))
             ),
-            "transient failures must not latch"
+            "retrying the same unresolved state must not latch"
         );
         assert!(
-            requests_of(&server, "PUT").await.len() > puts_after_first,
+            requests_of(&server, Method::PUT).await.len() > puts_after_first,
             "the next save must reach the network after a transient failure"
         );
     }
@@ -928,7 +1235,7 @@ mod tests {
             .await;
         Mock::given(method("PUT"))
             .and(path(RESOURCE_PATH))
-            .and(header("if-none-match", "*"))
+            .and(header(IF_NONE_MATCH.as_str(), "*"))
             .respond_with(ok_with_etag("\"v1\""))
             .mount(&server)
             .await;
@@ -940,11 +1247,11 @@ mod tests {
 
         let all = server.received_requests().await.unwrap();
         assert_eq!(
-            all[0].method.as_str(),
-            "GET",
+            all[0].method,
+            Method::GET,
             "version must be resolved before writing"
         );
-        assert_eq!(all[1].method.as_str(), "PUT");
+        assert_eq!(all[1].method, Method::PUT);
     }
 
     /// Conditional PUT responder: enforces `If-None-Match: *` before the first
@@ -957,13 +1264,13 @@ mod tests {
             let matches = if current == 0 {
                 request
                     .headers
-                    .get("if-none-match")
+                    .get(IF_NONE_MATCH)
                     .map(|value| value.as_bytes() == b"*")
                     .unwrap_or(false)
             } else {
                 request
                     .headers
-                    .get("if-match")
+                    .get(IF_MATCH)
                     .and_then(|value| value.to_str().ok())
                     .map(|value| value == format!("\"v{current}\""))
                     .unwrap_or(false)
@@ -973,7 +1280,7 @@ mod tests {
             }
             let next = current + 1;
             self.0.store(next, Ordering::SeqCst);
-            ResponseTemplate::new(200).insert_header("etag", format!("\"v{next}\"").as_str())
+            ResponseTemplate::new(200).insert_header(ETAG, format!("\"v{next}\"").as_str())
         }
     }
 
@@ -1031,9 +1338,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn given_post_load_method_when_loaded_should_use_post() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(RESOURCE_PATH))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let mut config = test_config(&server.uri());
+        config.load_method = HttpStateMethod::Post;
+        assert!(storage_for(&config).load().await.unwrap().is_none());
+        assert_eq!(requests_of(&server, Method::POST).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_configured_save_method_when_saved_should_use_it() {
+        for (configured, expected) in [
+            (HttpStateMethod::Put, Method::PUT),
+            (HttpStateMethod::Post, Method::POST),
+            (HttpStateMethod::Patch, Method::PATCH),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(RESOURCE_PATH))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(method(expected.clone()))
+                .and(path(RESOURCE_PATH))
+                .and(header(IF_NONE_MATCH.as_str(), "*"))
+                .respond_with(ok_with_etag("\"v1\""))
+                .mount(&server)
+                .await;
+
+            let mut config = test_config(&server.uri());
+            config.save_method = configured;
+            let storage = storage_for(&config);
+            storage.load().await.unwrap();
+            storage.save(ConnectorState(vec![1])).await.unwrap();
+            assert_eq!(requests_of(&server, expected).await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn given_query_string_in_base_url_when_requesting_should_preserve_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/state/source_test"))
+            .and(query_param("tenant", "acme"))
+            .and(query_param("region", "eu"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let config = test_config(&format!("{}/state?tenant=acme&region=eu", server.uri()));
+        assert!(storage_for(&config).load().await.unwrap().is_none());
+    }
+
     #[test]
     fn given_secret_headers_when_formatted_should_not_leak_values() {
-        let mut config = test_config("http://localhost:1/state");
+        let mut config = test_config("http://localhost:1/state?token=query-secret");
         config.request_headers.insert(
             "authorization".to_string(),
             SecretString::from("Bearer secret-token"),
@@ -1042,10 +1408,18 @@ mod tests {
         let display_output = format!("{config}");
         assert!(!debug_output.contains("secret-token"), "{debug_output}");
         assert!(!display_output.contains("secret-token"), "{display_output}");
+        assert!(!debug_output.contains("query-secret"), "{debug_output}");
+        assert!(!display_output.contains("query-secret"), "{display_output}");
         assert!(
             display_output.contains("authorization"),
             "header names stay visible for operators: {display_output}"
         );
+
+        let factory = HttpStateFactory::new(&config).expect("factory should build");
+        let factory_debug = format!("{factory:?}");
+        let storage_debug = format!("{:?}", factory.storage_for("test").unwrap());
+        assert!(!factory_debug.contains("query-secret"), "{factory_debug}");
+        assert!(!storage_debug.contains("query-secret"), "{storage_debug}");
     }
 
     #[test]
@@ -1064,11 +1438,49 @@ mod tests {
     }
 
     #[test]
+    fn given_userinfo_or_fragment_in_url_when_factory_built_should_fail() {
+        assert!(
+            HttpStateFactory::new(&test_config("https://user:secret@example.com/state")).is_err()
+        );
+        assert!(HttpStateFactory::new(&test_config("https://example.com/state#fragment")).is_err());
+    }
+
+    #[test]
     fn given_invalid_header_name_when_factory_built_should_fail() {
         let mut config = test_config("http://localhost:1/state");
         config
             .request_headers
             .insert("bad header".to_string(), SecretString::from("value"));
+        assert!(HttpStateFactory::new(&config).is_err());
+    }
+
+    #[test]
+    fn given_runtime_managed_header_when_factory_built_should_fail() {
+        for name in [
+            IF_MATCH.as_str(),
+            IF_NONE_MATCH.as_str(),
+            IDEMPOTENCY_KEY_HEADER.as_str(),
+            CONTENT_TYPE.as_str(),
+        ] {
+            let mut config = test_config("http://localhost:1/state");
+            config
+                .request_headers
+                .insert(name.to_string(), SecretString::from("value"));
+            assert!(
+                HttpStateFactory::new(&config).is_err(),
+                "{name} is owned by the state protocol"
+            );
+        }
+    }
+
+    #[test]
+    fn given_unsupported_method_for_operation_when_factory_built_should_fail() {
+        let mut config = test_config("http://localhost:1/state");
+        config.load_method = HttpStateMethod::Put;
+        assert!(HttpStateFactory::new(&config).is_err());
+
+        config.load_method = HttpStateMethod::Get;
+        config.save_method = HttpStateMethod::Get;
         assert!(HttpStateFactory::new(&config).is_err());
     }
 

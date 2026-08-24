@@ -478,9 +478,14 @@ pub(crate) async fn source_forwarding_loop(
             .observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
         let prepared_count = processed.messages.len();
         let processing_errors = decode_errors + processed.error_count;
+        let pending_state_error = state_storage.resolve_pending().await.err();
+        let state_latched = state_storage.is_latched();
+        let state_unavailable = pending_state_error.is_some() || state_latched;
 
         let iggy_send_start = Instant::now();
-        let send_result = if processing_errors == 0 {
+        let send_result = if state_unavailable {
+            Err(IggyError::Error)
+        } else if processing_errors == 0 {
             send_with_failed_tail_retries(processed.messages, plugin_id, |messages| {
                 producer.send(messages)
             })
@@ -502,7 +507,15 @@ pub(crate) async fn source_forwarding_loop(
         let mut state_save_us: Option<u64> = None;
         let mut batch_result = SourceBatchResult::Nack;
         if let Err(error) = send_result {
-            let error_msg = if processing_errors > 0 {
+            let error_msg = if let Some(state_error) = pending_state_error.as_ref() {
+                format!(
+                    "Rejected source batch {batch_id} while resolving a pending checkpoint for source connector with ID: {plugin_id}. {state_error}"
+                )
+            } else if state_latched {
+                format!(
+                    "Rejected source batch {batch_id} because state storage is latched for source connector with ID: {plugin_id}"
+                )
+            } else if processing_errors > 0 {
                 format!(
                     "Rejected source batch {batch_id} after {processing_errors} decode or processing errors for source connector with ID: {plugin_id}"
                 )
@@ -515,7 +528,12 @@ pub(crate) async fn source_forwarding_loop(
             };
             error!("{error_msg}");
             context.metrics.inc_errors_with_labels(&labels.counter);
-            context.sources.set_error(&plugin_key, &error_msg).await;
+            let preserve_original_error =
+                matches!(pending_state_error.as_ref(), Some(SdkError::StateLatched))
+                    || (pending_state_error.is_none() && state_latched);
+            if !preserve_original_error {
+                context.sources.set_error(&plugin_key, &error_msg).await;
+            }
         } else {
             context
                 .metrics

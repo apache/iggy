@@ -42,7 +42,7 @@ pub enum StateStorage {
     #[strum(to_string = "file")]
     File(FileStateProvider),
     #[strum(to_string = "http")]
-    Http(HttpStateProvider),
+    Http(Box<HttpStateProvider>),
 }
 
 impl StateStorage {
@@ -57,6 +57,20 @@ impl StateStorage {
         match self {
             StateStorage::File(provider) => provider.save(state).await,
             StateStorage::Http(provider) => provider.save(state).await,
+        }
+    }
+
+    pub async fn resolve_pending(&self) -> Result<(), Error> {
+        match self {
+            StateStorage::File(_) => Ok(()),
+            StateStorage::Http(provider) => provider.resolve_pending().await,
+        }
+    }
+
+    pub fn is_latched(&self) -> bool {
+        match self {
+            StateStorage::File(_) => false,
+            StateStorage::Http(provider) => provider.is_latched(),
         }
     }
 }

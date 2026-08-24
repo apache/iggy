@@ -58,6 +58,8 @@ storage = "file" # "file" | "http"
 # and idempotent retries (Idempotency-Key).
 [state.http]
 url = "" # Base URL of the state server, no trailing slash. Required for storage = "http".
+load_method = "get" # "get" | "post"
+save_method = "put" # "put" | "post" | "patch"
 timeout = "5s"
 
 # Static headers attached verbatim to every request (e.g. authentication).

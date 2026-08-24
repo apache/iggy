@@ -38,7 +38,8 @@ use iggy_connector_sdk::api::{ConnectorStatus, SourceInfoResponse};
 use integration::harness::config::TestServerConfig;
 use integration::harness::{TestBinaryError, TestFixture, TestHarness, seeds};
 use integration::iggy_harness;
-use reqwest::Client;
+use reqwest::header::{ETAG, HeaderName, IF_MATCH, IF_NONE_MATCH};
+use reqwest::{Client, Method};
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -54,6 +55,7 @@ const RESOURCE_PATH: &str = "/source_random_http_state";
 const RUNTIME_CONFIG_PATH: &str = "tests/connectors/runtime/http_state.toml";
 const WAIT_DEADLINE: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
 
 /// In-memory state server backing the wiremock responder. Enforces the
 /// conditional-write contract and exposes counters plus injectable failure
@@ -62,6 +64,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 struct SharedStore {
     version: AtomicU64,
     body: StdMutex<Vec<u8>>,
+    committed_requests: StdMutex<HashMap<String, (Vec<u8>, String)>>,
     conflict_mode: AtomicBool,
     fail_next_puts: AtomicU64,
     get_count: AtomicU64,
@@ -79,57 +82,87 @@ struct StateStoreResponder(Arc<SharedStore>);
 impl Respond for StateStoreResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let store = &self.0;
-        match request.method.as_str() {
-            "GET" => {
-                store.get_count.fetch_add(1, Ordering::SeqCst);
-                let version = store.version.load(Ordering::SeqCst);
-                if version == 0 {
-                    return ResponseTemplate::new(404);
-                }
-                let body = store.body.lock().expect("store lock").clone();
-                ResponseTemplate::new(200)
-                    .insert_header("etag", SharedStore::etag(version).as_str())
-                    .set_body_bytes(body)
+        if request.method == Method::GET {
+            store.get_count.fetch_add(1, Ordering::SeqCst);
+            let version = store.version.load(Ordering::SeqCst);
+            if version == 0 {
+                return ResponseTemplate::new(404);
             }
-            "PUT" => {
-                store.put_count.fetch_add(1, Ordering::SeqCst);
-                if store
-                    .fail_next_puts
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-                {
-                    return ResponseTemplate::new(503);
-                }
-                if store.conflict_mode.load(Ordering::SeqCst) {
-                    return ResponseTemplate::new(412);
-                }
-                let version = store.version.load(Ordering::SeqCst);
-                let condition_ok = if version == 0 {
-                    request
-                        .headers
-                        .get("if-none-match")
-                        .map(|value| value.as_bytes() == b"*")
-                        .unwrap_or(false)
-                } else {
-                    request
-                        .headers
-                        .get("if-match")
-                        .and_then(|value| value.to_str().ok())
-                        .map(|value| value == SharedStore::etag(version))
-                        .unwrap_or(false)
-                };
-                if !condition_ok {
-                    return ResponseTemplate::new(412);
-                }
-                let next = version + 1;
-                *store.body.lock().expect("store lock") = request.body.clone();
-                store.version.store(next, Ordering::SeqCst);
-                ResponseTemplate::new(200).insert_header("etag", SharedStore::etag(next).as_str())
-            }
-            _ => ResponseTemplate::new(405),
+            let body = store.body.lock().expect("store lock").clone();
+            return ResponseTemplate::new(200)
+                .insert_header(ETAG, SharedStore::etag(version).as_str())
+                .set_body_bytes(body);
         }
+        if request.method != Method::PUT
+            && request.method != Method::POST
+            && request.method != Method::PATCH
+        {
+            return ResponseTemplate::new(405);
+        }
+
+        store.put_count.fetch_add(1, Ordering::SeqCst);
+        let Some(idempotency_key) = request
+            .headers
+            .get(&IDEMPOTENCY_KEY_HEADER)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return ResponseTemplate::new(400);
+        };
+        if let Some((committed_body, etag)) = store
+            .committed_requests
+            .lock()
+            .expect("idempotency lock")
+            .get(idempotency_key)
+            .cloned()
+        {
+            if committed_body != request.body {
+                return ResponseTemplate::new(409);
+            }
+            return ResponseTemplate::new(200).insert_header(ETAG, etag.as_str());
+        }
+        if store
+            .fail_next_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return ResponseTemplate::new(503);
+        }
+        if store.conflict_mode.load(Ordering::SeqCst) {
+            return ResponseTemplate::new(412);
+        }
+        let version = store.version.load(Ordering::SeqCst);
+        let condition_ok = if version == 0 {
+            request
+                .headers
+                .get(IF_NONE_MATCH)
+                .map(|value| value.as_bytes() == b"*")
+                .unwrap_or(false)
+        } else {
+            request
+                .headers
+                .get(IF_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value == SharedStore::etag(version))
+                .unwrap_or(false)
+        };
+        if !condition_ok {
+            return ResponseTemplate::new(412);
+        }
+        let next = version + 1;
+        *store.body.lock().expect("store lock") = request.body.clone();
+        store.version.store(next, Ordering::SeqCst);
+        let etag = SharedStore::etag(next);
+        store
+            .committed_requests
+            .lock()
+            .expect("idempotency lock")
+            .insert(
+                idempotency_key.to_string(),
+                (request.body.clone(), etag.clone()),
+            );
+        ResponseTemplate::new(200).insert_header(ETAG, etag.as_str())
     }
 }
 

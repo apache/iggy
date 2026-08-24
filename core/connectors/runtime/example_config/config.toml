@@ -53,6 +53,8 @@ storage = "file" # "file" | "http"
 # and idempotent retries (Idempotency-Key).
 # [state.http]
 # url = "http://127.0.0.1:8080/connectors/state"
+# load_method = "get"
+# save_method = "put"
 # timeout = "5s"
 #
 # [state.http.request_headers]
