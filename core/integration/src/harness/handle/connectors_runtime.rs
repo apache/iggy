@@ -242,21 +242,22 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
         self.iggy_address = Some(addr);
     }
 
+    const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+    const HEALTH_CHECK_BUDGET: Duration = Duration::from_secs(20);
+
     async fn wait_ready(&mut self) -> Result<(), TestBinaryError> {
-        // Prefer /health over `/` so readiness means the connectors API is up,
-        // not some other listener that happened to bind the reserved port.
         let health_url = format!("{}/health", self.http_url());
-        // Bound each probe so a black-holed TCP accept (no HTTP response) cannot
-        // stall send() past the pid-crash / retry budget. Localhost dead process
-        // usually ECONNREFUSED, but a short timeout keeps both guards effective.
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
+            .timeout(HEALTH_PROBE_TIMEOUT)
             .build()
             .map_err(|error| TestBinaryError::InvalidState {
                 message: format!("Failed to build connectors health client: {error}"),
             })?;
 
-        for retry in 0..common::DEFAULT_HEALTH_CHECK_RETRIES {
+        let deadline = Instant::now() + HEALTH_CHECK_BUDGET;
+        let mut retries = 0u32;
+
+        loop {
             if let Some(pid) = self.pid()
                 && !common::is_process_alive(pid)
             {
@@ -269,16 +270,24 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
                 });
             }
 
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TestBinaryError::HealthCheckFailed {
+                    binary: "iggy-connectors".to_string(),
+                    address: health_url,
+                    retries,
+                });
+            }
+
             match client.get(&health_url).send().await {
-                Ok(response) if response.status().is_success() => {
-                    return Ok(());
-                }
+                Ok(response) if response.status().is_success() => return Ok(()),
                 Ok(_) | Err(_) => {
-                    if retry == common::DEFAULT_HEALTH_CHECK_RETRIES - 1 {
+                    retries += 1;
+                    if Instant::now() >= deadline {
                         return Err(TestBinaryError::HealthCheckFailed {
                             binary: "iggy-connectors".to_string(),
                             address: health_url,
-                            retries: common::DEFAULT_HEALTH_CHECK_RETRIES,
+                            retries,
                         });
                     }
                     sleep(Duration::from_millis(
@@ -288,8 +297,6 @@ impl IggyServerDependent for ConnectorsRuntimeHandle {
                 }
             }
         }
-
-        unreachable!()
     }
 }
 
