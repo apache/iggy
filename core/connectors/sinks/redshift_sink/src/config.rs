@@ -54,6 +54,10 @@ impl RedshiftSinkConfig {
     pub fn validate(&self) -> Result<(), Error> {
         let mut errors = String::new();
 
+        if self.batch_size.is_some_and(|v| v == 0) {
+            errors.push_str("batch_size cannot be 0\n");
+        }
+
         if self.connection_string.expose_secret().is_empty() {
             errors.push_str("connection_string is empty\n");
         }
@@ -74,15 +78,22 @@ impl RedshiftSinkConfig {
             errors.push_str(", aws_iam_role is empty\n");
         }
 
-        if let (Some(access), Some(secret)) = (&self.aws_access_key_id, &self.aws_secret_access_key)
-        {
-            // Validate AWS credentials: access keys must be provided
-            let has_access_key = !access.expose_secret().is_empty();
+        match (&self.aws_access_key_id, &self.aws_secret_access_key) {
+            (Some(access), Some(secret)) => {
+                // Validate AWS credentials: access keys must be provided
+                let has_access_key = !access.expose_secret().is_empty();
 
-            let has_secret_key = !secret.expose_secret().is_empty();
+                let has_secret_key = !secret.expose_secret().is_empty();
 
-            if !(has_access_key && has_secret_key) {
-                errors.push_str(", aws_access_key_id and aws_secret_access_key are empty\n");
+                if !(has_access_key && has_secret_key) {
+                    errors.push_str(", Choosing to use aws_access_key_id and aws_secret_access_key then both MUST be provided\n");
+                }
+            }
+            (None, None) => {}
+            _ => {
+                errors.push_str(
+                    ", Choosing to use aws_access_key_id and aws_secret_access_key then both MUST be provided\n",
+                );
             }
         }
 
@@ -132,8 +143,10 @@ impl PayloadFormat {
 
     pub fn sql_type(&self) -> &'static str {
         match self {
-            PayloadFormat::Varbyte => "VARBYTE",
-            PayloadFormat::Text => "VARCHAR",
+            // https://docs.aws.amazon.com/redshift/latest/dg/r_VARBYTE_type.html
+            PayloadFormat::Varbyte => "VARBYTE(16777216)",
+            // https://docs.aws.amazon.com/redshift/latest/dg/r_Character_types.html
+            PayloadFormat::Text => "VARCHAR(MAX)",
         }
     }
 

@@ -42,6 +42,7 @@ include_origin_timestamp = true
 payload_format = "varbyte"
 aws_access_key_id = "admin"
 aws_secret_access_key = "password"
+aws_iam_role = "arn:aws:iam::0123456789012:role/iggyRole"
 s3_bucket = "iggystaging"
 s3_prefix = "iggy/messages"
 s3_endpoint = "http://localhost:9000"

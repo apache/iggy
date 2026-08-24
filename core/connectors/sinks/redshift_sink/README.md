@@ -42,6 +42,7 @@ include_origin_timestamp = true
 payload_format = "varbyte"
 aws_access_key_id = "admin"
 aws_secret_access_key = "password"
+aws_iam_role ="aws_iam_role=arn:aws:iam::0123456789012:role/iggyRole"
 s3_bucket = "iggystaging"
 s3_prefix = "iggy/messages"
 s3_endpoint = "http://localhost:9000"
@@ -150,7 +151,8 @@ CREATE TABLE IF NOT EXISTS {table_name} (
 
 - Staging table name = `staging_` + `{table_name}`.
 - **pgwire test substitution:** `GETDATE()` → `NOW()`.
-- **pgwire test substitution:** `VARBYTE` → `BYTEA`. This affects the `column` when we have `VARBYTE` as the type.
+- **pgwire test substitution:** `VARBYTE(16777216)` → `BYTEA`. This affects the `column` when we have `VARBYTE` as the type.
+- **pgwire test substitution:** `VARCHAR(MAX)` → `VARCHAR(65535)`. This affects the `column` when we have `VARCHAR` as the type.
 - `iggy_offset`, `iggy_timestamp`, and `iggy_origin_timestamp` are u64 values in Iggy but are stored as `VARCHAR` rather than `BIGINT`. `BIGINT` is signed and tops out below `u64::MAX`, so a `VARCHAR` column sidesteps the overflow risk on the upper half of the u64 range without pulling in `DECIMAL`'s added precision/rounding handling.
 - `iggy_partition_id` is u32 in Iggy but is stored as `BIGINT` rather than `INTEGER`. `INTEGER` is signed and tops out below `u32::MAX`, so a `BIGINT` column sidesteps the overflow risk.
 

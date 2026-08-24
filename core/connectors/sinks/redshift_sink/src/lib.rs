@@ -66,6 +66,9 @@ impl Sink for RedshiftSink {
             table = %self.config.target_table, "opening Redshift sink connector"
         );
 
+        // Validating config
+        self.config.validate()?;
+
         self.connect().await?;
         // Ensuring tables exist
         self.ensure_tables_exist().await?;
@@ -266,7 +269,7 @@ impl RedshiftSink {
         if include_origin_timestamp {
             expected_cols.insert("iggy_origin_timestamp", "VARCHAR");
         }
-        expected_cols.insert("payload", payload_type);
+        expected_cols.insert("payload", Self::normalize_type(payload_type));
         expected_cols.insert("created_at", "VARCHAR");
 
         let target_cols = Self::load_columns(pool, &target_table).await?;
@@ -494,7 +497,7 @@ impl RedshiftSink {
             Err(e)?
         }
 
-        tracing::info!("Redshift stging COPY completed");
+        tracing::info!("Redshift staging COPY completed");
 
         // Do a merge into Redshift target table
         self.insert_into_target(&cols).await?;
@@ -1130,6 +1133,14 @@ mod tests {
     fn json_payload(value: serde_json::Value) -> Payload {
         let mut bytes = serde_json::to_vec(&value).expect("Failed to serialize JSON");
         Payload::Json(simd_json::to_owned_value(&mut bytes).expect("Failed to parse JSON"))
+    }
+
+    #[test]
+    fn given_zero_batch_size_should_error() {
+        let mut config = test_config(false, false, false);
+        config.batch_size = Some(0);
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

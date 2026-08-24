@@ -29,9 +29,9 @@ use pgwire::{
 };
 use sqlparser::{
     ast::{
-        CreateTable, DataType, Expr, HiveDistributionStyle, Ident, ObjectName, ObjectNamePart,
-        Select, SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement, TableFactor, Value,
-        VisitMut, VisitorMut,
+        CharacterLength, CreateTable, DataType, Expr, HiveDistributionStyle, Ident, ObjectName,
+        ObjectNamePart, Select, SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement,
+        TableFactor, Value, VisitMut, VisitorMut,
     },
     dialect::{PostgreSqlDialect, RedshiftSqlDialect},
     parser::Parser as SqlParser,
@@ -344,6 +344,13 @@ pub fn redshift_create_table_to_postgres(create: &mut CreateTable) -> Result<(),
             // as a custom type instead.
             DataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("VARBYTE") => {
                 column.data_type = DataType::Bytea;
+            }
+
+            DataType::Varchar(_) => {
+                column.data_type = DataType::Varchar(Some(CharacterLength::IntegerLength {
+                    length: 65535,
+                    unit: None,
+                }));
             }
 
             _ => {}
