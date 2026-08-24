@@ -471,23 +471,61 @@ recreate_missing_state = false
 
 # At boot, segment recovery walks each partition's segments: bytes after the
 # last decodable batch of a genuinely torn tail are physically truncated from
-# the .log/.index files, and the index is rebuilt when it was damaged. Only
-# the walk of a segment whose index was lost re-checksums batches; with an
-# intact index the walk trusts batch headers (decodable, contiguous offsets),
-# and bytes before the last index entry are not re-examined at boot at all --
-# at-rest damage there surfaces on the read path via validate_checksum.
-# Damage in the middle of a segment, or trailing bytes too large or costly to
-# prove torn, is never silently truncated: the partition is refused. With
-# peer replicas the refused files are moved to a .fenced.N directory beside
-# the partition, which is rebuilt empty and refilled from a peer. With
-# replica_count = 1 there is no peer: the refused files stay at their
-# original paths, the partition is tombstoned (unrouted, never served
-# empty), and the same refusal is re-derived and re-logged on every boot
-# until an operator intervenes. Only single-replica refusals with no
-# recoverable bytes at stake (a hole from a stray file, an orphaned empty
-# segment) still rebuild through .fenced.N. The metadata WAL truncates
-# genuinely torn tails too; interior WAL damage or oversized trailing bytes
-# refuse boot instead.
+# the .log/.index files. A LOST index is rebuilt from the batches the walk
+# proves -- lost meaning absent altogether, or holding no whole 24-byte
+# entry. An index that still holds whole entries is NEVER rebuilt, only
+# floored to whole entries, or the partition is refused when its entries
+# contradict the log. Only the walk of a segment whose index was lost
+# re-checksums every batch; with an intact index the walk trusts batch
+# headers, except that a batch contradicting the walk (see below) must pass
+# its batch checksum before the contradiction is believed. Bytes before the
+# last index entry are not re-examined at boot at all -- at-rest damage
+# there surfaces on the read path via validate_checksum.
+#
+# A restore that dropped every .index therefore boots by re-reading and
+# re-checksumming every byte of every segment and rebuilding each index
+# durably, two fsyncs per segment: budget minutes, not seconds, on a
+# partition holding thousands of segments. A boot that looks hung after such
+# a restore is doing that work. Before, that same shape refused the boot
+# outright.
+#
+# Either walk refuses a batch whose base offset does not continue the chain,
+# or whose partition_id stamp is not this partition's. A contradiction whose
+# batch fails its own checksum is damage rather than data: the walk stops
+# there and the residue goes through the damage probe like any other torn
+# tail, so a bit flip in a tail batch's offset truncates instead of refusing
+# the partition, regardless of the flip's direction.
+#
+# Damage in the middle of a segment is never silently truncated: the
+# partition is refused, as is trailing residue whose verification cost
+# exhausts the probe's residue-derived work budgets while walked batches
+# exist (residue after a walk that proved nothing recovers the segment as
+# empty instead, fencing the file pair aside whole). With peer replicas the
+# refused files are moved to a .fenced.N directory beside the partition,
+# which is rebuilt empty and refilled from a peer. With replica_count = 1
+# there is no peer, so nothing is moved and nothing is rebuilt: the refused
+# files stay at their original paths, the partition is tombstoned (unrouted,
+# clients get the retriable transient status, never an empty poll that would
+# read as a healthy empty partition), and the same refusal is re-derived and
+# re-logged on every boot. The tombstone lifts in exactly two ways: a
+# chain-shape refusal whose planned chain provably holds ZERO recoverable
+# bytes rebuilds through .fenced.N at boot, and deleting the
+# stream/topic/partition removes the refused files and clears the fence, so
+# a recreate of the same ids starts clean. One refusal is not durable: a
+# length divergence found when a writer reopens a file recovery just
+# truncated clears on the next boot, so that tombstone lasts only for the
+# life of the process.
+#
+# .fenced.N has a second producer, on a partition that recovers FINE: a tail
+# segment holding bytes that decode to nothing anywhere is moved there and
+# the segment recovered empty, so the partition serves without those bytes.
+# One fresh directory per such segment, so .fenced.0, .fenced.1, ... can
+# accumulate under a healthy partition. .fenced.N alone therefore does not
+# mean a partition was refused -- grep the boot log for "refusing the
+# recovered segment chain", which names the directory and the reason.
+#
+# The metadata WAL truncates genuinely torn tails too; interior WAL damage
+# or oversized trailing bytes refuse boot instead.
 
 # Memory pool configuration
 [system.memory_pool]
