@@ -41,15 +41,23 @@ pub use consumer_group_client_state::ConsumerGroupClientState;
 /// a genuine end-of-partition empty poll, which echoes the real partition id.
 pub const RESYNC_REQUIRED_PARTITION_SENTINEL: u32 = u32::MAX;
 
-/// Frozen ceiling on `message_bus.max_message_size`, the knob that caps a
-/// single framed wire message and with it the widest batch record any
-/// admission path can persist. Frozen rather than knob-derived because
+/// Frozen ceiling on the widest batch record any admission path can persist.
+/// Two knobs bound admission and both are validated against this at boot:
+/// `message_bus.max_message_size` caps every bus-framed wire message, and
+/// `http.max_request_size` caps the one path that is NOT bus-framed (the
+/// HTTP produce handler builds its bus message in-process, so the request
+/// body is what bounds its record). Frozen rather than knob-derived because
 /// boot-time segment recovery sizes fixed scan and allocation limits from the
-/// widest LEGAL record: a limit read from the live knob would change meaning
-/// between boots and refuse partitions written under an older value. Config
-/// validation rejects a knob above this at boot; raising it is a
-/// compatibility decision, not a tuning change, since segments written under
-/// a larger value would exceed what recovery on an older build accepts.
+/// widest LEGAL record: a limit read from a live knob would change meaning
+/// between boots and refuse partitions written under an older value.
+///
+/// Raising it is a compatibility decision, not a tuning change: segments
+/// written under a larger value would exceed what recovery on an older build
+/// accepts. The same applies to data from any build that admitted wider
+/// records -- a deployment holding them cannot upgrade in place, because
+/// recovery treats a record above the ceiling as implausible (truncating or
+/// refusing the segment); such data must be drained and re-produced below
+/// the ceiling first.
 pub const MAX_MESSAGE_SIZE_UPPER_BYTES: u64 = 256 * 1024 * 1024;
 pub use http::consumer_groups::*;
 pub use http::consumer_offsets::*;

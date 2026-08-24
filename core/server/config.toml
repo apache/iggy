@@ -48,6 +48,12 @@ enabled = true
 address = "127.0.0.1:3000"
 
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
+# HTTP produce requests are not framed by the message bus, so this body cap is
+# what bounds the widest batch record the HTTP path can persist. Boot refuses a
+# value above the frozen 256 MiB recovery ceiling (see
+# message_bus.max_message_size), and a body above message_bus.max_message_size
+# can still admit a batch that no peer accepts a replication frame for -- keep
+# this at or below that cap unless replica_count = 1.
 max_request_size = "2 MB"
 
 # Enables the embedded Web UI dashboard at '/ui'.
@@ -940,10 +946,11 @@ transfer_served_cache_bytes_max = "2176 MiB"
 #
 # The shipped value sits EXACTLY at that floor: 1024 MiB + the shipped 64 MiB
 # max_message_size. Raising max_message_size alone therefore refuses boot --
-# raise this one by the same amount in the same edit. Raising it above the floor
-# for headroom also DIVIDES the serving concurrency derived from
-# transfer_served_cache_bytes_max above, so raise that in step. Must be > 0 and
-# <= "64 GiB".
+# raise this one by the same amount in the same edit (max_message_size itself
+# tops out at the frozen 256 MiB recovery ceiling; see its own note). Raising
+# this above the floor for headroom also DIVIDES the serving concurrency
+# derived from transfer_served_cache_bytes_max above, so raise that in step.
+# Must be > 0 and <= "64 GiB".
 transfer_artifact_bytes_max = "1088 MiB"
 
 # Message bus configuration.
@@ -958,7 +965,11 @@ transfer_artifact_bytes_max = "1088 MiB"
 # call. Hard upper bound: IOV_MAX/2 = 512 on Linux.
 max_batch = 256
 
-# Wire-level cap on a single framed message.
+# Wire-level cap on a single framed message. Boot refuses a value above the
+# frozen 256 MiB ceiling: segment recovery derives fixed scan and allocation
+# limits from the widest LEGAL record, so batches admitted above the ceiling
+# would be refused as implausible on a later boot. Raising it past 64 MiB
+# also breaks Go clients, whose frame cap is a hard 64 MiB constant.
 max_message_size = "64 MiB"
 
 # Bound on the per-peer mpsc queue. The writer task drains; the
