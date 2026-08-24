@@ -260,7 +260,6 @@ async fn restart_source(
             context.config_provider.as_ref(),
             &context.iggy_clients.producer,
             &context.metrics,
-            &context.state_path,
             &context,
         )
         .await?;
