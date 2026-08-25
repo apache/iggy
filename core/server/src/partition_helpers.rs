@@ -353,8 +353,9 @@ pub async fn ensure_initial_segment(
             );
             source
         })?;
-    // Share the storage's size counters so reads observe persisted bytes;
-    // a writer with a private counter grows the file invisibly to readers.
+    // Share the storage's size counters: they are the write cursors. A private
+    // counter would let the append position diverge from the segment
+    // bookkeeping that index entries and poll bounds rely on.
     let messages_size_counter = storage
         .messages_writer
         .as_ref()

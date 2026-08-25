@@ -2172,6 +2172,20 @@ func (e InvalidReservedField) Is(target error) bool {
 	return ok
 }
 
+type SegmentSizeMismatchAtOpen struct {
+	OnDisk   uint64
+	Expected uint64
+}
+
+func (e SegmentSizeMismatchAtOpen) Error() string {
+	return fmt.Sprintf("segment file size on disk: %d does not match expected size: %d", e.OnDisk, e.Expected)
+}
+func (e SegmentSizeMismatchAtOpen) Code() Code { return 4102 }
+func (e SegmentSizeMismatchAtOpen) Is(target error) bool {
+	_, ok := target.(SegmentSizeMismatchAtOpen)
+	return ok
+}
+
 type ConsumerGroupIdNotFound struct {
 	GroupId uint32
 	TopicId uint32
@@ -2824,6 +2838,7 @@ var (
 	ErrProducerClosed                             = ProducerClosed{}
 	ErrInvalidOffset                              = InvalidOffset{}
 	ErrInvalidReservedField                       = InvalidReservedField{}
+	ErrSegmentSizeMismatchAtOpen                  = SegmentSizeMismatchAtOpen{}
 	ErrConsumerGroupIdNotFound                    = ConsumerGroupIdNotFound{}
 	ErrInvalidConsumerGroupId                     = InvalidConsumerGroupId{}
 	ErrConsumerGroupNameNotFound                  = ConsumerGroupNameNotFound{}
@@ -3066,6 +3081,7 @@ const (
 	ProducerClosedCode                             Code = 4057
 	InvalidOffsetCode                              Code = 4100
 	InvalidReservedFieldCode                       Code = 4101
+	SegmentSizeMismatchAtOpenCode                  Code = 4102
 	ConsumerGroupIdNotFoundCode                    Code = 5000
 	InvalidConsumerGroupIdCode                     Code = 5002
 	ConsumerGroupNameNotFoundCode                  Code = 5003
@@ -3501,6 +3517,8 @@ func (c Code) String() string {
 		return "InvalidOffset"
 	case InvalidReservedFieldCode:
 		return "InvalidReservedField"
+	case SegmentSizeMismatchAtOpenCode:
+		return "SegmentSizeMismatchAtOpen"
 	case ConsumerGroupIdNotFoundCode:
 		return "ConsumerGroupIdNotFound"
 	case InvalidConsumerGroupIdCode:
@@ -3982,6 +4000,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidOffset
 	case InvalidReservedFieldCode:
 		return ErrInvalidReservedField
+	case SegmentSizeMismatchAtOpenCode:
+		return ErrSegmentSizeMismatchAtOpen
 	case ConsumerGroupIdNotFoundCode:
 		return ErrConsumerGroupIdNotFound
 	case InvalidConsumerGroupIdCode:

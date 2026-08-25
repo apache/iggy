@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { xxh3 } from "@node-rs/xxhash";
 import { u128LEBufToBigint } from "../number.utils.js";
