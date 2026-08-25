@@ -35,7 +35,7 @@ ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
 RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static nodejs npm && \
-    cargo install cargo-zigbuild --version '=0.22.1' --locked
+    cargo install cargo-zigbuild --version '=0.23.2' --locked
 
 COPY rust-toolchain.toml rust-toolchain.toml
 
