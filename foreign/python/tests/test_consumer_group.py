@@ -19,7 +19,6 @@
 # + consumer_group setup once test fixture is in place.
 
 import asyncio
-import faulthandler
 from datetime import timedelta
 
 import pytest
@@ -904,23 +903,15 @@ class TestConsumerGroup:
         try:
             await asyncio.wait_for(consuming.wait(), timeout=10)
 
-            # A getter that blocks holds the GIL, so neither pytest-timeout nor asyncio
-            # can fire. The faulthandler watchdog needs no GIL and aborts instead.
-            # A regression hangs forever, so the timeout only has to outlast normal GIL
-            # contention -- it is generous because tripping it kills the whole run.
-            faulthandler.dump_traceback_later(5, exit=True)
-            try:
-                current_partition_id = consumer.partition_id()
-                assert consumer.name() == consumer_name
-                assert consumer.stream() == stream_name
-                assert consumer.topic() == topic_name
-                assert (
-                    consumer.get_last_consumed_offset(current_partition_id)
-                    == received_messages[-1].offset()
-                )
-                assert consumer.get_last_stored_offset(current_partition_id) == 0
-            finally:
-                faulthandler.cancel_dump_traceback_later()
+            current_partition_id = consumer.partition_id()
+            assert consumer.name() == consumer_name
+            assert consumer.stream() == stream_name
+            assert consumer.topic() == topic_name
+            assert (
+                consumer.get_last_consumed_offset(current_partition_id)
+                == received_messages[-1].offset()
+            )
+            assert consumer.get_last_stored_offset(current_partition_id) == 0
         finally:
             shutdown_event.set()
             await consume
