@@ -118,7 +118,7 @@ pub struct TemplateSinkConfig {
     pub timeout: Option<String>,
     pub max_retries: Option<u32>,
     pub retry_delay: Option<String>,
-    pub retry_max_delay: Option<String>,
+    pub max_retry_delay: Option<String>,
     pub max_open_retries: Option<u32>,
     pub open_retry_max_delay: Option<String>,
     pub circuit_breaker_threshold: Option<u32>,
