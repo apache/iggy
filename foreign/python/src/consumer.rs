@@ -171,36 +171,32 @@ impl IggyConsumer {
                     let mut inner = inner.lock().await;
                     Ok(inner.consume_messages(&consumer, shutdown_rx).await)
                 }));
-            let consume_result;
+            let handle_shutdown = shutdown_event
+                .map(|shutdown_event| -> PyResult<JoinHandle<PyResult<()>>> {
+                    let task_locals =
+                        Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
+                    Ok(get_runtime().spawn(scope(
+                        task_locals,
+                        wait_for_shutdown(shutdown_event, shutdown_tx),
+                    )))
+                })
+                .transpose()?;
 
-            if let Some(shutdown_event) = shutdown_event {
-                let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
-                async fn shutdown_impl(
-                    shutdown_event: Py<PyAny>,
-                    shutdown_tx: Sender<()>,
-                ) -> PyResult<()> {
-                    Python::attach(|py| {
-                        into_future(shutdown_event.bind(py).as_any().call_method0("wait")?)
-                    })?
-                    .await?;
-                    shutdown_tx.send(()).map_err(|_| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            "Failed to signal shutdown",
-                        )
-                    })?;
-                    Ok(())
+            let consume_result = handle_consume.await;
+
+            if let Some(handle_shutdown) = handle_shutdown {
+                // Consuming can also end on its own, and the shutdown task would then park on
+                // `Event.wait()` forever.
+                handle_shutdown.abort();
+                match handle_shutdown.await {
+                    Ok(shutdown_result) => shutdown_result?,
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            error.to_string(),
+                        ));
+                    }
                 }
-                let handle_shutdown: JoinHandle<Result<(), PyErr>> = get_runtime().spawn(scope(
-                    task_locals,
-                    shutdown_impl(shutdown_event, shutdown_tx),
-                ));
-                let shutdown_result;
-                (consume_result, shutdown_result) = tokio::join!(handle_consume, handle_shutdown);
-                shutdown_result.map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                })??;
-            } else {
-                consume_result = handle_consume.await;
             }
 
             consume_result
@@ -209,6 +205,15 @@ impl IggyConsumer {
             Ok(())
         })
     }
+}
+
+async fn wait_for_shutdown(shutdown_event: Py<PyAny>, shutdown_tx: Sender<()>) -> PyResult<()> {
+    Python::attach(|py| into_future(shutdown_event.bind(py).as_any().call_method0("wait")?))?
+        .await?;
+    // A closed receiver only means consuming has already stopped, so there is nothing left
+    // to signal and the result of the run is the one worth reporting.
+    let _ = shutdown_tx.send(());
+    Ok(())
 }
 
 /// The consumer polling the messages. It selects both the consumer kind and the
@@ -403,8 +408,7 @@ struct PyCallbackConsumer {
 impl MessageConsumer for PyCallbackConsumer {
     async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
         let callback = self.callback.clone();
-        let task_locals = self.task_locals.clone().lock_owned().await;
-        let task_locals = task_locals.clone();
+        let task_locals = self.task_locals.lock().await.clone();
         let message = ReceiveMessage {
             inner: received.message,
             partition_id: received.partition_id,
