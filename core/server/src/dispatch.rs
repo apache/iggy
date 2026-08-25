@@ -3106,7 +3106,7 @@ where
     // dropped channel, where nothing came back to classify.
     rx.recv()
         .await
-        .map_or(Err(MetadataSubmitError::Canceled), |outcome| outcome)
+        .unwrap_or(Err(MetadataSubmitError::Canceled))
 }
 
 /// Logout counterpart of [`submit_register_on_owner`].
@@ -3136,7 +3136,7 @@ where
     });
     rx.recv()
         .await
-        .map_or(Err(MetadataSubmitError::Canceled), |outcome| outcome)
+        .unwrap_or(Err(MetadataSubmitError::Canceled))
 }
 
 /// Handle a client `DeleteSegments`: resolve the requested count to an offset
