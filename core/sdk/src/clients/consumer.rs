@@ -978,6 +978,10 @@ impl Stream for IggyConsumer {
     type Item = Result<ReceivedMessage, IggyError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.shutdown.load(ORDERING) {
+            return Poll::Ready(None);
+        }
+
         let partition_id = self.current_partition_id.load(ORDERING);
         if let Some(message) = self.buffered_messages.pop_front() {
             {
@@ -1237,5 +1241,99 @@ impl Drop for IggyConsumer {
             "Consumer {} has been dropped, shutdown signal sent",
             self.consumer_name
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tcp::tcp_client::TcpClient;
+    use std::str::FromStr;
+    use std::task::Waker;
+
+    #[tokio::test]
+    async fn standalone_consumer_should_stop_yielding_messages_after_shutdown() {
+        let id = Identifier::numeric(1).unwrap();
+        let mut consumer = IggyConsumer::new(
+            IggyRwLock::new(ClientWrapper::Tcp(TcpClient::default())),
+            "consumer".to_owned(),
+            Consumer::new(id.clone()),
+            id.clone(),
+            id,
+            Some(1),
+            None,
+            PollingStrategy::next(),
+            1,
+            AutoCommit::Disabled,
+            false,
+            false,
+            None,
+            IggyDuration::ONE_SECOND,
+            None,
+            IggyDuration::ONE_SECOND,
+            false,
+            IggyDuration::ONE_SECOND,
+        );
+        consumer.buffered_messages.extend([
+            IggyMessage::from_str("a").unwrap(),
+            IggyMessage::from_str("b").unwrap(),
+        ]);
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            Pin::new(&mut consumer).poll_next(&mut context),
+            Poll::Ready(Some(Ok(_)))
+        ));
+
+        consumer.shutdown().await.unwrap();
+
+        assert_eq!(consumer.buffered_messages.len(), 1);
+        assert!(matches!(
+            Pin::new(&mut consumer).poll_next(&mut context),
+            Poll::Ready(None)
+        ));
+    }
+
+    // Same as above but for a consumer group.
+    #[tokio::test]
+    async fn consumer_group_should_stop_yielding_messages_after_shutdown() {
+        let id = Identifier::numeric(1).unwrap();
+        let mut consumer = IggyConsumer::new(
+            IggyRwLock::new(ClientWrapper::Tcp(TcpClient::default())),
+            "consumer".to_owned(),
+            Consumer::group(id.clone()),
+            id.clone(),
+            id,
+            Some(1),
+            None,
+            PollingStrategy::next(),
+            1,
+            AutoCommit::Disabled,
+            false,
+            false,
+            None,
+            IggyDuration::ONE_SECOND,
+            None,
+            IggyDuration::ONE_SECOND,
+            false,
+            IggyDuration::ONE_SECOND,
+        );
+        consumer.buffered_messages.extend([
+            IggyMessage::from_str("a").unwrap(),
+            IggyMessage::from_str("b").unwrap(),
+        ]);
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            Pin::new(&mut consumer).poll_next(&mut context),
+            Poll::Ready(Some(Ok(_)))
+        ));
+
+        consumer.shutdown().await.unwrap();
+
+        assert!(matches!(
+            Pin::new(&mut consumer).poll_next(&mut context),
+            Poll::Ready(None)
+        ));
     }
 }
