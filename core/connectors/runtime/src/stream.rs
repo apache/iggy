@@ -24,6 +24,15 @@ use crate::error::RuntimeError;
 
 const TOKEN_FILE_PREFIX: &str = "file:";
 
+fn append_query_parameters(connection_string: &str, parameters: &str) -> String {
+    let separator = if connection_string.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    format!("{connection_string}{separator}{parameters}")
+}
+
 fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -127,7 +136,10 @@ async fn create_client(
             .filter(|domain| !domain.is_empty())
             .map(|domain| format!("&tls_domain={domain}"))
             .unwrap_or_default();
-        format!("{connection_string}?tls=true&tls_ca_file={ca_file}{domain}")
+        append_query_parameters(
+            &connection_string,
+            &format!("tls=true&tls_ca_file={ca_file}{domain}"),
+        )
     } else {
         connection_string
     };
@@ -179,6 +191,27 @@ mod tests {
         let path = "relative/path";
         let result = expand_home(path);
         assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn given_existing_query_when_appending_parameters_should_use_ampersand() {
+        let connection_string = "iggy://user:password@127.0.0.1:8090?reconnection_retries=0";
+
+        let result = append_query_parameters(connection_string, "tls=true");
+
+        assert_eq!(
+            result,
+            "iggy://user:password@127.0.0.1:8090?reconnection_retries=0&tls=true"
+        );
+    }
+
+    #[test]
+    fn given_no_query_when_appending_parameters_should_use_question_mark() {
+        let connection_string = "iggy://user:password@127.0.0.1:8090";
+
+        let result = append_query_parameters(connection_string, "tls=true");
+
+        assert_eq!(result, "iggy://user:password@127.0.0.1:8090?tls=true");
     }
 
     #[test]

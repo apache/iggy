@@ -123,11 +123,10 @@ struct PendingBatch {
 enum PendingOperation {
     ProcessRows {
         table: String,
-        primary_key_column: String,
         ids: Vec<String>,
+        max_offset: String,
     },
     AdvanceReplicationSlot {
-        slot_name: String,
         lsn: String,
     },
 }
@@ -259,10 +258,7 @@ impl Source for PostgresSource {
             }
         };
 
-        let processed_rows = match polled.pending.as_ref() {
-            Some(pending) => pending.state.processed_rows,
-            None => self.state.lock().await.processed_rows,
-        };
+        let processed_rows = self.state.lock().await.processed_rows;
         if self.verbose {
             info!(
                 "PostgreSQL source connector ID: {} produced {} messages. Total processed: {}",
@@ -305,8 +301,9 @@ impl Source for PostgresSource {
 
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
         let pending = self.pending_batch.lock().await.take();
-        if result == SourceBatchResult::Nack {
-            return Ok(());
+        match result {
+            SourceBatchResult::Ack => {}
+            SourceBatchResult::Nack => return Ok(()),
         }
 
         let Some(pending) = pending else {
@@ -317,19 +314,14 @@ impl Source for PostgresSource {
             match operation {
                 PendingOperation::ProcessRows {
                     table,
-                    primary_key_column,
                     ids,
+                    max_offset,
                 } => {
-                    self.mark_or_delete_processed_rows(
-                        self.get_pool()?,
-                        &table,
-                        &primary_key_column,
-                        &ids,
-                    )
-                    .await?;
+                    self.mark_or_delete_processed_rows(self.get_pool()?, &table, &ids, &max_offset)
+                        .await?;
                 }
-                PendingOperation::AdvanceReplicationSlot { slot_name, lsn } => {
-                    self.advance_replication_slot(&slot_name, &lsn).await?;
+                PendingOperation::AdvanceReplicationSlot { lsn } => {
+                    self.advance_replication_slot(&lsn).await?;
                 }
             }
         }
@@ -423,11 +415,7 @@ impl PostgresSource {
             }
         }
 
-        let slot_name = self
-            .config
-            .replication_slot
-            .as_deref()
-            .unwrap_or("iggy_slot");
+        let slot_name = self.replication_slot();
 
         let existing_plugin: Option<String> =
             sqlx::query_scalar("SELECT plugin FROM pg_replication_slots WHERE slot_name = $1")
@@ -478,11 +466,7 @@ impl PostgresSource {
     async fn poll_cdc_builtin(&self) -> Result<PolledBatch, Error> {
         let pool = self.get_pool()?;
 
-        let slot_name = self
-            .config
-            .replication_slot
-            .as_deref()
-            .unwrap_or("iggy_slot");
+        let slot_name = self.replication_slot();
         let capture_ops = self
             .config
             .capture_operations
@@ -499,7 +483,7 @@ impl PostgresSource {
         // stops the backlog from growing unbounded across many transactions
         // the way NULL (no limit at all) did.
         let rows = sqlx::query(
-            "SELECT lsn::text AS lsn, xid, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
+            "SELECT lsn::text AS lsn, data FROM pg_logical_slot_peek_changes($1, NULL, $2)",
         )
         .bind(slot_name)
         .bind(batch_size)
@@ -556,10 +540,7 @@ impl PostgresSource {
             state.last_poll_time = Utc::now();
             Some(PendingBatch {
                 state,
-                operations: vec![PendingOperation::AdvanceReplicationSlot {
-                    slot_name: slot_name.to_string(),
-                    lsn,
-                }],
+                operations: vec![PendingOperation::AdvanceReplicationSlot { lsn }],
             })
         } else {
             None
@@ -575,12 +556,8 @@ impl PostgresSource {
         let mut candidate_state = self.state.lock().await.clone();
 
         let batch_size = self.config.batch_size.unwrap_or(1000);
-        let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
-        let pk_column = self
-            .config
-            .primary_key_column
-            .as_deref()
-            .unwrap_or(tracking_column);
+        let tracking_column = self.tracking_column();
+        let pk_column = self.primary_key_column();
 
         let row_config = RowProcessingConfig {
             table: "",
@@ -592,8 +569,6 @@ impl PostgresSource {
             include_metadata: self.config.include_metadata.unwrap_or(true),
         };
 
-        // Collect state updates to apply after processing
-        let mut state_updates: Vec<(String, String)> = Vec::new();
         let mut total_processed: u64 = 0;
 
         for table in &self.config.tables {
@@ -617,10 +592,14 @@ impl PostgresSource {
                 self.get_max_retries(),
                 self.retry_delay.as_millis() as u64,
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                Error::Connection(format!("failed to poll PostgreSQL table '{table}': {e}"))
+            })?;
 
             let mut max_offset: Option<String> = None;
             let mut processed_ids: Vec<String> = Vec::new();
+            let mut table_processed = 0;
 
             for row in rows {
                 let processed = self.process_row(&row, &table_config)?;
@@ -634,33 +613,37 @@ impl PostgresSource {
 
                 messages.push(processed.message);
                 total_processed += 1;
+                table_processed += 1;
             }
 
-            if !processed_ids.is_empty() {
+            if self.should_process_rows() && !processed_ids.is_empty() {
+                let max_offset = max_offset.clone().ok_or_else(|| {
+                    Error::InvalidRecordValue(format!(
+                        "tracking column '{tracking_column}' is missing from rows read from '{table}'"
+                    ))
+                })?;
                 operations.push(PendingOperation::ProcessRows {
                     table: table.clone(),
-                    primary_key_column: pk_column.to_string(),
                     ids: processed_ids,
+                    max_offset,
                 });
             }
 
-            // Collect offset update for later
             if let Some(offset) = max_offset {
-                state_updates.push((table.clone(), offset));
+                candidate_state
+                    .tracking_offsets
+                    .insert(table.clone(), offset);
             }
 
             if self.verbose {
-                info!("Fetched {} rows from table '{table}'", messages.len());
+                info!("Fetched {table_processed} rows from table '{table}'");
             } else {
-                debug!("Fetched {} rows from table '{table}'", messages.len());
+                debug!("Fetched {table_processed} rows from table '{table}'");
             }
         }
 
         let pending = if total_processed > 0 {
             candidate_state.processed_rows += total_processed;
-            for (table, offset) in state_updates {
-                candidate_state.tracking_offsets.insert(table, offset);
-            }
             candidate_state.last_poll_time = Utc::now();
             Some(PendingBatch {
                 state: candidate_state,
@@ -673,18 +656,26 @@ impl PostgresSource {
         Ok(PolledBatch { messages, pending })
     }
 
-    async fn advance_replication_slot(&self, slot_name: &str, lsn: &str) -> Result<(), Error> {
-        sqlx::query("SELECT pg_replication_slot_advance($1, $2::pg_lsn)")
-            .bind(slot_name)
-            .bind(lsn)
-            .execute(self.get_pool()?)
-            .await
-            .map_err(|e| {
-                error!("Failed to advance replication slot '{slot_name}' to {lsn}: {e}");
-                Error::Connection(format!(
-                    "failed to advance replication slot '{slot_name}' to {lsn}: {e}"
-                ))
-            })?;
+    async fn advance_replication_slot(&self, lsn: &str) -> Result<(), Error> {
+        let slot_name = self.replication_slot();
+        let pool = self.get_pool()?;
+        with_retry(
+            || {
+                sqlx::query("SELECT pg_replication_slot_advance($1, $2::pg_lsn)")
+                    .bind(slot_name)
+                    .bind(lsn)
+                    .execute(pool)
+            },
+            self.get_max_retries(),
+            self.retry_delay.as_millis() as u64,
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to advance replication slot '{slot_name}' to {lsn}: {e}");
+            Error::Connection(format!(
+                "failed to advance replication slot '{slot_name}' to {lsn}: {e}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -692,15 +683,17 @@ impl PostgresSource {
         &self,
         pool: &Pool<Postgres>,
         table: &str,
-        pk_column: &str,
         ids: &[String],
+        max_offset: &str,
     ) -> Result<(), Error> {
         if ids.is_empty() {
             return Ok(());
         }
 
         let quoted_table = quote_qualified_identifier(table)?;
-        let quoted_pk = quote_identifier(pk_column)?;
+        let quoted_pk = quote_identifier(self.primary_key_column())?;
+        let quoted_tracking = quote_identifier(self.tracking_column())?;
+        let tracking_boundary = format_offset_value(max_offset);
 
         let ids_list = ids
             .iter()
@@ -715,8 +708,10 @@ impl PostgresSource {
             .join(", ");
 
         if self.config.delete_after_read.unwrap_or(false) {
-            let delete_query =
-                format!("DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({ids_list})");
+            let delete_query = format!(
+                "DELETE FROM {quoted_table} WHERE {quoted_pk} IN ({ids_list}) \
+                 AND {quoted_tracking} <= {tracking_boundary}"
+            );
 
             if self.verbose {
                 info!("Deleting {} processed rows from '{table}'", ids.len());
@@ -724,17 +719,21 @@ impl PostgresSource {
                 debug!("Deleting {} processed rows from '{table}'", ids.len());
             }
 
-            sqlx::query(sqlx::AssertSqlSafe(delete_query))
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to delete processed rows: {e}");
-                    Error::InvalidRecord
-                })?;
+            with_retry(
+                || sqlx::query(sqlx::AssertSqlSafe(delete_query.as_str())).execute(pool),
+                self.get_max_retries(),
+                self.retry_delay.as_millis() as u64,
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to delete processed rows: {e}");
+                Error::Connection(format!("failed to delete processed rows: {e}"))
+            })?;
         } else if let Some(processed_col) = &self.config.processed_column {
             let quoted_processed = quote_identifier(processed_col)?;
             let update_query = format!(
-                "UPDATE {quoted_table} SET {quoted_processed} = TRUE WHERE {quoted_pk} IN ({ids_list})"
+                "UPDATE {quoted_table} SET {quoted_processed} = TRUE \
+                 WHERE {quoted_pk} IN ({ids_list}) AND {quoted_tracking} <= {tracking_boundary}"
             );
 
             if self.verbose {
@@ -743,13 +742,16 @@ impl PostgresSource {
                 debug!("Marking {} rows as processed in '{table}'", ids.len());
             }
 
-            sqlx::query(sqlx::AssertSqlSafe(update_query))
-                .execute(pool)
-                .await
-                .map_err(|e| {
-                    error!("Failed to mark rows as processed: {e}");
-                    Error::InvalidRecord
-                })?;
+            with_retry(
+                || sqlx::query(sqlx::AssertSqlSafe(update_query.as_str())).execute(pool),
+                self.get_max_retries(),
+                self.retry_delay.as_millis() as u64,
+            )
+            .await
+            .map_err(|e| {
+                error!("Failed to mark rows as processed: {e}");
+                Error::Connection(format!("failed to mark rows as processed: {e}"))
+            })?;
         }
 
         Ok(())
@@ -772,6 +774,28 @@ impl PostgresSource {
 
     fn get_max_retries(&self) -> u32 {
         self.config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES)
+    }
+
+    fn should_process_rows(&self) -> bool {
+        self.config.delete_after_read.unwrap_or(false) || self.config.processed_column.is_some()
+    }
+
+    fn tracking_column(&self) -> &str {
+        self.config.tracking_column.as_deref().unwrap_or("id")
+    }
+
+    fn primary_key_column(&self) -> &str {
+        self.config
+            .primary_key_column
+            .as_deref()
+            .unwrap_or_else(|| self.tracking_column())
+    }
+
+    fn replication_slot(&self) -> &str {
+        self.config
+            .replication_slot
+            .as_deref()
+            .unwrap_or("iggy_slot")
     }
 
     fn build_polling_query(
@@ -1752,7 +1776,11 @@ fn parse_bare_scalar(token: &str) -> serde_json::Value {
     }
 }
 
-async fn with_retry<T, F, Fut>(operation: F, max_retries: u32, delay_ms: u64) -> Result<T, Error>
+async fn with_retry<T, F, Fut>(
+    operation: F,
+    max_retries: u32,
+    delay_ms: u64,
+) -> Result<T, sqlx::Error>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T, sqlx::Error>>,
@@ -1765,7 +1793,7 @@ where
                 attempts += 1;
                 if attempts >= max_retries || !is_transient_error(&e) {
                     error!("Database operation failed after {attempts} attempts: {e}");
-                    return Err(Error::InvalidRecord);
+                    return Err(e);
                 }
                 warn!(
                     "Transient database error (attempt {attempts}/{max_retries}): {e}. Retrying in {delay_ms}ms..."
@@ -1809,6 +1837,8 @@ mod cdc_fixtures;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use super::*;
 
     fn test_config() -> PostgresSourceConfig {
@@ -2629,6 +2659,27 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn given_transient_database_errors_when_retrying_should_eventually_succeed() {
+        let attempts = AtomicU32::new(0);
+
+        let result = with_retry(
+            || async {
+                if attempts.fetch_add(1, Ordering::Relaxed) < 2 {
+                    Err(sqlx::Error::PoolTimedOut)
+                } else {
+                    Ok(())
+                }
+            },
+            3,
+            0,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
     #[test]
     fn given_nack_when_batch_is_staged_should_keep_committed_state() {
         let src = PostgresSource::new(1, test_config(), None);
@@ -2644,11 +2695,10 @@ mod tests {
                 operations: vec![
                     PendingOperation::ProcessRows {
                         table: "users".to_string(),
-                        primary_key_column: "id".to_string(),
                         ids: vec!["3".to_string()],
+                        max_offset: "3".to_string(),
                     },
                     PendingOperation::AdvanceReplicationSlot {
-                        slot_name: "iggy_slot".to_string(),
                         lsn: "0/16D32A0".to_string(),
                     },
                 ],

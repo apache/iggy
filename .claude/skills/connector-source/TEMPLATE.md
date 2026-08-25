@@ -16,13 +16,15 @@ helpers below.
 ```rust
 /* Apache 2.0 header */
 
-use async_trait::async_trait;
-use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
-};
-use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::time::Duration;
+
+use async_trait::async_trait;
+use iggy_connector_sdk::{
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
+};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -41,7 +43,7 @@ pub struct MySourceConfig {
     pub verbose_logging: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     cursor: Option<String>,                 // WAL LSN, scroll id, timestamp, ...
     last_offset: u64,
@@ -56,6 +58,7 @@ pub struct MySource {
     verbose: bool,
     client: Option<Client>,
     state: Mutex<State>,
+    pending: Mutex<Option<State>>,
 }
 
 impl MySource {
@@ -88,6 +91,7 @@ impl MySource {
                 last_offset: 0,
                 messages_produced: 0,
             })),
+            pending: Mutex::new(None),
         }
     }
 }
@@ -109,9 +113,9 @@ impl Source for MySource {
     async fn poll(&self) -> Result<ProducedMessages, Error> {
         sleep(self.poll_interval).await;            // sleep first - backpressure
 
-        let cursor = { self.state.lock().await.cursor.clone() };   // brief read
+        let mut candidate = self.state.lock().await.clone();
 
-        let fetched = self.fetch_since(cursor.as_deref()).await?;  // no lock held
+        let fetched = self.fetch_since(candidate.cursor.as_deref()).await?;
 
         let mut messages = Vec::with_capacity(fetched.len());
         let mut next_cursor = None;
@@ -137,20 +141,39 @@ impl Source for MySource {
             );
         }
 
-        let persisted = {                                  // brief write
-            let mut state = self.state.lock().await;
-            state.messages_produced += messages.len() as u64;
-            if let Some(c) = next_cursor {
-                state.cursor = Some(c);
-            }
-            ConnectorState::serialize(&*state, CONNECTOR_NAME, self.id)
-        };
+        if messages.is_empty() {
+            return Ok(ProducedMessages {
+                schema: Schema::Json,
+                messages,
+                state: None,
+            });
+        }
+
+        candidate.messages_produced += messages.len() as u64;
+        candidate.cursor = next_cursor;
+        let persisted = ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id)
+            .ok_or_else(|| Error::Serialization("failed to serialize source state".into()))?;
+        *self.pending.lock().await = Some(candidate);
 
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: persisted,
+            state: Some(persisted),
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let pending = self.pending.lock().await.take();
+        match result {
+            SourceBatchResult::Ack => {
+                let Some(candidate) = pending else {
+                    return Ok(());
+                };
+                *self.state.lock().await = candidate;
+            }
+            SourceBatchResult::Nack => {}
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {

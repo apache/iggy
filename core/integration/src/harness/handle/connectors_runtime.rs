@@ -83,6 +83,10 @@ impl ConnectorsRuntimeHandle {
         self.iggy_connection_options = Some(options.into());
     }
 
+    pub fn clear_iggy_connection_options(&mut self) {
+        self.iggy_connection_options = None;
+    }
+
     fn build_envs(&mut self) {
         let state_path = self.context.connectors_runtime_state_path(self.server_id);
         self.envs.insert(
