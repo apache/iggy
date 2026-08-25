@@ -20,7 +20,7 @@ use crate::stm::StateMachine;
 use crate::stm::authz::GatedApply;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use consensus::{
-    ClientTable, ClientTableDecodeError, VsrState, VsrStateError, build_reply_message,
+    ClientTable, ClientTableDecodeError, SessionEnd, VsrState, VsrStateError, build_reply_message,
     build_reply_message_with,
 };
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
@@ -618,7 +618,11 @@ where
             continue;
         }
         if header.operation == Operation::Logout {
-            client_table.remove_client(header.client);
+            client_table.remove_client(
+                header.client,
+                header.user_id,
+                SessionEnd::from_logout_request(header.request),
+            );
             // Logout's only state-machine effect, mirrored from the live
             // commit path: the caller drops the client from its consumer
             // groups (`remove_consumer_group_member`) so replay and live
@@ -653,7 +657,7 @@ where
             // eviction is replica-local and unlogged, so a WAL can legitimately
             // replay a lower request id onto a preserved watermark. Recovery
             // must boot from such a WAL, not refuse it.
-            let _ = client_table.commit_reply(header.client, cached);
+            let _ = client_table.commit_reply(header.client, header.user_id, cached);
         }
         tracing::debug!(
             target: "iggy.metadata.diag",
@@ -1347,6 +1351,7 @@ mod tests {
         let app = make_client_prepare(2, Operation::CreateStream, CLIENT, USER, 1);
         at_checkpoint.commit_reply(
             CLIENT,
+            USER,
             build_reply_message(app.header(), &bytes::Bytes::new()),
         );
 
