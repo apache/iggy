@@ -926,6 +926,64 @@ class TestConsumerGroup:
             await consume
 
     @pytest.mark.asyncio
+    async def test_consumer_group_manual_commit_while_consuming(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test that offsets can be committed from inside a consumption callback."""
+        consumer_name = unique_name()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        partition_id = 0
+        messages = [f"Manual commit {i} - {unique_name()}" for i in range(2)]
+        received_messages = []
+        stored_offsets = []
+        committed = asyncio.Event()
+        shutdown_event = asyncio.Event()
+
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1,
+        )
+
+        consumer = await iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.First(),
+            10,
+            auto_commit=AutoCommit.Disabled(),
+            poll_interval=timedelta(milliseconds=25),
+        )
+
+        async def take(received: ReceiveMessage) -> None:
+            received_messages.append(received)
+            await consumer.store_offset(received.offset(), None)
+            stored_offsets.append(consumer.get_last_stored_offset(partition_id))
+            if len(received_messages) == len(messages):
+                await consumer.delete_offset(partition_id)
+                committed.set()
+
+        await iggy_client.send_messages(
+            stream_name,
+            topic_name,
+            partition_id,
+            [Message(message) for message in messages],
+        )
+
+        consume = consumer.consume_messages(take, shutdown_event)
+        try:
+            await asyncio.wait_for(committed.wait(), timeout=10)
+            assert stored_offsets == [
+                received.offset() for received in received_messages
+            ]
+        finally:
+            shutdown_event.set()
+            await consume
+
+    @pytest.mark.asyncio
     async def test_get_last_consumed_offset_updates_as_messages_are_consumed(
         self, iggy_client: IggyClient, unique_name
     ):

@@ -93,19 +93,38 @@ pub enum AutoCommitAfter {
 
 /// A cheap, cloneable view of the state shared with an [`IggyConsumer`].
 ///
-/// Consuming borrows the consumer as `&mut` for the whole run, so reading its getters
-/// concurrently means sharing it behind a lock and then waiting on that lock. This view
-/// carries the same shared state and needs neither.
+/// Consuming borrows the consumer as `&mut` for the whole run, so reading its getters or
+/// committing an offset concurrently means sharing it behind a lock and then waiting on
+/// that lock. This view carries the same shared state and needs neither.
 #[derive(Clone)]
 pub struct IggyConsumerState {
+    client: IggyRwLock<ClientWrapper>,
+    consumer: Arc<Consumer>,
+    stream_id: Arc<Identifier>,
+    topic_id: Arc<Identifier>,
+    is_consumer_group: bool,
+    allow_replay: bool,
     current_partition_id: Arc<AtomicU32>,
     last_consumed_offsets: Arc<DashMap<u32, AtomicU64>>,
     last_stored_offsets: Arc<DashMap<u32, AtomicU64>>,
 }
 
 impl IggyConsumerState {
-    fn new() -> Self {
+    fn new(
+        client: IggyRwLock<ClientWrapper>,
+        consumer: Arc<Consumer>,
+        stream_id: Arc<Identifier>,
+        topic_id: Arc<Identifier>,
+        is_consumer_group: bool,
+        allow_replay: bool,
+    ) -> Self {
         Self {
+            client,
+            consumer,
+            stream_id,
+            topic_id,
+            is_consumer_group,
+            allow_replay,
             current_partition_id: Arc::new(AtomicU32::new(0)),
             last_consumed_offsets: Arc::new(DashMap::new()),
             last_stored_offsets: Arc::new(DashMap::new()),
@@ -129,6 +148,85 @@ impl IggyConsumerState {
     pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         let offset = self.last_stored_offsets.get(&partition_id)?;
         Some(offset.load(ORDERING))
+    }
+
+    /// Stores the consumer offset on the server either for the current partition or the provided partition ID.
+    pub async fn store_offset(
+        &self,
+        offset: u64,
+        partition_id: Option<u32>,
+    ) -> Result<(), IggyError> {
+        let partition_id = partition_id.unwrap_or_else(|| self.partition_id());
+        self.store_consumer_offset(partition_id, offset, self.allow_replay)
+            .await
+    }
+
+    /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
+    pub async fn delete_offset(&self, mut partition_id: Option<u32>) -> Result<(), IggyError> {
+        // `None` is only resolved server-side for consumer groups. For a standalone consumer
+        // explicitly assign the current partition_id.
+        if partition_id.is_none() && !self.is_consumer_group {
+            partition_id = Some(self.partition_id());
+        }
+        let client = self.client.read().await;
+        client
+            .delete_consumer_offset(
+                &self.consumer,
+                &self.stream_id,
+                &self.topic_id,
+                partition_id,
+            )
+            .await
+    }
+
+    async fn store_consumer_offset(
+        &self,
+        partition_id: u32,
+        offset: u64,
+        allow_replay: bool,
+    ) -> Result<(), IggyError> {
+        let consumer = &self.consumer;
+        let stream_id = &self.stream_id;
+        let topic_id = &self.topic_id;
+        trace!(
+            "Storing offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}..."
+        );
+        let stored_offset;
+        if let Some(offset_entry) = self.last_stored_offsets.get(&partition_id) {
+            stored_offset = offset_entry.load(ORDERING);
+        } else {
+            stored_offset = 0;
+            self.last_stored_offsets
+                .insert(partition_id, AtomicU64::new(0));
+        }
+
+        if !allow_replay && (offset <= stored_offset && offset >= 1) {
+            trace!(
+                "Offset: {offset} is less than or equal to the last stored offset: {stored_offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. Skipping storing the offset."
+            );
+            return Ok(());
+        }
+
+        let client = self.client.read().await;
+        if let Err(error) = client
+            .store_consumer_offset(consumer, stream_id, topic_id, Some(partition_id), offset)
+            .await
+        {
+            error!(
+                "Failed to store offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. {error}"
+            );
+            return Err(error);
+        }
+        trace!(
+            "Stored offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}."
+        );
+        if let Some(last_offset_entry) = self.last_stored_offsets.get(&partition_id) {
+            last_offset_entry.store(offset, ORDERING);
+        } else {
+            self.last_stored_offsets
+                .insert(partition_id, AtomicU64::new(offset));
+        }
+        Ok(())
     }
 
     /// Snapshots the last consumed offset of every tracked partition. Collecting up front
@@ -212,21 +310,33 @@ impl IggyConsumer {
         offset_drain_timeout: IggyDuration,
     ) -> Self {
         let (store_offset_sender, _) = flume::unbounded();
+        let is_consumer_group = consumer.kind == ConsumerKind::ConsumerGroup;
+        let consumer = Arc::new(consumer);
+        let stream_id = Arc::new(stream_id);
+        let topic_id = Arc::new(topic_id);
+        let state = IggyConsumerState::new(
+            client.clone(),
+            consumer.clone(),
+            stream_id.clone(),
+            topic_id.clone(),
+            is_consumer_group,
+            allow_replay,
+        );
         Self {
             initialized: false,
             shutdown: Arc::new(AtomicBool::new(false)),
-            is_consumer_group: consumer.kind == ConsumerKind::ConsumerGroup,
+            is_consumer_group,
             joined_consumer_group: Arc::new(AtomicBool::new(false)),
             can_poll: Arc::new(AtomicBool::new(true)),
             client,
             consumer_name,
-            consumer: Arc::new(consumer),
-            stream_id: Arc::new(stream_id),
-            topic_id: Arc::new(topic_id),
+            consumer,
+            stream_id,
+            topic_id,
             partition_id,
             polling_strategy,
             poll_interval_micros: polling_interval.map_or(0, |interval| interval.as_micros()),
-            state: IggyConsumerState::new(),
+            state,
             current_offsets: Arc::new(DashMap::new()),
             poll_future: None,
             batch_length,
@@ -305,22 +415,7 @@ impl IggyConsumer {
         offset: u64,
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
-        let partition_id = if let Some(partition_id) = partition_id {
-            partition_id
-        } else {
-            self.state.partition_id()
-        };
-        Self::store_consumer_offset(
-            &self.client,
-            &self.consumer,
-            &self.stream_id,
-            &self.topic_id,
-            partition_id,
-            offset,
-            &self.state.last_stored_offsets,
-            self.allow_replay,
-        )
-        .await
+        self.state.store_offset(offset, partition_id).await
     }
 
     /// Retrieves the last consumed offset for the specified partition ID.
@@ -330,21 +425,8 @@ impl IggyConsumer {
     }
 
     /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
-    pub async fn delete_offset(&self, mut partition_id: Option<u32>) -> Result<(), IggyError> {
-        // `None` is only resolved server-side for consumer groups. For a standalone consumer
-        // explicitly assign the current partition_id.
-        if partition_id.is_none() && !self.is_consumer_group {
-            partition_id = Some(self.state.partition_id());
-        }
-        let client = self.client.read().await;
-        client
-            .delete_consumer_offset(
-                &self.consumer,
-                &self.stream_id,
-                &self.topic_id,
-                partition_id,
-            )
-            .await
+    pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
+        self.state.delete_offset(partition_id).await
     }
 
     /// Retrieves the last stored offset (on the server) for the specified partition ID.
@@ -445,30 +527,19 @@ impl IggyConsumer {
             _ => {}
         }
 
-        let client = self.client.clone();
-        let consumer = self.consumer.clone();
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
-        let last_stored_offsets = self.state.last_stored_offsets.clone();
+        let state = self.state.clone();
         let (store_offset_sender, store_offset_receiver) = flume::unbounded();
         self.store_offset_sender = store_offset_sender;
 
         self.store_offset_task = Some(tokio::spawn(async move {
             while let Ok((partition_id, offset)) = store_offset_receiver.recv_async().await {
                 trace!(
-                    "Received offset to store: {offset}, partition ID: {partition_id}, stream: {stream_id}, topic: {topic_id}"
+                    "Received offset to store: {offset}, partition ID: {partition_id}, stream: {}, topic: {}",
+                    state.stream_id, state.topic_id
                 );
-                _ = Self::store_consumer_offset(
-                    &client,
-                    &consumer,
-                    &stream_id,
-                    &topic_id,
-                    partition_id,
-                    offset,
-                    &last_stored_offsets,
-                    false,
-                )
-                .await
+                _ = state
+                    .store_consumer_offset(partition_id, offset, false)
+                    .await
             }
         }));
 
@@ -480,63 +551,8 @@ impl IggyConsumer {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn store_consumer_offset(
-        client: &IggyRwLock<ClientWrapper>,
-        consumer: &Consumer,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: u32,
-        offset: u64,
-        last_stored_offsets: &DashMap<u32, AtomicU64>,
-        allow_replay: bool,
-    ) -> Result<(), IggyError> {
-        trace!(
-            "Storing offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}..."
-        );
-        let stored_offset;
-        if let Some(offset_entry) = last_stored_offsets.get(&partition_id) {
-            stored_offset = offset_entry.load(ORDERING);
-        } else {
-            stored_offset = 0;
-            last_stored_offsets.insert(partition_id, AtomicU64::new(0));
-        }
-
-        if !allow_replay && (offset <= stored_offset && offset >= 1) {
-            trace!(
-                "Offset: {offset} is less than or equal to the last stored offset: {stored_offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. Skipping storing the offset."
-            );
-            return Ok(());
-        }
-
-        let client = client.read().await;
-        if let Err(error) = client
-            .store_consumer_offset(consumer, stream_id, topic_id, Some(partition_id), offset)
-            .await
-        {
-            error!(
-                "Failed to store offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. {error}"
-            );
-            return Err(error);
-        }
-        trace!(
-            "Stored offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}."
-        );
-        if let Some(last_offset_entry) = last_stored_offsets.get(&partition_id) {
-            last_offset_entry.store(offset, ORDERING);
-        } else {
-            last_stored_offsets.insert(partition_id, AtomicU64::new(offset));
-        }
-        Ok(())
-    }
-
     fn store_offsets_in_background(&self, interval: IggyDuration) -> JoinHandle<()> {
-        let client = self.client.clone();
-        let consumer = self.consumer.clone();
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
         let state = self.state.clone();
-        let last_stored_offsets = self.state.last_stored_offsets.clone();
         let shutdown = self.shutdown.clone();
         let notify = self.background_commit_notify.clone();
         tokio::spawn(async move {
@@ -553,17 +569,9 @@ impl IggyConsumer {
                     break;
                 }
                 for (partition_id, consumed_offset) in state.last_consumed_offsets() {
-                    _ = Self::store_consumer_offset(
-                        &client,
-                        &consumer,
-                        &stream_id,
-                        &topic_id,
-                        partition_id,
-                        consumed_offset,
-                        &last_stored_offsets,
-                        false,
-                    )
-                    .await;
+                    _ = state
+                        .store_consumer_offset(partition_id, consumed_offset, false)
+                        .await;
                 }
             }
         })
@@ -1229,17 +1237,10 @@ impl IggyConsumer {
                     "Flushing final offset: {consumed_offset} for partition: {partition_id}, stream: {}, topic: {}",
                     self.stream_id, self.topic_id
                 );
-                let _ = Self::store_consumer_offset(
-                    &self.client,
-                    &self.consumer,
-                    &self.stream_id,
-                    &self.topic_id,
-                    partition_id,
-                    consumed_offset,
-                    &self.state.last_stored_offsets,
-                    self.allow_replay,
-                )
-                .await;
+                let _ = self
+                    .state
+                    .store_consumer_offset(partition_id, consumed_offset, self.allow_replay)
+                    .await;
             }
         }
 

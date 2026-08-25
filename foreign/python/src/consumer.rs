@@ -44,8 +44,8 @@ use crate::receive_message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
 /// It provides asynchronous functionality through the contained runtime.
-// `inner` stays locked for the whole duration of a consumption run, so the synchronous
-// getters must not touch it.
+// `inner` stays locked for the whole duration of a consumption run, so everything that can
+// be served from `state` or from a snapshot must not touch it.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct IggyConsumer {
@@ -101,11 +101,9 @@ impl IggyConsumer {
         offset: u64,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let inner = self.inner.clone();
+        let state = self.state.clone();
         future_into_py(py, async move {
-            inner
-                .lock()
-                .await
+            state
                 .store_offset(offset, partition_id)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
@@ -121,11 +119,9 @@ impl IggyConsumer {
         py: Python<'a>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let inner = self.inner.clone();
+        let state = self.state.clone();
         future_into_py(py, async move {
-            inner
-                .lock()
-                .await
+            state
                 .delete_offset(partition_id)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
