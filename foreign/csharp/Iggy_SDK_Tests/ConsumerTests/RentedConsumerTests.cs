@@ -22,9 +22,9 @@ using Apache.Iggy.Contracts;
 using Apache.Iggy.Encryption;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
-using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
+using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -377,7 +377,7 @@ public class RentedConsumerTests
                     return rentals.Dequeue();
                 }
 
-                return new PolledMessagesRental(TcpMessageStream.EmptyMemoryOwner.Instance)
+                return new PolledMessagesRental(EmptyMemoryOwner.Instance)
                 {
                     PartitionId = 1,
                     CurrentOffset = 0,
