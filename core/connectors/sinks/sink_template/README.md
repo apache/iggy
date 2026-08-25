@@ -32,7 +32,7 @@ blog post for the checklist this template is built against.
 
 ## What you need to fill in
 
-Search for `TODO(Developer)` in `src/lib.rs` — there is exactly one spot:
+Search for `TODO(ConnectorDeveloper)` in `src/lib.rs` — there is exactly one spot:
 
 **`push_batch()`** — build the request/write that actually sends one chunk
 of messages to your destination, using `self.config.connection_string` (and
@@ -55,7 +55,7 @@ in `open()` in favor of whatever connectivity check your driver offers.
 1. Copy this directory, rename it and the package in `Cargo.toml`
    (`iggy_connector_<yourname>_sink`), and add it to the `members` list in
    the workspace root `Cargo.toml`.
-2. Fill in the `TODO(Developer)` section(s).
+2. Fill in the `TODO(ConnectorDeveloper)` section(s).
 3. Update `config.toml` with your real `connection_string` and `target`, and
    any settings specific to your system; delete `auth_token` if you don't
    need it, or add fields of your own the same way (see
