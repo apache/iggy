@@ -25,7 +25,7 @@
 //! a dropped/nacked batch can be re-polled instead of silently lost.
 //!
 //! There are exactly **two** places you need to touch, each marked
-//! `TODO(Developer)`:
+//! `TODO(ConnectorDeveloper)`:
 //!   1. `TemplateSource::connect()`  — build your actual client/connection
 //!      from `config.connection_string` (and `config.auth_token`, if used).
 //!   2. `TemplateSource::fetch_records()` — fetch up to `batch_size` new
@@ -84,7 +84,7 @@ const DEFAULT_CIRCUIT_BREAKER_COOL_DOWN: &str = "30s";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateSourceConfig {
-    /// TODO(Developer): document the exact shape this connector expects, e.g.
+    /// TODO(ConnectorDeveloper): document the exact shape this connector expects, e.g.
     /// "https://api.example.com" or "postgres://user:pass@host:5432/db".
     /// `SecretString` because DSNs commonly embed credentials — never plain
     /// `String` for this field, see `PostgresSinkConfig::connection_string`
@@ -201,7 +201,7 @@ impl TemplateSource {
         ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
-    /// TODO(Developer): build your actual client/connection here using
+    /// TODO(ConnectorDeveloper): build your actual client/connection here using
     /// `self.config.connection_string` (and `self.config.auth_token`, if
     /// your system needs it). This template builds a plain `reqwest::Client`
     /// to hand to `build_retry_client` — if you're not talking HTTP, replace
@@ -217,7 +217,7 @@ impl TemplateSource {
             .map_err(|e| Error::Connection(format!("failed to build HTTP client: {e}")))
     }
 
-    /// TODO(Developer): fetch up to `self.batch_size` new records from your
+    /// TODO(ConnectorDeveloper): fetch up to `self.batch_size` new records from your
     /// external system, ordered after `cursor` (`None` means "from the
     /// beginning" or "from now" — whichever is right for your source).
     /// Use `self.config.connection_string` as the base address and
@@ -233,7 +233,7 @@ impl TemplateSource {
     ) -> Result<Vec<FetchedRecord>, Error> {
         let _ = (client, cursor); // remove once implemented
         Err(Error::InitError(
-            "TemplateSource::fetch_records is not implemented yet — see the TODO(Developer) comment \
+            "TemplateSource::fetch_records is not implemented yet — see the TODO(ConnectorDeveloper) comment \
              in template_source/src/lib.rs"
                 .to_string(),
         ))

@@ -25,7 +25,7 @@
 //! are chunked by a configurable batch size instead of shipped as one
 //! unbounded request.
 //!
-//! There is exactly **one** place you need to touch, marked `TODO(Developer)`:
+//! There is exactly **one** place you need to touch, marked `TODO(ConnectorDeveloper)`:
 //!   `TemplateSink::push_batch()` — build the request/write that actually
 //!   pushes one chunk of messages to your destination, using
 //!   `self.config.connection_string` (and `self.config.target`, if your
@@ -83,7 +83,7 @@ const DEFAULT_CIRCUIT_BREAKER_COOL_DOWN: &str = "30s";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateSinkConfig {
-    /// TODO(Developer): document the exact shape this connector expects, e.g.
+    /// TODO(ConnectorDeveloper): document the exact shape this connector expects, e.g.
     /// "https://api.example.com" or "postgres://user:pass@host:5432/db".
     /// `SecretString` because DSNs commonly embed credentials — never plain
     /// `String` for this field, see `PostgresSinkConfig::connection_string`
@@ -188,7 +188,7 @@ impl TemplateSink {
         }
     }
 
-    /// TODO(Developer): build your actual client/connection here using
+    /// TODO(ConnectorDeveloper): build your actual client/connection here using
     /// `self.config.connection_string` (and `self.config.auth_token`, if
     /// your destination needs it). This template builds a plain
     /// `reqwest::Client` to hand to `build_retry_client` — if you're not
@@ -205,7 +205,7 @@ impl TemplateSink {
             .map_err(|e| Error::Connection(format!("failed to build HTTP client: {e}")))
     }
 
-    /// TODO(Developer): push one chunk of already-batched messages to your
+    /// TODO(ConnectorDeveloper): push one chunk of already-batched messages to your
     /// destination using `self.config.connection_string` and
     /// `self.config.target`, via `self.client` (already retry-wrapped).
     /// Distinguish permanent failures (bad schema, destination rejects the
@@ -221,7 +221,7 @@ impl TemplateSink {
     ) -> Result<(), Error> {
         let _ = (client, batch); // remove once implemented
         Err(Error::InitError(
-            "TemplateSink::push_batch is not implemented yet — see the TODO(Developer) comment in \
+            "TemplateSink::push_batch is not implemented yet — see the TODO(ConnectorDeveloper) comment in \
              template_sink/src/lib.rs"
                 .to_string(),
         ))

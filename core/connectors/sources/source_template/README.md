@@ -29,7 +29,7 @@ blog post for the checklist this template is built against.
 
 ## What you need to fill in
 
-Search for `TODO(Developer)` in `src/lib.rs` — there are exactly two spots:
+Search for `TODO(ConnectorDeveloper)` in `src/lib.rs` — there are exactly two spots:
 
 1. **`build_raw_client()`** — if your source isn't HTTP, replace the
    `reqwest::Client` construction with your driver's connection/pool setup
@@ -50,7 +50,7 @@ Search for `TODO(Developer)` in `src/lib.rs` — there are exactly two spots:
 1. Copy this directory, rename it and the package in `Cargo.toml`
    (`iggy_connector_<yourname>_source`), and add it to the `members` list in
    the workspace root `Cargo.toml`.
-2. Fill in the two `TODO(Developer)` sections.
+2. Fill in the two `TODO(ConnectorDeveloper)` sections.
 3. Update `config.toml` with your real `connection_string` and any
    settings specific to your system; delete `auth_token` if you don't need
    it, or add fields of your own the same way (see `TemplateSourceConfig`).

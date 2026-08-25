@@ -72,7 +72,7 @@ passing `cargo test`:
   round-trip — plus the two ACK/NACK tests, plus config validation and
   the circuit-breaker short-circuit path).
 
-What's left is marked `TODO(Developer)` in each crate's `src/lib.rs`:
+What's left is marked `TODO(ConnectorDeveloper)` in each crate's `src/lib.rs`:
 one spot for a sink (`push_batch()`), two for a source
 (`build_raw_client()` if you're not talking HTTP, and
 `fetch_records()`). Everything else — the parts that used to eat a
@@ -81,7 +81,7 @@ review round — is already done.
 ## Using one
 
 Copy the crate, rename the package and the directory, add it to the
-workspace `members` list, fill in the `TODO(Developer)` spots, and
+workspace `members` list, fill in the `TODO(ConnectorDeveloper)` spots, and
 update `config.toml` for your system. Each crate's own `README.md`
 walks through the exact steps. Both templates already build, `clippy
 --all-targets -- -D warnings` clean, and pass their tests as committed
