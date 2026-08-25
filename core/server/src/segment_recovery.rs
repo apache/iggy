@@ -1327,7 +1327,7 @@ fn validate_index_entries(
                 );
                 ServerError::from(IggyError::CannotReadFile)
             })?;
-        for entry in window.chunks_exact(SPARSE_INDEX_ENTRY_SIZE) {
+        for entry in window.as_chunks::<SPARSE_INDEX_ENTRY_SIZE>().0 {
             let entry_offset = read_u64_le(entry, 0);
             let entry_position = read_u64_le(entry, 16);
             if let Some((previous_offset, previous_position)) = previous
