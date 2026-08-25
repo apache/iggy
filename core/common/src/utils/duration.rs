@@ -18,6 +18,7 @@
 use humantime::Duration as HumanDuration;
 use humantime::format_duration;
 use serde::de::{Error as DeError, Visitor};
+use serde::ser::Error as SerError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     error::Error,
@@ -197,7 +198,14 @@ impl Serialize for IggyDuration {
     where
         S: Serializer,
     {
-        serializer.serialize_u64(self.as_micros())
+        let micros = self.duration.as_micros();
+        let micros = u64::try_from(micros).map_err(|_| {
+            S::Error::custom(format!(
+                "duration of {micros} microseconds exceeds the {} microseconds the wire format carries",
+                u64::MAX
+            ))
+        })?;
+        serializer.serialize_u64(micros)
     }
 }
 
@@ -344,8 +352,9 @@ impl TryFrom<IggyDuration> for NonZeroIggyDuration {
             return Err(NonZeroDurationError::Zero);
         }
 
-        // Serialization emits whole microseconds, so a shorter duration would come back as zero.
-        if duration.as_micros() == 0 {
+        // Serialization emits whole microseconds, so a shorter duration would come back as
+        // zero. `as_micros` truncates to `u64`, so compare the underlying `Duration` instead.
+        if duration.get_duration() < Duration::from_micros(1) {
             return Err(NonZeroDurationError::SubMicrosecond);
         }
 
@@ -658,5 +667,34 @@ mod tests {
             duration,
             serde_json::from_str::<NonZeroIggyDuration>(&serialized).unwrap()
         );
+    }
+
+    #[test]
+    fn given_the_largest_serializable_duration_should_round_trip_through_serde() {
+        let duration = NonZeroIggyDuration::new(Duration::from_micros(u64::MAX)).unwrap();
+
+        let serialized = serde_json::to_string(&duration).unwrap();
+
+        assert_eq!(u64::MAX.to_string(), serialized);
+        assert_eq!(
+            duration,
+            serde_json::from_str::<NonZeroIggyDuration>(&serialized).unwrap()
+        );
+    }
+
+    #[test]
+    fn given_a_duration_beyond_the_serializable_range_should_build() {
+        let beyond_range = Duration::from_micros(u64::MAX) + Duration::from_micros(1);
+
+        assert!(NonZeroIggyDuration::new(beyond_range).is_ok());
+        assert!(NonZeroIggyDuration::new(beyond_range + Duration::from_micros(1)).is_ok());
+    }
+
+    #[test]
+    fn given_a_duration_beyond_the_serializable_range_should_fail_to_serialize() {
+        let beyond_range = Duration::from_micros(u64::MAX) + Duration::from_micros(1);
+
+        assert!(serde_json::to_string(&IggyDuration::new(beyond_range)).is_err());
+        assert!(serde_json::to_string(&NonZeroIggyDuration::new(beyond_range).unwrap()).is_err());
     }
 }
