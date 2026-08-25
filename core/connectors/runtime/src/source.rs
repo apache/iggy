@@ -24,7 +24,8 @@ use iggy::prelude::{
 };
 use iggy_connector_sdk::encoders::avro::{AvroEncoderConfig, AvroStreamEncoder};
 use iggy_connector_sdk::{
-    ConnectorState, DecodedMessage, ProducedMessages, Schema, StreamEncoder, TopicMetadata,
+    ConnectorState, DecodedMessage, Error as SdkError, ProducedMessages, Schema, StreamEncoder,
+    TopicMetadata,
     source::{BatchResultCallback, HandleCallback, SourceBatchResult},
     transforms::Transform,
 };
@@ -45,7 +46,7 @@ use crate::metrics::SourceLabels;
 use crate::{
     FailedPlugin, PLUGIN_ID, RuntimeError, SourceApi, SourceConnector, SourceConnectorPlugin,
     SourceConnectorProducer, SourceConnectorWrapper, resolve_plugin_path,
-    state::{FileStateProvider, StateProvider, StateStorage},
+    state::{StateStorage, StateStorageFactory},
     transform,
 };
 use iggy_connector_sdk::api::ConnectorStatus;
@@ -76,18 +77,22 @@ pub(crate) fn cleanup_sender(plugin_id: u32) {
 
 /// Initializes all enabled source connectors.
 ///
-/// Per-connector failures (path resolution, dlopen, state load, plugin init,
+/// Per-connector failures (path resolution, dlopen, plugin init,
 /// producer/encoder/transform setup) are captured against the offending
 /// connector and do not abort the runtime. Connectors that fail before their
 /// FFI container can be loaded are returned in the second tuple element so
 /// they remain visible in health/status output.
 ///
-/// Only system-level errors that prevent any connector from running (e.g. a
-/// poisoned global state) are propagated as `Err`.
+/// Only system-level errors that prevent any connector from running are
+/// propagated as `Err`. That includes classified state-store failures
+/// (`TransientState`/`PermanentState`/`StateLatched`) while loading an
+/// enabled source's state: the store is unhealthy, so the process must fail
+/// rather than rewind the source or mint a `FailedPlugin`. Unclassified
+/// state-load failures (the file backend) keep the per-connector path.
 pub async fn init(
     source_configs: HashMap<String, SourceConfig>,
     iggy_client: &IggyClient,
-    state_path: &str,
+    state_factory: &Arc<dyn StateStorageFactory>,
 ) -> Result<(HashMap<String, SourceConnector>, Vec<FailedPlugin>), RuntimeError> {
     let mut source_connectors: HashMap<String, SourceConnector> = HashMap::new();
     let mut failed_plugins: Vec<FailedPlugin> = Vec::new();
@@ -124,25 +129,38 @@ pub async fn init(
             &config.version
         );
 
-        let state_storage = get_state_storage(state_path, &key);
-        let state = match &state_storage {
-            StateStorage::File(file) => match file.load().await {
-                Ok(state) => state,
-                Err(error) => {
-                    let message = format!("Failed to load source state: {error}");
-                    error!("Source: {name} ({key}) - {message}");
-                    failed_plugins.push(FailedPlugin::new(
-                        plugin_id,
-                        &key,
-                        &name,
-                        &config.path,
-                        config.plugin_config_format,
-                        config.enabled,
-                        message,
-                    ));
-                    continue;
-                }
-            },
+        let state_storage = state_factory.storage_for(&key)?;
+        let state = match state_storage.load().await {
+            Ok(state) => state,
+            Err(
+                load_error @ (SdkError::TransientState(_)
+                | SdkError::PermanentState(_)
+                | SdkError::StateLatched),
+            ) => {
+                // A classified failure means the state store is unhealthy,
+                // not the plugin. Treating it as "no state" would silently
+                // rewind the source, and parking it as a failed plugin would
+                // hide an outage the next restart could clear, so abort boot.
+                error!("Source: {name} ({key}) - failed to load state: {load_error}");
+                return Err(RuntimeError::StateLoadFailed {
+                    connector_key: key,
+                    source: load_error,
+                });
+            }
+            Err(error) => {
+                let message = format!("Failed to load source state: {error}");
+                error!("Source: {name} ({key}) - {message}");
+                failed_plugins.push(FailedPlugin::new(
+                    plugin_id,
+                    &key,
+                    &name,
+                    &config.path,
+                    config.plugin_config_format,
+                    config.enabled,
+                    message,
+                ));
+                continue;
+            }
         };
 
         if !source_connectors.contains_key(&path) {
@@ -285,11 +303,6 @@ pub(crate) fn init_source(
     } else {
         Ok(())
     }
-}
-
-pub(crate) fn get_state_storage(state_path: &str, key: &str) -> StateStorage {
-    let path = format!("{state_path}/source_{key}.state");
-    StateStorage::File(FileStateProvider::new(path))
 }
 
 pub(crate) async fn setup_source_producer(
@@ -465,9 +478,14 @@ pub(crate) async fn source_forwarding_loop(
             .observe_stage_with_labels(&labels.stage_prepare, prepare_elapsed);
         let prepared_count = processed.messages.len();
         let processing_errors = decode_errors + processed.error_count;
+        let pending_state_error = state_storage.resolve_pending().await.err();
+        let state_latched = state_storage.is_latched();
+        let state_unavailable = pending_state_error.is_some() || state_latched;
 
         let iggy_send_start = Instant::now();
-        let send_result = if processing_errors == 0 {
+        let send_result = if state_unavailable {
+            Err(IggyError::Error)
+        } else if processing_errors == 0 {
             send_with_failed_tail_retries(processed.messages, plugin_id, |messages| {
                 producer.send(messages)
             })
@@ -489,7 +507,15 @@ pub(crate) async fn source_forwarding_loop(
         let mut state_save_us: Option<u64> = None;
         let mut batch_result = SourceBatchResult::Nack;
         if let Err(error) = send_result {
-            let error_msg = if processing_errors > 0 {
+            let error_msg = if let Some(state_error) = pending_state_error.as_ref() {
+                format!(
+                    "Rejected source batch {batch_id} while resolving a pending checkpoint for source connector with ID: {plugin_id}. {state_error}"
+                )
+            } else if state_latched {
+                format!(
+                    "Rejected source batch {batch_id} because state storage is latched for source connector with ID: {plugin_id}"
+                )
+            } else if processing_errors > 0 {
                 format!(
                     "Rejected source batch {batch_id} after {processing_errors} decode or processing errors for source connector with ID: {plugin_id}"
                 )
@@ -502,7 +528,12 @@ pub(crate) async fn source_forwarding_loop(
             };
             error!("{error_msg}");
             context.metrics.inc_errors_with_labels(&labels.counter);
-            context.sources.set_error(&plugin_key, &error_msg).await;
+            let preserve_original_error =
+                matches!(pending_state_error.as_ref(), Some(SdkError::StateLatched))
+                    || (pending_state_error.is_none() && state_latched);
+            if !preserve_original_error {
+                context.sources.set_error(&plugin_key, &error_msg).await;
+            }
         } else {
             context
                 .metrics
@@ -525,25 +556,24 @@ pub(crate) async fn source_forwarding_loop(
             let mut state_saved = true;
             if let Some(state) = produced_messages.state {
                 let state_save_start = Instant::now();
-                match &state_storage {
-                    StateStorage::File(file) => {
-                        if let Err(error) = file.save(state).await {
-                            state_saved = false;
-                            let error_msg = format!(
-                                "Failed to save state for source connector with ID: {plugin_id}. {error}"
-                            );
-                            error!("{error_msg}");
-                            context.metrics.inc_errors_with_labels(&labels.counter);
-                            context.sources.set_error(&plugin_key, &error_msg).await;
-                        } else {
-                            debug!("State saved for source connector with ID: {plugin_id}");
-                            let state_save_elapsed = state_save_start.elapsed();
-                            context.metrics.observe_stage_with_labels(
-                                &labels.stage_state_save,
-                                state_save_elapsed,
-                            );
-                            state_save_us = Some(benchmark::as_micros(state_save_elapsed));
-                        }
+                match state_storage.save(state).await {
+                    Ok(()) => {
+                        debug!("State saved for source connector with ID: {plugin_id}");
+                        let state_save_elapsed = state_save_start.elapsed();
+                        context.metrics.observe_stage_with_labels(
+                            &labels.stage_state_save,
+                            state_save_elapsed,
+                        );
+                        state_save_us = Some(benchmark::as_micros(state_save_elapsed));
+                    }
+                    Err(error) => {
+                        state_saved = false;
+                        let error_msg = format!(
+                            "Failed to save state for source connector with ID: {plugin_id}. {error}"
+                        );
+                        error!("{error_msg}");
+                        context.metrics.inc_errors_with_labels(&labels.counter);
+                        context.sources.set_error(&plugin_key, &error_msg).await;
                     }
                 }
             } else {

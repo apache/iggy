@@ -50,7 +50,28 @@ ca_file = "core/certs/iggy_ca_cert.pem"
 domain = "" # Optional domain for TLS connection
 
 [state]
-path = "local_state"
+path = "local_state" # Used by storage = "file"
+storage = "file" # "file" | "http"
+
+# HTTP state storage backend, used when storage = "http". Source state is
+# stored at {url}/source_{key} with optimistic concurrency (ETag/If-Match)
+# and idempotent retries (Idempotency-Key).
+[state.http]
+url = "" # Base URL of the state server, no trailing slash. Required for storage = "http".
+load_method = "get" # "get" | "post"
+save_method = "put" # "put" | "post" | "patch"
+timeout = "5s"
+
+# Static headers attached verbatim to every request (e.g. authentication).
+# [state.http.request_headers]
+# authorization = "Bearer ..."
+
+[state.http.retry]
+enabled = true
+max_attempts = 4
+initial_backoff = "200ms"
+max_backoff = "2s"
+backoff_multiplier = 2
 
 [connectors]
 config_type = "local"

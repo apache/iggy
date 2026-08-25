@@ -1057,6 +1057,14 @@
   fields:
     - name: Value
       type: uint64
+- name: SegmentSizeMismatchAtOpen
+  code: 4102
+  format: "segment file size on disk: %d does not match expected size: %d"
+  fields:
+    - name: OnDisk
+      type: uint64
+    - name: Expected
+      type: uint64
 - name: ConsumerGroupIdNotFound
   code: 5000
   format: "consumer group with id: %d for topic with id: %d was not found."
