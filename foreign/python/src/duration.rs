@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::IggyDuration;
+use iggy::prelude::{IggyDuration, NonZeroIggyDuration};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDelta;
@@ -53,13 +53,9 @@ pub fn duration_repr(duration: IggyDuration) -> String {
     }
 }
 
-/// Rejects a zero duration for parameters where zero means an unthrottled loop
-/// rather than "disabled".
-pub fn reject_zero(duration: IggyDuration, parameter: &str) -> PyResult<IggyDuration> {
-    if duration.is_zero() {
-        return Err(PyValueError::new_err(format!(
-            "'{parameter}' must not be zero"
-        )));
-    }
-    Ok(duration)
+/// Converts a duration for parameters that pace a loop, where zero means an
+/// unthrottled loop rather than "disabled".
+pub fn reject_zero(duration: IggyDuration, parameter: &str) -> PyResult<NonZeroIggyDuration> {
+    NonZeroIggyDuration::try_from(duration)
+        .map_err(|_| PyValueError::new_err(format!("'{parameter}' must not be zero")))
 }

@@ -1342,7 +1342,7 @@ async fn maybe_restart(harness: &mut TestHarness, client: &IggyClient, restart_s
 /// credentials in the transport config so the SDK re-authenticates on reconnect.
 fn build_root_client(harness: &TestHarness) -> IggyClient {
     let addr = harness.server().tcp_addr().unwrap();
-    let interval = IggyDuration::from_str("200ms").unwrap();
+    let interval = NonZeroIggyDuration::from_str("200ms").unwrap();
     IggyClient::builder()
         .with_tcp()
         .with_server_address(addr.to_string())
@@ -1352,7 +1352,7 @@ fn build_root_client(harness: &TestHarness) -> IggyClient {
         )))
         .with_reconnection_max_retries(Some(10))
         .with_reconnection_interval(interval)
-        .with_reestablish_after(interval)
+        .with_reestablish_after(interval.get())
         .build()
         .unwrap()
 }

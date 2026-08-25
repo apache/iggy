@@ -47,7 +47,7 @@ pub async fn run_producer(harness: &mut TestHarness) {
         .expect("Failed to create producer builder")
         .create_stream_if_not_exists()
         .create_topic_if_not_exists(1, IggyExpiry::NeverExpire, MaxTopicSize::ServerDefault)
-        .send_retries(Some(10), Some(IggyDuration::from_str("2s").unwrap()))
+        .send_retries(Some(10), Some(NonZeroIggyDuration::from_str("2s").unwrap()))
         .build();
 
     producer
@@ -142,7 +142,7 @@ pub async fn run_consumer(harness: &mut TestHarness) {
         .polling_strategy(PollingStrategy::next())
         .batch_length(10)
         .poll_interval(IggyDuration::from_str("100ms").unwrap())
-        .polling_retry_interval(IggyDuration::from_str("500ms").unwrap())
+        .polling_retry_interval(NonZeroIggyDuration::from_str("500ms").unwrap())
         .build();
 
     consumer

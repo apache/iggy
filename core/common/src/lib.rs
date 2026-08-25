@@ -145,7 +145,7 @@ pub use types::user::user_status::*;
 pub use utils::byte_size::IggyByteSize;
 pub use utils::checksum::*;
 pub use utils::crypto::*;
-pub use utils::duration::{IggyDuration, SEC_IN_MICRO};
+pub use utils::duration::{IggyDuration, NonZeroDurationError, NonZeroIggyDuration, SEC_IN_MICRO};
 pub use utils::expiry::IggyExpiry;
 pub use utils::hash::*;
 pub use utils::net::validate_api_url;
