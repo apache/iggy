@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ClientState, Credentials, DiagnosticEvent, Identifier, IggyDuration, IggyError};
+use crate::{
+    ClientState, Credentials, DiagnosticEvent, Identifier, IggyError, NonZeroIggyDuration,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -28,7 +30,7 @@ pub trait BinaryTransport {
     async fn set_state(&self, state: ClientState);
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
-    fn get_heartbeat_interval(&self) -> IggyDuration;
+    fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve
     /// partitioning client-side under VSR (the broker never picks a

@@ -36,8 +36,8 @@ use iggy_common::TcpClientReconnectionConfig;
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
-    IdKind, Identifier, IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions,
-    TransportProtocol,
+    IdKind, Identifier, IggyDuration, IggyError, IggyTimestamp, NonZeroIggyDuration,
+    TcpConnectionStringOptions, TransportProtocol,
 };
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
@@ -266,7 +266,7 @@ impl BinaryTransport for TcpClient {
         self.send_raw(code, payload).await
     }
 
-    fn get_heartbeat_interval(&self) -> IggyDuration {
+    fn get_heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.config.heartbeat_interval
     }
 
@@ -406,7 +406,7 @@ impl TcpClient {
     pub fn new(
         server_address: &str,
         auto_sign_in: AutoLogin,
-        heartbeat_interval: IggyDuration,
+        heartbeat_interval: NonZeroIggyDuration,
     ) -> Result<Self, IggyError> {
         Self::create(Arc::new(TcpClientConfig {
             heartbeat_interval,
@@ -421,7 +421,7 @@ impl TcpClient {
         server_address: &str,
         domain: &str,
         auto_sign_in: AutoLogin,
-        heartbeat_interval: IggyDuration,
+        heartbeat_interval: NonZeroIggyDuration,
     ) -> Result<Self, IggyError> {
         Self::create(Arc::new(TcpClientConfig {
             heartbeat_interval,
@@ -1447,7 +1447,7 @@ mod tests {
                 // Unlimited retries, so a transient classification never
                 // returns and this test times out instead of failing.
                 max_retries: None,
-                interval: IggyDuration::from_str("100ms").expect("duration"),
+                interval: NonZeroIggyDuration::from_str("100ms").expect("duration"),
                 ..TcpClientReconnectionConfig::default()
             },
             ..TcpClientConfig::default()
@@ -1872,6 +1872,33 @@ mod tests {
     }
 
     #[test]
+    fn should_fail_with_a_zero_heartbeat_interval() {
+        let value = "iggy+tcp://user:secret@127.0.0.1:1234?heartbeat_interval=none";
+
+        let error = TcpClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
+    }
+
+    #[test]
+    fn should_succeed_with_a_zero_reestablish_after() {
+        let value = "iggy+tcp://user:secret@127.0.0.1:1234?reestablish_after=0";
+
+        let client = TcpClient::from_connection_string(value).unwrap();
+
+        assert!(client.config.reconnection.reestablish_after.is_zero());
+    }
+
+    #[test]
+    fn should_fail_with_a_zero_reconnection_interval() {
+        let value = "iggy+tcp://user:secret@127.0.0.1:1234?reconnection_interval=0";
+
+        let error = TcpClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
+    }
+
+    #[test]
     fn should_fail_with_empty_connection_string() {
         let value = "";
         let tcp_client = TcpClient::from_connection_string(value);
@@ -2029,14 +2056,14 @@ mod tests {
         assert!(tcp_client_config.tls_ca_file.is_none());
         assert_eq!(
             tcp_client_config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
 
         assert!(tcp_client_config.reconnection.enabled);
         assert!(tcp_client_config.reconnection.max_retries.is_none());
         assert_eq!(
             tcp_client_config.reconnection.interval,
-            IggyDuration::from_str("1s").unwrap()
+            NonZeroIggyDuration::from_str("1s").unwrap()
         );
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,
@@ -2078,7 +2105,7 @@ mod tests {
         assert!(tcp_client_config.tls_ca_file.is_none());
         assert_eq!(
             tcp_client_config.heartbeat_interval,
-            IggyDuration::from_str(heartbeat_interval).unwrap()
+            NonZeroIggyDuration::from_str(heartbeat_interval).unwrap()
         );
 
         assert!(tcp_client_config.reconnection.enabled);
@@ -2088,7 +2115,7 @@ mod tests {
         );
         assert_eq!(
             tcp_client_config.reconnection.interval,
-            IggyDuration::from_str("1s").unwrap()
+            NonZeroIggyDuration::from_str("1s").unwrap()
         );
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,
@@ -2124,14 +2151,14 @@ mod tests {
         assert!(tcp_client_config.tls_ca_file.is_none());
         assert_eq!(
             tcp_client_config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
 
         assert!(tcp_client_config.reconnection.enabled);
         assert!(tcp_client_config.reconnection.max_retries.is_none());
         assert_eq!(
             tcp_client_config.reconnection.interval,
-            IggyDuration::from_str("1s").unwrap()
+            NonZeroIggyDuration::from_str("1s").unwrap()
         );
         assert_eq!(
             tcp_client_config.reconnection.reestablish_after,
