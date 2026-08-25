@@ -629,7 +629,7 @@ impl PrepareJournal {
     }
 
     /// How many entries the opening scan replayed unverified
-    /// ([`CHECKSUM_BODY_UNSEALED`]). `0` once every producer seals; the boot path
+    /// (`CHECKSUM_BODY_UNSEALED`). `0` once every producer seals; the boot path
     /// warns while it is not, so the fail-open stretch is visible to an operator.
     pub const fn unsealed_entry_count(&self) -> u64 {
         self.unsealed_entries

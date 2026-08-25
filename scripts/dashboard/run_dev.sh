@@ -16,7 +16,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
 # Exit on any error
 set -euo pipefail
 

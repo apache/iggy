@@ -84,7 +84,7 @@ pub struct MergedLog {
     /// The new primary installs these over its own log.
     pub headers: Vec<PrepareHeader>,
     /// Headers non-canonical senders report committed and the canonical chain
-    /// corroborates. See [`committed_elsewhere`].
+    /// corroborates. See `committed_elsewhere`.
     pub committed_elsewhere: Vec<PrepareHeader>,
 }
 

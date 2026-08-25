@@ -38,6 +38,7 @@ internal sealed class ConsensusSession
     private readonly object _gate = new();
 #endif
     private UInt128 _clientId;
+    private ulong _generation;
     private bool _registerPending;
     private ulong _requestCounter;
     private ulong? _session;
@@ -85,6 +86,23 @@ internal sealed class ConsensusSession
             lock (_gate)
             {
                 return _session.HasValue;
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Generation of the identity, bumped on every re-arm. Anything scoped to a server session - a
+    ///     consumer-group membership, say - compares the generation it was established under to detect that the
+    ///     session it lived on is gone, without inferring it from connection-state edges. Distinct from the
+    ///     fence epoch the wire protocol carries in <see cref="Session" />.
+    /// </summary>
+    internal ulong Generation
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _generation;
             }
         }
     }
@@ -205,6 +223,7 @@ internal sealed class ConsensusSession
         _session = null;
         _requestCounter = 1;
         _registerPending = false;
+        _generation++;
     }
 
     private static UInt128 GenerateClientId()

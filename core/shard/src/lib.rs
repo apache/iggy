@@ -1719,7 +1719,7 @@ where
     /// channel path -- and collects their replies.
     ///
     /// Bounded: a shard that doesn't reply within
-    /// [`LIST_CLIENTS_GATHER_TIMEOUT`] is skipped and the partial result is
+    /// `LIST_CLIENTS_GATHER_TIMEOUT` is skipped and the partial result is
     /// logged, so one wedged shard cannot hang the read. Callers should
     /// treat the result as best-effort-complete.
     #[allow(clippy::future_not_send)]
@@ -1786,7 +1786,7 @@ where
     /// Routes a [`LifecycleFrame::PartitionRead`] through the shards table
     /// (self-sends included, so a locally-owned partition takes the same
     /// path). `None` = unroutable namespace, full owning-shard inbox,
-    /// dropped reply sender, or [`PARTITION_READ_TIMEOUT`] expiry; the
+    /// dropped reply sender, or `PARTITION_READ_TIMEOUT` expiry; the
     /// caller maps it to a client-visible error.
     #[allow(clippy::future_not_send)]
     pub async fn partition_read(
@@ -2173,6 +2173,30 @@ where
                              over the live incarnation's path"
                         );
                         self.metrics.record_duplicate_partition_build_discarded();
+                        drop(partition);
+                        continue;
+                    }
+                    // A standing tombstone is a damage verdict or an
+                    // unfinished teardown, and it lifts only through
+                    // `ConfirmRemove` below, i.e. proof the disk delete
+                    // completed. Inserting would route the namespace while
+                    // the verdict stands: the plane drops requests for
+                    // tombstoned namespaces without replying, so clients
+                    // would hang to their read timeout over data declared
+                    // lost. The reconciler skips tombstoned namespaces
+                    // before building, so reaching this means the op was
+                    // staged before the fence landed. Damage control like
+                    // the guard above: the build already planted its
+                    // initial segment on disk.
+                    if partitions.is_tombstoned(&namespace) {
+                        tracing::error!(
+                            shard = self_shard_id,
+                            ns_raw = namespace.inner(),
+                            epoch,
+                            "discarding InsertOwned for a tombstoned namespace: the \
+                             tombstone lifts only via ConfirmRemove, never by routing a \
+                             fresh build over it"
+                        );
                         drop(partition);
                         continue;
                     }
@@ -2743,7 +2767,7 @@ where
     /// lockstep, so silence wedges the connection until the SDK read-timeout.
     ///
     /// The one retirement path a prepare still travels. It is retained
-    /// everywhere else (see [`ParkedFrame::passes`]); here the namespace itself
+    /// everywhere else (see `ParkedFrame::passes`); here the namespace itself
     /// is unreachable, so holding it buys nothing.
     pub fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
         // Bound the borrow to this statement: the guard in an `if let`
@@ -3007,10 +3031,10 @@ where
     }
 
     /// Age every frame under `namespace` by one pass, answering CLIENT REQUESTS
-    /// past [`MAX_PARKED_PASSES`]. Returns the number answered.
+    /// past `MAX_PARKED_PASSES`. Returns the number answered.
     ///
     /// Prepares age but never expire. Expiry destroys a committed op with
-    /// nothing to recover it (see [`ParkedFrame::passes`]), and passes are
+    /// nothing to recover it (see `ParkedFrame::passes`), and passes are
     /// commit-driven: a non-empty buffer defeats the reconciler fast-skip, so a
     /// create burst elapses four in milliseconds, across every parked namespace
     /// rather than the one it concerns. Byte budgets bound them instead. Only
