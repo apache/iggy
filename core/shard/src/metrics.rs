@@ -139,7 +139,7 @@ pub mod frame_drop_reason {
 
 // The tables only index the lazy fast-path cache below; a `{variant, reason}`
 // pair enters the `Family` (and therefore the scrape) the first time a drop
-// site actually produces it, so the unreachable corners of the 7 x 7 cross
+// site actually produces it, so the unreachable corners of the 7 x 9 cross
 // product never appear as permanent zero-valued series.
 const VARIANT_COUNT: usize = 7;
 const REASON_COUNT: usize = 9;

@@ -15,19 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Errors;
+using System.Buffers;
 
-namespace Apache.Iggy.Tests.Utils.Errors;
+namespace Apache.Iggy.Utils;
 
-public static class ErrorModelFactory
+internal static class ArrayPoolHelper
 {
-    public static ErrorModel CreateErrorModelBadRequest()
+    public static SlicedMemoryOwner Rent(int minimumLength, bool clearOnReturn = false)
     {
-        return new ErrorModel(69, "bad_request", "Bad Request");
+        return new SlicedMemoryOwner(minimumLength, clearOnReturn);
     }
 
-    public static ErrorModel CreateErrorModelNotFound()
+    internal sealed class SlicedMemoryOwner(int minimumLength, bool clearOnReturn = false) : IMemoryOwner<byte>
     {
-        return new ErrorModel(69, "not_found", "Not Found");
+        private readonly byte[] _value = ArrayPool<byte>.Shared.Rent(minimumLength);
+        private int _disposed;
+
+        public Memory<byte> Memory => _value.AsMemory()[..minimumLength];
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            ArrayPool<byte>.Shared.Return(_value, clearOnReturn);
+        }
     }
 }
