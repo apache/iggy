@@ -227,10 +227,11 @@ impl Visitor<'_> for IggyDurationVisitor {
     }
 }
 
-/// A duration that is guaranteed to be greater than zero.
+/// A duration that is guaranteed to be at least one microsecond.
 ///
 /// `IggyDuration::from_str` maps `0`, `none`, `disabled` and `unlimited` to the same
-/// zero, so all four are rejected here.
+/// zero, so all four are rejected here. Serialization emits whole microseconds, so a
+/// shorter duration such as `1ns` is rejected as well.
 ///
 /// # Example
 ///
@@ -247,6 +248,10 @@ impl Visitor<'_> for IggyDurationVisitor {
 ///     Err(NonZeroDurationError::Zero),
 ///     NonZeroIggyDuration::try_from(IggyDuration::from(0_u64)),
 /// );
+/// assert_eq!(
+///     Err(NonZeroDurationError::SubMicrosecond),
+///     NonZeroIggyDuration::from_str("1ns"),
+/// );
 /// ```
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct NonZeroIggyDuration {
@@ -258,6 +263,8 @@ pub struct NonZeroIggyDuration {
 pub enum NonZeroDurationError {
     /// The value parsed or converted to zero.
     Zero,
+    /// The value is shorter than the one microsecond resolution of the wire format.
+    SubMicrosecond,
     /// The text is not a duration `humantime` understands.
     InvalidFormat(humantime::DurationError),
 }
@@ -306,6 +313,9 @@ impl Display for NonZeroDurationError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             NonZeroDurationError::Zero => write!(f, "duration must be greater than zero"),
+            NonZeroDurationError::SubMicrosecond => {
+                write!(f, "duration must be at least one microsecond")
+            }
             NonZeroDurationError::InvalidFormat(error) => write!(f, "invalid duration: {error}"),
         }
     }
@@ -314,7 +324,7 @@ impl Display for NonZeroDurationError {
 impl Error for NonZeroDurationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            NonZeroDurationError::Zero => None,
+            NonZeroDurationError::Zero | NonZeroDurationError::SubMicrosecond => None,
             NonZeroDurationError::InvalidFormat(error) => Some(error),
         }
     }
@@ -332,6 +342,11 @@ impl TryFrom<IggyDuration> for NonZeroIggyDuration {
     fn try_from(duration: IggyDuration) -> Result<Self, Self::Error> {
         if duration.is_zero() {
             return Err(NonZeroDurationError::Zero);
+        }
+
+        // Serialization emits whole microseconds, so a shorter duration would come back as zero.
+        if duration.as_micros() == 0 {
+            return Err(NonZeroDurationError::SubMicrosecond);
         }
 
         Ok(NonZeroIggyDuration { duration })
@@ -614,5 +629,34 @@ mod tests {
     #[test]
     fn given_a_zero_microsecond_value_should_fail_to_deserialize() {
         assert!(serde_json::from_str::<NonZeroIggyDuration>("0").is_err());
+    }
+
+    #[test]
+    fn given_a_sub_microsecond_value_should_fail_to_build() {
+        assert_eq!(
+            Err(NonZeroDurationError::SubMicrosecond),
+            NonZeroIggyDuration::from_str("1ns")
+        );
+        assert_eq!(
+            Err(NonZeroDurationError::SubMicrosecond),
+            NonZeroIggyDuration::new(Duration::from_nanos(999))
+        );
+        assert_eq!(
+            Err(NonZeroDurationError::SubMicrosecond),
+            NonZeroIggyDuration::try_from(IggyDuration::new(Duration::from_nanos(1)))
+        );
+    }
+
+    #[test]
+    fn given_one_microsecond_should_round_trip_through_serde() {
+        let duration = NonZeroIggyDuration::from_str("1us").unwrap();
+
+        let serialized = serde_json::to_string(&duration).unwrap();
+
+        assert_eq!("1", serialized);
+        assert_eq!(
+            duration,
+            serde_json::from_str::<NonZeroIggyDuration>(&serialized).unwrap()
+        );
     }
 }
