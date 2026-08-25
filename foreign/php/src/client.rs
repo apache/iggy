@@ -407,7 +407,7 @@ impl IggyClient {
     }
 }
 
-fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {
+pub(crate) fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {
     NonZeroIggyDuration::try_from(micros)
         .map_err(|_| to_php_exception(format!("'{field}' must be greater than 0 microseconds")))
 }

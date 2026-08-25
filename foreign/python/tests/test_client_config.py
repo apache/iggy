@@ -350,17 +350,15 @@ class TestClientConstruction:
         ],
         ids=["interval", "interval_or_when", "interval_or_after"],
     )
-    def test_zero_auto_commit_interval_is_allowed(self, auto_commit: AutoCommit):
-        """Test that a zero auto-commit interval passes validation.
+    def test_zero_auto_commit_interval_is_rejected(self, auto_commit: AutoCommit):
+        """Test that a zero auto-commit interval fails at the call.
 
-        Zero there stores the offsets in a busy loop, which is a supported
-        choice. Reaching the awaitable is what proves it: building one without
-        a running loop is the next failure, and a rejected value would have
-        raised ValueError first.
+        Zero there stores the offsets in a busy loop. Committing on every poll
+        is spelled AutoCommit.When or AutoCommit.After instead.
         """
         client = IggyClient()
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError, match="zero"):
             client.consumer_group(
                 name="group",
                 stream="stream",

@@ -19,6 +19,7 @@
 declare(strict_types=1);
 
 use Iggy\AutoCommit;
+use Iggy\AutoCommitWhen;
 use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
@@ -438,6 +439,16 @@ final class IggySdkTest extends TestCase
                     false,
                 ),
                 'poll_interval_micros',
+            );
+
+            assert_throws(
+                static fn () => AutoCommit::interval(0),
+                'interval_micros',
+            );
+
+            assert_throws(
+                static fn () => AutoCommit::intervalOrWhen(0, AutoCommitWhen::pollingMessages()),
+                'interval_micros',
             );
 
             assert_throws(

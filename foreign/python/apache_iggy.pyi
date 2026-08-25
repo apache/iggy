@@ -1379,8 +1379,8 @@ class IggyClient:
         Creates a new consumer group consumer.
         Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
         `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-        `AutoCommit` interval is negative, or if `polling_retry_interval` or
-        `init_retry_interval` is zero.
+        `AutoCommit` interval is negative, or if any of those except `poll_interval`
+        is zero.
         """
     def send_binary_request(
         self, code: builtins.int, payload: builtins.bytes

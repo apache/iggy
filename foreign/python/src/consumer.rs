@@ -24,7 +24,7 @@ use iggy::prelude::{
     AutoCommitWhen as RustAutoCommitWhen, Consumer as RustConsumer,
     ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
     ConsumerGroupMember as RustConsumerGroupMember, Identifier, IggyConsumer as RustIggyConsumer,
-    IggyError, ReceivedMessage,
+    IggyError, NonZeroIggyDuration, ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::PyDelta;
@@ -38,7 +38,7 @@ use tokio::sync::Mutex;
 use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
-use crate::duration::py_delta_to_iggy_duration;
+use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
 use crate::receive_message::ReceiveMessage;
 
@@ -455,19 +455,21 @@ impl TryFrom<&AutoCommit> for RustAutoCommit {
     fn try_from(val: &AutoCommit) -> PyResult<RustAutoCommit> {
         Ok(match val {
             AutoCommit::Disabled() => RustAutoCommit::Disabled,
-            AutoCommit::Interval(delta) => {
-                RustAutoCommit::Interval(py_delta_to_iggy_duration(delta)?)
-            }
+            AutoCommit::Interval(delta) => RustAutoCommit::Interval(auto_commit_interval(delta)?),
             AutoCommit::IntervalOrWhen(delta, when) => {
-                RustAutoCommit::IntervalOrWhen(py_delta_to_iggy_duration(delta)?, when.into())
+                RustAutoCommit::IntervalOrWhen(auto_commit_interval(delta)?, when.into())
             }
             AutoCommit::IntervalOrAfter(delta, after) => {
-                RustAutoCommit::IntervalOrAfter(py_delta_to_iggy_duration(delta)?, after.into())
+                RustAutoCommit::IntervalOrAfter(auto_commit_interval(delta)?, after.into())
             }
             AutoCommit::When(when) => RustAutoCommit::When(when.into()),
             AutoCommit::After(after) => RustAutoCommit::After(after.into()),
         })
     }
+}
+
+fn auto_commit_interval(delta: &Py<PyDelta>) -> PyResult<NonZeroIggyDuration> {
+    reject_zero(py_delta_to_iggy_duration(delta)?, "interval")
 }
 
 /// The auto-commit mode for storing the offset on the server.

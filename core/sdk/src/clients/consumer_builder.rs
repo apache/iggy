@@ -67,7 +67,7 @@ impl IggyConsumerBuilder {
             polling_strategy: PollingStrategy::next(),
             batch_length: 1000,
             auto_commit: AutoCommit::IntervalOrWhen(
-                IggyDuration::ONE_SECOND,
+                NonZeroIggyDuration::ONE_SECOND,
                 AutoCommitWhen::PollingMessages,
             ),
             auto_join_consumer_group: true,

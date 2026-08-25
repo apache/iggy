@@ -51,14 +51,13 @@ pub enum AutoCommit {
     /// The auto-commit is disabled and the offset must be stored manually by the consumer.
     Disabled,
     /// The auto-commit is enabled and the offset is stored on the server after a certain interval.
-    /// A zero interval stores the offsets in a busy loop.
-    Interval(IggyDuration),
+    Interval(NonZeroIggyDuration),
     /// The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
-    IntervalOrWhen(IggyDuration, AutoCommitWhen),
+    IntervalOrWhen(NonZeroIggyDuration, AutoCommitWhen),
     /// The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
     ///
     /// **This will only work with the `IggyConsumerMessageExt` trait when using `consume_messages()`.**
-    IntervalOrAfter(IggyDuration, AutoCommitAfter),
+    IntervalOrAfter(NonZeroIggyDuration, AutoCommitAfter),
     /// The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
     When(AutoCommitWhen),
     /// The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
@@ -483,7 +482,7 @@ impl IggyConsumer {
         Ok(())
     }
 
-    fn store_offsets_in_background(&self, interval: IggyDuration) -> JoinHandle<()> {
+    fn store_offsets_in_background(&self, interval: NonZeroIggyDuration) -> JoinHandle<()> {
         let client = self.client.clone();
         let consumer = self.consumer.clone();
         let stream_id = self.stream_id.clone();
@@ -1264,13 +1263,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_accept_auto_commit_modes_with_a_zero_interval() {
-        let zero = IggyDuration::new(Duration::ZERO);
-
+    async fn should_accept_every_auto_commit_mode() {
         for auto_commit in [
-            AutoCommit::Interval(zero),
-            AutoCommit::IntervalOrWhen(zero, AutoCommitWhen::PollingMessages),
-            AutoCommit::IntervalOrAfter(zero, AutoCommitAfter::ConsumingAllMessages),
+            AutoCommit::Disabled,
+            AutoCommit::Interval(NonZeroIggyDuration::ONE_SECOND),
+            AutoCommit::When(AutoCommitWhen::PollingMessages),
+            AutoCommit::After(AutoCommitAfter::ConsumingAllMessages),
         ] {
             let mut consumer = builder().auto_commit(auto_commit).build();
 
