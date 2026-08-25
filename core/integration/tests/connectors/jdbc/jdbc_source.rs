@@ -18,13 +18,15 @@
 use crate::connectors::{ConnectorsRuntime, IggySetup, setup_runtime};
 use serial_test::serial;
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeSet, HashMap};
+use std::io::Cursor;
+use std::time::{Duration, Instant};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::time::sleep;
 use tracing::info;
+use zip::ZipArchive;
 
 const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "postgres";
@@ -52,21 +54,34 @@ async fn setup_postgres_container()
     Ok((postgres, jdbc_url, postgres_jar))
 }
 
-/// A file that starts with the ZIP local-file-header magic (`PK\x03\x04`) and is
-/// at least this large is treated as a real driver JAR. A truncated download or
-/// an HTML error page fails this check, so it is never cached or handed to the
-/// JVM (where it would only surface later as a `ClassNotFoundException` on
-/// `Class.forName`, with the bad file silently reused by every later test).
-const MIN_DRIVER_JAR_BYTES: usize = 500_000;
+/// The class the connector hands to `Class.forName`. Checking that the archive
+/// actually contains it is what makes the integrity check below meaningful.
+const DRIVER_CLASS_ENTRY: &str = "org/postgresql/Driver.class";
 
+/// Whether `bytes` is a driver JAR the JVM can actually load from: a readable
+/// ZIP archive that contains the driver class.
+///
+/// Magic bytes plus a minimum size are not enough. A download truncated past
+/// that size still starts with the ZIP local-file-header magic while its central
+/// directory is gone, so it passes a size check yet cannot be read as an
+/// archive. It is then cached and reused by every later JDBC test in the job,
+/// and the only symptom is a `ClassNotFoundException` on `Class.forName` that
+/// fails the connector's `open()`, so the runtime skips the source and every
+/// JDBC test fails having received no messages at all. Opening the archive and
+/// looking the entry up tests the property the JVM needs, and a cached file that
+/// fails it is deleted and re-downloaded rather than reused.
 fn looks_like_jar(bytes: &[u8]) -> bool {
-    bytes.len() >= MIN_DRIVER_JAR_BYTES && bytes.starts_with(b"PK\x03\x04")
+    let Ok(mut archive) = ZipArchive::new(Cursor::new(bytes)) else {
+        return false;
+    };
+    archive.by_name(DRIVER_CLASS_ENTRY).is_ok()
 }
 
 /// Get the PostgreSQL JDBC driver, downloading and integrity-checking it if a
 /// valid copy is not already cached. Downloads from Maven Central, verifies the
-/// bytes are a real JAR before persisting, and writes via a temp file + atomic
-/// rename so a partial or corrupt download can never be cached and reused.
+/// bytes open as an archive holding the driver class before persisting, and
+/// writes via a temp file + atomic rename so a partial or corrupt download can
+/// never be cached and reused.
 async fn get_postgres_driver_jar() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let jdbc_test_dir = format!("{target_dir}/test-jdbc-drivers");
@@ -101,10 +116,9 @@ async fn get_postgres_driver_jar() -> Result<String, Box<dyn std::error::Error +
     let bytes = response.bytes().await?;
     if !looks_like_jar(&bytes) {
         return Err(format!(
-            "Downloaded JDBC driver is not a valid JAR ({} bytes, magic {:02x?}); \
-             the download endpoint may have returned an error page",
-            bytes.len(),
-            bytes.get(..4).unwrap_or(&[])
+            "Downloaded JDBC driver is not a readable JAR containing {DRIVER_CLASS_ENTRY} \
+             ({} bytes); the download was truncated or the endpoint returned an error page",
+            bytes.len()
         )
         .into());
     }
@@ -413,6 +427,59 @@ fn collect_ids(messages: &[serde_json::Value]) -> Vec<i64> {
         .collect()
 }
 
+/// Poll until every id in `expected` has been seen, or `timeout` elapses.
+/// Returns the distinct ids seen, ascending, plus the raw number of messages
+/// received.
+///
+/// Bulk mode re-runs its query on every poll interval, so it keeps re-delivering
+/// the same rows for as long as the source runs. Matching on the distinct ids
+/// seen, rather than on a fixed-length prefix of the received messages, keeps a
+/// second re-delivered batch from failing an otherwise healthy run. The returned
+/// count separates "the source delivered nothing" from "it delivered messages
+/// that did not carry the expected `data.id`", which a bare id list cannot
+/// express: `collect_ids` drops unmatched messages silently.
+async fn poll_until_ids_seen(
+    client: &crate::connectors::ConnectorsIggyClient,
+    expected: &[i64],
+    timeout: Duration,
+) -> (Vec<i64>, usize) {
+    let deadline = Instant::now() + timeout;
+    let mut seen: BTreeSet<i64> = BTreeSet::new();
+    let mut received = 0usize;
+
+    loop {
+        let polled_messages = client
+            .get_messages()
+            .await
+            .expect("Failed to poll messages");
+
+        for msg in &polled_messages.messages {
+            received += 1;
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                && let Some(id) = value
+                    .get("data")
+                    .and_then(|data| data.get("id"))
+                    .and_then(|id| id.as_i64())
+            {
+                seen.insert(id);
+            }
+        }
+
+        if expected.iter().all(|id| seen.contains(id)) {
+            info!("Saw expected ids {expected:?} in {received} received messages");
+            break;
+        }
+
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        sleep(POLL_INTERVAL).await;
+    }
+
+    (seen.into_iter().collect(), received)
+}
+
 /// Test: incremental mode advances its tracking offset across polls; newly
 /// inserted rows are delivered exactly once and previously read rows are not
 /// re-delivered.
@@ -572,13 +639,13 @@ async fn source_recovers_after_repeated_query_errors() {
         .await
         .expect("Failed to insert rows");
 
-    let messages = poll_messages_with_retry(&client, 2).await;
-    let mut ids = collect_ids(&messages);
-    ids.sort_unstable();
+    let (ids, received) =
+        poll_until_ids_seen(&client, &[1, 2], POLL_INTERVAL * POLL_ATTEMPTS as u32).await;
     assert_eq!(
         ids,
         vec![1, 2],
-        "Source must recover after repeated query failures and deliver ids 1,2, got {ids:?}"
+        "Source must recover after repeated query failures and deliver ids 1,2; \
+         got ids {ids:?} from {received} received message(s)"
     );
 }
 
