@@ -17,6 +17,7 @@
 
 use iggy::prelude::*;
 use std::env;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 /// Resolves server address based on role and port, checking environment variables first
@@ -47,6 +48,24 @@ pub async fn create_and_connect_client(addr: &str) -> IggyClient {
         .expect("Client should connect");
 
     IggyClient::create(ClientWrapper::Tcp(client), None, None)
+}
+
+/// Whether two `host:port` spellings name the same endpoint.
+///
+/// A client that never redirected still holds the address it was given (a
+/// host name, in the BDD compose network), while a redirected one holds the
+/// address the roster published (an IP). Both name the same node, so they
+/// are compared once resolved, like the Go and Java suites do.
+pub fn is_same_endpoint(left: &str, right: &str) -> Result<bool, String> {
+    let resolve = |address: &str| -> Result<Vec<SocketAddr>, String> {
+        address
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .map_err(|error| format!("Failed to resolve server address {address}: {error}"))
+    };
+    let left = resolve(left)?;
+    let right = resolve(right)?;
+    Ok(left.iter().any(|candidate| right.contains(candidate)))
 }
 
 /// Verifies that a client is connected to the expected port
