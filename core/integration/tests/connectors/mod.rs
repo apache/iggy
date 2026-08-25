@@ -21,6 +21,7 @@ mod delta;
 mod doris;
 mod elasticsearch;
 mod fixtures;
+mod fluss;
 mod http;
 mod http_config_provider;
 mod iceberg;
@@ -35,7 +36,6 @@ mod runtime;
 mod s3;
 mod stdout;
 mod surrealdb;
-
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 
