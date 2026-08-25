@@ -343,8 +343,7 @@ impl IggyClient {
             builder = builder.auto_commit(auto_commit.into());
         }
         builder = match poll_interval_micros {
-            Some(micros) => builder
-                .poll_interval(non_zero_duration_micros("poll_interval_micros", micros)?.get()),
+            Some(micros) => builder.poll_interval(IggyDuration::from(micros)),
             None => builder.without_poll_interval(),
         };
         if let Some(micros) = polling_retry_interval_micros {
