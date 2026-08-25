@@ -29,6 +29,7 @@ use iggy_common::{
     IggyError, IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
 };
 use std::collections::VecDeque;
+use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -96,6 +97,9 @@ pub enum AutoCommitAfter {
 /// Consuming borrows the consumer as `&mut` for the whole run, so reading its getters or
 /// committing an offset concurrently means sharing it behind a lock and then waiting on
 /// that lock. This view carries the same shared state and needs neither.
+///
+/// Every getter is an independent load rather than part of one snapshot, so the partition
+/// ID can already have moved on by the time an offset is read for it.
 #[derive(Clone)]
 pub struct IggyConsumerState {
     client: IggyRwLock<ClientWrapper>,
@@ -107,6 +111,19 @@ pub struct IggyConsumerState {
     current_partition_id: Arc<AtomicU32>,
     last_consumed_offsets: Arc<DashMap<u32, AtomicU64>>,
     last_stored_offsets: Arc<DashMap<u32, AtomicU64>>,
+}
+
+impl Debug for IggyConsumerState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IggyConsumerState")
+            .field("consumer", &self.consumer)
+            .field("stream_id", &self.stream_id)
+            .field("topic_id", &self.topic_id)
+            .field("is_consumer_group", &self.is_consumer_group)
+            .field("allow_replay", &self.allow_replay)
+            .field("current_partition_id", &self.partition_id())
+            .finish_non_exhaustive()
+    }
 }
 
 impl IggyConsumerState {
@@ -136,14 +153,18 @@ impl IggyConsumerState {
         self.current_partition_id.load(ORDERING)
     }
 
-    /// Retrieves the last consumed offset for the specified partition ID.
+    /// Retrieves the last consumed offset for the specified partition ID, or `None` while
+    /// the partition is still untracked. Polling seeds an entry the first time it sees a
+    /// partition, so `Some(0)` also covers "seen, nothing consumed yet".
     /// To get the current partition ID use `partition_id()`
     pub fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         let offset = self.last_consumed_offsets.get(&partition_id)?;
         Some(offset.load(ORDERING))
     }
 
-    /// Retrieves the last stored offset (on the server) for the specified partition ID.
+    /// Retrieves the last stored offset (on the server) for the specified partition ID, or
+    /// `None` while the partition is still untracked. Storing seeds an entry the first time
+    /// it sees a partition, so `Some(0)` also covers "seen, nothing stored yet".
     /// To get the current partition ID use `partition_id()`
     pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         let offset = self.last_stored_offsets.get(&partition_id)?;

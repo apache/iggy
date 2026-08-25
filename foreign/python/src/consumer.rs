@@ -59,21 +59,25 @@ pub struct IggyConsumer {
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyConsumer {
-    /// Get the last consumed offset or `None` if no offset has been consumed yet.
+    /// Get the last consumed offset for the given partition, or `None` while that partition
+    /// is untracked. Polling starts tracking a partition at `0`, so `0` also means
+    /// "seen, nothing consumed yet".
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_consumed_offset(partition_id)
     }
 
-    /// Get the last stored offset or `None` if no offset has been stored yet.
+    /// Get the last stored offset for the given partition, or `None` while that partition is
+    /// untracked. Polling starts tracking a partition at `0`, so `0` also means
+    /// "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
         self.state.get_last_stored_offset(partition_id)
     }
 
     /// Gets the name of the consumer group.
-    fn name(&self) -> String {
-        self.name.clone()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// Gets the current partition id or `0` if no messages have been polled yet.
@@ -81,12 +85,12 @@ impl IggyConsumer {
         self.state.partition_id()
     }
 
-    /// Gets the name of the stream this consumer group is configured for.
+    /// Gets the identifier of the stream this consumer group is configured for.
     fn stream(&self) -> PyIdentifier {
         self.stream.clone()
     }
 
-    /// Gets the name of the topic this consumer group is configured for.
+    /// Gets the identifier of the topic this consumer group is configured for.
     fn topic(&self) -> PyIdentifier {
         self.topic.clone()
     }

@@ -1412,11 +1412,15 @@ class IggyConsumer:
         self, partition_id: builtins.int
     ) -> builtins.int | None:
         r"""
-        Get the last consumed offset or `None` if no offset has been consumed yet.
+        Get the last consumed offset for the given partition, or `None` while that partition
+        is untracked. Polling starts tracking a partition at `0`, so `0` also means
+        "seen, nothing consumed yet".
         """
     def get_last_stored_offset(self, partition_id: builtins.int) -> builtins.int | None:
         r"""
-        Get the last stored offset or `None` if no offset has been stored yet.
+        Get the last stored offset for the given partition, or `None` while that partition is
+        untracked. Polling starts tracking a partition at `0`, so `0` also means
+        "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
         """
     def name(self) -> builtins.str:
         r"""
@@ -1428,11 +1432,11 @@ class IggyConsumer:
         """
     def stream(self) -> builtins.str | builtins.int:
         r"""
-        Gets the name of the stream this consumer group is configured for.
+        Gets the identifier of the stream this consumer group is configured for.
         """
     def topic(self) -> builtins.str | builtins.int:
         r"""
-        Gets the name of the topic this consumer group is configured for.
+        Gets the identifier of the topic this consumer group is configured for.
         """
     def store_offset(
         self, offset: builtins.int, partition_id: builtins.int | None
