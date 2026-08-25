@@ -343,9 +343,7 @@ impl IggyClient {
             builder = builder.auto_commit(auto_commit.into());
         }
         builder = match poll_interval_micros {
-            Some(micros) => {
-                builder.poll_interval(non_zero_duration_micros("poll_interval_micros", micros)?)
-            }
+            Some(micros) => builder.poll_interval(IggyDuration::from(micros)),
             None => builder.without_poll_interval(),
         };
         if let Some(micros) = polling_retry_interval_micros {
@@ -408,12 +406,7 @@ impl IggyClient {
     }
 }
 
-fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<IggyDuration> {
-    if micros == 0 {
-        return Err(to_php_exception(format!(
-            "'{field}' must be greater than 0 microseconds"
-        )));
-    }
-
-    Ok(IggyDuration::from(micros))
+pub(crate) fn non_zero_duration_micros(field: &str, micros: u64) -> PhpResult<NonZeroIggyDuration> {
+    NonZeroIggyDuration::try_from(micros)
+        .map_err(|_| to_php_exception(format!("'{field}' must be greater than 0 microseconds")))
 }

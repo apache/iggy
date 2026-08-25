@@ -2027,8 +2027,7 @@ class TcpReconnectionConfig:
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
-                range of an unsigned 32-bit integer, or if `interval` is zero while
-                reconnection is enabled and `max_retries` is unlimited.
+                range of an unsigned 32-bit integer, or if `interval` is zero.
         """
     def __repr__(self) -> builtins.str: ...
 
