@@ -17,7 +17,8 @@
 
 use crate::clients::consumer::{AutoCommit, AutoCommitWhen};
 use crate::prelude::{
-    ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError, PollingStrategy,
+    ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError, NonZeroIggyDuration,
+    PollingStrategy,
 };
 use bon::Builder;
 use std::str::FromStr;
@@ -55,11 +56,11 @@ pub struct IggyConsumerConfig {
     /// `PollingStrategy` specifies from where to start polling messages. See `PollingStrategy` for details.
     polling_strategy: PollingStrategy,
     /// Sets the polling retry interval in case of server disconnection.
-    polling_retry_interval: IggyDuration,
+    polling_retry_interval: NonZeroIggyDuration,
     /// Sets the number of retries and the interval when initializing the consumer if the stream or topic is not found.
     /// Might be useful when the stream or topic is created dynamically by the producer.
     init_retries: Option<u32>,
-    init_interval: IggyDuration,
+    init_interval: NonZeroIggyDuration,
     /// Sets a optional client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
     /// Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
     encryptor: Option<Arc<EncryptorKind>>,
@@ -85,9 +86,9 @@ impl Default for IggyConsumerConfig {
             polling_strategy: PollingStrategy::last(),
             partitions_count: 1,
             encryptor: None,
-            polling_retry_interval: IggyDuration::new_from_secs(1),
+            polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: Some(5),
-            init_interval: IggyDuration::new_from_secs(3),
+            init_interval: NonZeroIggyDuration::from_str("3s").unwrap(),
         }
     }
 }
@@ -135,9 +136,9 @@ impl IggyConsumerConfig {
         polling_strategy: PollingStrategy,
         partitions_count: u32,
         encryptor: Option<Arc<EncryptorKind>>,
-        polling_retry_interval: IggyDuration,
+        polling_retry_interval: NonZeroIggyDuration,
         init_retries: Option<u32>,
-        init_interval: IggyDuration,
+        init_interval: NonZeroIggyDuration,
     ) -> Self {
         Self {
             stream_id,
@@ -196,9 +197,9 @@ impl IggyConsumerConfig {
             polling_strategy: PollingStrategy::last(),
             partitions_count: 1,
             encryptor: None,
-            polling_retry_interval: IggyDuration::new_from_secs(1),
+            polling_retry_interval: NonZeroIggyDuration::ONE_SECOND,
             init_retries: Some(5),
-            init_interval: IggyDuration::new_from_secs(3),
+            init_interval: NonZeroIggyDuration::from_str("3s").unwrap(),
         })
     }
 }
@@ -259,7 +260,7 @@ impl IggyConsumerConfig {
         self.encryptor.clone()
     }
 
-    pub fn polling_retry_interval(&self) -> IggyDuration {
+    pub fn polling_retry_interval(&self) -> NonZeroIggyDuration {
         self.polling_retry_interval
     }
 
@@ -267,7 +268,7 @@ impl IggyConsumerConfig {
         self.init_retries
     }
 
-    pub fn init_interval(&self) -> IggyDuration {
+    pub fn init_interval(&self) -> NonZeroIggyDuration {
         self.init_interval
     }
 }
@@ -295,10 +296,10 @@ mod tests {
             .consumer_kind(ConsumerKind::ConsumerGroup)
             .polling_interval(IggyDuration::from_str("5ms").unwrap())
             .polling_strategy(PollingStrategy::last())
-            .polling_retry_interval(IggyDuration::new_from_secs(1))
+            .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
             .partitions_count(1)
             .init_retries(3)
-            .init_interval(IggyDuration::new_from_secs(3))
+            .init_interval(NonZeroIggyDuration::from_str("3s").unwrap())
             .build();
 
         assert_eq!(
@@ -329,11 +330,14 @@ mod tests {
 
         assert_eq!(
             config.polling_retry_interval(),
-            IggyDuration::new_from_secs(1)
+            NonZeroIggyDuration::ONE_SECOND
         );
         assert_eq!(config.init_retries(), Some(3));
 
-        assert_eq!(config.init_interval(), IggyDuration::new_from_secs(3));
+        assert_eq!(
+            config.init_interval(),
+            NonZeroIggyDuration::from_str("3s").unwrap()
+        );
     }
 
     #[test]
@@ -362,9 +366,15 @@ mod tests {
         assert_eq!(config.polling_strategy(), PollingStrategy::last());
         assert_eq!(config.partitions_count(), 1);
 
-        assert_eq!(config.polling_retry_interval(), IggyDuration::ONE_SECOND);
+        assert_eq!(
+            config.polling_retry_interval(),
+            NonZeroIggyDuration::ONE_SECOND
+        );
         assert_eq!(config.init_retries(), Some(5));
-        assert_eq!(config.init_interval(), IggyDuration::new_from_secs(3));
+        assert_eq!(
+            config.init_interval(),
+            NonZeroIggyDuration::from_str("3s").unwrap()
+        );
     }
 
     #[test]
@@ -384,9 +394,9 @@ mod tests {
             PollingStrategy::last(),
             1,
             None,
-            IggyDuration::new_from_secs(1),
+            NonZeroIggyDuration::ONE_SECOND,
             Some(3),
-            IggyDuration::new_from_secs(3),
+            NonZeroIggyDuration::from_str("3s").unwrap(),
         );
         assert_eq!(
             config.stream_id(),
@@ -416,10 +426,13 @@ mod tests {
 
         assert_eq!(
             config.polling_retry_interval(),
-            IggyDuration::new_from_secs(1)
+            NonZeroIggyDuration::ONE_SECOND
         );
         assert_eq!(config.init_retries(), Some(3));
-        assert_eq!(config.init_interval(), IggyDuration::new_from_secs(3));
+        assert_eq!(
+            config.init_interval(),
+            NonZeroIggyDuration::from_str("3s").unwrap()
+        );
     }
 
     #[test]

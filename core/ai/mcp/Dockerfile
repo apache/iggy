@@ -34,7 +34,7 @@ ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
 RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig && \
-    cargo install cargo-zigbuild --version '=0.22.1' --locked && \
+    cargo install cargo-zigbuild --version '=0.23.2' --locked && \
     rustup target add \
     x86_64-unknown-linux-musl \
     aarch64-unknown-linux-musl \

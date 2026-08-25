@@ -179,7 +179,7 @@ async fn consume_with_strategy(
         .consumer(consumer_name, STREAM_NAME, TOPIC_NAME, PARTITION_ID)
         .unwrap()
         .auto_commit(AutoCommit::IntervalOrWhen(
-            IggyDuration::from_str("2ms").unwrap(),
+            NonZeroIggyDuration::from_str("2ms").unwrap(),
             AutoCommitWhen::ConsumingAllMessages,
         ))
         .polling_strategy(strategy)

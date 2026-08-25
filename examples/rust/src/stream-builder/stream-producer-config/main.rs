@@ -53,7 +53,7 @@ async fn main() -> Result<(), IggyError> {
         // The error can be related either to disconnecting from the server or to the server rejecting the messages.
         // Default is 3 retries with 1 second interval between them. Customize to your requirements.
         .send_retries_count(3)
-        .send_retries_interval(IggyDuration::new_from_secs(1))
+        .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
         // Optionally, set a custom client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
         // Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
         // .encryptor( Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[1; 32])?)))

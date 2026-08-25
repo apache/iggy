@@ -24,7 +24,7 @@ use iggy::prelude::{
     AutoCommitWhen as RustAutoCommitWhen, Consumer as RustConsumer,
     ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
     ConsumerGroupMember as RustConsumerGroupMember, Identifier, IggyConsumer as RustIggyConsumer,
-    IggyConsumerState as RustIggyConsumerState, IggyDuration, IggyError, ReceivedMessage,
+    IggyConsumerState as RustIggyConsumerState, IggyError, NonZeroIggyDuration, ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::PyDelta;
@@ -472,8 +472,8 @@ impl TryFrom<&AutoCommit> for RustAutoCommit {
     }
 }
 
-fn auto_commit_interval(delta: &Py<PyDelta>) -> PyResult<IggyDuration> {
-    reject_zero(py_delta_to_iggy_duration(delta)?, "AutoCommit interval")
+fn auto_commit_interval(delta: &Py<PyDelta>) -> PyResult<NonZeroIggyDuration> {
+    reject_zero(py_delta_to_iggy_duration(delta)?, "interval")
 }
 
 /// The auto-commit mode for storing the offset on the server.
