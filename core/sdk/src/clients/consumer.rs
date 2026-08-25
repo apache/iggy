@@ -130,6 +130,15 @@ impl IggyConsumerState {
         let offset = self.last_stored_offsets.get(&partition_id)?;
         Some(offset.load(ORDERING))
     }
+
+    /// Snapshots the last consumed offset of every tracked partition. Collecting up front
+    /// releases the map guards, which must not be held across the store round trip.
+    fn last_consumed_offsets(&self) -> Vec<(u32, u64)> {
+        self.last_consumed_offsets
+            .iter()
+            .map(|entry| (*entry.key(), entry.load(ORDERING)))
+            .collect()
+    }
 }
 
 // SAFETY: IggyConsumer is Sync because:
@@ -526,7 +535,7 @@ impl IggyConsumer {
         let consumer = self.consumer.clone();
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
-        let last_consumed_offsets = self.state.last_consumed_offsets.clone();
+        let state = self.state.clone();
         let last_stored_offsets = self.state.last_stored_offsets.clone();
         let shutdown = self.shutdown.clone();
         let notify = self.background_commit_notify.clone();
@@ -543,9 +552,7 @@ impl IggyConsumer {
                     trace!("Shutdown signal received, stopping background offset storage");
                     break;
                 }
-                for entry in last_consumed_offsets.iter() {
-                    let partition_id = *entry.key();
-                    let consumed_offset = entry.load(ORDERING);
+                for (partition_id, consumed_offset) in state.last_consumed_offsets() {
                     _ = Self::store_consumer_offset(
                         &client,
                         &consumer,
@@ -1214,16 +1221,8 @@ impl IggyConsumer {
             );
         }
 
-        for entry in self.state.last_consumed_offsets.iter() {
-            let partition_id = *entry.key();
-            let consumed_offset = entry.load(ORDERING);
-
-            let stored_offset = self
-                .state
-                .last_stored_offsets
-                .get(&partition_id)
-                .map(|e| e.load(ORDERING))
-                .unwrap_or(0);
+        for (partition_id, consumed_offset) in self.state.last_consumed_offsets() {
+            let stored_offset = self.state.get_last_stored_offset(partition_id).unwrap_or(0);
 
             if consumed_offset > stored_offset {
                 trace!(
