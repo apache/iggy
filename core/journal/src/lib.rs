@@ -26,10 +26,7 @@ pub mod local_gate;
 pub mod prepare_journal;
 pub mod superblock;
 
-pub trait Journal<S>
-where
-    S: Storage,
-{
+pub trait Journal {
     type Header;
     type Entry;
     type HeaderRef<'a>: Deref<Target = Self::Header>
@@ -101,8 +98,7 @@ where
 }
 
 pub trait JournalHandle {
-    type Storage: Storage;
-    type Target: Journal<Self::Storage>;
+    type Target: Journal;
 
     fn handle(&self) -> &Self::Target;
 }
@@ -112,7 +108,6 @@ pub trait JournalHandle {
 /// the metadata WAL across a replica restart: the bytes and index survive the
 /// shard being dropped and rebuilt.
 impl<T: JournalHandle> JournalHandle for Rc<T> {
-    type Storage = T::Storage;
     type Target = T::Target;
 
     fn handle(&self) -> &Self::Target {

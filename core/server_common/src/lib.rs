@@ -26,6 +26,7 @@ pub mod fs_utils;
 pub mod iobuf;
 pub mod log;
 mod memory_pool;
+mod reactor_yield;
 mod segment_storage;
 pub mod send_messages;
 pub mod sharding;
@@ -39,7 +40,8 @@ pub use consensus_message::{
     MutableBacking, RequestBacking, RequestBackingKind, ResponseBacking, ResponseBackingKind,
 };
 pub use executor::create_shard_executor;
-pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolConfigOther, memory_pool};
+pub use memory_pool::{MEMORY_POOL, MemoryPool, MemoryPoolSettings, memory_pool};
+pub use reactor_yield::yield_to_reactor;
 pub use segment_storage::{
     IndexReader, IndexWriter, MessagesReader, MessagesWriter, SegmentStorage,
 };

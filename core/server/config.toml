@@ -48,6 +48,12 @@ enabled = true
 address = "127.0.0.1:3000"
 
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
+# HTTP produce requests are not framed by the message bus, so this body cap is
+# what bounds the widest batch record the HTTP path can persist. Boot refuses a
+# value above the frozen 256 MiB recovery ceiling (see
+# message_bus.max_message_size), and a body above message_bus.max_message_size
+# can still admit a batch that no peer accepts a replication frame for -- keep
+# this at or below that cap unless replica_count = 1.
 max_request_size = "2 MB"
 
 # Enables the embedded Web UI dashboard at '/ui'.
@@ -463,6 +469,64 @@ archive_expired = false
 # Unsupported: setting this to `true` aborts boot.
 recreate_missing_state = false
 
+# At boot, segment recovery walks each partition's segments: bytes after the
+# last decodable batch of a genuinely torn tail are physically truncated from
+# the .log/.index files. A LOST index is rebuilt from the batches the walk
+# proves -- lost meaning absent altogether, or holding no whole 24-byte
+# entry. An index that still holds whole entries is NEVER rebuilt, only
+# floored to whole entries, or the partition is refused when its entries
+# contradict the log. Only the walk of a segment whose index was lost
+# re-checksums every batch; with an intact index the walk trusts batch
+# headers, except that a batch contradicting the walk (see below) must pass
+# its batch checksum before the contradiction is believed. Bytes before the
+# last index entry are not re-examined at boot at all -- at-rest damage
+# there surfaces on the read path via validate_checksum.
+#
+# A restore that dropped every .index therefore boots by re-reading and
+# re-checksumming every byte of every segment and rebuilding each index
+# durably, two fsyncs per segment: budget minutes, not seconds, on a
+# partition holding thousands of segments. A boot that looks hung after such
+# a restore is doing that work. Before, that same shape refused the boot
+# outright.
+#
+# Either walk refuses a batch whose base offset does not continue the chain,
+# or whose partition_id stamp is not this partition's. A contradiction whose
+# batch fails its own checksum is damage rather than data: the walk stops
+# there and the residue goes through the damage probe like any other torn
+# tail, so a bit flip in a tail batch's offset truncates instead of refusing
+# the partition, regardless of the flip's direction.
+#
+# Damage in the middle of a segment is never silently truncated: the
+# partition is refused, as is trailing residue whose verification cost
+# exhausts the probe's residue-derived work budgets while walked batches
+# exist (residue after a walk that proved nothing recovers the segment as
+# empty instead, fencing the file pair aside whole). With peer replicas the
+# refused files are moved to a .fenced.N directory beside the partition,
+# which is rebuilt empty and refilled from a peer. With replica_count = 1
+# there is no peer, so nothing is moved and nothing is rebuilt: the refused
+# files stay at their original paths, the partition is tombstoned (unrouted,
+# clients get the retriable transient status, never an empty poll that would
+# read as a healthy empty partition), and the same refusal is re-derived and
+# re-logged on every boot. The tombstone lifts in exactly two ways: a
+# chain-shape refusal whose planned chain provably holds ZERO recoverable
+# bytes rebuilds through .fenced.N at boot, and deleting the
+# stream/topic/partition removes the refused files and clears the fence, so
+# a recreate of the same ids starts clean. One refusal is not durable: a
+# length divergence found when a writer reopens a file recovery just
+# truncated clears on the next boot, so that tombstone lasts only for the
+# life of the process.
+#
+# .fenced.N has a second producer, on a partition that recovers FINE: a tail
+# segment holding bytes that decode to nothing anywhere is moved there and
+# the segment recovered empty, so the partition serves without those bytes.
+# One fresh directory per such segment, so .fenced.0, .fenced.1, ... can
+# accumulate under a healthy partition. .fenced.N alone therefore does not
+# mean a partition was refused -- grep the boot log for "refusing the
+# recovered segment chain", which names the directory and the reason.
+#
+# The metadata WAL truncates genuinely torn tails too; interior WAL damage
+# or oversized trailing bytes refuse boot instead.
+
 # Memory pool configuration
 [system.memory_pool]
 # Enables or disables the memory pool (boolean).
@@ -559,6 +623,15 @@ repair_retry_interval = "1s"
 # the queue and drops frames. Must be > 0 and <= 1024.
 repair_chunk_max = 128
 
+# How long the metadata superblock may stay unwritable before the replica
+# fail-stops (duration). A replica that cannot persist its view is already
+# fenced quorum-invisible and retries with capped backoff; past this window the
+# process exits with a distinct status so a supervisor restarts or replaces it
+# instead of an operator finding the wedge in logs. "0" disables the fail-stop
+# and leaves the replica fenced indefinitely. Nonzero values must be at least
+# 30s so a transient disk hiccup cannot kill the process.
+superblock_wedged_fatal_timeout = "2m"
+
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
 # When true, every replica peer must complete the authenticated handshake or be
@@ -612,6 +685,19 @@ key_file = ""
 # carrying matching IP SANs. Hostname-only certificates fail verification;
 # use hostnames in the roster if the certificates only have DNS SANs.
 ca_file = ""
+
+# Shard-0 coordinator placement.
+[cluster.coordinator]
+# When the server runs more than one shard, exclude shard 0 from replica
+# placement. Shard 0 already hosts the coordinator, the metadata writer, and
+# both listeners; replica connections are long-lived steady flows, so they are
+# offloaded to peer shards by default.
+skip_shard_zero_for_replicas = true
+
+# When the server runs more than one shard, exclude shard 0 from client
+# placement. Off by default: client connections are short-lived and benefit
+# from shard-0 parallelism more than replicas do.
+skip_shard_zero_for_clients = false
 
 # Full roster of cluster members. Byte-identical on every node. The running
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
@@ -725,14 +811,20 @@ cpu_allocation = "numa:auto"
 # process onto the same low-numbered cores.
 pin_cores = true
 
-# Per-shard inter-shard inbox capacity. Bounded by design: consensus-frame
-# drops recover via VSR retransmit, but cross-shard client-reply drops are
-# terminal. Size for the worst-case sum of both: the consensus working set
-# (~ the prepare queue depth of the planes the shard hosts - [metadata] on
-# shard 0, [partition] elsewhere - times replica_count times directions) plus
-# peak client-reply fan-out per shard. Both depths are tunable, so raising
-# either raises the capacity needed here.
+# Per-shard inter-shard inbox capacity (the main lane: consensus frames,
+# connection setup, reconcile wakes). Bounded by design; consensus-frame
+# drops recover via VSR retransmit. Size for the consensus working set:
+# ~ the prepare queue depth of the planes the shard hosts ([metadata] on
+# shard 0, [partition] elsewhere) times replica_count times directions.
+# Both depths are tunable, so raising either raises the capacity needed here.
 inbox_capacity = 1024
+
+# Capacity of the reply lane: a separate bounded channel for cross-shard
+# client-reply forwards, whose drops are terminal (no in-protocol
+# retransmit - the client never receives the reply). Split from
+# inbox_capacity so a consensus burst cannot evict reply forwards; size for
+# peak client-reply fan-out per shard.
+reply_inbox_capacity = 1024
 
 # Wall-clock budget for a single shard's bus drain on shutdown. Drives
 # the per-shard watchdog and the parallel-join survivor path; sized
@@ -892,10 +984,11 @@ transfer_served_cache_bytes_max = "2176 MiB"
 #
 # The shipped value sits EXACTLY at that floor: 1024 MiB + the shipped 64 MiB
 # max_message_size. Raising max_message_size alone therefore refuses boot --
-# raise this one by the same amount in the same edit. Raising it above the floor
-# for headroom also DIVIDES the serving concurrency derived from
-# transfer_served_cache_bytes_max above, so raise that in step. Must be > 0 and
-# <= "64 GiB".
+# raise this one by the same amount in the same edit (max_message_size itself
+# tops out at the frozen 256 MiB recovery ceiling; see its own note). Raising
+# this above the floor for headroom also DIVIDES the serving concurrency
+# derived from transfer_served_cache_bytes_max above, so raise that in step.
+# Must be > 0 and <= "64 GiB".
 transfer_artifact_bytes_max = "1088 MiB"
 
 # Message bus configuration.
@@ -910,7 +1003,11 @@ transfer_artifact_bytes_max = "1088 MiB"
 # call. Hard upper bound: IOV_MAX/2 = 512 on Linux.
 max_batch = 256
 
-# Wire-level cap on a single framed message.
+# Wire-level cap on a single framed message. Boot refuses a value above the
+# frozen 256 MiB ceiling: segment recovery derives fixed scan and allocation
+# limits from the widest LEGAL record, so batches admitted above the ceiling
+# would be refused as implausible on a later boot. Raising it past 64 MiB
+# also breaks Go clients, whose frame cap is a hard 64 MiB constant.
 max_message_size = "64 MiB"
 
 # Bound on the per-peer mpsc queue. The writer task drains; the

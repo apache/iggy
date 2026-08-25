@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 export const translateErrorCode = (code: number): string => {
   switch (code.toString()) {
@@ -222,6 +221,7 @@ export const translateErrorCode = (code: number): string => {
     case '4057': return "Producer closed";
     case '4100': return "Invalid offset: {0}";
     case '4101': return "Invalid reserved field value: {0}, expected: 0";
+    case '4102': return "Segment file size on disk: {0} does not match expected size: {1}";
 
     // CONSUMER GROUP
     case '5000': return "Consumer group with ID: {0} for topic with ID: {1} was not found.";

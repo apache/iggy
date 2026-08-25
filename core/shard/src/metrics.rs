@@ -31,18 +31,16 @@
 //!   this shard's own inbox was refused.
 //!
 //! The counter uses atomic interior mutability, safe to bump from `!Send`
-//! compio reactor contexts. Each shard owns its own instance. It is not
-//! yet exposed through a scrape endpoint; every drop site also logs via
-//! `tracing`, so the counter is a structured complement to those logs
-//! until a per-shard exporter lands.
-//!
-//! TODO(hubcio): register `frame_drops_total` with a per-shard prometheus
-//! exporter so the counter is scrape-able; until then the `tracing`
-//! drop-site logs are the only alertable signal.
+//! compio reactor contexts. Each shard owns its own instance, and the server
+//! exposes every shard's instance through the `[http.metrics]` scrape
+//! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
+//! sub-registry per shard); every drop site also logs via `tracing`.
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::registry::Registry;
+use std::sync::{Arc, OnceLock};
 
 /// Label for `frame_drops_total`.
 ///
@@ -71,9 +69,9 @@ pub struct FrameDropLabel {
 /// closure fails. Unlike `CONSENSUS` drops (which VSR retransmit
 /// recovers), a `FORWARD_CLIENT_SEND` drop is terminal: the client never
 /// receives the reply and request / response semantics break above the
-/// bus. Operators should alert on the drop-site `tracing` logs (the
-/// counter is not scrape-able yet, see the module doc) and size
-/// `inbox_capacity` for the worst-case cross-shard reply burst.
+/// bus. Operators should alert on this pair in the scrape (backed by the
+/// drop-site `tracing` logs) and size `inbox_capacity` for the worst-case
+/// cross-shard reply burst.
 /// `FORWARD_REPLICA_SEND` is the symmetric variant for replica forwards;
 /// VSR retransmit covers its loss so it stays informational.
 ///
@@ -122,6 +120,14 @@ pub mod frame_drop_variant {
 /// replicated traffic has nobody to answer, so this is the only record the op
 /// was destroyed.
 pub mod frame_drop_reason {
+    /// Operation discriminant unknown to this build: the sender is newer.
+    ///
+    /// Distinct from `UNPARSABLE` because upgrading this node is the fix, and
+    /// until it is, the frame's consensus group gap-stops here.
+    pub const UNSUPPORTED_OPERATION: &str = "unsupported_operation";
+    /// A consensus frame failed typed decode for any other reason (corrupt
+    /// header, bad size, client-bound command on the inbound path).
+    pub const UNPARSABLE: &str = "unparsable";
     pub const FULL: &str = "full";
     pub const DISCONNECTED: &str = "disconnected";
     pub const UNROUTABLE: &str = "unroutable";
@@ -131,12 +137,12 @@ pub mod frame_drop_reason {
     pub const PARK_DROPPED: &str = "park_dropped";
 }
 
-// Minted in full, so 7 x 7 includes pairs no drop site produces:
-// `park_overflow` and `park_dropped` pair only with `PARTITION`, leaving 12
-// unreachable. Free while nothing scrapes these (module `TODO(hubcio)`); mint
-// per drop site once a registry lands, so the scrape carries no permanent zeroes.
+// The tables only index the lazy fast-path cache below; a `{variant, reason}`
+// pair enters the `Family` (and therefore the scrape) the first time a drop
+// site actually produces it, so the unreachable corners of the 7 x 9 cross
+// product never appear as permanent zero-valued series.
 const VARIANT_COUNT: usize = 7;
-const REASON_COUNT: usize = 7;
+const REASON_COUNT: usize = 9;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::CONSENSUS,
@@ -149,6 +155,8 @@ const VARIANTS: [&str; VARIANT_COUNT] = [
 ];
 
 const REASONS: [&str; REASON_COUNT] = [
+    frame_drop_reason::UNSUPPORTED_OPERATION,
+    frame_drop_reason::UNPARSABLE,
     frame_drop_reason::FULL,
     frame_drop_reason::DISCONNECTED,
     frame_drop_reason::UNROUTABLE,
@@ -169,11 +177,14 @@ fn reason_index(s: &str) -> Option<usize> {
 /// Per-shard metric handles.
 ///
 /// Cheap to clone (`Arc` of a `Family` under the hood). Each shard owns
-/// one instance produced by [`ShardMetrics::for_shard`]. The
-/// `VARIANT_COUNT * REASON_COUNT` cross product of `Counter`s is minted
-/// at construction so the drop-site hot path never re-enters
-/// `Family::get_or_create` (which acquires a `RwLock` read guard per
-/// drop and stalls under VSR retransmit / drop-burst storms).
+/// one instance produced by [`ShardMetrics::for_shard`]. A known
+/// `{variant, reason}` pair's `Counter` is minted through
+/// `Family::get_or_create` (a `RwLock` read guard, too dear per drop
+/// under VSR retransmit / drop-burst storms) exactly once, on the pair's
+/// first drop, and cached; later drops are an array index + atomic
+/// increment. Lazy rather than pre-minted so a pair no drop site produces
+/// never enters the family, keeping the scrape free of permanent
+/// zero-valued series.
 ///
 /// `partitions_materialised_total` / `partitions_removed_total` /
 /// `partitions_reconcile_failures_total` are simple unlabelled counters
@@ -182,7 +193,7 @@ fn reason_index(s: &str) -> Option<usize> {
 #[derive(Clone)]
 pub struct ShardMetrics {
     frame_drops_total: Family<FrameDropLabel, Counter>,
-    cached_counters: [[Counter; REASON_COUNT]; VARIANT_COUNT],
+    cached_counters: Arc<[[OnceLock<Counter>; REASON_COUNT]; VARIANT_COUNT]>,
     partitions_materialised_total: Counter,
     partitions_removed_total: Counter,
     partitions_reconcile_failures_total: Counter,
@@ -198,23 +209,12 @@ impl ShardMetrics {
     /// Create a metrics handle for a shard. The handle is per-shard by
     /// virtue of being constructed once per shard; the shard id does not
     /// appear in the label set (see [`FrameDropLabel`] doc).
-    ///
-    /// All `VARIANT_COUNT * REASON_COUNT` counters are pre-registered
-    /// with the underlying [`Family`] so the drop-site hot path is a
-    /// constant-time array index + atomic increment.
     #[must_use]
     pub fn for_shard() -> Self {
         let frame_drops_total: Family<FrameDropLabel, Counter> = Family::default();
-        let cached_counters = std::array::from_fn(|v_idx| {
-            std::array::from_fn(|r_idx| {
-                frame_drops_total
-                    .get_or_create(&FrameDropLabel {
-                        variant: VARIANTS[v_idx],
-                        reason: REASONS[r_idx],
-                    })
-                    .clone()
-            })
-        });
+        let cached_counters = Arc::new(std::array::from_fn(|_| {
+            std::array::from_fn(|_| OnceLock::new())
+        }));
         Self {
             frame_drops_total,
             cached_counters,
@@ -239,7 +239,13 @@ impl ShardMetrics {
     /// to extend the const tables above.
     pub fn record_frame_drop(&self, variant: &'static str, reason: &'static str) {
         if let (Some(v_idx), Some(r_idx)) = (variant_index(variant), reason_index(reason)) {
-            self.cached_counters[v_idx][r_idx].inc();
+            self.cached_counters[v_idx][r_idx]
+                .get_or_init(|| {
+                    self.frame_drops_total
+                        .get_or_create(&FrameDropLabel { variant, reason })
+                        .clone()
+                })
+                .inc();
         } else {
             self.frame_drops_total
                 .get_or_create(&FrameDropLabel { variant, reason })
@@ -304,10 +310,6 @@ impl ShardMetrics {
     /// (delete + recreate recycled the namespace's slab keys). Serving it would
     /// have written a dead topic's op into the topic that replaced it, so a
     /// non-zero value is a caught correctness anomaly, not routine churn.
-    ///
-    /// Like every counter in this module it is not scrape-able yet (see the
-    /// module-level `TODO(hubcio)`); the `warn!` at the reject site is what an
-    /// operator can actually alert on today.
     pub fn record_partition_frame_rejected_stale(&self) {
         self.partition_frames_rejected_stale_total.inc();
     }
@@ -334,6 +336,7 @@ impl ShardMetrics {
         self.cached_counters
             .iter()
             .flatten()
+            .filter_map(OnceLock::get)
             .map(prometheus_client::metrics::counter::Counter::get)
             .sum()
     }
@@ -425,9 +428,69 @@ impl ShardMetrics {
     #[must_use]
     pub fn frame_drop_count(&self, variant: &'static str, reason: &'static str) -> u64 {
         match (variant_index(variant), reason_index(reason)) {
-            (Some(v_idx), Some(r_idx)) => self.cached_counters[v_idx][r_idx].get(),
+            (Some(v_idx), Some(r_idx)) => self.cached_counters[v_idx][r_idx]
+                .get()
+                .map_or(0, prometheus_client::metrics::counter::Counter::get),
             _ => 0,
         }
+    }
+
+    /// Register every metric this handle owns with `registry`, which the
+    /// server scopes per shard (a `shard`-labelled sub-registry) before the
+    /// `[http.metrics]` scrape encodes it. Names are registered without the
+    /// `_total` suffix; the prometheus text exposition appends it for
+    /// counters.
+    pub fn register(&self, registry: &mut Registry) {
+        registry.register(
+            "frame_drops",
+            "frames shed instead of delivered, by frame class and refusal reason",
+            self.frame_drops_total.clone(),
+        );
+        registry.register(
+            "partitions_materialised",
+            "partitions materialised by the reconciliation loop",
+            self.partitions_materialised_total.clone(),
+        );
+        registry.register(
+            "partitions_removed",
+            "partitions dropped after their namespace left the committed metadata",
+            self.partitions_removed_total.clone(),
+        );
+        registry.register(
+            "partitions_reconcile_failures",
+            "partition build or delete attempts the reconciler will retry",
+            self.partitions_reconcile_failures_total.clone(),
+        );
+        registry.register(
+            "partitions_duplicate_builds_discarded",
+            "duplicate partition builds discarded by the pump; non-zero is a caught anomaly",
+            self.partitions_duplicate_builds_discarded_total.clone(),
+        );
+        registry.register(
+            "partition_transfer_refusals",
+            "partition state transfers refused by the serving peer",
+            self.partition_transfer_refusals_total.clone(),
+        );
+        registry.register(
+            "partition_frames_rejected_stale",
+            "parked frames rejected for a dead incarnation; non-zero is a caught anomaly",
+            self.partition_frames_rejected_stale_total.clone(),
+        );
+        registry.register(
+            "partition_frames_rejected_ahead",
+            "parked frames rejected for an epoch ahead of the materialised one",
+            self.partition_frames_rejected_ahead_total.clone(),
+        );
+        registry.register(
+            "partition_requests_denied_transient",
+            "partition requests answered with a retriable transient denial",
+            self.partition_requests_denied_transient_total.clone(),
+        );
+        registry.register(
+            "partition_repair_serves_deferred_purge",
+            "partition repair serves or completions deferred until a committed purge applies",
+            self.partition_repair_serves_deferred_purge_total.clone(),
+        );
     }
 }
 
@@ -464,6 +527,28 @@ mod tests {
             ),
             1,
             "a distinct reason gets its own counter",
+        );
+    }
+
+    #[test]
+    fn unproduced_pairs_never_enter_the_scrape() {
+        // The lazy fast-path cache must not mint the full variant x reason
+        // cross product: a pair no drop site produced would otherwise sit in
+        // every scrape as a permanent zero-valued series.
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::FULL);
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        assert!(
+            buffer.contains(frame_drop_variant::CONSENSUS),
+            "the produced pair must appear in the scrape",
+        );
+        assert!(
+            !buffer.contains(frame_drop_reason::PARK_OVERFLOW),
+            "a pair no drop site produced must not appear in the scrape",
         );
     }
 

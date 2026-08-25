@@ -22,7 +22,7 @@
 //! state, so the op commits as a deterministic no-op whose error rides the
 //! cached reply and replays on retry, exactly like a business rejection.
 //!
-//! Replay-determinism invariant: [`authorize`] is a pure function of the
+//! Replay-determinism invariant: `authorize` is a pure function of the
 //! prepare header (`operation` + the acting `user_id`, stamped into the
 //! replicated header at submit time) and the committed permission/stream
 //! state as of the op immediately before this one. That state is applied in
@@ -83,7 +83,7 @@ where
     mux.update(prepare)
 }
 
-/// Generic entry point to [`gated_apply`] for the WAL-replay path.
+/// Generic entry point to `gated_apply` for the WAL-replay path.
 ///
 /// The replay path is generic over the state machine and cannot name the
 /// concrete accessors, so it dispatches through this trait. Implemented only
@@ -92,7 +92,7 @@ where
 pub trait GatedApply:
     StateMachine<Input = Message<PrepareHeader>, Output = ApplyReply, Error = IggyError>
 {
-    /// See [`gated_apply`].
+    /// See `gated_apply`.
     ///
     /// # Errors
     /// Propagates the underlying [`StateMachine::update`] error.

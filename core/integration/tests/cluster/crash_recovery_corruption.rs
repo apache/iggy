@@ -302,8 +302,8 @@ fn flip_interior_byte(path: &Path, numerator: u64, denominator: u64) {
 }
 
 /// Byte-compare the partition segment `.log` files across all nodes, panicking
-/// with `defect` (the named bug) plus a per-file diff on divergence.
-fn assert_segment_logs_identical(data_paths: &[PathBuf], defect: &str) {
+/// with the violated `invariant` plus a per-file diff on divergence.
+fn assert_segment_logs_identical(data_paths: &[PathBuf], invariant: &str) {
     let per_node: Vec<_> = data_paths
         .iter()
         .map(|root| disk::collect_comparable_files(root, false))
@@ -324,27 +324,19 @@ fn assert_segment_logs_identical(data_paths: &[PathBuf], defect: &str) {
             }
         }
     }
-    assert!(problems.is_empty(), "{defect}:\n{}", problems.join("\n"));
+    assert!(problems.is_empty(), "{invariant}:\n{}", problems.join("\n"));
 }
 
-/// RED SPEC, expected to FAIL: a torn tail of garbage on the active segment
-/// `.log` must be truncated for good by recovery. Recovery does walk whole
-/// batches and computes the correct pre-garbage size, but reopening the
-/// segment re-stats the RAW file length into the writer's size counter
-/// (`MessagesWriter::new` with `file_exists = true`), while the recovered
-/// segment metadata keeps the walked size. Post-recovery appends then land at
-/// the raw position (after the resurrected garbage) while their index entries
-/// record the walked position, so every new index entry points below where
-/// its bytes physically landed and the NEXT recovery refuses the segment as
-/// message/index divergence. One torn tail on one replica permanently bricks
-/// that node's next restart.
-///
-/// The refusal also provokes a distinct defect this spec does not assert:
-/// the owner shard's boot refusal cascades the surviving shards into
-/// metadata STM read-handle panics (`ShardBootstrapBarrierAborted`, then
-/// `ShardPumpDied`) instead of a clean fail-stop.
-// TODO(hubcio): fix this test
-#[ignore = "torn .log tail re-stated into the size counter bricks the next restart"]
+/// A torn tail of garbage on the active segment `.log` must be truncated for
+/// good by recovery: the walked bounds govern both the on-disk length and the
+/// reopened write cursor, so post-recovery appends land exactly where their
+/// index entries point. The spec asserts the outcomes that used to break: the
+/// node survives its NEXT restart (a stale cursor bricked it as message/index
+/// divergence), every acked offset still reads back, and the at-rest `.log`
+/// bytes stay identical across replicas (resurrected garbage diverged them).
+// TODO(hubcio): both torn-tail specs tear a BACKUP; add a primary-side
+// variant (tear the leader's segment, restart it) since the leader path
+// exercises different reopen and catch-up code.
 #[iggy_harness(cluster_nodes = 3)]
 async fn given_a_torn_segment_tail_when_a_node_recovers_should_keep_size_counter_consistent(
     harness: &mut TestHarness,
@@ -364,7 +356,15 @@ async fn given_a_torn_segment_tail_when_a_node_recovers_should_keep_size_counter
         .await;
     }
 
-    let (_, backup) = pick_backup(harness).await;
+    // The setup client is pinned to node 0, which is the backup whenever the
+    // leader sits elsewhere; harness clients never reconnect, so swap to a
+    // producer on the leader, which stays up across both backup restarts.
+    drop(client);
+    let (leader, backup) = pick_backup(harness).await;
+    let client = harness
+        .root_client_for_node(leader)
+        .await
+        .expect("connect a producer to the leader");
     harness.stop_node(backup).expect("stop the backup");
     let segment_log = find_active_segment_file(&harness.node(backup).data_path(), "log");
     append_garbage(&segment_log, TORN_LOG_GARBAGE);
@@ -388,13 +388,8 @@ async fn given_a_torn_segment_tail_when_a_node_recovers_should_keep_size_counter
 
     harness.restart_node(backup).unwrap_or_else(|error| {
         panic!(
-            "the second recovery over a repaired torn tail must boot cleanly, but the \
-             segment reopen re-stats the raw file length (garbage included) into the \
-             messages writer while the recovered segment metadata keeps the walked \
-             size, so post-recovery appends land after the resurrected garbage and \
-             their index entries point below where the bytes physically landed; the \
-             next boot then refuses the segment as message/index divergence and the \
-             node cannot restart over its own data; boot error: {error}"
+            "a node must restart cleanly over a segment it repaired and then \
+             appended to; boot error: {error}"
         )
     });
     let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
@@ -416,25 +411,18 @@ async fn given_a_torn_segment_tail_when_a_node_recovers_should_keep_size_counter
         .expect("stop the cluster for the at-rest comparison");
     assert_segment_logs_identical(
         &data_paths,
-        "the torn segment tail was resurrected into the live byte range: recovery \
-         computes the valid size by walking whole batches past the garbage, but the \
-         segment reopen re-stats the raw file length into the shared size counter, \
-         so subsequent appends land after the garbage and this replica's segment \
-         bytes diverge from its peers for the same acked history",
+        "segment .log files must stay byte-identical across replicas after a \
+         torn-tail recovery",
     );
 }
 
-/// RED SPEC, expected to FAIL: a torn tail on the segment `.index` (10 bytes,
-/// not a multiple of the 24-byte entry stride) must not poison later entries.
-/// The first recovery ignores the partial tail (whole-entry floor division) and
-/// boots, but the index reopen re-stats the RAW length and appends every new
-/// entry at that unaligned position, while every reader addresses entries as
-/// stride-from-0. The next recovery then decodes a garbage-straddling entry as
-/// the last flush and refuses the partition (or serves misresolved reads).
-/// The refusal provokes the same unasserted shard-cascade defect as the torn
-/// `.log` spec above.
-// TODO(hubcio): fix this test
-#[ignore = "torn .index tail misaligns subsequent entries off the 24-byte stride"]
+/// A torn tail on the segment `.index` (10 bytes, not a multiple of the
+/// 24-byte entry stride) must not poison later entries: recovery floors the
+/// index to whole entries and truncates the partial tail off the file, so
+/// every subsequent entry keeps the stride-from-0 addressing readers assume.
+/// The spec asserts the node survives its NEXT restart (an unaligned write
+/// cursor used to make the following recovery decode a garbage-straddling
+/// entry and refuse the partition) and every acked offset still reads back.
 #[iggy_harness(cluster_nodes = 3)]
 async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subsequent_entries(
     harness: &mut TestHarness,
@@ -454,7 +442,15 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
         .await;
     }
 
-    let (_, backup) = pick_backup(harness).await;
+    // The setup client is pinned to node 0, which is the backup whenever the
+    // leader sits elsewhere; harness clients never reconnect, so swap to a
+    // producer on the leader, which stays up across both backup restarts.
+    drop(client);
+    let (leader, backup) = pick_backup(harness).await;
+    let client = harness
+        .root_client_for_node(leader)
+        .await
+        .expect("connect a producer to the leader");
     harness.stop_node(backup).expect("stop the backup");
     let segment_index = find_active_segment_file(&harness.node(backup).data_path(), "index");
     append_garbage(&segment_index, TORN_INDEX_GARBAGE);
@@ -476,11 +472,8 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
 
     harness.restart_node(backup).unwrap_or_else(|error| {
         panic!(
-            "the recovery after a torn index tail must not misalign subsequent index \
-             entries: the index reopen re-stats the raw (unaligned) file length and \
-             appends new entries off the 24-byte stride, while recovery reads entries \
-             as stride-from-0, so the second boot decodes a garbage-straddling entry \
-             and refuses the segment; boot error: {error}"
+            "a node must restart cleanly over an index it repaired and then \
+             appended to; boot error: {error}"
         )
     });
 
@@ -489,11 +482,7 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
     wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
         .await
         .unwrap_or_else(|state| {
-            panic!(
-                "every acked offset must poll back after the torn-index recovery \
-                 (index entries misaligned off the 24-byte stride misresolve reads): \
-                 {state}"
-            )
+            panic!("every acked offset must poll back after the torn-index recovery: {state}")
         });
 }
 

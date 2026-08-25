@@ -417,7 +417,7 @@ mod tests {
     fn build_senders(total: u16) -> Rc<Vec<TaggedSender>> {
         let mut senders = Vec::with_capacity(total as usize);
         for shard_id in 0..total {
-            let (tx, _rx) = crate::shard_channel(shard_id, 16);
+            let (tx, _rx, _reply_rx) = crate::shard_channel(shard_id, 16, 16);
             senders.push(tx);
         }
         Rc::new(senders)
@@ -429,7 +429,7 @@ mod tests {
         let mut senders = Vec::with_capacity(total as usize);
         let mut receivers = Vec::with_capacity(total as usize);
         for shard_id in 0..total {
-            let (tx, rx) = crate::shard_channel(shard_id, 16);
+            let (tx, rx, _reply_rx) = crate::shard_channel(shard_id, 16, 16);
             senders.push(tx);
             receivers.push(rx);
         }
@@ -440,10 +440,10 @@ mod tests {
     fn ctor_rejects_permuted_sender_vec() {
         // Build senders in correct order, then swap two entries so the
         // indexed position no longer matches the tagged shard id.
-        let (tx0, _rx0) = crate::shard_channel(0, 16);
-        let (tx1, _rx1) = crate::shard_channel(1, 16);
-        let (tx2, _rx2) = crate::shard_channel(2, 16);
-        let (tx3, _rx3) = crate::shard_channel(3, 16);
+        let (tx0, _rx0, _reply_rx0) = crate::shard_channel(0, 16, 16);
+        let (tx1, _rx1, _reply_rx1) = crate::shard_channel(1, 16, 16);
+        let (tx2, _rx2, _reply_rx2) = crate::shard_channel(2, 16, 16);
+        let (tx3, _rx3, _reply_rx3) = crate::shard_channel(3, 16, 16);
         let permuted = Rc::new(vec![tx0, tx2, tx1, tx3]);
         let result = ShardZeroCoordinator::new(
             permuted,

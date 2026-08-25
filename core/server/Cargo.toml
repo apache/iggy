@@ -192,3 +192,6 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 enum_glob_use = "deny"
 pedantic = "deny"
 nursery = "warn"
+
+[lints.rust]
+warnings = "deny"

@@ -20,7 +20,7 @@ use iggy_binary_protocol::ReplyHeader;
 use iggy_common::{IggyByteSize, PollingStrategy};
 use partitions::{PollingArgs, PollingConsumer};
 use server_common::sharding::IggyNamespace;
-use server_common::{MemoryPool, MemoryPoolConfigOther, Message};
+use server_common::{MemoryPool, MemoryPoolSettings, Message};
 use simulator::Simulator;
 use simulator::client::SimClient;
 use simulator::packet::PacketSimulatorOptions;
@@ -41,7 +41,7 @@ fn step_until_reply(sim: &mut Simulator, max_ticks: u64) -> Vec<Message<ReplyHea
 fn main() {
     // PooledBuffer::from (used by poll_messages) panics if the global pool is uninitialized.
     // Disabled pooling just falls through to the system allocator.
-    MemoryPool::init_pool(&MemoryPoolConfigOther {
+    MemoryPool::init_pool(&MemoryPoolSettings {
         enabled: false,
         size: IggyByteSize::from(0u64),
         bucket_capacity: 1,
