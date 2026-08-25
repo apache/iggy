@@ -135,7 +135,14 @@ impl ConnectorsIggyClient {
             .map(|_| ())
     }
 
-    async fn get_messages(&self) -> Result<PolledMessages, iggy_common::IggyError> {
+    /// Poll up to `count` messages from the configured stream/topic.
+    ///
+    /// `count` is the caller's, because it bounds how much a collect-until-N loop
+    /// can drain per attempt: a batch smaller than what the caller waits for turns
+    /// the loop's attempt budget into a cap on the total it can ever see, so the
+    /// test fails on a slow runner even though the source delivered everything.
+    /// Sibling source tests poll in batches of 100.
+    async fn get_messages(&self, count: u32) -> Result<PolledMessages, iggy_common::IggyError> {
         self.client
             .poll_messages(
                 &self.stream.clone().try_into().unwrap(),
@@ -143,7 +150,7 @@ impl ConnectorsIggyClient {
                 None,
                 &iggy_common::Consumer::new("test_consumer".try_into().unwrap()),
                 &iggy_common::PollingStrategy::next(),
-                10,
+                count,
                 true,
             )
             .await

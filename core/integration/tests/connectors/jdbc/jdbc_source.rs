@@ -32,10 +32,18 @@ const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "postgres";
 const POSTGRES_DB: &str = "postgres";
 
-/// Maximum number of poll attempts before giving up
-const POLL_ATTEMPTS: usize = 30;
+/// How long to wait for the source to deliver what a test expects.
+///
+/// A deadline, not an attempt count: an attempt count doubles as a cap on the
+/// total a collect-until-N loop can ever drain (attempts x batch size), so a
+/// test asking for more than a fraction of that cap fails on a slow runner even
+/// though the source delivered everything.
+const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay between poll attempts
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Messages requested per poll, kept well above any single expectation below so
+/// the deadline alone bounds how long the source may take.
+const POLL_BATCH: u32 = 500;
 
 /// Setup Postgres container with test data
 async fn setup_postgres_container()
@@ -207,15 +215,18 @@ fn build_jdbc_env(
     envs
 }
 
-/// Poll messages from Iggy with retry logic, returning deserialized JSON values.
+/// Poll until at least `expected_count` messages have been collected or
+/// `POLL_TIMEOUT` elapses, returning them deserialized.
 async fn poll_messages_with_retry(
     client: &crate::connectors::ConnectorsIggyClient,
     expected_count: usize,
 ) -> Vec<serde_json::Value> {
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut received: Vec<serde_json::Value> = Vec::new();
-    for attempt in 0..POLL_ATTEMPTS {
+
+    loop {
         let polled_messages = client
-            .get_messages()
+            .get_messages(POLL_BATCH)
             .await
             .expect("Failed to poll messages");
 
@@ -226,18 +237,16 @@ async fn poll_messages_with_retry(
         }
 
         if received.len() >= expected_count {
-            info!(
-                "Received {} messages after {} attempts",
-                received.len(),
-                attempt + 1
-            );
+            info!("Received {} messages", received.len());
+            return received;
+        }
+
+        if Instant::now() >= deadline {
             return received;
         }
 
         sleep(POLL_INTERVAL).await;
     }
-
-    received
 }
 
 /// Setup connector runtime with JDBC source for Postgres
@@ -415,29 +424,17 @@ fn pg_sqlx_url(jdbc_url: &str) -> String {
     format!("postgres://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{host_and_db}")
 }
 
-/// Collect the `data.id` integer from each polled (metadata-wrapped) message.
-fn collect_ids(messages: &[serde_json::Value]) -> Vec<i64> {
-    messages
-        .iter()
-        .filter_map(|m| {
-            m.get("data")
-                .and_then(|d| d.get("id"))
-                .and_then(|v| v.as_i64())
-        })
-        .collect()
-}
-
 /// Poll until every id in `expected` has been seen, or `timeout` elapses.
 /// Returns the distinct ids seen, ascending, plus the raw number of messages
 /// received.
 ///
-/// Bulk mode re-runs its query on every poll interval, so it keeps re-delivering
-/// the same rows for as long as the source runs. Matching on the distinct ids
-/// seen, rather than on a fixed-length prefix of the received messages, keeps a
-/// second re-delivered batch from failing an otherwise healthy run. The returned
-/// count separates "the source delivered nothing" from "it delivered messages
-/// that did not carry the expected `data.id`", which a bare id list cannot
-/// express: `collect_ids` drops unmatched messages silently.
+/// A source can deliver a row more than once: bulk mode re-runs its query every
+/// poll interval, and delivery is at-least-once, so a nacked batch is re-read.
+/// Matching on the distinct ids seen, rather than on a fixed-length prefix of the
+/// received messages, keeps a re-delivered batch from failing an otherwise
+/// healthy run. The returned count separates "the source delivered nothing" from
+/// "it delivered messages that did not carry the expected `data.id`", which a
+/// bare id list cannot express: unmatched messages are dropped silently.
 async fn poll_until_ids_seen(
     client: &crate::connectors::ConnectorsIggyClient,
     expected: &[i64],
@@ -449,7 +446,7 @@ async fn poll_until_ids_seen(
 
     loop {
         let polled_messages = client
-            .get_messages()
+            .get_messages(POLL_BATCH)
             .await
             .expect("Failed to poll messages");
 
@@ -513,10 +510,13 @@ async fn incremental_mode_advances_offset_across_polls() {
             .expect("Failed to setup runtime");
 
     // First batch: ids 1..3.
-    let first = poll_messages_with_retry(&client, 3).await;
-    let mut first_ids = collect_ids(&first);
-    first_ids.sort_unstable();
-    assert_eq!(first_ids, vec![1, 2, 3], "Expected ids 1,2,3 on first poll");
+    let (first_ids, first_received) = poll_until_ids_seen(&client, &[1, 2, 3], POLL_TIMEOUT).await;
+    assert_eq!(
+        first_ids,
+        vec![1, 2, 3],
+        "Expected ids 1,2,3 on the first poll; got ids {first_ids:?} from {first_received} \
+         received message(s)"
+    );
 
     // Insert more rows; only these (id > last_offset) should arrive next.
     sqlx::query("INSERT INTO inc_test (id, name) VALUES (4, 'd'), (5, 'e')")
@@ -524,13 +524,12 @@ async fn incremental_mode_advances_offset_across_polls() {
         .await
         .expect("Failed to insert additional rows");
 
-    let second = poll_messages_with_retry(&client, 2).await;
-    let mut second_ids = collect_ids(&second);
-    second_ids.sort_unstable();
+    let (second_ids, second_received) = poll_until_ids_seen(&client, &[4, 5], POLL_TIMEOUT).await;
     assert_eq!(
         second_ids,
         vec![4, 5],
-        "Expected only the new ids 4,5 (offset must have advanced past 3), got {second_ids:?}"
+        "Expected only the new ids 4,5 (offset must have advanced past 3); got ids \
+         {second_ids:?} from {second_received} received message(s)"
     );
 }
 
@@ -639,8 +638,7 @@ async fn source_recovers_after_repeated_query_errors() {
         .await
         .expect("Failed to insert rows");
 
-    let (ids, received) =
-        poll_until_ids_seen(&client, &[1, 2], POLL_INTERVAL * POLL_ATTEMPTS as u32).await;
+    let (ids, received) = poll_until_ids_seen(&client, &[1, 2], POLL_TIMEOUT).await;
     assert_eq!(
         ids,
         vec![1, 2],
@@ -694,7 +692,7 @@ async fn bulk_result_larger_than_batch_size_fails_closed() {
     // nothing, and in particular never the truncated 2-row subset.
     sleep(Duration::from_secs(4)).await;
     let polled = client
-        .get_messages()
+        .get_messages(POLL_BATCH)
         .await
         .expect("Failed to poll messages");
     assert!(
