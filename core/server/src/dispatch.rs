@@ -54,8 +54,9 @@ use crate::wire::{request_body, usize_to_u32, verify_request_checksum};
 use bytes::Bytes;
 use configs::server::ServerSystemConfig;
 use consensus::{
-    Consensus, EvictionContext, MetadataHandle, PartitionsHandle, build_eviction_message,
-    build_incompatible_protocol_eviction_message, build_result_rejection_reply,
+    Consensus, DISCONNECT_LOGOUT_REQUEST_ID, EvictionContext, MetadataHandle, PartitionsHandle,
+    build_eviction_message, build_incompatible_protocol_eviction_message,
+    build_result_rejection_reply,
 };
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
@@ -3415,12 +3416,9 @@ fn submit_disconnect_logout<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // Synthetic request id: header validation rejects `request == 0` for
-    // non-register ops, and a disconnect has no client-issued request id.
-    // The logout apply keys on (client, session) only, so any non-zero id
-    // is valid here.
-    const DISCONNECT_LOGOUT_REQUEST_ID: u64 = u64::MAX;
-
+    // The sentinel request id is what the apply path reads to keep, rather
+    // than drop, the session's dedup fence: the client may be reconnecting
+    // under the same key, and its retry must still be answered.
     let bus = shard.bus.clone();
     bus.spawn(async move {
         if let Err(error) =
