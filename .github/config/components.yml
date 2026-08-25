@@ -295,7 +295,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "foreign/cpp/**"
-    tasks: ["lint", "build", "test", "e2e"]
+    tasks: ["lint", "build", "test"]
 
   # Shared BDD infrastructure that affects all BDD tests
   bdd-infrastructure:

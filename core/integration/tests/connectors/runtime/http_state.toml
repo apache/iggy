@@ -15,37 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Bazel configuration for iggy C++ bindings
+[connectors]
+config_type = "local"
+config_dir = "tests/connectors/runtime/http_state_config"
 
-# Enable BzlMod
-common --enable_bzlmod
+# The state server URL is injected per test via IGGY_CONNECTORS_STATE_HTTP_URL.
+[state]
+storage = "http"
 
-# Default test behavior
-test --test_output=errors
-test --cache_test_results=no
+[state.http]
+timeout = "2s"
 
-# Debug configuration
-build:debug --compilation_mode=dbg
-build:debug --copt=-g3
-build:debug --copt=-O0
-build:debug --copt=-fno-omit-frame-pointer
-build:debug --copt=-DDEBUG
-build:debug --strip=never
-build:debug --linkopt=-g
-
-# Release configuration
-build:release --compilation_mode=opt
-build:release --copt=-O2
-build:release --copt=-DNDEBUG
-build:release --strip=always
-
-# CI configuration
-common:ci --color=no
-common:ci --curses=no
-common:ci --announce_rc
-
-build:ci --config=release
-build:ci --lockfile_mode=error
-
-test:ci --lockfile_mode=error
-test:ci --test_summary=detailed
+[state.http.retry]
+enabled = true
+max_attempts = 1
+initial_backoff = "10ms"
+max_backoff = "50ms"
+backoff_multiplier = 2
