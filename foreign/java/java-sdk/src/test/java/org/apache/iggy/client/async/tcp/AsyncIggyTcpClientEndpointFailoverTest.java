@@ -105,18 +105,23 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
             });
 
+            // No builder credentials: the replay can only come from the
+            // sign-in the caller ran, which is the shape that could not
+            // reconnect at all before. With credentials configured, the replay
+            // falls back to them and the test would pass without a remembered
+            // sign-in at all.
             AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
                     .host(loopback.getHostAddress())
                     .port(primaryPort)
-                    .credentials("iggy", "iggy")
-                    .requestTimeout(Duration.ofSeconds(5))
-                    // A redial rotates one endpoint per attempt, so the survivor
-                    // is the second: keep the pacing short enough to observe.
-                    .retryPolicy(RetryPolicy.fixedDelay(8, Duration.ofMillis(50)))
+                    .requestTimeout(Duration.ofSeconds(2))
+                    // A whole rotation dials every endpoint the client knows, so
+                    // the survivor is reached before this delay is ever spent.
+                    // One endpoint per attempt would need it first.
+                    .retryPolicy(RetryPolicy.fixedDelay(8, Duration.ofSeconds(5)))
                     .build();
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
-                client.login().get(5, TimeUnit.SECONDS);
+                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
                 client.sendBinaryRequest(PING_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
                 assertThat(client.getConnectionInfo().port()).isEqualTo(primaryPort);
 
@@ -125,8 +130,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 // The request in flight when the node died is allowed to fail;
                 // what is not allowed is never completing one, which is what a
                 // client that only knows the dead endpoint does.
-                assertThat(resumeWithin(client, Duration.ofSeconds(10)))
-                        .as("the client has to resume on the survivor the roster named")
+                assertThat(resumeWithin(client, Duration.ofSeconds(4)))
+                        .as("the client has to resume on the survivor inside the first rotation")
                         .isTrue();
 
                 assertThat(client.getConnectionInfo().port())
@@ -138,6 +143,69 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 assertThat(survivorPings)
                         .as("the request landed on the survivor")
                         .hasValueGreaterThanOrEqualTo(1);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                survivor.close();
+            }
+        }
+    }
+
+    /**
+     * An explicit sign-out is caller intent, like a close: the redial after it
+     * must not sign back in with the credentials that sign-in used.
+     */
+    @Test
+    void shouldNotResurrectASignedOutSessionOnASurvivor() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
+                ServerSocket survivorSocket = new ServerSocket(0, 4, loopback)) {
+            int primaryPort = primarySocket.getLocalPort();
+            int survivorPort = survivorSocket.getLocalPort();
+            AtomicInteger survivorRegistrations = new AtomicInteger();
+
+            MockNode primary = MockNode.serve(primarySocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, primaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            MockNode survivor = MockNode.serve(survivorSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, survivorPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    survivorRegistrations.incrementAndGet();
+                    return Response.success(OPERATION_REGISTER, registerBody(2));
+                }
+                // Echoed, so a logout is answered as a logout: the client
+                // checks the reply's operation against the request's.
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(primaryPort)
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .retryPolicy(RetryPolicy.fixedDelay(4, Duration.ofMillis(50)))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                client.users().logout().get(5, TimeUnit.SECONDS);
+
+                primary.kill();
+
+                // Every attempt is allowed to fail; none of them may register.
+                resumeWithin(client, Duration.ofSeconds(2));
+
+                assertThat(survivorRegistrations)
+                        .as("a signed-out client has no session to restore")
+                        .hasValue(0);
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
                 survivor.close();

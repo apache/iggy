@@ -44,6 +44,23 @@ const LEADERLESS_POLL_INTERVAL_MS = 250;
 const MAX_LEADER_REDIRECTS = 3;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
+/**
+ * How long a `TRANSIENT_NOT_ACCEPTED` request replays on the same connection
+ * before the roster is re-read. A node that stopped being primary refuses
+ * forever, so replaying alone never recovers. Matches the Rust SDK.
+ */
+const VSR_FAILOVER_CHECK_MS = 2_000;
+
+/**
+ * A request the current node keeps refusing as not-admitted. Carries the
+ * refusal so the caller can surface it when the roster turns out to still name
+ * this node as the leader. Never escapes `sendCommand`.
+ */
+class LeaderMovedError extends Error {
+  constructor(readonly refusal: ResponseError) {
+    super('the node refused the request as not-admitted; re-reading the roster');
+  }
+}
 
 /**
  * Command codes that can be executed without authentication.
@@ -186,21 +203,24 @@ export class CommandResponseStream extends EventEmitter {
       if (!this.isAuthenticated && !this.isUnloggedCommand(command))
         await this.authenticate(this.options.credentials);
 
-      const response = await new Promise<CommandResponse>(
-        (resolve, reject) => {
-          const job = {
-            command,
-            payload,
-            handleResponse,
-            resolve,
-            reject
-          };
-          if (last)
-            this._execQueue.push(job);
-          else
-            this._execQueue.unshift(job);
-          this._processQueue();
-        });
+      // The roster read is itself a queued command and the queue is
+      // single-flighted, so the leader re-check cannot happen inside
+      // `_processVsr`. The refusal comes back out here instead, where the
+      // queue is free, and the command is re-issued on the node that now
+      // leads.
+      let response: CommandResponse;
+      for (let move = 0; ; move += 1) {
+        try {
+          response = await this._queueCommand(command, payload, handleResponse,
+            last);
+          break;
+        } catch (error) {
+          if (!(error instanceof LeaderMovedError))
+            throw error;
+          if (move >= MAX_LEADER_REDIRECTS || !await this._followLeaderMove())
+            throw responseError(command, error.refusal.errorCode);
+        }
+      }
       if (!isLoginCommand(command) || this.settlingLeader)
         return response;
       this.settlingLeader = true;
@@ -213,6 +233,57 @@ export class CommandResponseStream extends EventEmitter {
     } finally {
       this.pendingSubmissions -= 1;
       this._emitFinishQueue();
+    }
+  }
+
+  private _queueCommand(
+    command: number,
+    payload: Buffer,
+    handleResponse: boolean,
+    last: boolean
+  ): Promise<CommandResponse> {
+    return new Promise<CommandResponse>((resolve, reject) => {
+      const job = {
+        command,
+        payload,
+        handleResponse,
+        resolve,
+        reject
+      };
+      if (last)
+        this._execQueue.push(job);
+      else
+        this._execQueue.unshift(job);
+      this._processQueue();
+    });
+  }
+
+  /**
+   * Re-reads the roster and moves to the leader it names.
+   *
+   * @returns Whether the client moved, so the refused request is worth
+   * re-issuing
+   */
+  private async _followLeaderMove(): Promise<boolean> {
+    const leader = await this._readLeaderEndpoint();
+    if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
+      return false;
+    debug(`the leader moved to ${leader.host}:${leader.port}, following it`);
+    await this.connection.redirect(leader.host, leader.port);
+    return true;
+  }
+
+  private _rememberRoster(response: CommandResponse): void {
+    try {
+      const metadata = GET_CLUSTER_METADATA.deserialize(response);
+      this.connection.rememberRoster(
+        metadata.nodes
+          .filter((node) => node.endpoints.tcp !== 0)
+          .map((node) => ({ host: node.ip, port: node.endpoints.tcp }))
+      );
+    } catch (error) {
+      debug('an unreadable roster leaves the redial candidates as they are',
+        error);
     }
   }
 
@@ -285,7 +356,9 @@ export class CommandResponseStream extends EventEmitter {
       const prepared = prepareVsrCommand(command, payload);
       // A transient retry must preserve all request identity fields.
       const frame = this.vsrSession.encode(prepared.command, prepared.payload);
-      const deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS;
+      const startedAt = Date.now();
+      const deadline = startedAt + VSR_RESPONSE_TIMEOUT_MS;
+      const notAcceptedDeadline = startedAt + VSR_FAILOVER_CHECK_MS;
       let lastTransientError: ResponseError | undefined;
       let parsed: CommandResponse;
       while (true) {
@@ -316,6 +389,16 @@ export class CommandResponseStream extends EventEmitter {
               !isTransientVsrError(error.errorCode))
             throw error;
           lastTransientError = error;
+          // A not-admitted refusal is a statement about who leads, not about
+          // load: a node that stopped being primary refuses forever, so
+          // replaying on this connection never recovers. Hand it back for a
+          // roster re-read once the window is spent. Not-committed (57) stays
+          // here: the request is in flight on this very node, and its outcome
+          // is unknown anywhere else.
+          if (error.errorCode === TRANSIENT_NOT_ACCEPTED &&
+              !isLoginCommand(command) &&
+              Date.now() >= notAcceptedDeadline)
+            throw new LeaderMovedError(error);
           const retryDelay = Math.min(
             VSR_RETRY_INTERVAL_MS,
             Math.max(0, deadline - Date.now())
@@ -335,8 +418,18 @@ export class CommandResponseStream extends EventEmitter {
       if (prepared.command === COMMAND_CODE.LogoutUser) {
         this._resetSession();
       }
+      // Every roster read feeds the redial candidates, whoever asked for it
+      // and whatever it says: a node dies together with its address, the
+      // roster is unreachable exactly when it is needed, and reading it only
+      // during a login would leave the candidates stale between logins.
+      if (handleResp && command === GET_CLUSTER_METADATA.code)
+        this._rememberRoster(parsed);
       return parsed;
     } catch (error) {
+      // A not-admitted refusal is an answer, so the session is not in doubt
+      // and the request was never applied.
+      if (error instanceof LeaderMovedError)
+        throw error;
       // Once bytes were handed to the socket, a local transport or decode
       // failure leaves the request outcome ambiguous. Register a fresh session
       // rather than replaying that request under a different client identity.
@@ -477,14 +570,10 @@ export class CommandResponseStream extends EventEmitter {
           GET_CLUSTER_METADATA.serialize(),
           { last: false }
         );
+        // The redial candidates are fed by `_processVsr` for every roster
+        // read, leaderless ones included: a roster with no leader still names
+        // where the nodes are.
         const metadata = GET_CLUSTER_METADATA.deserialize(response);
-        // Every read feeds the redial candidates, leaderless ones included: a
-        // roster with no leader still names where the nodes are.
-        this.connection.rememberRoster(
-          metadata.nodes
-            .filter((node) => node.endpoints.tcp !== 0)
-            .map((node) => ({ host: node.ip, port: node.endpoints.tcp }))
-        );
         if (metadata.nodes.length <= 1)
           return undefined;
         const leader = metadata.nodes.find(

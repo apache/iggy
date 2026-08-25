@@ -574,18 +574,18 @@ describe('VSR client socket', () => {
           socket.destroy();
         await primary.close();
 
-        // The attempt in flight when the socket died is allowed to fail; what
-        // is not allowed is never completing one, which is what a client that
-        // only knows the dead endpoint does.
+        // The attempt in flight when the socket died is allowed to fail; the
+        // one after it has to land on the survivor. Two attempts, not a
+        // polling loop: the comment above promises at most one failed
+        // submission, and a loop of twenty would pass with nineteen failures.
         let resumed = false;
         let lastError: unknown;
-        for (let attempt = 0; attempt < 20 && !resumed; attempt += 1) {
+        for (let attempt = 0; attempt < 2 && !resumed; attempt += 1) {
           try {
             await client.sendCommand(60_021, Buffer.alloc(0));
             resumed = true;
           } catch (error) {
             lastError = error;
-            await new Promise((resolve) => setTimeout(resolve, 10));
           }
         }
         assert.ok(resumed, `the client never resumed: ${String(lastError)}`);

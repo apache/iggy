@@ -37,6 +37,7 @@ import org.apache.iggy.client.async.tcp.AsyncTcpConnection.TcpConnectionPoolConf
 import org.apache.iggy.client.async.tcp.LeaderAwareness.LeaderRedirectionState;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyMissingCredentialsException;
 import org.apache.iggy.exception.IggyNotConnectedException;
 import org.apache.iggy.exception.IggyServerException;
@@ -54,6 +55,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -458,6 +460,10 @@ public class AsyncIggyTcpClient {
      */
     public CompletableFuture<Void> close() {
         closed = true;
+        // Closing is caller intent, like a logout: connect() clears `closed`
+        // again, and a session the caller ended must not come back with the
+        // credentials the earlier sign-in used.
+        rememberedLogin = null;
         AsyncTcpConnection currentConnection = connection.get();
         if (currentConnection != null) {
             return currentConnection.close();
@@ -488,8 +494,38 @@ public class AsyncIggyTcpClient {
                 heartbeatInterval,
                 maxVsrFrameSize,
                 this::retryTransientOnLeader,
-                routingState::clearAssignments,
+                this::onSessionReset,
                 this::onConnectionFailure);
+    }
+
+    /**
+     * A server-side eviction reached this client. The routing state it cached
+     * belonged to the evicted session, and a stale-client eviction is the
+     * server ending that session authoritatively, like a logout: the
+     * remembered sign-in ends with it, so only credentials configured on the
+     * builder may bring the session back.
+     */
+    private void onSessionReset(int errorCode) {
+        routingState.clearAssignments();
+        if (errorCode != IggyErrorCode.STALE_CLIENT.getCode()) {
+            return;
+        }
+        // Credentials configured on the builder are what every connect of this
+        // client signs in as, so an eviction does not revoke them and the
+        // client recovers on its own. A sign-in a caller ran is different: the
+        // server ended that session deliberately, and reviving it behind the
+        // caller's back is what an explicit logout must not be able to do
+        // either. Dropped in both places, because the connection replays its
+        // own captured login to bring up a replacement channel.
+        if (username.isPresent() && password.isPresent()) {
+            return;
+        }
+        log.warn("The server evicted this session as stale; the sign-in it ran will not be replayed");
+        rememberedLogin = null;
+        AsyncTcpConnection currentConnection = connection.get();
+        if (currentConnection != null) {
+            currentConnection.forgetCapturedLogin();
+        }
     }
 
     /**
@@ -585,10 +621,12 @@ public class AsyncIggyTcpClient {
      * Entry point of the background redial after a pool acquire failure or an
      * expired reply. Requests that were in flight stay failed (their outcome
      * is unknown); the redial only restores the client for subsequent calls.
-     * Alternates the current endpoint with the seed, paced by the configured
-     * retry policy, and replays the builder credentials on the restored
-     * connection. Personal-access-token logins cannot be replayed here; those
-     * clients must log in again themselves.
+     * Each rotation sweeps every endpoint the client knows -- where it was,
+     * the configured seed, then the roster it learned -- and only a rotation
+     * that reaches none of them waits out the retry policy's delay. The
+     * sign-in is replayed on whichever endpoint answers, whether it was
+     * configured on the builder or run by the caller, personal access tokens
+     * included.
      */
     private void onConnectionFailure(Throwable cause) {
         if (closed || !isConnectionLoss(cause)) {
@@ -616,48 +654,112 @@ public class AsyncIggyTcpClient {
             log.error("Redial gave up after {} attempts, next request will fail fast", policy.getMaxRetries());
             return CompletableFuture.completedFuture(null);
         }
-        ConnectionInfo target = ReconnectPlan.target(redialCandidates(), attempt);
-        Duration delay = ReconnectPlan.delay(policy, attempt);
+        List<ConnectionInfo> candidates = redialCandidates();
+        // The delay paces rotations, not dials. The first rotation runs at once
+        // when there is somewhere else to go: pausing before dialing a survivor
+        // only pushes the failover past the window the caller waits in, and the
+        // node just lost may be gone for good.
+        Duration delay = attempt == 1 && candidates.size() > 1 ? Duration.ZERO : ReconnectPlan.delay(policy, attempt);
         Executor delayedExecutor = CompletableFuture.delayedExecutor(delay.toMillis(), TimeUnit.MILLISECONDS);
-        return CompletableFuture.supplyAsync(() -> null, delayedExecutor).thenCompose(ignored -> {
-            if (closed) {
-                return CompletableFuture.completedFuture(null);
-            }
-            log.info("Redial attempt {}/{} to {}", attempt, policy.getMaxRetries(), target.serverAddress());
-            return retarget(target)
-                    .thenCompose(retargeted -> replayLogin())
-                    .handle((ok, error) -> {
-                        if (error == null) {
-                            log.info("Reconnected to {}", target.serverAddress());
-                            return CompletableFuture.<Void>completedFuture(null);
-                        }
-                        log.warn(
-                                "Redial attempt {} to {} failed: {}",
-                                attempt,
-                                target.serverAddress(),
-                                error.getMessage());
-                        return redialAttempt(attempt + 1, policy);
-                    })
-                    .thenCompose(Function.identity());
-        });
+        return CompletableFuture.supplyAsync(() -> null, delayedExecutor)
+                .thenCompose(ignored -> sweepCandidates(candidates, 0, attempt, policy));
     }
 
     /**
-     * Replays the builder credentials on the freshly published connection.
+     * Dials one endpoint of a rotation and, if it does not come up, the next
+     * one. Every endpoint gets its turn inside one attempt, so a full pass over
+     * the cluster costs one retry rather than one per endpoint: with the
+     * default policy, rotating one endpoint per attempt would first dial a
+     * two-node survivor two delays in.
+     */
+    private CompletableFuture<Void> sweepCandidates(
+            List<ConnectionInfo> candidates, int index, int attempt, RetryPolicy policy) {
+        if (closed) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (index >= candidates.size()) {
+            return redialAttempt(attempt + 1, policy);
+        }
+        ConnectionInfo target = candidates.get(index);
+        log.info(
+                "Redial attempt {}/{} to {} ({}/{})",
+                attempt,
+                policy.getMaxRetries(),
+                target.serverAddress(),
+                index + 1,
+                candidates.size());
+        return retarget(target)
+                .handle((retargeted, dialError) -> {
+                    if (dialError != null) {
+                        log.warn("Redial to {} failed: {}", target.serverAddress(), dialError.getMessage());
+                        return sweepCandidates(candidates, index + 1, attempt, policy);
+                    }
+                    return replaySignInOn(target, candidates, index, attempt, policy);
+                })
+                .thenCompose(Function.identity());
+    }
+
+    /**
+     * Re-establishes the session on an endpoint that just came up.
+     *
+     * A sign-in the server rejected -- a rotated password, an expired token --
+     * ends the redial: the connection is up, no other endpoint would answer
+     * differently, and retrying would tear the working connection down on the
+     * next rotation and leave the client connected but unauthenticated anyway.
+     * The rejected credentials are dropped so nothing replays them.
+     */
+    private CompletableFuture<Void> replaySignInOn(
+            ConnectionInfo target, List<ConnectionInfo> candidates, int index, int attempt, RetryPolicy policy) {
+        return replayLogin()
+                .handle((ok, loginError) -> {
+                    if (loginError == null) {
+                        log.info("Reconnected to {}", target.serverAddress());
+                        return CompletableFuture.<Void>completedFuture(null);
+                    }
+                    if (isConnectionLoss(unwrap(loginError))) {
+                        log.warn(
+                                "The sign-in on {} was lost with the connection: {}",
+                                target.serverAddress(),
+                                loginError.getMessage());
+                        return sweepCandidates(candidates, index + 1, attempt, policy);
+                    }
+                    log.error(
+                            "Reconnected to {} but the sign-in was rejected: {}. The connection stands"
+                                    + " unauthenticated until the caller signs in again.",
+                            target.serverAddress(),
+                            loginError.getMessage());
+                    rememberedLogin = null;
+                    return CompletableFuture.<Void>completedFuture(null);
+                })
+                .thenCompose(Function.identity());
+    }
+
+    private static Throwable unwrap(Throwable error) {
+        return error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+    }
+
+    /**
+     * Re-establishes the session on the freshly published connection: with the
+     * credentials configured on the builder, or else the sign-in a caller ran
+     * by hand. Configured credentials win, as in the Rust and Go SDKs -- they
+     * are what every connect of this client is meant to sign in as, and a
+     * remembered sign-in exists to make a hand-run login as reconnectable as
+     * a configured one, not to override it.
+     *
      * The login runs through the users client, so leader discovery retargets
      * again before Register when the redialed node is not the leader.
      */
     private CompletableFuture<Void> replayLogin() {
-        Supplier<CompletableFuture<IdentityInfo>> replay = rememberedLogin;
-        if (replay != null) {
-            // Runs through loginOnLeader, so a redial that landed on a backup
-            // still settles on the leader before the session is used.
-            return loginOnLeader(replay).thenApply(identity -> null);
+        if (username.isPresent() && password.isPresent() && usersClient != null) {
+            return usersClient.login(username.get(), password.get()).thenApply(identity -> null);
         }
-        if (username.isEmpty() || password.isEmpty() || usersClient == null) {
+        Supplier<CompletableFuture<IdentityInfo>> replay = rememberedLogin;
+        if (replay == null) {
             return CompletableFuture.completedFuture(null);
         }
-        return usersClient.login(username.get(), password.get()).thenApply(identity -> null);
+        // Runs through loginOnLeader, so a redial that landed on a backup
+        // still settles on the leader before the session is used.
+        return loginOnLeader(replay).thenApply(identity -> null);
     }
 
     /**
@@ -788,15 +890,17 @@ public class AsyncIggyTcpClient {
     /**
      * Endpoints a redial rotates through, likeliest first: where the client
      * currently is, the address it was configured with, then the roster it
-     * learned while connected. Duplicates are dropped, so an endpoint the
-     * roster merely spells differently does not earn a second attempt.
+     * learned while connected. Duplicates are dropped by spelling, so an
+     * endpoint the roster merely writes differently does not earn a second
+     * attempt. Spelling only: this runs on the Netty event loop, where a
+     * resolver lookup per candidate pair would block it.
      */
     private List<ConnectionInfo> redialCandidates() {
         List<ConnectionInfo> candidates = new ArrayList<>();
         candidates.add(connectionInfo);
         Stream.concat(Stream.of(seedConnectionInfo), rosterTargets.stream())
                 .filter(endpoint ->
-                        candidates.stream().noneMatch(candidate -> LeaderAwareness.isSameAddress(candidate, endpoint)))
+                        candidates.stream().noneMatch(candidate -> LeaderAwareness.isSameSpelling(candidate, endpoint)))
                 .forEach(candidates::add);
         return List.copyOf(candidates);
     }

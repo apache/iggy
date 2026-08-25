@@ -67,6 +67,16 @@ const getTransport = (config: ClientConfig): Socket => {
   }
 };
 
+/** One node of the cluster, as a redial candidate. */
+export type Endpoint = { host: string, port: number };
+
+/**
+ * Bound on one dial while other endpoints are queued behind it. A socket has
+ * no connect deadline of its own, so a node whose syns are dropped would hold
+ * the whole pass. Matches the Rust SDK.
+ */
+const FAILOVER_DIAL_TIMEOUT_MS = 2_000;
+
 /**
  * Default reconnection settings.
  * Attempts reconnection every 5 seconds, up to 12 times.
@@ -124,7 +134,7 @@ export class IggyConnection extends EventEmitter {
    * exactly when it is needed, so it has to have been remembered while the
    * connection was still healthy.
    */
-  private rosterEndpoints: { host: string, port: number }[];
+  private rosterEndpoints: Endpoint[];
 
   /** Incremental response frame decoder */
   private responseDecoder: ResponseFrameDecoder;
@@ -235,6 +245,38 @@ export class IggyConnection extends EventEmitter {
     return connectPromise;
   }
 
+  /**
+   * Waits for one dial, bounded while other endpoints are queued behind it.
+   *
+   * A socket has no connect deadline of its own and there is no 'timeout'
+   * listener on it, so a node whose syns are dropped holds the pass for the
+   * whole OS connect timeout -- and it leads every pass, because the current
+   * endpoint only moves on success. The bound matches the Rust SDK's.
+   */
+  private async _dialWithin(socket: Socket, bounded: boolean): Promise<this> {
+    if (!bounded)
+      return this._waitForConnection(socket);
+
+    let expire: NodeJS.Timeout | undefined;
+    const bound = new Promise<never>((_resolve, reject) => {
+      expire = setTimeout(() => {
+        // Destroying it makes the pending dial settle and releases the handle;
+        // left alone it would keep the event loop alive.
+        socket.destroy();
+        reject(new Error(
+          `dial exceeded ${FAILOVER_DIAL_TIMEOUT_MS}ms`
+        ));
+      }, FAILOVER_DIAL_TIMEOUT_MS);
+      expire.unref?.();
+    });
+
+    try {
+      return await Promise.race([this._waitForConnection(socket), bound]);
+    } finally {
+      clearTimeout(expire);
+    }
+  }
+
   private _waitForConnection(socket: Socket): Promise<this> {
     return new Promise<this>((resolve, reject) => {
       const cleanup = () => {
@@ -308,10 +350,18 @@ export class IggyConnection extends EventEmitter {
   ): Promise<this> {
     let lastError = initialError;
     let expectedSocket = this.socket;
+    let firstPass = true;
     while (enabled && this.reconnectCount < maxRetries) {
       this.connecting = true;
       this.reconnectCount += 1;
-      await waitForReconnect(interval);
+      const candidates = this._redialCandidates();
+      // The backoff paces retries against a single endpoint. With other
+      // endpoints known there is somewhere else to go, and pausing first only
+      // pushes the failover past the interval a caller is willing to wait;
+      // later passes still back off.
+      if (!firstPass || candidates.length === 1)
+        await waitForReconnect(interval);
+      firstPass = false;
       if (this.ending)
         throw new Error('connection is closed', { cause: lastError });
       // A redirect may replace the socket at any point. Defer to the active
@@ -323,14 +373,27 @@ export class IggyConnection extends EventEmitter {
       // the cluster costs one retry rather than one per endpoint: a pass that
       // stopped at the first refusal would never reach the survivors of a
       // client configured for a single retry.
-      for (const options of this._redialCandidates()) {
+      for (const options of candidates) {
+        // Re-checked every iteration, not once above the loop: a destroy or a
+        // redirect mid-pass has to stop the pass. Left running, the next
+        // endpoint that answers would leave an open socket nobody closes, a
+        // 'connect' event after the destroy, and the process alive.
+        if (this.ending)
+          throw new Error('connection is closed', { cause: lastError });
+        if (this.socket !== expectedSocket)
+          return this.connect();
+
         const socket = this._installSocket(
           getTransport({ ...this.config, options })
         );
         this.socket = socket;
         expectedSocket = socket;
         try {
-          await this._waitForConnection(socket);
+          await this._dialWithin(socket, candidates.length > 1);
+          if (this.ending) {
+            socket.destroy();
+            throw new Error('connection is closed', { cause: lastError });
+          }
           if (this.socket !== socket)
             return this.connect();
           this.config.options = options;
@@ -358,7 +421,7 @@ export class IggyConnection extends EventEmitter {
    * answer about where its nodes are, so a node it dropped stops being
    * dialed. The configured seed is kept separately and outlives it.
    */
-  rememberRoster(endpoints: { host: string, port: number }[]): void {
+  rememberRoster(endpoints: Endpoint[]): void {
     if (endpoints.length === 0)
       return;
     this.rosterEndpoints = endpoints;
@@ -369,8 +432,13 @@ export class IggyConnection extends EventEmitter {
    * currently is, the endpoint it was configured with, then the roster it
    * learned while connected. After a leader redirect the current endpoint may
    * die with the leader, and the rest of the list is the way back to the
-   * cluster. Duplicates are dropped, so an endpoint the roster merely spells
-   * differently does not earn a second attempt.
+   * cluster.
+   *
+   * Duplicates are dropped by spelling: the loopback aliases and an
+   * IPv4-mapped IPv6 address collapse onto one endpoint. Names are not
+   * resolved, so a seed given as a DNS name and the roster's IP for the same
+   * node still count as two candidates -- one wasted dial per pass, not a
+   * correctness problem.
    */
   _redialCandidates(): ClientConfig['options'][] {
     const candidates = [this.config.options];
@@ -382,8 +450,8 @@ export class IggyConnection extends EventEmitter {
     ];
     for (const candidate of known) {
       const duplicate = candidates.some(
-        (known) => known.port === candidate.port &&
-          normalizeHost(known.host) === normalizeHost(candidate.host)
+        (existing) => existing.port === candidate.port &&
+          normalizeHost(existing.host) === normalizeHost(candidate.host)
       );
       if (!duplicate)
         candidates.push(candidate);

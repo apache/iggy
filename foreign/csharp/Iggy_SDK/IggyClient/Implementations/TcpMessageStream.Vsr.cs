@@ -71,6 +71,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     private const int VsrMaxLeaderRedirects = 3;
 
     /// <summary>
+    ///     Bound on one endpoint's dial while other endpoints are queued behind it. Neither the connect nor the
+    ///     TLS handshake has a deadline of its own, so a node whose syns are dropped would hold the sweep for
+    ///     the whole kernel connect timeout - minutes - while a survivor goes untried. Matches the Rust SDK.
+    /// </summary>
+    private const int FailoverDialTimeout = 2_000;
+
+    /// <summary>
     ///     Attempts a consumer-group poll gets before it gives up and reports an empty poll: one re-sync after
     ///     the coordinator fences a stale assignment, then one retry.
     /// </summary>
@@ -562,6 +569,11 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
                 if (attempt.Error is VsrSessionEvictedException evicted)
                 {
+                    // Whatever the eviction interrupted, the session it evicted is gone. Reported as an
+                    // outcome-unknown write it never reaches the lost-connection path, so the remembered
+                    // sign-in would otherwise survive it and the next reconnect would resurrect the session.
+                    ForgetSessionAfterEviction(evicted.Verdict);
+
                     if (attempt.RequestStarted && !VsrOperations.IsReplaySafeRead(code, isLoginRegister, body.Span))
                     {
                         throw new VsrRequestOutcomeUnknownException(evicted);

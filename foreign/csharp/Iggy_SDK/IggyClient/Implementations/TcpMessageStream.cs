@@ -127,6 +127,10 @@ public sealed partial class TcpMessageStream : IIggyClient
         _connection?.Dispose();
         _connection = null;
 
+        // Nothing can reconnect after this, and the remembered sign-in holds a plain-string password
+        // or token.
+        _rememberedLogin = null;
+
         SetConnectionState(ConnectionState.Disconnected);
         _connectionEvents.Clear();
     }
@@ -744,7 +748,9 @@ public sealed partial class TcpMessageStream : IIggyClient
         {
             await ResetConsensusSessionAsync();
 
-            // An explicit sign-out leaves no session to restore, and a reconnect must not resurrect one.
+            // An explicit sign-out leaves no session to restore, so the sign-in this client remembered
+            // does not outlive it. Credentials configured as AutoLoginSettings are a different promise -
+            // they are what every connect signs in with - and a reconnect still uses them.
             _rememberedLogin = null;
 
             if (State == ConnectionState.Authenticated)
@@ -1057,7 +1063,17 @@ public sealed partial class TcpMessageStream : IIggyClient
                 // trailing segment of a large request until the previous one is acked.
                 socket.NoDelay = true;
 
-                await socket.ConnectAsync(host, port, token);
+                // Neither ConnectAsync nor the TLS handshake has a deadline of its own, and nothing up the
+                // stack adds one: a node whose syns are dropped - or one that accepts TCP and then never
+                // answers the ClientHello - would hold the sweep, and the connection semaphore with it, for
+                // the whole kernel connect timeout while a survivor goes untried.
+                using var dialCancellation = candidates.Length > 1
+                    ? CancellationTokenSource.CreateLinkedTokenSource(token)
+                    : null;
+                dialCancellation?.CancelAfter(FailoverDialTimeout);
+                var dialToken = dialCancellation?.Token ?? token;
+
+                await socket.ConnectAsync(host, port, dialToken);
                 dialed = true;
 
                 _currentRemoteAddress = socket.RemoteEndPoint is IPEndPoint remote
@@ -1069,7 +1085,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 5);
 
                 var connectionStream = _configuration.TlsSettings.Enabled
-                    ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings)
+                    ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings, dialToken)
                     : new NetworkStream(socket, true);
 
                 await _sendingSemaphore.WaitAsync(token);
@@ -1108,7 +1124,11 @@ public sealed partial class TcpMessageStream : IIggyClient
             // Only a failed dial is worth another attempt. Everything past it - a rejected certificate, bad
             // credentials, a leader that cannot be found - fails the same way every time, and with unlimited
             // retries a caller would otherwise never get the error back.
-            catch (Exception e) when (dialed || e is OperationCanceledException || _disposed)
+            // A dial the bound above cut short is a failed dial like any other, so it must not land here:
+            // only a cancellation the caller actually asked for is fatal.
+            catch (Exception e) when (dialed
+                                      || (e is OperationCanceledException && token.IsCancellationRequested)
+                                      || _disposed)
             {
                 socket?.Dispose();
 
@@ -1126,14 +1146,6 @@ public sealed partial class TcpMessageStream : IIggyClient
 
                 _logger.LogError(e, "Failed to connect");
 
-                if (!_configuration.ReconnectionSettings.Enabled ||
-                    (_configuration.ReconnectionSettings.MaxRetries > 0 &&
-                     retryCount >= _configuration.ReconnectionSettings.MaxRetries))
-                {
-                    SetConnectionState(ConnectionState.Disconnected);
-                    throw;
-                }
-
                 // Every other endpoint gets its turn before the retry delay: the node just lost may be gone for
                 // good, and pausing on it helps nothing.
                 if (++candidate < candidates.Length)
@@ -1144,6 +1156,17 @@ public sealed partial class TcpMessageStream : IIggyClient
 
                 candidate = 0;
                 _currentAddress = candidates[0];
+
+                // The sweep is what the reconnection budget applies to, not a single dial: checked per dial,
+                // the last round would try only the endpoint the client started on, and a client with
+                // reconnection turned off would never reach its other endpoints at all.
+                if (!_configuration.ReconnectionSettings.Enabled ||
+                    (_configuration.ReconnectionSettings.MaxRetries > 0 &&
+                     retryCount >= _configuration.ReconnectionSettings.MaxRetries))
+                {
+                    SetConnectionState(ConnectionState.Disconnected);
+                    throw;
+                }
 
                 retryCount++;
                 if (_configuration.ReconnectionSettings.UseExponentialBackoff)
@@ -1267,7 +1290,8 @@ public sealed partial class TcpMessageStream : IIggyClient
         return _rememberedLogin;
     }
 
-    private async Task<Stream> CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings)
+    private async Task<Stream> CreateSslStreamAndAuthenticate(Socket socket, TlsSettings tlsSettings,
+        CancellationToken token)
     {
         ValidateCertificatePath(tlsSettings.CertificatePath);
 
@@ -1276,7 +1300,10 @@ public sealed partial class TcpMessageStream : IIggyClient
         var stream = new NetworkStream(socket, true);
         var sslStream = new SslStream(stream, false, RemoteCertificateValidationCallback);
 
-        await sslStream.AuthenticateAsClientAsync(tlsSettings.Hostname);
+        // The token carries the dial bound when other endpoints are queued behind this one: a peer that
+        // accepts TCP and never answers the ClientHello has no deadline of its own here either.
+        await sslStream.AuthenticateAsClientAsync(
+            new SslClientAuthenticationOptions { TargetHost = tlsSettings.Hostname }, token);
 
         return sslStream;
     }
@@ -1301,10 +1328,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             // remembered sign-in ends with it, so only a configured auto login may bring the session back.
             // Remembered credentials exist for transport loss, where the session died with the socket rather
             // than by anyone's decision.
-            if (e is IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true })
-            {
-                _rememberedLogin = null;
-            }
+            ForgetSessionAfterEviction(e);
 
             if (!_configuration.ReconnectionSettings.Enabled)
             {
@@ -1333,6 +1357,18 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         return VsrConnection.IsConnectionException(e)
                || e is IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true };
+    }
+
+    // An eviction ends this session authoritatively, like a logout: the sign-in this client remembered goes
+    // with it, so only a configured auto login may bring the session back. Called from the consensus layer,
+    // which sees the eviction whatever it interrupted - an eviction that landed on a replicated write is
+    // reported as VsrRequestOutcomeUnknownException and never reaches the lost-connection path at all.
+    private void ForgetSessionAfterEviction(Exception verdict)
+    {
+        if (verdict is IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true })
+        {
+            _rememberedLogin = null;
+        }
     }
 
     private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ReadOnlyMemory<byte> body,

@@ -228,6 +228,12 @@ impl iggy_common::VsrSessionControl for QuicClient {
 impl BinaryClient for QuicClient {}
 
 impl QuicClient {
+    /// Whether an `AutoLogin` is configured on this client, which makes the
+    /// session after any connect the configured user's rather than whoever
+    /// signed in by hand.
+    pub(crate) fn auto_login_configured(&self) -> bool {
+        matches!(self.config.auto_login, AutoLogin::Enabled(_))
+    }
     /// Creates a new QUIC client for the provided client and server addresses.
     pub fn new(
         client_address: &str,

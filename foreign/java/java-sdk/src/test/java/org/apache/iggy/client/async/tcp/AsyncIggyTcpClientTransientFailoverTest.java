@@ -159,6 +159,61 @@ class AsyncIggyTcpClientTransientFailoverTest {
         }
     }
 
+    /**
+     * A stale-client eviction is the server ending the session
+     * authoritatively, like a logout. A client whose credentials were
+     * configured signs in again on every connect and recovers (the test
+     * above); one whose session came from a caller's own sign-in must not have
+     * that session revived behind the caller's back.
+     */
+    @Test
+    void shouldNotReviveAHandRunSignInAfterAStaleClientEviction() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket serverSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger registrations = new AtomicInteger();
+            CompletableFuture<Void> server = serve(serverSocket, 4, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(registrations.incrementAndGet()));
+                }
+                if (request.operation() == OPERATION_CREATE_STREAM) {
+                    return Response.eviction(EVICTION_STALE_CLIENT);
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+
+            // No configured credentials: the only sign-in is the one run below.
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(serverSocket.getLocalPort())
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                int registrationsBeforeEviction = registrations.get();
+
+                assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                                .get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyServerException.class);
+
+                // Whatever the caller does next, nothing may sign this session
+                // back in on its own.
+                assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                                .get(5, TimeUnit.SECONDS))
+                        .isNotNull();
+                assertThat(registrations)
+                        .as("the evicted session was signed back in")
+                        .hasValue(registrationsBeforeEviction);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.completeExceptionally(new IllegalStateException("test over"));
+        }
+    }
+
     private static Response handleOldLeader(
             Request request, int oldLeaderPort, int newLeaderPort, AtomicInteger denials) {
         if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {

@@ -224,6 +224,12 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
 impl BinaryClient for WebSocketClient {}
 
 impl WebSocketClient {
+    /// Whether an `AutoLogin` is configured on this client, which makes the
+    /// session after any connect the configured user's rather than whoever
+    /// signed in by hand.
+    pub(crate) fn auto_login_configured(&self) -> bool {
+        matches!(self.config.auto_login, AutoLogin::Enabled(_))
+    }
     /// Create a new WebSocket client with the provided configuration.
     pub fn create(config: Arc<WebSocketClientConfig>) -> Result<Self, IggyError> {
         let (sender, receiver) = broadcast(1000);

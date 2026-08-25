@@ -39,16 +39,17 @@ async fn given_a_logged_in_client_when_explicitly_disconnected_should_require_a_
     client.disconnect().await.unwrap();
     client.connect().await.unwrap();
     assert!(
-        client.get_me().await.is_err(),
+        matches!(client.get_me().await, Err(IggyError::Unauthenticated)),
         "an explicit disconnect is caller intent, like a logout: the sign-in it ended \
-         must not be silently replayed by the reconnect"
+         must not be silently replayed by the reconnect, so the server sees an \
+         unauthenticated request"
     );
 
     client.disconnect().await.unwrap();
     assert!(
-        client.get_stats().await.is_err(),
-        "an operation after an explicit disconnect must fail instead of reconnecting \
-         into a resurrected session"
+        matches!(client.get_stats().await, Err(IggyError::NotConnected)),
+        "an operation after an explicit disconnect must fail on the dead transport \
+         instead of reconnecting into a resurrected session"
     );
 
     // The remembered sign-in exists for involuntary drops; a fresh manual

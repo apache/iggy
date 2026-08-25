@@ -25,23 +25,29 @@ use crate::session::ConsensusSession;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
+use crate::vsr::operation_for_code;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
+use iggy_binary_protocol::consensus::Operation;
+#[cfg(test)]
+use iggy_common::TcpClientReconnectionConfig;
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
-    IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions, TransportProtocol,
+    IdKind, Identifier, IggyDuration, IggyError, IggyTimestamp, TcpConnectionStringOptions,
+    TransportProtocol,
 };
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
-use secrecy::ExposeSecret;
-use std::io;
+use secrecy::{ExposeSecret, SecretString};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+#[cfg(test)]
+use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -97,7 +103,7 @@ pub struct TcpClient {
     /// Credentials a sign-in on this client succeeded with, so a reconnect --
     /// onto this node or, after a failover, another one -- can re-establish
     /// the session instead of surfacing `Unauthenticated`. Cleared on logout.
-    session_credentials: Mutex<Option<Credentials>>,
+    session_credentials: Mutex<Option<RememberedSignIn>>,
     // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
     // is `encode_request_header`, which is pure CPU and never awaits. The
     // tokio variant would pay a waker alloc + internal semaphore on
@@ -105,6 +111,22 @@ pub struct TcpClient {
     consensus_session: Arc<StdMutex<ConsensusSession>>,
     skip_auto_login_once: Mutex<bool>,
     consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
+}
+
+/// The sign-in a manual login on this client succeeded with, and who it signed
+/// in as. The user matters because a password change has to swap the new
+/// password in here, and `change_password` may well target somebody else.
+#[derive(Debug)]
+struct RememberedSignIn {
+    credentials: Credentials,
+    user_id: u32,
+}
+
+/// A connection that completed every step of coming up, TLS included.
+struct EstablishedConnection {
+    stream: ConnectionStreamKind,
+    client_address: SocketAddr,
+    remote_address: SocketAddr,
 }
 
 impl Default for TcpClient {
@@ -178,15 +200,6 @@ impl BinaryTransport for TcpClient {
             return Err(error);
         }
 
-        // A stale-client eviction is the server ending this session
-        // authoritatively, like a logout: the remembered sign-in ends with it,
-        // so only a configured auto-login may bring the session back.
-        // Remembered credentials exist for transport loss, where the session
-        // died with the socket rather than by anyone's decision.
-        if matches!(error, IggyError::StaleClient) {
-            self.forget_session_credentials().await;
-        }
-
         if !self.config.reconnection.enabled {
             return Err(IggyError::Disconnected);
         }
@@ -200,6 +213,27 @@ impl BinaryTransport for TcpClient {
             // relies on the client timing out and replaying the request.
             return Err(error);
         }
+
+        // Reconnecting heals the transport, but replaying the request over the
+        // new connection is a second attempt under a new session:
+        // `reset_vsr_session` drops the client id the server's dedup fence is
+        // keyed on, so a replicated write that committed before its reply was
+        // lost would apply a second time. Replay only what provably never
+        // reached the log -- the errors raised before the request was written,
+        // and the operations that never enter it.
+        //
+        // Login and register are the exception: the server stays deliberately
+        // silent on a transient register failure and relies on the client
+        // replaying, so that replay is the protocol rather than a retry.
+        let replay_after_reconnect = is_login_register_code(code)
+            || matches!(
+                error,
+                IggyError::NotConnected
+                    | IggyError::CannotEstablishConnection
+                    | IggyError::Unauthenticated
+                    | IggyError::StaleClient
+            )
+            || matches!(operation_for_code(code), Operation::NonReplicated);
 
         self.disconnect_transport().await?;
 
@@ -222,6 +256,16 @@ impl BinaryTransport for TcpClient {
             *self.skip_auto_login_once.lock().await = false;
         }
         reconnect?;
+
+        if !replay_after_reconnect {
+            warn!(
+                "Reconnected, but command: {code} is replicated and its outcome is unknown: \
+                 replaying it under the new session could apply it twice, so the original \
+                 error is returned instead."
+            );
+            return Err(error);
+        }
+
         self.send_raw(code, payload).await
     }
 
@@ -263,12 +307,39 @@ impl iggy_common::VsrSessionControl for TcpClient {
         Ok(())
     }
 
-    async fn remember_session_credentials(&self, credentials: Credentials) {
-        self.session_credentials.lock().await.replace(credentials);
+    async fn remember_session_credentials(&self, credentials: Credentials, user_id: u32) {
+        self.session_credentials
+            .lock()
+            .await
+            .replace(RememberedSignIn {
+                credentials,
+                user_id,
+            });
     }
 
     async fn forget_session_credentials(&self) {
         self.session_credentials.lock().await.take();
+    }
+
+    async fn refresh_session_password(&self, user: &Identifier, new_password: &str) {
+        let mut remembered = self.session_credentials.lock().await;
+        let Some(sign_in) = remembered.as_mut() else {
+            return;
+        };
+        // A personal access token is not derived from the password.
+        let Credentials::UsernamePassword(username, password) = &mut sign_in.credentials else {
+            return;
+        };
+
+        let targets_session_user = match user.kind {
+            IdKind::Numeric => user.get_u32_value().is_ok_and(|id| id == sign_in.user_id),
+            IdKind::String => user
+                .get_cow_str_value()
+                .is_ok_and(|name| name.as_ref() == username),
+        };
+        if targets_session_user {
+            *password = SecretString::from(new_password.to_owned());
+        }
     }
 
     fn sdk_version(&self) -> &'static str {
@@ -363,23 +434,19 @@ impl TcpClient {
             }
 
             self.set_state(ClientState::Connecting).await;
-            let candidates = self.dial_candidates().await;
-            // The reestablish delay paces reconnects to the one endpoint a
-            // single-address client has. With other endpoints known there is
-            // somewhere else to go, and pausing first only pushes the
-            // failover past the window the caller is willing to wait; the
-            // retry interval still paces the loop.
-            let reestablish_wait = if candidates.len() > 1 {
-                None
-            } else {
-                self.reestablish_wait().await
-            };
-            if let Some(remaining) = reestablish_wait {
-                info!("Trying to connect to the server in: {remaining}",);
-                sleep(remaining.get_duration()).await;
+            let mut candidates = self.dial_candidates().await;
+            // `reestablish_after` paces reconnects to the endpoint this client
+            // was last on, and to that one only: the other endpoints owe it no
+            // cooldown, and pausing before dialing them would push the failover
+            // past the window the caller is willing to wait. So when there is
+            // somewhere else to go, the paced endpoint goes last -- by which
+            // time its window has usually elapsed anyway -- instead of the wait
+            // being skipped outright.
+            let paced_endpoint = self.current_server_address.lock().await.clone();
+            if candidates.len() > 1 && self.reestablish_wait().await.is_some() {
+                candidates.rotate_left(1);
             }
 
-            let tls_enabled = self.config.tls_enabled;
             let mut retry_count = 0;
             let connection_stream: ConnectionStreamKind;
             let remote_address;
@@ -387,146 +454,82 @@ impl TcpClient {
             let mut candidate = 0;
             loop {
                 let server_address = candidates[candidate].clone();
-                info!(
-                    "{NAME} client is connecting to server: {}...",
-                    server_address
-                );
+                if server_address == paced_endpoint
+                    && let Some(remaining) = self.reestablish_wait().await
+                {
+                    info!("Trying to connect to the server: {server_address} in: {remaining}");
+                    sleep(remaining.get_duration()).await;
+                }
 
-                let connection = self.dial(&server_address, candidates.len() > 1).await;
-                if let Err(err) = &connection {
-                    error!(
-                        "Failed to connect to server: {}. Error: {}",
-                        server_address, err
-                    );
-                    if !self.config.reconnection.enabled {
-                        warn!("Automatic reconnection is disabled.");
-                        return Err(IggyError::CannotEstablishConnection);
+                info!("{NAME} client is connecting to server: {server_address}...");
+                match self.establish_bounded(&server_address, &candidates).await {
+                    Ok(connection) => {
+                        // The endpoint that answered is where this client now
+                        // lives: the leader check compares against it, and the
+                        // next reconnect starts from it. Recorded only once the
+                        // stream is usable, so a node that accepts TCP but
+                        // fails the TLS handshake does not become sticky and
+                        // shadow the endpoints behind it.
+                        *self.current_server_address.lock().await = server_address;
+                        client_address = connection.client_address;
+                        remote_address = connection.remote_address;
+                        self.client_address.lock().await.replace(client_address);
+                        connection_stream = connection.stream;
+                        break;
                     }
-
-                    // Every other endpoint gets its turn before the retry
-                    // interval: the node just lost may be gone for good, and
-                    // pausing on it helps nothing.
-                    candidate += 1;
-                    if candidate < candidates.len() {
-                        continue;
+                    Err(IggyError::CannotEstablishConnection) => {}
+                    Err(error) => {
+                        // An unreadable CA file or an unusable TLS domain is a
+                        // configuration fault: no other endpoint fixes it, and
+                        // retrying forever under `max_retries = None` would
+                        // only bury it.
+                        self.fail_connect().await;
+                        return Err(error);
                     }
-                    candidate = 0;
+                }
 
-                    let unlimited_retries = self.config.reconnection.max_retries.is_none();
-                    let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
-                    let max_retries_str =
-                        if let Some(max_retries) = self.config.reconnection.max_retries {
-                            max_retries.to_string()
-                        } else {
-                            "unlimited".to_string()
-                        };
+                // Every other endpoint gets its turn before the retry
+                // interval: the node just lost may be gone for good, and
+                // pausing on it helps nothing.
+                candidate += 1;
+                if candidate < candidates.len() {
+                    continue;
+                }
+                candidate = 0;
 
-                    let interval_str = self.config.reconnection.interval.as_human_time_string();
-                    if unlimited_retries || retry_count < max_retries {
-                        retry_count += 1;
-                        info!(
-                            "Retrying to connect to server ({retry_count}/{max_retries_str}): {} in: {interval_str}",
-                            server_address,
-                        );
-                        sleep(self.config.reconnection.interval.get_duration()).await;
-                        continue;
-                    }
-
-                    self.set_state(ClientState::Disconnected).await;
-                    self.publish_event(DiagnosticEvent::Disconnected).await;
+                // The sweep is what reconnection settings apply to, not a
+                // single dial: with reconnection off there are no retries, but
+                // the failover endpoints were configured to be tried and they
+                // get their one turn first.
+                if !self.config.reconnection.enabled {
+                    warn!("Automatic reconnection is disabled.");
+                    self.fail_connect().await;
                     return Err(IggyError::CannotEstablishConnection);
                 }
 
-                let stream = connection.map_err(|error| {
-                    error!("Failed to establish TCP connection to the server: {error}",);
-                    IggyError::CannotEstablishConnection
-                })?;
-                // The endpoint that answered is where this client now lives:
-                // the leader check compares against it, and the next
-                // reconnect starts from it.
-                *self.current_server_address.lock().await = server_address.clone();
-                client_address = stream.local_addr().map_err(|error| {
-                    error!("Failed to get the local address of the client: {error}",);
-                    IggyError::CannotEstablishConnection
-                })?;
-                remote_address = stream.peer_addr().map_err(|error| {
-                    error!("Failed to get the remote address of the server: {error}",);
-                    IggyError::CannotEstablishConnection
-                })?;
-                self.client_address.lock().await.replace(client_address);
-
-                if let Err(e) = stream.set_nodelay(self.config.nodelay) {
-                    error!("Failed to set the nodelay option on the client: {e}, continuing...",);
-                }
-
-                if !tls_enabled {
-                    connection_stream =
-                        ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_address, stream));
-                    break;
-                }
-
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-                let config = if self.config.tls_validate_certificate {
-                    let mut root_cert_store = rustls::RootCertStore::empty();
-                    if let Some(certificate_path) = &self.config.tls_ca_file {
-                        for cert in
-                            CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
-                                error!("Failed to read the CA file: {certificate_path}. {error}",);
-                                IggyError::InvalidTlsCertificatePath
-                            })?
-                        {
-                            let certificate = cert.map_err(|error| {
-                            error!(
-                                "Failed to read a certificate from the CA file: {certificate_path}. {error}",
-                            );
-                            IggyError::InvalidTlsCertificate
-                        })?;
-                            root_cert_store.add(certificate).map_err(|error| {
-                            error!(
-                                "Failed to add a certificate to the root certificate store. {error}",
-                            );
-                            IggyError::InvalidTlsCertificate
-                        })?;
-                        }
+                let unlimited_retries = self.config.reconnection.max_retries.is_none();
+                let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
+                let max_retries_str =
+                    if let Some(max_retries) = self.config.reconnection.max_retries {
+                        max_retries.to_string()
                     } else {
-                        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                    }
+                        "unlimited".to_string()
+                    };
 
-                    rustls::ClientConfig::builder()
-                        .with_root_certificates(root_cert_store)
-                        .with_no_client_auth()
-                } else {
-                    use crate::tcp::tcp_tls_verifier::NoServerVerification;
-                    rustls::ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(NoServerVerification))
-                        .with_no_client_auth()
-                };
-                let connector = TlsConnector::from(Arc::new(config));
-                let tls_domain = if self.config.tls_domain.is_empty() {
-                    // Extract hostname/IP from server_address when tls_domain is not specified
-                    server_address
-                        .split(':')
-                        .next()
-                        .unwrap_or(&server_address)
-                        .to_string()
-                } else {
-                    self.config.tls_domain.to_owned()
-                };
-                let domain = ServerName::try_from(tls_domain).map_err(|error| {
-                    error!("Failed to create a server name from the domain. {error}",);
-                    IggyError::InvalidTlsDomain
-                })?;
-                let stream = connector.connect(domain, stream).await.map_err(|error| {
-                    error!("Failed to establish a TLS connection to the server: {error}",);
-                    IggyError::CannotEstablishConnection
-                })?;
-                connection_stream = ConnectionStreamKind::TcpTls(TcpTlsConnectionStream::new(
-                    client_address,
-                    TlsStream::Client(stream),
-                ));
-                break;
+                if unlimited_retries || retry_count < max_retries {
+                    retry_count += 1;
+                    let interval_str = self.config.reconnection.interval.as_human_time_string();
+                    info!(
+                        "Retrying to connect ({retry_count}/{max_retries_str}), \
+                         {} endpoint(s) in: {interval_str}",
+                        candidates.len(),
+                    );
+                    sleep(self.config.reconnection.interval.get_duration()).await;
+                    continue;
+                }
+
+                self.fail_connect().await;
+                return Err(IggyError::CannotEstablishConnection);
             }
 
             let now = IggyTimestamp::now();
@@ -560,19 +563,44 @@ impl TcpClient {
                     } else {
                         info!("{NAME} client: {client_address} is signing in...");
                         self.set_state(ClientState::Authenticating).await;
-                        match &credentials {
-                            Credentials::UsernamePassword(username, password) => {
-                                self.login_user(username, password.expose_secret()).await?;
-                                info!(
-                                    "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
-                                );
+                        let signed_in = match &credentials {
+                            Credentials::UsernamePassword(username, password) => self
+                                .login_user(username, password.expose_secret())
+                                .await
+                                .map(|_| format!("the user credentials, username: {username}")),
+                            Credentials::PersonalAccessToken(token) => self
+                                .login_with_personal_access_token(token.expose_secret())
+                                .await
+                                .map(|_| "a personal access token".to_owned()),
+                        };
+                        match signed_in {
+                            Ok(how) => {
+                                info!("{NAME} client: {client_address} has signed in with {how}.")
                             }
-                            Credentials::PersonalAccessToken(token) => {
-                                self.login_with_personal_access_token(token.expose_secret())
-                                    .await?;
-                                info!(
-                                    "{NAME} client: {client_address} has signed in with a personal access token.",
-                                );
+                            Err(error) => {
+                                // The transport is up and only the session is
+                                // not, so the state has to say so: left at
+                                // `Authenticating` every gated operation fails
+                                // client-side with `Disconnected`, `connect()`
+                                // returns ok without dialing, and nothing short
+                                // of an explicit `login_user` recovers.
+                                self.set_state(ClientState::Connected).await;
+                                // A rejected credential does not become valid on
+                                // the next reconnect, and replaying it costs an
+                                // argon2 on the server every time. Configured
+                                // credentials stay as configured -- they are the
+                                // caller's to fix -- so only the remembered
+                                // sign-in is dropped.
+                                if matches!(
+                                    error,
+                                    IggyError::InvalidCredentials
+                                        | IggyError::InvalidUsername
+                                        | IggyError::InvalidPassword
+                                        | IggyError::Unauthenticated
+                                ) {
+                                    self.forget_session_credentials().await;
+                                }
+                                return Err(error);
                             }
                         }
 
@@ -639,6 +667,13 @@ impl TcpClient {
         }
     }
 
+    /// Whether an `AutoLogin` is configured on this client, which makes the
+    /// session after any connect the configured user's rather than whoever
+    /// signed in by hand.
+    pub(crate) fn auto_login_configured(&self) -> bool {
+        matches!(self.config.auto_login, AutoLogin::Enabled(_))
+    }
+
     /// Credentials to sign in with after connecting: the configured ones, or
     /// else the ones a manual sign-in on this client succeeded with. A manual
     /// sign-in is otherwise less reconnectable than a configured one, which
@@ -646,7 +681,12 @@ impl TcpClient {
     async fn sign_in_credentials(&self) -> Option<Credentials> {
         match &self.config.auto_login {
             AutoLogin::Enabled(credentials) => Some(credentials.clone()),
-            AutoLogin::Disabled => self.session_credentials.lock().await.clone(),
+            AutoLogin::Disabled => self
+                .session_credentials
+                .lock()
+                .await
+                .as_ref()
+                .map(|remembered| remembered.credentials.clone()),
         }
     }
 
@@ -667,20 +707,137 @@ impl TcpClient {
         candidates
     }
 
-    /// Dial one endpoint, bounding the wait while other endpoints are queued
-    /// behind it (see `FAILOVER_DIAL_TIMEOUT`).
-    async fn dial(&self, server_address: &str, bounded: bool) -> io::Result<TcpStream> {
-        if !bounded {
-            return TcpStream::connect(server_address).await;
+    /// Bring one endpoint all the way up: TCP connect, socket options, and the
+    /// TLS handshake when it is configured. Nothing about the connection is
+    /// recorded until this succeeds, so a half-usable endpoint leaves no trace
+    /// for the next connect to lead with.
+    ///
+    /// `CannotEstablishConnection` means this endpoint failed and the next one
+    /// is worth trying; any other error is a configuration fault that no
+    /// endpoint can satisfy.
+    async fn establish(&self, server_address: &str) -> Result<EstablishedConnection, IggyError> {
+        let stream = TcpStream::connect(server_address).await.map_err(|error| {
+            error!("Failed to connect to server: {server_address}. Error: {error}");
+            IggyError::CannotEstablishConnection
+        })?;
+        let client_address = stream.local_addr().map_err(|error| {
+            error!("Failed to get the local address of the client: {error}");
+            IggyError::CannotEstablishConnection
+        })?;
+        let remote_address = stream.peer_addr().map_err(|error| {
+            error!("Failed to get the remote address of the server: {error}");
+            IggyError::CannotEstablishConnection
+        })?;
+
+        if let Err(error) = stream.set_nodelay(self.config.nodelay) {
+            error!("Failed to set the nodelay option on the client: {error}, continuing...");
         }
 
-        match tokio::time::timeout(FAILOVER_DIAL_TIMEOUT, TcpStream::connect(server_address)).await
-        {
-            Ok(connection) => connection,
-            Err(_elapsed) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("dialing {server_address} took longer than {FAILOVER_DIAL_TIMEOUT:?}"),
+        if !self.config.tls_enabled {
+            return Ok(EstablishedConnection {
+                stream: ConnectionStreamKind::Tcp(TcpConnectionStream::new(client_address, stream)),
+                client_address,
+                remote_address,
+            });
+        }
+
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = if self.config.tls_validate_certificate {
+            let mut root_cert_store = rustls::RootCertStore::empty();
+            if let Some(certificate_path) = &self.config.tls_ca_file {
+                for cert in CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
+                    error!("Failed to read the CA file: {certificate_path}. {error}");
+                    IggyError::InvalidTlsCertificatePath
+                })? {
+                    let certificate = cert.map_err(|error| {
+                        error!(
+                            "Failed to read a certificate from the CA file: {certificate_path}. {error}",
+                        );
+                        IggyError::InvalidTlsCertificate
+                    })?;
+                    root_cert_store.add(certificate).map_err(|error| {
+                        error!(
+                            "Failed to add a certificate to the root certificate store. {error}"
+                        );
+                        IggyError::InvalidTlsCertificate
+                    })?;
+                }
+            } else {
+                root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            }
+
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth()
+        } else {
+            use crate::tcp::tcp_tls_verifier::NoServerVerification;
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoServerVerification))
+                .with_no_client_auth()
+        };
+
+        let connector = TlsConnector::from(Arc::new(config));
+        let tls_domain = if self.config.tls_domain.is_empty() {
+            // Extract hostname/IP from server_address when tls_domain is not specified
+            server_address
+                .split(':')
+                .next()
+                .unwrap_or(server_address)
+                .to_string()
+        } else {
+            self.config.tls_domain.to_owned()
+        };
+        let domain = ServerName::try_from(tls_domain).map_err(|error| {
+            error!("Failed to create a server name from the domain. {error}");
+            IggyError::InvalidTlsDomain
+        })?;
+        let stream = connector.connect(domain, stream).await.map_err(|error| {
+            error!("Failed to establish a TLS connection to the server: {error}");
+            IggyError::CannotEstablishConnection
+        })?;
+
+        Ok(EstablishedConnection {
+            stream: ConnectionStreamKind::TcpTls(TcpTlsConnectionStream::new(
+                client_address,
+                TlsStream::Client(stream),
             )),
+            client_address,
+            remote_address,
+        })
+    }
+
+    /// Give up on connecting. The state has to go back to `Disconnected`:
+    /// left at `Connecting`, the next `connect()` returns ok at the top
+    /// without ever dialing.
+    async fn fail_connect(&self) {
+        self.set_state(ClientState::Disconnected).await;
+        self.publish_event(DiagnosticEvent::Disconnected).await;
+    }
+
+    /// [`Self::establish`], bounded while other endpoints are queued behind
+    /// this one (see `FAILOVER_DIAL_TIMEOUT`). The bound covers the handshake
+    /// as well as the connect: a peer that accepts TCP and then never answers
+    /// the ClientHello is exactly the kind of failure the survivors are there
+    /// for, and neither step has a deadline of its own.
+    async fn establish_bounded(
+        &self,
+        server_address: &str,
+        candidates: &[String],
+    ) -> Result<EstablishedConnection, IggyError> {
+        if candidates.len() < 2 {
+            return self.establish(server_address).await;
+        }
+
+        match tokio::time::timeout(FAILOVER_DIAL_TIMEOUT, self.establish(server_address)).await {
+            Ok(connection) => connection,
+            Err(_elapsed) => {
+                error!(
+                    "Connecting to server: {server_address} took longer than \
+                     {FAILOVER_DIAL_TIMEOUT:?}"
+                );
+                Err(IggyError::CannotEstablishConnection)
+            }
         }
     }
 
@@ -1006,6 +1163,8 @@ const fn is_login_register_code(code: u32) -> bool {
 mod tests {
     use super::*;
 
+    const SESSION_USER_ID: u32 = 7;
+
     fn client_with(server_address: &str, failover_addresses: Vec<String>) -> TcpClient {
         TcpClient::create(Arc::new(TcpClientConfig {
             server_address: server_address.to_string(),
@@ -1013,6 +1172,205 @@ mod tests {
             ..TcpClientConfig::default()
         }))
         .expect("create the client")
+    }
+
+    /// A listener nothing ever accepts from: the kernel completes the TCP
+    /// handshake out of its backlog, which is all a dial needs to succeed.
+    async fn live_endpoint() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a listener");
+        let address = listener.local_addr().expect("listener address").to_string();
+        (listener, address)
+    }
+
+    /// An address with nothing behind it: the dial is refused at once.
+    async fn dead_endpoint() -> String {
+        let (listener, address) = live_endpoint().await;
+        drop(listener);
+        address
+    }
+
+    /// A peer that accepts TCP and hangs up without a byte: enough for the
+    /// dial, never enough for a TLS handshake.
+    async fn endpoint_that_hangs_up() -> String {
+        let (listener, address) = live_endpoint().await;
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        address
+    }
+
+    // With reconnection off there are no retries, but the failover endpoints
+    // were configured to be tried and each still gets its one turn.
+    #[tokio::test]
+    async fn a_client_with_reconnection_disabled_still_sweeps_its_failover_endpoints() {
+        let (_listener, survivor) = live_endpoint().await;
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: dead_endpoint().await,
+            failover_addresses: vec![survivor.clone()],
+            reconnection: TcpClientReconnectionConfig {
+                enabled: false,
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+
+        TcpClient::connect(&client).await.expect("connect");
+        assert_eq!(*client.current_server_address.lock().await, survivor);
+    }
+
+    // A connect that gives up has to leave the state at `Disconnected`: left
+    // at `Connecting`, the next `connect()` returns ok at the top without ever
+    // dialing, and the client is wedged for good.
+    #[tokio::test]
+    async fn a_connect_that_exhausts_every_endpoint_leaves_the_client_disconnected() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: dead_endpoint().await,
+            failover_addresses: vec![dead_endpoint().await],
+            reconnection: TcpClientReconnectionConfig {
+                enabled: false,
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+
+        assert!(matches!(
+            TcpClient::connect(&client).await,
+            Err(IggyError::CannotEstablishConnection)
+        ));
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert!(
+            matches!(
+                TcpClient::connect(&client).await,
+                Err(IggyError::CannotEstablishConnection)
+            ),
+            "a second connect has to dial again rather than report success"
+        );
+    }
+
+    // An endpoint that accepts TCP but fails the TLS handshake is not where
+    // this client lives: recording it would make the next connect lead with
+    // it and shadow every endpoint behind it.
+    #[tokio::test]
+    async fn an_endpoint_that_fails_the_tls_handshake_does_not_become_the_current_one() {
+        let configured = dead_endpoint().await;
+        // Plain TCP behind a TLS client: the dial succeeds, the handshake
+        // cannot.
+        let plaintext = endpoint_that_hangs_up().await;
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: configured.clone(),
+            failover_addresses: vec![plaintext],
+            tls_enabled: true,
+            tls_validate_certificate: false,
+            reconnection: TcpClientReconnectionConfig {
+                enabled: false,
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+
+        assert!(matches!(
+            TcpClient::connect(&client).await,
+            Err(IggyError::CannotEstablishConnection)
+        ));
+        assert_eq!(*client.current_server_address.lock().await, configured);
+    }
+
+    // A peer that accepts TCP and then never answers is what the other
+    // endpoints are there for; without a bound on the handshake the sweep
+    // waits on it forever.
+    #[tokio::test]
+    async fn an_endpoint_that_never_answers_the_handshake_does_not_hold_up_the_sweep() {
+        let (_listener, silent) = live_endpoint().await;
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: silent,
+            failover_addresses: vec![dead_endpoint().await],
+            tls_enabled: true,
+            tls_validate_certificate: false,
+            reconnection: TcpClientReconnectionConfig {
+                enabled: false,
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+
+        let sweep = tokio::time::timeout(
+            FAILOVER_DIAL_TIMEOUT * 3,
+            std::pin::pin!(TcpClient::connect(&client)),
+        )
+        .await
+        .expect("the sweep has to end on its own");
+        assert!(matches!(sweep, Err(IggyError::CannotEstablishConnection)));
+    }
+
+    // `reestablish_after` paces reconnects to the endpoint that was lost. With
+    // somewhere else to go, that pause must not hold up the failover.
+    #[tokio::test]
+    async fn a_pending_reestablish_pause_does_not_delay_dialing_another_endpoint() {
+        let (_listener, survivor) = live_endpoint().await;
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: dead_endpoint().await,
+            failover_addresses: vec![survivor.clone()],
+            reconnection: TcpClientReconnectionConfig {
+                reestablish_after: IggyDuration::from_str("10s").expect("duration"),
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+        client
+            .connected_at
+            .lock()
+            .await
+            .replace(IggyTimestamp::now());
+
+        let started = std::time::Instant::now();
+        TcpClient::connect(&client).await.expect("connect");
+        assert_eq!(*client.current_server_address.lock().await, survivor);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the failover waited out a pause it owed only the lost endpoint: {:?}",
+            started.elapsed()
+        );
+    }
+
+    // The other half of the same promise: `with_reestablish_after` is a
+    // cooldown on redialing the endpoint that was lost, and a known roster
+    // does not cancel it.
+    #[tokio::test]
+    async fn the_reestablish_pause_still_applies_to_the_endpoint_that_was_lost() {
+        let (_listener, current) = live_endpoint().await;
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: current.clone(),
+            failover_addresses: vec![dead_endpoint().await],
+            reconnection: TcpClientReconnectionConfig {
+                reestablish_after: IggyDuration::from_str("1s").expect("duration"),
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+        client
+            .connected_at
+            .lock()
+            .await
+            .replace(IggyTimestamp::now());
+
+        let started = std::time::Instant::now();
+        TcpClient::connect(&client).await.expect("connect");
+        assert_eq!(*client.current_server_address.lock().await, current);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(700),
+            "the cooldown on the lost endpoint was skipped: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1056,10 +1414,10 @@ mod tests {
     async fn an_explicit_disconnect_forgets_the_remembered_sign_in() {
         let client = client_with("127.0.0.1:8090", Vec::new());
         client
-            .remember_session_credentials(Credentials::UsernamePassword(
-                "iggy".to_string(),
-                "iggy".into(),
-            ))
+            .remember_session_credentials(
+                Credentials::UsernamePassword("iggy".to_string(), "iggy".into()),
+                SESSION_USER_ID,
+            )
             .await;
 
         Client::disconnect(&client).await.expect("disconnect");
@@ -1073,10 +1431,10 @@ mod tests {
     async fn a_transport_drop_keeps_the_remembered_sign_in() {
         let client = client_with("127.0.0.1:8090", Vec::new());
         client
-            .remember_session_credentials(Credentials::UsernamePassword(
-                "iggy".to_string(),
-                "iggy".into(),
-            ))
+            .remember_session_credentials(
+                Credentials::UsernamePassword("iggy".to_string(), "iggy".into()),
+                SESSION_USER_ID,
+            )
             .await;
 
         client
@@ -1095,10 +1453,10 @@ mod tests {
         assert!(client.sign_in_credentials().await.is_none());
 
         client
-            .remember_session_credentials(Credentials::UsernamePassword(
-                "iggy".to_string(),
-                "iggy".into(),
-            ))
+            .remember_session_credentials(
+                Credentials::UsernamePassword("iggy".to_string(), "iggy".into()),
+                SESSION_USER_ID,
+            )
             .await;
         assert!(client.sign_in_credentials().await.is_some());
 
@@ -1106,6 +1464,92 @@ mod tests {
         // must not resurrect one.
         client.forget_session_credentials().await;
         assert!(client.sign_in_credentials().await.is_none());
+    }
+
+    // A password change for the signed-in user has to reach the remembered
+    // sign-in, or the next reconnect replays the old password and fails an
+    // unrelated request with `InvalidCredentials`.
+    #[tokio::test]
+    async fn a_password_change_for_the_signed_in_user_updates_the_remembered_sign_in() {
+        let client = client_with("127.0.0.1:8090", Vec::new());
+        client
+            .remember_session_credentials(
+                Credentials::UsernamePassword("iggy".to_string(), "old".into()),
+                SESSION_USER_ID,
+            )
+            .await;
+
+        for user in [
+            Identifier::numeric(SESSION_USER_ID).expect("numeric identifier"),
+            Identifier::named("iggy").expect("named identifier"),
+        ] {
+            client.refresh_session_password(&user, "new").await;
+            match client.sign_in_credentials().await {
+                Some(Credentials::UsernamePassword(_, password)) => {
+                    assert_eq!(password.expose_secret(), "new", "for user: {user}");
+                }
+                other => panic!("expected the remembered user credentials, got {other:?}"),
+            }
+            // Put it back so the second identifier form starts from the same
+            // place as the first.
+            client
+                .remember_session_credentials(
+                    Credentials::UsernamePassword("iggy".to_string(), "old".into()),
+                    SESSION_USER_ID,
+                )
+                .await;
+        }
+    }
+
+    // `change_password` can target anyone the caller may manage, and those
+    // changes say nothing about the credentials this client reconnects with.
+    #[tokio::test]
+    async fn a_password_change_for_another_user_leaves_the_remembered_sign_in_alone() {
+        let client = client_with("127.0.0.1:8090", Vec::new());
+        client
+            .remember_session_credentials(
+                Credentials::UsernamePassword("iggy".to_string(), "old".into()),
+                SESSION_USER_ID,
+            )
+            .await;
+
+        for user in [
+            Identifier::numeric(SESSION_USER_ID + 1).expect("numeric identifier"),
+            Identifier::named("someone-else").expect("named identifier"),
+        ] {
+            client.refresh_session_password(&user, "new").await;
+            match client.sign_in_credentials().await {
+                Some(Credentials::UsernamePassword(_, password)) => {
+                    assert_eq!(password.expose_secret(), "old", "for user: {user}");
+                }
+                other => panic!("expected the remembered user credentials, got {other:?}"),
+            }
+        }
+    }
+
+    // A personal access token is not derived from any password.
+    #[tokio::test]
+    async fn a_password_change_leaves_a_remembered_personal_access_token_alone() {
+        let client = client_with("127.0.0.1:8090", Vec::new());
+        client
+            .remember_session_credentials(
+                Credentials::PersonalAccessToken("token".into()),
+                SESSION_USER_ID,
+            )
+            .await;
+
+        client
+            .refresh_session_password(
+                &Identifier::numeric(SESSION_USER_ID).expect("numeric identifier"),
+                "new",
+            )
+            .await;
+        match client.sign_in_credentials().await {
+            Some(Credentials::PersonalAccessToken(token)) => {
+                assert_eq!(token.expose_secret(), "token");
+            }
+            other => panic!("expected the remembered token, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1119,10 +1563,10 @@ mod tests {
         }))
         .expect("create the client");
         client
-            .remember_session_credentials(Credentials::UsernamePassword(
-                "signed-in".to_string(),
-                "iggy".into(),
-            ))
+            .remember_session_credentials(
+                Credentials::UsernamePassword("signed-in".to_string(), "iggy".into()),
+                SESSION_USER_ID,
+            )
             .await;
 
         match client.sign_in_credentials().await {

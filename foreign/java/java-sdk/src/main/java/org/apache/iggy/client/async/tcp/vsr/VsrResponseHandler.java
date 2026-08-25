@@ -35,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.IntConsumer;
 
 /**
  * Correlates multiplexed requests by operation and request id, decodes VSR
@@ -54,10 +55,10 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private final ConcurrentMap<RequestKey, CompletableFuture<ByteBuf>> pendingRequests = new ConcurrentHashMap<>();
     private final ConsensusSession session;
-    private final Runnable onEviction;
+    private final IntConsumer onEviction;
     private final AtomicReference<Throwable> closeCause = new AtomicReference<>();
 
-    public VsrResponseHandler(ConsensusSession session, Runnable onEviction) {
+    public VsrResponseHandler(ConsensusSession session, IntConsumer onEviction) {
         this.session = session;
         this.onEviction = onEviction;
     }
@@ -162,7 +163,11 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         IggyServerException error = VsrHeaders.evictionToException(frame);
         session.reset();
         try {
-            onEviction.run();
+            // The reason travels with the notification: an eviction the server
+            // decided on (a stale client) ends the session authoritatively,
+            // while the rest are transport-shaped, and the listener has to
+            // tell them apart.
+            onEviction.accept(error.getRawErrorCode());
         } catch (RuntimeException listenerError) {
             log.warn("Eviction listener failed: {}", listenerError.getMessage());
         }

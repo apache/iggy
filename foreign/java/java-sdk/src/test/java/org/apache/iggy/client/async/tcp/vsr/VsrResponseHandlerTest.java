@@ -39,7 +39,11 @@ class VsrResponseHandlerTest {
 
     private final ConsensusSession session = new ConsensusSession();
     private final AtomicInteger evictions = new AtomicInteger();
-    private final VsrResponseHandler handler = new VsrResponseHandler(session, evictions::incrementAndGet);
+    private final AtomicInteger lastEvictionReason = new AtomicInteger();
+    private final VsrResponseHandler handler = new VsrResponseHandler(session, errorCode -> {
+        evictions.incrementAndGet();
+        lastEvictionReason.set(errorCode);
+    });
     private final EmbeddedChannel channel = new EmbeddedChannel(handler);
 
     @AfterEach
@@ -159,6 +163,9 @@ class VsrResponseHandlerTest {
         assertThat(rawErrorCode(future)).isEqualTo(42);
         assertThat(session.isBound()).isFalse();
         assertThat(evictions).hasValue(1);
+        // The reason reaches the listener, which has to tell an eviction the
+        // server decided on from a transport-shaped one.
+        assertThat(lastEvictionReason).hasValue(42);
     }
 
     @Test
@@ -171,6 +178,7 @@ class VsrResponseHandlerTest {
 
         assertThat(session.isBound()).isFalse();
         assertThat(evictions).hasValue(1);
+        assertThat(lastEvictionReason).hasValue(VsrHeaders.ERROR_STALE_CLIENT);
         assertThat(frame.refCnt()).isZero();
         assertThat(channel.isActive()).isFalse();
     }

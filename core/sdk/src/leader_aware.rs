@@ -20,7 +20,7 @@ use iggy_common::ClusterClient;
 use iggy_common::{
     ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
 };
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use tracing::{debug, info, warn};
 
@@ -217,11 +217,39 @@ fn process_cluster_metadata(
 
 /// Check if two addresses refer to the same endpoint
 /// Handles various formats like 127.0.0.1:8090 vs localhost:8090
+///
+/// A host name and the address it resolves to are one endpoint too: a client
+/// configured as `iggy-server:8090` whose roster advertises `10.0.0.5:8090`
+/// would otherwise dial that node twice per failover sweep, and a single-node
+/// deployment would be treated as a cluster. Resolution is the last resort,
+/// only when the spellings differ and at least one side is not a literal
+/// address, and it is a blocking lookup: this runs on the connect and redirect
+/// paths, which are rare and already wait on the network.
 pub(crate) fn is_same_address(addr1: &str, addr2: &str) -> bool {
     match (parse_address(addr1), parse_address(addr2)) {
         (Some(sock1), Some(sock2)) => sock1.ip() == sock2.ip() && sock1.port() == sock2.port(),
-        _ => normalize_address(addr1) == normalize_address(addr2),
+        (parsed1, parsed2) => {
+            if normalize_address(addr1) == normalize_address(addr2) {
+                return true;
+            }
+            if parsed1.is_some() && parsed2.is_some() {
+                return false;
+            }
+            resolve_all(addr1)
+                .zip(resolve_all(addr2))
+                .is_some_and(|(first, second)| {
+                    first.iter().any(|resolved| second.contains(resolved))
+                })
+        }
     }
+}
+
+/// Every socket address a host:port spelling resolves to, `None` when the
+/// resolver does not know the name (which then compares unequal, at worst
+/// costing one extra dial).
+fn resolve_all(addr: &str) -> Option<Vec<SocketAddr>> {
+    let resolved: Vec<SocketAddr> = addr.to_socket_addrs().ok()?.collect();
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 /// Parse address string to SocketAddr, handling various formats
@@ -336,6 +364,20 @@ mod tests {
         assert!(is_same_address("localhost:8090", "127.0.0.1:8090"));
         assert!(!is_same_address("127.0.0.1:8090", "127.0.0.1:8091"));
         assert!(!is_same_address("192.168.1.1:8090", "127.0.0.1:8090"));
+    }
+
+    // A host name and the address it resolves to name one endpoint; a name the
+    // resolver does not know compares unequal rather than erroring.
+    #[test]
+    fn a_host_name_matches_the_address_it_resolves_to() {
+        // `localhost` is rewritten before resolution, so use the loopback name
+        // the resolver itself answers for.
+        assert!(is_same_address("LOCALHOST:8090", "127.0.0.1:8090"));
+        assert!(!is_same_address("localhost:8090", "localhost:8091"));
+        assert!(!is_same_address(
+            "no-such-host.invalid:8090",
+            "127.0.0.1:8090"
+        ));
     }
 
     #[test]

@@ -135,9 +135,10 @@ impl<B: BinaryClient> PersonalAccessTokenClient for B {
             "authenticated against iggy server"
         );
         self.set_state(ClientState::Authenticated).await;
-        self.remember_session_credentials(Credentials::PersonalAccessToken(SecretString::from(
-            token.to_string(),
-        )))
+        self.remember_session_credentials(
+            Credentials::PersonalAccessToken(SecretString::from(token.to_string())),
+            wire_resp.user_id,
+        )
         .await;
         self.publish_event(DiagnosticEvent::SignedIn).await;
         Ok(IdentityInfo {

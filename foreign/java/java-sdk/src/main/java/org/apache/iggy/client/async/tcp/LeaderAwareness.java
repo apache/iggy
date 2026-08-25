@@ -217,15 +217,26 @@ final class LeaderAwareness {
      * at worst costs one redirect hop back to the same node.
      */
     static boolean isSameAddress(ConnectionInfo target1, ConnectionInfo target2) {
+        if (isSameSpelling(target1, target2)) {
+            return true;
+        }
         if (target1.port() != target2.port()) {
             return false;
         }
-        var host1 = canonicalHost(target1.host());
-        var host2 = canonicalHost(target2.host());
-        if (host1.equals(host2)) {
-            return true;
-        }
-        return resolveToSameHost(host1, host2);
+        return resolveToSameHost(canonicalHost(target1.host()), canonicalHost(target2.host()));
+    }
+
+    /**
+     * Whether two targets are written the same way, up to canonicalization.
+     *
+     * The cheap half of {@link #isSameAddress}, for callers that must not
+     * block: resolution is a synchronous DNS lookup, and the redial dedup runs
+     * on the Netty event loop. Two spellings of one node that only resolution
+     * could equate cost one wasted dial per rotation, which is not worth
+     * stalling an event loop for.
+     */
+    static boolean isSameSpelling(ConnectionInfo target1, ConnectionInfo target2) {
+        return target1.port() == target2.port() && canonicalHost(target1.host()).equals(canonicalHost(target2.host()));
     }
 
     private static String canonicalHost(String host) {
@@ -263,9 +274,6 @@ final class LeaderAwareness {
     }
 
     /**
-     * One leader-check verdict from a cluster-metadata snapshot.
-     */
-    /**
      * What one leader check learned from the roster: where to go, and every
      * node the cluster named for this transport. A client keeps the latter as
      * redial candidates, because the address it was configured with dies with
@@ -283,6 +291,9 @@ final class LeaderAwareness {
         }
     }
 
+    /**
+     * One leader-check verdict from a cluster-metadata snapshot.
+     */
     sealed interface LeaderCheck {
 
         /** A healthy leader with an enabled tcp transport lives elsewhere; reconnect to it. */

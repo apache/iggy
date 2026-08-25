@@ -38,6 +38,21 @@ public sealed class DialCandidatesTests
         Assert.Equal(["127.0.0.1:8090", "127.0.0.1:8091", "127.0.0.1:8092"], candidates);
     }
 
+    /// <summary>
+    ///     The configured address comes before the roster: it is the one endpoint the caller vouched for, and a
+    ///     roster learned from a cluster that has since changed shape may name nodes that are gone.
+    /// </summary>
+    [Fact]
+    public void DialsTheConfiguredAddressBeforeTheLearnedRoster()
+    {
+        var candidates = TcpMessageStream.DialCandidates(
+            "127.0.0.1:8090",
+            "127.0.0.1:8099",
+            ["127.0.0.1:8091", "127.0.0.1:8092"]);
+
+        Assert.Equal(["127.0.0.1:8090", "127.0.0.1:8099", "127.0.0.1:8091", "127.0.0.1:8092"], candidates);
+    }
+
     [Fact]
     public void KeepsTheConfiguredAddressWhenNoRosterWasLearned()
     {

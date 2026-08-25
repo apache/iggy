@@ -68,6 +68,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.IntConsumer;
 
 /**
  * Async TCP connection using Netty for non-blocking I/O.
@@ -97,7 +98,7 @@ public class AsyncTcpConnection {
     private final AtomicLong authGeneration = new AtomicLong(0);
     private final VsrRequestEncoder vsrEncoder;
     private final TransientFailoverHandler transientFailoverHandler;
-    private final Runnable sessionResetListener;
+    private final IntConsumer sessionResetListener;
     private final Consumer<Throwable> connectionFailureListener;
     private final long requestTimeoutNanos;
     private final long heartbeatIntervalNanos;
@@ -127,7 +128,7 @@ public class AsyncTcpConnection {
                 Duration.ofSeconds(5),
                 VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE,
                 null,
-                () -> {},
+                errorCode -> {},
                 ignored -> {});
     }
 
@@ -143,7 +144,7 @@ public class AsyncTcpConnection {
             Duration heartbeatInterval,
             int maxVsrFrameSize,
             TransientFailoverHandler transientFailoverHandler,
-            Runnable sessionResetListener,
+            IntConsumer sessionResetListener,
             Consumer<Throwable> connectionFailureListener) {
         this.transientFailoverHandler = transientFailoverHandler;
         this.sessionResetListener = sessionResetListener;
@@ -827,10 +828,29 @@ public class AsyncTcpConnection {
      * channel. Bumping the generation makes the replacement channel re-run
      * login and Register. The fresh session invalidates cached routing state
      * such as consumer-group assignments.
+     *
+     * The reason travels to the listener, which owns the question of whether
+     * the session may be re-established at all: only it knows whether the
+     * sign-in was configured on the client or run by a caller.
      */
-    private void onSessionEvicted() {
+    private void onSessionEvicted(int errorCode) {
         authGeneration.incrementAndGet();
-        sessionResetListener.run();
+        sessionResetListener.accept(errorCode);
+    }
+
+    /**
+     * Drops the captured sign-in, so the next channel comes up
+     * unauthenticated instead of replaying it.
+     *
+     * The channel replays the payload it captured to re-authenticate a
+     * replacement channel, which is right for a lost connection and wrong
+     * after an eviction the server decided on: that would resurrect the very
+     * session the server ended.
+     */
+    void forgetCapturedLogin() {
+        authenticated = false;
+        authGeneration.incrementAndGet();
+        releaseLoginPayload();
     }
 
     private void captureLoginPayloadIfNeeded(int commandCode, ByteBuf payload) {
@@ -894,7 +914,7 @@ public class AsyncTcpConnection {
         private final SslContext sslContext;
         private final ConsensusSession consensusSession;
         private final int maxVsrFrameSize;
-        private final Runnable onEviction;
+        private final IntConsumer onEviction;
 
         PoolChannelHandler(
                 String host,
@@ -903,7 +923,7 @@ public class AsyncTcpConnection {
                 SslContext sslContext,
                 ConsensusSession consensusSession,
                 int maxVsrFrameSize,
-                Runnable onEviction) {
+                IntConsumer onEviction) {
             this.host = host;
             this.port = port;
             this.enableTls = enableTls;
