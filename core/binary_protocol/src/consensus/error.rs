@@ -79,6 +79,17 @@ pub enum ConsensusError {
     #[error("invalid bit pattern in header (enum discriminant out of range)")]
     InvalidBitPattern,
 
+    // Consequence deliberately left out: `RequestHeader` reaches here too, and a
+    // client frame is dropped without a reply rather than stalling a consensus
+    // group. The plane-specific outcome belongs to the call site that logs it.
+    // "Likely", not asserted: replica frames authenticate the byte (frame seal
+    // or prepare identity) before this is raised, but a client `Request` has
+    // neither checksum, so its byte stays unverifiable.
+    #[error(
+        "operation {operation:#04x} is not known to this build; a newer release likely added it"
+    )]
+    UnsupportedOperation { operation: u8 },
+
     #[error("client-bound command {0:?} cannot be dispatched on inbound path")]
     ClientBoundCommand(Command),
 }
