@@ -262,8 +262,9 @@ async fn json_messages_sink_stores_as_json(
     for (i, (offset, payload, _)) in rows.iter().enumerate() {
         assert_eq!(*offset, i.to_string(), "Offset mismatch at row {i}");
         assert_eq!(
-            payload,
-            &json_payloads[i].to_string(),
+            serde_json::from_str::<serde_json::Value>(payload)
+                .expect("Failed to parse JSON string"),
+            json_payloads[i],
             "JSON payload mismatch at row {i}"
         );
     }
@@ -410,6 +411,7 @@ async fn sink_with_no_archive_deletes_s3_artefact(
         assert!(
             fixture
                 .confirm_empty_bucket()
+                .await
                 .expect("Failed to read empty bucket")
         );
     }

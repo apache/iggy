@@ -127,7 +127,7 @@ impl PayloadFormat {
                 tracing::warn!("Json is not supported, falling back to Text");
                 PayloadFormat::Text
             }
-
+            Some("varbyte") => PayloadFormat::Varbyte,
             other => {
                 if other.is_some() {
                     tracing::warn!(

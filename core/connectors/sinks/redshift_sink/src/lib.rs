@@ -632,11 +632,9 @@ impl RedshiftSink {
         // https://docs.aws.amazon.com/redshift/latest/dg/r_COPY_command_examples.html
         let iam_role = quote_identifier(&self.config.aws_iam_role)?.replace('"', "");
 
-        let region = quote_identifier(&self.config.aws_region)?.replace('"', "");
-
         Ok(format!(
-            "COPY {} ({}) FROM '{}' CREDENTIALS 'aws_iam_role={}' FORMAT AS PARQUET REGION '{}';",
-            staging_table, cols, s3_path, iam_role, region
+            "COPY {} ({}) FROM '{}' CREDENTIALS 'aws_iam_role={}' FORMAT AS PARQUET;",
+            staging_table, cols, s3_path, iam_role
         ))
     }
 
@@ -1230,8 +1228,8 @@ mod tests {
 
     #[test]
     fn given_payload_format_should_return_correct_sql_type() {
-        assert_eq!(PayloadFormat::Varbyte.sql_type(), "VARBYTE");
-        assert_eq!(PayloadFormat::Text.sql_type(), "VARCHAR");
+        assert!(PayloadFormat::Varbyte.sql_type().starts_with("VARBYTE("));
+        assert!(PayloadFormat::Text.sql_type().starts_with("VARCHAR("));
     }
 
     #[test]

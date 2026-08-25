@@ -298,8 +298,8 @@ pub struct RedshiftSinkNoArchiveFixture {
 }
 
 impl RedshiftSinkNoArchiveFixture {
-    pub fn confirm_empty_bucket(&self) -> Result<bool, TestBinaryError> {
-        bucket_empty(&self.minio_endpoint)
+    pub async fn confirm_empty_bucket(&self) -> Result<bool, TestBinaryError> {
+        bucket_empty(&self.minio_endpoint).await
     }
 }
 
@@ -402,38 +402,79 @@ fn create_bucket(minio_endpoint: &str) -> Result<(), TestBinaryError> {
     Ok(())
 }
 
-fn bucket_empty(minio_endpoint: &str) -> Result<bool, TestBinaryError> {
+async fn bucket_empty(minio_endpoint: &str) -> Result<bool, TestBinaryError> {
     use std::process::Command;
 
     let host = minio_endpoint.trim_start_matches("http://");
     let mc_host = format!("http://{}:{}@{}", MINIO_ACCESS_KEY, MINIO_SECRET_KEY, host);
 
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--network=host",
-            "-e",
-            &format!("MC_HOST_minio={}", mc_host),
-            "minio/mc",
-            "ls",
-            &format!("minio/{}", MINIO_BUCKET),
-        ])
-        .output()
-        .map_err(|error| TestBinaryError::FixtureSetup {
-            fixture_type: "RedshiftFixture".to_string(),
-            message: format!("Failed to run mc command: {error}"),
-        })?;
+    let mut result = false;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(TestBinaryError::FixtureSetup {
-            fixture_type: "IcebergFixture".to_string(),
-            message: format!("Failed to create bucket: stderr={stderr}, stdout={stdout}"),
-        });
+    for _ in 0..DEFAULT_POLL_ATTEMPTS {
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--network=host",
+                "-e",
+                &format!("MC_HOST_minio={}", mc_host),
+                "minio/mc",
+                "ls",
+                &format!("minio/{}", MINIO_BUCKET),
+            ])
+            .output()
+            .map_err(|error| TestBinaryError::FixtureSetup {
+                fixture_type: "RedshiftFixture".to_string(),
+                message: format!("Failed to run mc command: {error}"),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(TestBinaryError::FixtureSetup {
+                fixture_type: "IcebergFixture".to_string(),
+                message: format!("Failed to create bucket: stderr={stderr}, stdout={stdout}"),
+            });
+        }
+
+        tracing::info!("Checking bucket contents");
+
+        // When testing live S3
+
+        // let credentials = s3::creds::Credentials::new(
+        //     Some("AKIARI2XXXXXX"),
+        //     Some("X82flw9cR2iTYDS5nEFgXXXXX"),
+        //     None,
+        //     None,
+        //     None,
+        // )
+        // .expect("Failed to create credentials");
+
+        // let region = s3::Region::from_str(STAGING_REGION).expect("Failed to parse region");
+
+        // let bucket = s3::Bucket::new(MINIO_BUCKET, region, credentials).unwrap();
+
+        // let (results, _code) = bucket
+        //     .list_page(String::from(STAGING_PREFIX), None, None, None, Some(1))
+        //     .await
+        //     .unwrap();
+
+        // tracing::info!("Bucket contents: {:?}", results.contents);
+
+        // results.contents.is_empty();
+
+        match output.stdout.is_empty() {
+            true => {
+                return Ok(true);
+            }
+
+            false => {
+                result = false;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
     }
 
-    tracing::info!("Created MinIO bucket: {MINIO_BUCKET}");
-    Ok(output.stdout.is_empty())
+    Ok(result)
 }

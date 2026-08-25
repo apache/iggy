@@ -42,7 +42,7 @@ include_origin_timestamp = true
 payload_format = "varbyte"
 aws_access_key_id = "admin"
 aws_secret_access_key = "password"
-aws_iam_role ="aws_iam_role=arn:aws:iam::0123456789012:role/iggyRole"
+aws_iam_role ="arn:aws:iam::0123456789012:role/iggyRole"
 s3_bucket = "iggystaging"
 s3_prefix = "iggy/messages"
 s3_endpoint = "http://localhost:9000"
@@ -183,8 +183,7 @@ Substitutions: `pg_table_def` → `information_schema.columns`, `"column"` → `
 ```sql
 COPY "staging_iggy_messages" (id, iggy_offset, iggy_timestamp, iggy_stream, iggy_topic, iggy_partition_id, iggy_checksum, iggy_origin_timestamp, payload, created_at) FROM 's3://iggystaging/iggy/messages/019ff3d5-a06f-7921-b084-0c67cabfefed.parquet'
 CREDENTIALS 'aws_iam_role=arn:aws:iam::0123456789012:role/iggyRole'
-FORMAT AS PARQUET
-REGION 'us-east-1';
+FORMAT AS PARQUET;
 ```
 
 **pgwire test equivalent:**
