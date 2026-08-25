@@ -18,7 +18,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
 };
 use jni::objects::{GlobalRef, JByteArray, JObject, JString, JThrowable, JValue};
 use jni::{JNIEnv, JavaVM};
@@ -311,7 +312,13 @@ pub struct JdbcSource {
     // Behind a Mutex so `poll()` (&self) can transparently re-establish a dead
     // direct connection without `&mut self`.
     connection: Mutex<Option<GlobalRef>>,
+    // The committed cursor: only ever advanced from `pending_state` once the
+    // runtime confirms the batch was both sent and its checkpoint persisted.
     state: Arc<Mutex<State>>,
+    // The cursor this in-flight batch would advance to, staged by `poll` and
+    // resolved by `on_batch_result`. The SDK keeps at most one batch in flight,
+    // so a single slot is sufficient.
+    pending_state: Mutex<Option<State>>,
     // Poll interval parsed once from `config.poll_interval` at construction.
     poll_interval: Duration,
     // Scheduled start of the next poll, used to pace polls at a fixed cadence
@@ -355,6 +362,7 @@ impl JdbcSource {
             jvm: None,
             connection: Mutex::new(None),
             state: Arc::new(Mutex::new(state)),
+            pending_state: Mutex::new(None),
             poll_interval,
             next_poll_at: Mutex::new(None),
         }
@@ -639,11 +647,20 @@ impl JdbcSource {
         }
     }
 
-    /// Execute query and fetch results.
+    /// Execute query and fetch results, returning the messages together with the
+    /// cursor this batch *would* advance to.
     ///
-    /// The mutex is held only briefly: once to read the current offset for
-    /// query building, and once after the JNI work to write the updated state.
-    fn execute_query(&self, env: &mut JNIEnv) -> Result<Vec<ProducedMessage>, Error> {
+    /// The candidate cursor is deliberately not written to `self.state` here: the
+    /// caller stages it and commits it only once the runtime acknowledges that the
+    /// batch was both sent and its checkpoint persisted. Advancing the in-memory
+    /// cursor at fetch time would permanently skip a batch whose send later failed.
+    ///
+    /// The mutex is held only briefly: once to read the current offset for query
+    /// building, and once after the JNI work to snapshot the counters.
+    fn execute_query(
+        &self,
+        env: &mut JNIEnv,
+    ) -> Result<(Vec<ProducedMessage>, Option<State>), Error> {
         let connection = self.get_connection(env)?;
 
         // Read current state snapshot (short lock)
@@ -672,21 +689,29 @@ impl JdbcSource {
             )));
         }
 
-        // Update state with results (short lock)
-        {
-            let mut state = lock_mutex(&self.state, "state")?;
-            if let Some(offset) = max_offset {
-                state.last_offset = Some(offset);
-            }
-            state.processed_rows += row_count;
-            state.last_poll_time = Utc::now();
-            info!(
-                "Fetched {} rows, total processed: {}",
-                row_count, state.processed_rows
-            );
+        // An empty poll moves no cursor, so there is nothing to checkpoint.
+        // Returning no candidate state keeps an idle table from rewriting an
+        // unchanged checkpoint every interval, which on the HTTP state backend
+        // would be a network round-trip per poll.
+        if row_count == 0 {
+            return Ok((messages, None));
         }
 
-        Ok(messages)
+        // Snapshot the cursor this batch would commit (short lock).
+        let candidate = {
+            let state = lock_mutex(&self.state, "state")?;
+            State {
+                last_offset: max_offset.or_else(|| state.last_offset.clone()),
+                processed_rows: state.processed_rows.saturating_add(row_count),
+                last_poll_time: Utc::now(),
+            }
+        };
+        info!(
+            "Fetched {} rows, {} processed once this batch is acknowledged",
+            row_count, candidate.processed_rows
+        );
+
+        Ok((messages, Some(candidate)))
     }
 
     /// Prepare a JDBC statement, execute it, and read all result rows into messages.
@@ -1457,37 +1482,49 @@ impl Source for JdbcSource {
         // block_in_place so it does not monopolize a shared async-runtime worker
         // while other connectors need to make progress. The connectors runtime is
         // multi-threaded, which block_in_place requires.
-        let messages = tokio::task::block_in_place(|| -> Result<Vec<ProducedMessage>, Error> {
-            let jvm = self
-                .jvm
-                .as_ref()
-                .ok_or_else(|| Error::InitError("JVM not initialized".to_string()))?;
-            let mut env = jvm
-                .attach_current_thread()
-                .map_err(|e| Error::InitError(format!("Failed to attach thread: {e}")))?;
-            // Defensive: clear any exception left pending by a prior failed poll
-            // on this thread before issuing JNI calls.
-            clear_pending_exception(&mut env);
-            // Bound this poll's local references (the connection local ref, the
-            // query string, and the statement/result-set handles) to a frame
-            // reclaimed when the poll returns. A tokio worker thread stays
-            // attached to the JVM across polls (attach_current_thread returns a
-            // no-detach nested guard once attached), so without this frame those
-            // per-poll locals accumulate on the thread's top-level frame and
-            // eventually overflow the JNI local reference table, aborting the JVM.
-            env.push_local_frame(16)
-                .map_err(|e| Error::Connection(format!("Failed to push local frame: {e}")))?;
-            let result = self.execute_query(&mut env);
-            // SAFETY: execute_query returns only owned Rust data (messages); no
-            // JNI local reference escapes the frame.
-            let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-            result
-        })?;
+        let (messages, candidate_state) = tokio::task::block_in_place(
+            || -> Result<(Vec<ProducedMessage>, Option<State>), Error> {
+                let jvm = self
+                    .jvm
+                    .as_ref()
+                    .ok_or_else(|| Error::InitError("JVM not initialized".to_string()))?;
+                let mut env = jvm
+                    .attach_current_thread()
+                    .map_err(|e| Error::InitError(format!("Failed to attach thread: {e}")))?;
+                // Defensive: clear any exception left pending by a prior failed poll
+                // on this thread before issuing JNI calls.
+                clear_pending_exception(&mut env);
+                // Bound this poll's local references (the connection local ref, the
+                // query string, and the statement/result-set handles) to a frame
+                // reclaimed when the poll returns. A tokio worker thread stays
+                // attached to the JVM across polls (attach_current_thread returns a
+                // no-detach nested guard once attached), so without this frame those
+                // per-poll locals accumulate on the thread's top-level frame and
+                // eventually overflow the JNI local reference table, aborting the JVM.
+                env.push_local_frame(16)
+                    .map_err(|e| Error::Connection(format!("Failed to push local frame: {e}")))?;
+                let result = self.execute_query(&mut env);
+                // SAFETY: execute_query returns only owned Rust data (messages and
+                // the candidate state); no JNI local reference escapes the frame.
+                let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+                result
+            },
+        )?;
 
-        // Persist state so offsets survive connector restarts
-        let connector_state = {
-            let state = lock_mutex(&self.state, "state")?;
-            ConnectorState::serialize(&*state, CONNECTOR_NAME, self.id)
+        // Stage the advanced cursor rather than committing it. The runtime saves
+        // the returned state only after the batch is sent, then reports the
+        // outcome to `on_batch_result`, which commits on Ack and discards on Nack
+        // so a failed send is re-polled instead of silently skipped.
+        let connector_state = match candidate_state {
+            Some(candidate) => {
+                let serialized = ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id)
+                    .ok_or_else(|| {
+                        Error::Serialization("failed to serialize JDBC source state".to_string())
+                    })?;
+                *lock_mutex(&self.pending_state, "pending_state")? = Some(candidate);
+                Some(serialized)
+            }
+            None => None,
         };
 
         Ok(ProducedMessages {
@@ -1495,6 +1532,34 @@ impl Source for JdbcSource {
             messages,
             state: connector_state,
         })
+    }
+
+    /// Resolve the cursor staged by the last `poll`.
+    ///
+    /// `Ack` means the runtime both sent the batch and durably persisted its
+    /// checkpoint, so the staged cursor becomes the committed one. `Nack` means
+    /// neither happened, so the staged cursor is dropped and the next poll rebuilds
+    /// the same query from the committed offset. That re-reads the batch (delivery
+    /// stays at-least-once) instead of skipping it, which is what advancing the
+    /// cursor at fetch time would have done.
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let candidate = lock_mutex(&self.pending_state, "pending_state")?.take();
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        match result {
+            SourceBatchResult::Ack => {
+                *lock_mutex(&self.state, "state")? = candidate;
+            }
+            SourceBatchResult::Nack => {
+                warn!(
+                    "JDBC source [{}] batch was not acknowledged; discarding the staged offset \
+                     {:?} and re-polling the same range",
+                    self.id, candidate.last_offset
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -3284,6 +3349,94 @@ mod tests {
             "Debug output should contain masked password: {}",
             debug_output
         );
+    }
+
+    // =========================================================================
+    // Batch-result (staged cursor) tests
+    //
+    // Named after the sibling `random_source` convention, which covers the same
+    // Ack/Nack contract.
+    // =========================================================================
+
+    /// An incremental source whose committed offset starts at `committed`.
+    fn incremental_source_at(committed: &str) -> JdbcSource {
+        let mut config = base_config();
+        config.mode = Mode::Incremental;
+        config.tracking_column = Some("id".to_string());
+        config.query =
+            "SELECT id FROM t WHERE {tracking_column} > {last_offset} ORDER BY {tracking_column}"
+                .to_string();
+        let source = JdbcSource::new(1, config, None);
+        source.state.lock().expect("state lock").last_offset = Some(committed.to_string());
+        source
+    }
+
+    /// Stage the cursor a fetched batch would advance to, as `poll` does.
+    fn stage_candidate(source: &JdbcSource, offset: &str, processed_rows: u64) {
+        *source.pending_state.lock().expect("pending lock") = Some(State {
+            last_offset: Some(offset.to_string()),
+            processed_rows,
+            last_poll_time: Utc::now(),
+        });
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build test runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn given_ack_when_batch_is_staged_should_commit_candidate_offset() {
+        let source = incremental_source_at("10");
+        stage_candidate(&source, "42", 32);
+
+        block_on(source.on_batch_result(SourceBatchResult::Ack)).expect("ACK should apply");
+
+        let state = source.state.lock().expect("state lock");
+        assert_eq!(state.last_offset, Some("42".to_string()));
+        assert_eq!(state.processed_rows, 32);
+        assert!(source.pending_state.lock().expect("pending lock").is_none());
+    }
+
+    #[test]
+    fn given_nack_when_batch_is_staged_should_keep_committed_offset() {
+        let source = incremental_source_at("10");
+        stage_candidate(&source, "42", 32);
+
+        block_on(source.on_batch_result(SourceBatchResult::Nack)).expect("NACK should apply");
+
+        let state = source.state.lock().expect("state lock");
+        // The undelivered batch must not advance the cursor, and the staged value
+        // must be discarded rather than lingering for a later batch to commit.
+        assert_eq!(state.last_offset, Some("10".to_string()));
+        assert_eq!(state.processed_rows, 0);
+        assert!(source.pending_state.lock().expect("pending lock").is_none());
+    }
+
+    #[test]
+    fn given_nack_when_next_poll_builds_query_should_re_read_the_same_range() {
+        let source = incremental_source_at("10");
+        stage_candidate(&source, "42", 32);
+        block_on(source.on_batch_result(SourceBatchResult::Nack)).expect("NACK should apply");
+
+        // The regression this guards: advancing the cursor at fetch time would
+        // rebuild the next query from '42' and permanently skip rows 11..=42.
+        let state = source.state.lock().expect("state lock");
+        let query = source.build_query(&state).expect("build query");
+        assert_eq!(query, "SELECT id FROM t WHERE id > '10' ORDER BY id");
+    }
+
+    #[test]
+    fn given_ack_when_nothing_is_staged_should_leave_committed_state_unchanged() {
+        let source = incremental_source_at("10");
+        // An empty poll stages nothing, so an ACK for it must not disturb the cursor.
+        block_on(source.on_batch_result(SourceBatchResult::Ack)).expect("ACK should apply");
+
+        let state = source.state.lock().expect("state lock");
+        assert_eq!(state.last_offset, Some("10".to_string()));
+        assert_eq!(state.processed_rows, 0);
     }
 
     #[test]

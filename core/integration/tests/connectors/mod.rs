@@ -41,7 +41,7 @@ use iggy::prelude::{IggyClient, IggyMessage, Partitioning};
 use iggy_common::Client;
 use iggy_common::{
     CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, MessageClient, PolledMessages,
-    StreamClient, TopicClient,
+    StreamClient, TopicClient, TopicCreateOptions,
 };
 use integration::harness::{ConnectorsRuntimeConfig, IpAddrKind, TestHarness, TestServerConfig};
 use serde::{Deserialize, Serialize};
@@ -63,8 +63,9 @@ fn setup_runtime() -> ConnectorsRuntime {
                         // The harness pre-reserves a fixed TCP port (see PortReserver),
                         // so the server binds a non-zero port. That relies on the server
                         // writing current_config.toml on bind regardless of how the port
-                        // was chosen (see tcp_listener.rs); the harness reads that file to
-                        // discover the bound address before it considers startup complete.
+                        // was chosen (see config_writer::write_current_config); the harness
+                        // reads that file to discover the bound address before it considers
+                        // startup complete.
                         ("IGGY_TCP_ADDRESS".to_owned(), "127.0.0.1:0".to_owned()),
                     ]))
                     .build(),
@@ -131,6 +132,7 @@ impl ConnectorsIggyClient {
                 messages,
             )
             .await
+            .map(|_| ())
     }
 
     async fn get_messages(&self) -> Result<PolledMessages, iggy_common::IggyError> {
@@ -203,11 +205,13 @@ impl ConnectorsRuntime {
             .create_topic(
                 &stream_id,
                 &iggy_setup.topic,
-                1,
-                CompressionAlgorithm::None,
-                None,
-                IggyExpiry::ServerDefault,
-                MaxTopicSize::ServerDefault,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    compression_algorithm: Some(CompressionAlgorithm::None),
+                    message_expiry: Some(IggyExpiry::ServerDefault),
+                    max_topic_size: Some(MaxTopicSize::ServerDefault),
+                    ..TopicCreateOptions::default()
+                },
             )
             .await
             .expect("Failed to create topic");

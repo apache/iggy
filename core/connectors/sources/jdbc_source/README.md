@@ -13,7 +13,7 @@ This connector reads data from relational databases using JDBC (Java Database Co
 - **Bulk Mode**: Re-runs the query each poll for snapshots (capped at `batch_size` rows; see limitations)
 - **Type Mapping**: Automatic conversion of SQL types to JSON
 - **Configurable Polling**: Control how frequently data is fetched
-- **State Management**: Tracks offsets so rows below the cursor are not re-read (at-least-once across restarts, not exactly-once)
+- **State Management**: Tracks offsets so rows below the cursor are not re-read, committing the cursor only once the runtime acknowledges delivery (at-least-once, not exactly-once)
 - **Flexible Queries**: Support for custom SQL queries with placeholders
 
 ## Supported Databases
@@ -347,14 +347,15 @@ JDBC SQL types are automatically mapped to JSON:
   than a batch, raise `batch_size` to cover the full result, or use incremental
   mode with an ordered `tracking_column`. (Full cross-database OFFSET pagination
   is a planned follow-up.)
-- **Delivery semantics.** State (the incremental offset) is persisted by the
-  runtime only after a batch is successfully sent, so offsets are **at-least-once
-  across restarts**: a crash or restart never skips rows. One narrower gap
-  remains: a *transient in-process send failure without a restart* can skip the
-  batch it happened on, because the in-memory offset is not rolled back. This
-  matches the other offset-tracking source connectors and is a runtime-level
-  limitation (there is no per-poll delivery ack to the connector); a stronger
-  guarantee is tracked as a follow-up.
+- **Delivery semantics: at-least-once.** The offset advanced by a poll is only
+  *staged*; it is committed after the runtime reports that the batch was both
+  sent and its checkpoint durably persisted (`SourceBatchResult::Ack`). If either
+  step fails (`Nack`), the staged offset is discarded and the next poll rebuilds
+  the same query from the committed offset, so the batch is **re-read rather than
+  skipped** - for a transient in-process send failure as well as for a crash or
+  restart. Rows can therefore be delivered more than once (message IDs are
+  random per poll, so downstream consumers must dedupe on a business key if they
+  need exactly-once); rows are never silently dropped.
 - **Connection recovery.** The connection is validated with `Connection.isValid`
   each poll and transparently re-established (closing the old handle) if it has
   dropped. The check runs on the shared `block_in_place` worker, so its timeout

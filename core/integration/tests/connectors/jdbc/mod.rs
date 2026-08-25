@@ -15,7 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// JDBC connector tests.
-// Source PostgreSQL tests: test_with_postgres.rs
-// Sink PostgreSQL tests:   test_sink_with_postgres.rs
-mod test_with_postgres;
+// JDBC connector tests, exercised against PostgreSQL over the JDBC driver.
+mod jdbc_source;
