@@ -32,7 +32,7 @@ pub struct ProducerDispatcher {
     closed: AtomicBool,
     bytes_permit: Arc<Semaphore>,
     stop_tx: broadcast::Sender<()>,
-    _join_handle: JoinHandle<()>,
+    join_handle: JoinHandle<()>,
 }
 
 impl ProducerDispatcher {
@@ -49,7 +49,6 @@ impl ProducerDispatcher {
         let err_callback = config.error_callback.clone();
         let (stop_tx, _) = broadcast::channel::<()>(1);
 
-        // A task that receives errors from shards when writing messages failed.
         let handle = tokio::spawn(async move {
             while let Ok(ctx) = err_rx.recv_async().await {
                 if let Err(panic) = std::panic::AssertUnwindSafe(err_callback.call(ctx))
@@ -90,7 +89,7 @@ impl ProducerDispatcher {
             closed: AtomicBool::new(false),
             bytes_permit: Arc::new(Semaphore::new(bytes_permit)),
             stop_tx,
-            _join_handle: handle,
+            join_handle: handle,
         }
     }
 
@@ -182,7 +181,7 @@ impl ProducerDispatcher {
 
         // After shards are closed await the error callback task,
         // that might drain queued errors from the final flush.
-        if let Err(e) = self._join_handle.await {
+        if let Err(e) = self.join_handle.await {
             tracing::error!("error-worker panicked: {e:?}");
         }
     }
@@ -366,11 +365,14 @@ mod tests {
     #[derive(Clone, Debug)]
     struct TestErrorCallback {
         called: Arc<AtomicUsize>,
+        last_batch_len: Arc<AtomicUsize>,
     }
 
     impl ErrorCallback for TestErrorCallback {
-        fn call(&self, _ctx: ErrorCtx) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        fn call(&self, ctx: ErrorCtx) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
             self.called.fetch_add(1, Ordering::SeqCst);
+            self.last_batch_len
+                .store(ctx.messages.len(), Ordering::SeqCst);
             Box::pin(async {})
         }
     }
@@ -378,27 +380,27 @@ mod tests {
     #[tokio::test]
     async fn test_custom_sharding_and_error_callback() {
         let mut mock = MockProducerCoreBackend::new();
-        mock.expect_send_internal()
-            .times(1)
-            .returning(|_, _, _, _| {
-                Box::pin(async {
-                    Err(IggyError::ProducerSendFailed {
-                        cause: Box::new(IggyError::Error),
-                        failed: Arc::new(vec![dummy_message(10)]),
-                        committed: Arc::new(Vec::new()),
-                        stream_name: "1".to_string(),
-                        topic_name: "1".to_string(),
-                    })
+        mock.expect_send_internal().returning(|_, _, _, _| {
+            Box::pin(async {
+                Err(IggyError::ProducerSendFailed {
+                    cause: Box::new(IggyError::Error),
+                    failed: Arc::new(vec![dummy_message(10)]),
+                    committed: Arc::new(Vec::new()),
+                    stream_name: "1".to_string(),
+                    topic_name: "1".to_string(),
                 })
-            });
+            })
+        });
 
         let sharding_called = Arc::new(AtomicUsize::new(0));
         let error_called = Arc::new(AtomicUsize::new(0));
+        let last_batch_len = Arc::new(AtomicUsize::new(0));
 
         let config = BackgroundConfig::builder()
             .num_shards(1)
             .error_callback(Arc::new(Box::new(TestErrorCallback {
                 called: error_called.clone(),
+                last_batch_len: last_batch_len.clone(),
             })))
             .sharding(Box::new(TestSharding {
                 called: sharding_called.clone(),
@@ -421,33 +423,33 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(sharding_called.load(Ordering::SeqCst), 1);
         assert_eq!(error_called.load(Ordering::SeqCst), 1);
+        assert_eq!(last_batch_len.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn test_shutdown_reports_errors_from_final_flush() {
         let mut mock = MockProducerCoreBackend::new();
-        // mock a failed send to be caught by the error callback
-        mock.expect_send_internal()
-            .times(1)
-            .returning(|_, _, _, _| {
-                Box::pin(async {
-                    Err(IggyError::ProducerSendFailed {
-                        cause: Box::new(IggyError::Error),
-                        failed: Arc::new(vec![dummy_message(10)]),
-                        committed: Arc::new(Vec::new()),
-                        stream_name: "1".to_string(),
-                        topic_name: "1".to_string(),
-                    })
+        mock.expect_send_internal().returning(|_, _, _, _| {
+            Box::pin(async {
+                Err(IggyError::ProducerSendFailed {
+                    cause: Box::new(IggyError::Error),
+                    failed: Arc::new(vec![dummy_message(10)]),
+                    committed: Arc::new(Vec::new()),
+                    stream_name: "1".to_string(),
+                    topic_name: "1".to_string(),
                 })
-            });
+            })
+        });
 
         let error_called = Arc::new(AtomicUsize::new(0));
+        let last_batch_len = Arc::new(AtomicUsize::new(0));
 
         let config = BackgroundConfig::builder()
             .num_shards(1)
-            .linger_time(Duration::from_secs(60).into()) // block/ wait so shutdown triggers the flush
+            .linger_time(Duration::from_secs(60).into())
             .error_callback(Arc::new(Box::new(TestErrorCallback {
                 called: error_called.clone(),
+                last_batch_len: last_batch_len.clone(),
             })))
             .build();
 
@@ -463,11 +465,9 @@ mod tests {
             .await
             .unwrap();
 
-        // trigger the final flush
         dispatcher.shutdown().await;
 
-        // Passes, if the error callback is hit once after final
-        // flush from shutdown.
         assert_eq!(error_called.load(Ordering::SeqCst), 1);
+        assert_eq!(last_batch_len.load(Ordering::SeqCst), 1);
     }
 }
