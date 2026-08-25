@@ -643,7 +643,23 @@ func (c *IggyTcpClient) sendFrame(ctx context.Context, code uint32, frame []byte
 				return nil, redirectErr
 			}
 			if redirect {
+				// A connect-scoped request is issued from inside the sign-in
+				// transaction, which holds registerMtx: the automatic sign-in
+				// on the reconnect path would wait on that lock forever. The
+				// transaction signs in itself on the node it lands on, so the
+				// reconnect must not.
+				connectScopedRequest := ctx.Value(connectScoped{}) != nil
+				if connectScopedRequest {
+					c.mtx.Lock()
+					c.skipAutoLoginOnce = true
+					c.mtx.Unlock()
+				}
 				if connectErr := c.Connect(ctx); connectErr != nil {
+					if connectScopedRequest {
+						c.mtx.Lock()
+						c.skipAutoLoginOnce = false
+						c.mtx.Unlock()
+					}
 					return nil, connectErr
 				}
 				stamped = false
@@ -963,18 +979,34 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 			// a pass that stopped at the first refusal would never reach the
 			// survivors of a client configured for a single retry.
 			var lastErr error
+			// A fault no retry can fix, kept aside rather than returned at
+			// once: it belongs to the endpoint that raised it, and the
+			// endpoints behind that one may be perfectly usable.
+			var configFault error
 			for _, address := range candidates {
 				if address == pacedEndpoint {
-					c.awaitReestablish(connectedAt)
+					c.awaitReestablish(ctx, connectedAt)
 				}
 				connection, err := c.dialCandidate(ctx, address, len(candidates) > 1)
 				if err != nil {
 					lastErr = err
+					if isTLSConfigFault(err) {
+						configFault = err
+					}
 					continue
 				}
 
 				conn = connection
 				return nil
+			}
+
+			// An unreadable CA file, an unparsable domain, a certificate this
+			// client will never accept: no endpoint answered, and at least one
+			// said why in a way no retry changes. Reported as unrecoverable so
+			// the default unlimited retries do not redial it every interval
+			// forever and bury it.
+			if configFault != nil {
+				return retry.Unrecoverable(configFault)
 			}
 
 			return lastErr
@@ -1009,18 +1041,48 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	return nil
 }
 
+// isTLSConfigFault reports whether a dial failed for a reason that says the
+// client's own TLS configuration is wrong -- an unreadable or unparsable CA
+// file, a domain that yields no server name, or a certificate this client will
+// never accept. None of those change on a retry.
+func isTLSConfigFault(err error) bool {
+	if errors.Is(err, ierror.ErrInvalidTlsCertificatePath) ||
+		errors.Is(err, ierror.ErrInvalidTlsCertificate) ||
+		errors.Is(err, ierror.ErrInvalidTlsDomain) {
+		return true
+	}
+
+	var certificateError *tls.CertificateVerificationError
+	var recordError tls.RecordHeaderError
+	return errors.As(err, &certificateError) || errors.As(err, &recordError)
+}
+
 // awaitReestablish waits out what is left of the reestablishAfter window since
 // the last successful connection, if any.
-func (c *IggyTcpClient) awaitReestablish(connectedAt time.Time) {
+//
+// The wait ends early on the caller's context or on Close: a sweep that found
+// every other endpoint refused reaches the paced one in milliseconds, and
+// sleeping the rest of the window regardless would hold the client in
+// Connecting long past the deadline the caller gave it.
+func (c *IggyTcpClient) awaitReestablish(ctx context.Context, connectedAt time.Time) {
 	if connectedAt.IsZero() {
 		return
 	}
 
 	elapsed := time.Since(connectedAt)
 	c.logger.Debug("Elapsed time since last connection", slog.Duration("elapsed", elapsed))
-	if remaining := c.config.reconnection.reestablishAfter - elapsed; remaining > 0 {
-		c.logger.Info("Trying to connect to the server", slog.Duration("remaining", remaining))
-		time.Sleep(remaining)
+	remaining := c.config.reconnection.reestablishAfter - elapsed
+	if remaining <= 0 {
+		return
+	}
+
+	c.logger.Info("Trying to connect to the server", slog.Duration("remaining", remaining))
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	case <-c.closed:
 	}
 }
 
@@ -1054,7 +1116,7 @@ func (c *IggyTcpClient) dialCandidate(ctx context.Context, address string, bound
 
 	established := connection
 	if c.config.tlsEnabled {
-		tlsConfig, err := c.createTLSConfig()
+		tlsConfig, err := c.createTLSConfig(address)
 		if err != nil {
 			_ = connection.Close()
 			return nil, err
@@ -1157,7 +1219,14 @@ func (c *IggyTcpClient) forgetLogin() {
 	c.rememberedLogin = AutoLogin{}
 }
 
-func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
+// createTLSConfig builds the client config for one dial.
+//
+// address is the candidate being dialed, which is where the SNI comes from
+// when no domain is configured. Taking it from currentServerAddress instead
+// would name the endpoint the client just lost: with validation on, a failover
+// to a node with another name or address then fails the handshake against a
+// certificate that never covered the old one.
+func (c *IggyTcpClient) createTLSConfig(address string) (*tls.Config, error) {
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: !c.config.tls.tlsValidateCertificate,
 	}
@@ -1165,9 +1234,9 @@ func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
 	// Set server name for SNI
 	serverName := c.config.tls.tlsDomain
 	if serverName == "" {
-		host, _, err := net.SplitHostPort(c.currentServerAddress)
+		host, _, err := net.SplitHostPort(address)
 		if err != nil {
-			host = c.currentServerAddress
+			host = address
 		}
 		serverName = host
 	}

@@ -21,7 +21,11 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.exception.IggyConnectionException;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyServerException;
 import org.junit.jupiter.api.Test;
 
 import java.io.EOFException;
@@ -36,6 +40,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -382,5 +387,53 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     @FunctionalInterface
     private interface RequestHandler {
         Response handle(Request request);
+    }
+
+    /**
+     * A roster read that learned nothing must leave the last one standing:
+     * emptying the redial candidates when the cluster is unreachable takes them
+     * away exactly when they are needed.
+     */
+    @Test
+    void shouldKeepTheLastRosterWhenALookupLearnedNothing() {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                .host(loopback.getHostAddress())
+                .port(8090)
+                .build();
+        List<ConnectionInfo> roster = List.of(new ConnectionInfo("iggy-0", 8091), new ConnectionInfo("iggy-1", 8092));
+
+        client.rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), roster));
+        assertThat(client.rosterTargets()).isEqualTo(roster);
+
+        client.rememberRoster(LeaderAwareness.LeaderLookup.inconclusive());
+        assertThat(client.rosterTargets())
+                .as("an inconclusive check erased the endpoints the client still needs")
+                .isEqualTo(roster);
+    }
+
+    /**
+     * Only the server answering "no" ends a redial. A channel that closed
+     * before the reply, or a node that refuses because it is not the primary,
+     * says nothing about the credentials -- treated as a rejection, they are
+     * dropped and the client is published on a node that is already gone.
+     */
+    @Test
+    void shouldTreatOnlyANonTransientServerVerdictAsASignInRejection() {
+        assertThat(AsyncIggyTcpClient.isSignInRejection(
+                        IggyServerException.fromTcpResponse(IggyErrorCode.INVALID_CREDENTIALS.getCode(), new byte[0])))
+                .isTrue();
+        assertThat(AsyncIggyTcpClient.isSignInRejection(new IggyConnectionException("channel closed")))
+                .as("a channel that died mid sign-in is not a rejected credential")
+                .isFalse();
+        assertThat(AsyncIggyTcpClient.isSignInRejection(new IOException("connection reset")))
+                .isFalse();
+        assertThat(AsyncIggyTcpClient.isSignInRejection(
+                        IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])))
+                .as("a node that is not the primary refuses transiently; another endpoint answers")
+                .isFalse();
+        assertThat(AsyncIggyTcpClient.isSignInRejection(
+                        IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_COMMITTED, new byte[0])))
+                .isFalse();
     }
 }

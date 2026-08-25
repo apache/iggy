@@ -24,7 +24,7 @@ import type {
 } from '../client/client.type.js';
 import { ResponseError, responseError } from '../wire/error.utils.js';
 import { debug } from './client.debug.js';
-import { IggyConnection } from './client.connection.js';
+import { type Endpoint, IggyConnection } from './client.connection.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT, PING } from '../wire/index.js';
 import { GET_CLUSTER_METADATA } from '../wire/cluster/get-cluster-metadata.command.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
@@ -81,6 +81,8 @@ type Job = {
   payload: Buffer,
   /** Whether to parse the response */
   handleResponse: boolean,
+  /** When the whole request gives up, however often it is re-issued */
+  deadline: number,
   /** Promise resolve function */
   resolve: (v: CommandResponse | PromiseLike<CommandResponse>) => void,
   /** Promise reject function */
@@ -116,6 +118,12 @@ export class CommandResponseStream extends EventEmitter {
   private authenticationPromise?: Promise<boolean>;
   /** Whether a login is already being moved to the leader */
   private settlingLeader: boolean;
+  /**
+   * Whether a refused request is already re-checking the leader. The roster
+   * read that re-check runs can be refused the same way, and answering a
+   * leader check with another leader check would recurse.
+   */
+  private followingLeaderMove = false;
   /** How long a leaderless roster is polled before settling in place */
   private leaderlessWaitBudget: number;
   /** Delay between roster reads while the cluster elects */
@@ -208,17 +216,37 @@ export class CommandResponseStream extends EventEmitter {
       // `_processVsr`. The refusal comes back out here instead, where the
       // queue is free, and the command is re-issued on the node that now
       // leads.
+      //
+      // A not-admitted refusal means the request was never applied, so it is
+      // re-issued for the whole request budget rather than given up on after
+      // one window: the roster can still name this node -- an election in
+      // flight, a leader that has not moved yet -- and that is a wait, not a
+      // verdict.
+      // One budget for the whole request: the transient replays on a
+      // connection, the leader re-checks, and the re-issues after a move all
+      // spend it, so a request cannot outlive it by moving.
+      const deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS;
       let response: CommandResponse;
-      for (let move = 0; ; move += 1) {
+      for (;;) {
         try {
           response = await this._queueCommand(command, payload, handleResponse,
-            last);
+            last, deadline);
           break;
         } catch (error) {
           if (!(error instanceof LeaderMovedError))
             throw error;
-          if (move >= MAX_LEADER_REDIRECTS || !await this._followLeaderMove())
+          // The roster read itself is refused: it runs through this same
+          // path, and re-checking the leader to answer a leader check would
+          // recurse. Its caller reads a failure as "stay where you are".
+          if (this.followingLeaderMove || Date.now() >= deadline)
             throw responseError(command, error.refusal.errorCode);
+          await this._followLeaderMove();
+          // A move drops the session with the socket it was bound to, so the
+          // re-issue would otherwise go out under no session: a replicated
+          // command fails client-side, a non-replicated one goes out with
+          // session 0.
+          if (!this.isAuthenticated && !this.isUnloggedCommand(command))
+            await this.authenticate(this.options.credentials);
         }
       }
       if (!isLoginCommand(command) || this.settlingLeader)
@@ -240,13 +268,15 @@ export class CommandResponseStream extends EventEmitter {
     command: number,
     payload: Buffer,
     handleResponse: boolean,
-    last: boolean
+    last: boolean,
+    deadline: number
   ): Promise<CommandResponse> {
     return new Promise<CommandResponse>((resolve, reject) => {
       const job = {
         command,
         payload,
         handleResponse,
+        deadline,
         resolve,
         reject
       };
@@ -261,16 +291,30 @@ export class CommandResponseStream extends EventEmitter {
   /**
    * Re-reads the roster and moves to the leader it names.
    *
-   * @returns Whether the client moved, so the refused request is worth
-   * re-issuing
+   * Best effort: an unreadable roster, or one that still names this node,
+   * leaves the client where it is and the refused request is re-issued here
+   * anyway. Guarded against re-entry, since the roster read is itself a
+   * command that can be refused the same way.
+   *
+   * @returns Whether the client moved
    */
   private async _followLeaderMove(): Promise<boolean> {
-    const leader = await this._readLeaderEndpoint();
-    if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
+    if (this.followingLeaderMove)
       return false;
-    debug(`the leader moved to ${leader.host}:${leader.port}, following it`);
-    await this.connection.redirect(leader.host, leader.port);
-    return true;
+    this.followingLeaderMove = true;
+    try {
+      const leader = await this._readLeaderEndpoint();
+      if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
+        return false;
+      debug(`the leader moved to ${leader.host}:${leader.port}, following it`);
+      await this.connection.redirect(leader.host, leader.port);
+      return true;
+    } catch (error) {
+      debug('the leader could not be re-checked, staying on this node', error);
+      return false;
+    } finally {
+      this.followingLeaderMove = false;
+    }
   }
 
   private _rememberRoster(response: CommandResponse): void {
@@ -299,9 +343,9 @@ export class CommandResponseStream extends EventEmitter {
     while (this._execQueue.length > 0 && this.connection.socket.writable) {
       const next = this._execQueue.shift();
       if (!next) break;
-      const { command, payload, handleResponse, resolve, reject } = next;
+      const { command, payload, handleResponse, deadline, resolve, reject } = next;
       try {
-        resolve(await this._processNext(command, payload, handleResponse));
+        resolve(await this._processNext(command, payload, handleResponse, deadline));
       } catch (err) {
         reject(err);
       }
@@ -325,40 +369,46 @@ export class CommandResponseStream extends EventEmitter {
    * @param command - Command code
    * @param payload - Command payload
    * @param handleResp - Whether to parse the response
+   * @param deadline - When the whole request gives up, shared with the leader
+   * re-checks and the re-issues after a move
    * @returns Promise resolving to the command response
    */
   _processNext(
     command: number,
     payload: Buffer,
-    handleResp = true
+    handleResp = true,
+    deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS
   ): Promise<CommandResponse> {
     if (isLoginCommand(command) && this.isAuthenticated)
-      return this._processVsrLogin(command, payload, handleResp);
-    return this._processVsr(command, payload, handleResp);
+      return this._processVsrLogin(command, payload, handleResp, deadline);
+    return this._processVsr(command, payload, handleResp, deadline);
   }
 
   private async _processVsrLogin(
     command: number,
     payload: Buffer,
-    handleResp: boolean
+    handleResp: boolean,
+    deadline: number
   ): Promise<CommandResponse> {
-    await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true);
-    return this._processVsr(command, payload, handleResp);
+    await this._processVsr(LOGOUT.code, LOGOUT.serialize(), true, deadline);
+    return this._processVsr(command, payload, handleResp, deadline);
   }
 
   private async _processVsr(
     command: number,
     payload: Buffer,
-    handleResp: boolean
+    handleResp: boolean,
+    deadline: number
   ): Promise<CommandResponse> {
     let requestWritten = false;
     try {
       const prepared = prepareVsrCommand(command, payload);
       // A transient retry must preserve all request identity fields.
       const frame = this.vsrSession.encode(prepared.command, prepared.payload);
-      const startedAt = Date.now();
-      const deadline = startedAt + VSR_RESPONSE_TIMEOUT_MS;
-      const notAcceptedDeadline = startedAt + VSR_FAILOVER_CHECK_MS;
+      // Derived from the request's own budget rather than read off the clock,
+      // so one request spends one budget however many times it is re-issued.
+      const notAcceptedDeadline =
+        deadline - VSR_RESPONSE_TIMEOUT_MS + VSR_FAILOVER_CHECK_MS;
       let lastTransientError: ResponseError | undefined;
       let parsed: CommandResponse;
       while (true) {
@@ -547,8 +597,7 @@ export class CommandResponseStream extends EventEmitter {
    * died between the login and this read), keeps the client on its current
    * node instead of failing a login that already succeeded.
    */
-  private async _readLeaderEndpoint():
-    Promise<{ host: string, port: number } | undefined> {
+  private async _readLeaderEndpoint(): Promise<Endpoint | undefined> {
     // A cluster can be transiently leaderless: a restarted node cedes the
     // primaryship its stale view assigns it, and the roster reports no leader
     // until the peers' election completes. That window is roughly one heartbeat

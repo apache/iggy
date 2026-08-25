@@ -100,9 +100,16 @@ export type TransportType = typeof Transports[number];
 export type ReconnectOption = {
   /** Whether automatic reconnection is enabled */
   enabled: boolean,
-  /** Interval between reconnection attempts in milliseconds */
+  /**
+   * Milliseconds to wait between passes. The first pass runs at once when more
+   * than one endpoint is known.
+   */
   interval: number,
-  /** Maximum number of reconnection attempts */
+  /**
+   * Maximum number of passes over the known endpoints. One pass dials the
+   * endpoint the client is on, the endpoint it was configured with, and every
+   * node the roster named, so this counts passes rather than dials.
+   */
   maxRetries: number
 }
 

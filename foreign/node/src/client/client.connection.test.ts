@@ -472,6 +472,91 @@ describe('IggyConnection', () => {
     }
   );
 
+  it('skips the first backoff when another endpoint is known',
+    async () => {
+      // The endpoint the client is on is dead and a live one sits behind it in
+      // the roster: waiting out the interval before the first pass would push
+      // the failover past what the caller waits for, and the node just lost may
+      // be gone for good.
+      const dead = await startServer();
+      const deadPort = (dead.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => dead.close(() => resolve()));
+      const live = await startServer();
+      const livePort = (live.address() as AddressInfo).port;
+
+      const interval = 3000;
+      const connection = new IggyConnection({
+        transport: 'TCP',
+        options: { host: '127.0.0.1', port: deadPort },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: true, interval, maxRetries: 3 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: livePort }]);
+        const dialed = once(live, 'connection');
+        const started = Date.now();
+        void connection.connect().catch(() => undefined);
+        await dialed;
+
+        assert.ok(Date.now() - started < interval,
+          'the failover waited out the backoff before its first pass'
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => live.close(() => resolve()));
+      }
+    }
+  );
+
+  it('bounds a dial that never becomes usable when others are queued behind it',
+    async () => {
+      // Plain TCP behind a TLS client: the socket connects, so only a bound on
+      // the handshake ends the attempt. The endpoint behind it is dead, so the
+      // pass has to end on its own rather than hang on the first one.
+      const silent = await startServer();
+      const silentPort = (silent.address() as AddressInfo).port;
+      const held: Socket[] = [];
+      silent.on('connection', (socket) => { held.push(socket); });
+      const dead = await startServer();
+      const deadPort = (dead.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => dead.close(() => resolve()));
+
+      const connection = new IggyConnection({
+        transport: 'TLS',
+        options: {
+          host: '127.0.0.1',
+          port: silentPort,
+          rejectUnauthorized: false
+        },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: true, interval: 10, maxRetries: 3 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: deadPort }]);
+        void connection.connect().catch(() => undefined);
+
+        // Unbounded, the first dial never ends and this endpoint is dialed
+        // exactly once, forever.
+        const deadline = Date.now() + 8_000;
+        while (held.length < 2 && Date.now() < deadline)
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+        assert.ok(held.length >= 2,
+          'a dial that never became usable held the pass'
+        );
+        assert.equal(connection.connected, false);
+      } finally {
+        connection._destroy();
+        held.forEach((socket) => socket.destroy());
+        await new Promise<void>((resolve) => silent.close(() => resolve()));
+      }
+    }
+  );
+
   it('stops a redial pass that is destroyed part-way through',
     async () => {
       // The endpoint the client is on is dead, so every dial to it is refused

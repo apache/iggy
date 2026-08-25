@@ -19,6 +19,7 @@ package tcp
 
 import (
 	"context"
+	"crypto/tls"
 	"log/slog"
 	"net"
 	"sync/atomic"
@@ -241,6 +242,122 @@ func TestFailover_ReLoginSurvivesALogoutTheTransportSwallowed(t *testing.T) {
 	require.NoError(t, client.Ping(ctx))
 }
 
+// The other way a logout fails to land: the node answers it as not-admitted,
+// which is what a node that stopped being primary does. The redirect that
+// follows must not sign in on its own -- this goroutine holds the sign-in lock,
+// and the reconnect's automatic sign-in would wait on it forever.
+func TestFailover_ReLoginSurvivesALogoutTheOldPrimaryRefused(t *testing.T) {
+	var leader *testListener
+	var follower *testListener
+	var demoted atomic.Bool
+
+	// The node the client is on: leader until the logout, then a follower that
+	// refuses it as not-admitted and points at the survivor.
+	follower = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			if demoted.Load() {
+				return clusterMetadataFrame(t, 1, follower.address(), leader.address())
+			}
+			return clusterMetadataFrame(t, 0, follower.address(), leader.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 128)
+		case read.operation() == vsr.OperationLogout:
+			demoted.Store(true)
+			return statusReplyFrame(vsr.OperationLogout,
+				uint32(ierror.TransientNotAcceptedCode), nil)
+		default:
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		}
+	})
+	leader = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 1, follower.address(), leader.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 256)
+		default:
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		}
+	})
+
+	client := newDialingClient(t, follower.address())
+	ctx := context.Background()
+	require.NoError(t, client.Connect(ctx))
+	_, err := client.LoginUser(ctx, "iggy", "iggy")
+	require.NoError(t, err)
+
+	relogin := make(chan error, 1)
+	go func() {
+		_, err := client.LoginUser(ctx, "iggy", "iggy")
+		relogin <- err
+	}()
+	select {
+	case err := <-relogin:
+		require.NoError(t, err, "the sign-in has to settle on the node that leads")
+	case <-time.After(15 * time.Second):
+		t.Fatal("the re-login deadlocked on the sign-in lock")
+	}
+
+	assert.True(t, client.session.Bound(), "the replayed sign-in bound a session")
+	assert.Equal(t, leader.address(), client.currentServerAddress)
+}
+
+// A logout that never landed still ended the session it belonged to, so the
+// credentials that established it must not outlive it: a sign-in that then
+// fails would otherwise leave them for the next dropped request to replay,
+// signing the old user back in after the caller asked for another one.
+func TestFailover_ARejectedReLoginDoesNotResurrectThePreviousUser(t *testing.T) {
+	var server *testListener
+	var dropLogout atomic.Bool
+	var dropSocket atomic.Bool
+	var rejectLogin atomic.Bool
+	var registeredUsers atomic.Int32
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if dropSocket.Load() {
+			return nil
+		}
+		if dropLogout.Load() && read.operation() == vsr.OperationLogout {
+			return nil
+		}
+		if read.operation() == vsr.OperationRegister {
+			registeredUsers.Add(1)
+			if rejectLogin.Load() {
+				return statusReplyFrame(vsr.OperationRegister,
+					uint32(ierror.InvalidCredentialsCode), nil)
+			}
+			return registerReplyFrame(7, 128)
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+
+	client := newDialingClient(t, server.address())
+	ctx := context.Background()
+	require.NoError(t, client.Connect(ctx))
+	_, err := client.LoginUser(ctx, "alice", "alice")
+	require.NoError(t, err)
+
+	// The logout is swallowed and the sign-in that follows is rejected, so the
+	// client ends up with no session and no credentials it may use.
+	dropLogout.Store(true)
+	rejectLogin.Store(true)
+	_, err = client.LoginUser(ctx, "bob", "bob")
+	require.Error(t, err)
+
+	_, remembered := client.signInCredentials()
+	assert.False(t, remembered, "the ended session's credentials must not survive it")
+
+	// The socket dies with nothing remembered: the reconnect has no session to
+	// restore, and must not invent one out of the user who was signed in
+	// before.
+	dropLogout.Store(false)
+	dropSocket.Store(true)
+	registersBefore := registeredUsers.Load()
+	assert.Error(t, client.Ping(ctx), "there is no session left to restore")
+	assert.Equal(t, registersBefore, registeredUsers.Load(),
+		"the reconnect signed the previous user back in")
+}
+
 // reestablishAfter is a cooldown on redialing the endpoint that was lost. It
 // is owed to that endpoint alone, so a failover to another one must not sit
 // through it.
@@ -280,6 +397,27 @@ func TestFailover_KeepsTheReestablishPauseForTheEndpointThatWasLost(t *testing.T
 	assert.Equal(t, current.address(), client.currentServerAddress)
 	assert.GreaterOrEqual(t, time.Since(started), 350*time.Millisecond,
 		"the cooldown on the endpoint that was lost was skipped")
+}
+
+// The cooldown is a pace limit, not a commitment: a caller that gave the
+// connect a deadline has to get an answer inside it, and Close has to end the
+// wait too.
+func TestFailover_TheReestablishPauseHonoursTheCallersDeadline(t *testing.T) {
+	current := listenVSR(t, nil, func(_, _ int, read request) []byte {
+		return singleNodeHandler(t, func() string { return "127.0.0.1:8090" })(0, 0, read)
+	})
+
+	client := newDialingClient(t, current.address())
+	client.config.reconnection.reestablishAfter = time.Minute
+	client.connectedAt = time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_ = client.Connect(ctx)
+
+	assert.Less(t, time.Since(started), 5*time.Second,
+		"the cooldown outlived the deadline the caller gave the connect")
 }
 
 // A node whose syns are dropped must not hold the sweep: without a bound on
@@ -338,6 +476,63 @@ func TestFailover_DoesNotSettleOnAnEndpointThatFailedTheHandshake(t *testing.T) 
 	require.Error(t, client.Connect(context.Background()))
 	assert.Equal(t, configured, client.currentServerAddress,
 		"the endpoint that failed the handshake became the current one")
+}
+
+// The SNI of a dial belongs to the endpoint being dialed. Taken from the
+// endpoint the client just lost, a failover to a node the certificate does not
+// cover fails the handshake -- which is every failover, once the addresses
+// differ.
+func TestFailover_UsesTheDialedEndpointAsTheServerName(t *testing.T) {
+	certificate, caPath := selfSignedCert(t)
+	survivor := listenVSR(t,
+		func(conn net.Conn) net.Conn {
+			return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
+		},
+		singleNodeHandler(t, func() string { return "127.0.0.1:8090" }))
+
+	// The certificate covers 127.0.0.1, and the endpoint the client starts on
+	// is 127.0.0.2, where nothing listens: with the server name taken from
+	// that endpoint, the handshake on the survivor is checked against the
+	// address that died.
+	_, port, err := net.SplitHostPort(survivor.address())
+	require.NoError(t, err)
+	client := newDialingClient(t, "127.0.0.2:"+port,
+		WithTLS(WithTLSCAFile(caPath), WithTLSValidateCertificate(true)))
+	client.knownServerAddresses = []string{"127.0.0.1:" + port}
+
+	require.NoError(t, client.Connect(context.Background()))
+	assert.Equal(t, "127.0.0.1:"+port, client.currentServerAddress)
+}
+
+// A TLS configuration the client itself cannot satisfy says the same thing on
+// every attempt, so it has to reach the caller instead of being redialed every
+// interval forever -- which is what the default unlimited retries did with it.
+func TestFailover_AConfigFaultEndsTheConnectInsteadOfRetryingForever(t *testing.T) {
+	certificate, _ := selfSignedCert(t)
+	server := listenVSR(t,
+		func(conn net.Conn) net.Conn {
+			return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
+		},
+		singleNodeHandler(t, func() string { return "127.0.0.1:8090" }))
+
+	// A CA the server's certificate was not signed by: no retry makes that
+	// certificate acceptable.
+	_, unrelatedCA := selfSignedCert(t)
+	client := NewIggyTcpClient(slog.New(slog.DiscardHandler),
+		WithServerAddress(server.address()),
+		WithTLS(WithTLSCAFile(unrelatedCA), WithTLSValidateCertificate(true)))
+	t.Cleanup(func() { _ = client.Close() })
+	client.config.reconnection.maxRetries = 0 // unlimited
+	client.config.reconnection.interval = 10 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() { done <- client.Connect(context.Background()) }()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a connect that can never succeed has to end instead of retrying forever")
+	}
 }
 
 // A client with nothing to dial must say so: reporting success would leave

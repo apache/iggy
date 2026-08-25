@@ -21,6 +21,7 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
@@ -1033,6 +1034,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         var retryCount = 0;
         var redirects = 0;
         var delay = _configuration.ReconnectionSettings.InitialDelay;
+        Exception? configurationFault = null;
 
         if (string.IsNullOrEmpty(_currentAddress))
         {
@@ -1051,7 +1053,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             }
 
             Socket? socket = null;
-            var dialed = false;
+            var established = false;
             try
             {
                 socket = new Socket(ServerAddress.AddressFamilyOf(host), SocketType.Stream, ProtocolType.Tcp);
@@ -1074,7 +1076,6 @@ public sealed partial class TcpMessageStream : IIggyClient
                 var dialToken = dialCancellation?.Token ?? token;
 
                 await socket.ConnectAsync(host, port, dialToken);
-                dialed = true;
 
                 _currentRemoteAddress = socket.RemoteEndPoint is IPEndPoint remote
                     ? ServerAddress.HostPort(remote.Address.ToString(), (ushort)remote.Port)
@@ -1087,6 +1088,11 @@ public sealed partial class TcpMessageStream : IIggyClient
                 var connectionStream = _configuration.TlsSettings.Enabled
                     ? await CreateSslStreamAndAuthenticate(socket, _configuration.TlsSettings, dialToken)
                     : new NetworkStream(socket, true);
+
+                // Established, not merely dialed: everything up to here belongs to this endpoint and the
+                // sweep may try the next one, while everything past it - auto login, a redirect, the leader
+                // lookup - fails the same way wherever the client lands.
+                established = true;
 
                 await _sendingSemaphore.WaitAsync(token);
                 try
@@ -1121,12 +1127,13 @@ public sealed partial class TcpMessageStream : IIggyClient
 
                 break;
             }
-            // Only a failed dial is worth another attempt. Everything past it - a rejected certificate, bad
-            // credentials, a leader that cannot be found - fails the same way every time, and with unlimited
+            // Only bringing an endpoint up is worth trying elsewhere. Everything past it - bad credentials, a
+            // leader that cannot be found - fails the same way wherever the client lands, and with unlimited
             // retries a caller would otherwise never get the error back.
-            // A dial the bound above cut short is a failed dial like any other, so it must not land here:
-            // only a cancellation the caller actually asked for is fatal.
-            catch (Exception e) when (dialed
+            //
+            // A handshake the dial bound cut short is a failed attempt on this endpoint like any other, so it
+            // must not land here: only a cancellation the caller actually asked for is fatal.
+            catch (Exception e) when (established
                                       || (e is OperationCanceledException && token.IsCancellationRequested)
                                       || _disposed)
             {
@@ -1146,6 +1153,14 @@ public sealed partial class TcpMessageStream : IIggyClient
 
                 _logger.LogError(e, "Failed to connect");
 
+                if (IsTlsConfigurationFault(e))
+                {
+                    // A fault no retry can fix, kept aside rather than thrown at once: it belongs to the
+                    // endpoint that raised it - a certificate that names another host - and the endpoints
+                    // behind that one may be perfectly usable.
+                    configurationFault = e;
+                }
+
                 // Every other endpoint gets its turn before the retry delay: the node just lost may be gone for
                 // good, and pausing on it helps nothing.
                 if (++candidate < candidates.Length)
@@ -1156,6 +1171,15 @@ public sealed partial class TcpMessageStream : IIggyClient
 
                 candidate = 0;
                 _currentAddress = candidates[0];
+
+                // No endpoint answered and at least one said why in a way no retry changes: an unreadable CA
+                // file, a certificate this client will never accept. The caller gets that reason instead of a
+                // retry loop that buries it - unlimited retries would otherwise redial it forever.
+                if (configurationFault is not null)
+                {
+                    SetConnectionState(ConnectionState.Disconnected);
+                    throw configurationFault;
+                }
 
                 // The sweep is what the reconnection budget applies to, not a single dial: checked per dial,
                 // the last round would try only the endpoint the client started on, and a client with
@@ -1299,13 +1323,32 @@ public sealed partial class TcpMessageStream : IIggyClient
         _customCaStore.ImportFromPemFile(tlsSettings.CertificatePath);
         var stream = new NetworkStream(socket, true);
         var sslStream = new SslStream(stream, false, RemoteCertificateValidationCallback);
-
-        // The token carries the dial bound when other endpoints are queued behind this one: a peer that
-        // accepts TCP and never answers the ClientHello has no deadline of its own here either.
-        await sslStream.AuthenticateAsClientAsync(
-            new SslClientAuthenticationOptions { TargetHost = tlsSettings.Hostname }, token);
+        try
+        {
+            // The token carries the dial bound when other endpoints are queued behind this one: a peer that
+            // accepts TCP and never answers the ClientHello has no deadline of its own here either.
+            await sslStream.AuthenticateAsClientAsync(
+                new SslClientAuthenticationOptions { TargetHost = tlsSettings.Hostname }, token);
+        }
+        catch
+        {
+            // A handshake that failed leaves the stream owning the socket, and the sweep moves on to the
+            // next endpoint: undisposed, both leak for as long as the client lives.
+            await sslStream.DisposeAsync();
+            throw;
+        }
 
         return sslStream;
+    }
+
+    /// <summary>
+    ///     Whether bringing an endpoint up failed for a reason that says this client's own TLS configuration is
+    ///     wrong: a CA file that cannot be read, or a certificate it will never accept. Neither changes on a
+    ///     retry, so the sweep reports it instead of redialing forever.
+    /// </summary>
+    private static bool IsTlsConfigurationFault(Exception e)
+    {
+        return e is AuthenticationException or InvalidCertificatePathException;
     }
 
     private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token)

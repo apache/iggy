@@ -41,8 +41,8 @@ async fn given_a_logged_in_client_when_explicitly_disconnected_should_require_a_
     assert!(
         matches!(client.get_me().await, Err(IggyError::Unauthenticated)),
         "an explicit disconnect is caller intent, like a logout: the sign-in it ended \
-         must not be silently replayed by the reconnect, so the server sees an \
-         unauthenticated request"
+         must not be silently replayed by the reconnect, so the client's own \
+         authentication gate refuses the request before it is sent"
     );
 
     client.disconnect().await.unwrap();

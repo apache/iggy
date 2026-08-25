@@ -212,6 +212,62 @@ public sealed class EndpointFailoverTests
         Assert.Equal(connectionsBeforeEviction, node.Connections);
     }
 
+    /// <summary>
+    ///     A survivor that only comes up after the first rotation still has to be found. The reconnection
+    ///     budget counts rotations, not dials, so one retry is one full pass over every endpoint the client
+    ///     knows rather than one dial of the endpoint it started from.
+    /// </summary>
+    [Fact]
+    public async Task ResumesOnASurvivorThatComesUpAfterTheFirstRotation()
+    {
+        // A port nothing listens on yet: the survivor comes up on it only after the first rotation has
+        // already failed on both endpoints.
+        var probe = new TcpListener(IPAddress.Loopback, 0);
+        probe.Start();
+        var survivorPort = (ushort)((IPEndPoint)probe.LocalEndpoint).Port;
+        probe.Stop();
+
+        using var primary = new MockNode();
+        primary.Serve(request => request.Code == GetClusterMetadataCode
+            ? Reply(OperationNonReplicated, ClusterMetadata(primary.Port, survivorPort, primary.Port))
+            : Answer(request));
+
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{primary.Port}",
+            Protocol = Protocol.Tcp,
+            AutoLoginSettings = new AutoLoginSettings { Enabled = true, Username = "iggy", Password = "iggy" },
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                // One retry: the rotation after the first failure is the last one, which is where the
+                // budget check used to cut the sweep short.
+                MaxRetries = 1,
+                InitialDelay = TimeSpan.FromMilliseconds(600)
+            }
+        };
+        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+        await client.PingAsync(TestContext.Current.CancellationToken);
+
+        primary.Kill();
+        using var survivor = new MockNode(survivorPort);
+        var comesUp = Task.Run(async () =>
+        {
+            await Task.Delay(250, TestContext.Current.CancellationToken);
+            survivor.Serve(request => request.Code == GetClusterMetadataCode
+                ? Reply(OperationNonReplicated, ClusterMetadata(primary.Port, survivorPort, survivorPort))
+                : Answer(request));
+        }, TestContext.Current.CancellationToken);
+
+        await client.PingAsync(TestContext.Current.CancellationToken);
+        await comesUp;
+
+        Assert.True(survivor.Registrations >= 1, "the session was re-established on the survivor");
+    }
+
     private static byte[] EvictionFrame(byte reason)
     {
         var frame = new byte[HeaderSize];
@@ -368,9 +424,13 @@ public sealed class EndpointFailoverTests
         private int _pings;
         private int _registrations;
 
-        public MockNode()
+        /// <param name="port">
+        ///     A port to bind, for a node that has to come up on an address the client already knows. Zero
+        ///     takes whatever the OS hands out.
+        /// </param>
+        public MockNode(ushort port = 0)
         {
-            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener = new TcpListener(IPAddress.Loopback, port);
             _listener.Start();
             Port = (ushort)((IPEndPoint)_listener.LocalEndpoint).Port;
         }

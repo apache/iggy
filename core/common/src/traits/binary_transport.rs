@@ -62,9 +62,14 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// and a reconnect must not resurrect one.
     async fn forget_session_credentials(&self) {}
     /// A committed password change for `user`: when it is the signed-in user,
-    /// the remembered credentials switch to the new password, or the next
-    /// reconnect would sign in with the old one and fail an unrelated request
-    /// with `InvalidCredentials`. Other users' changes are ignored.
+    /// the credentials the next reconnect signs in with switch to the new
+    /// password, or that reconnect would replay the old one and fail an
+    /// unrelated request with `InvalidCredentials`. Other users' changes are
+    /// ignored.
+    ///
+    /// This covers a configured `AutoLogin` as well as a sign-in the caller
+    /// ran: the configured credentials still decide *who* the client signs in
+    /// as, and a committed change decides what that user's password is.
     async fn refresh_session_password(&self, _user: &Identifier, _new_password: &str) {}
     /// SDK crate version sent in the login-register version prefix.
     /// Implemented by the transports so the value is the SDK crate's own

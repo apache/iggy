@@ -501,31 +501,41 @@ public class AsyncIggyTcpClient {
     /**
      * A server-side eviction reached this client. The routing state it cached
      * belonged to the evicted session, and a stale-client eviction is the
-     * server ending that session authoritatively, like a logout: the
-     * remembered sign-in ends with it, so only credentials configured on the
-     * builder may bring the session back.
+     * server ending that session authoritatively, like a logout: nothing may
+     * revive it behind the caller's back.
+     *
+     * The captured login always goes, whatever is configured. The connection
+     * replays it to bring up a replacement channel, so keeping it would revive
+     * exactly the session the server ended -- and on a client whose caller
+     * signed in as somebody other than the configured user, it would revive a
+     * different user than a redial replays, making the outcome depend on which
+     * failure ran.
+     *
+     * What may re-establish the session is what every connect of this client
+     * signs in as: credentials configured on the builder. A sign-in the caller
+     * ran is theirs to repeat.
      */
     private void onSessionReset(int errorCode) {
         routingState.clearAssignments();
         if (errorCode != IggyErrorCode.STALE_CLIENT.getCode()) {
             return;
         }
-        // Credentials configured on the builder are what every connect of this
-        // client signs in as, so an eviction does not revoke them and the
-        // client recovers on its own. A sign-in a caller ran is different: the
-        // server ended that session deliberately, and reviving it behind the
-        // caller's back is what an explicit logout must not be able to do
-        // either. Dropped in both places, because the connection replays its
-        // own captured login to bring up a replacement channel.
-        if (username.isPresent() && password.isPresent()) {
-            return;
-        }
-        log.warn("The server evicted this session as stale; the sign-in it ran will not be replayed");
-        rememberedLogin = null;
         AsyncTcpConnection currentConnection = connection.get();
         if (currentConnection != null) {
             currentConnection.forgetCapturedLogin();
         }
+        if (username.isEmpty() || password.isEmpty()) {
+            log.warn("The server evicted this session as stale; the sign-in it ran will not be replayed");
+            rememberedLogin = null;
+            return;
+        }
+
+        log.info("The server evicted this session as stale; signing in again with the configured credentials");
+        replayLogin().whenComplete((ignored, error) -> {
+            if (error != null) {
+                log.warn("Signing in again after the eviction failed: {}", error.getMessage());
+            }
+        });
     }
 
     /**
@@ -716,9 +726,9 @@ public class AsyncIggyTcpClient {
                         log.info("Reconnected to {}", target.serverAddress());
                         return CompletableFuture.<Void>completedFuture(null);
                     }
-                    if (isConnectionLoss(unwrap(loginError))) {
+                    if (!isSignInRejection(unwrap(loginError))) {
                         log.warn(
-                                "The sign-in on {} was lost with the connection: {}",
+                                "The sign-in on {} did not complete: {}",
                                 target.serverAddress(),
                                 loginError.getMessage());
                         return sweepCandidates(candidates, index + 1, attempt, policy);
@@ -732,6 +742,24 @@ public class AsyncIggyTcpClient {
                     return CompletableFuture.<Void>completedFuture(null);
                 })
                 .thenCompose(Function.identity());
+    }
+
+    /**
+     * Whether the server answered the sign-in with a verdict no other endpoint
+     * would change: a rotated password, an expired token.
+     *
+     * Only that ends a redial. Everything else -- the channel closing before
+     * the reply, a timeout, a transient refusal from a node that is not the
+     * primary -- says nothing about the credentials, and treating it as a
+     * rejection would drop them and leave the client published on a node that
+     * is already gone, with every later call failing "not authenticated".
+     */
+    static boolean isSignInRejection(Throwable error) {
+        if (!(error instanceof IggyServerException serverError)) {
+            return false;
+        }
+        int code = serverError.getRawErrorCode();
+        return code != AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED && code != AsyncTcpConnection.TRANSIENT_NOT_COMMITTED;
     }
 
     private static Throwable unwrap(Throwable error) {
@@ -777,7 +805,10 @@ public class AsyncIggyTcpClient {
         CompletableFuture<IdentityInfo> callerFuture = new CompletableFuture<>();
         transaction.whenComplete((identity, error) -> {
             gate.complete(null);
-            if (error == null) {
+            // Not after a close: a login still in flight when `close()` cleared
+            // this would set it again, and `connect()` clears `closed`, so the
+            // next loss would replay a sign-in the caller had ended.
+            if (error == null && !closed) {
                 rememberedLogin = loginAttempt;
             }
             if (error != null) {
@@ -876,15 +907,42 @@ public class AsyncIggyTcpClient {
         }
         return LeaderAwareness.findLeaderElsewhere(currentSystemClient::getClusterMetadata, currentTarget)
                 .thenApply(lookup -> {
-                    // Replaced wholesale rather than merged: the roster is the
-                    // cluster's own answer about where its nodes are, so a node
-                    // it dropped stops being dialed. The configured seed is
-                    // kept separately and outlives it.
-                    if (!lookup.endpoints().isEmpty()) {
-                        rosterTargets = lookup.endpoints();
-                    }
+                    rememberRoster(lookup);
                     return lookup.redirect();
                 });
+    }
+
+    /**
+     * Keeps what a leader check learned about where the cluster's nodes are.
+     *
+     * Replaced wholesale rather than merged: the roster is the cluster's own
+     * answer, so a node it dropped stops being dialed. The configured seed is
+     * kept separately and outlives it.
+     *
+     * An inconclusive check -- an unreadable roster, a metadata read that
+     * failed -- names no endpoint, and that must leave the last roster
+     * standing: assigning it anyway would empty the redial candidates exactly
+     * when the cluster is unreachable, which is when they are needed.
+     */
+    void rememberRoster(LeaderAwareness.LeaderLookup lookup) {
+        if (!lookup.endpoints().isEmpty()) {
+            rosterTargets = lookup.endpoints();
+        }
+    }
+
+    /** The roster this client would redial, for tests in this package. */
+    List<ConnectionInfo> rosterTargets() {
+        return rosterTargets;
+    }
+
+    /** Whether a sign-in is remembered for replay, for tests in this package. */
+    boolean hasRememberedLogin() {
+        return rememberedLogin != null;
+    }
+
+    /** The live connection, for tests in this package. */
+    AsyncTcpConnection currentConnection() {
+        return connection.get();
     }
 
     /**

@@ -20,7 +20,7 @@ use iggy_common::ClusterClient;
 use iggy_common::{
     ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
 };
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use tracing::{debug, info, warn};
 
@@ -82,7 +82,7 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
                     metadata.name
                 );
                 let endpoints = transport_endpoints(&metadata, transport);
-                match process_cluster_metadata(&metadata, current_address, transport) {
+                match process_cluster_metadata(&metadata, current_address, transport).await {
                     Outcome::Redirect(address) => {
                         return Ok(LeaderCheck {
                             redirect: Some(address),
@@ -171,7 +171,7 @@ fn transport_port(node: &ClusterNode, transport: TransportProtocol) -> u16 {
 }
 
 /// Process cluster metadata and determine if redirection is needed
-fn process_cluster_metadata(
+async fn process_cluster_metadata(
     metadata: &ClusterMetadata,
     current_address: &str,
     transport: TransportProtocol,
@@ -200,7 +200,7 @@ fn process_cluster_metadata(
                 leader_node.name, leader_address, transport
             );
 
-            if !is_same_address(current_address, &leader_address) {
+            if !is_same_address(current_address, &leader_address).await {
                 info!(
                     "Current connection to {} is not the leader, will redirect to {}",
                     current_address, leader_address
@@ -215,40 +215,67 @@ fn process_cluster_metadata(
     }
 }
 
+/// Whether two addresses are written the same way, up to canonicalization
+/// (`localhost` and `[::]` spellings, and a literal address compared as an
+/// address rather than as text).
+///
+/// Cheap and non-blocking, which is the whole point: the resolving comparison
+/// below is a `getaddrinfo`, and every caller reaches this first.
+pub(crate) fn is_same_spelling(addr1: &str, addr2: &str) -> bool {
+    match (parse_address(addr1), parse_address(addr2)) {
+        (Some(sock1), Some(sock2)) => sock1.ip() == sock2.ip() && sock1.port() == sock2.port(),
+        _ => normalize_address(addr1) == normalize_address(addr2),
+    }
+}
+
 /// Check if two addresses refer to the same endpoint
 /// Handles various formats like 127.0.0.1:8090 vs localhost:8090
 ///
 /// A host name and the address it resolves to are one endpoint too: a client
 /// configured as `iggy-server:8090` whose roster advertises `10.0.0.5:8090`
 /// would otherwise dial that node twice per failover sweep, and a single-node
-/// deployment would be treated as a cluster. Resolution is the last resort,
-/// only when the spellings differ and at least one side is not a literal
-/// address, and it is a blocking lookup: this runs on the connect and redirect
-/// paths, which are rare and already wait on the network.
-pub(crate) fn is_same_address(addr1: &str, addr2: &str) -> bool {
-    match (parse_address(addr1), parse_address(addr2)) {
-        (Some(sock1), Some(sock2)) => sock1.ip() == sock2.ip() && sock1.port() == sock2.port(),
-        (parsed1, parsed2) => {
-            if normalize_address(addr1) == normalize_address(addr2) {
-                return true;
-            }
-            if parsed1.is_some() && parsed2.is_some() {
-                return false;
-            }
-            resolve_all(addr1)
-                .zip(resolve_all(addr2))
-                .is_some_and(|(first, second)| {
-                    first.iter().any(|resolved| second.contains(resolved))
-                })
-        }
+/// deployment would be treated as a cluster.
+///
+/// Resolution is the last resort, only when the spellings differ and at least
+/// one side is not a literal address. It runs through the runtime's resolver
+/// rather than `ToSocketAddrs`: name lookup is a blocking `getaddrinfo`, and
+/// this is called from the connect and redirect paths, where stalling a
+/// runtime worker on a slow resolver would stall every task sharing it.
+pub(crate) async fn is_same_address(addr1: &str, addr2: &str) -> bool {
+    is_same_address_with(addr1, addr2, resolve_all).await
+}
+
+/// [`is_same_address`] against a caller-provided resolver, so the fallback can
+/// be exercised without depending on what the machine's resolver answers.
+async fn is_same_address_with<R, F>(addr1: &str, addr2: &str, resolve: R) -> bool
+where
+    R: Fn(String) -> F,
+    F: Future<Output = Option<Vec<SocketAddr>>>,
+{
+    if is_same_spelling(addr1, addr2) {
+        return true;
     }
+
+    // Two literal addresses that did not compare equal are different
+    // endpoints; resolving them would only hand back what they already say.
+    if parse_address(addr1).is_some() && parse_address(addr2).is_some() {
+        return false;
+    }
+
+    let (Some(first), Some(second)) = (
+        resolve(addr1.to_owned()).await,
+        resolve(addr2.to_owned()).await,
+    ) else {
+        return false;
+    };
+    first.iter().any(|resolved| second.contains(resolved))
 }
 
 /// Every socket address a host:port spelling resolves to, `None` when the
 /// resolver does not know the name (which then compares unequal, at worst
 /// costing one extra dial).
-fn resolve_all(addr: &str) -> Option<Vec<SocketAddr>> {
-    let resolved: Vec<SocketAddr> = addr.to_socket_addrs().ok()?.collect();
+async fn resolve_all(addr: String) -> Option<Vec<SocketAddr>> {
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(addr).await.ok()?.collect();
     (!resolved.is_empty()).then_some(resolved)
 }
 
@@ -358,26 +385,54 @@ mod tests {
         assert!(transport_endpoints(&metadata, TransportProtocol::Quic).is_empty());
     }
 
-    #[test]
-    fn test_is_same_address() {
-        assert!(is_same_address("127.0.0.1:8090", "127.0.0.1:8090"));
-        assert!(is_same_address("localhost:8090", "127.0.0.1:8090"));
-        assert!(!is_same_address("127.0.0.1:8090", "127.0.0.1:8091"));
-        assert!(!is_same_address("192.168.1.1:8090", "127.0.0.1:8090"));
+    #[tokio::test]
+    async fn test_is_same_address() {
+        assert!(is_same_address("127.0.0.1:8090", "127.0.0.1:8090").await);
+        assert!(is_same_address("localhost:8090", "127.0.0.1:8090").await);
+        assert!(!is_same_address("127.0.0.1:8090", "127.0.0.1:8091").await);
+        assert!(!is_same_address("192.168.1.1:8090", "127.0.0.1:8090").await);
     }
 
-    // A host name and the address it resolves to name one endpoint; a name the
-    // resolver does not know compares unequal rather than erroring.
-    #[test]
-    fn a_host_name_matches_the_address_it_resolves_to() {
-        // `localhost` is rewritten before resolution, so use the loopback name
-        // the resolver itself answers for.
-        assert!(is_same_address("LOCALHOST:8090", "127.0.0.1:8090"));
-        assert!(!is_same_address("localhost:8090", "localhost:8091"));
-        assert!(!is_same_address(
-            "no-such-host.invalid:8090",
-            "127.0.0.1:8090"
-        ));
+    /// A stand-in resolver: the BDD cluster's spelling of one node, which no
+    /// canonicalization rewrites, so only the resolving comparison can equate
+    /// the two. `None` for anything else, like a name the resolver does not
+    /// know.
+    async fn resolve_bdd_leader(addr: String) -> Option<Vec<SocketAddr>> {
+        match addr.as_str() {
+            "iggy-leader:8091" | "172.28.0.101:8091" => {
+                Some(vec![SocketAddr::from(([172, 28, 0, 101], 8091))])
+            }
+            _ => None,
+        }
+    }
+
+    // A host name and the address it resolves to name one endpoint. Exactly
+    // the case the BDD cluster hits: the client dials `iggy-leader:8091` and
+    // the roster advertises `172.28.0.101:8091`.
+    #[tokio::test]
+    async fn a_host_name_matches_the_address_it_resolves_to() {
+        assert!(
+            is_same_address_with("iggy-leader:8091", "172.28.0.101:8091", resolve_bdd_leader).await
+        );
+    }
+
+    // A name the resolver does not know compares unequal rather than
+    // erroring, and a resolvable name never matches another port.
+    #[tokio::test]
+    async fn an_unresolvable_name_or_another_port_is_a_different_endpoint() {
+        assert!(
+            !is_same_address_with(
+                "iggy-follower:8092",
+                "172.28.0.101:8091",
+                resolve_bdd_leader
+            )
+            .await
+        );
+        assert!(
+            !is_same_address_with("iggy-leader:8091", "172.28.0.101:8092", resolve_bdd_leader)
+                .await
+        );
+        assert!(!is_same_address("no-such-host.invalid:8090", "127.0.0.1:8090").await);
     }
 
     #[test]

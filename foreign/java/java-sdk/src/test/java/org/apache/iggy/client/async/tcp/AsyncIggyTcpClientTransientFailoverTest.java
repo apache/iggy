@@ -35,8 +35,11 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -160,6 +163,119 @@ class AsyncIggyTcpClientTransientFailoverTest {
     }
 
     /**
+     * Closing is caller intent, like a logout. A sign-in still in flight when
+     * it happens must not put its credentials back: `connect()` clears the
+     * closed flag, so the next connection loss would replay a session the
+     * caller had ended.
+     */
+    @Test
+    void shouldNotRememberASignInThatLandedAfterClose() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket serverSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger registrations = new AtomicInteger();
+            CompletableFuture<Void> server = serve(serverSocket, 4, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    int attempt = registrations.incrementAndGet();
+                    if (attempt > 1) {
+                        // The second sign-in is the one racing the close.
+                        try {
+                            Thread.sleep(300);
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    return Response.success(OPERATION_REGISTER, registerBody(attempt));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(serverSocket.getLocalPort())
+                    .requestTimeout(Duration.ofSeconds(5))
+                    .build();
+            client.connect().get(5, TimeUnit.SECONDS);
+            client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+
+            CompletableFuture<?> racing = client.users().login("iggy", "iggy");
+            Thread.sleep(50);
+            client.close().get(5, TimeUnit.SECONDS);
+            racing.handle((ignored, error) -> null).get(5, TimeUnit.SECONDS);
+
+            assertThat(client.hasRememberedLogin())
+                    .as("a sign-in that landed after the close put its credentials back")
+                    .isFalse();
+            server.completeExceptionally(new IllegalStateException("test over"));
+        }
+    }
+
+    /**
+     * The user an eviction re-establishes must not depend on which failure
+     * ran. Configured credentials are what every connect of this client signs
+     * in as, so they are what comes back -- not whoever the caller signed in
+     * as by hand, which is what the connection's captured login would replay.
+     */
+    @Test
+    void shouldSignInAsTheConfiguredUserAfterAnEviction() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket serverSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger registrations = new AtomicInteger();
+            List<String> registeredLogins = new CopyOnWriteArrayList<>();
+            AtomicBoolean evict = new AtomicBoolean(true);
+            CompletableFuture<Void> server = serve(serverSocket, 6, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    registeredLogins.add(request.bodyAsText());
+                    return Response.success(OPERATION_REGISTER, registerBody(registrations.incrementAndGet()));
+                }
+                if (request.operation() == OPERATION_CREATE_STREAM && evict.compareAndSet(true, false)) {
+                    return Response.eviction(EVICTION_STALE_CLIENT);
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(serverSocket.getLocalPort())
+                    .credentials("configured", "configured")
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                client.users().login("handrun", "handrun").get(5, TimeUnit.SECONDS);
+                int registrationsBeforeEviction = registrations.get();
+
+                assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                                .get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyServerException.class);
+
+                // The sign-in that follows the eviction runs on its own, so
+                // give it a moment to land.
+                long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+                while (registrations.get() == registrationsBeforeEviction && System.nanoTime() < deadline) {
+                    Thread.sleep(25);
+                }
+                assertThat(registrations.get())
+                        .as("the eviction was not followed by a sign-in")
+                        .isGreaterThan(registrationsBeforeEviction);
+                assertThat(registeredLogins.get(registeredLogins.size() - 1))
+                        .as("the eviction revived the hand-run sign-in instead of the configured one")
+                        .contains("configured")
+                        .doesNotContain("handrun");
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.completeExceptionally(new IllegalStateException("test over"));
+        }
+    }
+
+    /**
      * A stale-client eviction is the server ending the session
      * authoritatively, like a logout. A client whose credentials were
      * configured signs in again on every connect and recovers (the test
@@ -207,6 +323,12 @@ class AsyncIggyTcpClientTransientFailoverTest {
                 assertThat(registrations)
                         .as("the evicted session was signed back in")
                         .hasValue(registrationsBeforeEviction);
+                // The connection replays the login it captured to bring up a
+                // replacement channel, so that copy has to go too: kept, the
+                // next channel revives exactly the session the server ended.
+                assertThat(client.currentConnection().authenticationSnapshot())
+                        .as("the captured login outlived the session it established")
+                        .isEmpty();
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }
@@ -290,7 +412,8 @@ class AsyncIggyTcpClientTransientFailoverTest {
         return new Request(
                 Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]),
                 fields.getInt(REQUEST_CODE_OFFSET),
-                fields.getLong(REQUEST_ID_OFFSET));
+                fields.getLong(REQUEST_ID_OFFSET),
+                body);
     }
 
     private static void writeResponse(OutputStream output, Request request, Response response) throws IOException {
@@ -365,9 +488,14 @@ class AsyncIggyTcpClientTransientFailoverTest {
         body.writeBytes(bytes);
     }
 
-    private record Request(int operation, int commandCode, long requestId) {
+    private record Request(int operation, int commandCode, long requestId, byte[] body) {
         boolean is(int expectedCode, int expectedOperation) {
             return commandCode == expectedCode && operation == expectedOperation;
+        }
+
+        /** The request body as text, for asserting which user a login names. */
+        String bodyAsText() {
+            return new String(body, StandardCharsets.UTF_8);
         }
     }
 

@@ -219,6 +219,11 @@ func (c *IggyTcpClient) endBoundSession(ctx context.Context) error {
 	c.groups.clear()
 	c.topics.clearCounts()
 	c.mtx.Unlock()
+	// The session this sign-in belonged to is over either way, so the
+	// credentials that established it go with it. Kept, a sign-in that then
+	// fails would leave them behind for the next dropped request to replay --
+	// signing the old user back in after the caller asked for another one.
+	c.forgetLogin()
 	return nil
 }
 

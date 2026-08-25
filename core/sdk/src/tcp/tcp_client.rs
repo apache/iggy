@@ -120,6 +120,11 @@ pub struct TcpClient {
 struct RememberedSignIn {
     credentials: Credentials,
     user_id: u32,
+    /// Set by a committed password change for `user_id`. The configured
+    /// `AutoLogin` credentials cannot be rewritten -- the config is shared and
+    /// immutable -- so this marks the remembered copy as the newer one for
+    /// that same user, and [`TcpClient::sign_in_credentials`] prefers it.
+    password_refreshed: bool,
 }
 
 /// A connection that completed every step of coming up, TLS included.
@@ -225,15 +230,7 @@ impl BinaryTransport for TcpClient {
         // Login and register are the exception: the server stays deliberately
         // silent on a transient register failure and relies on the client
         // replaying, so that replay is the protocol rather than a retry.
-        let replay_after_reconnect = is_login_register_code(code)
-            || matches!(
-                error,
-                IggyError::NotConnected
-                    | IggyError::CannotEstablishConnection
-                    | IggyError::Unauthenticated
-                    | IggyError::StaleClient
-            )
-            || matches!(operation_for_code(code), Operation::NonReplicated);
+        let replay_after_reconnect = replay_is_safe(code, &error);
 
         self.disconnect_transport().await?;
 
@@ -278,6 +275,59 @@ impl BinaryTransport for TcpClient {
     }
 }
 
+/// Whether replaying `code` over a fresh connection cannot apply it twice.
+///
+/// The reconnect registers a new client identity, so the server's dedup fence
+/// no longer covers the original request: only requests that provably never
+/// reached the log may be re-sent.
+///
+/// - the errors raised before the frame was written, and the server's own
+///   refusals, which precede execution;
+/// - operations that never enter the log: a non-replicated read, and a logout,
+///   which ends whatever session the connection carried -- the reconnect
+///   brought a new one, and refusing the replay would strand
+///   `logout_before_relogin`, whose failure aborts the sign-in that was about
+///   to replace the session;
+/// - login and register, where the replay is the protocol: the server stays
+///   deliberately silent on a transient register failure and relies on the
+///   client resending.
+fn replay_is_safe(code: u32, error: &IggyError) -> bool {
+    is_login_register_code(code)
+        || matches!(
+            error,
+            IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::Unauthenticated
+                | IggyError::StaleClient
+        )
+        || matches!(
+            operation_for_code(code),
+            Operation::NonReplicated | Operation::Logout
+        )
+}
+
+/// Why a TLS handshake failed, as far as retrying is concerned.
+///
+/// A certificate this client will never accept -- the wrong CA, a name it does
+/// not cover, a peer that answers a ClientHello with something else -- says the
+/// same thing on every attempt. Reported as a configuration fault it ends the
+/// connect after one sweep; reported as a lost connection it would be redialed
+/// every interval forever under `max_retries = None`, which is how a wrong CA
+/// looks like a flaky network.
+fn classify_handshake_failure(error: &std::io::Error) -> IggyError {
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        Some(
+            rustls::Error::InvalidCertificate(_)
+            | rustls::Error::NoCertificatesPresented
+            | rustls::Error::InvalidMessage(_),
+        ) => IggyError::InvalidTlsCertificate,
+        _ => IggyError::CannotEstablishConnection,
+    }
+}
+
 impl iggy_common::VsrSessionSealed for TcpClient {}
 
 #[async_trait::async_trait]
@@ -314,6 +364,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
             .replace(RememberedSignIn {
                 credentials,
                 user_id,
+                password_refreshed: false,
             });
     }
 
@@ -339,6 +390,7 @@ impl iggy_common::VsrSessionControl for TcpClient {
         };
         if targets_session_user {
             *password = SecretString::from(new_password.to_owned());
+            sign_in.password_refreshed = true;
         }
     }
 
@@ -452,6 +504,11 @@ impl TcpClient {
             let remote_address;
             let client_address;
             let mut candidate = 0;
+            // A fault no retry can fix, remembered rather than returned at
+            // once: it belongs to the endpoint that raised it (a certificate
+            // that names another host, a domain that will not parse), and the
+            // endpoints behind that one may be perfectly usable.
+            let mut config_fault: Option<IggyError> = None;
             loop {
                 let server_address = candidates[candidate].clone();
                 if server_address == paced_endpoint
@@ -478,14 +535,7 @@ impl TcpClient {
                         break;
                     }
                     Err(IggyError::CannotEstablishConnection) => {}
-                    Err(error) => {
-                        // An unreadable CA file or an unusable TLS domain is a
-                        // configuration fault: no other endpoint fixes it, and
-                        // retrying forever under `max_retries = None` would
-                        // only bury it.
-                        self.fail_connect().await;
-                        return Err(error);
-                    }
+                    Err(error) => config_fault = Some(error),
                 }
 
                 // Every other endpoint gets its turn before the retry
@@ -496,6 +546,17 @@ impl TcpClient {
                     continue;
                 }
                 candidate = 0;
+
+                // An unreadable CA file, a certificate that names another
+                // host, a domain that will not parse: no endpoint answered and
+                // at least one said why in a way that a retry cannot change,
+                // so the caller gets that reason instead of a retry loop that
+                // buries it (`max_retries = None` would otherwise redial it
+                // every interval forever).
+                if let Some(error) = config_fault {
+                    self.fail_connect().await;
+                    return Err(error);
+                }
 
                 // The sweep is what reconnection settings apply to, not a
                 // single dial: with reconnection off there are no retries, but
@@ -578,13 +639,33 @@ impl TcpClient {
                                 info!("{NAME} client: {client_address} has signed in with {how}.")
                             }
                             Err(error) => {
-                                // The transport is up and only the session is
-                                // not, so the state has to say so: left at
+                                // With the transport up and only the session
+                                // missing, the state has to say so: left at
                                 // `Authenticating` every gated operation fails
                                 // client-side with `Disconnected`, `connect()`
                                 // returns ok without dialing, and nothing short
                                 // of an explicit `login_user` recovers.
-                                self.set_state(ClientState::Connected).await;
+                                //
+                                // A sign-in can also fail because the socket
+                                // died under it. Whatever is left of that
+                                // connection cannot carry a request, so it goes
+                                // rather than being kept behind a `Connected`
+                                // that makes the next `connect()` a no-op and
+                                // leaves every gated operation failing until
+                                // someone calls `disconnect()` by hand.
+                                if matches!(
+                                    error,
+                                    IggyError::Disconnected
+                                        | IggyError::EmptyResponse
+                                        | IggyError::NotConnected
+                                        | IggyError::CannotEstablishConnection
+                                        | IggyError::TcpError
+                                        | IggyError::StaleClient
+                                ) {
+                                    self.disconnect_transport().await?;
+                                } else if self.get_state().await == ClientState::Authenticating {
+                                    self.set_state(ClientState::Connected).await;
+                                }
                                 // A rejected credential does not become valid on
                                 // the next reconnect, and replaying it costs an
                                 // argon2 on the server every time. Configured
@@ -679,14 +760,33 @@ impl TcpClient {
     /// sign-in is otherwise less reconnectable than a configured one, which
     /// is a surprising difference between two ways of doing the same thing.
     async fn sign_in_credentials(&self) -> Option<Credentials> {
-        match &self.config.auto_login {
-            AutoLogin::Enabled(credentials) => Some(credentials.clone()),
-            AutoLogin::Disabled => self
-                .session_credentials
+        let remembered =
+            self.session_credentials
                 .lock()
                 .await
                 .as_ref()
-                .map(|remembered| remembered.credentials.clone()),
+                .map(|remembered: &RememberedSignIn| {
+                    (
+                        remembered.credentials.clone(),
+                        remembered.password_refreshed,
+                    )
+                });
+
+        match (&self.config.auto_login, remembered) {
+            // A committed password change for the configured user outranks the
+            // configured password: the config cannot be rewritten, and signing
+            // in with the password this client itself replaced would fail
+            // `InvalidCredentials` on every later reconnect. Same user either
+            // way -- `refresh_session_password` only marks a change that
+            // targeted the signed-in one.
+            (
+                AutoLogin::Enabled(Credentials::UsernamePassword(configured_username, _)),
+                Some((Credentials::UsernamePassword(username, password), true)),
+            ) if configured_username == &username => {
+                Some(Credentials::UsernamePassword(username, password))
+            }
+            (AutoLogin::Enabled(configured), _) => Some(configured.clone()),
+            (AutoLogin::Disabled, remembered) => remembered.map(|(credentials, _)| credentials),
         }
     }
 
@@ -697,10 +797,14 @@ impl TcpClient {
         let mut candidates = vec![self.current_server_address.lock().await.clone()];
         let roster = self.roster_endpoints.lock().await.clone();
         for endpoint in roster.iter().chain(self.config.failover_addresses.iter()) {
-            if !candidates
-                .iter()
-                .any(|candidate| is_same_address(candidate, endpoint))
-            {
+            let mut known = false;
+            for candidate in &candidates {
+                if is_same_address(candidate, endpoint).await {
+                    known = true;
+                    break;
+                }
+            }
+            if !known {
                 candidates.push(endpoint.clone());
             }
         }
@@ -794,7 +898,7 @@ impl TcpClient {
         })?;
         let stream = connector.connect(domain, stream).await.map_err(|error| {
             error!("Failed to establish a TLS connection to the server: {error}");
-            IggyError::CannotEstablishConnection
+            classify_handshake_failure(&error)
         })?;
 
         Ok(EstablishedConnection {
@@ -1162,6 +1266,8 @@ const fn is_login_register_code(code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::codes::{GET_ME_CODE, LOGOUT_USER_CODE, SEND_MESSAGES_CODE};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SESSION_USER_ID: u32 = 7;
 
@@ -1308,6 +1414,124 @@ mod tests {
         .await
         .expect("the sweep has to end on its own");
         assert!(matches!(sweep, Err(IggyError::CannotEstablishConnection)));
+    }
+
+    /// A peer that accepts TCP and then answers a ClientHello with something
+    /// else: the handshake fails for a reason no retry changes.
+    async fn endpoint_that_speaks_no_tls() -> String {
+        let (listener, address) = live_endpoint().await;
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = stream.write_all(b"this is not a TLS record\n").await;
+                    // Held open, so the failure is the handshake's verdict
+                    // rather than a closed socket.
+                    let mut sink = [0u8; 64];
+                    while stream.read(&mut sink).await.is_ok_and(|read| read > 0) {}
+                });
+            }
+        });
+        address
+    }
+
+    // A certificate this client will never accept says the same thing on every
+    // attempt, so it has to reach the caller instead of being redialed every
+    // interval forever -- which is what `max_retries = None` did with it.
+    #[tokio::test]
+    async fn a_handshake_no_retry_can_fix_ends_the_connect() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: endpoint_that_speaks_no_tls().await,
+            tls_enabled: true,
+            tls_validate_certificate: false,
+            reconnection: TcpClientReconnectionConfig {
+                // Unlimited retries, so a transient classification never
+                // returns and this test times out instead of failing.
+                max_retries: None,
+                interval: IggyDuration::from_str("100ms").expect("duration"),
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+
+        let connect = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            std::pin::pin!(TcpClient::connect(&client)),
+        )
+        .await
+        .expect("the connect has to end on its own");
+        assert!(matches!(connect, Err(IggyError::InvalidTlsCertificate)));
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+    }
+
+    // A sign-in that lost its socket leaves nothing to send on, so the
+    // transport goes with it: kept behind a `Connected`, the next `connect()`
+    // would return ok without dialing and every gated operation would fail
+    // until someone disconnected by hand.
+    #[tokio::test]
+    async fn a_sign_in_that_lost_its_socket_leaves_the_client_disconnected() {
+        let (listener, address) = live_endpoint().await;
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                // Accept, then hang up: the dial succeeds and the sign-in dies
+                // on the socket.
+                drop(stream);
+            }
+        });
+
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            server_address: address,
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "iggy".to_string(),
+                "iggy".into(),
+            )),
+            reconnection: TcpClientReconnectionConfig {
+                enabled: false,
+                ..TcpClientReconnectionConfig::default()
+            },
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+
+        assert!(TcpClient::connect(&client).await.is_err());
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+        assert!(
+            client.stream.lock().await.is_none(),
+            "a dead connection must not be kept for the next request to find"
+        );
+    }
+
+    // The reconnect registers a new client identity, so the server's dedup
+    // fence no longer covers the original request.
+    #[test]
+    fn only_requests_that_cannot_double_apply_are_replayed() {
+        // Never written, or refused before execution.
+        assert!(replay_is_safe(SEND_MESSAGES_CODE, &IggyError::NotConnected));
+        assert!(replay_is_safe(
+            SEND_MESSAGES_CODE,
+            &IggyError::CannotEstablishConnection
+        ));
+        assert!(replay_is_safe(SEND_MESSAGES_CODE, &IggyError::StaleClient));
+        // Written, and its outcome unknown: a replicated write must not be
+        // re-sent under a session the fence cannot match it against.
+        assert!(!replay_is_safe(
+            SEND_MESSAGES_CODE,
+            &IggyError::Disconnected
+        ));
+        assert!(!replay_is_safe(
+            SEND_MESSAGES_CODE,
+            &IggyError::EmptyResponse
+        ));
+        // A read never enters the log, and a logout ends a session the
+        // reconnect already replaced -- `logout_before_relogin` depends on it.
+        assert!(replay_is_safe(GET_ME_CODE, &IggyError::Disconnected));
+        assert!(replay_is_safe(LOGOUT_USER_CODE, &IggyError::Disconnected));
+        // The register replay is the protocol: the server stays silent on a
+        // transient failure and waits for the resend.
+        assert!(replay_is_safe(
+            LOGIN_REGISTER_CODE,
+            &IggyError::Disconnected
+        ));
     }
 
     // `reestablish_after` paces reconnects to the endpoint that was lost. With
@@ -1549,6 +1773,78 @@ mod tests {
                 assert_eq!(token.expose_secret(), "token");
             }
             other => panic!("expected the remembered token, got {other:?}"),
+        }
+    }
+
+    // The configured credentials cannot be rewritten, so a committed password
+    // change for the configured user has to reach the next reconnect through
+    // the remembered copy, or every later drop replays the password this very
+    // client replaced.
+    #[tokio::test]
+    async fn a_password_change_reaches_a_configured_auto_login() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "iggy".to_string(),
+                "old".into(),
+            )),
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+        client
+            .remember_session_credentials(
+                Credentials::UsernamePassword("iggy".to_string(), "old".into()),
+                SESSION_USER_ID,
+            )
+            .await;
+
+        client
+            .refresh_session_password(
+                &Identifier::numeric(SESSION_USER_ID).expect("numeric identifier"),
+                "new",
+            )
+            .await;
+
+        match client.sign_in_credentials().await {
+            Some(Credentials::UsernamePassword(username, password)) => {
+                assert_eq!(username, "iggy");
+                assert_eq!(password.expose_secret(), "new");
+            }
+            other => panic!("expected the configured user with the new password, got {other:?}"),
+        }
+    }
+
+    // A change for somebody else says nothing about the configured user's
+    // password, and a sign-in as another user does not get to replace it.
+    #[tokio::test]
+    async fn a_password_change_for_another_user_leaves_a_configured_auto_login_alone() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "configured".to_string(),
+                "old".into(),
+            )),
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+        client
+            .remember_session_credentials(
+                Credentials::UsernamePassword("signed-in".to_string(), "old".into()),
+                SESSION_USER_ID,
+            )
+            .await;
+
+        client
+            .refresh_session_password(
+                &Identifier::numeric(SESSION_USER_ID).expect("numeric identifier"),
+                "new",
+            )
+            .await;
+
+        match client.sign_in_credentials().await {
+            Some(Credentials::UsernamePassword(username, password)) => {
+                assert_eq!(username, "configured");
+                assert_eq!(password.expose_secret(), "old");
+            }
+            other => panic!("expected the configured credentials, got {other:?}"),
         }
     }
 

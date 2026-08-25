@@ -75,10 +75,6 @@ import java.util.function.IntConsumer;
  * Manages the connection lifecycle and request/response correlation.
  */
 public class AsyncTcpConnection {
-    private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
-    private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
-    // A missing reply must not hold the single VSR-pinned channel forever.
-    private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
     // Transient VSR denials (not-committed / not-accepted) are replayed with
     // the same encoded frame so the server's dedup sees the same request id.
     // A not-committed outcome is unknown, so it replays for the whole budget.
@@ -86,8 +82,15 @@ public class AsyncTcpConnection {
     // so after a short same-node retry it is handed to the owning client for
     // a leader recheck and safe replay; mirrors TRANSIENT_FAILOVER_CHECK_INTERVAL
     // in core/sdk/src/tcp/tcp_client.rs.
-    private static final int TRANSIENT_NOT_COMMITTED = 57;
-    private static final int TRANSIENT_NOT_ACCEPTED = 58;
+    //
+    // Package-private: the client classifies a failed sign-in by these codes,
+    // and a transient one is not a rejected credential.
+    static final int TRANSIENT_NOT_COMMITTED = 57;
+    static final int TRANSIENT_NOT_ACCEPTED = 58;
+    private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
+    private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
+    // A missing reply must not hold the single VSR-pinned channel forever.
+    private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
     private static final long TRANSIENT_RETRY_INTERVAL_MS = 50;
     private static final Duration TRANSIENT_RETRY_BUDGET = Duration.ofSeconds(30);
     private static final Duration NOT_ACCEPTED_RETRY_BUDGET = Duration.ofSeconds(2);

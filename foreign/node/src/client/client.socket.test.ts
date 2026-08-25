@@ -969,6 +969,38 @@ describe('VSR client socket', () => {
     }
   });
 
+  it('keeps re-issuing a not-admitted request while the roster still names this node',
+    async () => {
+      const server = await startVsrServer((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_031) {
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream(vsrConfig(server.port));
+      try {
+        await client.authenticate(vsrConfig(server.port).credentials);
+
+        // A refusal the roster cannot explain is a wait, not a verdict: an
+        // election may still be in flight, so the request keeps going for its
+        // whole budget instead of failing after the first re-check window.
+        const pending = client.sendCommand(60_031, Buffer.alloc(0));
+        const outcome = await Promise.race([
+          pending.then(() => 'answered', () => 'gave up'),
+          new Promise((resolve) => {
+            setTimeout(() => resolve('still trying'), 4_000).unref();
+          })
+        ]);
+
+        assert.equal(outcome, 'still trying');
+      } finally {
+        client.destroy();
+        await server.close();
+      }
+    }
+  );
+
   it('keeps a typed transient error and session at its retry deadline',
     async () => {
       const server = await startVsrServer((frame, socket) => {

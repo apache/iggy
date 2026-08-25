@@ -626,7 +626,7 @@ func TestConnect_ExchangesOverTLS(t *testing.T) {
 func TestCreateTLSConfig_ExtractsAnIPv6ServerName(t *testing.T) {
 	client := NewIggyTcpClient(nil, WithServerAddress("[::1]:8090"), WithTLS())
 
-	config, err := client.createTLSConfig()
+	config, err := client.createTLSConfig("[::1]:8090")
 	require.NoError(t, err)
 	assert.Equal(t, "::1", config.ServerName)
 }

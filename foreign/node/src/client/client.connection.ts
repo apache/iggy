@@ -71,15 +71,21 @@ const getTransport = (config: ClientConfig): Socket => {
 export type Endpoint = { host: string, port: number };
 
 /**
- * Bound on one dial while other endpoints are queued behind it. A socket has
- * no connect deadline of its own, so a node whose syns are dropped would hold
- * the whole pass. Matches the Rust SDK.
+ * Bound on one dial while other endpoints are queued behind it. Neither the
+ * connect nor the TLS handshake has a deadline of its own, so a node whose syns
+ * are dropped -- or one that accepts TCP and never answers the ClientHello --
+ * would hold the whole pass. Matches the Rust SDK.
  */
 const FAILOVER_DIAL_TIMEOUT_MS = 2_000;
 
 /**
  * Default reconnection settings.
- * Attempts reconnection every 5 seconds, up to 12 times.
+ *
+ * One retry is one full pass over every endpoint the client knows, so this is
+ * twelve passes rather than twelve dials, waiting 5 seconds between them. The
+ * first pass runs at once when more than one endpoint is known: the node just
+ * lost may be gone for good, and pausing before dialing a survivor only pushes
+ * the failover past the interval a caller is willing to wait.
  */
 const DefaultReconnectOption: ReconnectOption = {
   enabled: true,
@@ -191,7 +197,10 @@ export class IggyConnection extends EventEmitter {
       this.emit('error', err);
     });
 
-    socket.once('connect', () => {
+    // The readiness event, not 'connect': on TLS the socket is only usable
+    // once the handshake completes, and writing a request before that would
+    // announce a connection the peer has not agreed to yet.
+    socket.once(this._readyEvent(), () => {
       if (this.socket !== socket)
         return;
       debug('socket/connect event');
@@ -235,7 +244,13 @@ export class IggyConnection extends EventEmitter {
 
     this.connecting = true;
     const socket = this.socket;
-    const connectPromise = this._waitForConnection(socket);
+    // Bounded here too when the client knows somewhere else to go: this dial
+    // is not part of a pass, so an endpoint that never becomes usable would
+    // hold it with no timer of its own and the redial pass would never start.
+    const connectPromise = this._dialWithin(
+      socket,
+      this._redialCandidates().length > 1
+    );
     this.connectPromise = connectPromise;
     const clearConnectPromise = () => {
       if (this.connectPromise === connectPromise)
@@ -251,7 +266,9 @@ export class IggyConnection extends EventEmitter {
    * A socket has no connect deadline of its own and there is no 'timeout'
    * listener on it, so a node whose syns are dropped holds the pass for the
    * whole OS connect timeout -- and it leads every pass, because the current
-   * endpoint only moves on success. The bound matches the Rust SDK's.
+   * endpoint only moves on success. The bound covers the TLS handshake too,
+   * which is what `_readyEvent()` waits for and has no deadline of its own
+   * either. It matches the Rust, Go and C# SDKs'.
    */
   private async _dialWithin(socket: Socket, bounded: boolean): Promise<this> {
     if (!bounded)
@@ -277,10 +294,23 @@ export class IggyConnection extends EventEmitter {
     }
   }
 
+  /**
+   * The event that says a socket can carry a request.
+   *
+   * On TLS that is 'secureConnect', not 'connect': the latter fires as soon as
+   * the TCP handshake completes, so waiting on it would treat a peer that
+   * never answers the ClientHello as connected and leave the handshake with no
+   * deadline at all.
+   */
+  private _readyEvent(): 'connect' | 'secureConnect' {
+    return this.config.transport === 'TLS' ? 'secureConnect' : 'connect';
+  }
+
   private _waitForConnection(socket: Socket): Promise<this> {
+    const ready = this._readyEvent();
     return new Promise<this>((resolve, reject) => {
       const cleanup = () => {
-        socket.removeListener('connect', resolveConnect);
+        socket.removeListener(ready, resolveConnect);
         socket.removeListener('error', rejectConnect);
         socket.removeListener('close', rejectClosed);
       };
@@ -297,7 +327,7 @@ export class IggyConnection extends EventEmitter {
       };
       socket.once('error', rejectConnect);
       socket.once('close', rejectClosed);
-      socket.once('connect', resolveConnect);
+      socket.once(ready, resolveConnect);
     });
   }
 
