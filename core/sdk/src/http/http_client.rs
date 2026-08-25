@@ -279,7 +279,7 @@ impl HttpClient {
         Ok(Self {
             api_url,
             client,
-            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
+            heartbeat_interval: config.heartbeat_interval,
             access_token: IggyRwLock::new(access_token),
             events: broadcast(1000),
         })
@@ -541,8 +541,9 @@ mod tests {
         let username = "user";
         let password = "secret";
         let retries = "10";
+        let heartbeat_interval = "10s";
         let value = format!(
-            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?retries={retries}"
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?retries={retries}&heartbeat_interval={heartbeat_interval}"
         );
         let http_client = HttpClient::from_connection_string(&value);
         assert!(http_client.is_ok());
@@ -550,6 +551,10 @@ mod tests {
         assert_eq!(
             http_client.as_ref().unwrap().api_url.to_string(),
             format!("{protocol}://{server_address}:{port}/")
+        );
+        assert_eq!(
+            http_client.as_ref().unwrap().heartbeat_interval,
+            NonZeroIggyDuration::from_str(heartbeat_interval).unwrap()
         );
     }
 

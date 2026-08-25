@@ -129,7 +129,7 @@ impl ClientProviderConfig {
                 config.http = Some(Arc::new(HttpClientConfig {
                     api_url: args.http_api_url,
                     retries: args.http_retries,
-                    jwt: None,
+                    ..Default::default()
                 }));
             }
             TransportProtocol::Tcp => {
