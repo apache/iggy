@@ -38,9 +38,9 @@ use crate::Simulator;
 use crate::replica::Replica;
 use crate::workload::shadow::Shadow;
 use crate::workload::{Workload, apply_sim_commands, resubmit_due, state_checker};
-use consensus::{MetadataHandle, Status};
+use consensus::{Consensus, MetadataHandle, Status};
 use metadata::impls::metadata::StreamsFrontend;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 /// Prefix every workload-generated entity name carries (see
@@ -176,13 +176,19 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
             .consensus
             .as_ref()
         {
+            // The three ways `is_caught_up_primary` stays shut on what otherwise
+            // reads as a healthy Normal primary, silently dropping every request.
             let _ = write!(
                 report,
-                " | metadata status={:?} view={} log_view={} commit={} primary={}",
+                " | metadata status={:?} view={} log_view={} commit={}..{} barrier={} \
+                 transferring={} primary={}",
                 consensus.status(),
                 consensus.view(),
                 consensus.log_view(),
                 consensus.commit_min(),
+                consensus.commit_max(),
+                consensus.recovery_barrier(),
+                consensus.is_transferring(),
                 consensus.is_primary(),
             );
         }
@@ -198,10 +204,10 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
             );
         }
         report.push('\n');
-        // Per-client table state. `check_request` admits a metadata request only at
-        // exactly `watermark + 1`, so the watermark says whether an outstanding
-        // request is still expected, already answered (and owed a cached-reply
-        // replay), or ahead of what this replica will accept.
+        // Per-client table state. `check_request` admits anything above the
+        // watermark, so the watermark says whether an outstanding request is still
+        // expected (above it) or already answered and owed a cached-reply replay (at
+        // or below it).
         let table = sim.replicas[usize::from(replica_idx)].shards[0]
             .plane
             .metadata()
@@ -353,7 +359,7 @@ fn partition_view_is_settled(sim: &Simulator, ns: server_common::sharding::IggyN
 /// If a replica is ahead of the leader, two replicas disagree on a committed op,
 /// or the shadow mismatches the leader. The workload seed is in the message so the
 /// failing run replays deterministically.
-pub fn assert_converged(sim: &Simulator, workload: &mut Workload) {
+pub fn assert_converged(sim: &Simulator, workload: &mut Workload) -> ConvergenceReport {
     let seed = workload.options.seed;
     let live: Vec<usize> = (0..sim.replica_count)
         .filter(|replica_idx| !sim.is_crashed(*replica_idx))
@@ -373,6 +379,15 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) {
         "committed metadata prefixes agree across every live replica"
     );
 
+    let Some(leader) = metadata_leader(sim, &live) else {
+        panic!("no metadata leader live at quiesce (seed={seed:#x})");
+    };
+
+    // Settlement treats "no live replica hosts this group" as settled, so losing
+    // every instance of a LIVE partition reads as converged. The metadata read
+    // separates that from a group whose stream the workload deleted.
+    let namespaces_checked = assert_live_namespaces_have_a_primary(sim, workload, leader, seed);
+
     // Safety direction: no live replica may have COMMITTED more of a group than
     // its leader has. A backup may trail (no idle catch-up yet, see module docs),
     // but a backup committed past the leader is a divergence.
@@ -385,11 +400,11 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) {
     // being always furthest ahead; with primary crashes it fires on a correct
     // cluster.
     for &ns in &workload.options.namespaces {
-        let Some(leader) = sim.primary_index(ns) else {
+        let Some(partition_leader) = sim.primary_index(ns) else {
             continue;
         };
         let Some(leader_committed) = sim
-            .partition_consensus_state(usize::from(leader), ns)
+            .partition_consensus_state(usize::from(partition_leader), ns)
             .map(|state| state.commit_min)
         else {
             continue;
@@ -401,12 +416,21 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) {
             {
                 assert!(
                     committed <= leader_committed,
-                    "replica {replica_idx} committed {committed} ops exceeds leader {leader} \
-                     ({leader_committed}) on ns {ns:?} at quiesce (seed={seed:#x})",
+                    "replica {replica_idx} committed {committed} ops exceeds leader \
+                     {partition_leader} ({leader_committed}) on ns {ns:?} at quiesce \
+                     (seed={seed:#x})",
                 );
             }
         }
     }
+
+    let replicas_compared = assert_committed_metadata_agrees(sim, &live, seed);
+
+    let report = ConvergenceReport {
+        ops_compared,
+        replicas_compared,
+        namespaces_checked,
+    };
 
     // Entity oracle: on a serial run the shadow must equal the committed
     // metadata on the leader, the authoritative holder of the metadata log.
@@ -417,11 +441,8 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) {
     // means the unknown did cost the shadow an effect, which is reported rather than
     // asserted, since a failure there would blame the harness's gap on the cluster.
     if !workload.serial_run() {
-        return;
+        return report;
     }
-    let Some(leader) = metadata_leader(sim, &live) else {
-        panic!("no metadata leader live at quiesce (seed={seed:#x})");
-    };
     let committed = read_committed_metadata(&sim.replicas[leader].shards[0]).workload_owned();
     let shadow = shadow_metadata(&workload.shadow);
     if workload.strict_outcome_oracle() {
@@ -430,7 +451,9 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) {
             "shadow diverged from leader-committed metadata at quiesce \
              (leader={leader}, seed={seed:#x})",
         );
-    } else if shadow == committed {
+        return report;
+    }
+    if shadow == committed {
         workload.rearm_outcome_oracle();
         tracing::info!(
             leader,
@@ -445,6 +468,118 @@ pub fn assert_converged(sim: &Simulator, workload: &mut Workload) {
              proved nothing about entity state"
         );
     }
+    report
+}
+
+/// What [`assert_converged`] actually managed to compare.
+///
+/// Counts of exercised comparisons, not of checks attempted: zero exactly when the
+/// property was never tested. An oracle that compared nothing passes like one that
+/// compared everything, so callers assert on these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvergenceReport {
+    /// Committed metadata ops witnessed by more than one live replica.
+    pub ops_compared: usize,
+    /// Live replicas whose committed metadata CONTENT was compared against a peer
+    /// sharing its commit point. Zero on a solo cluster.
+    pub replicas_compared: usize,
+    /// Namespaces still present in committed metadata that were required to have a
+    /// host and exactly one primary.
+    pub namespaces_checked: usize,
+}
+
+/// Require a host and exactly one primary for every workload namespace committed
+/// metadata still knows about. Returns how many namespaces that covered.
+///
+/// A namespace the leader no longer holds is skipped: a deleted stream is not
+/// re-materialised, and that is the only legitimate reason to have no host.
+fn assert_live_namespaces_have_a_primary(
+    sim: &Simulator,
+    workload: &Workload,
+    leader: usize,
+    seed: u64,
+) -> usize {
+    let streams = sim.replicas[leader].shards[0]
+        .plane
+        .metadata()
+        .mux_stm
+        .streams();
+    let mut checked = 0;
+    for &ns in &workload.options.namespaces {
+        if streams.created_revision_for_namespace(ns).is_none() {
+            continue;
+        }
+        checked += 1;
+        let mut hosts = 0usize;
+        let mut primaries = 0usize;
+        for replica_idx in 0..sim.replica_count {
+            if sim.is_crashed(replica_idx) {
+                continue;
+            }
+            if let Some(state) = sim.partition_consensus_state(usize::from(replica_idx), ns) {
+                hosts += 1;
+                if state.is_primary {
+                    primaries += 1;
+                }
+            }
+        }
+        assert!(
+            hosts > 0,
+            "ns {ns:?} is live on leader {leader} but no live replica hosts it at \
+             quiesce: every instance was lost (seed={seed:#x})"
+        );
+        assert_eq!(
+            primaries, 1,
+            "ns {ns:?} is live on leader {leader} but {hosts} host(s) report \
+             {primaries} primaries at quiesce (seed={seed:#x})"
+        );
+    }
+    checked
+}
+
+/// Assert live replicas standing at the same committed op hold the same committed
+/// metadata. Returns how many replicas were compared against a peer.
+///
+/// The gap [`state_checker`] leaves by construction: it compares prepare HEADERS, so
+/// two replicas whose logs agree op for op pass even when one applied that log onto a
+/// different baseline, which is what a botched restart leaves.
+///
+/// Grouped by commit point because a replica that trails legitimately holds less.
+/// Workload-owned only because `seed_stream_topic_partition` seeds the `sim-*` filler
+/// straight into each LIVE replica's STM, bypassing consensus, so those differ across
+/// replicas on a healthy cluster.
+fn assert_committed_metadata_agrees(sim: &Simulator, live: &[usize], seed: u64) -> usize {
+    let mut by_commit: BTreeMap<u64, (usize, CommittedMetadata)> = BTreeMap::new();
+    let mut compared = 0;
+    for &replica_idx in live {
+        let Some(consensus) = sim.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+        else {
+            continue;
+        };
+        let committed =
+            read_committed_metadata(&sim.replicas[replica_idx].shards[0]).workload_owned();
+        match by_commit.get(&consensus.commit_min()) {
+            Some((owner, canonical)) => {
+                assert_eq!(
+                    &committed,
+                    canonical,
+                    "at quiesce replicas {owner} and {replica_idx} both committed \
+                     through metadata op {} but hold different metadata: one applied \
+                     that log onto a different baseline (seed={seed:#x})",
+                    consensus.commit_min(),
+                );
+                compared += 1;
+            }
+            None => {
+                by_commit.insert(consensus.commit_min(), (replica_idx, committed));
+            }
+        }
+    }
+    compared
 }
 
 /// The live replica whose metadata consensus is the current primary, i.e. the

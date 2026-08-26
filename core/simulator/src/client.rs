@@ -159,10 +159,11 @@ impl SimClient {
 
     /// Assign the wire request id for `operation`, keyed by plane.
     ///
-    /// Metadata/replicated ops advance a contiguous `1, 2, 3, …` counter: the
-    /// `ClientTable` dedups them and rejects anything but `committed + 1`, so a
-    /// gap opens a permanent `RequestGap` and wedges the client's metadata
-    /// plane. Partition ops are at-least-once with no dedup and the server
+    /// Metadata/replicated ops advance a contiguous `1, 2, 3, …` counter, matching
+    /// the real SDK. Gaps are admitted rather than fatal (`check_request` answers
+    /// `New` to anything above the watermark; there is no `RequestGap`), but the
+    /// dedup ring is sized for a contiguous sequence. Partition ops are at-least-once
+    /// with no dedup and the server
     /// treats their id as an opaque echo, so they draw from a separate counter
     /// offset into a disjoint range ([`PARTITION_ID_BASE`]). A partition id can
     /// therefore never equal a metadata id, so a delayed or duplicated partition

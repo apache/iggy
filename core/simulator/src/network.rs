@@ -130,6 +130,11 @@ impl Network {
     ///
     /// **Warning:** resets all link filters to [`ALLOW_ALL`], including
     /// manually-set per-command filters.
+    /// End fault injection: see [`PacketSimulator::heal`].
+    pub fn heal(&mut self) {
+        self.simulator.heal();
+    }
+
     pub fn clear_partition(&mut self) {
         self.simulator.clear_partition();
     }

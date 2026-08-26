@@ -72,6 +72,12 @@ pub struct StateChecker {
     /// exists for. The cost is re-walking a recovering replica's prefix, bounded by
     /// its own commit point.
     verified_upto: BTreeMap<u8, u64>,
+    /// Each replica's metadata incarnation as of the last check.
+    ///
+    /// A change means everything below the commit point was rebuilt from disk, so it
+    /// is not the bytes already compared. Lowering the mark alone misses this: a
+    /// replica recovering the SAME point leaves an empty range to walk.
+    incarnations: BTreeMap<u8, u128>,
 }
 
 impl StateChecker {
@@ -102,24 +108,53 @@ impl StateChecker {
                 continue;
             };
             let committed = consensus.commit_min();
+            // Re-walk from the snapshot floor, which bounds the cost: below it the
+            // state came from the snapshot and has no header to compare.
+            let restarted = self
+                .incarnations
+                .insert(replica_idx, replica.metadata_incarnation)
+                .is_some_and(|previous| previous != replica.metadata_incarnation);
+            if restarted {
+                self.verified_upto
+                    .insert(replica_idx, replica.metadata_journal.snapshot_op());
+            }
             let verified = self.verified_upto.get(&replica_idx).copied().unwrap_or(0);
             for op in (verified + 1)..=committed {
-                let Some(header) = journaled_header(replica, op) else {
-                    assert!(
-                        absent_header_is_legitimate(replica, op, committed),
-                        "replica {replica_idx} reports op {op} committed but has no journal \
-                         header for it, and the op is above its snapshot floor {} and below \
-                         its commit point {committed}: a hole in the committed log \
-                         (seed={seed:#x})",
-                        replica.metadata_journal.snapshot_op(),
-                    );
-                    continue;
-                };
-                self.record(replica_idx, op, &header, seed);
+                self.verify(replica_idx, replica, op, committed, seed);
+            }
+            // Again, even when the loop already walked it. A replica whose point does
+            // not move is otherwise never compared, while what it holds there can
+            // change under it (recovery, repair, transfer install). TigerBeetle
+            // re-derives the checksum at `commit_min` every tick for this reason.
+            if committed > 0 {
+                self.verify(replica_idx, replica, committed, committed, seed);
             }
             // Recorded verbatim, NOT maxed: see the field doc.
             self.verified_upto.insert(replica_idx, committed);
         }
+    }
+
+    /// Fold one replica's op into the canonical chain, or prove its absence
+    /// legitimate.
+    fn verify(
+        &mut self,
+        replica_idx: u8,
+        replica: &crate::SimReplica,
+        op: u64,
+        committed: u64,
+        seed: u64,
+    ) {
+        let Some(header) = journaled_header(replica, op) else {
+            assert!(
+                absent_header_is_legitimate(replica, op),
+                "replica {replica_idx} reports op {op} committed (point {committed}) \
+                 but holds no header for it above its snapshot floor {}: a hole in the \
+                 committed log (seed={seed:#x})",
+                replica.metadata_journal.snapshot_op(),
+            );
+            return;
+        };
+        self.record(replica_idx, op, &header, seed);
     }
 
     /// Number of ops in the canonical chain. Tests assert this is non-zero, so a
@@ -231,7 +266,7 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
                 // The one legitimate absence is an op dropped under the snapshot
                 // floor.
                 assert!(
-                    absent_header_is_legitimate(replica, op, committed),
+                    absent_header_is_legitimate(replica, op),
                     "at quiesce replica {replica_idx} reports op {op} committed but holds \
                      no header for it (snapshot floor {}, commit point {committed}): its \
                      committed prefix has a hole (seed={seed:#x})",
@@ -259,18 +294,17 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
 /// Whether a committed op having no journal header is legitimate rather than a
 /// hole.
 ///
-/// Two cases, and only two. The journal dropped it under its own snapshot floor,
-/// which a checkpoint does. Or it is the commit point itself on a replica whose
-/// point came from `SimJournal::recovery_commit_watermark`, a LOWER bound taken
-/// from the highest `commit` any journaled prepare stamped, so the true point may
-/// be one higher than anything the log holds.
+/// One case only: the journal dropped it under its own snapshot floor, which a
+/// checkpoint does.
 ///
-/// Skipping unconditionally instead, on the grounds that the simulator never
-/// checkpoints (which `Simulator::with_checkpoints` has since made false), hides a
-/// journal head sitting far below a commit floor, which is what a botched state
-/// transfer or repair leaves.
-fn absent_header_is_legitimate(replica: &crate::SimReplica, op: u64, committed: u64) -> bool {
-    op <= replica.metadata_journal.snapshot_op() || op == committed
+/// The commit point itself used to be exempt too, on the grounds that
+/// `recovery_commit_watermark` is a lower bound. Unnecessary and unsafe: a checkpoint
+/// drains `0..=snapshot_op - 1`, retaining the commit-point header for view-change
+/// merging (`checkpoint_drain_retains_the_commit_point_header`), so on a healthy
+/// replica it is always there and the exemption only hid a missing committed head.
+/// TigerBeetle draws the same line at `commit_min == op_checkpoint()`.
+fn absent_header_is_legitimate(replica: &crate::SimReplica, op: u64) -> bool {
+    op <= replica.metadata_journal.snapshot_op()
 }
 
 /// The header a replica has journaled at `op`, if any.
@@ -280,4 +314,122 @@ fn absent_header_is_legitimate(replica: &crate::SimReplica, op: u64, committed: 
 fn journaled_header(replica: &crate::SimReplica, op: u64) -> Option<PrepareHeader> {
     let slot = usize::try_from(op).ok()?;
     replica.metadata_journal.header(slot).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::SimClient;
+    use crate::packet::PacketSimulatorOptions;
+
+    const SEED: u64 = 0x5C11;
+
+    /// A three-replica cluster with six committed metadata ops behind it.
+    fn cluster_with_committed_ops() -> Simulator {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let client_id: u128 = 1;
+        let mut sim = Simulator::new(
+            3,
+            std::iter::once(client_id),
+            PacketSimulatorOptions {
+                node_count: 3,
+                client_count: 1,
+                seed: SEED,
+                ..PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+        for sequence in 0..6u32 {
+            let msg = client.create_stream(&format!("wl-chk-{sequence}"));
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..40 {
+                sim.step();
+            }
+        }
+        sim
+    }
+
+    /// A committed op with no header is a hole, including at the commit point, which
+    /// is the one op a checkpoint deliberately retains.
+    #[test]
+    #[should_panic(expected = "a hole in the committed log")]
+    fn a_missing_committed_head_above_the_snapshot_floor_is_a_hole() {
+        let sim = cluster_with_committed_ops();
+        let committed = sim.replicas[1].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus")
+            .commit_min();
+        assert!(
+            committed > sim.replicas[1].metadata_journal.snapshot_op(),
+            "the commit point must sit above the snapshot floor or this test is vacuous"
+        );
+        assert!(
+            sim.replicas[1].metadata_journal.forget_op(committed),
+            "the head this test removes must have been there"
+        );
+        StateChecker::new().check(&sim, SEED);
+    }
+
+    /// A hole punched below a replica's verified mark is caught after it restarts.
+    ///
+    /// The mark survives a crash, so without the incarnation reset the walk begins
+    /// past the damage. The hole stands in for any way a rebuilt prefix can differ
+    /// from the one already compared.
+    #[test]
+    #[should_panic(expected = "a hole in the committed log")]
+    fn a_damaged_prefix_is_rechecked_after_a_restart() {
+        let mut sim = cluster_with_committed_ops();
+        let mut checker = StateChecker::new();
+        checker.check(&sim, SEED);
+        assert!(
+            checker.chain_len() > 2,
+            "the checker verified nothing, so the mark it carries into the restart \
+             proves nothing"
+        );
+
+        sim.replica_crash(1);
+        sim.replica_restart(1);
+        for _ in 0..200 {
+            sim.step();
+        }
+        assert!(
+            sim.replicas[1].metadata_journal.forget_op(2),
+            "op 2 must be journaled for this test to damage anything"
+        );
+        checker.check(&sim, SEED);
+    }
+
+    /// An undamaged prefix passes the recheck: the reset must turn a restart into a
+    /// comparison, not into a failure.
+    #[test]
+    fn an_undamaged_prefix_passes_the_recheck_after_a_restart() {
+        let mut sim = cluster_with_committed_ops();
+        let mut checker = StateChecker::new();
+        checker.check(&sim, SEED);
+        let before = checker.chain_len();
+
+        sim.replica_crash(1);
+        sim.replica_restart(1);
+        for _ in 0..400 {
+            sim.step();
+        }
+        checker.check(&sim, SEED);
+        assert!(
+            checker.chain_len() >= before,
+            "the canonical chain shrank across a restart"
+        );
+        assert!(
+            checker.ops_compared() > 0,
+            "no op was witnessed by more than one replica, so the recheck compared \
+             nothing"
+        );
+    }
 }

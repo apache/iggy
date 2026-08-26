@@ -92,8 +92,21 @@ struct Args {
     /// default, and an unbounded journal never checkpoints, so WAL drain,
     /// `snapshot_op` movement, `RangeEvicted` and metadata state transfer are all
     /// unreachable until this is set.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_journal_slots)]
     journal_slots: Option<usize>,
+    /// Directory the checkpointing run writes its snapshots into, retained for
+    /// diagnosis. Defaults to a fresh per-process directory, whose path is printed.
+    /// Refuses an existing one unless `--reuse-data-dir` says so.
+    #[arg(long)]
+    data_dir: Option<std::path::PathBuf>,
+    /// Allow `--data-dir` to name a directory that already exists.
+    #[arg(long)]
+    reuse_data_dir: bool,
+    /// Live replicas the fault injector will not crash below. Defaults to a commit
+    /// quorum (`replicas / 2 + 1`). `--replicas 1 --min-survivors 0` is the only way
+    /// to exercise a single-replica restart.
+    #[arg(long)]
+    min_survivors: Option<u8>,
     /// Let a rebuilt partition recover its consensus frontier from the log the
     /// harness carried across the restart.
     ///
@@ -113,6 +126,22 @@ struct Args {
     /// this flag a run whose oracle stayed disarmed still exits 0.
     #[arg(long)]
     require_entity_oracle: bool,
+    /// Committed workload operations this run must produce, or it fails.
+    ///
+    /// A run that commits nothing proved nothing: every oracle downstream compares an
+    /// empty shadow against empty committed state and agrees. `0` opts out.
+    #[arg(long, default_value_t = 1)]
+    min_commits: u64,
+    /// Committed metadata ops that must have been witnessed by more than one live
+    /// replica, i.e. that exercised cross-replica agreement. Ignored below two live
+    /// replicas, where the property is untestable rather than untested. `0` opts out.
+    #[arg(long, default_value_t = 1)]
+    min_ops_compared: usize,
+    /// Fail the run if crash or restart injection was requested but never happened.
+    /// Off by default, since a short run at low probability may legitimately draw
+    /// none; on for a campaign where such a seed is silently wasted.
+    #[arg(long)]
+    require_faults: bool,
     /// Route every client request through the server's real dispatch handlers
     /// instead of the raw `on_message` fast path. Clients then log in against the
     /// seeded root user and carry a bound session, so the run also covers
@@ -139,7 +168,7 @@ struct Args {
     #[arg(long)]
     one_way_delay_mean: Option<u64>,
     /// Maximum packets queued on a single link; beyond it the link drops.
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..))]
     link_capacity: Option<u8>,
     /// How an automatic partition picks its sides.
     #[arg(long, value_enum)]
@@ -299,6 +328,26 @@ impl Plane {
     }
 }
 
+/// Clap value parser: a journal slot count a checkpoint can actually be driven by.
+///
+/// At or below the coordinator's margin the journal sits at the threshold from the
+/// first op, so the run checkpoints on every commit and measures that, not the
+/// workload.
+fn parse_journal_slots(raw: &str) -> Result<usize, String> {
+    let value: usize = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a whole number"))?;
+    let margin = metadata::impls::metadata::SnapshotCoordinator::<()>::CHECKPOINT_MARGIN;
+    if value > margin {
+        Ok(value)
+    } else {
+        Err(format!(
+            "must exceed the checkpoint margin ({margin}), or every commit checkpoints; \
+             got {value}"
+        ))
+    }
+}
+
 /// Clap value parser: accept a probability in `[0.0, 1.0]`.
 fn parse_unit_interval(raw: &str) -> Result<f32, String> {
     let value: f32 = raw
@@ -429,6 +478,22 @@ fn network_options(args: &Args, replicas: u8, clients: u8, seed: u64) -> PacketS
     options
 }
 
+/// Report a network configuration that cannot do what it says, before the simulator
+/// asserts on it several frames deeper.
+///
+/// The delay pair is the one relationship no single parser can check: the two values
+/// may arrive from different sources, a profile supplying one and a flag the other.
+fn validate_network_options(options: &PacketSimulatorOptions) -> Result<(), String> {
+    if options.one_way_delay_mean < options.one_way_delay_min {
+        return Err(format!(
+            "one-way delay mean ({}) is below the minimum ({}); the exponential draw is \
+             floored at the minimum, so the mean would never take effect",
+            options.one_way_delay_mean, options.one_way_delay_min,
+        ));
+    }
+    Ok(())
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -455,9 +520,19 @@ fn main() {
     // is replayable. The process still exits non-zero via the default hook.
     std::panic::set_hook(Box::new(move |info| {
         eprintln!("workload-fuzz FAILED, reproduce with --seed {seed}\n{info}");
+        // The hook REPLACES the default one, so without this `RUST_BACKTRACE=1`
+        // silently does nothing and an assertion deep in consensus reports only its
+        // message. Gated on the env var: always printing would bury a campaign.
+        if std::env::var_os("RUST_BACKTRACE").is_some_and(|value| value != "0") {
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
     }));
 
     let network_opts = network_options(&args, replicas, clients, seed);
+    if let Err(error) = validate_network_options(&network_opts) {
+        eprintln!("workload-fuzz: invalid network configuration: {error}");
+        std::process::exit(2);
+    }
     print_run_banner(&args, seed, &network_opts);
 
     // poll_messages / reply paths panic without an initialized pool; disabled
@@ -475,6 +550,9 @@ fn main() {
     options.crash_per_tick_ratio = crash_prob;
     options.restart_per_tick_ratio = args.restart_prob;
     options.spare_primary = !args.crash_primary;
+    if let Some(min_survivors) = args.min_survivors {
+        options.min_survivors = min_survivors;
+    }
     options.ack_quorum_ratio = args.ack_quorum_ratio;
     options.weights = plane.weights();
     let mut workload = Workload::new(options);
@@ -501,6 +579,20 @@ fn main() {
     print_coverage(&workload);
 
     if quiesce {
+        // Liveness phase, before anything is asserted. A drain against a handicapped
+        // cluster has no verdict: a replica still down cannot answer or be compared
+        // against, and on a solo run leaves nobody to drain at all. TigerBeetle's VOPR
+        // does the same (`transition_to_liveness_mode`).
+        let revived: Vec<u8> = (0..replicas).filter(|idx| sim.is_crashed(*idx)).collect();
+        for replica_idx in &revived {
+            sim.replica_restart(*replica_idx);
+        }
+        sim.network.heal();
+        println!(
+            "liveness phase: network healed, {} replica(s) restarted {revived:?}",
+            revived.len(),
+        );
+
         // A failed drain is a hard failure, not a warning. It was a warning while a
         // lost request could not be retried, making stalls expected and
         // unactionable; with the client resending, a request unanswered inside the
@@ -518,7 +610,7 @@ fn main() {
             "metadata views never converged after the drain\n{}",
             oracle::quiesce_failure_report(&sim, &workload),
         );
-        oracle::assert_converged(&sim, &mut workload);
+        let convergence = oracle::assert_converged(&sim, &mut workload);
         // Named, not implied. `assert_converged` skips the entity oracle when an
         // eviction disarmed it and the shadow has not been proven consistent since,
         // so "converged" alone would report a run that asserted nothing about entity
@@ -532,17 +624,56 @@ fn main() {
         };
         println!(
             "quiesced and converged (leader-relative; entity oracle: {entity_oracle}; \
-             evictions={})",
+             evictions={}; ops_compared={} replicas_compared={} namespaces_checked={})",
             workload.evictions(),
+            convergence.ops_compared,
+            convergence.replicas_compared,
+            convergence.namespaces_checked,
         );
         assert!(
             !args.require_entity_oracle || workload.strict_outcome_oracle(),
             "--require-entity-oracle: the entity oracle was {entity_oracle}, so this run \
              proved nothing about entity state (seed={seed:#x})"
         );
+        let live = usize::from(replicas) - sim.crashed.len();
+        assert!(
+            args.min_ops_compared == 0
+                || live < 2
+                || convergence.ops_compared >= args.min_ops_compared,
+            "--min-ops-compared {}: {live} replicas live but only {} op(s) witnessed \
+             by more than one, so cross-replica agreement went untested \
+             (seed={seed:#x})",
+            args.min_ops_compared,
+            convergence.ops_compared,
+        );
         // Again after the drain: the drain both answers outstanding requests and
         // issues its own resends, so the pre-drain numbers are not the final ones.
         print_coverage(&workload);
+    }
+
+    // After the quiesce block, so the drain's own commits count. Rejections are added
+    // to the per-action counter, which tracks committed SUCCESSES: a business
+    // rejection is still an op the cluster ordered and applied as a no-op, so a run
+    // full of them exercised the plane.
+    let stats = workload.auditor.stats();
+    let commits: u64 = stats.commits_per_action.iter().sum::<u64>() + stats.committed_rejections;
+    assert!(
+        commits >= args.min_commits,
+        "--min-commits {}: the run committed {commits} operation(s) on the {plane:?} \
+         plane, so every oracle above compared empty against empty (seed={seed:#x})",
+        args.min_commits,
+    );
+    if args.require_faults {
+        assert!(
+            crash_prob <= 0.0 || injector.crashes() > 0,
+            "--require-faults: --crash-prob {crash_prob} crashed nothing \
+             (seed={seed:#x})"
+        );
+        assert!(
+            args.restart_prob <= 0.0 || injector.restarts() > 0,
+            "--require-faults: --restart-prob {} restarted nothing (seed={seed:#x})",
+            args.restart_prob,
+        );
     }
 
     print_command_coverage(&sim);
@@ -567,12 +698,10 @@ fn build_cluster(
     // data directory for the coordinator to write into. Neither exists on the plain
     // constructors, which is why an unbounded run never reaches WAL drain,
     // `RangeEvicted` or metadata state transfer. The directory is leaked
-    // deliberately: it holds the snapshots a failing run is diagnosed from, and the
-    // run's own seed names it.
+    // deliberately: it holds the snapshots a failing run is diagnosed from.
     let mut sim = match args.journal_slots {
         Some(slots) => {
-            let root = std::env::temp_dir().join(format!("iggy-workload-fuzz-{args_seed:#x}"));
-            std::fs::create_dir_all(&root).expect("fuzz data directory must be creatable");
+            let root = checkpoint_data_dir(args, args_seed);
             println!(
                 "checkpointing enabled: journal_slots={slots} data_dir={}",
                 root.display()
@@ -615,6 +744,31 @@ fn build_cluster(
         }
     }
     (sim, sim_clients, ns)
+}
+
+/// Where a checkpointing run keeps its snapshots.
+///
+/// Per-process, not per-seed: a restart now recovers from `snapshot.bin`, so a
+/// directory an earlier run left is INPUT to this one and seeded naming would let a
+/// run silently boot off its predecessor's state while reporting only the seed.
+fn checkpoint_data_dir(args: &Args, seed: u64) -> std::path::PathBuf {
+    let root = match &args.data_dir {
+        Some(explicit) => {
+            assert!(
+                args.reuse_data_dir || !explicit.exists(),
+                "--data-dir {} already exists; the run would boot off what it holds. \
+                 Remove it, name another, or pass --reuse-data-dir.",
+                explicit.display(),
+            );
+            explicit.clone()
+        }
+        None => std::env::temp_dir().join(format!(
+            "iggy-workload-fuzz-{seed:#x}-{}",
+            std::process::id()
+        )),
+    };
+    std::fs::create_dir_all(&root).expect("fuzz data directory must be creatable");
+    root
 }
 
 /// Which protocol commands the run delivered, and which it never reached.

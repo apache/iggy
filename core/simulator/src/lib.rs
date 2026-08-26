@@ -1852,9 +1852,10 @@ mod tests {
     /// streams equal the metadata committed on the leader.
     ///
     /// Interleaves creates, deletes and partition sends from one client. A send
-    /// between two metadata ops once consumed a metadata request number and gapped
-    /// the next create into a permanent `RequestGap`; `SimClient`'s per-plane
-    /// numbering keeps the metadata sequence contiguous, so the mix drains. Compares
+    /// between two metadata ops once consumed a metadata request number, gapping the
+    /// next create; `SimClient`'s per-plane numbering keeps the metadata sequence
+    /// contiguous, so the mix drains and the auditor never misattributes a partition
+    /// reply to a metadata entry. Compares
     /// against the leader only: a quorum-excluded backup has no idle catch-up, so
     /// full cross-replica equality stays deferred (see [`oracle`]).
     #[test]
@@ -2444,6 +2445,206 @@ mod tests {
         assert!(partitions.contains(&ns_a) && partitions.contains(&ns_b));
     }
 
+    /// Committed stream names on one replica, read out of the committed (left)
+    /// buffer so an uncommitted write is invisible.
+    fn committed_stream_names(
+        sim: &Simulator,
+        replica_idx: usize,
+    ) -> std::collections::BTreeSet<String> {
+        use metadata::impls::metadata::StreamsFrontend;
+        sim.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| {
+                inner
+                    .items
+                    .iter()
+                    .map(|(_, stream)| stream.name.to_string())
+                    .collect()
+            })
+    }
+
+    /// How much of the WAL a checkpoint reclaimed. Non-zero is the precondition every
+    /// checkpoint-recovery test needs: at zero the WAL still holds everything.
+    fn snapshot_floor(sim: &Simulator, replica_idx: usize) -> u64 {
+        use journal::Journal;
+        sim.replicas[replica_idx].metadata_journal.snapshot_op()
+    }
+
+    /// A client's committed request watermark on one replica.
+    fn client_watermark(sim: &Simulator, replica_idx: usize, client_id: u128) -> Option<u64> {
+        sim.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .client_table
+            .borrow()
+            .get_watermark(client_id)
+    }
+
+    /// A checkpointing cluster with `streams` committed streams behind it, named
+    /// `wl-{prefix}-N`. The returned `TempDir` keeps the snapshots alive.
+    fn checkpointing_cluster(
+        replicas: u8,
+        seed: u64,
+        prefix: &str,
+        streams: u32,
+    ) -> (Simulator, u128, tempfile::TempDir) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let root = tempfile::tempdir().expect("temp dir for the simulator's snapshots");
+        let client_id: u128 = 1;
+        let mut sim = Simulator::with_checkpoints(
+            usize::from(replicas),
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: replicas,
+                client_count: 1,
+                seed,
+                ..packet::PacketSimulatorOptions::default()
+            },
+            false,
+            root.path(),
+        );
+        // Small enough that the ops below cross the coordinator's margin.
+        sim.set_metadata_journal_slots(80);
+
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+        for sequence in 0..streams {
+            let msg = client.create_stream(&format!("wl-{prefix}-{sequence}"));
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..40 {
+                sim.step();
+            }
+        }
+        (sim, client_id, root)
+    }
+
+    /// A solo replica that checkpointed recovers the state the checkpoint absorbed.
+    ///
+    /// The case with no second opinion: a clustered replica repairs a botched local
+    /// recovery from a peer, so what boot reconstructs here IS the state. The client
+    /// table is asserted too, being folded in separately by `persist_snapshot`.
+    #[test]
+    fn solo_replica_recovers_the_state_its_checkpoint_absorbed() {
+        let (mut sim, client_id, _root) = checkpointing_cluster(1, 0xC4E0_0002, "solo", 40);
+
+        let before = committed_stream_names(&sim, 0);
+        let watermark_before = client_watermark(&sim, 0, client_id);
+        assert!(
+            snapshot_floor(&sim, 0) > 0,
+            "the solo replica never checkpointed, so this proves nothing about \
+             snapshot recovery"
+        );
+
+        sim.replica_crash(0);
+        sim.replica_restart(0);
+        for _ in 0..2_000 {
+            sim.step();
+        }
+
+        assert_eq!(
+            committed_stream_names(&sim, 0),
+            before,
+            "the restarted solo replica lost committed streams the checkpoint \
+             drained out of the WAL"
+        );
+        assert_eq!(
+            client_watermark(&sim, 0, client_id),
+            watermark_before,
+            "the checkpoint's folded client table did not come back, so a session \
+             below the snapshot floor lost its watermark"
+        );
+    }
+
+    /// A clustered replica that took its own checkpoint rejoins holding the same
+    /// committed metadata as a healthy peer.
+    ///
+    /// Against a peer, not a recorded snapshot of itself: a replica that dropped the
+    /// drained prefix still reports a plausible commit point, and only the peer
+    /// comparison shows the state behind it is wrong.
+    #[test]
+    fn a_checkpointed_replica_rejoins_agreeing_with_a_healthy_peer() {
+        let (mut sim, _client_id, _root) = checkpointing_cluster(3, 0xC4E0_0003, "peer", 40);
+
+        // A backup, so the restart does not also trigger a view change: the subject
+        // here is local recovery, not election.
+        let rejoining = 1u8;
+        assert!(
+            snapshot_floor(&sim, usize::from(rejoining)) > 0,
+            "replica {rejoining} never checkpointed, so its restart exercises no \
+             snapshot recovery"
+        );
+        let healthy = committed_stream_names(&sim, 0);
+        assert!(
+            healthy.len() > 1,
+            "the peer holds no workload streams to compare"
+        );
+
+        sim.replica_crash(rejoining);
+        sim.replica_restart(rejoining);
+        for _ in 0..8_000 {
+            sim.step();
+        }
+
+        assert_eq!(
+            committed_stream_names(&sim, usize::from(rejoining)),
+            healthy,
+            "the rejoined replica disagrees with a healthy peer on committed \
+             metadata: local recovery dropped the prefix its checkpoint drained"
+        );
+    }
+
+    /// A namespace still live in committed metadata but hosted by nobody is a
+    /// convergence FAILURE, not a converged cluster.
+    ///
+    /// Settlement and the leader-relative offset check both skip such a namespace,
+    /// which is right for a deleted stream and used to be the only word on the
+    /// subject. Seeds the metadata half without the partition half, the state a total
+    /// loss of instances leaves.
+    #[test]
+    #[should_panic(expected = "no live replica hosts it at quiesce")]
+    fn a_live_namespace_with_no_host_fails_convergence() {
+        use crate::workload::{Workload, options::WorkloadOptions, oracle};
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let seed = 0xC4E0_0004;
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                seed,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(client_id);
+        let ns = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        // Metadata only: the namespace is committed-visible, but no replica ever
+        // materialises the group (`init_partition` is deliberately not called).
+        sim.seed_stream_topic_partition(ns);
+        sim.register_client_with_primary(&client);
+        for _ in 0..200 {
+            sim.step();
+        }
+
+        let mut workload = Workload::new(WorkloadOptions::new(seed, replica_count, vec![ns]));
+        oracle::assert_converged(&sim, &mut workload);
+    }
+
     /// A replica that checkpoints serves a real state transfer: the rejoining peer
     /// fetches the snapshot in chunks rather than stalling at the handshake.
     ///
@@ -2524,6 +2725,51 @@ mod tests {
         assert!(
             sim.network.delivered_any(Command::StateChunk),
             "no chunk was served: the peer offered a transfer it could not fulfil"
+        );
+
+        // Traffic is not recovery: everything above passes when the chunks arrive and
+        // the install then fails. Each assertion below closes one of those ways.
+        let recovered = &sim.replicas[usize::from(lagging)].shards[0];
+        let consensus = recovered
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus");
+        assert_eq!(
+            consensus.status(),
+            consensus::Status::Normal,
+            "the rejoining replica never returned to Normal"
+        );
+        let transferred_floor = snapshot_floor(&sim, 0);
+        assert!(
+            transferred_floor > 0,
+            "the serving peer has no snapshot to transfer"
+        );
+        assert!(
+            consensus.commit_min() >= transferred_floor,
+            "the rejoining replica commits through {} but was served a snapshot \
+             covering {transferred_floor}: the install did not land",
+            consensus.commit_min(),
+        );
+        assert!(
+            consensus.commit_max() >= consensus.recovery_barrier(),
+            "a recovery barrier at {} still gates the rejoining replica (commit_max {})",
+            consensus.recovery_barrier(),
+            consensus.commit_max(),
+        );
+
+        assert_eq!(
+            committed_stream_names(&sim, usize::from(lagging)),
+            committed_stream_names(&sim, 0),
+            "the transfer left the rejoining replica holding different committed \
+             metadata than the peer that served it"
+        );
+        assert_eq!(
+            client_watermark(&sim, usize::from(lagging), client_id),
+            client_watermark(&sim, 0, client_id),
+            "the transferred client table did not install: the session below the \
+             snapshot floor came back without its watermark"
         );
     }
 

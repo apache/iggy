@@ -297,6 +297,13 @@ pub struct PacketSimulator {
     options: PacketSimulatorOptions,
     /// Flat array of links. Index = `from_idx` * `max_processes` + `to_idx`.
     links: Vec<Link>,
+    /// Whether each process is running, indexed by flat process index.
+    ///
+    /// A layer ABOVE the link filters, never written into them, so a crash and a
+    /// partition compose. Folding availability into `Link::filter` meant restarting a
+    /// process wrote `ALLOW_ALL` over whatever the partition had set. Mirrors
+    /// TigerBeetle's `buses_enabled`.
+    process_up: Vec<bool>,
     /// Maximum number of processes (determines link array size).
     max_processes: usize,
     /// Mapping from [`ProcessId`] to flat index.
@@ -446,6 +453,7 @@ impl PacketSimulator {
         Self {
             options,
             links,
+            process_up: vec![true; max_processes],
             max_processes,
             process_indices,
             next_index: node_count,
@@ -602,31 +610,31 @@ impl PacketSimulator {
         &mut self.links[idx].drop_packet_fn
     }
 
-    /// Disable a process by blocking all links to and from it.
+    /// Mark a process down. Anything addressed to it is dropped at delivery.
     ///
-    /// Packets already queued on those links remain but will be dropped at
-    /// delivery time because the link filter is [`BLOCK_ALL`].
+    /// Link filters are untouched, so a partition or command filter standing at crash
+    /// time still stands at restart.
     pub fn process_disable(&mut self, process: ProcessId) {
-        let all_processes: Vec<ProcessId> = self.process_indices.keys().copied().collect();
-        for other in all_processes {
-            if other == process {
-                continue;
-            }
-            *self.link_filter(process, other) = BLOCK_ALL;
-            *self.link_filter(other, process) = BLOCK_ALL;
-        }
+        let idx = self
+            .process_index(process)
+            .expect("process_disable: unregistered process");
+        self.process_up[idx] = false;
     }
 
-    /// Re-enable a process by allowing all links to and from it.
+    /// Mark a process up again. Restores nothing else: whatever the link layer was
+    /// applying before the crash still applies after the restart.
     pub fn process_enable(&mut self, process: ProcessId) {
-        let all_processes: Vec<ProcessId> = self.process_indices.keys().copied().collect();
-        for other in all_processes {
-            if other == process {
-                continue;
-            }
-            *self.link_filter(process, other) = ALLOW_ALL;
-            *self.link_filter(other, process) = ALLOW_ALL;
-        }
+        let idx = self
+            .process_index(process)
+            .expect("process_enable: unregistered process");
+        self.process_up[idx] = true;
+    }
+
+    /// Whether a process is currently running.
+    #[must_use]
+    pub fn is_process_up(&self, process: ProcessId) -> bool {
+        self.process_index(process)
+            .is_some_and(|idx| self.process_up[idx])
     }
 
     // TODO: implement record/replay_recorded for deterministic replay support.
@@ -653,6 +661,7 @@ impl PacketSimulator {
 
         let Self {
             links,
+            process_up,
             prng,
             options,
             current_tick,
@@ -679,6 +688,14 @@ impl PacketSimulator {
                     let Some(packet) = link.packets.remove_ready(prng, *current_tick) else {
                         break;
                     };
+
+                    // Discarded on arrival rather than by blocking the link, which is
+                    // what lets a crash and a partition stand at once. Target only, as
+                    // in TigerBeetle: a packet sent before the sender died still lands.
+                    if !process_up[to] {
+                        tracing::trace!(to, "packet dropped (target process is down)");
+                        continue;
+                    }
 
                     // Per-command link filter check: drop if command not in filter
                     let command = packet.message.header().command;
@@ -863,6 +880,22 @@ impl PacketSimulator {
     #[must_use]
     pub const fn current_tick(&self) -> u64 {
         self.current_tick
+    }
+
+    /// End fault injection: heal what is broken and stop drawing new faults.
+    ///
+    /// A drain cannot prove convergence while the generator that broke connectivity
+    /// keeps breaking it. Mirrors TigerBeetle's `transition_to_liveness_mode`. Delays
+    /// stay: they slow a drain, they do not prevent it.
+    pub fn heal(&mut self) {
+        self.options.packet_loss_probability = 0.0;
+        self.options.replay_probability = 0.0;
+        self.options.partition_probability = 0.0;
+        self.options.path_clog_probability = 0.0;
+        self.clear_partition();
+        for link in &mut self.links {
+            link.clogged_till = 0;
+        }
     }
 
     /// Clear all partitions, restoring full connectivity.
@@ -1071,6 +1104,125 @@ mod tests {
         // Now it should deliver
         let delivered = sim.step();
         assert_eq!(delivered.len(), 1);
+    }
+
+    /// A partition standing when a process crashes still stands when it restarts.
+    ///
+    /// `process_enable` used to write `ALLOW_ALL` over every link touching the
+    /// restarted process, clearing its share of a partition still reported active.
+    /// Both symmetries, because a blanket re-enable erases either.
+    #[test]
+    fn a_restart_leaves_a_standing_partition_intact() {
+        for symmetry in [PartitionSymmetry::Symmetric, PartitionSymmetry::Asymmetric] {
+            let mut sim = PacketSimulator::new(PacketSimulatorOptions {
+                one_way_delay_min: 1,
+                one_way_delay_mean: 1,
+                partition_probability: 1.0,
+                unpartition_probability: 0.0,
+                partition_stability: 1_000,
+                unpartition_stability: 0,
+                partition_mode: PartitionMode::UniformSize,
+                partition_symmetry: symmetry,
+                node_count: 3,
+                client_count: 0,
+                seed: 0x9A11,
+                ..Default::default()
+            });
+
+            sim.tick();
+            assert!(
+                sim.auto_partition_active,
+                "{symmetry:?}: expected a partition"
+            );
+            let filters_while_partitioned: Vec<LinkFilter> =
+                sim.links.iter().map(|link| link.filter).collect();
+            assert!(
+                filters_while_partitioned.iter().any(EnumSet::is_empty),
+                "{symmetry:?}: the partition blocked no link, so this proves nothing"
+            );
+
+            sim.process_disable(ProcessId::Replica(0));
+            assert!(!sim.is_process_up(ProcessId::Replica(0)));
+            sim.process_enable(ProcessId::Replica(0));
+            assert!(sim.is_process_up(ProcessId::Replica(0)));
+
+            let filters_after_restart: Vec<LinkFilter> =
+                sim.links.iter().map(|link| link.filter).collect();
+            assert_eq!(
+                filters_after_restart, filters_while_partitioned,
+                "{symmetry:?}: restarting a replica changed the partition's link state"
+            );
+            assert!(
+                sim.auto_partition_active,
+                "{symmetry:?}: the partition must still be active after the restart"
+            );
+        }
+    }
+
+    /// A hand-set per-command filter survives a crash and restart.
+    ///
+    /// A restart restoring it turns a scenario test's targeted fault into no fault at
+    /// all, with the test still green.
+    #[test]
+    fn a_restart_leaves_a_manual_command_filter_intact() {
+        let mut sim = PacketSimulator::new(PacketSimulatorOptions {
+            one_way_delay_min: 1,
+            one_way_delay_mean: 1,
+            node_count: 2,
+            client_count: 0,
+            seed: 0x9A12,
+            ..Default::default()
+        });
+
+        let from = ProcessId::Replica(0);
+        let to = ProcessId::Replica(1);
+        let filter = ALLOW_ALL - Command::Prepare;
+        *sim.link_filter(from, to) = filter;
+
+        sim.process_disable(to);
+        sim.process_enable(to);
+
+        assert_eq!(
+            *sim.link_filter(from, to),
+            filter,
+            "the restart restored a command the filter was dropping"
+        );
+    }
+
+    /// Packets addressed to a crashed process are dropped on arrival; the process
+    /// receives again the moment it is back. What the availability layer owes now that
+    /// link filters no longer carry it.
+    #[test]
+    fn a_down_process_receives_nothing_and_recovers_on_restart() {
+        let mut sim = PacketSimulator::new(PacketSimulatorOptions {
+            one_way_delay_min: 1,
+            one_way_delay_mean: 1,
+            node_count: 2,
+            client_count: 0,
+            seed: 0x9A13,
+            ..Default::default()
+        });
+
+        let from = ProcessId::Replica(0);
+        let to = ProcessId::Replica(1);
+
+        // Exponential delays, so drain over a window rather than a single tick.
+        let drain = |sim: &mut PacketSimulator| {
+            let mut delivered = 0;
+            for _ in 0..50 {
+                sim.tick();
+                delivered += sim.step().len();
+            }
+            delivered
+        };
+
+        sim.process_disable(to);
+        sim.submit(from, to, create_test_message_with_command(Command::Prepare));
+        assert_eq!(drain(&mut sim), 0, "a crashed replica must receive nothing");
+
+        sim.process_enable(to);
+        sim.submit(from, to, create_test_message_with_command(Command::Prepare));
+        assert_eq!(drain(&mut sim), 1, "a restarted replica must receive again");
     }
 
     #[test]

@@ -20,10 +20,13 @@ use crate::deps::SimSuperblock;
 use crate::deps::{MemStorage, SimJournal, SimMuxStateMachine, SimSnapshot};
 use configs::server::PersonalAccessTokenConfig;
 use configs::server::ServerSystemConfig;
-use consensus::{ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
+use consensus::{ClientTable, ConsensusClock, LocalPipeline, Sequencer, VsrConsensus, VsrState};
 use iggy_common::IggyByteSize;
 use iggy_common::variadic;
+use journal::Journal;
+use metadata::impls::metadata::IggySnapshot;
 use metadata::stm::mux::WithFactory;
+use metadata::stm::snapshot::RestoreSnapshot;
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use metadata::{IggyMetadata, apply_committed_prepare};
@@ -81,6 +84,30 @@ pub type SimMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
 /// unless a test injects one on purpose. Tests assert the frame-drop
 /// metrics stay zero.
 pub const SIM_INBOX_CAPACITY: usize = 8192;
+
+/// Read this replica's persisted metadata checkpoint and its trailer checksum.
+///
+/// A file that exists but does not load panics rather than reading as `None`:
+/// production refuses boot on a torn snapshot, and booting empty instead would turn
+/// a storage fault into the silent state loss this path exists to prevent.
+///
+/// # Panics
+/// If `snapshot.bin` exists but cannot be read or decoded.
+fn load_local_checkpoint(data_dir: &std::path::Path) -> Option<(IggySnapshot, u128)> {
+    let path = data_dir
+        .join(metadata::impls::METADATA_DIR)
+        .join(metadata::impls::SNAPSHOT_FILE_NAME);
+    if !path.exists() {
+        return None;
+    }
+    let loaded = IggySnapshot::load(&path).unwrap_or_else(|error| {
+        panic!(
+            "metadata checkpoint at {} exists but does not load: {error}",
+            path.display(),
+        )
+    });
+    Some(loaded)
+}
 
 /// Build one shard of a sim replica around the real inter-shard mesh.
 ///
@@ -147,6 +174,20 @@ pub fn new_shard(
     let restored_op = metadata_journal
         .as_ref()
         .and_then(|journal| journal.last_op());
+    // Read before the state machine is built: it REPLACES the seeded default rather
+    // than layering onto it, so without it a checkpointed replica recovers an empty
+    // baseline and loses every op the drain reclaimed.
+    let local_checkpoint = data_dir
+        .as_deref()
+        .filter(|_| shard_idx == 0)
+        .and_then(load_local_checkpoint);
+    let has_checkpoint = local_checkpoint.is_some();
+    // Off by one from the journal's watermark, deliberately: a checkpoint at op N
+    // drains `0..=N - 1` and retains N's header for view-change merging, so replaying
+    // from the journal floor would re-apply N on top of a snapshot that has it.
+    let checkpoint_seq = local_checkpoint
+        .as_ref()
+        .map_or(0, |(snapshot, _)| snapshot.snapshot().sequence_number);
 
     let mux = reader_bundle.map_or_else(
         // Writer shard (shard 0). Seed the root user at slab id 0, matching
@@ -161,6 +202,12 @@ pub fn new_shard(
         // after `IggyMetadata` is built (see below), so the factory bundle is minted
         // only then.
         || {
+            // Seeding on top of a restored checkpoint would mint a second root user
+            // and shift every workload entity's slab id.
+            if let Some((snapshot, _)) = local_checkpoint.as_ref() {
+                return SimMuxStateMachine::restore_snapshot(snapshot.snapshot())
+                    .expect("the local checkpoint decodes into the metadata state machine");
+            }
             let users: Users = UsersInner::new().into();
             let root_password_hash = if shell {
                 crypto::hash_with_fixed_salt(SHELL_ROOT_PASSWORD)
@@ -220,14 +267,14 @@ pub fn new_shard(
         // of an uncommitted suffix is skipped, since a rejoining replica is always a
         // backup.
         let restored_head = restored_op.unwrap_or(0);
-        if !solo && (restored_head > 0 || recovered_state.is_some()) {
+        if !solo && (restored_head > 0 || recovered_state.is_some() || has_checkpoint) {
             consensus.init_as_backup();
             consensus.begin_view_probe();
         } else {
             consensus.init();
         }
         if let (Some(journal), Some(head)) = (metadata_journal.as_ref(), restored_op) {
-            let commit_watermark = journal.recovery_commit_watermark(solo);
+            let commit_watermark = journal.recovery_commit_watermark(solo).max(checkpoint_seq);
             consensus.sequencer().set_sequence(head);
             consensus.restore_commit_state(commit_watermark, commit_watermark);
             if let Some(header) = last_header {
@@ -256,6 +303,22 @@ pub fn new_shard(
         data_dir,
     );
 
+    // Both halves are load-bearing: the pairing keeps a later view-change superblock
+    // write from regressing to `(0, 0)`, and the folded table is the floor the replayed
+    // suffix advances, so a session below the drained prefix keeps its watermark.
+    if let Some((snapshot, checksum)) = local_checkpoint.as_ref() {
+        metadata.seed_checkpoint_ref(snapshot.snapshot().sequence_number, *checksum);
+        if let Some(table) = snapshot.snapshot().client_table.clone() {
+            let capacity = metadata.client_table_capacity();
+            let restored = ClientTable::from_snapshot(table, capacity)
+                .expect("the local checkpoint's client table decodes");
+            assert!(
+                metadata.install_client_table(restored),
+                "a freshly built plane holds no sessions, so this must install"
+            );
+        }
+    }
+
     // Reconstruct shard 0's committed metadata from the retained WAL, the sim analog
     // of production's snapshot + WAL replay. `apply_committed_prepare` is the SAME
     // apply path the commit walk uses, so it rebuilds BOTH the state machine and the
@@ -264,19 +327,31 @@ pub fn new_shard(
     // watermark; this only rebuilds derived state, and does nothing on a fresh boot.
     // The commit notifier is unwired during recovery, hence the no-op hook.
     if let Some(journal) = metadata.journal.as_ref() {
-        let commit_watermark = journal.recovery_commit_watermark(solo);
-        for op in 1..=commit_watermark {
-            if let Some(entry) = journal.entry_sync(op) {
-                // `true`: the sim performs no state transfer, so no frontier
-                // shields any op from the table half of the apply.
-                apply_committed_prepare(
-                    &metadata.mux_stm,
-                    &metadata.client_table,
-                    true,
-                    |_| {},
-                    entry,
+        let floor = journal.snapshot_op().max(checkpoint_seq);
+        let commit_watermark = journal.recovery_commit_watermark(solo).max(checkpoint_seq);
+        for op in (floor + 1)..=commit_watermark {
+            let Some(entry) = journal.entry_sync(op) else {
+                // Applying across a hole would replay effects onto a state machine
+                // that never saw the missing op; the suffix is left for VSR repair.
+                tracing::warn!(
+                    replica_id,
+                    op,
+                    floor,
+                    commit_watermark,
+                    "metadata WAL has no entry at this committed op; stopping replay"
                 );
-            }
+                break;
+            };
+            // `true`: the frontier is volatile, so a rebuilt plane starts at zero and
+            // every op above the floor must mutate the table. A frontier only fences a
+            // LIVE table a state transfer just replaced.
+            apply_committed_prepare(
+                &metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                |_| {},
+                entry,
+            );
         }
     }
     // Mint the peers' read-side bundle AFTER reconstruction so it reflects the

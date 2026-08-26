@@ -338,7 +338,10 @@ impl<M> SnapshotCoordinator<M> {
     /// forced. Must stay >= the prepare-queue depth: the ops already
     /// pipelined while a checkpoint runs skip it and append into this
     /// margin.
-    const CHECKPOINT_MARGIN: usize = 64;
+    ///
+    /// Public so a caller sizing a journal can refuse a slot count at or below it:
+    /// such a journal checkpoints on every commit rather than on occupancy.
+    pub const CHECKPOINT_MARGIN: usize = 64;
 
     #[must_use]
     pub fn new(

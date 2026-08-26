@@ -441,17 +441,29 @@ impl SimJournal<MemStorage> {
     /// `commit` any journaled prepare stamped, a lower bound, since a prepare
     /// records the primary's commit point at send time, so the true point may be one
     /// op higher and re-commits on rejoin.
+    ///
+    /// Floored at the snapshot watermark and clamped at the first gap above it, as
+    /// `metadata::recover` folds from `snapshot_floor` and stops at `chain_break_op`.
+    /// The fold only sees surviving headers, so a backup missing one prepare would
+    /// otherwise claim a commit point ABOVE the hole, telling the cluster there is
+    /// nothing to repair.
     #[must_use]
     pub fn recovery_commit_watermark(&self, solo: bool) -> u64 {
-        if solo {
-            return self.last_op.get().unwrap_or(0);
-        }
+        let floor = self.snapshot_op.get();
         let headers = unsafe { &*self.headers.get() };
-        headers
-            .values()
-            .map(|header| header.commit)
-            .max()
-            .unwrap_or(0)
+        let claimed = if solo {
+            self.last_op.get().unwrap_or(0).max(floor)
+        } else {
+            headers
+                .values()
+                .map(|header| header.commit)
+                .fold(floor, u64::max)
+        };
+        let mut watermark = floor;
+        while watermark < claimed && headers.contains_key(&(watermark + 1)) {
+            watermark += 1;
+        }
+        watermark
     }
 
     /// The head prepare's header, `None` when empty. Restores the last-prepare
