@@ -97,14 +97,17 @@ impl IggyIndexWriter {
         })
     }
 
-    /// Appends encoded sparse index bytes to the backing file.
+    /// Appends encoded sparse index bytes at the current write cursor and
+    /// returns how many bytes landed. The cursor is left where it was: the
+    /// caller advances it with `advance` once the companion segment save has
+    /// also succeeded.
     ///
     /// # Errors
     ///
     /// Returns an error if the index bytes cannot be written or synced to disk.
-    pub async fn save_indexes(&self, indexes: Vec<u8>) -> Result<(), IggyError> {
+    pub async fn save_indexes(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
         if indexes.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let len = indexes.len();
@@ -120,12 +123,6 @@ impl IggyIndexWriter {
             self.fsync().await?;
         }
 
-        // Advance the write cursor last: if the write or fsync fails, the
-        // counter must stay put so the retry overwrites the same slot instead
-        // of appending a duplicate entry that boot recovery would refuse.
-        self.index_size_bytes
-            .fetch_add(len as u64, Ordering::Release);
-
         trace!(
             target: "iggy.partitions.storage",
             file = self.file_path.as_str(),
@@ -133,7 +130,14 @@ impl IggyIndexWriter {
             position,
             "saved sparse index bytes to file"
         );
-        Ok(())
+        Ok(len as u64)
+    }
+
+    /// Move the write cursor forward over `bytes` that are now durable. Split
+    /// out of the save so the index and segment cursors advance together, only
+    /// once both halves have succeeded.
+    pub(crate) fn advance(&self, bytes: u64) {
+        self.index_size_bytes.fetch_add(bytes, Ordering::Release);
     }
 
     /// Flushes buffered index file contents to disk.

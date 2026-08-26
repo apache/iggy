@@ -3090,9 +3090,9 @@ where
 
             // Persist BEFORE eviction so a write failure leaves the rest of the
             // committed prefix resident for retry. The persist is idempotent on
-            // failure: a batch write that lands but whose index save then fails
-            // rewinds the segment write cursor, so the retry overwrites those
-            // bytes instead of appending a duplicate. Chunks already durable
+            // failure: it advances its write cursors only once both the batch
+            // and the index are durable, so the retry overwrites the same
+            // positions instead of appending a duplicate. Chunks already durable
             // are evicted before the error propagates, so the retry cannot
             // re-read them (and re-write them past a rotation).
             if let Err(error) = self
@@ -3711,37 +3711,40 @@ where
         let messages_writer = messages_writer.expect("checked above");
         let index_writer = index_writer.expect("checked above");
 
-        let saved = messages_writer
-            .save_frozen_batches(&stripped_batches)
-            .await
-            .map_err(|error| {
+        // Both writes are in flight before either completes, so under
+        // `enforce_fsync` the two fdatasync round trips overlap instead of
+        // serializing. `join` never cancels a half, so no write is dropped
+        // mid-flight when the other one fails.
+        let (log_result, index_result) = futures::future::join(
+            messages_writer.save_frozen_batches(&stripped_batches),
+            index_writer.save_indexes(index_bytes),
+        )
+        .await;
+
+        let (saved, saved_index_bytes) = match (log_result, index_result) {
+            (Ok(saved), Ok(saved_index_bytes)) => (saved, saved_index_bytes),
+            (Err(error), _) | (Ok(_), Err(error)) => {
                 warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
                     namespace_raw = self.namespace().inner(),
                     batch_count,
                     %error,
-                    "failed to save frozen batches"
+                    "failed to persist frozen batches"
                 );
-                error
-            })?;
+                return Err(error);
+            }
+        };
 
-        if let Err(error) = index_writer.save_indexes(index_bytes).await {
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                namespace_raw = self.namespace().inner(),
-                batch_count,
-                %error,
-                "failed to save sparse indexes; rewinding segment write cursor"
-            );
-            // The batch bytes landed but the index did not, so the whole persist
-            // fails and the committed prefix stays resident for retry. Rewind the
-            // writer cursor by exactly what this call advanced so the retry
-            // overwrites those bytes instead of appending a duplicate copy.
-            messages_writer.rewind(saved.as_bytes_u64());
-            return Err(error);
-        }
+        // Advance both cursors only here, back to back with no await between.
+        // They are the writers' next-write positions: a half whose save failed
+        // must keep its cursor so the retry overwrites the same slot instead of
+        // appending a duplicate index entry or leaving a hole in the segment.
+        // Moving them together keeps the pair describing one durable prefix,
+        // which is what a re-opened writer asserts against the length of the
+        // file it finds.
+        messages_writer.advance(saved.as_bytes_u64());
+        index_writer.advance(saved_index_bytes);
 
         debug!(
             target: "iggy.partitions.diag",
@@ -5086,6 +5089,8 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
+    use crate::iggy_index_reader::IggyIndexReader;
     use crate::poll_plan::{DiskReadOutcome, SealedSegmentHandle};
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
@@ -7342,6 +7347,264 @@ mod tests {
     #[test]
     fn given_unframed_operation_when_committed_should_reply_empty_body() {
         assert!(committed_reply_body(Operation::DeleteSegments).is_empty());
+    }
+
+    /// Every write to this device fails with `ENOSPC`, which is how the
+    /// persist failure cases below inject a fault into one half of the flush
+    /// without any production-side plumbing.
+    #[cfg(target_os = "linux")]
+    const DEV_FULL: &str = "/dev/full";
+
+    const FIRST_PAYLOAD: &[u8] = b"first-chunk";
+    const SECOND_PAYLOAD: &[u8] = b"second-chunk-is-longer";
+
+    /// Partition whose active segment carries real writers over the given
+    /// paths, both with fsync on. Point either path at [`DEV_FULL`] to make
+    /// that half's save fail.
+    struct PersistFixture {
+        partition: IggyPartition<IggyMessageBus>,
+        log_cursor: Rc<AtomicU64>,
+        index_cursor: Rc<AtomicU64>,
+    }
+
+    impl PersistFixture {
+        async fn new(log_path: &str, index_path: &str) -> Self {
+            let log_cursor = Rc::new(AtomicU64::new(0));
+            let index_cursor = Rc::new(AtomicU64::new(0));
+            let messages_writer =
+                MessagesWriter::new(log_path, log_cursor.clone(), true, false, None)
+                    .await
+                    .expect("open segment log writer");
+            let index_writer = IggyIndexWriter::new(index_path, index_cursor.clone(), true, false)
+                .await
+                .expect("open segment index writer");
+
+            let mut partition = test_partition();
+            partition.log.add_persisted_segment(
+                Segment::new(0, IggyByteSize::from(1024 * 1024_u64)),
+                SegmentStorage::default(),
+                Some(Rc::new(messages_writer)),
+                Some(Rc::new(index_writer)),
+            );
+
+            Self {
+                partition,
+                log_cursor,
+                index_cursor,
+            }
+        }
+
+        /// Mirrors one `commit_messages` chunk: the sparse entry addresses the
+        /// byte the batch is about to land on, taken from the segment size the
+        /// way production takes it, so a second persist can only index
+        /// correctly if the first one advanced the segment in step with the
+        /// writer's cursor.
+        async fn persist(&mut self, payload: &[u8], offset: u64) -> Result<(), IggyError> {
+            let index = IggyIndex::new(offset, offset + 1, self.segment_size());
+            self.partition
+                .persist_frozen_batches_to_disk(
+                    vec![prepare_framed(payload)],
+                    IggyIndexCache::serialize(&index),
+                    1,
+                )
+                .await
+        }
+
+        fn cursors(&self) -> (u64, u64) {
+            (
+                self.log_cursor.load(Ordering::Relaxed),
+                self.index_cursor.load(Ordering::Relaxed),
+            )
+        }
+
+        fn segment_size(&self) -> u64 {
+            self.partition.log.active_segment().size.as_bytes_u64()
+        }
+    }
+
+    /// Journaled entry in the shape the persist path expects: a `PrepareHeader`
+    /// prefix it strips, followed by the bytes that reach the segment file.
+    fn prepare_framed(payload: &[u8]) -> Frozen<4096> {
+        let mut bytes = vec![0u8; size_of::<PrepareHeader>()];
+        bytes.extend_from_slice(payload);
+        Owned::<4096>::copy_from_slice(&bytes).into()
+    }
+
+    fn file_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).expect("stat file").len()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_index_save_failure_when_persisting_should_leave_both_cursors_and_segment_size_untouched()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let mut fixture =
+            PersistFixture::new(log_path.to_str().expect("utf-8 path"), DEV_FULL).await;
+
+        let result = fixture.persist(FIRST_PAYLOAD, 0).await;
+
+        assert!(
+            matches!(result, Err(IggyError::CannotSaveIndexToSegment)),
+            "index save over {DEV_FULL} must fail, got {result:?}"
+        );
+        assert_eq!(
+            file_len(&log_path),
+            FIRST_PAYLOAD.len() as u64,
+            "the segment bytes landed; only the cursor is withheld"
+        );
+        assert_eq!(
+            fixture.cursors(),
+            (0, 0),
+            "neither cursor may advance when the index half failed"
+        );
+        assert_eq!(fixture.segment_size(), 0, "segment size must not advance");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_log_save_failure_when_persisting_should_leave_both_cursors_and_segment_size_untouched()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let index_path = dir.path().join("segment.index");
+        let mut fixture =
+            PersistFixture::new(DEV_FULL, index_path.to_str().expect("utf-8 path")).await;
+
+        let result = fixture.persist(FIRST_PAYLOAD, 0).await;
+
+        assert!(
+            matches!(result, Err(IggyError::CannotWriteToFile)),
+            "segment save over {DEV_FULL} must fail, got {result:?}"
+        );
+        assert_eq!(
+            file_len(&index_path),
+            IGGY_INDEX_SIZE as u64,
+            "the index entry landed; only the cursor is withheld"
+        );
+        assert_eq!(
+            fixture.cursors(),
+            (0, 0),
+            "neither cursor may advance when the segment half failed"
+        );
+        assert_eq!(fixture.segment_size(), 0, "segment size must not advance");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_both_saves_failing_when_persisting_should_leave_both_cursors_untouched() {
+        let mut fixture = PersistFixture::new(DEV_FULL, DEV_FULL).await;
+
+        let result = fixture.persist(FIRST_PAYLOAD, 0).await;
+
+        assert!(
+            matches!(result, Err(IggyError::CannotWriteToFile)),
+            "a failed segment save must win over the index error, got {result:?}"
+        );
+        assert_eq!(fixture.cursors(), (0, 0), "no cursor may advance");
+        assert_eq!(fixture.segment_size(), 0, "segment size must not advance");
+    }
+
+    /// The two saves run concurrently, so each must read its own cursor
+    /// without observing the other's advance: the second chunk lands exactly
+    /// where the first one ended, and its index entry says so.
+    #[compio::test]
+    async fn given_two_successful_persists_when_reading_back_should_place_second_chunk_at_first_chunk_end()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let index_path = dir.path().join("segment.index");
+        let mut fixture = PersistFixture::new(
+            log_path.to_str().expect("utf-8 path"),
+            index_path.to_str().expect("utf-8 path"),
+        )
+        .await;
+
+        fixture
+            .persist(FIRST_PAYLOAD, 0)
+            .await
+            .expect("first persist");
+        fixture
+            .persist(SECOND_PAYLOAD, 7)
+            .await
+            .expect("second persist");
+
+        let log_bytes = (FIRST_PAYLOAD.len() + SECOND_PAYLOAD.len()) as u64;
+        let index_bytes = 2 * IGGY_INDEX_SIZE as u64;
+        assert_eq!(
+            fixture.cursors(),
+            (log_bytes, index_bytes),
+            "both cursors must cover both persists"
+        );
+        assert_eq!(file_len(&log_path), log_bytes, "segment file length");
+        assert_eq!(file_len(&index_path), index_bytes, "index file length");
+        assert_eq!(fixture.segment_size(), log_bytes, "segment size");
+
+        let reader = IggyIndexReader::new(index_path.to_str().expect("utf-8 path"))
+            .await
+            .expect("open index reader");
+        let last = reader
+            .load_last()
+            .await
+            .expect("read last index entry")
+            .expect("index entry present");
+        assert_eq!(
+            last,
+            IggyIndex::new(7, 8, FIRST_PAYLOAD.len() as u64),
+            "the second entry must address the first chunk's end"
+        );
+    }
+
+    /// A half that failed never advanced its cursor, so the retry rewrites
+    /// the same positions: one copy of the batch, one index entry.
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_failed_persist_when_retried_with_a_healthy_writer_should_overwrite_the_same_positions()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let index_path = dir.path().join("segment.index");
+        let mut fixture =
+            PersistFixture::new(log_path.to_str().expect("utf-8 path"), DEV_FULL).await;
+
+        assert!(
+            fixture.persist(FIRST_PAYLOAD, 0).await.is_err(),
+            "index save over {DEV_FULL} must fail"
+        );
+
+        // The committed prefix stays resident, so the retry re-persists the
+        // identical bytes; only the broken index writer is swapped out.
+        let index_writer = IggyIndexWriter::new(
+            index_path.to_str().expect("utf-8 path"),
+            fixture.index_cursor.clone(),
+            true,
+            false,
+        )
+        .await
+        .expect("open replacement index writer");
+        let active = fixture.partition.log.index_writers().len() - 1;
+        fixture.partition.log.index_writers_mut()[active] = Some(Rc::new(index_writer));
+
+        fixture
+            .persist(FIRST_PAYLOAD, 0)
+            .await
+            .expect("retry persist");
+
+        assert_eq!(
+            file_len(&log_path),
+            FIRST_PAYLOAD.len() as u64,
+            "the retry must overwrite the batch, not append a second copy"
+        );
+        assert_eq!(
+            file_len(&index_path),
+            IGGY_INDEX_SIZE as u64,
+            "the retry must write exactly one index entry"
+        );
+        assert_eq!(
+            fixture.cursors(),
+            (FIRST_PAYLOAD.len() as u64, IGGY_INDEX_SIZE as u64),
+            "both cursors must advance once the retry succeeded"
+        );
     }
 }
 

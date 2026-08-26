@@ -284,9 +284,14 @@ pub enum ServerError {
 /// causes, and not all of them are at-rest corruption: an empty non-tail
 /// segment is a failed rebuild's orphan pairing, a hole is a stray or
 /// half-unlinked file, interior damage is bit rot (or a resurrected tail
-/// appended over), a divergent index is a mis-strided or foreign write, and
-/// offsets that do not continue the chain can be minted into byte-clean files
-/// by an upstream crash window as well as by damage.
+/// appended over), and offsets that do not continue the chain can be minted
+/// into byte-clean files by an upstream crash window as well as by damage.
+///
+/// An index the log cannot back, or that contradicts itself, is deliberately
+/// NOT here: entries are derived from the log, so recovery floors the index
+/// to the last entry the log proves and rebuilds it from the log when none
+/// does or when the entries are out of order. The index is never evidence
+/// about the log; only the log is.
 #[derive(Debug)]
 pub enum PartitionRecoveryRefusal {
     /// `recoverable_bytes` on the two chain-shape refusals is the sum of
@@ -305,16 +310,6 @@ pub enum PartitionRecoveryRefusal {
         next_start: u64,
         recoverable_bytes: u64,
     },
-    /// The index holds entries but no whole batch decodes AND verifies where
-    /// its last entry points, so index and log describe different files. The
-    /// damage probe ran first: anything verifying past the anchor's damage
-    /// refuses as [`Self::InteriorDamage`] instead.
-    IndexLogDivergence {
-        start_offset: u64,
-        end_offset: u64,
-        messages_size_bytes: u64,
-        indexed_size_bytes: u64,
-    },
     /// A complete, checksum-verifying batch survives PAST bytes that do not
     /// decode. A torn tail has nothing after it, so this is interior damage,
     /// and truncating at it would silently discard the surviving batches.
@@ -330,9 +325,12 @@ pub enum PartitionRecoveryRefusal {
     /// were re-examined -- a probe defect); the verification budget bounds
     /// the bytes handed to checksum verifies, whose claimed slices overlap,
     /// so residue packed with plausible headers can exhaust it from an
-    /// on-disk shape. Truncation is only ever sound for a proven torn tail,
-    /// so giving up keeps the bytes. The residue width is diagnostic only;
-    /// it is not a gate.
+    /// on-disk shape. The index anchor search charges the same verification
+    /// budget as it steps back through entries the log cannot back, so an
+    /// index packed with claims the log never proves ends here too instead
+    /// of paying a verify per entry. Truncation is only ever sound for a
+    /// proven torn tail, so giving up keeps the bytes. The residue width is
+    /// diagnostic only; it is not a gate.
     UnverifiedResidue {
         start_offset: u64,
         damage_position: u64,
@@ -364,14 +362,6 @@ pub enum PartitionRecoveryRefusal {
         start_offset: u64,
         batch_partition_id: u64,
         position: u64,
-    },
-    /// Index entries must ascend in offset and position (they are appended,
-    /// one per flushed chunk, over a growing log); a regression means the
-    /// file was written mis-strided or over foreign bytes.
-    IndexEntriesNotMonotone { start_offset: u64, entry_index: u64 },
-    IndexEntryBeforeSegmentStart {
-        start_offset: u64,
-        first_entry_offset: u64,
     },
     /// A writer reopening over recovered bounds found the on-disk length
     /// diverging from the size recovery just validated and truncated to.
@@ -407,18 +397,6 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 "segment {previous_start} ends at offset {previous_end} but the next \
                  starts at {next_start}, leaving a hole in a chain holding \
                  {recoverable_bytes} recoverable bytes"
-            ),
-            Self::IndexLogDivergence {
-                start_offset,
-                end_offset,
-                messages_size_bytes,
-                indexed_size_bytes,
-            } => write!(
-                f,
-                "segment {start_offset} has message/index divergence: the index ends \
-                 at offset {end_offset}, byte {indexed_size_bytes}, where the \
-                 {messages_size_bytes}-byte log holds no batch that decodes and \
-                 verifies"
             ),
             Self::InteriorDamage {
                 start_offset,
@@ -468,22 +446,6 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 "segment {start_offset} holds a verified batch at byte {position} \
                  stamped for partition {batch_partition_id}; a foreign record in \
                  this log is preserved as evidence, not truncated"
-            ),
-            Self::IndexEntriesNotMonotone {
-                start_offset,
-                entry_index,
-            } => write!(
-                f,
-                "segment {start_offset} index entry {entry_index} regresses in \
-                 offset or position; the index was not appended over this log"
-            ),
-            Self::IndexEntryBeforeSegmentStart {
-                start_offset,
-                first_entry_offset,
-            } => write!(
-                f,
-                "segment {start_offset} index claims offset {first_entry_offset}, \
-                 below the segment's own start"
             ),
             Self::StorageSizeMismatch {
                 start_offset,

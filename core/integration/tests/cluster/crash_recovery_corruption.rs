@@ -58,6 +58,27 @@ const GARBAGE_BYTE: u8 = 0xA5;
 /// the file provably lands ahead of many complete committed entries.
 const WAL_FODDER_STREAMS: usize = 20;
 
+/// Sparse index entry layout, mirrored from `partitions::iggy_index::IggyIndex`
+/// (which the `integration` crate does not depend on): three little-endian
+/// u64s, `offset`, `timestamp`, `position`.
+const INDEX_ENTRY_SIZE: usize = 3 * size_of::<u64>();
+const INDEX_ENTRY_POSITION_AT: usize = 2 * size_of::<u64>();
+
+/// Batches produced before the index-ahead-of-log surgery. High enough that
+/// the damaged node's index holds several flush chunks at either role's
+/// cadence (a primary flushes per op, a backup per committed range).
+const INDEX_AHEAD_BATCHES: u32 = 30;
+/// Flush chunks the damaged node's index must hold for the surgery to leave
+/// BOTH a surviving prefix and entries pointing past the truncated log end.
+const MIN_INDEX_ENTRIES: usize = 4;
+/// Infix of the directory the refusal path renames a partition's segment files
+/// into (`partitions::state_transfer::quarantine_segment_files`).
+const FENCED_DIR_MARKER: &str = ".fenced.";
+/// Boot log line recovery emits when it floors an index the log cannot fully
+/// back (`server::segment_recovery::recover_segment_bounds`): the positive
+/// evidence the floor ran, as opposed to a rebuild or a refusal.
+const INDEX_FLOOR_MARKER: &str = "flooring it to the entries the log proves";
+
 async fn create_stream_and_topic(client: &IggyClient) {
     client
         .create_stream(STREAM_NAME)
@@ -285,6 +306,64 @@ fn append_garbage(path: &Path, count: usize) {
     fs::write(path, bytes).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
 }
 
+/// Cut `path` down to exactly `length` bytes. The owning process is already
+/// dead, so nothing can be holding the file open against the truncation.
+fn truncate_to(path: &Path, length: u64) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_len(length))
+        .unwrap_or_else(|error| panic!("truncate {} to {length}: {error}", path.display()));
+}
+
+/// The `position` of every whole entry in a segment `.index`, in file order.
+///
+/// One entry is written per flushed chunk and points at that chunk's FIRST
+/// batch, so every position is both an absolute byte offset into the paired
+/// `.log` and a batch boundary in it.
+fn index_positions(path: &Path) -> Vec<u64> {
+    let bytes = fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    bytes
+        .as_chunks::<INDEX_ENTRY_SIZE>()
+        .0
+        .iter()
+        .map(|entry| {
+            let mut position = [0u8; size_of::<u64>()];
+            position.copy_from_slice(&entry[INDEX_ENTRY_POSITION_AT..]);
+            u64::from_le_bytes(position)
+        })
+        .collect()
+}
+
+/// Payloads from `expected` whose bytes appear anywhere in `haystack`. The
+/// payloads are fixed-width, so none is a prefix of another and a plain
+/// substring search cannot cross-match them.
+fn payloads_within(haystack: &[u8], expected: &[String]) -> Vec<String> {
+    expected
+        .iter()
+        .filter(|payload| {
+            haystack
+                .windows(payload.len())
+                .any(|window| window == payload.as_bytes())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Segment files a boot refusal renamed aside on this node. Once written the
+/// fenced directory stays, so an empty result is a stable verdict rather than
+/// a snapshot that catch-up could invalidate.
+fn fenced_segment_paths(data_path: &Path) -> Vec<PathBuf> {
+    let mut fenced = Vec::new();
+    let _ = disk::walk(data_path, &mut |path| {
+        if path.to_string_lossy().contains(FENCED_DIR_MARKER) {
+            fenced.push(path.to_path_buf());
+        }
+        false
+    });
+    fenced
+}
+
 /// Flip one interior byte at `numerator/denominator` of the file's length.
 fn flip_interior_byte(path: &Path, numerator: u64, denominator: u64) {
     let mut bytes =
@@ -484,6 +563,174 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
         .unwrap_or_else(|state| {
             panic!("every acked offset must poll back after the torn-index recovery: {state}")
         });
+}
+
+/// A crash can leave a node's segment `.log` shorter than its already durable
+/// `.index` claims: the two files are persisted concurrently, so death between
+/// them lands the index ahead even under `enforce_fsync`, where both were
+/// durable at ack time. The index is a rebuildable local artifact and the log
+/// is the authority, so recovery must floor the index to the last entry the
+/// log still proves and keep serving the batches behind it - not refuse the
+/// chain, which fences every surviving byte aside on a cluster and tombstones
+/// the partition outright on a single replica. The spec pins the whole
+/// outcome: the node boots without a refusal, nothing is fenced, its index no
+/// longer points past its log, catch-up refills the truncated tail, every
+/// acked offset reads back, and the replicas end byte-identical.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_should_floor_the_index_and_serve_the_surviving_prefix(
+    harness: &mut TestHarness,
+) {
+    let client = harness.tcp_root_client().await.unwrap();
+    create_stream_and_topic(&client).await;
+    let acked = produce_acked(&client, "index-ahead", INDEX_AHEAD_BATCHES).await;
+    let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
+    for node in 0..harness.cluster_size() {
+        wait_until_node_holds_payloads(
+            harness,
+            node,
+            &payloads,
+            FLUSH_INSTALL_TIMEOUT,
+            "eager flush before the surgery",
+        )
+        .await;
+    }
+
+    drop(client);
+
+    // The leader keeps quorum and serving throughout, so the damaged node
+    // always has a peer to catch up from. SIGKILL rather than a graceful stop:
+    // the shape under test is a crash, and no shutdown hook may run to
+    // reconcile the two files first.
+    let (_, backup) = pick_backup(harness).await;
+    harness.kill_node(backup).expect("SIGKILL the backup");
+
+    let backup_data = harness.node(backup).data_path();
+    let log_path = find_active_segment_file(&backup_data, "log");
+    // Paired by stem, not by a second `find_active_segment_file` sweep, so the
+    // index provably describes the log being cut.
+    let index_path = log_path.with_extension("index");
+    let positions = index_positions(&index_path);
+    assert!(
+        positions.len() >= MIN_INDEX_ENTRIES,
+        "the backup's index holds only {} flush chunk(s), fewer than the {MIN_INDEX_ENTRIES} \
+         the surgery needs to leave both a surviving prefix and entries past the log end",
+        positions.len()
+    );
+    let log_size = fs::metadata(&log_path)
+        .map(|meta| meta.len())
+        .unwrap_or_else(|error| panic!("stat {}: {error}", log_path.display()));
+    // Cutting at the midpoint entry's position lands the log end exactly on a
+    // batch boundary, keeps whole batches behind it, and leaves every entry
+    // from the midpoint on pointing at or past the end of the file - what a
+    // crash between the log write and the index write produces.
+    let cut_at = positions[positions.len() / 2];
+    assert!(
+        cut_at > 0 && cut_at < log_size,
+        "the midpoint entry's position {cut_at} must sit inside the {log_size}-byte log"
+    );
+    truncate_to(&log_path, cut_at);
+    let truncated =
+        fs::read(&log_path).unwrap_or_else(|error| panic!("read {}: {error}", log_path.display()));
+    let surviving = payloads_within(&truncated, &payloads);
+    assert!(
+        !surviving.is_empty() && surviving.len() < payloads.len(),
+        "the surgery must keep a real prefix and remove a real tail; {} of {} payloads \
+         survived the cut at byte {cut_at}",
+        surviving.len(),
+        payloads.len()
+    );
+
+    harness.restart_node(backup).unwrap_or_else(|error| {
+        panic!(
+            "an index ahead of its log is what a crash between the two writes leaves; \
+             boot must floor the index instead of failing: {error}"
+        )
+    });
+
+    // Stat the index BEFORE the log, both right after boot: catch-up grows
+    // the two files together, so a log still at the cut proves the index was
+    // read before any append landed, and the floor is then the only shape it
+    // may have. Once the log has grown the refilled tail re-mints the very
+    // entries the floor dropped, and nothing on disk tells the two apart; the
+    // boot log marker below is the evidence that survives that.
+    let recovered_index_len = fs::metadata(&index_path)
+        .map(|meta| meta.len())
+        .unwrap_or_else(|error| panic!("stat {}: {error}", index_path.display()));
+    let recovered_log_len = fs::metadata(&log_path)
+        .map(|meta| meta.len())
+        .unwrap_or_else(|error| panic!("stat {}: {error}", log_path.display()));
+    if recovered_log_len == cut_at {
+        let floored_entries = positions
+            .iter()
+            .filter(|position| **position < cut_at)
+            .count();
+        assert_eq!(
+            recovered_index_len,
+            (floored_entries * INDEX_ENTRY_SIZE) as u64,
+            "recovery must floor the index to exactly the {floored_entries} entries the \
+             {cut_at}-byte log proves"
+        );
+    }
+
+    let fenced = fenced_segment_paths(&backup_data);
+    assert!(
+        fenced.is_empty(),
+        "recovery must floor the index to the entries the log proves, keeping the {} \
+         surviving batches in service; instead the chain was refused and fenced aside: {fenced:?}",
+        surviving.len()
+    );
+    // `fenced_segment_paths` walks past unreadable directories, so an empty
+    // result alone could be vacuous: the files must still be where boot found
+    // them.
+    assert!(
+        log_path.exists() && index_path.exists(),
+        "the segment files must stay in place after recovery; missing under {}",
+        backup_data.display()
+    );
+    // `restart_node` truncates the node's stdout log, so a marker found here
+    // was logged by the boot just performed. Under `IGGY_TEST_VERBOSE` the
+    // child's output is inherited and no file exists to read, which would make
+    // either check vacuous.
+    if stderr_is_captured() {
+        assert!(
+            !harness
+                .node(backup)
+                .stdout_contains("refusing the recovered segment chain"),
+            "boot must absorb an index that outruns its log, not refuse the chain"
+        );
+        assert!(
+            harness.node(backup).stdout_contains(INDEX_FLOOR_MARKER),
+            "boot must log the index floor ({INDEX_FLOOR_MARKER:?}); recovery took another path"
+        );
+    }
+
+    wait_until_node_holds_payloads(
+        harness,
+        backup,
+        &payloads,
+        CONVERGE_TIMEOUT,
+        "catch-up refilling the truncated tail",
+    )
+    .await;
+
+    let nodes: Vec<usize> = (0..harness.cluster_size()).collect();
+    let client = wait_until_cluster_serves(harness, &nodes, CONVERGE_TIMEOUT).await;
+    wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
+        .await
+        .unwrap_or_else(|state| {
+            panic!("every acked offset must poll back after the floored-index recovery: {state}")
+        });
+
+    let data_paths: Vec<PathBuf> = harness
+        .all_servers()
+        .iter()
+        .map(|server| server.data_path())
+        .collect();
+    harness
+        .stop()
+        .await
+        .expect("stop the cluster for the at-rest comparison");
+    disk::assert_replica_data_identical(&data_paths, false);
 }
 
 /// An interior flip in the metadata WAL is bit-rot, not a torn append: a
