@@ -28,7 +28,7 @@ use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
     Consensus, EvictionContext, FatalReason, Pipeline, PipelineEntry, Plane, PlaneIdentity,
     PlaneKind, PreflightOutcome, PrepareRollback, Project, ReplicaLogContext, RequestLogEvent,
-    Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    Sequencer, SessionEnd, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
     build_reply_message_with, build_result_rejection_reply, emit_sim_event, fatal,
     fence_old_prepare_by_commit, is_caught_up_primary,
@@ -628,7 +628,11 @@ pub fn apply_committed_prepare<M>(
     }
     if header.operation == Operation::Logout {
         if table_mutations_allowed {
-            client_table.borrow_mut().remove_client(header.client);
+            client_table.borrow_mut().remove_client(
+                header.client,
+                header.user_id,
+                SessionEnd::from_logout_request(header.request),
+            );
         }
         // Drop the disconnected client from every consumer group it joined and
         // rebalance, Logout's only state-machine effect.
@@ -655,7 +659,9 @@ pub fn apply_committed_prepare<M>(
     // client, and replica-local eviction makes a stale-request replay
     // reachable. Both are skips, not faults.
     if table_mutations_allowed {
-        let outcome = client_table.borrow_mut().commit_reply(header.client, reply);
+        let outcome = client_table
+            .borrow_mut()
+            .commit_reply(header.client, header.user_id, reply);
         log_commit_reply_outcome(outcome, header.client, header.op);
     }
 }
@@ -2772,9 +2778,11 @@ where
                 // Logout unregisters the VSR client session on every replica.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
                 if self.client_table_mutation_allowed(prepare_header.op) {
-                    self.client_table
-                        .borrow_mut()
-                        .remove_client(prepare_header.client);
+                    self.client_table.borrow_mut().remove_client(
+                        prepare_header.client,
+                        prepare_header.user_id,
+                        SessionEnd::from_logout_request(prepare_header.request),
+                    );
                 }
                 // Drop the disconnected client from every consumer group it
                 // joined and rebalance. Deterministic side-effect of the
@@ -2809,10 +2817,11 @@ where
                 // or below the state-transfer frontier are already reflected
                 // in the transferred table and are skipped.
                 if self.client_table_mutation_allowed(prepare_header.op) {
-                    let outcome = self
-                        .client_table
-                        .borrow_mut()
-                        .commit_reply(prepare_header.client, reply.clone());
+                    let outcome = self.client_table.borrow_mut().commit_reply(
+                        prepare_header.client,
+                        prepare_header.user_id,
+                        reply.clone(),
+                    );
                     log_commit_reply_outcome(outcome, prepare_header.client, prepare_header.op);
                 }
                 reply
@@ -3297,6 +3306,22 @@ where
         // (see `resolve_acting_user_id`); server-originated internal ops
         // (`CompleteConsumerGroupRevocation`, the PAT-cleaner delete) build their
         // prepare directly, bypassing this path, and keep `user_id` 0 (gate skips).
+        // A Logout is not gated, so it gets no acting user above, yet its apply
+        // removes a dedup fence keyed by user. Resolve the owner of the session
+        // it ends here, on the primary, from the live entry or its fence, so
+        // every replica drops the same fence; an unmatched session stamps 0
+        // and the apply leaves the fences alone.
+        if operation == Operation::Logout {
+            let request_header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+            )
+            .expect("a routed request header was validated on receipt");
+            request_header.user_id = self
+                .client_table
+                .borrow()
+                .user_id_for_session(client_id, request_header.session)
+                .unwrap_or(0);
+        }
         if let Some(acting_user_id) =
             resolve_acting_user_id(operation, client_id, &self.client_table)?
         {
@@ -3950,6 +3975,12 @@ fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
             "commit_reply: committed op is older than the cached entry \
              (replica-local eviction replayed out of order); cache skipped"
         ),
+        CommitReply::AdvancedFence => tracing::trace!(
+            target: "iggy.metadata.diag",
+            client_id,
+            op,
+            "commit_reply: client evicted while being prepared; reply shipped, fence advanced"
+        ),
     }
 }
 
@@ -4049,6 +4080,7 @@ mod tests {
         // `crate::stm::stream::tests::populated_streams_snapshot_reencode_is_byte_stable`.
         let mut snapshot = IggySnapshot::new(7);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            fences: vec![],
             slots: vec![
                 (
                     0,
@@ -4100,6 +4132,7 @@ mod tests {
         const REPLY_LEN: usize = 512;
         let mut snapshot = IggySnapshot::new(1);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            fences: vec![],
             slots: vec![(
                 0,
                 consensus::ClientEntrySnapshot {
@@ -4568,7 +4601,7 @@ mod tests {
         let pat_success = committed_reply(CLIENT, 1, Operation::CreatePersonalAccessToken, 0);
         md.client_table
             .borrow_mut()
-            .commit_reply(CLIENT, pat_success);
+            .commit_reply(CLIENT, USER, pat_success);
 
         // Replaying request 1 as a PAT create must NOT return the cached
         // success; it must refuse with the name-taken code.
@@ -4594,7 +4627,7 @@ mod tests {
         );
         md.client_table
             .borrow_mut()
-            .commit_reply(CLIENT, pat_rejection);
+            .commit_reply(CLIENT, USER, pat_rejection);
         let reply = md
             .submit_request_in_process(pat_create_request(CLIENT, 2))
             .await

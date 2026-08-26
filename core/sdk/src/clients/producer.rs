@@ -26,8 +26,8 @@ use futures_util::StreamExt;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{Client, MessageClient, StreamClient, TopicClient, TopicCreateOptions};
 use iggy_common::{
-    DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration, IggyError, IggyExpiry,
-    IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
+    DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyError, IggyExpiry, IggyMessage,
+    IggyTimestamp, MaxTopicSize, NonZeroIggyDuration, Partitioner, Partitioning,
     SendMessagesConfirmationResponse, SendMessagesResponse,
 };
 use std::sync::Arc;
@@ -99,7 +99,7 @@ pub struct ProducerCore {
     default_partitioning: Arc<Partitioning>,
     last_sent_at: Arc<AtomicU64>,
     send_retries_count: Option<u32>,
-    send_retries_interval: Option<IggyDuration>,
+    send_retries_interval: Option<NonZeroIggyDuration>,
     direct_config: Option<DirectConfig>,
 }
 
@@ -496,7 +496,7 @@ impl IggyProducer {
         topic_message_expiry: IggyExpiry,
         topic_max_size: MaxTopicSize,
         send_retries_count: Option<u32>,
-        send_retries_interval: Option<IggyDuration>,
+        send_retries_interval: Option<NonZeroIggyDuration>,
         mode: SendMode,
     ) -> Self {
         let core = Arc::new(ProducerCore {

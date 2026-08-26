@@ -102,9 +102,10 @@ public partial class IggyConsumer
     /// </summary>
     protected async Task PollRentedMessagesAsync(CancellationToken ct)
     {
-        if (!_joinedConsumerGroup)
+        if (!_joinedConsumerGroup || !IsGroupMembershipCurrent())
         {
             LogConsumerGroupNotJoinedYetSkippingPolling();
+            await TryRecoverGroupMembershipAsync(ct);
             return;
         }
 

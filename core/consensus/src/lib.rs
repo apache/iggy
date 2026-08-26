@@ -162,7 +162,7 @@ pub mod client_table;
 pub mod le_cursor;
 pub use client_table::{
     CachedReply, ClientEntrySnapshot, ClientTable, ClientTableDecodeError, ClientTableSnapshot,
-    ClientTableWireError, CommitReply,
+    ClientTableWireError, CommitReply, DISCONNECT_LOGOUT_REQUEST_ID, FenceSnapshot, SessionEnd,
 };
 pub mod state_manifest;
 pub use state_manifest::{

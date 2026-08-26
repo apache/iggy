@@ -23,7 +23,9 @@ use crate::session::ConsensusSession;
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
-use crate::prelude::{IggyDuration, IggyError, IggyTimestamp, QuicClientConfig};
+use crate::prelude::{
+    IggyDuration, IggyError, IggyTimestamp, NonZeroIggyDuration, QuicClientConfig,
+};
 use crate::quic::skip_server_verification::SkipServerVerification;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
@@ -182,7 +184,7 @@ impl BinaryTransport for QuicClient {
         self.send_raw(code, payload).await
     }
 
-    fn get_heartbeat_interval(&self) -> IggyDuration {
+    fn get_heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.config.heartbeat_interval
     }
 
@@ -782,6 +784,24 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn should_fail_with_a_zero_heartbeat_interval() {
+        let value = "iggy+quic://user:secret@127.0.0.1:1234?heartbeat_interval=none";
+
+        let error = QuicClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
+    }
+
+    #[tokio::test]
+    async fn should_fail_with_a_zero_reconnection_interval() {
+        let value = "iggy+quic://user:secret@127.0.0.1:1234?reconnection_interval=0";
+
+        let error = QuicClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
+    }
+
+    #[tokio::test]
     async fn should_fail_with_empty_connection_string() {
         let value = "";
         let quic_client = QuicClient::from_connection_string(value);
@@ -945,14 +965,14 @@ mod tests {
         assert!(!quic_client_config.validate_certificate);
         assert_eq!(
             quic_client_config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
 
         assert!(quic_client_config.reconnection.enabled);
         assert!(quic_client_config.reconnection.max_retries.is_none());
         assert_eq!(
             quic_client_config.reconnection.interval,
-            IggyDuration::from_str("1s").unwrap()
+            NonZeroIggyDuration::from_str("1s").unwrap()
         );
         assert_eq!(
             quic_client_config.reconnection.reestablish_after,
@@ -1003,14 +1023,14 @@ mod tests {
         assert!(!quic_client_config.validate_certificate);
         assert_eq!(
             quic_client_config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
 
         assert!(quic_client_config.reconnection.enabled);
         assert!(quic_client_config.reconnection.max_retries.is_none());
         assert_eq!(
             quic_client_config.reconnection.interval,
-            IggyDuration::from_str(reconnection_interval).unwrap()
+            NonZeroIggyDuration::from_str(reconnection_interval).unwrap()
         );
         assert_eq!(
             quic_client_config.reconnection.reestablish_after,
@@ -1052,14 +1072,14 @@ mod tests {
         assert!(!quic_client_config.validate_certificate);
         assert_eq!(
             quic_client_config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
 
         assert!(quic_client_config.reconnection.enabled);
         assert!(quic_client_config.reconnection.max_retries.is_none());
         assert_eq!(
             quic_client_config.reconnection.interval,
-            IggyDuration::from_str("1s").unwrap()
+            NonZeroIggyDuration::from_str("1s").unwrap()
         );
         assert_eq!(
             quic_client_config.reconnection.reestablish_after,
