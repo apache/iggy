@@ -18,6 +18,14 @@
 #![allow(clippy::future_not_send)]
 
 use iggy_common::SemanticVersion;
+#[cfg(all(feature = "mimalloc", not(feature = "disable-mimalloc")))]
+use mimalloc::MiMalloc;
+
+// Both features are checked because `--all-features` turns on `mimalloc` and
+// `disable-mimalloc` at once, while `--no-default-features` drops the crate.
+#[cfg(all(feature = "mimalloc", not(feature = "disable-mimalloc")))]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);

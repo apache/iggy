@@ -44,6 +44,10 @@ fn main() -> Result<(), ServerError> {
     let mut logging = Logging::new(server::VERSION);
     logging.early_init();
     server_common::print_build_info!(server::VERSION);
+    #[cfg(all(feature = "mimalloc", not(feature = "disable-mimalloc")))]
+    info!("Using mimalloc allocator");
+    #[cfg(not(all(feature = "mimalloc", not(feature = "disable-mimalloc"))))]
+    tracing::warn!("Using the default system allocator");
     if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
         let _ = dotenvy::from_path(&env_path);
     } else {
