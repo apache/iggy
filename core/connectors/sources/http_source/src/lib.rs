@@ -317,7 +317,7 @@ pub struct StaticEndpointConfig {
     pub hmac_header: String,
     #[serde(default = "default_hmac_prefix")]
     pub hmac_prefix: String,
-    /// Unix seconds; requests arriving at or after this answer 410 Gone.
+    /// Unix seconds; requests arriving at or after this answer 404.
     #[serde(default)]
     pub expires_at: Option<u64>,
 }

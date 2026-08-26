@@ -166,7 +166,11 @@ pub fn unix_now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
+        // A clock behind the epoch is the only way this fails, and defaulting
+        // to 0 would make every `expires_at` lie in the future, quietly
+        // reviving endpoints that expired. Saturating instead expires
+        // everything, which is the direction a broken clock should fail.
+        .unwrap_or(u64::MAX)
 }
 
 /// Clamps a forwarded header value to the Iggy `HeaderValue` limit on a

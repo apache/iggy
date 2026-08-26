@@ -126,7 +126,7 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `auth_secret` | string | none | Required unless `auth_type` is `none`. |
 | `hmac_header` | string | `X-Hub-Signature-256` | Header carrying the signature. |
 | `hmac_prefix` | string | `sha256=` | Prefix stripped before hex-decoding. Use `""` for a bare hex signature. |
-| `expires_at` | u64 | none | Unix seconds. Requests arriving at or after this answer 410. |
+| `expires_at` | u64 | none | Unix seconds. Requests arriving at or after this answer 404. |
 
 `HttpSourceConfig` deliberately does not implement `Serialize`, so this connector cannot write a credential out by accident. That does **not** protect the values in your TOML: the runtime keeps plugin configuration as raw JSON and serves it verbatim from `GET /sources/{key}/configs/plugin` (and inside `/configs` and `/configs/active`), so anyone who can reach the runtime's control API can read every secret configured here. Treat that API as privileged. (`/stats` carries no plugin configuration.)
 
@@ -158,13 +158,12 @@ Content-Type: application/json
 | 200 | Accepted into the bridge | `{"status":"queued"}` |
 | 401 | Bearer or HMAC validation failed | `{"error":"unauthorized"}` |
 | 404 | Unknown path, or a revoked endpoint | `{"error":"not found"}` |
-| 410 | Endpoint past `expires_at` | `{"error":"gone"}` |
 | 400 | Malformed request body, e.g. the client reset mid-send | `{"error":"bad request"}` |
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
 | 429 | Bridge full | `{"error":"service temporarily unavailable"}` plus `Retry-After: 1` |
 | 503 | `GET /health` with no instance serving | `{"status":"unavailable"}` |
 
-Revoked endpoints answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. Error bodies carry no internals; diagnostics live on the admin listener.
+Revoked and expired endpoints both answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. The lookup runs before any credential is checked, so anything other than 404 would answer that question for an unauthenticated caller. Error bodies carry no internals; diagnostics live on the admin listener.
 
 `GET /health` on the public listener answers 200 while at least one instance is serving and 503 otherwise, which is what a load balancer should watch.
 

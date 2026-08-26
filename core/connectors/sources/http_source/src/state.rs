@@ -184,7 +184,7 @@ impl EndpointRegistry {
 
     /// Endpoints that would accept a request right now: neither revoked nor
     /// past their expiry. An expired endpoint is still `Active` in lifecycle
-    /// terms but answers 410, so counting it as serving would mislead.
+    /// terms but answers 404, so counting it as serving would mislead.
     pub fn serving_count(&self, now_seconds: u64) -> usize {
         self.endpoints
             .values()
@@ -279,6 +279,22 @@ mod tests {
         registry
             .to_connector_state(1)
             .expect("registry must serialize")
+    }
+
+    #[test]
+    fn given_revoked_endpoint_when_serialized_should_not_carry_the_secret() {
+        let mut registry = EndpointRegistry::default();
+        assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
+        assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
+
+        let ConnectorState(bytes) = registry_state(&registry);
+
+        assert!(
+            !bytes
+                .windows(b"whsec_dynamic".len())
+                .any(|window| window == b"whsec_dynamic"),
+            "revoking because a secret leaked must not then persist that secret; the handler 404s before authorize() runs and nothing compacts tombstones"
+        );
     }
 
     #[test]

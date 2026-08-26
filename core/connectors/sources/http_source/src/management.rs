@@ -26,8 +26,9 @@
 //! a response here means "accepted", not "written"; `GET /admin/endpoints`
 //! reports `submitted` per endpoint for callers that need the difference.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -70,16 +71,31 @@ pub(crate) fn router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
                 .patch(rotate_secret)
                 .delete(revoke_endpoint),
         )
+        // The guard is a layer, not a line in each handler, because axum runs
+        // every extractor before the handler body. Checking inside the handler
+        // still read and parsed an unauthenticated request's JSON first, which
+        // is not what the route tests below claim to prove.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_management_token,
+        ))
+}
+
+async fn require_management_token(
+    State(state): State<Arc<ServerState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(response) = denied(&state, request.headers()) {
+        return response;
+    }
+    next.run(request).await
 }
 
 async fn register_endpoint(
     State(state): State<Arc<ServerState>>,
-    request_headers: HeaderMap,
     body: Result<Json<RegisterRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    if let Some(response) = denied(&state, &request_headers) {
-        return response;
-    }
     let Json(request) = match body {
         Ok(body) => body,
         Err(rejection) => return error_response(rejection.status(), "invalid request body"),
@@ -175,12 +191,8 @@ async fn register_endpoint(
 async fn rotate_secret(
     State(state): State<Arc<ServerState>>,
     Path(endpoint_id): Path<String>,
-    request_headers: HeaderMap,
     body: Result<Json<RotateRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    if let Some(response) = denied(&state, &request_headers) {
-        return response;
-    }
     let Json(request) = match body {
         Ok(body) => body,
         Err(rejection) => return error_response(rejection.status(), "invalid request body"),
@@ -241,12 +253,8 @@ async fn rotate_secret(
 async fn revoke_endpoint(
     State(state): State<Arc<ServerState>>,
     Path(endpoint_id): Path<String>,
-    request_headers: HeaderMap,
     body: Option<Json<RevokeRequest>>,
 ) -> Response {
-    if let Some(response) = denied(&state, &request_headers) {
-        return response;
-    }
     let reason = body
         .and_then(|Json(request)| request.reason)
         .unwrap_or_else(|| "unspecified".to_string());
@@ -278,13 +286,7 @@ async fn revoke_endpoint(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn list_endpoints(
-    State(state): State<Arc<ServerState>>,
-    request_headers: HeaderMap,
-) -> Response {
-    if let Some(response) = denied(&state, &request_headers) {
-        return response;
-    }
+async fn list_endpoints(State(state): State<Arc<ServerState>>) -> Response {
     let endpoints: Vec<EndpointSummary> = state
         .instances()
         .iter()
@@ -302,11 +304,7 @@ async fn list_endpoints(
 async fn get_endpoint(
     State(state): State<Arc<ServerState>>,
     Path(endpoint_id): Path<String>,
-    request_headers: HeaderMap,
 ) -> Response {
-    if let Some(response) = denied(&state, &request_headers) {
-        return response;
-    }
     let Some(instance) = owner_of(&state, &endpoint_id) else {
         return error_response(StatusCode::NOT_FOUND, "not found");
     };
@@ -608,8 +606,8 @@ mod tests {
     #[tokio::test]
     async fn given_wrong_token_when_each_route_called_should_answer_unauthorized() {
         // Every route, not just the one route a single test happens to reach.
-        // Each handler carries its own guard, so a check dropped from any of
-        // the four mutating ones would still leave the suite green.
+        // The guard is a router layer, so dropping it would fail all of these
+        // at once rather than silently leaving one route open.
         let fixture = Fixture::start(Some(TOKEN)).await;
         let endpoints = format!("{}/admin/endpoints", fixture.admin);
         let one = format!("{endpoints}/{ENDPOINT_ONE}");
@@ -643,6 +641,51 @@ mod tests {
                 "{route} must refuse a wrong token before it does anything else"
             );
         }
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_wrong_token_and_unparsable_body_should_refuse_before_reading_it() {
+        // The status is the whole point. axum runs extractors before the
+        // handler body, so while the guard lived inside the handler an
+        // unauthenticated request still had its JSON read and parsed first,
+        // and this body would have answered 400 instead of 401.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+
+        let response = client()
+            .post(format!("{}/admin/endpoints", fixture.admin))
+            .header(header::AUTHORIZATION, "Bearer not-the-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{ this is not json")
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated caller must not reach the body parser"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_unknown_field_when_registered_should_reject() {
+        let fixture = Fixture::start(Some(TOKEN)).await;
+
+        let response = client()
+            .post(format!("{}/admin/endpoints", fixture.admin))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .json(&json!({"instance": "http_github", "auth_typo": "bearer"}))
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "these bodies never carry the runtime's env overrides, so an unknown field is a caller typo"
+        );
         fixture.close().await;
     }
 
