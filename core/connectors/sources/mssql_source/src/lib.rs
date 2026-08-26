@@ -404,7 +404,10 @@ impl MSSQLSource {
 
 		let schema_prefix = format!("{}_", self.config.schema.clone().unwrap_or("dbo".to_string()));
 		for row in table_columns {
-			let capture_table: &str = row.get::<&str, _>("table_name").unwrap();
+			let capture_table: &str = row
+				.try_get::<&str, _>("capture_table")
+				.map_err(|e| Error::InvalidRecord)?
+				.ok_or(Error::InvalidRecord)?;
 			let capture_table = capture_table.replacen(&schema_prefix, "", 1);
 
 			let	source_table: &str = row.get::<&str, _>("source_table").unwrap();
@@ -479,11 +482,16 @@ impl MSSQLSource {
 
 		let mut result = Vec::new();
 		let default_columns = "*".to_string();
+
 		for (table, data) in &self.capture_columns {
 
+			// Get columns from config, otherwise from the monitored ones or fallback to *
 			let columns = match self.config.capture_table_columns.get::<String>(table) {
 				Some(x) => x,
-				None => &default_columns
+				None => match self.capture_columns.get(table) {
+					Some(x) => &x.columns,
+					None => &default_columns
+				}
 			};
 
 			let first_table_lsn = lsn_to_hex(&data.start_lsn);
@@ -525,9 +533,10 @@ impl MSSQLSource {
 		let mut messages = Vec::new();
 		for (table_name, row) in result {
 			for r in row {
-				let data: String = match r.get::<&str, _>("data") {
-					Some(x) => x.to_string(),
-					None => return Err(Error::InvalidRecord)
+				let data: String = match r.try_get::<&str, _>("data") {
+					Ok(Some(x)) => x.to_string(),
+					Ok(None) => return Err(Error::InvalidRecord),
+					Err(_) => return Err(Error::InvalidRecord)
 				};
 
 				let operation_type = match r.try_get::<i32, _>("__$operation").map_err(|_| Error::InvalidRecord)? {
@@ -578,7 +587,6 @@ impl MSSQLSource {
 
 		// Update state with minimal lock time
 		if !messages.is_empty() {
-			// let mut state = self.state.lock().await;
 			state.processed_rows += messages.len() as u64;
 			state.last_poll_lsn = Some(new_lsn);
 		}
