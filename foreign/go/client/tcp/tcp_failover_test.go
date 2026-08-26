@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
@@ -543,6 +544,49 @@ func TestFailover_AConfigFaultEndsTheConnectInsteadOfRetryingForever(t *testing.
 	}
 }
 
+// A peer that answers the handshake in plaintext says something about that
+// endpoint, not about this client's TLS configuration. Ended the whole connect,
+// one misconfigured node in the roster costs the client every endpoint behind
+// it, including the ones that are only down for a moment.
+func TestFailover_APlaintextEndpointDoesNotEndTheSweep(t *testing.T) {
+	certificate, _ := selfSignedCert(t)
+	var accepted atomic.Int32
+	var survivor *testListener
+	survivor = listenVSR(t,
+		func(conn net.Conn) net.Conn {
+			if accepted.Add(1) == 1 {
+				// Down for the first pass, up for the second: without it the
+				// sweep reaches this node and the pass succeeds either way.
+				_ = conn.Close()
+				return conn
+			}
+			return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
+		},
+		singleNodeHandler(t, func() string { return survivor.address() }))
+
+	plaintext, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = plaintext.Close() })
+	go func() {
+		for {
+			conn, err := plaintext.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = conn.Write([]byte("not a TLS record\n"))
+			_ = conn.Close()
+		}
+	}()
+
+	client := newDialingClient(t, plaintext.Addr().String(),
+		WithTLS(WithTLSValidateCertificate(false)))
+	client.config.reconnection.maxRetries = 2
+	client.knownServerAddresses = []string{survivor.address()}
+
+	require.NoError(t, client.Connect(context.Background()))
+	assert.Equal(t, survivor.address(), client.currentServerAddress)
+}
+
 // A client with nothing to dial must say so: reporting success would leave
 // every request answering ErrNotConnected while Connect keeps claiming a
 // connection.
@@ -599,6 +643,98 @@ func TestConnect_ConcurrentCallersShareOneAttempt(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, registers, "one attempt, one sign-in")
+}
+
+// Two requests failing at once are one reconnect. Each tears the connection
+// down before reconnecting, and a teardown that resets the state under an
+// attempt already dialing lets the second caller start a second attempt: the
+// two then fight over which socket is installed and which outcome the waiters
+// are handed.
+func TestConnect_ConcurrentReconnectsThroughExchangeShareOneAttempt(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, func(connection, index int, read request) []byte {
+		if connection == 0 && read.code() == uint32(command.PingCode) {
+			// Ends the socket under both in-flight requests at once.
+			return nil
+		}
+		if connection > 0 && read.operation() == vsr.OperationRegister {
+			// The reconnect's sign-in is the slow part, so the second caller
+			// reliably arrives while the first attempt is still running.
+			time.Sleep(300 * time.Millisecond)
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(connection, index, read)
+	})
+
+	client := newDialingClient(t, server.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	require.NoError(t, client.Connect(context.Background()))
+
+	const callers = 2
+	results := make(chan error, callers)
+	start := make(chan struct{})
+	for range callers {
+		go func() {
+			<-start
+			results <- client.Ping(context.Background())
+		}()
+	}
+	close(start)
+	for range callers {
+		require.NoError(t, <-results, "a request did not survive the reconnect")
+	}
+
+	assert.Equal(t, 2, server.connections(),
+		"the two failing requests reconnected separately")
+}
+
+// The sign-in transaction holds registerMtx across its reconnect, and an
+// attempt started by a plain request ends in a sign-in that needs that same
+// lock. Waiting for that attempt closes a cycle -- the owner blocked on
+// registerMtx, the transaction blocked on the owner -- and callers pass a
+// context with no deadline, so nothing breaks it.
+func TestConnect_DoesNotWaitOnAnAttemptThatSignsIn(t *testing.T) {
+	certificate, _ := selfSignedCert(t)
+	var survivor *testListener
+	survivor = listenVSR(t,
+		func(conn net.Conn) net.Conn {
+			return tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{certificate}})
+		},
+		singleNodeHandler(t, func() string { return survivor.address() }))
+
+	// A listener that accepts and never answers the ClientHello: the attempt
+	// spends the whole dial bound here, which is the window a second caller
+	// arrives in.
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = silent.Close() })
+
+	client := newDialingClient(t, silent.Addr().String(),
+		WithTLS(WithTLSValidateCertificate(false)),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	client.knownServerAddresses = []string{survivor.address()}
+
+	// Stands in for the sign-in transaction: register holds this across the
+	// disconnect and the reconnect that follow it.
+	client.registerMtx.Lock()
+	owner := make(chan error, 1)
+	go func() { owner <- client.Connect(context.Background()) }()
+	require.Eventually(t, func() bool {
+		client.mtx.Lock()
+		defer client.mtx.Unlock()
+		return client.transportState == iggcon.TransportStateConnecting
+	}, time.Second, time.Millisecond, "the attempt never started dialing")
+
+	suppressed := make(chan error, 1)
+	go func() { suppressed <- client.Connect(suppressAutoLogin(context.Background())) }()
+	select {
+	case err := <-suppressed:
+		require.Error(t, err, "the transaction was told a connection it does not have is up")
+	case <-time.After(2 * failoverDialTimeout):
+		t.Fatal("the sign-in transaction waited on an attempt that cannot finish without it")
+	}
+
+	client.registerMtx.Unlock()
+	require.NoError(t, <-owner, "the attempt the transaction left alone did not finish")
 }
 
 // deadAddress returns an address nothing listens on, so a dial to it is

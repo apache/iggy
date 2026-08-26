@@ -52,6 +52,21 @@ func GetDefaultOptions() Options {
 	}
 }
 
+// connectAttempt is one run of Connect, shared with the callers waiting on it.
+//
+// The outcome is kept per attempt rather than in a field on the client: a
+// waiter that read a shared field would read whatever the attempt after the one
+// it waited on had written there, and a fresh attempt has no outcome yet.
+type connectAttempt struct {
+	// done is closed once the attempt settles, whichever way it ends.
+	done chan struct{}
+	// err is the attempt's outcome, written before done is closed.
+	err error
+	// suppressesLogin records that the owner does not sign in, which is what
+	// makes the attempt safe to wait on from inside the sign-in transaction.
+	suppressesLogin bool
+}
+
 type IggyTcpClient struct {
 	conn net.Conn
 	// reader buffers reads off conn, so a reply costs one syscall instead of
@@ -82,11 +97,9 @@ type IggyTcpClient struct {
 	// loggedOut records an explicit sign-out, so a reconnect's automatic
 	// sign-in does not silently reverse it; guarded by c.mtx.
 	loggedOut bool
-	// connectInFlight is the attempt a Connect is running, shared with every
-	// caller that arrives while it is in progress: closed when the attempt
-	// settles, with connectErr carrying its outcome. Guarded by c.mtx.
-	connectInFlight chan struct{}
-	connectErr      error
+	// connectAttempt is the attempt a Connect is running, shared with every
+	// caller that arrives while it is in progress. Guarded by c.mtx.
+	connectAttempt *connectAttempt
 	// rememberedLogin holds the credentials a manual sign-in succeeded with,
 	// so a reconnect -- on this node or, after a failover, another one -- can
 	// re-establish the session instead of surfacing an unauthenticated error.
@@ -648,11 +661,6 @@ func (c *IggyTcpClient) sendFrame(ctx context.Context, code uint32, frame []byte
 				return nil, redirectErr
 			}
 			if redirect {
-				// A connect-scoped request is issued from inside the sign-in
-				// transaction, which holds registerMtx: the automatic sign-in
-				// on the reconnect path would wait on that lock forever. The
-				// transaction signs in itself on the node it lands on, so the
-				// reconnect must not.
 				redirectCtx := ctx
 				if ctx.Value(connectScoped{}) != nil {
 					// Issued from inside the sign-in transaction, which holds
@@ -919,6 +927,7 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 // instead would hand them a client with no connection yet, and their next
 // request would fail ErrNotConnected for no reason of its own.
 func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
+	suppressesLogin := ctx.Value(skipAutoLogin{}) != nil
 	c.mtx.Lock()
 	switch c.transportState {
 	case iggcon.TransportStateShutdown:
@@ -931,40 +940,48 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 		c.logger.Debug("Client is already connected.", slog.String("client_address", clientAddress))
 		return nil
 	case iggcon.TransportStateConnecting:
-		inFlight := c.connectInFlight
+		attempt := c.connectAttempt
 		c.mtx.Unlock()
-		c.logger.Debug("Client is already connecting; waiting for that attempt.")
-		if inFlight == nil {
+		if attempt == nil {
 			return nil
 		}
+		if suppressesLogin && !attempt.suppressesLogin {
+			// Only the sign-in transaction suppresses the automatic sign-in,
+			// and it holds registerMtx while it does. The attempt in flight
+			// ends in a sign-in that needs that same lock, so waiting here
+			// would close a cycle: the owner blocked on registerMtx, this
+			// goroutine blocked on the owner, and neither context cancelled.
+			c.logger.Debug("Another connect is signing in; not waiting for it.")
+			return ierror.ErrCannotEstablishConnection
+		}
+		c.logger.Debug("Client is already connecting; waiting for that attempt.")
 		select {
-		case <-inFlight:
+		case <-attempt.done:
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c.closed:
 			return ierror.ErrClientShutdown
 		}
-		c.mtx.Lock()
-		attemptErr := c.connectErr
-		c.mtx.Unlock()
-		return attemptErr
-	default:
-		c.transportState = iggcon.TransportStateConnecting
-		c.connectInFlight = make(chan struct{})
-		c.connectErr = nil
+		return attempt.err
 	}
+	attempt := &connectAttempt{
+		done:            make(chan struct{}),
+		suppressesLogin: suppressesLogin,
+	}
+	c.transportState = iggcon.TransportStateConnecting
+	c.connectAttempt = attempt
 	connectedAt := c.connectedAt
 	c.mtx.Unlock()
 
 	// Settles the attempt for whoever is waiting on it, whichever way it ends.
 	defer func() {
+		attempt.err = err
 		c.mtx.Lock()
-		c.connectErr = err
-		if c.connectInFlight != nil {
-			close(c.connectInFlight)
-			c.connectInFlight = nil
+		if c.connectAttempt == attempt {
+			c.connectAttempt = nil
 		}
 		c.mtx.Unlock()
+		close(attempt.done)
 	}()
 
 	candidates := c.connectionCandidates()
@@ -1056,24 +1073,23 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 	}
 
 	c.mtx.Lock()
-	if c.transportState != iggcon.TransportStateConnecting {
-		// Disconnected or shut down while this attempt was dialing: the
-		// connection it just made is not wanted, and installing it would
-		// resurrect a client somebody asked to stop.
-		state := c.transportState
+	if state := c.transportState; state != iggcon.TransportStateConnecting {
+		// Superseded while this attempt was dialing. The connection it just
+		// made is surplus either way, but what to report differs: a client
+		// another attempt already connected is connected, and saying
+		// otherwise would fail a caller whose client is up.
 		c.mtx.Unlock()
 		_ = conn.Close()
-		c.logger.Debug("The connect was superseded while dialing; dropping the connection.")
-		if state == iggcon.TransportStateShutdown {
+		c.logger.Debug("The connect was superseded while dialing; dropping the connection.",
+			slog.Any("transport_state", state))
+		switch state {
+		case iggcon.TransportStateShutdown:
 			return ierror.ErrClientShutdown
+		case iggcon.TransportStateConnected:
+			return nil
+		default:
+			return ierror.ErrNotConnected
 		}
-		return ierror.ErrNotConnected
-	}
-	// A connection installed over another one leaks its socket: two Connects
-	// can race here, and the loser's conn would otherwise stay open with
-	// nothing left holding it.
-	if previous := c.conn; previous != nil {
-		_ = previous.Close()
 	}
 	c.conn = conn
 	c.reader = bufio.NewReaderSize(conn, 64*1024)
@@ -1100,6 +1116,10 @@ func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 // client's own TLS configuration is wrong -- an unreadable or unparsable CA
 // file, a domain that yields no server name, or a certificate this client will
 // never accept. None of those change on a retry.
+//
+// A peer that answered the ClientHello in plaintext is not one of them: that
+// says something about the endpoint, not about this client, and the endpoints
+// behind it in the roster may be speaking TLS perfectly well.
 func isTLSConfigFault(err error) bool {
 	if errors.Is(err, ierror.ErrInvalidTlsCertificatePath) ||
 		errors.Is(err, ierror.ErrInvalidTlsCertificate) ||
@@ -1108,8 +1128,7 @@ func isTLSConfigFault(err error) bool {
 	}
 
 	var certificateError *tls.CertificateVerificationError
-	var recordError tls.RecordHeaderError
-	return errors.As(err, &certificateError) || errors.As(err, &recordError)
+	return errors.As(err, &certificateError)
 }
 
 // awaitReestablish waits out what is left of the reestablishAfter window since
@@ -1330,6 +1349,15 @@ func (c *IggyTcpClient) disconnect() error {
 	defer c.mtx.Unlock()
 
 	if c.transportState == iggcon.TransportStateDisconnected || c.transportState == iggcon.TransportStateShutdown {
+		return nil
+	}
+	if c.transportState == iggcon.TransportStateConnecting {
+		// An attempt is already dialing. Every caller here is tearing the
+		// connection down to reconnect, which that attempt is doing anyway:
+		// resetting the state under it would let the next Connect start a
+		// second attempt, and the two would fight over which socket ends up
+		// installed and which error the waiters are told about.
+		c.logger.Debug("Not disconnecting; a connect is already in flight.")
 		return nil
 	}
 

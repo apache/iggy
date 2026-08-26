@@ -404,6 +404,115 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     }
 
     /**
+     * A retry budget of zero still gets one rotation when several endpoints are
+     * known: those endpoints -- the address the client was configured with, the
+     * nodes the roster named -- were made known in order to be tried, and every
+     * other SDK sweeps them once too. With one endpoint known, zero retries
+     * redials nothing, which is what it asked for.
+     */
+    @Test
+    void shouldSweepTheKnownEndpointsOnceWithNoRetries() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
+                ServerSocket survivorSocket = new ServerSocket(0, 4, loopback)) {
+            int primaryPort = primarySocket.getLocalPort();
+            int survivorPort = survivorSocket.getLocalPort();
+            AtomicInteger survivorRegistrations = new AtomicInteger();
+
+            MockNode primary = MockNode.serve(primarySocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, primaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+            });
+            MockNode survivor = MockNode.serve(survivorSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, survivorPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    survivorRegistrations.incrementAndGet();
+                    return Response.success(OPERATION_REGISTER, registerBody(2));
+                }
+                return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+            });
+
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(primaryPort)
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .retryPolicy(RetryPolicy.noRetry())
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                client.sendBinaryRequest(PING_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
+
+                primary.kill();
+
+                assertThat(resumeWithin(client, Duration.ofSeconds(4)))
+                        .as("zero retries skipped the one rotation the known endpoints are for")
+                        .isTrue();
+                assertThat(client.getConnectionInfo().port()).isEqualTo(survivorPort);
+                assertThat(survivorRegistrations)
+                        .as("the sign-in was replayed on the survivor")
+                        .hasValueGreaterThanOrEqualTo(1);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                survivor.close();
+            }
+        }
+    }
+
+    /**
+     * Every dial is capped once more than one endpoint is known, a configured
+     * connection timeout included: it says how long one endpoint may take, and a
+     * rotation that spends it on each of them reaches the survivor long after
+     * the caller gave up. A timeout shorter than the cap is what the caller
+     * asked for and stands; with one endpoint known nothing is queued behind
+     * the dial, so the configured value stands there too.
+     */
+    @Test
+    void shouldCapEveryDialWhenMoreThanOneEndpointIsKnown() {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        List<ConnectionInfo> roster = List.of(new ConnectionInfo("iggy-1", 8091));
+
+        AsyncIggyTcpClient patient = AsyncIggyTcpClient.builder()
+                .host(loopback.getHostAddress())
+                .port(8090)
+                .connectionTimeout(Duration.ofSeconds(30))
+                .build();
+        assertThat(patient.dialTimeout()).contains(Duration.ofSeconds(30));
+        patient.rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), roster));
+        assertThat(patient.dialTimeout())
+                .as("a configured timeout exempted the dial from the failover cap")
+                .contains(AsyncIggyTcpClient.FAILOVER_DIAL_TIMEOUT);
+
+        AsyncIggyTcpClient impatient = AsyncIggyTcpClient.builder()
+                .host(loopback.getHostAddress())
+                .port(8090)
+                .connectionTimeout(Duration.ofMillis(500))
+                .build();
+        impatient.rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), roster));
+        assertThat(impatient.dialTimeout())
+                .as("a timeout shorter than the cap is what the caller asked for")
+                .contains(Duration.ofMillis(500));
+
+        AsyncIggyTcpClient unconfigured = AsyncIggyTcpClient.builder()
+                .host(loopback.getHostAddress())
+                .port(8090)
+                .build();
+        assertThat(unconfigured.dialTimeout()).isEmpty();
+        unconfigured.rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), roster));
+        assertThat(unconfigured.dialTimeout()).contains(AsyncIggyTcpClient.FAILOVER_DIAL_TIMEOUT);
+    }
+
+    /**
      * A roster read that learned nothing must leave the last one standing:
      * emptying the redial candidates when the cluster is unreachable takes them
      * away exactly when they are needed.

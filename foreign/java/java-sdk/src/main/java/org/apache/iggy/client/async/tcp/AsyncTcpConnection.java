@@ -36,6 +36,7 @@ import io.netty.channel.pool.FixedChannelPool;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SslHandler;
 import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
@@ -169,12 +170,13 @@ public class AsyncTcpConnection {
         this.vsrEncoder = new VsrRequestEncoder(consensusSession);
         this.eventLoopGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
 
+        long dialTimeoutMillis =
+                connectionTimeout.orElse(DEFAULT_CONNECTION_TIMEOUT).toMillis();
         var bootstrap = new Bootstrap()
                 .group(eventLoopGroup)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.TCP_NODELAY, true)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int)
-                        connectionTimeout.orElse(DEFAULT_CONNECTION_TIMEOUT).toMillis())
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) dialTimeoutMillis)
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .remoteAddress(host, port);
 
@@ -184,7 +186,14 @@ public class AsyncTcpConnection {
         this.channelPool = new FixedChannelPool(
                 bootstrap,
                 new PoolChannelHandler(
-                        host, port, enableTls, sslContext, consensusSession, maxVsrFrameSize, this::onSessionEvicted),
+                        host,
+                        port,
+                        enableTls,
+                        sslContext,
+                        dialTimeoutMillis,
+                        consensusSession,
+                        maxVsrFrameSize,
+                        this::onSessionEvicted),
                 ChannelHealthChecker.ACTIVE,
                 FixedChannelPool.AcquireTimeoutAction.FAIL,
                 poolConfig.getAcquireTimeoutMillis(),
@@ -832,9 +841,10 @@ public class AsyncTcpConnection {
      * login and Register. The fresh session invalidates cached routing state
      * such as consumer-group assignments.
      *
-     * The reason travels to the listener, which owns the question of whether
-     * the session may be re-established at all: only it knows whether the
-     * sign-in was configured on the client or run by a caller.
+     * The reason travels to the listener so it can drop what belonged to the
+     * evicted session and log what happened. The session itself is kept
+     * whichever way the sign-in was made: only an explicit sign-out or close
+     * ends one.
      */
     private void onSessionEvicted(int errorCode) {
         authGeneration.incrementAndGet();
@@ -900,15 +910,18 @@ public class AsyncTcpConnection {
         private final int port;
         private final boolean enableTls;
         private final SslContext sslContext;
+        private final long dialTimeoutMillis;
         private final ConsensusSession consensusSession;
         private final int maxVsrFrameSize;
         private final IntConsumer onEviction;
 
+        @SuppressWarnings("checkstyle:ParameterNumber")
         PoolChannelHandler(
                 String host,
                 int port,
                 boolean enableTls,
                 SslContext sslContext,
+                long dialTimeoutMillis,
                 ConsensusSession consensusSession,
                 int maxVsrFrameSize,
                 IntConsumer onEviction) {
@@ -916,6 +929,7 @@ public class AsyncTcpConnection {
             this.port = port;
             this.enableTls = enableTls;
             this.sslContext = sslContext;
+            this.dialTimeoutMillis = dialTimeoutMillis;
             this.consensusSession = consensusSession;
             this.maxVsrFrameSize = maxVsrFrameSize;
             this.onEviction = onEviction;
@@ -925,7 +939,12 @@ public class AsyncTcpConnection {
         public void channelCreated(Channel ch) {
             ChannelPipeline pipeline = ch.pipeline();
             if (enableTls) {
-                pipeline.addLast("ssl", sslContext.newHandler(ch.alloc(), host, port));
+                SslHandler ssl = sslContext.newHandler(ch.alloc(), host, port);
+                // A peer that accepts TCP and then never answers the
+                // ClientHello would otherwise hold the dial for Netty's own
+                // 10s default, well past the bound the rotation dials under.
+                ssl.setHandshakeTimeoutMillis(dialTimeoutMillis);
+                pipeline.addLast("ssl", ssl);
             }
             pipeline.addLast("frameDecoder", new VsrFrameDecoder(maxVsrFrameSize));
             pipeline.addLast("responseHandler", new VsrResponseHandler(consensusSession, onEviction));

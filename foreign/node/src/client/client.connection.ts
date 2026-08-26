@@ -133,7 +133,11 @@ export class IggyConnection extends EventEmitter {
   public redirecting: boolean;
   /** Reconnection configuration */
   private reconnectOption: ReconnectOption;
-  /** Number of reconnection attempts made */
+  /**
+   * Number of passes made over the known endpoints. One pass dials the
+   * endpoint the client is on, the endpoint it was configured with, and every
+   * node the roster named.
+   */
   private reconnectCount: number;
   /** Shared promise for concurrent callers waiting on one connection attempt */
   private connectPromise?: Promise<this>;
@@ -395,8 +399,14 @@ export class IggyConnection extends EventEmitter {
     // be tried, so they get one pass and no backoff, as in the other SDKs. A
     // client that knows one endpoint and turned reconnection off redials
     // nothing, which is what it asked for.
+    // Counted rather than tracked within this call: every dial the pass fails
+    // closes a socket, and a close starts a reconnect of its own. Bounded by
+    // `firstPass` alone, each of those closes would open another sweep and the
+    // pass would repeat for as long as the endpoints stay down. The count is
+    // reset when a connection is established, so a later loss sweeps again.
     const sweepOnce = !enabled && this._redialCandidates().length > 1;
-    while ((enabled && this.reconnectCount < maxRetries) || (sweepOnce && firstPass)) {
+    while ((enabled && this.reconnectCount < maxRetries) ||
+      (sweepOnce && this.reconnectCount < 1)) {
       this.connecting = true;
       this.reconnectCount += 1;
       const candidates = this._redialCandidates();

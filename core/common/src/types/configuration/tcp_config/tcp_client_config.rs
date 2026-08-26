@@ -72,10 +72,7 @@ impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
     fn from(connection_string: ConnectionString<TcpConnectionStringOptions>) -> Self {
         TcpClientConfig {
             server_address: connection_string.server_address().into(),
-            // The connection-string grammar names a single host, so a client
-            // built from one starts with no seeds and learns the roster once
-            // it is connected.
-            failover_addresses: Vec::new(),
+            failover_addresses: connection_string.options().failover_addresses().to_vec(),
             auto_login: connection_string.auto_login().to_owned(),
             tls_enabled: connection_string.options().tls_enabled(),
             tls_domain: connection_string.options().tls_domain().into(),

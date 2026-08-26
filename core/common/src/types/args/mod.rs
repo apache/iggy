@@ -76,6 +76,12 @@ pub struct ArgsOptional {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_server_address: Option<String>,
 
+    /// The optional addresses of other nodes of the same cluster, dialed in
+    /// order when the server address cannot be reached
+    #[arg(long, value_delimiter = ',')]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_failover_addresses: Option<Vec<String>>,
+
     /// The optional number of max reconnect retries for the TCP transport
     ///
     /// [default: 10]
@@ -244,6 +250,10 @@ pub struct Args {
     /// The optional client address for the TCP transport
     pub tcp_server_address: String,
 
+    /// The optional addresses of other nodes of the same cluster, dialed in
+    /// order when the server address cannot be reached
+    pub tcp_failover_addresses: Vec<String>,
+
     /// The optional number of maximum reconnect retries for the TCP transport
     pub tcp_reconnection_enabled: bool,
 
@@ -380,6 +390,7 @@ impl Default for Args {
             username: DEFAULT_ROOT_USERNAME.to_string(),
             password: DEFAULT_ROOT_PASSWORD.to_string(),
             tcp_server_address: "127.0.0.1:8090".to_string(),
+            tcp_failover_addresses: Vec::new(),
             tcp_reconnection_enabled: true,
             tcp_reconnection_max_retries: Some(10),
             tcp_reconnection_interval: "1s".to_string(),
@@ -445,6 +456,9 @@ impl From<Vec<ArgsOptional>> for Args {
             }
             if let Some(tcp_server_address) = optional_args.tcp_server_address {
                 args.tcp_server_address = tcp_server_address;
+            }
+            if let Some(tcp_failover_addresses) = optional_args.tcp_failover_addresses {
+                args.tcp_failover_addresses = tcp_failover_addresses;
             }
             if let Some(tcp_reconnection_retries) = optional_args.tcp_reconnection_max_retries {
                 args.tcp_reconnection_max_retries = Some(tcp_reconnection_retries);

@@ -163,10 +163,10 @@ public class VsrResponseHandler extends SimpleChannelInboundHandler<ByteBuf> {
         IggyServerException error = VsrHeaders.evictionToException(frame);
         session.reset();
         try {
-            // The reason travels with the notification: an eviction the server
-            // decided on (a stale client) ends the session authoritatively,
-            // while the rest are transport-shaped, and the listener has to
-            // tell them apart.
+            // The reason travels with the notification so the listener can drop
+            // what belonged to the evicted session and say which eviction it
+            // was. None of them ends the sign-in: the next request
+            // re-establishes the session.
             onEviction.accept(error.getRawErrorCode());
         } catch (RuntimeException listenerError) {
             log.warn("Eviction listener failed: {}", listenerError.getMessage());

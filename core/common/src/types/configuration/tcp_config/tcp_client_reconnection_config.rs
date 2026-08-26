@@ -24,7 +24,9 @@ pub struct TcpClientReconnectionConfig {
     /// endpoints the client knows still get one pass, since they were
     /// configured to be tried, but nothing is retried after it.
     pub enabled: bool,
-    /// How many passes over the known endpoints, or `None` for unlimited.
+    /// How many passes over the known endpoints *after the first*, or `None`
+    /// for unlimited. `Some(0)` still makes that one pass, since the endpoints
+    /// were configured to be tried.
     ///
     /// Passes, not dials: one pass tries the endpoint the client is on, the
     /// addresses it was configured with, and every node the roster named, so a
@@ -34,9 +36,14 @@ pub struct TcpClientReconnectionConfig {
     /// Delay between passes. The first pass runs at once when the client knows
     /// more than one endpoint.
     pub interval: NonZeroIggyDuration,
-    /// Cooldown before redialing the endpoint that was just lost. It is owed to
-    /// that endpoint alone: the others are dialed without waiting, and the
-    /// paced one goes last in the pass.
+    /// Cooldown before redialing the endpoint of the last successful
+    /// connection, measured from when that connection was established rather
+    /// than from when it was lost: a session that outlived this interval is
+    /// redialed with no wait at all, which is the point -- the pace limit is
+    /// there for connections that keep dropping straight away.
+    ///
+    /// Owed to that endpoint alone: the others are dialed without waiting, and
+    /// the paced one goes last in the pass.
     pub reestablish_after: IggyDuration,
 }
 

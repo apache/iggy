@@ -90,6 +90,10 @@ type Job = {
   payload: Buffer,
   /** Whether to parse the response */
   handleResponse: boolean,
+  /** Whether the command is appended rather than prepended to the queue */
+  last: boolean,
+  /** Whether a not-admitted refusal re-checks the leader and re-issues */
+  followsLeaderMoves: boolean,
   /** When the whole request gives up, however often it is re-issued */
   deadline: number,
   /** Promise resolve function */
@@ -132,6 +136,13 @@ export class CommandResponseStream extends EventEmitter {
    * request refused by the same node so one demotion moves the client once.
    */
   private leaderMoveInFlight?: Promise<boolean>;
+  /**
+   * Refusals handed out to callers that have not decided what to do with them
+   * yet. The queue holds while any are outstanding: the caller of a refused
+   * command re-checks the leader, and a command written in the meantime goes
+   * out on the socket that check is about to replace.
+   */
+  private leaderMovesUndecided: number;
   /** How long a leaderless roster is polled before settling in place */
   private leaderlessWaitBudget: number;
   /** Delay between roster reads while the cluster elects */
@@ -165,6 +176,7 @@ export class CommandResponseStream extends EventEmitter {
     this.vsrSession = new VsrSession();
     this.authenticationPromise = undefined;
     this.settlingLeader = false;
+    this.leaderMovesUndecided = 0;
     this.leaderlessWaitBudget = LEADERLESS_WAIT_BUDGET_MS;
     this.leaderlessPollInterval = LEADERLESS_POLL_INTERVAL_MS;
     this.pendingSubmissions = 0;
@@ -214,8 +226,15 @@ export class CommandResponseStream extends EventEmitter {
     this._execQueue = [];
     for (const job of queued) {
       debug('re-issuing a queued command after a leader move', job.command);
+      // The whole job, not just the payload: a fresh budget would let a command
+      // caught in a move take twice the response timeout, and a roster read
+      // re-issued as leader-following would answer a leader check with another
+      // leader check.
       this.sendCommand(job.command, job.payload, {
-        handleResponse: job.handleResponse
+        handleResponse: job.handleResponse,
+        last: job.last,
+        followsLeaderMoves: job.followsLeaderMoves,
+        deadline: job.deadline
       }).then(job.resolve, job.reject);
     }
   }
@@ -262,13 +281,15 @@ export class CommandResponseStream extends EventEmitter {
       //
       // One budget for the whole request: the transient replays on a
       // connection, the leader re-checks, and the re-issues after a move all
-      // spend it, so a request cannot outlive it by moving.
-      const deadline = Date.now() + VSR_RESPONSE_TIMEOUT_MS;
+      // spend it, so a request cannot outlive it by moving. A command re-issued
+      // after a move keeps the budget it was first submitted with, rather than
+      // opening a second one.
+      const deadline = options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS;
       let response: CommandResponse;
       for (;;) {
         try {
           response = await this._queueCommand(command, payload, handleResponse,
-            last, deadline);
+            last, followsLeaderMoves, deadline);
           break;
         } catch (error) {
           if (!(error instanceof LeaderMovedError))
@@ -282,10 +303,19 @@ export class CommandResponseStream extends EventEmitter {
           // refusal the server actually gave: re-issued into what is left, the
           // request would time out instead and the caller would see a timeout
           // where the answer was "not admitted".
-          if (!followsLeaderMoves || !worthAnotherAttempt(deadline))
-            throw responseError(command, error.refusal.errorCode);
-
-          const moved = await this._followLeaderMove();
+          let moved = false;
+          try {
+            if (!followsLeaderMoves || !worthAnotherAttempt(deadline))
+              throw responseError(command, error.refusal.errorCode);
+            moved = await this._followLeaderMove();
+          } finally {
+            // Released as soon as the move is decided, before the pace below
+            // and before any re-authentication: those go through the queue
+            // themselves, and a queue still held for this refusal would never
+            // reach them.
+            if (followsLeaderMoves)
+              this._releaseUndecidedMove();
+          }
           if (!moved) {
             // Nowhere else to go yet: the roster still names this node, or it
             // could not be read. Paced, because the in-connection replay
@@ -326,13 +356,16 @@ export class CommandResponseStream extends EventEmitter {
     payload: Buffer,
     handleResponse: boolean,
     last: boolean,
+    followsLeaderMoves: boolean,
     deadline: number
   ): Promise<CommandResponse> {
     return new Promise<CommandResponse>((resolve, reject) => {
-      const job = {
+      const job: Job = {
         command,
         payload,
         handleResponse,
+        last,
+        followsLeaderMoves,
         deadline,
         resolve,
         reject
@@ -379,10 +412,33 @@ export class CommandResponseStream extends EventEmitter {
     })();
     this.leaderMoveInFlight = move;
     void move.finally(() => {
-      if (this.leaderMoveInFlight === move)
-        this.leaderMoveInFlight = undefined;
+      if (this.leaderMoveInFlight !== move)
+        return;
+      this.leaderMoveInFlight = undefined;
+      // The drain stopped while the move was being decided. A move that
+      // happened re-issues what was held back on the new socket; one that did
+      // not leaves it here, with nothing else due to pick it up.
+      if (!this.connection.redirecting)
+        void this._processQueue();
     });
     return move;
+  }
+
+  /** Whether a leader move is being decided or carried out. */
+  private _movePending(): boolean {
+    return this.leaderMovesUndecided > 0 || this.leaderMoveInFlight !== undefined;
+  }
+
+  /**
+   * Releases the queue hold one refusal took, and drains what was held back
+   * once the last of them is decided.
+   */
+  private _releaseUndecidedMove(): void {
+    if (this.leaderMovesUndecided > 0)
+      this.leaderMovesUndecided -= 1;
+    if (this._movePending() || this.connection.redirecting)
+      return;
+    void this._processQueue();
   }
 
   private _rememberRoster(response: CommandResponse): void {
@@ -409,12 +465,27 @@ export class CommandResponseStream extends EventEmitter {
       return;
     this.busy = true;
     while (this._execQueue.length > 0 && this.connection.socket.writable) {
-      const next = this._execQueue.shift();
+      // While a leader move is being decided, only the roster read the move
+      // itself runs goes out -- it is what decides where the client lands, and
+      // it is the one command that does not follow moves. Draining the rest
+      // would write them to the socket `redirect()` is about to replace, and a
+      // command in flight when that happens dies with a lost-connection error
+      // instead of being re-issued on the node the move lands on.
+      const index = this._movePending()
+        ? this._execQueue.findIndex((job) => !job.followsLeaderMoves)
+        : 0;
+      if (index < 0) break;
+      const [next] = this._execQueue.splice(index, 1);
       if (!next) break;
       const { command, payload, handleResponse, deadline, resolve, reject } = next;
       try {
         resolve(await this._processNext(command, payload, handleResponse, deadline));
       } catch (err) {
+        if (err instanceof LeaderMovedError && next.followsLeaderMoves)
+          // Counted before the rejection is handed out, not after: the caller
+          // resumes as a microtask, so this loop would otherwise write the next
+          // command before the re-check it is about to start has begun.
+          this.leaderMovesUndecided += 1;
         reject(err);
       }
     }
@@ -424,8 +495,11 @@ export class CommandResponseStream extends EventEmitter {
       // node being moved to.
       if (this.connection.redirecting)
         this._reissueQueue();
-      else
+      else if (!this._movePending())
         this._failQueue(new Error('connection is not writable'));
+      // Otherwise the move is still being decided: these commands were never
+      // written, and they are drained again once it settles -- here if the
+      // client stays, on the new socket if it moves.
     }
     this.busy = false;
     this._emitFinishQueue();

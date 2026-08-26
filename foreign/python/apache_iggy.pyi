@@ -1933,6 +1933,8 @@ class TcpConfig:
     @property
     def server_address(self) -> builtins.str: ...
     @property
+    def failover_addresses(self) -> builtins.list[builtins.str]: ...
+    @property
     def auto_login(self) -> AutoLogin: ...
     @property
     def reconnection(self) -> TcpReconnectionConfig: ...
@@ -1952,6 +1954,7 @@ class TcpConfig:
         cls,
         *,
         server_address: builtins.str | None = None,
+        failover_addresses: typing.Sequence[builtins.str] | None = None,
         auto_login: AutoLogin | None = None,
         reconnection: TcpReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
@@ -1966,6 +1969,11 @@ class TcpConfig:
 
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
+            failover_addresses: `host:port` of other nodes of the same cluster, dialed
+                in order when `server_address` cannot be reached. The roster the server
+                reports is remembered while the client is connected and dialed first,
+                so these seeds only have to be enough to reach the cluster once.
+                Defaults to none.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
             reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
@@ -1985,8 +1993,9 @@ class TcpConfig:
                 leaving it on.
 
         Raises:
-            ValueError: If `server_address` is not a valid `host:port` pair, if a
-                duration is negative, or if `heartbeat_interval` is zero.
+            ValueError: If `server_address` or one of `failover_addresses` is not a
+                valid `host:port` pair, if a duration is negative, or if
+                `heartbeat_interval` is zero.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2016,18 +2025,21 @@ class TcpReconnectionConfig:
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
-            max_retries: Passes over the known endpoints before giving up, or
-                `None` for unlimited. One pass tries the endpoint the client is
-                on, the address it was configured with, and every node the
-                roster named, so this counts passes rather than dials. Defaults
+            max_retries: Passes over the known endpoints after the first, or
+                `None` for unlimited; `0` still makes that first pass. One pass
+                tries the endpoint the client is on, the address it was
+                configured with, and every node the roster named, so this counts
+                passes rather than dials. Defaults
                 to unlimited, which means a call awaited while the server is
                 down never returns: `connect()`, `send_messages()` and
                 `poll_messages()` all wait inside the retry loop. Set a finite
                 number for request/reply style usage, so a call fails instead.
             interval: Delay between passes. Defaults to 1 second. The first pass
                 runs at once when more than one endpoint is known.
-            reestablish_after: Cooldown before redialing the endpoint that was
-                just lost, owed to that endpoint alone. Defaults to 5 seconds.
+            reestablish_after: Cooldown before redialing the endpoint of the last
+                successful connection, measured from when it was established, so
+                a session that outlived the interval is redialed at once. Owed to
+                that endpoint alone. Defaults to 5 seconds.
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the

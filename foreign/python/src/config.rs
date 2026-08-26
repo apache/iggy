@@ -121,18 +121,21 @@ impl TcpReconnectionConfig {
     ///
     /// Args:
     ///     enabled: Whether to reconnect at all. Defaults to enabled.
-    ///     max_retries: Passes over the known endpoints before giving up, or
-    ///         `None` for unlimited. One pass tries the endpoint the client is
-    ///         on, the address it was configured with, and every node the
-    ///         roster named, so this counts passes rather than dials. Defaults
+    ///     max_retries: Passes over the known endpoints after the first, or
+    ///         `None` for unlimited; `0` still makes that first pass. One pass
+    ///         tries the endpoint the client is on, the address it was
+    ///         configured with, and every node the roster named, so this counts
+    ///         passes rather than dials. Defaults
     ///         to unlimited, which means a call awaited while the server is
     ///         down never returns: `connect()`, `send_messages()` and
     ///         `poll_messages()` all wait inside the retry loop. Set a finite
     ///         number for request/reply style usage, so a call fails instead.
     ///     interval: Delay between passes. Defaults to 1 second. The first pass
     ///         runs at once when more than one endpoint is known.
-    ///     reestablish_after: Cooldown before redialing the endpoint that was
-    ///         just lost, owed to that endpoint alone. Defaults to 5 seconds.
+    ///     reestablish_after: Cooldown before redialing the endpoint of the last
+    ///         successful connection, measured from when it was established, so
+    ///         a session that outlived the interval is redialed at once. Owed to
+    ///         that endpoint alone. Defaults to 5 seconds.
     ///
     /// Raises:
     ///     ValueError: If a duration is negative, if `max_retries` is outside the
@@ -241,6 +244,11 @@ impl TcpConfig {
     ///
     /// Args:
     ///     server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
+    ///     failover_addresses: `host:port` of other nodes of the same cluster, dialed
+    ///         in order when `server_address` cannot be reached. The roster the server
+    ///         reports is remembered while the client is connected and dialed first,
+    ///         so these seeds only have to be enough to reach the cluster once.
+    ///         Defaults to none.
     ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
     ///     reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
     ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
@@ -260,12 +268,14 @@ impl TcpConfig {
     ///         leaving it on.
     ///
     /// Raises:
-    ///     ValueError: If `server_address` is not a valid `host:port` pair, if a
-    ///         duration is negative, or if `heartbeat_interval` is zero.
+    ///     ValueError: If `server_address` or one of `failover_addresses` is not a
+    ///         valid `host:port` pair, if a duration is negative, or if
+    ///         `heartbeat_interval` is zero.
     #[new]
     #[pyo3(signature = (
         *,
         server_address=None,
+        failover_addresses=None,
         auto_login=None,
         reconnection=None,
         heartbeat_interval=None,
@@ -280,6 +290,8 @@ impl TcpConfig {
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] server_address: Option<
             String,
         >,
+        #[gen_stub(override_type(type_repr = "typing.Sequence[builtins.str] | None", imports=("typing")))]
+        failover_addresses: Option<Vec<String>>,
         #[gen_stub(override_type(type_repr = "AutoLogin | None"))] auto_login: Option<AutoLogin>,
         #[gen_stub(override_type(type_repr = "TcpReconnectionConfig | None"))] reconnection: Option<
             TcpReconnectionConfig,
@@ -298,6 +310,9 @@ impl TcpConfig {
         let mut builder = TcpClientConfigBuilder::new();
         if let Some(server_address) = server_address {
             builder = builder.with_server_address(server_address);
+        }
+        if let Some(failover_addresses) = failover_addresses {
+            builder = builder.with_failover_addresses(failover_addresses);
         }
         let mut inner = builder
             .build()
@@ -338,6 +353,12 @@ impl TcpConfig {
     #[getter]
     fn server_address(&self) -> String {
         self.inner.server_address.clone()
+    }
+
+    #[gen_stub(override_return_type(type_repr = "builtins.list[builtins.str]"))]
+    #[getter]
+    fn failover_addresses(&self) -> Vec<String> {
+        self.inner.failover_addresses.clone()
     }
 
     #[getter]
@@ -392,8 +413,9 @@ impl TcpConfig {
             None => "None".to_owned(),
         };
         format!(
-            "TcpConfig(server_address={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, tls_enabled={}, tls_domain={:?}, tls_ca_file={tls_ca_file}, tls_validate_certificate={}, nodelay={})",
+            "TcpConfig(server_address={:?}, failover_addresses={:?}, auto_login={}, reconnection={}, heartbeat_interval={}, tls_enabled={}, tls_domain={:?}, tls_ca_file={tls_ca_file}, tls_validate_certificate={}, nodelay={})",
             self.inner.server_address,
+            self.inner.failover_addresses,
             self.auto_login().__repr__(),
             self.reconnection().__repr__(),
             duration_repr(self.inner.heartbeat_interval.get()),

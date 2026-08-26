@@ -53,7 +53,14 @@ export type SendCommandOptions = {
    * command. False for the roster read a re-check itself runs: answering a
    * leader check with another leader check would recurse.
    */
-  followsLeaderMoves?: boolean
+  followsLeaderMoves?: boolean,
+  /**
+   * When the whole request gives up, as an epoch timestamp in milliseconds.
+   * Set when a command already carries a budget -- one re-issued after a
+   * leader move keeps the budget it was first submitted with, rather than
+   * opening a second one on top of it. Defaults to a fresh response timeout.
+   */
+  deadline?: number
 };
 
 /**

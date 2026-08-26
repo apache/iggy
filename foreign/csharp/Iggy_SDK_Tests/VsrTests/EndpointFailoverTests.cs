@@ -219,6 +219,10 @@ public sealed class EndpointFailoverTests
     ///     A survivor that is not listening yet when its node dies still has to be found: the client keeps
     ///     rotating over every endpoint it knows, so one that comes up while it is retrying is dialed on a
     ///     later pass rather than only on the first.
+    ///     <para>
+    ///         The retry budget counts rotations, not dials: a single retry buys a whole second pass over
+    ///         both endpoints. Spent per dial, the budget would be gone before the survivor came up.
+    ///     </para>
     /// </summary>
     [Fact]
     public async Task ResumesOnASurvivorThatComesUpWhileTheClientIsRetrying()
@@ -243,7 +247,9 @@ public sealed class EndpointFailoverTests
             ReconnectionSettings = new ReconnectionSettings
             {
                 Enabled = true,
-                MaxRetries = 4,
+                // One retry, so the pass that finds the survivor is the one the budget pays for. A larger
+                // budget would find it whether the budget counts rotations or dials.
+                MaxRetries = 1,
                 InitialDelay = TimeSpan.FromMilliseconds(200)
             }
         };

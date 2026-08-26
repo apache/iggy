@@ -548,6 +548,62 @@ describe('IggyConnection', () => {
     }
   );
 
+  it('makes one pass when every endpoint is down and reconnection is disabled',
+    async () => {
+      // One pass, not the whole retry budget: with the budget read but the
+      // flag ignored, a client that opted out of retries dials every endpoint
+      // once per pass for all of them -- and with the backoff gated on the same
+      // flag, back to back.
+      //
+      // Plain TCP behind a TLS client, closed at once: the dial fails, so the
+      // pass moves on, and every dial is counted where it lands.
+      const first = await startServer();
+      const firstPort = (first.address() as AddressInfo).port;
+      let firstDials = 0;
+      first.on('connection', (socket) => {
+        firstDials += 1;
+        socket.destroy();
+      });
+      const second = await startServer();
+      const secondPort = (second.address() as AddressInfo).port;
+      let secondDials = 0;
+      second.on('connection', (socket) => {
+        secondDials += 1;
+        socket.destroy();
+      });
+
+      const connection = new IggyConnection({
+        transport: 'TLS',
+        options: {
+          host: '127.0.0.1',
+          port: firstPort,
+          rejectUnauthorized: false
+        },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: secondPort }]);
+        await connection.connect().catch(() => undefined);
+        await new Promise<void>((resolve) => setTimeout(resolve, 300));
+
+        assert.equal(connection.connected, false);
+        // The connect's own dial of the configured endpoint, then one pass over
+        // both: the endpoint the client starts on is dialed twice, the one
+        // behind it once.
+        assert.deepEqual([firstDials, secondDials], [2, 1],
+          'a client that opted out of retries swept more than once'
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => first.close(() => resolve()));
+        await new Promise<void>((resolve) => second.close(() => resolve()));
+      }
+    }
+  );
+
   it('skips the first backoff when another endpoint is known',
     async () => {
       // The endpoint the client is on is dead and a live one sits behind it in

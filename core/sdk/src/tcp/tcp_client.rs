@@ -372,38 +372,59 @@ impl iggy_common::VsrSessionControl for TcpClient {
     }
 
     async fn refresh_session_password(&self, user: &Identifier, new_password: &str) {
-        let mut remembered = self.session_credentials.lock().await;
-        let Some(sign_in) = remembered.as_mut() else {
-            return;
+        // Two independent copies of a password can go stale here, and a change
+        // may target either user: the sign-in this client remembers, and the
+        // one a configured `AutoLogin` carries. A caller signed in as somebody
+        // else -- by hand, or with a token -- can still be the one who changed
+        // the configured user's password.
+        let remembered_username = {
+            let mut remembered = self.session_credentials.lock().await;
+            remembered.as_mut().and_then(|sign_in| {
+                // A personal access token is not derived from the password.
+                let Credentials::UsernamePassword(username, password) = &mut sign_in.credentials
+                else {
+                    return None;
+                };
+                let targets_session_user = match user.kind {
+                    IdKind::Numeric => user.get_u32_value().is_ok_and(|id| id == sign_in.user_id),
+                    IdKind::String => user
+                        .get_cow_str_value()
+                        .is_ok_and(|name| name.as_ref() == username),
+                };
+                if targets_session_user {
+                    *password = SecretString::from(new_password.to_owned());
+                }
+                Some((username.clone(), targets_session_user))
+            })
         };
-        // A personal access token is not derived from the password.
-        let Credentials::UsernamePassword(username, password) = &mut sign_in.credentials else {
+
+        let AutoLogin::Enabled(Credentials::UsernamePassword(configured, _)) =
+            &self.config.auto_login
+        else {
             return;
         };
 
-        let targets_session_user = match user.kind {
-            IdKind::Numeric => user.get_u32_value().is_ok_and(|id| id == sign_in.user_id),
-            IdKind::String => user
-                .get_cow_str_value()
-                .is_ok_and(|name| name.as_ref() == username),
-        };
-        if !targets_session_user {
-            return;
-        }
-
-        *password = SecretString::from(new_password.to_owned());
         // The configured credentials cannot be rewritten -- the config is
         // shared and immutable -- and the password they carry will never work
-        // again, so the new one is kept here instead. Kept outside the
+        // again, so the new one is kept beside them. Kept outside the
         // remembered sign-in on purpose: that record is replaced wholesale by
         // every later login, so a marker on it would survive exactly one
         // reconnect and the one after that would replay the dead password.
-        let configured_user_changed = matches!(
-            &self.config.auto_login,
-            AutoLogin::Enabled(Credentials::UsernamePassword(configured, _))
-                if configured == username
-        );
-        if configured_user_changed {
+        //
+        // A numeric identifier can only be recognised as the configured user
+        // through the id the signed-in user's own login reported, so a change
+        // made from another user's session has to name the user for the
+        // configured copy to be refreshed. Naming it is what an administrator
+        // doing this from elsewhere does anyway.
+        let targets_configured_user = match user.kind {
+            IdKind::String => user
+                .get_cow_str_value()
+                .is_ok_and(|name| name.as_ref() == configured),
+            IdKind::Numeric => remembered_username.is_some_and(|(username, is_session_user)| {
+                is_session_user && &username == configured
+            }),
+        };
+        if targets_configured_user {
             self.configured_password
                 .lock()
                 .await
@@ -782,7 +803,20 @@ impl TcpClient {
     /// applied on top: the configured password will never work again, and every
     /// later reconnect would otherwise fail `InvalidCredentials`.
     async fn sign_in_credentials(&self) -> Option<Credentials> {
+        // The sign-in that last succeeded, whoever ran it. One rule in every
+        // SDK: a client is whoever it last signed in as, so the same failure
+        // restores the same session everywhere. A configured `AutoLogin` signs
+        // in through this very path, so for a client that never signed in by
+        // hand the remembered credentials *are* the configured ones.
+        if let Some(remembered) = self.session_credentials.lock().await.as_ref() {
+            return Some(remembered.credentials.clone());
+        }
+
         match &self.config.auto_login {
+            // Before the first sign-in, or after a logout dropped what was
+            // remembered. A password change this client committed for the
+            // configured user is applied on top: the configured password will
+            // never work again, and the config cannot be rewritten.
             AutoLogin::Enabled(Credentials::UsernamePassword(username, configured_password)) => {
                 let password = self
                     .configured_password
@@ -793,12 +827,7 @@ impl TcpClient {
                 Some(Credentials::UsernamePassword(username.clone(), password))
             }
             AutoLogin::Enabled(credentials) => Some(credentials.clone()),
-            AutoLogin::Disabled => self
-                .session_credentials
-                .lock()
-                .await
-                .as_ref()
-                .map(|remembered| remembered.credentials.clone()),
+            AutoLogin::Disabled => None,
         }
     }
 
@@ -1877,6 +1906,10 @@ mod tests {
             )
             .await;
 
+        // A sign-out drops what was remembered, so what the configured
+        // credentials carry is what the next connect signs in with -- and this
+        // change was somebody else's.
+        client.forget_session_credentials().await;
         match client.sign_in_credentials().await {
             Some(Credentials::UsernamePassword(username, password)) => {
                 assert_eq!(username, "configured");
@@ -1886,8 +1919,49 @@ mod tests {
         }
     }
 
+    // A change made from a session signed in as somebody else still kills the
+    // configured password, so the next connect must not replay it. Named rather
+    // than numbered, since only the signed-in user's own id is known here.
     #[tokio::test]
-    async fn configured_credentials_outrank_the_ones_a_sign_in_remembered() {
+    async fn a_password_change_naming_the_configured_user_reaches_it_from_another_session() {
+        let client = TcpClient::create(Arc::new(TcpClientConfig {
+            auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
+                "configured".to_string(),
+                "old".into(),
+            )),
+            ..TcpClientConfig::default()
+        }))
+        .expect("create the client");
+        client
+            .remember_session_credentials(
+                Credentials::PersonalAccessToken("token".into()),
+                SESSION_USER_ID,
+            )
+            .await;
+
+        client
+            .refresh_session_password(
+                &Identifier::named("configured").expect("named identifier"),
+                "new",
+            )
+            .await;
+
+        client.forget_session_credentials().await;
+        match client.sign_in_credentials().await {
+            Some(Credentials::UsernamePassword(username, password)) => {
+                assert_eq!(username, "configured");
+                assert_eq!(password.expose_secret(), "new");
+            }
+            other => panic!("expected the configured user with the new password, got {other:?}"),
+        }
+    }
+
+    // One rule in every SDK: a client is whoever it last signed in as, so the
+    // same failure restores the same session in each of them. The connection
+    // re-authenticates from the login it captured, and a redial that replayed
+    // somebody else would make the outcome depend on which got there first.
+    #[tokio::test]
+    async fn the_last_sign_in_outranks_the_configured_credentials() {
         let client = TcpClient::create(Arc::new(TcpClientConfig {
             auto_login: AutoLogin::Enabled(Credentials::UsernamePassword(
                 "configured".to_string(),
@@ -1903,6 +1977,14 @@ mod tests {
             )
             .await;
 
+        match client.sign_in_credentials().await {
+            Some(Credentials::UsernamePassword(username, _)) => assert_eq!(username, "signed-in"),
+            other => panic!("expected the sign-in that last succeeded, got {other:?}"),
+        }
+
+        // A sign-out leaves no session to restore, and the configured
+        // credentials are what every connect of this client signs in as.
+        client.forget_session_credentials().await;
         match client.sign_in_credentials().await {
             Some(Credentials::UsernamePassword(username, _)) => assert_eq!(username, "configured"),
             other => panic!("expected the configured credentials, got {other:?}"),

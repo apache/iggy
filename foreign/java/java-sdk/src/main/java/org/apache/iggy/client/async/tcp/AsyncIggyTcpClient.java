@@ -116,15 +116,18 @@ import java.util.stream.Stream;
  */
 public class AsyncIggyTcpClient {
 
-    private static final int INVALID_COMMAND_ERROR_CODE = 3;
-    private static final Logger log = LoggerFactory.getLogger(AsyncIggyTcpClient.class);
-    private static final RetryPolicy DEFAULT_RECONNECT_POLICY = RetryPolicy.fixedDelay(12, Duration.ofSeconds(5));
     /**
      * Bound on one dial while other endpoints are queued behind it, matching
      * the Rust, Go, C# and Node SDKs. Netty's own connect timeout would
      * otherwise let a node whose syns are dropped hold the whole rotation.
+     *
+     * Package-private: the tests pin the bound against the other SDKs'.
      */
-    private static final Duration FAILOVER_DIAL_TIMEOUT = Duration.ofSeconds(2);
+    static final Duration FAILOVER_DIAL_TIMEOUT = Duration.ofSeconds(2);
+
+    private static final int INVALID_COMMAND_ERROR_CODE = 3;
+    private static final Logger log = LoggerFactory.getLogger(AsyncIggyTcpClient.class);
+    private static final RetryPolicy DEFAULT_RECONNECT_POLICY = RetryPolicy.fixedDelay(12, Duration.ofSeconds(5));
 
     private final ConnectionInfo seedConnectionInfo;
     private final AtomicBoolean reconnecting = new AtomicBoolean();
@@ -509,15 +512,20 @@ public class AsyncIggyTcpClient {
      *
      * With other endpoints queued behind this one, a node whose syns are
      * dropped must not hold the rotation, so the wait is capped at
-     * {@link #FAILOVER_DIAL_TIMEOUT} - the bound the other SDKs use. A caller
-     * who configured a connection timeout gets exactly that, and a client that
-     * knows one endpoint keeps the ordinary default.
+     * {@link #FAILOVER_DIAL_TIMEOUT} - the bound the other SDKs use. A
+     * configured connection timeout is capped too rather than exempted: it says
+     * how long one endpoint may take, and a rotation that spends it on every
+     * endpoint reaches the survivor long after the caller gave up. A client that
+     * knows one endpoint keeps whatever it configured, since there is nothing
+     * queued behind that dial.
      */
-    private Optional<Duration> dialTimeout() {
-        if (connectionTimeout.isPresent() || redialCandidates().size() < 2) {
+    Optional<Duration> dialTimeout() {
+        if (redialCandidates().size() < 2) {
             return connectionTimeout;
         }
-        return Optional.of(FAILOVER_DIAL_TIMEOUT);
+        return Optional.of(connectionTimeout
+                .filter(configured -> configured.compareTo(FAILOVER_DIAL_TIMEOUT) < 0)
+                .orElse(FAILOVER_DIAL_TIMEOUT));
     }
 
     /**
@@ -670,7 +678,9 @@ public class AsyncIggyTcpClient {
         // retries redials nothing, which is what it asked for.
         boolean sweepOnce = attempt == 1 && candidates.size() > 1;
         if (attempt > policy.getMaxRetries() && !sweepOnce) {
-            log.error("Redial gave up after {} attempts, next request will fail fast", policy.getMaxRetries());
+            // The rotations actually run, not the configured budget: a policy of
+            // zero retries still sweeps once when it knows several endpoints.
+            log.error("Redial gave up after {} rotations, next request will fail fast", attempt - 1);
             return CompletableFuture.completedFuture(null);
         }
         // The delay paces rotations, not dials. The first rotation runs at once
@@ -699,10 +709,14 @@ public class AsyncIggyTcpClient {
             return redialAttempt(attempt + 1, policy);
         }
         ConnectionInfo target = candidates.get(index);
+        // A policy of zero retries that knows several endpoints still gets the
+        // one rotation they were made known for, so the budget shown here is
+        // what will actually run rather than what was configured.
+        int rotations = Math.max(policy.getMaxRetries(), candidates.size() > 1 ? 1 : 0);
         log.info(
                 "Redial attempt {}/{} to {} ({}/{})",
                 attempt,
-                policy.getMaxRetries(),
+                rotations,
                 target.serverAddress(),
                 index + 1,
                 candidates.size());
@@ -779,14 +793,14 @@ public class AsyncIggyTcpClient {
      * sign-in that last succeeded, falling back to the credentials configured
      * on the builder when no login has run yet.
      *
-     * The last sign-in rather than the configured one, which is where this
-     * differs from the Rust and Go SDKs: the connection re-authenticates a
-     * replacement channel from the login payload it captured, which is that
-     * same last sign-in. Replaying a different user here would make the same
-     * eviction land on a different session depending on whether the channel
-     * or the redial got there first. A client that only ever used its
-     * configured credentials remembers exactly those, so nothing changes for
-     * it.
+     * The last sign-in outranks the configured credentials, the same rule as in
+     * every other SDK: a client is whoever it last signed in as. The connection
+     * also re-authenticates a replacement channel from the login payload it
+     * captured, which is that same last sign-in, so replaying a different user
+     * here would make one eviction land on a different session depending on
+     * whether the channel or the redial got there first. A client that only ever
+     * used its configured credentials remembers exactly those, so nothing
+     * changes for it.
      *
      * The login runs through the users client, so leader discovery retargets
      * again before Register when the redialed node is not the leader.
@@ -952,11 +966,6 @@ public class AsyncIggyTcpClient {
     /** Whether a sign-in is remembered for replay, for tests in this package. */
     boolean hasRememberedLogin() {
         return rememberedLogin != null;
-    }
-
-    /** The live connection, for tests in this package. */
-    AsyncTcpConnection currentConnection() {
-        return connection.get();
     }
 
     /**

@@ -64,7 +64,6 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int OPERATION_CREATE_STREAM = 128;
     private static final int GET_CLUSTER_METADATA_CODE = 12;
     private static final int CREATE_STREAM_CODE = 202;
-    private static final int PING_CODE = 1;
     private static final int TRANSIENT_NOT_ACCEPTED = 58;
     private static final int EVICTION_STALE_CLIENT = 13;
 
@@ -274,6 +273,72 @@ class AsyncIggyTcpClientTransientFailoverTest {
                         .as("the evicted session was not re-established")
                         .isGreaterThan(registrationsBeforeEviction);
                 assertThat(registeredLogins.get(registeredLogins.size() - 1)).contains("handrun");
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            server.completeExceptionally(new IllegalStateException("test over"));
+        }
+    }
+
+    /**
+     * Credentials on the builder and a hand-run sign-in for somebody else: the
+     * revived session is the last sign-in, the same rule as on a redial and in
+     * every other SDK. The connection re-authenticates a replacement channel
+     * from the login it captured, which is that same sign-in, so replaying the
+     * configured user here would make one eviction land on a different session
+     * depending on which path got there first.
+     */
+    @Test
+    void shouldReviveTheLastSignInRatherThanTheConfiguredOne() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket serverSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger registrations = new AtomicInteger();
+            List<String> registeredLogins = new CopyOnWriteArrayList<>();
+            AtomicBoolean evict = new AtomicBoolean(true);
+            CompletableFuture<Void> server = serve(serverSocket, 6, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    registeredLogins.add(request.bodyAsText());
+                    return Response.success(OPERATION_REGISTER, registerBody(registrations.incrementAndGet()));
+                }
+                if (request.operation() == OPERATION_CREATE_STREAM) {
+                    if (evict.compareAndSet(true, false)) {
+                        return Response.eviction(EVICTION_STALE_CLIENT);
+                    }
+                    ByteBuf body = Unpooled.buffer(Integer.BYTES);
+                    body.writeIntLE(0);
+                    return Response.success(OPERATION_CREATE_STREAM, body);
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(serverSocket.getLocalPort())
+                    .credentials("configured", "configured")
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("handrun", "handrun").get(5, TimeUnit.SECONDS);
+                int registrationsBeforeEviction = registrations.get();
+
+                assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                                .get(5, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(IggyServerException.class);
+
+                assertThat(client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                                .get(5, TimeUnit.SECONDS))
+                        .isEmpty();
+                assertThat(registrations.get())
+                        .as("the evicted session was not re-established")
+                        .isGreaterThan(registrationsBeforeEviction);
+                assertThat(registeredLogins.get(registeredLogins.size() - 1))
+                        .as("the revived session signed in as the configured user")
+                        .contains("handrun")
+                        .doesNotContain("configured");
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }

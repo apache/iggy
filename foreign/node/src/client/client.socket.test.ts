@@ -226,12 +226,6 @@ const connectionOf = (client: CommandResponseStream): {
   connection: { redirect: (host: string, port: number) => Promise<void> }
 }).connection;
 
-/** Drives the leader re-check a refused request runs. */
-const followLeaderMove = (client: CommandResponseStream): Promise<boolean> =>
-  (client as unknown as {
-    _followLeaderMove: () => Promise<boolean>
-  })._followLeaderMove();
-
 const compressLeaderlessPoll = (
   client: CommandResponseStream,
   budget: number
@@ -1031,14 +1025,14 @@ describe('VSR client socket', () => {
             COMMAND_CODE.GetClusterMetadata
         ).length;
 
-        // Two refusals, one re-check: the second caller shares the move the
-        // first started rather than starting its own or being told 58.
-        const moves = await Promise.all([
-          followLeaderMove(client),
-          followLeaderMove(client)
+        // Two commands, both refused by the demoted node: one re-check between
+        // them, and both answered on the node it moved to.
+        const answers = await Promise.all([
+          client.sendCommand(60_032, Buffer.alloc(0)),
+          client.sendCommand(60_032, Buffer.alloc(0))
         ]);
 
-        assert.deepEqual(moves, [true, true]);
+        assert.deepEqual(answers.map((answer) => answer.status), [0, 0]);
         const rosterReads = demoted.frames.filter(
           (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) ===
             COMMAND_CODE.GetClusterMetadata
@@ -1046,10 +1040,89 @@ describe('VSR client socket', () => {
         assert.equal(rosterReads, 1,
           'each refusal re-read the roster on its own'
         );
+        const reissued = leader.frames.filter(
+          (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_032
+        ).length;
+        assert.equal(reissued, 2,
+          'a refused command was not re-issued on the node the move landed on'
+        );
         const connection = (client as unknown as {
           connection: { isConnectedTo: (host: string, port: number) => boolean }
         }).connection;
         assert.equal(connection.isConnectedTo('127.0.0.1', leader.port), true);
+      } finally {
+        client.destroy();
+        await leader.close();
+        await demoted.close();
+      }
+    }
+  );
+
+  it('holds a queued command instead of writing it to the node being left',
+    async () => {
+      // A refusal sends its caller to re-read the roster, and the drain that
+      // handed it out keeps going. Written in that window, the next queued
+      // command goes to the socket the move is about to replace: in flight when
+      // that happens, it dies with a lost-connection error nobody can act on
+      // instead of being re-issued on the node the move lands on.
+      const leader = await startVsrServer((frame, socket) => {
+        singleNodeHandler(leader.port)(frame, socket);
+      });
+      let demotedYet = false;
+      const demoted = await startVsrServer((frame, socket) => {
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (code === COMMAND_CODE.GetClusterMetadata) {
+          socket.write(replyFrame(
+            Operation.NonReplicated,
+            demotedYet
+              ? twoNodeMetadataBody(demoted.port, leader.port)
+              : twoNodeMetadataBody(leader.port, demoted.port)
+          ));
+          return;
+        }
+        if (code === 60_037) {
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          return;
+        }
+        if (code === 60_038) {
+          // Accepted and never answered: a command written here is stuck until
+          // the move replaces the socket under it.
+          return;
+        }
+        singleNodeHandler(demoted.port)(frame, socket);
+      });
+
+      const client = new CommandResponseStream(vsrConfig(demoted.port));
+      try {
+        await client.authenticate(vsrConfig(demoted.port).credentials);
+        demotedYet = true;
+
+        // The second command is queued while the first is in flight, which is
+        // where a command caught in a move comes from.
+        const refused = client.sendCommand(60_037, Buffer.alloc(0));
+        const behind = client.sendCommand(60_038, Buffer.alloc(0));
+        refused.catch(() => undefined);
+        behind.catch(() => undefined);
+
+        const settled = await Promise.race([
+          Promise.all([refused, behind]).then(() => 'answered'),
+          new Promise((resolve) => {
+            setTimeout(() => resolve('stalled'), 10_000).unref();
+          })
+        ]);
+        assert.equal(settled, 'answered',
+          'the command behind the refusal went out on the node being left'
+        );
+        assert.ok(
+          !demoted.frames.some((frame) =>
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_038),
+          'the command behind the refusal was written to the node being left'
+        );
+        assert.ok(
+          leader.frames.some((frame) =>
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_038),
+          'the command behind the refusal never reached the node moved to'
+        );
       } finally {
         client.destroy();
         await leader.close();
@@ -1117,9 +1190,6 @@ describe('VSR client socket', () => {
       const realNow = Date.now;
       try {
         await client.authenticate(vsrConfig(server.port).credentials);
-        // The request's own budget, then the clock jumped past it: what is left
-        // cannot carry another attempt, so the caller has to see the answer the
-        // server gave and not the timeout a doomed re-issue would produce.
         // The request's budget, the first exchange, the window that hands the
         // refusal out, and then a clock 10ms short of the deadline: too little
         // to carry another attempt, so the caller has to see the answer the
@@ -1138,6 +1208,73 @@ describe('VSR client socket', () => {
         Date.now = realNow;
         client.destroy();
         await server.close();
+      }
+    }
+  );
+
+  it('surfaces the refusal when the move left too little of the budget',
+    async () => {
+      // The move itself costs budget: a roster read, an election it waited out,
+      // a redial. What is left can be positive and still too small to carry
+      // another exchange, and re-issued into it the request times out -- the
+      // caller then sees a timeout where the answer was "not admitted".
+      const leader = await startVsrServer((frame, socket) => {
+        singleNodeHandler(leader.port)(frame, socket);
+      });
+      let demotedYet = false;
+      const demoted = await startVsrServer((frame, socket) => {
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (code === COMMAND_CODE.GetClusterMetadata) {
+          socket.write(replyFrame(
+            Operation.NonReplicated,
+            demotedYet
+              ? twoNodeMetadataBody(demoted.port, leader.port)
+              : twoNodeMetadataBody(leader.port, demoted.port)
+          ));
+          return;
+        }
+        if (code === 60_039) {
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          return;
+        }
+        singleNodeHandler(demoted.port)(frame, socket);
+      });
+
+      const client = new CommandResponseStream(vsrConfig(demoted.port));
+      const realNow = Date.now;
+      let offset = 0;
+      try {
+        await client.authenticate(vsrConfig(demoted.port).credentials);
+        demotedYet = true;
+
+        const deadline = realNow() + 30_000;
+        const connection = connectionOf(client);
+        const move = connection.redirect.bind(connection);
+        connection.redirect = async (host: string, port: number) => {
+          await move(host, port);
+          // 30ms of budget left the moment the client lands: positive, and
+          // below the interval one exchange needs.
+          offset = deadline - realNow() - 30;
+        };
+        Date.now = () => realNow() + offset;
+
+        await assert.rejects(
+          () => client.sendCommand(60_039, Buffer.alloc(0), { deadline }),
+          (error: unknown) =>
+            error instanceof ResponseError &&
+            error.commandCode === 60_039 &&
+            error.errorCode === 58
+        );
+        assert.ok(
+          !leader.frames.some((frame) =>
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_039),
+          'the request was re-issued into a budget too small to answer it'
+        );
+      } finally {
+        Date.now = realNow;
+        client.destroy();
+        await leader.close();
+        await demoted.close();
       }
     }
   );
