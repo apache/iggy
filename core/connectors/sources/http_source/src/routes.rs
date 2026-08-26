@@ -185,6 +185,12 @@ pub enum RouteConflict {
 }
 
 impl RouteTable {
+    /// Whether anything is routable. An instance with every endpoint revoked
+    /// or expired and no named path serves nothing, however joined it is.
+    pub fn is_empty(&self) -> bool {
+        self.secret_paths.is_empty() && self.named_paths.is_empty()
+    }
+
     /// Projects every joined instance's registry into one lookup table.
     pub fn build(instances: &[Arc<SharedState>]) -> Result<Self, RouteConflict> {
         let mut table = RouteTable::default();

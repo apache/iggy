@@ -189,7 +189,9 @@ Forwarding the provider's delivery id is the recommended default, because it is 
 
 ## Sharing one listener
 
-The first instance to open binds both ports. Later instances validate their configuration against the running listener and join it. `listen_addr`, `admin_listen_addr`, `max_body_size_bytes`, and `management_token` must agree; a mismatch fails that instance's `open()` with a message naming the field, rather than silently handing it a listener its configuration does not describe.
+The first instance to open binds both ports. Later instances validate their configuration against the running listener and join it. `admin_listen_addr`, `max_body_size_bytes`, and `management_token` must agree; a mismatch fails that instance's `open()` with a message naming the field, rather than silently handing it a listener its configuration does not describe.
+
+`listen_addr` is not validated that way, because it is what groups instances onto a listener in the first place. Two spellings of the same socket, `0.0.0.0:9090` and `127.0.0.1:9090`, are two groups, so the second instance tries to bind a port the first already holds and fails with an address-in-use error naming that field. Instances meant to share a listener must spell `listen_addr` identically.
 
 `instance_name` must also be unique on the listener, since it is how the management API addresses an instance and how every metric series is labelled. Instances that leave it unset get their distinct numeric plugin id, so they cannot collide.
 
