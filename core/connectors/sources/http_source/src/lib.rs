@@ -37,7 +37,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -71,6 +71,11 @@ pub const DEFAULT_HMAC_HEADER: &str = "X-Hub-Signature-256";
 pub const DEFAULT_HMAC_PREFIX: &str = "sha256=";
 
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long after a poll returns the source still counts as live. Generous
+/// against the SDK's 30s batch-result timeout, which is the longest a healthy
+/// source sits between polls.
+const POLL_LIVENESS_SECONDS: u64 = 60;
 
 /// HTTP handler side of an instance's bridge. The pair comes from
 /// `bounded_async` because the `poll()` side needs `recv().await`; the handler
@@ -110,6 +115,20 @@ pub struct HttpSource {
     restore_error: Option<String>,
 }
 
+/// Clears the in-flight marker however `poll()` ends, including cancellation.
+/// The SDK drops the poll future when it stops the task, so without a guard a
+/// stopped source would look permanently mid-poll.
+pub(crate) struct PollGuard<'a>(&'a SharedState);
+
+impl Drop for PollGuard<'_> {
+    fn drop(&mut self) {
+        self.0.poll_active.store(false, Ordering::Release);
+        self.0
+            .last_poll_at
+            .store(unix_now_seconds(), Ordering::Release);
+    }
+}
+
 /// Unacknowledged batch, kept whole so a NACK can be re-polled verbatim.
 #[derive(Debug)]
 struct StagedBatch {
@@ -135,6 +154,13 @@ pub struct SharedState {
     pub(crate) forward_headers: Vec<(HeaderName, HeaderKey)>,
     registry: ArcSwap<EndpointRegistry>,
     registry_dirty: AtomicBool,
+    /// True while a `poll()` is in flight, including the long block on an idle
+    /// bridge. Cleared by a guard, so a cancelled poll clears it too, which is
+    /// what makes a stopped poll task observable.
+    poll_active: AtomicBool,
+    /// When the last `poll()` returned. Covers the gap between polls, where
+    /// the SDK is awaiting a batch result and nothing is in flight.
+    last_poll_at: AtomicU64,
     /// Serializes registry writers, which are all control-plane. The request
     /// path only ever loads the `ArcSwap` and never touches this.
     registry_writer: Mutex<()>,
@@ -202,6 +228,23 @@ impl SharedState {
                 self.id
             );
         }
+    }
+
+    /// Whether the poll task still looks alive.
+    ///
+    /// An in-flight poll counts even when it has been blocked on an empty
+    /// bridge for hours, which is the normal state of a quiet gateway. The
+    /// timestamp covers the other case, where the SDK is between polls waiting
+    /// for a batch result. Neither advances once the poll task has stopped.
+    pub fn poll_is_live(&self, now_seconds: u64) -> bool {
+        self.poll_active.load(Ordering::Acquire)
+            || now_seconds.saturating_sub(self.last_poll_at.load(Ordering::Acquire))
+                <= POLL_LIVENESS_SECONDS
+    }
+
+    pub(crate) fn enter_poll(&self) -> PollGuard<'_> {
+        self.poll_active.store(true, Ordering::Release);
+        PollGuard(self)
     }
 
     /// Re-arms a flush whose state was taken but never persisted.
@@ -510,6 +553,8 @@ impl HttpSource {
             forward_headers,
             registry: ArcSwap::from_pointee(registry),
             registry_dirty: AtomicBool::new(false),
+            poll_active: AtomicBool::new(false),
+            last_poll_at: AtomicU64::new(0),
             registry_writer: Mutex::new(()),
             state_flush: Notify::new(),
         };
@@ -618,6 +663,7 @@ impl Source for HttpSource {
     }
 
     async fn poll(&self) -> Result<ProducedMessages, Error> {
+        let _polling = self.shared.enter_poll();
         // An unacknowledged batch outranks new traffic: replaying it in order
         // is what turns the runtime's NACK into a retry instead of a gap.
         if let Some(staged) = self.staged_batch().await {
@@ -698,19 +744,24 @@ impl Source for HttpSource {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
+        // Counted before `leave`, which is what folds it into
+        // `http_source_dropped_on_close_total` alongside the bridge. Leaving it
+        // to a log line under-reported shutdown loss by up to `max_batch_size`.
+        let staged_dropped = match self.staged.lock().await.take() {
+            Some(staged) => {
+                warn!(
+                    "Dropping {} unacknowledged messages for {CONNECTOR_NAME} connector ID: {}",
+                    staged.messages.len(),
+                    self.id
+                );
+                staged.messages.len() as u64
+            }
+            None => 0,
+        };
         // The SDK stops the poll task before calling this, so anything still
         // in the bridge is already unreachable. Deregistering first is what
         // stops new requests from being accepted into a queue nobody drains.
-        server::leave(&self.shared).await;
-        // A staged batch was NACKed on the way down and has no reader left.
-        // Name the loss instead of letting it disappear with the instance.
-        if let Some(staged) = self.staged.lock().await.take() {
-            warn!(
-                "Dropping {} unacknowledged messages for {CONNECTOR_NAME} connector ID: {}",
-                staged.messages.len(),
-                self.id
-            );
-        }
+        server::leave(&self.shared, staged_dropped).await;
         info!("Closed {CONNECTOR_NAME} connector ID: {}", self.id);
         Ok(())
     }
@@ -1492,6 +1543,36 @@ mod tests {
         assert_eq!(
             next.messages[0].payload, b"one",
             "and an empty batch stages nothing, so its NACK must not wedge the poll loop"
+        );
+    }
+
+    #[test]
+    fn given_poll_states_when_liveness_checked_should_separate_running_from_stopped() {
+        let source = HttpSource::new(1, test_support::config(None, &[]), None);
+        let now = 1_000_000;
+
+        assert!(
+            !source.shared.poll_is_live(now),
+            "a source that has never polled is not live"
+        );
+
+        let polling = source.shared.enter_poll();
+        assert!(
+            source.shared.poll_is_live(now),
+            "an in-flight poll counts even when it has been blocked on an empty bridge for hours"
+        );
+
+        drop(polling);
+        let returned_at = unix_now_seconds();
+        assert!(
+            source.shared.poll_is_live(returned_at),
+            "and the gap between polls, where the SDK awaits a batch result, still counts"
+        );
+        assert!(
+            !source
+                .shared
+                .poll_is_live(returned_at + POLL_LIVENESS_SECONDS + 1),
+            "but a poll task the SDK stopped after five NACKs eventually goes stale, which is what stops readiness reporting ok"
         );
     }
 

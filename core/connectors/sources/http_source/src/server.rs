@@ -80,7 +80,8 @@ pub async fn join(instance: Arc<SharedState>) -> Result<(), Error> {
         let mut instances = server.state.instances();
         // Names address instances in the management API and label every
         // metric series, so a duplicate would silently route registrations to
-        // whichever instance happens to sit first in the list.
+        // whichever instance happens to sit first in the list. Both are scoped
+        // to this listener, which is why the check is too.
         if instances
             .iter()
             .any(|joined| joined.instance_name == instance.instance_name)
@@ -114,18 +115,29 @@ pub async fn join(instance: Arc<SharedState>) -> Result<(), Error> {
 
 /// Deregisters an instance's routes, and shuts the listeners down once the
 /// last instance has left.
-pub async fn leave(instance: &Arc<SharedState>) {
+/// Deregisters an instance, folding `staged_dropped` into the same shutdown
+/// loss metric as whatever is still queued in the bridge.
+pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
     let listen_addr = &instance.config.listen_addr;
     let mut servers = SERVERS.lock().await;
     let Some(server) = servers.get_mut(listen_addr) else {
         return;
     };
 
-    let remaining: Vec<Arc<SharedState>> = server
-        .state
-        .instances()
+    let joined = server.state.instances();
+    if !joined.iter().any(|candidate| candidate.id == instance.id) {
+        // `SourceContainer::open` keeps the source even when `open()` failed,
+        // and stop closes unconditionally, so this runs for instances that
+        // never joined. Tearing down on their behalf would rebuild the route
+        // table for nothing, log a deregistration that never happened, and,
+        // when the failure was the duplicate-name rejection, wipe the metrics
+        // of the sibling that legitimately owns that name.
+        return;
+    }
+
+    let remaining: Vec<Arc<SharedState>> = joined
         .into_iter()
-        .filter(|joined| joined.id != instance.id)
+        .filter(|candidate| candidate.id != instance.id)
         .collect();
     let remaining_count = remaining.len();
     if let Err(error) = server.state.publish(remaining) {
@@ -151,7 +163,7 @@ pub async fn leave(instance: &Arc<SharedState>) {
     // not close it: a handler that already loaded the old table can still
     // enqueue after this read. The SDK stops the poll task before close(), so
     // whatever is queued here is unreachable either way.
-    let dropped = instance.sender.len() as u64;
+    let dropped = instance.sender.len() as u64 + staged_dropped;
     if dropped > 0 {
         warn!(
             "Dropped {dropped} queued messages closing {CONNECTOR_NAME} connector ID: {}",
@@ -390,8 +402,20 @@ impl SharedServer {
 
 async fn bind(address: &str) -> Result<TcpListener, Error> {
     TcpListener::bind(address).await.map_err(|error| {
+        // Instances are grouped by the `listen_addr` string, so two spellings
+        // of the same socket, `0.0.0.0:9090` and `127.0.0.1:9090`, are two
+        // groups and the second one tries to bind a port the first already
+        // holds. The operator sees a bind failure for a field they believe is
+        // shared, so name that possibility rather than only the OS error.
+        let hint = if error.kind() == std::io::ErrorKind::AddrInUse {
+            format!(
+                ". If another {CONNECTOR_NAME} instance is meant to share this listener, its listen_addr must match this one exactly"
+            )
+        } else {
+            String::new()
+        };
         Error::InitError(format!(
-            "Failed to bind the {CONNECTOR_NAME} listener to {address}. {error}"
+            "Failed to bind the {CONNECTOR_NAME} listener to {address}. {error}{hint}"
         ))
     })
 }
@@ -577,8 +601,22 @@ async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> String {
 }
 
 /// Readiness for a load balancer: unavailable until an instance is serving.
+///
+/// A joined instance is not the same as a polling one. The SDK stops the poll
+/// task after five consecutive NACKs without calling `close()`, so the instance
+/// stays joined and this kept answering 200 to the load balancer while handlers
+/// accepted into a bridge nobody drained, until it filled and 429d forever.
+/// Readiness needs all three: an instance, a route it can reach, and a poll
+/// task still running behind it.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
-    if state.instances.load().is_empty() {
+    let now = unix_now_seconds();
+    let ready = !state.routes.load().is_empty()
+        && state
+            .instances
+            .load()
+            .iter()
+            .any(|instance| instance.poll_is_live(now));
+    if !ready {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(StatusResponse {
@@ -1441,6 +1479,10 @@ mod tests {
     #[tokio::test]
     async fn given_serving_instance_when_health_checked_should_report_ok() {
         let mut source = open(1, config(free_port(), free_port(), &[])).await;
+        // Readiness needs a poll task behind the route, and nothing drives one
+        // in these tests, so stand in for the poll that would be in flight.
+        let shared = Arc::clone(source.shared());
+        let _polling = shared.enter_poll();
 
         let response = client()
             .get(format!("{}/health", base_url(&source)))
