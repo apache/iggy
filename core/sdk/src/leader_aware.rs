@@ -132,10 +132,31 @@ pub async fn check_and_redirect_to_leader<C: ClusterClient>(
     }
 }
 
+/// Every endpoint the roster names for `transport`, empty when the read did
+/// not answer.
+///
+/// No leader verdict and no waiting for an election: the caller is not moving
+/// anywhere, it only wants somewhere to dial once the node it is on dies.
+pub(crate) async fn read_transport_endpoints<C: ClusterClient>(
+    client: &C,
+    transport: TransportProtocol,
+) -> Vec<String> {
+    match client.get_cluster_metadata().await {
+        Ok(metadata) => transport_endpoints(&metadata, transport),
+        Err(error) => {
+            debug!("Failed to read the cluster roster: {error}");
+            Vec::new()
+        }
+    }
+}
+
 /// How long to wait for a transiently leaderless cluster to elect before
 /// proceeding on the current node anyway.
 const LEADERLESS_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 const LEADERLESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bound on one name lookup made to compare two addresses.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One leader-check verdict from a cluster-metadata snapshot.
 enum Outcome {
@@ -156,9 +177,21 @@ fn transport_endpoints(metadata: &ClusterMetadata, transport: TransportProtocol)
         .iter()
         .filter_map(|node| {
             let port = transport_port(node, transport);
-            (port != 0).then(|| format!("{}:{port}", node.ip))
+            (port != 0).then(|| node_address(node, port))
         })
         .collect()
+}
+
+/// One node's `host:port`, bracketing a literal IPv6 address. Appending a
+/// port to a bare `::1` yields a spelling no dial can parse, so an IPv6
+/// cluster would hand out a roster of undialable entries that still count as
+/// endpoints to fail over to.
+fn node_address(node: &ClusterNode, port: u16) -> String {
+    if node.ip.contains(':') && !node.ip.starts_with('[') {
+        format!("[{}]:{port}", node.ip)
+    } else {
+        format!("{}:{port}", node.ip)
+    }
 }
 
 fn transport_port(node: &ClusterNode, transport: TransportProtocol) -> u16 {
@@ -193,7 +226,7 @@ async fn process_cluster_metadata(
     match leader {
         Some(leader_node) => {
             let leader_port = transport_port(leader_node, transport);
-            let leader_address = format!("{}:{}", leader_node.ip, leader_port);
+            let leader_address = node_address(leader_node, leader_port);
 
             info!(
                 "Found leader node: {} at {} (using {} transport)",
@@ -272,10 +305,17 @@ where
 }
 
 /// Every socket address a host:port spelling resolves to, `None` when the
-/// resolver does not know the name (which then compares unequal, at worst
-/// costing one extra dial).
+/// resolver does not know the name or does not answer in time (which then
+/// compares unequal, at worst costing one extra dial).
 async fn resolve_all(addr: String) -> Option<Vec<SocketAddr>> {
-    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(addr).await.ok()?.collect();
+    // A resolver that never answers must not own the request budget: this
+    // comparison runs on the connect and redirect paths, the redirect one
+    // inside the caller's request deadline, and `lookup_host` has no deadline
+    // of its own.
+    let lookup = tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(addr))
+        .await
+        .ok()?;
+    let resolved: Vec<SocketAddr> = lookup.ok()?.collect();
     (!resolved.is_empty()).then_some(resolved)
 }
 
@@ -383,6 +423,48 @@ mod tests {
         // A node that does not expose the transport reports port 0; dialing
         // it would burn a failover attempt on an endpoint that cannot answer.
         assert!(transport_endpoints(&metadata, TransportProtocol::Quic).is_empty());
+    }
+
+    // A port appended to a bare IPv6 address parses as neither, so the roster
+    // of an IPv6 cluster would name endpoints no dial can use while still
+    // counting as somewhere to fail over to.
+    #[test]
+    fn an_ipv6_node_is_named_as_a_bracketed_address() {
+        let metadata = ClusterMetadata {
+            name: "iggy".to_string(),
+            nodes: vec![
+                node("iggy-1", "::1", 8090, ClusterNodeRole::Leader),
+                node("iggy-2", "[fd00::2]", 8090, ClusterNodeRole::Follower),
+            ],
+        };
+
+        let endpoints = transport_endpoints(&metadata, TransportProtocol::Tcp);
+        assert_eq!(endpoints, vec!["[::1]:8090", "[fd00::2]:8090"]);
+        for endpoint in endpoints {
+            assert!(
+                SocketAddr::from_str(&endpoint).is_ok(),
+                "the roster named an endpoint no dial can parse: {endpoint}"
+            );
+        }
+    }
+
+    // The address a redirect hands to the next dial comes from the same
+    // roster entry, so it has to be spelled the same way.
+    #[tokio::test]
+    async fn a_redirect_to_an_ipv6_leader_names_a_dialable_address() {
+        let metadata = ClusterMetadata {
+            name: "iggy".to_string(),
+            nodes: vec![
+                node("iggy-1", "fd00::1", 8090, ClusterNodeRole::Leader),
+                node("iggy-2", "fd00::2", 8090, ClusterNodeRole::Follower),
+            ],
+        };
+
+        match process_cluster_metadata(&metadata, "[fd00::2]:8090", TransportProtocol::Tcp).await {
+            Outcome::Redirect(leader) => assert_eq!(leader, "[fd00::1]:8090"),
+            Outcome::LeaderIsCurrent => panic!("the follower was taken for the leader"),
+            Outcome::NoLeader => panic!("the roster named a healthy leader"),
+        }
     }
 
     #[tokio::test]

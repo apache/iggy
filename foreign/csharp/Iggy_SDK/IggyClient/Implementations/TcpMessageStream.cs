@@ -21,7 +21,6 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
@@ -1157,8 +1156,8 @@ public sealed partial class TcpMessageStream : IIggyClient
                 if (IsTlsConfigurationFault(e))
                 {
                     // A fault no retry can fix, kept aside rather than thrown at once: it belongs to the
-                    // endpoint that raised it - a certificate that names another host - and the endpoints
-                    // behind that one may be perfectly usable.
+                    // endpoint that raised it - a CA file that cannot be read - and the endpoints behind that
+                    // one may be perfectly usable.
                     configurationFault = e;
                 }
 
@@ -1174,8 +1173,8 @@ public sealed partial class TcpMessageStream : IIggyClient
                 _currentAddress = candidates[0];
 
                 // No endpoint answered and at least one said why in a way no retry changes: an unreadable CA
-                // file, a certificate this client will never accept. The caller gets that reason instead of a
-                // retry loop that buries it - unlimited retries would otherwise redial it forever.
+                // file. The caller gets that reason instead of a retry loop that buries it - unlimited retries
+                // would otherwise redial it forever.
                 if (configurationFault is not null)
                 {
                     SetConnectionState(ConnectionState.Disconnected);
@@ -1344,21 +1343,16 @@ public sealed partial class TcpMessageStream : IIggyClient
 
     /// <summary>
     ///     Whether bringing an endpoint up failed for a reason that says this client's own TLS configuration is
-    ///     wrong: a CA file that cannot be read, or a certificate it will never accept. Neither changes on a
-    ///     retry, so the sweep reports it instead of redialing forever.
+    ///     wrong: a CA file that cannot be read. It does not change on a retry, so the sweep reports it instead
+    ///     of redialing forever.
     /// </summary>
     private static bool IsTlsConfigurationFault(Exception e)
     {
-        if (e is InvalidCertificatePathException)
-        {
-            return true;
-        }
-
-        // AuthenticationException also carries a handshake that died on the wire - a reset, a closed socket -
-        // and that says nothing about the configuration. Only a verdict reached without transport trouble is
-        // one no retry can change.
-        return e is AuthenticationException
-               && e.InnerException is not (IOException or SocketException);
+        // A handshake verdict describes the peer, not this client: a certificate that names another host, a
+        // peer that answers a ClientHello with something else. The endpoints behind it may be fine, and with
+        // one roster entry per node the target host is a bare address no certificate has to cover, so a failed
+        // handshake ends the dial rather than the connect.
+        return e is InvalidCertificatePathException;
     }
 
     private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token)
