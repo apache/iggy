@@ -33,6 +33,7 @@ use iggy_connector_sdk::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -51,6 +52,21 @@ pub const DEFAULT_ADMIN_LISTEN_ADDR: &str = "127.0.0.1:9091";
 pub const DEFAULT_MAX_BODY_SIZE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_BUFFER_CAPACITY: usize = 10_000;
 pub const DEFAULT_MAX_BATCH_SIZE: usize = 500;
+/// Ceilings for the three sizing values, mirroring their `> 0` floors.
+///
+/// `buffer_capacity` is the dangerous one: crossfire asserts `cap < 1 << 31`
+/// while building the ring and allocates every slot eagerly, so a typo either
+/// panics or OOMs. That panic unwinds out of `iggy_source_open`, which is
+/// `extern "C"` with no `catch_unwind` around it, and takes down the whole
+/// connectors process along with every other plugin loaded into it. The ring
+/// is built in `new`, before the SDK ever calls `open`, so `validate` cannot
+/// be what protects it.
+pub const MAX_BUFFER_CAPACITY: usize = 1_000_000;
+/// Bounds the `Vec::with_capacity(max_batch_size)` that every `poll()` builds
+/// up front, which is what an oversized value actually costs.
+pub const MAX_BATCH_SIZE_LIMIT: usize = 100_000;
+pub const MAX_MAX_BODY_SIZE_BYTES: usize = 64 * 1024 * 1024;
+
 pub const DEFAULT_HMAC_HEADER: &str = "X-Hub-Signature-256";
 pub const DEFAULT_HMAC_PREFIX: &str = "sha256=";
 
@@ -152,6 +168,40 @@ impl SharedState {
     /// Whether a mutation is still waiting to be handed to the runtime.
     pub fn has_pending_state(&self) -> bool {
         self.registry_dirty.load(Ordering::Acquire)
+    }
+
+    /// Names the auth posture of every path this instance serves.
+    ///
+    /// A misspelled `auth_bearer_token` key does not fail the config, it just
+    /// deserializes to `None`, and the named-path handler skips its whole auth
+    /// block when it is `None`. So the difference between "guarded" and "open
+    /// to the internet" is one silent typo. Saying it out loud at open is what
+    /// makes that visible without turning every env override into an error,
+    /// which is what `deny_unknown_fields` here would do.
+    pub fn log_auth_posture(&self) {
+        if let Some(topic_path) = &self.config.topic_path {
+            if self.config.auth_bearer_token.is_some() {
+                info!(
+                    "Serving POST /topics/{topic_path} with bearer auth for {CONNECTOR_NAME} connector ID: {}",
+                    self.id
+                );
+            } else {
+                warn!(
+                    "Serving POST /topics/{topic_path} with NO authentication for {CONNECTOR_NAME} connector ID: {}; set auth_bearer_token to guard it",
+                    self.id
+                );
+            }
+        }
+
+        let unguarded = self
+            .registry()
+            .serving_count_without_auth(unix_now_seconds());
+        if unguarded > 0 {
+            warn!(
+                "Serving {unguarded} secret-path endpoints with no second factor for {CONNECTOR_NAME} connector ID: {}; anyone holding the URL can post to them",
+                self.id
+            );
+        }
     }
 
     /// Re-arms a flush whose state was taken but never persisted.
@@ -305,20 +355,23 @@ impl HttpSourceConfig {
                     self.admin_listen_addr
                 ))
             })?;
-        if self.buffer_capacity == 0 {
-            return Err(Error::InvalidConfigValue(
-                "buffer_capacity must be at least 1".to_string(),
-            ));
+        if self.buffer_capacity == 0 || self.buffer_capacity > MAX_BUFFER_CAPACITY {
+            return Err(Error::InvalidConfigValue(format!(
+                "buffer_capacity {} must be between 1 and {MAX_BUFFER_CAPACITY}",
+                self.buffer_capacity
+            )));
         }
-        if self.max_batch_size == 0 {
-            return Err(Error::InvalidConfigValue(
-                "max_batch_size must be at least 1".to_string(),
-            ));
+        if self.max_batch_size == 0 || self.max_batch_size > MAX_BATCH_SIZE_LIMIT {
+            return Err(Error::InvalidConfigValue(format!(
+                "max_batch_size {} must be between 1 and {MAX_BATCH_SIZE_LIMIT}",
+                self.max_batch_size
+            )));
         }
-        if self.max_body_size_bytes == 0 {
-            return Err(Error::InvalidConfigValue(
-                "max_body_size_bytes must be at least 1".to_string(),
-            ));
+        if self.max_body_size_bytes == 0 || self.max_body_size_bytes > MAX_MAX_BODY_SIZE_BYTES {
+            return Err(Error::InvalidConfigValue(format!(
+                "max_body_size_bytes {} must be between 1 and {MAX_MAX_BODY_SIZE_BYTES}",
+                self.max_body_size_bytes
+            )));
         }
         if let Some(instance_name) = &self.instance_name
             && HeaderKey::try_from(instance_name.as_str()).is_err()
@@ -369,7 +422,26 @@ impl HttpSourceConfig {
                 )));
             }
         }
+        let mut seen: BTreeSet<&EndpointId> = BTreeSet::new();
         for endpoint in &self.endpoints {
+            if !seen.insert(&endpoint.endpoint_id) {
+                // The registry is a map, so a second block with the same id
+                // silently last-wins, and a copy-paste whose second copy
+                // carries a weaker auth_type is the one that gets served.
+                return Err(Error::InvalidConfigValue(format!(
+                    "endpoint {} is declared more than once",
+                    endpoint.endpoint_id.log_prefix()
+                )));
+            }
+            if HeaderName::from_str(&endpoint.hmac_header).is_err() {
+                // An invalid name makes `HeaderMap::get` return `None`, so
+                // every signed request 401s forever with nothing naming why.
+                return Err(Error::InvalidConfigValue(format!(
+                    "endpoint {} declares hmac_header '{}', which is not a valid HTTP header name",
+                    endpoint.endpoint_id.log_prefix(),
+                    endpoint.hmac_header
+                )));
+            }
             if endpoint.auth_type != EndpointAuthType::None
                 && !endpoint
                     .auth_secret
@@ -395,6 +467,16 @@ impl HttpSourceConfig {
 
 impl HttpSource {
     pub fn new(id: u32, config: HttpSourceConfig, state: Option<ConnectorState>) -> Self {
+        // Clamped rather than rejected: `new` cannot fail, and an unchecked
+        // value reaches crossfire before `open` runs. `validate` still rejects
+        // it, so the operator learns through `last_error` instead of an abort.
+        let buffer_capacity = config.buffer_capacity.clamp(1, MAX_BUFFER_CAPACITY);
+        if buffer_capacity != config.buffer_capacity {
+            warn!(
+                "Clamped buffer_capacity {} to {buffer_capacity} for {CONNECTOR_NAME} connector ID: {id}",
+                config.buffer_capacity
+            );
+        }
         // An unreadable registry cannot be served, but `new` has 21 callers and
         // the SDK builds the source before it calls `open`, so the failure is
         // carried to `open` rather than widening this signature. The empty
@@ -404,7 +486,7 @@ impl HttpSource {
                 Ok(registry) => (registry, None),
                 Err(error) => (EndpointRegistry::default(), Some(error.to_string())),
             };
-        let (sender, receiver) = crossfire::mpsc::bounded_async(config.buffer_capacity);
+        let (sender, receiver) = crossfire::mpsc::bounded_async(buffer_capacity);
         let instance_name = config
             .instance_name
             .clone()
@@ -524,6 +606,7 @@ impl Source for HttpSource {
         }
         self.shared.config.validate()?;
         server::join(Arc::clone(&self.shared)).await?;
+        self.shared.log_auth_posture();
         info!(
             "Opened {CONNECTOR_NAME} connector ID: {}, listen address: {}, endpoints: {}, named path: {:?}",
             self.id,
@@ -785,6 +868,91 @@ mod tests {
             config.validate(),
             Err(Error::InvalidConfigValue(message)) if message.contains("buffer_capacity")
         ));
+    }
+
+    #[test]
+    fn given_oversized_sizing_values_when_validated_should_reject() {
+        for (field, json) in [
+            (
+                "buffer_capacity",
+                r#"{"listen_addr": "0.0.0.0:9090", "buffer_capacity": 1000001}"#,
+            ),
+            (
+                "max_batch_size",
+                r#"{"listen_addr": "0.0.0.0:9090", "max_batch_size": 100001}"#,
+            ),
+            (
+                "max_body_size_bytes",
+                r#"{"listen_addr": "0.0.0.0:9090", "max_body_size_bytes": 67108865}"#,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse(json).validate(),
+                    Err(Error::InvalidConfigValue(message)) if message.contains(field)
+                ),
+                "{field} had a floor and no ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn given_unbuildable_buffer_capacity_when_constructed_should_clamp_not_panic() {
+        let mut config = test_support::config(None, &[]);
+        config.buffer_capacity = usize::MAX;
+
+        // `new` builds the crossfire ring, and crossfire asserts on a capacity
+        // this large. That panic would unwind out of `iggy_source_open`, which
+        // is `extern "C"` with no `catch_unwind`, aborting the whole connectors
+        // process. The SDK builds the source before it calls `open`, so
+        // `validate` is not what stands between a typo and that abort.
+        let source = HttpSource::new(1, config, None);
+
+        assert!(
+            source.shared.sender.try_send(queued("one")).is_ok(),
+            "the clamped ring must still be usable"
+        );
+        assert!(
+            matches!(
+                source.shared.config.validate(),
+                Err(Error::InvalidConfigValue(message)) if message.contains("buffer_capacity")
+            ),
+            "and open() must still report the misconfiguration rather than serve it"
+        );
+    }
+
+    #[test]
+    fn given_duplicate_endpoint_id_when_validated_should_reject() {
+        let config = parse(
+            r#"{"listen_addr": "0.0.0.0:9090", "endpoints": [
+                {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "none"},
+                {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "none"}
+            ]}"#,
+        );
+        assert!(
+            matches!(
+                config.validate(),
+                Err(Error::InvalidConfigValue(message)) if message.contains("more than once")
+            ),
+            "the registry is a map, so the second block would silently last-win"
+        );
+    }
+
+    #[test]
+    fn given_invalid_hmac_header_when_validated_should_reject() {
+        let config = parse(
+            r#"{"listen_addr": "0.0.0.0:9090", "endpoints": [
+                {"endpoint_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "auth_type": "hmac-sha256",
+                 "auth_secret": "whsec", "hmac_header": "not a header"}
+            ]}"#,
+        );
+        assert!(
+            matches!(
+                config.validate(),
+                Err(Error::InvalidConfigValue(message)) if message.contains("hmac_header")
+            ),
+            "an invalid name makes HeaderMap::get return None, so every signed request 401s forever"
+        );
     }
 
     #[test]

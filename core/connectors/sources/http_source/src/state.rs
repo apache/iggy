@@ -36,7 +36,7 @@ use tracing::info;
 
 use crate::routes::{Endpoint, EndpointOrigin};
 use crate::types::EndpointId;
-use crate::{CONNECTOR_NAME, StaticEndpointConfig};
+use crate::{CONNECTOR_NAME, EndpointAuthType, StaticEndpointConfig};
 
 /// Every secret-path endpoint one instance owns, static and dynamic alike.
 ///
@@ -196,6 +196,16 @@ impl EndpointRegistry {
         self.endpoints
             .values()
             .filter(|endpoint| endpoint.is_serving(now_seconds) && endpoint.origin == origin)
+            .count()
+    }
+
+    /// Serving endpoints whose URL is the only thing guarding them.
+    pub fn serving_count_without_auth(&self, now_seconds: u64) -> usize {
+        self.endpoints
+            .values()
+            .filter(|endpoint| {
+                endpoint.is_serving(now_seconds) && endpoint.auth_type == EndpointAuthType::None
+            })
             .count()
     }
 

@@ -400,7 +400,10 @@ fn generate_endpoint_id() -> EndpointId {
         .expect("hex of 16 bytes is 32 lowercase hex characters")
 }
 
+// Unlike the plugin config, these never carry the runtime's flat env
+// overrides, so a rejected unknown field is a caller typo and nothing else.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterRequest {
     instance: String,
     #[serde(default)]
@@ -415,12 +418,18 @@ struct RegisterRequest {
     expires_at: Option<u64>,
 }
 
+// Unlike the plugin config, these never carry the runtime's flat env
+// overrides, so a rejected unknown field is a caller typo and nothing else.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RotateRequest {
     auth_secret: SecretString,
 }
 
+// Unlike the plugin config, these never carry the runtime's flat env
+// overrides, so a rejected unknown field is a caller typo and nothing else.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RevokeRequest {
     #[serde(default)]
     reason: Option<String>,

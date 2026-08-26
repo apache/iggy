@@ -95,7 +95,9 @@ auth_type = "bearer"
 auth_secret = "partner-token"
 ```
 
-The stream's `schema` **must be `raw`**. This connector always produces raw bodies; with `schema = "json"` the runtime's encoder rejects every message and the batch is dropped.
+The stream's `schema` **must be `raw`**. This connector always produces raw bodies; with `schema = "json"` the runtime's encoder rejects every message, which counts as a processing error and becomes a NACK rather than a drop.
+
+The batch is then replayed on every poll and the SDK stops the poll task after five consecutive NACKs, while the listener keeps answering 200. The connector cannot guard against this itself: `schema` lives under `[[streams]]` and the plugin only ever receives `[plugin_config]`, so nothing in `open()` can see it.
 
 ### Options
 
