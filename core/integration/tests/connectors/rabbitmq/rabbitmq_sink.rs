@@ -17,15 +17,19 @@
 
 use crate::connectors::fixtures::{
     RabbitMqOps, RabbitMqSinkDirectFixture, RabbitMqSinkFanoutFixture, RabbitMqSinkFixture,
-    RabbitMqSinkRawSchemaFixture, RabbitMqSinkWithoutMetadataFixture,
+    RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
+    RabbitMqSinkWithoutMetadataFixture,
 };
 use bytes::Bytes;
-use iggy::prelude::{IggyMessage, Partitioning};
+use iggy::prelude::{HeaderKey, HeaderValue, IggyMessage, Partitioning};
 use iggy_common::Identifier;
 use iggy_common::MessageClient;
 use integration::harness::seeds;
 use integration::iggy_harness;
 use lapin::types::{AMQPValue, ShortString};
+use std::collections::BTreeMap;
+use std::str::FromStr;
+use std::time::Duration;
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/rabbitmq/sink.toml")),
@@ -296,4 +300,130 @@ async fn given_fanout_exchange_when_published_should_deliver_to_all_bound_queues
             Some("test_topic")
         );
     }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/rabbitmq/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_predeclared_durable_exchange_when_published_should_deliver(
+    harness: &TestHarness,
+    fixture: RabbitMqSinkFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    let payload = serde_json::json!({"name": "Alice"});
+    let mut messages = vec![
+        IggyMessage::builder()
+            .id(1)
+            .payload(Bytes::from(serde_json::to_vec(&payload).unwrap()))
+            .build()
+            .unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    let delivered = fixture.consume_messages(1).await.unwrap();
+    assert_eq!(delivered.len(), 1);
+    let value: serde_json::Value = serde_json::from_slice(&delivered[0].data).unwrap();
+    assert_eq!(value, payload);
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/rabbitmq/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_unroutable_routing_key_when_published_should_not_deliver(
+    harness: &TestHarness,
+    fixture: RabbitMqSinkUnroutableFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    let payload = serde_json::json!({"name": "Alice"});
+    let mut messages = vec![
+        IggyMessage::builder()
+            .id(1)
+            .payload(Bytes::from(serde_json::to_vec(&payload).unwrap()))
+            .build()
+            .unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let delivered = fixture
+        .consume_messages_from_with_timeout(&fixture.queue_names()[0], 1, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(
+        delivered.is_empty(),
+        "unroutable mandatory publish must not reach any queue"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/rabbitmq/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_user_header_when_published_through_headers_exchange_should_route(
+    harness: &TestHarness,
+    fixture: RabbitMqSinkHeadersFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    let user_headers = BTreeMap::from([(
+        HeaderKey::from_str("x-user").unwrap(),
+        HeaderValue::from_str("alice").unwrap(),
+    )]);
+    let payload = serde_json::json!({"name": "Alice"});
+    let mut messages = vec![
+        IggyMessage::builder()
+            .id(1)
+            .payload(Bytes::from(serde_json::to_vec(&payload).unwrap()))
+            .user_headers(user_headers)
+            .build()
+            .unwrap(),
+    ];
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .unwrap();
+
+    let delivered = fixture.consume_messages(1).await.unwrap();
+    assert_eq!(delivered.len(), 1);
+    let value: serde_json::Value = serde_json::from_slice(&delivered[0].data).unwrap();
+    assert_eq!(value, payload);
+    assert_eq!(
+        header_str(&delivered[0].headers, "x-user").as_deref(),
+        Some("alice"),
+        "user header must survive to AMQP headers for headers-exchange routing"
+    );
 }
