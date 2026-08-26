@@ -19,8 +19,9 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
-    AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError, Partitioner,
-    QuicClientConfigBuilder, TcpClientConfigBuilder, WebSocketClientConfigBuilder,
+    AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError,
+    NonZeroIggyDuration, Partitioner, QuicClientConfigBuilder, TcpClientConfigBuilder,
+    WebSocketClientConfigBuilder,
 };
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
@@ -174,7 +175,10 @@ impl TcpClientBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, reconnection_interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(
+        mut self,
+        reconnection_interval: NonZeroIggyDuration,
+    ) -> Self {
         self.config = self
             .config
             .with_reconnection_interval(reconnection_interval);
@@ -258,7 +262,10 @@ impl QuicClientBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, reconnection_interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(
+        mut self,
+        reconnection_interval: NonZeroIggyDuration,
+    ) -> Self {
         self.config = self
             .config
             .with_reconnection_interval(reconnection_interval);
@@ -351,7 +358,10 @@ impl WebSocketClientBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, reconnection_interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(
+        mut self,
+        reconnection_interval: NonZeroIggyDuration,
+    ) -> Self {
         self.config = self
             .config
             .with_reconnection_interval(reconnection_interval);

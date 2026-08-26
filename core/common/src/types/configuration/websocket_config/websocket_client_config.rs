@@ -17,7 +17,7 @@
 
 use crate::types::configuration::auth_config::connection_string::ConnectionString;
 use crate::types::configuration::websocket_config::websocket_connection_string_options::WebSocketConnectionStringOptions;
-use crate::{AutoLogin, IggyDuration, WebSocketClientReconnectionConfig};
+use crate::{AutoLogin, NonZeroIggyDuration, WebSocketClientReconnectionConfig};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use tungstenite::protocol::WebSocketConfig as TungsteniteConfig;
@@ -32,7 +32,7 @@ pub struct WebSocketClientConfig {
     /// Whether to automatically reconnect when disconnected.
     pub reconnection: WebSocketClientReconnectionConfig,
     /// Interval of heartbeats sent by the client
-    pub heartbeat_interval: IggyDuration,
+    pub heartbeat_interval: NonZeroIggyDuration,
     /// WebSocket-specific configuration.
     pub ws_config: WebSocketConfig,
     /// Whether tls is enabled
@@ -69,7 +69,7 @@ impl Default for WebSocketClientConfig {
             server_address: "127.0.0.1:8092".to_string(),
             auto_login: AutoLogin::Disabled,
             reconnection: WebSocketClientReconnectionConfig::default(),
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             ws_config: WebSocketConfig::default(),
             tls_enabled: false,
             tls_domain: "localhost".to_string(),
