@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
@@ -107,7 +108,11 @@ pub struct HttpSource {
     /// The runtime NACKs a batch it could not send, expecting the next `poll()`
     /// to produce it again. Draining the bridge is destructive, so without this
     /// the events would exist nowhere else and the NACK would be silent loss.
-    staged: Mutex<Option<StagedBatch>>,
+    /// `std`, not `tokio`: the guard never crosses an `.await`, so the async
+    /// lock only added suspension points. One of them mattered - a shutdown
+    /// landing inside `stage()` could drop the batch there with nothing
+    /// counting it.
+    staged: StdMutex<Option<StagedBatch>>,
     /// Why the persisted registry could not be restored, if it could not be.
     ///
     /// Held rather than acted on in `new` so `open` can fail with it, which is
@@ -562,7 +567,7 @@ impl HttpSource {
             id,
             shared: Arc::new(shared),
             receiver: Mutex::new(receiver),
-            staged: Mutex::new(None),
+            staged: StdMutex::new(None),
             restore_error,
         }
     }
@@ -571,9 +576,15 @@ impl HttpSource {
         &self.shared
     }
 
+    /// A poisoned `staged` means a panic while a batch was held. The batch is
+    /// still intact, and refusing to look at it would lose it for certain.
+    fn lock_staged(&self) -> std::sync::MutexGuard<'_, Option<StagedBatch>> {
+        self.staged.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Re-emits the unacknowledged batch, if one is waiting.
-    async fn staged_batch(&self) -> Option<ProducedMessages> {
-        let staged = self.staged.lock().await;
+    fn staged_batch(&self) -> Option<ProducedMessages> {
+        let staged = self.lock_staged();
         let staged = staged.as_ref()?;
         debug!(
             "Replaying {} unacknowledged messages after {} NACK(s) for {CONNECTOR_NAME} connector ID: {}",
@@ -591,10 +602,10 @@ impl HttpSource {
 
     /// Holds `queued` until the runtime acknowledges it and converts it into
     /// the batch to produce. The clone buys the ability to replay.
-    async fn stage(&self, queued: Vec<QueuedMessage>) -> Vec<ProducedMessage> {
+    fn stage(&self, queued: Vec<QueuedMessage>) -> Vec<ProducedMessage> {
         let messages: Vec<ProducedMessage> = queued.iter().cloned().map(Into::into).collect();
         if !queued.is_empty() {
-            *self.staged.lock().await = Some(StagedBatch {
+            *self.lock_staged() = Some(StagedBatch {
                 messages: queued,
                 nacks: 0,
             });
@@ -615,8 +626,8 @@ impl HttpSource {
     /// connector rejects malformed work at the door rather than mid-stream:
     /// oversized bodies get 413 before a handler runs, headers are clamped on
     /// accept, and `Schema::Raw` cannot fail to decode.
-    async fn on_nack(&self) -> Result<(), Error> {
-        let mut staged = self.staged.lock().await;
+    fn on_nack(&self) -> Result<(), Error> {
+        let mut staged = self.lock_staged();
         let Some(batch) = staged.as_mut() else {
             drop(staged);
             // Nothing staged means the batch carried state and no messages,
@@ -666,7 +677,7 @@ impl Source for HttpSource {
         let _polling = self.shared.enter_poll();
         // An unacknowledged batch outranks new traffic: replaying it in order
         // is what turns the runtime's NACK into a retry instead of a gap.
-        if let Some(staged) = self.staged_batch().await {
+        if let Some(staged) = self.staged_batch() {
             return Ok(staged);
         }
 
@@ -723,7 +734,7 @@ impl Source for HttpSource {
 
         Ok(ProducedMessages {
             schema: Schema::Raw,
-            messages: self.stage(queued).await,
+            messages: self.stage(queued),
             state,
         })
     }
@@ -736,10 +747,10 @@ impl Source for HttpSource {
     async fn on_batch_result(&self, result: source::SourceBatchResult) -> Result<(), Error> {
         match result {
             source::SourceBatchResult::Ack => {
-                self.staged.lock().await.take();
+                self.lock_staged().take();
                 Ok(())
             }
-            source::SourceBatchResult::Nack => self.on_nack().await,
+            source::SourceBatchResult::Nack => self.on_nack(),
         }
     }
 
@@ -747,7 +758,7 @@ impl Source for HttpSource {
         // Counted before `leave`, which is what folds it into
         // `http_source_dropped_on_close_total` alongside the bridge. Leaving it
         // to a log line under-reported shutdown loss by up to `max_batch_size`.
-        let staged_dropped = match self.staged.lock().await.take() {
+        let staged_dropped = match self.lock_staged().take() {
             Some(staged) => {
                 warn!(
                     "Dropping {} unacknowledged messages for {CONNECTOR_NAME} connector ID: {}",
