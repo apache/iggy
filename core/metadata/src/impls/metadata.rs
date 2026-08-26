@@ -28,7 +28,7 @@ use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
     Consensus, EvictionContext, FatalReason, Pipeline, PipelineEntry, Plane, PlaneIdentity,
     PlaneKind, PreflightOutcome, PrepareRollback, Project, ReplicaLogContext, RequestLogEvent,
-    Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    Sequencer, SessionEnd, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
     build_reply_message_with, build_result_rejection_reply, emit_sim_event, fatal,
     fence_old_prepare_by_commit, is_caught_up_primary,
@@ -316,7 +316,7 @@ impl Snapshot for IggySnapshot {
 ///
 /// Owns the data directory path and the snapshot creation function. The
 /// three-phase checkpoint (persist snapshot, record the pairing durably, drain the
-/// WAL) is orchestrated one layer up in [`IggyMetadata::checkpoint_if_needed`], so
+/// WAL) is orchestrated one layer up in `IggyMetadata::checkpoint_if_needed`, so
 /// the superblock write can sit between persist and drain; this type owns only the
 /// snapshot I/O and the last-checkpoint bookkeeping.
 pub struct SnapshotCoordinator<M> {
@@ -623,7 +623,11 @@ pub fn apply_committed_prepare<M>(
     }
     if header.operation == Operation::Logout {
         if table_mutations_allowed {
-            client_table.borrow_mut().remove_client(header.client);
+            client_table.borrow_mut().remove_client(
+                header.client,
+                header.user_id,
+                SessionEnd::from_logout_request(header.request),
+            );
         }
         // Drop the disconnected client from every consumer group it joined and
         // rebalance, Logout's only state-machine effect.
@@ -650,7 +654,9 @@ pub fn apply_committed_prepare<M>(
     // client, and replica-local eviction makes a stale-request replay
     // reachable. Both are skips, not faults.
     if table_mutations_allowed {
-        let outcome = client_table.borrow_mut().commit_reply(header.client, reply);
+        let outcome = client_table
+            .borrow_mut()
+            .commit_reply(header.client, header.user_id, reply);
         log_commit_reply_outcome(outcome, header.client, header.op);
     }
 }
@@ -945,7 +951,7 @@ where
     B: MessageBus,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -1138,10 +1144,6 @@ where
             return;
         }
 
-        // TODO add assertions for valid state here.
-
-        // TODO handle gap in ops.
-
         // Verify hash chain integrity BEFORE checkpoint. `checkpoint_if_needed`
         // can drain WAL entries, making previous_header return None.
         if let Some(previous) = journal.handle().previous_header(&header) {
@@ -1317,7 +1319,7 @@ where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StateMachine<Input = Message<PrepareHeader>>,
 {
     fn is_applicable<H>(&self, message: &<VsrConsensus<B, P> as Consensus>::Message<H>) -> bool
@@ -1460,7 +1462,7 @@ where
     B: MessageBus,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -1698,6 +1700,40 @@ where
         let local_applied = consensus.commit_min();
         let snapshot_ahead = snapshot_seq > local_applied;
 
+        if snapshot_ahead && let Some(journal) = &self.journal {
+            // Discard the WAL suffix above the incoming floor BEFORE anything
+            // installs: the commit walk matches entries by op number alone, so
+            // a pre-crash suffix a view change has since reassigned would be
+            // applied as committed once the floor jump below pulls the walk
+            // past it. Ahead of the snapshot restore so a failed truncate
+            // aborts a not-yet-started install (the transfer retries) instead
+            // of stranding a restored state machine without its floor jump,
+            // which would double-apply the snapshot's ops on the next walk.
+            // Committed ops the range covered come back through the
+            // post-install tail repair; uncommitted ones were decided away by
+            // the view change that made this replica a transfer receiver.
+            // Serialization against appends holds as in
+            // `reconcile_metadata_view_divergence`: the pump is
+            // single-threaded and `replicate_preflight` refuses prepares
+            // while `is_transferring`.
+            let removed = journal
+                .handle()
+                .truncate_from(snapshot_seq + 1)
+                .await
+                .map_err(SnapshotError::Io)?;
+            if removed > 0 {
+                // The DVC snapshot's `(op, commit)` tag does not move when
+                // entries are removed under it; left stale it would advertise
+                // headers this replica can no longer serve.
+                consensus.invalidate_local_dvc_suffix();
+                tracing::warn!(
+                    snapshot_seq,
+                    removed,
+                    "state transfer dropped {removed} journal entries above the incoming floor"
+                );
+            }
+        }
+
         if snapshot_ahead {
             if let Some(coordinator) = &self.coordinator {
                 // The transferred snapshot REPLACES the one the superblock's
@@ -1764,26 +1800,9 @@ where
             // The snapshot IS ops `..=snapshot_seq` applied: jump the applied
             // frontier (this is the op-jump the tail repair resumes from) and
             // let the announced commit point pull the walk target forward.
-            //
-            // TODO(suffix-truncation): this hands the commit walk a floor it never
-            // verified. `set_snapshot_op` above only marks entries at or below the
-            // floor EVICTABLE -- everything above it stays resident -- and the walk
-            // matches WAL entries by op number alone, with no view or hash-chain
-            // check. A node carrying a pre-crash prepared-but-uncommitted suffix that
-            // a view change has since reassigned cluster-side will therefore apply
-            // those stale bodies as committed. The client table is shielded (the
-            // `client_table_frontier` fence skips table effects at or below the
-            // transferred frontier); the state machine is not.
-            //
-            // Same root cause as the `TODO(suffix-truncation)` in
-            // `VsrConsensus::handle_start_view`, and the same missing piece closes
-            // both: a durable truncate-from-op primitive on the journal, so a floor
-            // jump can discard the suffix above it instead of leaving it to be
-            // matched by op number. The floor jump does not create the hole, but it
-            // widens exposure to it precisely on the nodes guaranteed to have a stale
-            // log -- every state-transfer receiver is one. Deliberately out of scope
-            // here (flagged in review as follow-up): the primitive is a journal
-            // durability change, not a state-transfer one.
+            // The walk matches WAL entries by op number alone, so this floor
+            // is only safe because the truncate at the top of this install
+            // already discarded every journal entry above it.
             consensus.set_commit_floor(snapshot_seq);
             if snapshot_seq > consensus.sequencer().current_sequence() {
                 consensus.sequencer().set_sequence(snapshot_seq);
@@ -2727,9 +2746,11 @@ where
                 // Logout unregisters the VSR client session on every replica.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
                 if self.client_table_mutation_allowed(prepare_header.op) {
-                    self.client_table
-                        .borrow_mut()
-                        .remove_client(prepare_header.client);
+                    self.client_table.borrow_mut().remove_client(
+                        prepare_header.client,
+                        prepare_header.user_id,
+                        SessionEnd::from_logout_request(prepare_header.request),
+                    );
                 }
                 // Drop the disconnected client from every consumer group it
                 // joined and rebalance. Deterministic side-effect of the
@@ -2764,10 +2785,11 @@ where
                 // or below the state-transfer frontier are already reflected
                 // in the transferred table and are skipped.
                 if self.client_table_mutation_allowed(prepare_header.op) {
-                    let outcome = self
-                        .client_table
-                        .borrow_mut()
-                        .commit_reply(prepare_header.client, reply.clone());
+                    let outcome = self.client_table.borrow_mut().commit_reply(
+                        prepare_header.client,
+                        prepare_header.user_id,
+                        reply.clone(),
+                    );
                     log_commit_reply_outcome(outcome, prepare_header.client, prepare_header.op);
                 }
                 reply
@@ -3094,7 +3116,7 @@ where
     P: Pipeline<Entry = PipelineEntry>,
     SB: SuperblockStore,
     J: JournalHandle,
-    J::Target: Journal<J::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     M: StreamsFrontend
         + StateMachine<
             Input = Message<PrepareHeader>,
@@ -3252,6 +3274,22 @@ where
         // (see `resolve_acting_user_id`); server-originated internal ops
         // (`CompleteConsumerGroupRevocation`, the PAT-cleaner delete) build their
         // prepare directly, bypassing this path, and keep `user_id` 0 (gate skips).
+        // A Logout is not gated, so it gets no acting user above, yet its apply
+        // removes a dedup fence keyed by user. Resolve the owner of the session
+        // it ends here, on the primary, from the live entry or its fence, so
+        // every replica drops the same fence; an unmatched session stamps 0
+        // and the apply leaves the fences alone.
+        if operation == Operation::Logout {
+            let request_header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+            )
+            .expect("a routed request header was validated on receipt");
+            request_header.user_id = self
+                .client_table
+                .borrow()
+                .user_id_for_session(client_id, request_header.session)
+                .unwrap_or(0);
+        }
         if let Some(acting_user_id) =
             resolve_acting_user_id(operation, client_id, &self.client_table)?
         {
@@ -3423,12 +3461,11 @@ where
 
         let header = *message.header();
 
-        // TODO: calculate the index;
         #[allow(clippy::cast_possible_truncation)]
-        let idx = header.op as usize;
+        let op = header.op as usize;
         assert_eq!(header.command, Command::Prepare);
         assert!(
-            journal.handle().header(idx).is_some(),
+            journal.handle().header(op).is_some(),
             "replicate: prepare must be durable in local journal before chain-forward"
         );
         if let Err(e) = replicate_to_next_in_chain(consensus, message).await {
@@ -3443,7 +3480,7 @@ where
     ///
     /// `advance_commit_min(op)` and matching `client_table` mutation
     /// (`commit_register` / `commit_reply`) run back-to-back, no `.await`
-    /// between. [`crate::metadata_helpers::is_caught_up_primary`] reads
+    /// between. [`consensus::is_caught_up_primary`] reads
     /// `commit_min == commit_max` as proof the table is caught up; an await
     /// here lets another task observe transient equality with stale table,
     /// dispatch a fresh Register on an already-registered client, and bump
@@ -3548,9 +3585,17 @@ where
         if !self.persist_superblock_if_needed(consensus).await {
             return;
         }
+        // Containment, not occupancy: after a refused append (slot collision,
+        // view-change race) the slot can hold a DIFFERENT prepare at this op,
+        // and acking it would vouch durability for bytes this replica never
+        // journaled. Checksum equality withholds the ack; the primary's
+        // retransmit re-drives it once the right prepare lands.
         let journal = self.journal.as_ref().unwrap();
-        let persisted = journal.handle().header(header.op as usize).is_some();
-        send_prepare_ok_common(consensus, header, Some(persisted)).await;
+        let persisted = journal
+            .handle()
+            .header(header.op as usize)
+            .is_some_and(|stored| stored.checksum == header.checksum);
+        send_prepare_ok_common(consensus, header, persisted).await;
     }
 }
 
@@ -3898,6 +3943,12 @@ fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
             "commit_reply: committed op is older than the cached entry \
              (replica-local eviction replayed out of order); cache skipped"
         ),
+        CommitReply::AdvancedFence => tracing::trace!(
+            target: "iggy.metadata.diag",
+            client_id,
+            op,
+            "commit_reply: client evicted while being prepared; reply shipped, fence advanced"
+        ),
     }
 }
 
@@ -3997,6 +4048,7 @@ mod tests {
         // `crate::stm::stream::tests::populated_streams_snapshot_reencode_is_byte_stable`.
         let mut snapshot = IggySnapshot::new(7);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            fences: vec![],
             slots: vec![
                 (
                     0,
@@ -4048,6 +4100,7 @@ mod tests {
         const REPLY_LEN: usize = 512;
         let mut snapshot = IggySnapshot::new(1);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            fences: vec![],
             slots: vec![(
                 0,
                 consensus::ClientEntrySnapshot {
@@ -4516,7 +4569,7 @@ mod tests {
         let pat_success = committed_reply(CLIENT, 1, Operation::CreatePersonalAccessToken, 0);
         md.client_table
             .borrow_mut()
-            .commit_reply(CLIENT, pat_success);
+            .commit_reply(CLIENT, USER, pat_success);
 
         // Replaying request 1 as a PAT create must NOT return the cached
         // success; it must refuse with the name-taken code.
@@ -4542,7 +4595,7 @@ mod tests {
         );
         md.client_table
             .borrow_mut()
-            .commit_reply(CLIENT, pat_rejection);
+            .commit_reply(CLIENT, USER, pat_rejection);
         let reply = md
             .submit_request_in_process(pat_create_request(CLIENT, 2))
             .await
@@ -5294,6 +5347,99 @@ mod tests {
     /// `resume_stranded_commits` (wired into the shard pump tick) is the
     /// backstop: it re-enters the commit path, applies the stranded prefix,
     /// and promotes the queued register, whose awaiter then resolves.
+    /// A state-transfer receiver's WAL can hold a pre-crash suffix above the
+    /// incoming floor. The commit walk matches entries by op number alone, so
+    /// installing without discarding that suffix would later apply its stale
+    /// bodies as committed. The install must truncate the WAL above
+    /// `snapshot_seq` and keep everything at or below it, which tail repair
+    /// resumes from.
+    #[compio::test]
+    async fn state_transfer_install_truncates_the_wal_above_the_incoming_floor() {
+        const CLIENT: u128 = 9;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        const SNAPSHOT_SEQ: u64 = 2;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        // Journal ops 1..=3 directly (no acks, so `commit_min` stays 0 and the
+        // transfer is "ahead"): 1 and 2 sit at or below the incoming floor, 3 is
+        // the relic suffix a view change has since reassigned.
+        for (request_id, name) in [(1, "s1"), (2, "s2"), (3, "s3")] {
+            let projected = md
+                .prepare_request(create_stream_request(CLIENT, request_id, name))
+                .expect("CreateStream is client-allowed");
+            consensus.pipeline_message(PlaneKind::Metadata, &projected);
+            md.journal
+                .as_ref()
+                .unwrap()
+                .handle()
+                .append(projected)
+                .await
+                .expect("seeding the WAL succeeds");
+        }
+        let journal_handle = md.journal.as_ref().unwrap().handle();
+        assert_eq!(journal_handle.last_op(), Some(3));
+
+        // A donor mux fills the snapshot the way a serving primary would, so
+        // the restore path sees populated sections rather than a bare envelope.
+        let snapshot_bytes =
+            <IggySnapshot as Snapshot>::create(&TestMux::default(), SNAPSHOT_SEQ, 1)
+                .expect("donor snapshot builds")
+                .encode()
+                .expect("donor snapshot encodes");
+        md.install_state_transfer(
+            &snapshot_bytes,
+            ClientTable::new(CLIENTS_TABLE_MAX),
+            0,
+            SNAPSHOT_SEQ,
+        )
+        .await
+        .expect("install succeeds");
+
+        assert_eq!(
+            journal_handle.last_op(),
+            Some(SNAPSHOT_SEQ),
+            "the relic above the incoming floor must be gone"
+        );
+        assert!(
+            journal_handle.header(3).is_none(),
+            "op 3 was above the floor; the commit walk must never see it again"
+        );
+        assert!(
+            journal_handle.header(1).is_some() && journal_handle.header(2).is_some(),
+            "ops at or below the floor stay for the walk and tail repair"
+        );
+    }
+
     #[compio::test]
     async fn tick_backstop_must_resume_stranded_commits_and_promotions() {
         use std::future::Future;

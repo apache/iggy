@@ -180,6 +180,8 @@ runs:
 
     - name: Doc test
       if: inputs.task == 'doctest'
+      env:
+        RUSTDOCFLAGS: -D warnings
       run: |
         cargo test --locked --doc
         cargo doc --no-deps --all-features --quiet
@@ -195,7 +197,7 @@ runs:
     - name: Install dependencies for Rust tests
       if: startsWith(inputs.task, 'test-') && runner.os == 'Linux'
       run: |
-        sudo apt-get install --yes musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
+        ./scripts/ci/apt-install.sh musl-tools gnome-keyring keyutils dbus-x11 libsecret-tools
         rm -f $HOME/.local/share/keyrings/*
       shell: bash
 
@@ -293,7 +295,12 @@ runs:
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
           if [[ -n "$NEXTEST_FILTER" ]]; then
-            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
+            # Every test target in the `bdd` crate is `required-features =
+            # ["bdd"]`, so the `cargo test --no-run` above builds no binaries
+            # for it. A PR touching only that crate then produces a valid
+            # filter that matches zero tests, and nextest's default
+            # `--no-tests=fail` turns that into exit 4 on a green PR.
+            cargo nextest run --locked --no-fail-fast --no-tests=warn --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
           else
             cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG
           fi
@@ -370,7 +377,7 @@ runs:
     - name: Install musl tools for aarch64-musl
       if: inputs.task == 'build-aarch64-musl' && runner.os == 'Linux'
       run: |
-        sudo apt-get update && sudo apt-get install -y musl-tools
+        ./scripts/ci/apt-install.sh musl-tools
         rustup target add aarch64-unknown-linux-musl
       shell: bash
 

@@ -29,7 +29,7 @@ use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     api::ConnectorStatus,
     sink::ConsumeCallback,
-    source::{HandleCallback, SendCallback},
+    source::{BatchResultCallback, HandleCallback, SendCallback},
     transforms::Transform,
 };
 use mimalloc::MiMalloc;
@@ -63,7 +63,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Parser, Debug)]
-#[command(author = "Apache Iggy (Incubating)", version)]
+#[command(author = "Apache Iggy", version)]
 struct Args {}
 
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
@@ -80,7 +80,8 @@ pub(crate) struct SourceApi {
         state_len: usize,
         log_callback: iggy_connector_sdk::LogCallback,
     ) -> i32,
-    iggy_source_handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
+    iggy_source_handle_v2: extern "C" fn(id: u32, callback: SendCallback) -> i32,
+    iggy_source_batch_result: extern "C" fn(plugin_id: u32, batch_id: u64, result: u8) -> i32,
     iggy_source_close: extern "C" fn(id: u32) -> i32,
     iggy_source_version: extern "C" fn() -> *const std::ffi::c_char,
 }
@@ -141,9 +142,7 @@ async fn main() -> Result<(), RuntimeError> {
 
     log::init_logging(&config.telemetry, &config.logging, VERSION);
 
-    std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
-
-    info!("State will be stored in: {}", config.state.path);
+    let state_factory = state::factory_from_config(&config.state)?;
 
     let iggy_clients = Arc::new(stream::init(config.iggy.clone()).await?);
 
@@ -160,7 +159,7 @@ async fn main() -> Result<(), RuntimeError> {
     let (sources, failed_sources) = source::init(
         sources_config.clone(),
         &iggy_clients.producer,
-        &config.state.path,
+        &state_factory,
     )
     .await?;
 
@@ -185,12 +184,14 @@ async fn main() -> Result<(), RuntimeError> {
     let mut source_containers_by_key: HashMap<String, Arc<Container<SourceApi>>> = HashMap::new();
     for (_path, source) in sources {
         let container = Arc::new(source.container);
-        let callback = container.iggy_source_handle;
+        let handle_callback = container.iggy_source_handle_v2;
+        let batch_result_callback = container.iggy_source_batch_result;
         for plugin in &source.plugins {
             source_containers_by_key.insert(plugin.key.clone(), container.clone());
         }
         source_wrappers.push(SourceConnectorWrapper {
-            callback,
+            handle_callback,
+            batch_result_callback,
             plugins: source.plugins,
         });
     }
@@ -205,7 +206,7 @@ async fn main() -> Result<(), RuntimeError> {
         &failed_sources,
         connectors_config_provider,
         iggy_clients.clone(),
-        config.state.path.clone(),
+        state_factory,
     );
     for (key, container) in sink_containers_by_key {
         if let Some(details) = context.sinks.get(&key).await {
@@ -460,7 +461,8 @@ struct SourceConnectorProducer {
 }
 
 struct SourceConnectorWrapper {
-    callback: HandleCallback,
+    handle_callback: HandleCallback,
+    batch_result_callback: BatchResultCallback,
     plugins: Vec<SourceConnectorPlugin>,
 }
 

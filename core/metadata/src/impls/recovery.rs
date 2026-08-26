@@ -20,7 +20,7 @@ use crate::stm::StateMachine;
 use crate::stm::authz::GatedApply;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use consensus::{
-    ClientTable, ClientTableDecodeError, VsrState, VsrStateError, build_reply_message,
+    ClientTable, ClientTableDecodeError, SessionEnd, VsrState, VsrStateError, build_reply_message,
     build_reply_message_with,
 };
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
@@ -358,6 +358,7 @@ pub async fn recover<M>(
     journal_slots: usize,
     clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
+    on_replayed_logout: impl Fn(&M, u128, iggy_common::IggyTimestamp),
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
@@ -617,11 +618,20 @@ where
             continue;
         }
         if header.operation == Operation::Logout {
-            client_table.remove_client(header.client);
-            // TODO: the commit paths also run `remove_consumer_group_member`
-            // here; recovery has no `StreamsFrontend` bound, so replayed
-            // logouts leave stale group members (pre-existing, harmless for
-            // dead connections but a divergence from the live apply).
+            client_table.remove_client(
+                header.client,
+                header.user_id,
+                SessionEnd::from_logout_request(header.request),
+            );
+            // Logout's only state-machine effect, mirrored from the live
+            // commit path: the caller drops the client from its consumer
+            // groups (`remove_consumer_group_member`) so replay and live
+            // apply converge on the same group membership.
+            on_replayed_logout(
+                &mux_stm,
+                header.client,
+                iggy_common::IggyTimestamp::from(header.timestamp),
+            );
             last_applied_op = Some(header.op);
             continue;
         }
@@ -647,7 +657,7 @@ where
             // eviction is replica-local and unlogged, so a WAL can legitimately
             // replay a lower request id onto a preserved watermark. Recovery
             // must boot from such a WAL, not refuse it.
-            let _ = client_table.commit_reply(header.client, cached);
+            let _ = client_table.commit_reply(header.client, header.user_id, cached);
         }
         tracing::debug!(
             target: "iggy.metadata.diag",
@@ -956,6 +966,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -981,6 +992,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1016,6 +1028,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1073,6 +1086,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1132,6 +1146,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await;
 
@@ -1182,6 +1197,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1219,6 +1235,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1288,6 +1305,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1333,6 +1351,7 @@ mod tests {
         let app = make_client_prepare(2, Operation::CreateStream, CLIENT, USER, 1);
         at_checkpoint.commit_reply(
             CLIENT,
+            USER,
             build_reply_message(app.header(), &bytes::Bytes::new()),
         );
 
@@ -1363,6 +1382,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1428,6 +1448,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1477,12 +1498,14 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
+        let replayed_logouts = std::cell::RefCell::new(Vec::new());
         let recovered = recover::<TestStm>(
             dir.path(),
             SOLO,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, client, _| replayed_logouts.borrow_mut().push(client),
         )
         .await
         .unwrap();
@@ -1490,6 +1513,11 @@ mod tests {
             recovered.client_table.get_epoch(CLIENT),
             None,
             "logged-out session must not be resurrected"
+        );
+        assert_eq!(
+            replayed_logouts.into_inner(),
+            vec![CLIENT],
+            "replay must hand the logged-out client to the group-removal hook"
         );
         assert_eq!(recovered.last_applied_op, Some(2));
     }
@@ -1545,6 +1573,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await;
         assert!(matches!(
@@ -1577,6 +1606,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await;
         assert!(matches!(
@@ -1608,6 +1638,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1660,6 +1691,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
+                |_, _, _| {},
             )
             .await;
             match result {
@@ -1700,6 +1732,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         {
@@ -1764,6 +1797,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1816,6 +1850,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();

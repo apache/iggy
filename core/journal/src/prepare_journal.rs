@@ -629,7 +629,7 @@ impl PrepareJournal {
     }
 
     /// How many entries the opening scan replayed unverified
-    /// ([`CHECKSUM_BODY_UNSEALED`]). `0` once every producer seals; the boot path
+    /// (`CHECKSUM_BODY_UNSEALED`). `0` once every producer seals; the boot path
     /// warns while it is not, so the fail-open stretch is visible to an operator.
     pub const fn unsealed_entry_count(&self) -> u64 {
         self.unsealed_entries
@@ -741,7 +741,7 @@ impl PrepareJournal {
     clippy::cast_sign_loss,
     clippy::future_not_send
 )]
-impl Journal<FileStorage> for PrepareJournal {
+impl Journal for PrepareJournal {
     fn last_op(&self) -> Option<u64> {
         self.last_op.get()
     }
@@ -1162,7 +1162,6 @@ impl Journal<FileStorage> for PrepareJournal {
 }
 
 impl JournalHandle for PrepareJournal {
-    type Storage = FileStorage;
     type Target = Self;
 
     fn handle(&self) -> &Self::Target {

@@ -929,7 +929,7 @@ where
     }
 }
 
-impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMemStorage> {
+impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     type Header = PrepareHeader;
     type Entry = JournalBuffer;
     #[rustfmt::skip]

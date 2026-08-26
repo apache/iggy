@@ -41,7 +41,7 @@
 
 ---
 
-## What is Apache Iggy (Incubating)?
+## What is Apache Iggy?
 
 **Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, WebSocket, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
@@ -391,7 +391,7 @@ producer.send(messages).await?;
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
     .auto_commit(AutoCommit::IntervalOrWhen(
-        IggyDuration::from_str("1s")?,
+        NonZeroIggyDuration::from_str("1s")?,
         AutoCommitWhen::ConsumingAllMessages,
     ))
     .create_consumer_group_if_not_exists()

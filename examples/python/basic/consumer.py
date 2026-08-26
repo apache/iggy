@@ -19,7 +19,7 @@ import argparse
 import asyncio
 from typing import NamedTuple
 
-from apache_iggy import IggyClient, PollingStrategy, ReceiveMessage
+from apache_iggy import Consumer, IggyClient, PollingStrategy, ReceiveMessage
 from loguru import logger
 
 STREAM_NAME = "sample-stream"
@@ -27,6 +27,7 @@ TOPIC_NAME = "sample-topic"
 STREAM_ID = 0
 TOPIC_ID = 0
 PARTITION_ID = 0
+CONSUMER_NAME = "sample-consumer"
 BATCHES_LIMIT = 5
 
 
@@ -73,6 +74,7 @@ async def consume_messages(client: IggyClient):
             polled_messages = await client.poll_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
+                consumer=Consumer.Single(CONSUMER_NAME),
                 partition_id=PARTITION_ID,
                 polling_strategy=PollingStrategy.Next(),
                 count=messages_per_batch,

@@ -21,10 +21,11 @@ use ext_php_rs::{exception::PhpResult, php_class, php_impl, types::ZendCallable}
 use futures::StreamExt;
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitWhen as RustAutoCommitWhen,
-    IggyConsumer as RustIggyConsumer, IggyDuration,
+    IggyConsumer as RustIggyConsumer,
 };
 use tokio::sync::Mutex;
 
+use crate::client::non_zero_duration_micros;
 use crate::error::to_php_exception;
 use crate::message_iterator::MessageIterator;
 use crate::receive_message::ReceiveMessage;
@@ -198,16 +199,22 @@ impl AutoCommit {
         }
     }
 
-    pub fn interval(interval_micros: u64) -> Self {
-        Self {
-            inner: RustAutoCommit::Interval(IggyDuration::from(interval_micros)),
-        }
+    pub fn interval(interval_micros: u64) -> PhpResult<Self> {
+        Ok(Self {
+            inner: RustAutoCommit::Interval(non_zero_duration_micros(
+                "interval_micros",
+                interval_micros,
+            )?),
+        })
     }
 
-    pub fn interval_or_when(interval_micros: u64, when: &AutoCommitWhen) -> Self {
-        Self {
-            inner: RustAutoCommit::IntervalOrWhen(IggyDuration::from(interval_micros), when.inner),
-        }
+    pub fn interval_or_when(interval_micros: u64, when: &AutoCommitWhen) -> PhpResult<Self> {
+        Ok(Self {
+            inner: RustAutoCommit::IntervalOrWhen(
+                non_zero_duration_micros("interval_micros", interval_micros)?,
+                when.inner,
+            ),
+        })
     }
 
     pub fn when(when: &AutoCommitWhen) -> Self {

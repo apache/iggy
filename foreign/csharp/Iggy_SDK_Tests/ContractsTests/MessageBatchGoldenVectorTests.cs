@@ -18,7 +18,7 @@
 using System.Buffers.Binary;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Extensions;
-using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.Vsr;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Utils;
@@ -139,7 +139,7 @@ public sealed class MessageBatchGoldenVectorTests
         var pollBody = Convert.FromHexString(PollBody);
 
         using var rental =
-            Mappers.BinaryMapper.MapRentedMessages(pollBody, TcpMessageStream.EmptyMemoryOwner.Instance);
+            Mappers.BinaryMapper.MapRentedMessages(pollBody, EmptyMemoryOwner.Instance);
 
         Assert.Equal(3, rental.PartitionId);
         Assert.Equal(101ul, rental.CurrentOffset);

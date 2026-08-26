@@ -143,7 +143,18 @@ extract_hawkeye_paths() {
   local key="$1"
   local file="$2"
 
-  jq -r --arg key "$key" '.[$key] // [] | .[]' "$file" \
+  jq -r --arg key "$key" '
+      .files[]
+      | select(
+          if $key == "missing" then .outcome == "add"
+          elif $key == "inconsistent" then (.outcome == "replace" or .outcome == "conflict")
+          elif $key == "change" then (.outcome == "add" or .outcome == "replace")
+          elif $key == "unknown" then .outcome == "unsupported"
+          else .outcome == $key
+          end
+        )
+      | .path
+    ' "$file" \
     | awk -v root="$REPO_ROOT" '
         NF {
           if (index($0, root "/") == 1) {
@@ -176,20 +187,24 @@ write_hawkeye_report() {
   local json_file="$1"
   local report_file="$2"
   local missing_file
+  local inconsistent_file
   local unknown_file
 
   missing_file=$(mktemp)
+  inconsistent_file=$(mktemp)
   unknown_file=$(mktemp)
 
   extract_hawkeye_paths missing "$json_file" > "$missing_file"
+  extract_hawkeye_paths inconsistent "$json_file" > "$inconsistent_file"
   extract_hawkeye_paths unknown "$json_file" > "$unknown_file"
 
   {
     append_hawkeye_section "Missing license headers" "$missing_file"
+    append_hawkeye_section "Inconsistent license headers" "$inconsistent_file"
     append_hawkeye_section "Unknown file types" "$unknown_file"
   } > "$report_file"
 
-  rm -f "$missing_file" "$unknown_file"
+  rm -f "$missing_file" "$inconsistent_file" "$unknown_file"
 }
 
 find_duplicate_license_headers() {
@@ -286,8 +301,8 @@ if [ "$MODE" = "fix" ]; then
   LOG_FILE=$(mktemp)
   trap 'rm -f "$TEMP_FILE" "$MISSING_FILE" "$UNKNOWN_FILE" "$DUPLICATE_FILE" "$LOG_FILE"' EXIT
 
-  run_hawkeye check --config licenserc.toml --fail-if-unknown -o "$TEMP_FILE" > "$LOG_FILE" 2>&1 || true
-  extract_hawkeye_paths missing "$TEMP_FILE" > "$MISSING_FILE"
+  run_hawkeye check --config licenserc.toml --fail-on-unknown --output-format json > "$TEMP_FILE" 2> "$LOG_FILE" || true
+  extract_hawkeye_paths change "$TEMP_FILE" > "$MISSING_FILE"
   extract_hawkeye_paths unknown "$TEMP_FILE" > "$UNKNOWN_FILE"
 
   if [ -s "$UNKNOWN_FILE" ]; then
@@ -297,7 +312,7 @@ if [ "$MODE" = "fix" ]; then
     exit 1
   fi
 
-  run_hawkeye format --config licenserc.toml --fail-if-updated false --fail-if-unknown
+  run_hawkeye format --config licenserc.toml --fail-on-unknown
   find_duplicate_license_headers "$DUPLICATE_FILE"
 
   if [ -s "$MISSING_FILE" ]; then
@@ -327,7 +342,7 @@ else
   trap 'rm -f "$TEMP_FILE" "$REPORT_FILE" "$DUPLICATE_FILE" "$LOG_FILE"' EXIT
 
   HAWKEYE_STATUS=0
-  run_hawkeye check --config licenserc.toml --fail-if-unknown -o "$TEMP_FILE" > "$LOG_FILE" 2>&1 || HAWKEYE_STATUS=$?
+  run_hawkeye check --config licenserc.toml --fail-on-unknown --output-format json > "$TEMP_FILE" 2> "$LOG_FILE" || HAWKEYE_STATUS=$?
   find_duplicate_license_headers "$DUPLICATE_FILE"
 
   if [ "$HAWKEYE_STATUS" -eq 0 ] && [ ! -s "$DUPLICATE_FILE" ]; then

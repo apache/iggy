@@ -40,7 +40,7 @@ import pytest
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
-from apache_iggy import IggyClient, PollingStrategy
+from apache_iggy import Consumer, IggyClient, PollingStrategy
 from apache_iggy import SendMessage as Message
 
 from .utils import wait_for_ping, wait_for_server
@@ -143,6 +143,7 @@ class TestTlsConnectivity:
         polled = await tls_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,

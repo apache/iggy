@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { createPool, type Pool } from 'generic-pool';
 import type { RawClient, ClientConfig } from "./client.type.js"

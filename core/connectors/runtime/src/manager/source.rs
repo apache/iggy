@@ -22,7 +22,6 @@ use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::metrics::Metrics;
 use crate::source;
-use crate::state::{StateProvider, StateStorage};
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use iggy::prelude::IggyClient;
@@ -109,6 +108,17 @@ impl SourceManager {
         }
     }
 
+    pub async fn is_stopping_or_stopped(&self, key: &str) -> bool {
+        let Some(source) = self.sources.get(key).map(|entry| entry.value().clone()) else {
+            return true;
+        };
+        let source = source.lock().await;
+        matches!(
+            source.info.status,
+            ConnectorStatus::Stopping | ConnectorStatus::Stopped
+        )
+    }
+
     pub async fn stop_connector_with_guard(
         &self,
         key: &str,
@@ -138,6 +148,9 @@ impl SourceManager {
             .map(|e| e.value().clone())
             .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
 
+        self.update_status(key, ConnectorStatus::Stopping, Some(metrics))
+            .await;
+
         let (task_handles, plugin_id, container) = {
             let mut details = details.lock().await;
             (
@@ -147,8 +160,8 @@ impl SourceManager {
             )
         };
 
-        // Order: close FFI (stops callbacks) -> drop sender (unblocks
-        // recv_async) -> await tasks. Reversing risks an abort mid-save.
+        // The result callback can race with close, so the forwarding loop
+        // treats callback failures during Stopping as expected shutdown.
         if let Some(container) = &container {
             info!("Closing source connector with ID: {plugin_id} for plugin: {key}");
             (container.iggy_source_close)(plugin_id);
@@ -172,12 +185,8 @@ impl SourceManager {
 
         {
             let mut details = details.lock().await;
-            let old_status = details.info.status;
             details.info.status = ConnectorStatus::Stopped;
             details.info.last_error = None;
-            if old_status == ConnectorStatus::Running {
-                metrics.decrement_sources_running();
-            }
         }
 
         Ok(())
@@ -189,7 +198,6 @@ impl SourceManager {
         config: &SourceConfig,
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
-        state_path: &str,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let details = self
@@ -207,10 +215,19 @@ impl SourceManager {
 
         let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
 
-        let state_storage = source::get_state_storage(state_path, key);
-        let state = match &state_storage {
-            StateStorage::File(file) => file.load().await?,
-        };
+        let state_storage = context.state_factory.storage_for(key)?;
+        let state = state_storage
+            .load()
+            .await
+            .map_err(|load_error| match load_error {
+                iggy_connector_sdk::Error::TransientState(_)
+                | iggy_connector_sdk::Error::PermanentState(_)
+                | iggy_connector_sdk::Error::StateLatched => RuntimeError::StateLoadFailed {
+                    connector_key: key.to_string(),
+                    source: load_error,
+                },
+                other => RuntimeError::ConnectorSdkError(other),
+            })?;
 
         source::init_source(
             &container,
@@ -223,7 +240,8 @@ impl SourceManager {
         let (producer, encoder, transforms) =
             source::setup_source_producer(key, config, iggy_client).await?;
 
-        let callback = container.iggy_source_handle;
+        let handle_callback = container.iggy_source_handle_v2;
+        let batch_result_callback = container.iggy_source_batch_result;
         let handler_tasks = source::spawn_source_handler(
             plugin_id,
             key,
@@ -233,7 +251,8 @@ impl SourceManager {
             encoder,
             transforms,
             state_storage,
-            callback,
+            handle_callback,
+            batch_result_callback,
             context.clone(),
         );
 
@@ -256,7 +275,6 @@ impl SourceManager {
         config_provider: &dyn ConnectorsConfigProvider,
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
-        state_path: &str,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let guard = {
@@ -282,7 +300,7 @@ impl SourceManager {
             .map_err(|e| RuntimeError::InvalidConfiguration(e.to_string()))?
             .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
 
-        self.start_connector(key, &config, iggy_client, metrics, state_path, context)
+        self.start_connector(key, &config, iggy_client, metrics, context)
             .await?;
         info!("Source connector: {key} restarted successfully.");
         Ok(())

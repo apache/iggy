@@ -19,10 +19,10 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(
-    author = "Apache Iggy (Incubating)",
+    author = "Apache Iggy",
     version,
     about = "Apache Iggy: Hyper-Efficient Message Streaming at Laser Speed",
-    long_about = r#"Apache Iggy (Incubating) - a persistent message streaming platform written in Rust
+    long_about = r#"Apache Iggy - a persistent message streaming platform written in Rust
 
 Iggy stores every stream in a replicated log kept consistent by Viewstamped
 Replication. One binary serves both the single-node and the clustered
