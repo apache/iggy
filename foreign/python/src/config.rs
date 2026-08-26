@@ -245,9 +245,10 @@ impl TcpConfig {
     /// Args:
     ///     server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
     ///     failover_addresses: `host:port` of other nodes of the same cluster, dialed
-    ///         in order when `server_address` cannot be reached. The roster the server
-    ///         reports is remembered while the client is connected and dialed first,
-    ///         so these seeds only have to be enough to reach the cluster once.
+    ///         when `server_address` cannot be reached. Part of every failover pass,
+    ///         ahead of the roster the client learned while connected, and the only
+    ///         other addresses it has before its first connect, a fresh process
+    ///         included, since reading the roster needs a connection.
     ///         Defaults to none.
     ///     auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
     ///     reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.

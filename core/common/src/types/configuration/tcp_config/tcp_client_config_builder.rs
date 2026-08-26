@@ -45,8 +45,8 @@ impl TcpClientConfigBuilder {
         self
     }
 
-    /// Sets the addresses of other nodes of the same cluster, dialed in order
-    /// when `server_address` cannot be reached.
+    /// Sets the addresses of other nodes of the same cluster, dialed when `server_address`
+    /// cannot be reached, ahead of the roster the client learns while connected.
     pub fn with_failover_addresses(mut self, failover_addresses: Vec<String>) -> Self {
         self.config.failover_addresses = failover_addresses;
         self

@@ -26,11 +26,13 @@ use std::str::FromStr;
 pub struct TcpClientConfig {
     /// The address of the Iggy server.
     pub server_address: String,
-    /// Addresses of other nodes of the same cluster, dialed in order when
-    /// `server_address` cannot be reached. The roster the server reports is
-    /// remembered while the client is connected and dialed first, so these
-    /// seeds only have to be enough to reach the cluster once -- at the very
-    /// first connect, when nothing has been learned yet.
+    /// Addresses of other nodes of the same cluster, dialed when
+    /// `server_address` cannot be reached.
+    ///
+    /// Part of every failover pass, ahead of the roster the client learned while
+    /// connected, since the caller vouched for these. Before the first connect --
+    /// a fresh process included -- they are the only other addresses there are,
+    /// because reading the roster needs a connection.
     pub failover_addresses: Vec<String>,
     /// Whether to use TLS when connecting to the server.
     pub tls_enabled: bool,
