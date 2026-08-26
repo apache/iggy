@@ -81,6 +81,13 @@ Example:
 - Namespace: `nyc`
 - Table name: `users`
 
+## Partitioned Tables
+
+Data files follow the table's default partition spec. Each batch is split by the spec's transforms
+(`identity`, `bucket`, `truncate`, `year`, `month`, `day`, `hour`) and every partition value present
+in the batch gets at least one Parquet file under its partition path. Unpartitioned tables are
+written into a single file per batch.
+
 ## Source Compatibility
 
 The Iceberg sink expects **flat JSON** where each top-level key maps directly to a column in the

@@ -7053,6 +7053,7 @@ dependencies = [
 name = "iggy_connector_iceberg_sink"
 version = "0.5.0-edge.4"
 dependencies = [
+ "arrow-array 57.3.1",
  "arrow-json 57.3.1",
  "async-trait",
  "dashmap",
@@ -7064,6 +7065,7 @@ dependencies = [
  "serde",
  "simd-json",
  "strum 0.28.0",
+ "tokio",
  "tracing",
  "uuid",
 ]
