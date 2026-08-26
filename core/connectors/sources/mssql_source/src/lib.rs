@@ -211,9 +211,9 @@ impl Source for MSSQLSource {
 					"MSSQL polling mode not enabled for connector ID: {}",
 					self.id
 				);
-				return Err(Error::InitError(format!(
-					"Polling mode is not available. Use CDC."
-				)));
+				return Err(Error::InitError(
+					"Polling mode is not available. Use CDC.".to_string()
+				));
 			}
 			_ => {
 				return Err(Error::InitError(format!(
@@ -406,7 +406,7 @@ impl MSSQLSource {
 		for row in table_columns {
 			let capture_table: &str = row
 				.try_get::<&str, _>("capture_table")
-				.map_err(|e| Error::InvalidRecord)?
+				.map_err(|_| Error::InvalidRecord)?
 				.ok_or(Error::InvalidRecord)?;
 			let capture_table = capture_table.replacen(&schema_prefix, "", 1);
 
@@ -438,19 +438,23 @@ impl MSSQLSource {
 		let query = format!("SELECT [{database}].sys.fn_cdc_get_max_lsn() as lsn;");
 
 		let new_lsn: Lsn = self.query(Query::new(query))
-			.await?[0]
-			.get::<&[u8], _>("lsn")
-			.unwrap()
-			.try_into()
-			.unwrap();
+			.await?
+			.first()
+			.and_then(|row| row.get::<&[u8], _>("lsn"))
+			.ok_or(Error::InvalidRecord)?
+    		.try_into()
+    		.map_err(|_| Error::InvalidRecord)?;
 		let new_lsn_hex = lsn_to_hex(&new_lsn);
 
-		let mut state = self.state.lock().await;
-		if state.last_poll_lsn.is_some() && state.last_poll_lsn.unwrap() == new_lsn {
+		let last_poll_lsn = {
+			let state = self.state.lock().await;
+			state.last_poll_lsn
+		};
+		if last_poll_lsn.is_some() && last_poll_lsn.unwrap() == new_lsn {
 			return Ok(vec![]);
 		}
 
-		let base_filter = match state.last_poll_lsn {
+		let base_filter = match last_poll_lsn {
 			Some(x) => {
 				let last_poll_lsn = lsn_to_hex(&x);
 				format!("[__$start_lsn] > {last_poll_lsn} AND [__$start_lsn] <= {new_lsn_hex}")
@@ -481,18 +485,15 @@ impl MSSQLSource {
 		let database = self.config.database.clone();
 
 		let mut result = Vec::new();
-		let default_columns = "*".to_string();
 
 		for (table, data) in &self.capture_columns {
 
 			// Get columns from config, otherwise from the monitored ones or fallback to *
 			let columns = match self.config.capture_table_columns.get::<String>(table) {
 				Some(x) => x,
-				None => match self.capture_columns.get(table) {
-					Some(x) => &x.columns,
-					None => &default_columns
-				}
+				None => &data.columns
 			};
+			let cdc_table = &data.capture_instance;
 
 			let first_table_lsn = lsn_to_hex(&data.start_lsn);
 			let query_filter = format!("{base_filter} AND {first_table_lsn} <= [__$start_lsn]");
@@ -513,14 +514,14 @@ impl MSSQLSource {
 					,(
 						SELECT
 							{columns}
-						FROM [{database}].[cdc].[{table}] t_json
+						FROM [{database}].[cdc].[{cdc_table}] t_json
 						WHERE t.[__$start_lsn] = t_json.[__$start_lsn]
 							AND t.[__$update_mask] = t_json.[__$update_mask]
 							AND t.[__$command_id]= t_json.[__$command_id]
-						ORDER BY t_json.[__$command_id] ASC
+						ORDER BY t_json.[__$operation] DESC
 						FOR JSON AUTO
 					) as data
-				FROM [{database}].cdc.[{table}] t
+				FROM [{database}].cdc.[{cdc_table}] t
 				WHERE {query_filter}
 				GROUP BY [__$start_lsn], [__$command_id], [__$seqval], [__$end_lsn], [__$update_mask]
 				ORDER BY [__$start_lsn] ASC, [__$command_id] ASC;
@@ -561,14 +562,53 @@ impl MSSQLSource {
 					None => Utc::now()
 				};
 
-				let parsed_data = serde_json::from_str(&data)
+				let parsed_data: serde_json::Value = serde_json::from_str(&data)
 					.map_err(|_| Error::InvalidRecord)?;
+
+				// Since query above groups update rows
+				// (i.e. row with __$operation 3 is old data and row with __$operation 4 is new data)
+				// then for insert and delete only one row shall be present
+				// and two rows for updates, with the first being new and last being old
+				let (new_data, old_data) = match operation_type.as_str() {
+					"UPDATE" => {
+						let rows = parsed_data
+							.as_array()
+							.ok_or(Error::InvalidRecord)?;
+
+						if rows.len() != 2 {
+							error!(
+								"Expected exactly 2 CDC rows for UPDATE, got {}",
+								rows.len()
+							);
+							return Err(Error::InvalidRecord);
+						}
+
+						(
+							rows[0].clone(),
+							Some(rows[1].clone()),
+						)
+					}
+					"INSERT" | "DELETE" => {
+						let rows = parsed_data
+							.as_array()
+							.ok_or(Error::InvalidRecord)?;
+
+						let data = rows
+							.first()
+							.cloned()
+							.ok_or(Error::InvalidRecord)?;
+
+						(data, None)
+					}
+					_ => return Err(Error::InvalidRecord),
+				};
+
 				let change_record = DatabaseRecord {
 					table_name: table_name.to_string(),
 					operation_type,
 					timestamp,
-					data: serde_json::Value::Object(parsed_data),
-					old_data: None
+					data: new_data,
+					old_data
 				};
 				let payload =
 					simd_json::to_vec(&change_record).map_err(|_| Error::InvalidRecord)?;
@@ -585,10 +625,12 @@ impl MSSQLSource {
 			}
 		}
 
-		// Update state with minimal lock time
-		if !messages.is_empty() {
-			state.processed_rows += messages.len() as u64;
+		// LSN may advance due to untracked changes (but still recorded)
+		// Update the value, in order to reduce the window of search on the next check
+		{
+			let mut state = self.state.lock().await;
 			state.last_poll_lsn = Some(new_lsn);
+			state.processed_rows += messages.len() as u64;
 		}
 
 		if self.verbose {
@@ -606,7 +648,7 @@ impl MSSQLSource {
 		if lock.is_none() {
 			return Err(Error::InitError("No connection to the database!".to_string()));
 		}
-		let mut conn = lock.as_mut().unwrap();
+		let conn = lock.as_mut().unwrap();
 		q.query(conn)
 			.await
 			.map_err(|e| Error::InitError(format!("Failed to query the database: {e}")))?
