@@ -38,8 +38,11 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 async-trait = { workspace = true }
 dashmap = { workspace = true }
+iggy = { workspace = true }
+iggy_common = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 lapin = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
