@@ -76,8 +76,9 @@ pub struct ArgsOptional {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_server_address: Option<String>,
 
-    /// The optional addresses of other nodes of the same cluster, dialed in
-    /// order when the server address cannot be reached
+    /// The optional addresses of other cluster nodes for the TCP transport
+    ///
+    /// Dialed in order when the server address cannot be reached.
     #[arg(long, value_delimiter = ',')]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_failover_addresses: Option<Vec<String>>,
