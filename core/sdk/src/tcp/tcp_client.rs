@@ -832,17 +832,16 @@ impl TcpClient {
     }
 
     /// Endpoints to dial for one connect, likeliest first: where the client
-    /// currently is, the addresses it was configured with, then the roster it
+    /// currently is, the address it was configured with, then the roster it
     /// learned while connected.
     ///
-    /// Configured before learned, as in the other SDKs: those are the endpoints
+    /// Configured before learned, as in the other SDKs: that is the endpoint
     /// the caller vouched for, while a roster read from a cluster that has since
     /// changed shape may name nodes that are gone.
     async fn dial_candidates(&self) -> Vec<String> {
         let mut candidates = vec![self.current_server_address.lock().await.clone()];
         let roster = self.roster_endpoints.lock().await.clone();
-        let configured = std::iter::once(&self.config.server_address)
-            .chain(self.config.failover_addresses.iter());
+        let configured = std::iter::once(&self.config.server_address);
         for endpoint in configured.chain(roster.iter()) {
             let mut known = false;
             for candidate in &candidates {
@@ -1318,13 +1317,19 @@ mod tests {
 
     const SESSION_USER_ID: u32 = 7;
 
-    fn client_with(server_address: &str, failover_addresses: Vec<String>) -> TcpClient {
+    fn client_with(server_address: &str) -> TcpClient {
         TcpClient::create(Arc::new(TcpClientConfig {
             server_address: server_address.to_string(),
-            failover_addresses,
             ..TcpClientConfig::default()
         }))
         .expect("create the client")
+    }
+
+    /// A client whose roster names `endpoints`, as a leader check leaves it.
+    async fn client_with_roster(server_address: &str, endpoints: Vec<String>) -> TcpClient {
+        let client = client_with(server_address);
+        *client.roster_endpoints.lock().await = endpoints;
+        client
     }
 
     /// A listener nothing ever accepts from: the kernel completes the TCP
@@ -1356,14 +1361,13 @@ mod tests {
         address
     }
 
-    // With reconnection off there are no retries, but the failover endpoints
-    // were configured to be tried and each still gets its one turn.
+    // With reconnection off there are no retries, but the endpoints the roster
+    // named are still there to be tried and each gets its one turn.
     #[tokio::test]
-    async fn a_client_with_reconnection_disabled_still_sweeps_its_failover_endpoints() {
+    async fn a_client_with_reconnection_disabled_still_sweeps_the_endpoints_it_knows() {
         let (_listener, survivor) = live_endpoint().await;
         let client = TcpClient::create(Arc::new(TcpClientConfig {
             server_address: dead_endpoint().await,
-            failover_addresses: vec![survivor.clone()],
             reconnection: TcpClientReconnectionConfig {
                 enabled: false,
                 ..TcpClientReconnectionConfig::default()
@@ -1371,6 +1375,7 @@ mod tests {
             ..TcpClientConfig::default()
         }))
         .expect("create the client");
+        *client.roster_endpoints.lock().await = vec![survivor.clone()];
 
         TcpClient::connect(&client).await.expect("connect");
         assert_eq!(*client.current_server_address.lock().await, survivor);
@@ -1383,7 +1388,6 @@ mod tests {
     async fn a_connect_that_exhausts_every_endpoint_leaves_the_client_disconnected() {
         let client = TcpClient::create(Arc::new(TcpClientConfig {
             server_address: dead_endpoint().await,
-            failover_addresses: vec![dead_endpoint().await],
             reconnection: TcpClientReconnectionConfig {
                 enabled: false,
                 ..TcpClientReconnectionConfig::default()
@@ -1391,6 +1395,7 @@ mod tests {
             ..TcpClientConfig::default()
         }))
         .expect("create the client");
+        *client.roster_endpoints.lock().await = vec![dead_endpoint().await];
 
         assert!(matches!(
             TcpClient::connect(&client).await,
@@ -1417,7 +1422,6 @@ mod tests {
         let plaintext = endpoint_that_hangs_up().await;
         let client = TcpClient::create(Arc::new(TcpClientConfig {
             server_address: configured.clone(),
-            failover_addresses: vec![plaintext],
             tls_enabled: true,
             tls_validate_certificate: false,
             reconnection: TcpClientReconnectionConfig {
@@ -1427,6 +1431,7 @@ mod tests {
             ..TcpClientConfig::default()
         }))
         .expect("create the client");
+        *client.roster_endpoints.lock().await = vec![plaintext];
 
         assert!(matches!(
             TcpClient::connect(&client).await,
@@ -1443,7 +1448,6 @@ mod tests {
         let (_listener, silent) = live_endpoint().await;
         let client = TcpClient::create(Arc::new(TcpClientConfig {
             server_address: silent,
-            failover_addresses: vec![dead_endpoint().await],
             tls_enabled: true,
             tls_validate_certificate: false,
             reconnection: TcpClientReconnectionConfig {
@@ -1453,6 +1457,7 @@ mod tests {
             ..TcpClientConfig::default()
         }))
         .expect("create the client");
+        *client.roster_endpoints.lock().await = vec![dead_endpoint().await];
 
         let sweep = tokio::time::timeout(
             FAILOVER_DIAL_TIMEOUT * 3,
@@ -1588,7 +1593,6 @@ mod tests {
         let (_listener, survivor) = live_endpoint().await;
         let client = TcpClient::create(Arc::new(TcpClientConfig {
             server_address: dead_endpoint().await,
-            failover_addresses: vec![survivor.clone()],
             reconnection: TcpClientReconnectionConfig {
                 reestablish_after: IggyDuration::from_str("10s").expect("duration"),
                 ..TcpClientReconnectionConfig::default()
@@ -1596,6 +1600,7 @@ mod tests {
             ..TcpClientConfig::default()
         }))
         .expect("create the client");
+        *client.roster_endpoints.lock().await = vec![survivor.clone()];
         client
             .connected_at
             .lock()
@@ -1620,7 +1625,6 @@ mod tests {
         let (_listener, current) = live_endpoint().await;
         let client = TcpClient::create(Arc::new(TcpClientConfig {
             server_address: current.clone(),
-            failover_addresses: vec![dead_endpoint().await],
             reconnection: TcpClientReconnectionConfig {
                 reestablish_after: IggyDuration::from_str("1s").expect("duration"),
                 ..TcpClientReconnectionConfig::default()
@@ -1628,6 +1632,7 @@ mod tests {
             ..TcpClientConfig::default()
         }))
         .expect("create the client");
+        *client.roster_endpoints.lock().await = vec![dead_endpoint().await];
         client
             .connected_at
             .lock()
@@ -1646,37 +1651,32 @@ mod tests {
 
     #[tokio::test]
     async fn dial_candidates_lead_with_the_current_endpoint_and_name_each_other_one_once() {
-        let client = client_with(
+        let client = client_with_roster(
             "127.0.0.1:8090",
-            vec!["127.0.0.1:8092".to_string(), "localhost:8090".to_string()],
-        );
-        *client.roster_endpoints.lock().await = vec![
-            "127.0.0.1:8090".to_string(),
-            "127.0.0.1:8091".to_string(),
-            "127.0.0.1:8092".to_string(),
-        ];
-
-        // The current endpoint leads, the configured ones follow, and the
-        // roster comes last -- the same order as the other SDKs. Neither the
-        // roster's copy of an endpoint already named nor a seed that only
-        // spells one differently earns a second dial.
-        assert_eq!(
-            client.dial_candidates().await,
             vec![
                 "127.0.0.1:8090".to_string(),
-                "127.0.0.1:8092".to_string(),
+                "localhost:8090".to_string(),
                 "127.0.0.1:8091".to_string(),
-            ]
+            ],
+        )
+        .await;
+
+        // The current endpoint leads and the roster follows, the same order as
+        // the other SDKs. An endpoint the roster names again earns no second
+        // dial, whether it is spelled the same way or not.
+        assert_eq!(
+            client.dial_candidates().await,
+            vec!["127.0.0.1:8090".to_string(), "127.0.0.1:8091".to_string()]
         );
     }
 
     #[tokio::test]
-    async fn a_client_that_learned_no_roster_still_dials_its_configured_seeds() {
-        let client = client_with("127.0.0.1:8090", vec!["127.0.0.1:8091".to_string()]);
+    async fn a_client_that_learned_no_roster_dials_only_its_configured_endpoint() {
+        let client = client_with("127.0.0.1:8090");
 
         assert_eq!(
             client.dial_candidates().await,
-            vec!["127.0.0.1:8090".to_string(), "127.0.0.1:8091".to_string()]
+            vec!["127.0.0.1:8090".to_string()]
         );
     }
 
@@ -1684,7 +1684,7 @@ mod tests {
     // the caller signs in again. Only involuntary drops keep the sign-in.
     #[tokio::test]
     async fn an_explicit_disconnect_forgets_the_remembered_sign_in() {
-        let client = client_with("127.0.0.1:8090", Vec::new());
+        let client = client_with("127.0.0.1:8090");
         client
             .remember_session_credentials(
                 Credentials::UsernamePassword("iggy".to_string(), "iggy".into()),
@@ -1701,7 +1701,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_transport_drop_keeps_the_remembered_sign_in() {
-        let client = client_with("127.0.0.1:8090", Vec::new());
+        let client = client_with("127.0.0.1:8090");
         client
             .remember_session_credentials(
                 Credentials::UsernamePassword("iggy".to_string(), "iggy".into()),
@@ -1721,7 +1721,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sign_in_makes_a_client_without_auto_login_reconnectable() {
-        let client = client_with("127.0.0.1:8090", Vec::new());
+        let client = client_with("127.0.0.1:8090");
         assert!(client.sign_in_credentials().await.is_none());
 
         client
@@ -1743,7 +1743,7 @@ mod tests {
     // unrelated request with `InvalidCredentials`.
     #[tokio::test]
     async fn a_password_change_for_the_signed_in_user_updates_the_remembered_sign_in() {
-        let client = client_with("127.0.0.1:8090", Vec::new());
+        let client = client_with("127.0.0.1:8090");
         client
             .remember_session_credentials(
                 Credentials::UsernamePassword("iggy".to_string(), "old".into()),
@@ -1777,7 +1777,7 @@ mod tests {
     // changes say nothing about the credentials this client reconnects with.
     #[tokio::test]
     async fn a_password_change_for_another_user_leaves_the_remembered_sign_in_alone() {
-        let client = client_with("127.0.0.1:8090", Vec::new());
+        let client = client_with("127.0.0.1:8090");
         client
             .remember_session_credentials(
                 Credentials::UsernamePassword("iggy".to_string(), "old".into()),
@@ -1802,7 +1802,7 @@ mod tests {
     // A personal access token is not derived from any password.
     #[tokio::test]
     async fn a_password_change_leaves_a_remembered_personal_access_token_alone() {
-        let client = client_with("127.0.0.1:8090", Vec::new());
+        let client = client_with("127.0.0.1:8090");
         client
             .remember_session_credentials(
                 Credentials::PersonalAccessToken("token".into()),

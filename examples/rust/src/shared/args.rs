@@ -98,9 +98,6 @@ pub struct Args {
     #[arg(long, default_value = "127.0.0.1:8090")]
     pub tcp_server_address: String,
 
-    #[arg(long, value_delimiter = ',')]
-    pub tcp_failover_addresses: Vec<String>,
-
     #[arg(long, default_value = "false")]
     pub tcp_tls_enabled: bool,
 
@@ -234,7 +231,6 @@ impl Default for Args {
             tcp_reconnection_reestablish_after: "5s".to_string(),
             tcp_heartbeat_interval: "5s".to_string(),
             tcp_server_address: "127.0.0.1:8090".to_string(),
-            tcp_failover_addresses: Vec::new(),
             tcp_tls_enabled: false,
             tcp_tls_domain: "localhost".to_string(),
             tcp_tls_ca_file: "".to_string(),
@@ -335,7 +331,6 @@ impl Args {
             username: self.username.clone(),
             password: self.password.clone(),
             tcp_server_address: self.tcp_server_address.clone(),
-            tcp_failover_addresses: self.tcp_failover_addresses.clone(),
             tcp_reconnection_enabled: self.tcp_reconnection_enabled,
             tcp_reconnection_max_retries: self.tcp_reconnection_max_retries,
             tcp_reconnection_interval: self.tcp_reconnection_interval.clone(),

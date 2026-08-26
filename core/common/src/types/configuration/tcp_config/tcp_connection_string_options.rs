@@ -23,7 +23,6 @@ use std::str::FromStr;
 
 #[derive(Debug)]
 pub struct TcpConnectionStringOptions {
-    failover_addresses: Vec<String>,
     tls_enabled: bool,
     tls_domain: String,
     tls_ca_file: Option<String>,
@@ -33,10 +32,6 @@ pub struct TcpConnectionStringOptions {
 }
 
 impl TcpConnectionStringOptions {
-    pub fn failover_addresses(&self) -> &[String] {
-        &self.failover_addresses
-    }
-
     pub fn tls_enabled(&self) -> bool {
         self.tls_enabled
     }
@@ -69,7 +64,6 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
 
     fn parse_options(options: &str) -> Result<TcpConnectionStringOptions, IggyError> {
         let options = options.split('&').collect::<Vec<&str>>();
-        let mut failover_addresses = Vec::new();
         let mut tls_enabled = false;
         let mut tls_domain = "".to_string();
         let mut tls_ca_file = None;
@@ -85,14 +79,6 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
                 return Err(IggyError::InvalidConnectionString);
             }
             match option_parts[0] {
-                "failover_addresses" => {
-                    failover_addresses = option_parts[1]
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|address| !address.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                }
                 "tls" => {
                     tls_enabled = option_parts[1] == "true";
                 }
@@ -143,7 +129,6 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
             .map_err(|_| IggyError::InvalidConnectionString)?;
 
         let connection_string_options = TcpConnectionStringOptions::new(
-            failover_addresses,
             tls_enabled,
             tls_domain,
             tls_ca_file,
@@ -158,7 +143,6 @@ impl ConnectionStringOptions for TcpConnectionStringOptions {
 
 impl TcpConnectionStringOptions {
     pub fn new(
-        failover_addresses: Vec<String>,
         tls_enabled: bool,
         tls_domain: String,
         tls_ca_file: Option<String>,
@@ -167,7 +151,6 @@ impl TcpConnectionStringOptions {
         nodelay: bool,
     ) -> Self {
         Self {
-            failover_addresses,
             tls_enabled,
             tls_domain,
             tls_ca_file,
@@ -181,7 +164,6 @@ impl TcpConnectionStringOptions {
 impl Default for TcpConnectionStringOptions {
     fn default() -> Self {
         TcpConnectionStringOptions {
-            failover_addresses: Vec::new(),
             tls_enabled: false,
             tls_domain: "".to_string(),
             tls_ca_file: None,

@@ -26,14 +26,6 @@ use std::str::FromStr;
 pub struct TcpClientConfig {
     /// The address of the Iggy server.
     pub server_address: String,
-    /// Addresses of other nodes of the same cluster, dialed when
-    /// `server_address` cannot be reached.
-    ///
-    /// Part of every failover pass, ahead of the roster the client learned while
-    /// connected, since the caller vouched for these. Before the first connect --
-    /// a fresh process included -- they are the only other addresses there are,
-    /// because reading the roster needs a connection.
-    pub failover_addresses: Vec<String>,
     /// Whether to use TLS when connecting to the server.
     pub tls_enabled: bool,
     /// The domain to use for TLS when connecting to the server.
@@ -57,7 +49,6 @@ impl Default for TcpClientConfig {
     fn default() -> TcpClientConfig {
         TcpClientConfig {
             server_address: "127.0.0.1:8090".to_string(),
-            failover_addresses: Vec::new(),
             tls_enabled: false,
             tls_domain: "".to_string(),
             tls_ca_file: None,
@@ -74,7 +65,6 @@ impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
     fn from(connection_string: ConnectionString<TcpConnectionStringOptions>) -> Self {
         TcpClientConfig {
             server_address: connection_string.server_address().into(),
-            failover_addresses: connection_string.options().failover_addresses().to_vec(),
             auto_login: connection_string.auto_login().to_owned(),
             tls_enabled: connection_string.options().tls_enabled(),
             tls_domain: connection_string.options().tls_domain().into(),

@@ -160,13 +160,6 @@ impl TcpClientBuilder {
         self
     }
 
-    /// Sets the addresses of other nodes of the same cluster, dialed when the server address
-    /// cannot be reached, ahead of the roster the client learns while connected.
-    pub fn with_failover_addresses(mut self, failover_addresses: Vec<String>) -> Self {
-        self.config = self.config.with_failover_addresses(failover_addresses);
-        self
-    }
-
     /// Sets the auto sign in during connection.
     pub fn with_auto_sign_in(mut self, auto_sign_in: AutoLogin) -> Self {
         self.config = self.config.with_auto_sign_in(auto_sign_in);

@@ -23,7 +23,6 @@ use crate::{
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
 /// - `server_address`: Default is "127.0.0.1:8090"
-/// - `failover_addresses`: Default is empty.
 /// - `auto_login`: Default is AutoLogin::Disabled.
 /// - `reconnection`: Default is enabled unlimited retries and 1 second interval.
 /// - `tls_enabled`: Default is false.
@@ -42,13 +41,6 @@ impl TcpClientConfigBuilder {
     /// Sets the server address for the TCP client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
         self.config.server_address = server_address;
-        self
-    }
-
-    /// Sets the addresses of other nodes of the same cluster, dialed when `server_address`
-    /// cannot be reached, ahead of the roster the client learns while connected.
-    pub fn with_failover_addresses(mut self, failover_addresses: Vec<String>) -> Self {
-        self.config.failover_addresses = failover_addresses;
         self
     }
 
@@ -116,10 +108,6 @@ impl TcpClientConfigBuilder {
     pub fn build(mut self) -> Result<TcpClientConfig, IggyError> {
         self.config.server_address = self.config.server_address.trim().to_owned();
         validate_server_address(&self.config.server_address)?;
-        for failover_address in &mut self.config.failover_addresses {
-            *failover_address = failover_address.trim().to_owned();
-            validate_server_address(failover_address)?;
-        }
 
         Ok(self.config)
     }
@@ -191,32 +179,6 @@ mod tests {
     #[test]
     fn missing_port_should_fail() {
         let builder = builder_with_address("127.0.0.1");
-        assert!(matches!(
-            builder.build(),
-            Err(IggyError::InvalidIpAddress(_, _))
-        ));
-    }
-
-    #[test]
-    fn valid_failover_addresses_should_succeed() {
-        let config = builder_with_address("127.0.0.1:8090")
-            .with_failover_addresses(vec![
-                " 127.0.0.1:8091 ".to_string(),
-                "iggy-server-3:8090".to_string(),
-            ])
-            .build()
-            .expect("build the configuration");
-
-        assert_eq!(
-            config.failover_addresses,
-            vec!["127.0.0.1:8091", "iggy-server-3:8090"]
-        );
-    }
-
-    #[test]
-    fn malformed_failover_address_should_fail() {
-        let builder = builder_with_address("127.0.0.1:8090")
-            .with_failover_addresses(vec!["127.0.0.1".to_string()]);
         assert!(matches!(
             builder.build(),
             Err(IggyError::InvalidIpAddress(_, _))

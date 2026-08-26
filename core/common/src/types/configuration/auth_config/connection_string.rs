@@ -159,7 +159,6 @@ impl ConnectionStringUtils {
 mod tests {
     use super::*;
     use crate::NonZeroIggyDuration;
-    use crate::TcpClientConfig;
     use crate::TcpConnectionStringOptions;
     use secrecy::ExposeSecret;
 
@@ -320,33 +319,5 @@ mod tests {
             connection_string.options.heartbeat_interval(),
             NonZeroIggyDuration::from_str("5s").unwrap()
         );
-    }
-
-    #[test]
-    fn should_carry_failover_addresses_into_the_config() {
-        let value = format!(
-            "{DEFAULT_CONNECTION_STRING_PREFIX}user:secret@127.0.0.1:1234?failover_addresses=127.0.0.2:1234, 127.0.0.3:1234"
-        );
-        let connection_string =
-            ConnectionString::<TcpConnectionStringOptions>::new(&value).unwrap();
-        assert_eq!(
-            connection_string.options.failover_addresses(),
-            ["127.0.0.2:1234", "127.0.0.3:1234"]
-        );
-
-        let config = TcpClientConfig::from(connection_string);
-        assert_eq!(config.server_address, "127.0.0.1:1234");
-        assert_eq!(
-            config.failover_addresses,
-            ["127.0.0.2:1234", "127.0.0.3:1234"]
-        );
-    }
-
-    #[test]
-    fn should_leave_the_failover_addresses_empty_when_the_option_is_absent() {
-        let value = format!("{DEFAULT_CONNECTION_STRING_PREFIX}user:secret@127.0.0.1:1234");
-        let connection_string =
-            ConnectionString::<TcpConnectionStringOptions>::new(&value).unwrap();
-        assert!(connection_string.options.failover_addresses().is_empty());
     }
 }

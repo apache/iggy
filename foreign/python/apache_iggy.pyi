@@ -1933,8 +1933,6 @@ class TcpConfig:
     @property
     def server_address(self) -> builtins.str: ...
     @property
-    def failover_addresses(self) -> builtins.list[builtins.str]: ...
-    @property
     def auto_login(self) -> AutoLogin: ...
     @property
     def reconnection(self) -> TcpReconnectionConfig: ...
@@ -1954,7 +1952,6 @@ class TcpConfig:
         cls,
         *,
         server_address: builtins.str | None = None,
-        failover_addresses: typing.Sequence[builtins.str] | None = None,
         auto_login: AutoLogin | None = None,
         reconnection: TcpReconnectionConfig | None = None,
         heartbeat_interval: datetime.timedelta | None = None,
@@ -1969,12 +1966,6 @@ class TcpConfig:
 
         Args:
             server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8090`.
-            failover_addresses: `host:port` of other nodes of the same cluster, dialed
-                when `server_address` cannot be reached. Part of every failover pass,
-                ahead of the roster the client learned while connected, and the only
-                other addresses it has before its first connect, a fresh process
-                included, since reading the roster needs a connection.
-                Defaults to none.
             auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
             reconnection: Reconnection policy. Defaults to `TcpReconnectionConfig()`.
             heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
@@ -1994,9 +1985,8 @@ class TcpConfig:
                 leaving it on.
 
         Raises:
-            ValueError: If `server_address` or one of `failover_addresses` is not a
-                valid `host:port` pair, if a duration is negative, or if
-                `heartbeat_interval` is zero.
+            ValueError: If `server_address` is not a valid `host:port` pair, if a
+                duration is negative, or if `heartbeat_interval` is zero.
         """
     def __repr__(self) -> builtins.str: ...
 

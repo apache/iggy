@@ -90,11 +90,6 @@ Options:
 {CLAP_INDENT}
           [default: 127.0.0.1:8090]
 
-      --tcp-failover-addresses <TCP_FAILOVER_ADDRESSES>
-          The optional addresses of other cluster nodes for the TCP transport
-{CLAP_INDENT}
-          Dialed in order when the server address cannot be reached.
-
       --tcp-reconnection-max-retries <TCP_RECONNECTION_MAX_RETRIES>
           The optional number of max reconnect retries for the TCP transport
 {CLAP_INDENT}

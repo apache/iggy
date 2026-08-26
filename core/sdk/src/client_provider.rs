@@ -135,7 +135,6 @@ impl ClientProviderConfig {
             TransportProtocol::Tcp => {
                 config.tcp = Some(Arc::new(TcpClientConfig {
                     server_address: args.tcp_server_address,
-                    failover_addresses: args.tcp_failover_addresses,
                     tls_enabled: args.tcp_tls_enabled,
                     tls_domain: args.tcp_tls_domain,
                     tls_ca_file: args.tcp_tls_ca_file,
