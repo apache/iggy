@@ -119,11 +119,10 @@ export class CommandResponseStream extends EventEmitter {
   /** Whether a login is already being moved to the leader */
   private settlingLeader: boolean;
   /**
-   * Whether a refused request is already re-checking the leader. The roster
-   * read that re-check runs can be refused the same way, and answering a
-   * leader check with another leader check would recurse.
+   * The leader re-check a refused request started, shared with every other
+   * request refused by the same node so one demotion moves the client once.
    */
-  private followingLeaderMove = false;
+  private leaderMoveInFlight?: Promise<boolean>;
   /** How long a leaderless roster is polled before settling in place */
   private leaderlessWaitBudget: number;
   /** Delay between roster reads while the cluster elects */
@@ -202,7 +201,8 @@ export class CommandResponseStream extends EventEmitter {
     try {
       const {
         handleResponse = true,
-        last = true
+        last = true,
+        followsLeaderMoves = true
       } = options;
 
       if (!this.connection.connected)
@@ -222,6 +222,7 @@ export class CommandResponseStream extends EventEmitter {
       // one window: the roster can still name this node -- an election in
       // flight, a leader that has not moved yet -- and that is a wait, not a
       // verdict.
+      //
       // One budget for the whole request: the transient replays on a
       // connection, the leader re-checks, and the re-issues after a move all
       // spend it, so a request cannot outlive it by moving.
@@ -235,12 +236,24 @@ export class CommandResponseStream extends EventEmitter {
         } catch (error) {
           if (!(error instanceof LeaderMovedError))
             throw error;
-          // The roster read itself is refused: it runs through this same
-          // path, and re-checking the leader to answer a leader check would
-          // recurse. Its caller reads a failure as "stay where you are".
-          if (this.followingLeaderMove || Date.now() >= deadline)
+          // The roster read that a re-check runs is itself a command that can
+          // be refused this way, and answering a leader check with another
+          // leader check would recurse. Its caller reads a failure as "stay
+          // where you are".
+          if (!followsLeaderMoves || Date.now() >= deadline)
             throw responseError(command, error.refusal.errorCode);
-          await this._followLeaderMove();
+
+          const moved = await this._followLeaderMove();
+          if (!moved) {
+            // Nowhere else to go yet: the roster still names this node, or it
+            // could not be read. Paced, because the in-connection replay
+            // window belongs to the request's budget and has already been
+            // spent -- re-issuing straight away would spin.
+            const remaining = deadline - Date.now();
+            if (remaining <= 0)
+              throw responseError(command, error.refusal.errorCode);
+            await delay(Math.min(VSR_FAILOVER_CHECK_MS, remaining));
+          }
           // A move drops the session with the socket it was bound to, so the
           // re-issue would otherwise go out under no session: a replicated
           // command fails client-side, a non-replicated one goes out with
@@ -292,29 +305,40 @@ export class CommandResponseStream extends EventEmitter {
    * Re-reads the roster and moves to the leader it names.
    *
    * Best effort: an unreadable roster, or one that still names this node,
-   * leaves the client where it is and the refused request is re-issued here
-   * anyway. Guarded against re-entry, since the roster read is itself a
-   * command that can be refused the same way.
+   * leaves the client where it is and the refused request is re-issued anyway.
+   *
+   * Single-flighted, and concurrent callers share the outcome instead of
+   * failing: several commands are refused by the same demoted node, and each
+   * starting its own redirect would move the client once per command. The
+   * first redirect's `'disconnected'` also fails the others' roster reads, so
+   * a caller that raced one would report a refusal it never had to.
    *
    * @returns Whether the client moved
    */
-  private async _followLeaderMove(): Promise<boolean> {
-    if (this.followingLeaderMove)
-      return false;
-    this.followingLeaderMove = true;
-    try {
-      const leader = await this._readLeaderEndpoint();
-      if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
+  private _followLeaderMove(): Promise<boolean> {
+    const inFlight = this.leaderMoveInFlight;
+    if (inFlight)
+      return inFlight;
+
+    const move = (async () => {
+      try {
+        const leader = await this._readLeaderEndpoint();
+        if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
+          return false;
+        debug(`the leader moved to ${leader.host}:${leader.port}, following it`);
+        await this.connection.redirect(leader.host, leader.port);
+        return true;
+      } catch (error) {
+        debug('the leader could not be re-checked, staying on this node', error);
         return false;
-      debug(`the leader moved to ${leader.host}:${leader.port}, following it`);
-      await this.connection.redirect(leader.host, leader.port);
-      return true;
-    } catch (error) {
-      debug('the leader could not be re-checked, staying on this node', error);
-      return false;
-    } finally {
-      this.followingLeaderMove = false;
-    }
+      }
+    })();
+    this.leaderMoveInFlight = move;
+    void move.finally(() => {
+      if (this.leaderMoveInFlight === move)
+        this.leaderMoveInFlight = undefined;
+    });
+    return move;
   }
 
   private _rememberRoster(response: CommandResponse): void {
@@ -617,7 +641,7 @@ export class CommandResponseStream extends EventEmitter {
         const response = await this.sendCommand(
           GET_CLUSTER_METADATA.code,
           GET_CLUSTER_METADATA.serialize(),
-          { last: false }
+          { last: false, followsLeaderMoves: false }
         );
         // The redial candidates are fed by `_processVsr` for every roster
         // read, leaderless ones included: a roster with no leader still names

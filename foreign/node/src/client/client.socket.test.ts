@@ -209,6 +209,12 @@ const vsrConfig = (port: number): ClientConfig => ({
 });
 
 /** Shrinks the leaderless poll so a test observes it without waiting on it. */
+/** Drives the leader re-check a refused request runs. */
+const followLeaderMove = (client: CommandResponseStream): Promise<boolean> =>
+  (client as unknown as {
+    _followLeaderMove: () => Promise<boolean>
+  })._followLeaderMove();
+
 const compressLeaderlessPoll = (
   client: CommandResponseStream,
   budget: number
@@ -968,6 +974,72 @@ describe('VSR client socket', () => {
       await server.close();
     }
   });
+
+  it('re-issues every request refused by a demoted node, not just the first',
+    async () => {
+      // One demotion, several refused requests: each of them re-checking on
+      // its own would move the client once per request, and the first
+      // redirect's drop would fail the others' roster reads - reporting a
+      // refusal they never had to.
+      const leader = await startVsrServer((frame, socket) => {
+        singleNodeHandler(leader.port)(frame, socket);
+      });
+      // Leader at login, so the settlement leaves the client here, then
+      // demoted: the refusals below are what tells the client to look again.
+      let demotedYet = false;
+      const demoted = await startVsrServer((frame, socket) => {
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (code === COMMAND_CODE.GetClusterMetadata) {
+          socket.write(replyFrame(
+            Operation.NonReplicated,
+            demotedYet
+              ? twoNodeMetadataBody(demoted.port, leader.port)
+              : twoNodeMetadataBody(leader.port, demoted.port)
+          ));
+          return;
+        }
+        if (code === 60_032) {
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          return;
+        }
+        singleNodeHandler(demoted.port)(frame, socket);
+      });
+
+      const client = new CommandResponseStream(vsrConfig(demoted.port));
+      try {
+        await client.authenticate(vsrConfig(demoted.port).credentials);
+        demotedYet = true;
+        const rosterReadsBefore = demoted.frames.filter(
+          (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) ===
+            COMMAND_CODE.GetClusterMetadata
+        ).length;
+
+        // Two refusals, one re-check: the second caller shares the move the
+        // first started rather than starting its own or being told 58.
+        const moves = await Promise.all([
+          followLeaderMove(client),
+          followLeaderMove(client)
+        ]);
+
+        assert.deepEqual(moves, [true, true]);
+        const rosterReads = demoted.frames.filter(
+          (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) ===
+            COMMAND_CODE.GetClusterMetadata
+        ).length - rosterReadsBefore;
+        assert.equal(rosterReads, 1,
+          'each refusal re-read the roster on its own'
+        );
+        const connection = (client as unknown as {
+          connection: { isConnectedTo: (host: string, port: number) => boolean }
+        }).connection;
+        assert.equal(connection.isConnectedTo('127.0.0.1', leader.port), true);
+      } finally {
+        client.destroy();
+        await leader.close();
+        await demoted.close();
+      }
+    }
+  );
 
   it('keeps re-issuing a not-admitted request while the roster still names this node',
     async () => {

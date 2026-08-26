@@ -500,42 +500,21 @@ public class AsyncIggyTcpClient {
 
     /**
      * A server-side eviction reached this client. The routing state it cached
-     * belonged to the evicted session, and a stale-client eviction is the
-     * server ending that session authoritatively, like a logout: nothing may
-     * revive it behind the caller's back.
+     * belonged to the evicted session, so it goes.
      *
-     * The captured login always goes, whatever is configured. The connection
-     * replays it to bring up a replacement channel, so keeping it would revive
-     * exactly the session the server ended -- and on a client whose caller
-     * signed in as somebody other than the configured user, it would revive a
-     * different user than a redial replays, making the outcome depend on which
-     * failure ran.
-     *
-     * What may re-establish the session is what every connect of this client
-     * signs in as: credentials configured on the builder. A sign-in the caller
-     * ran is theirs to repeat.
+     * The sign-in stays. A stale-client eviction is not caller intent: the
+     * server's heartbeat verifier sends it after a gc pause or a laptop sleep,
+     * and a client that signed in by hand has to recover from it exactly like
+     * one whose credentials were configured. The connection re-authenticates
+     * the replacement channel from the login it captured, which is the same
+     * sign-in a redial would replay. Same rule in every SDK; only an explicit
+     * sign-out or close ends a session for good.
      */
     private void onSessionReset(int errorCode) {
         routingState.clearAssignments();
-        if (errorCode != IggyErrorCode.STALE_CLIENT.getCode()) {
-            return;
+        if (errorCode == IggyErrorCode.STALE_CLIENT.getCode()) {
+            log.debug("The server evicted this session as stale; the next request re-establishes it");
         }
-        AsyncTcpConnection currentConnection = connection.get();
-        if (currentConnection != null) {
-            currentConnection.forgetCapturedLogin();
-        }
-        if (username.isEmpty() || password.isEmpty()) {
-            log.warn("The server evicted this session as stale; the sign-in it ran will not be replayed");
-            rememberedLogin = null;
-            return;
-        }
-
-        log.info("The server evicted this session as stale; signing in again with the configured credentials");
-        replayLogin().whenComplete((ignored, error) -> {
-            if (error != null) {
-                log.warn("Signing in again after the eviction failed: {}", error.getMessage());
-            }
-        });
     }
 
     /**
@@ -660,11 +639,18 @@ public class AsyncIggyTcpClient {
         if (closed) {
             return CompletableFuture.completedFuture(null);
         }
-        if (attempt > policy.getMaxRetries()) {
+        List<ConnectionInfo> candidates = redialCandidates();
+        // The retry budget bounds the rotations, not the endpoints. A policy of
+        // zero retries with several endpoints known still gets one rotation:
+        // those endpoints - the address the client was configured with, the
+        // nodes the roster named - were made known in order to be tried, and
+        // the other SDKs sweep them once too. With one endpoint known, zero
+        // retries redials nothing, which is what it asked for.
+        boolean sweepOnce = attempt == 1 && candidates.size() > 1;
+        if (attempt > policy.getMaxRetries() && !sweepOnce) {
             log.error("Redial gave up after {} attempts, next request will fail fast", policy.getMaxRetries());
             return CompletableFuture.completedFuture(null);
         }
-        List<ConnectionInfo> candidates = redialCandidates();
         // The delay paces rotations, not dials. The first rotation runs at once
         // when there is somewhere else to go: pausing before dialing a survivor
         // only pushes the failover past the window the caller waits in, and the
@@ -767,27 +753,33 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * Re-establishes the session on the freshly published connection: with the
-     * credentials configured on the builder, or else the sign-in a caller ran
-     * by hand. Configured credentials win, as in the Rust and Go SDKs -- they
-     * are what every connect of this client is meant to sign in as, and a
-     * remembered sign-in exists to make a hand-run login as reconnectable as
-     * a configured one, not to override it.
+     * Re-establishes the session on the freshly published connection with the
+     * sign-in that last succeeded, falling back to the credentials configured
+     * on the builder when no login has run yet.
+     *
+     * The last sign-in rather than the configured one, which is where this
+     * differs from the Rust and Go SDKs: the connection re-authenticates a
+     * replacement channel from the login payload it captured, which is that
+     * same last sign-in. Replaying a different user here would make the same
+     * eviction land on a different session depending on whether the channel
+     * or the redial got there first. A client that only ever used its
+     * configured credentials remembers exactly those, so nothing changes for
+     * it.
      *
      * The login runs through the users client, so leader discovery retargets
      * again before Register when the redialed node is not the leader.
      */
     private CompletableFuture<Void> replayLogin() {
+        Supplier<CompletableFuture<IdentityInfo>> replay = rememberedLogin;
+        if (replay != null) {
+            // Runs through loginOnLeader, so a redial that landed on a backup
+            // still settles on the leader before the session is used.
+            return loginOnLeader(replay).thenApply(identity -> null);
+        }
         if (username.isPresent() && password.isPresent() && usersClient != null) {
             return usersClient.login(username.get(), password.get()).thenApply(identity -> null);
         }
-        Supplier<CompletableFuture<IdentityInfo>> replay = rememberedLogin;
-        if (replay == null) {
-            return CompletableFuture.completedFuture(null);
-        }
-        // Runs through loginOnLeader, so a redial that landed on a backup
-        // still settles on the leader before the session is used.
-        return loginOnLeader(replay).thenApply(identity -> null);
+        return CompletableFuture.completedFuture(null);
     }
 
     /**

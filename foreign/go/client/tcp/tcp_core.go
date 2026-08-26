@@ -79,9 +79,6 @@ type IggyTcpClient struct {
 	// session carries the consensus client identity and request watermark;
 	// guarded by c.mtx.
 	session *vsr.Session
-	// skipAutoLoginOnce suppresses the next automatic sign-in so a replayed
-	// login is not preempted by one the reconnect issues; guarded by c.mtx.
-	skipAutoLoginOnce bool
 	// loggedOut records an explicit sign-out, so a reconnect's automatic
 	// sign-in does not silently reverse it; guarded by c.mtx.
 	loggedOut bool
@@ -466,6 +463,19 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 // deadlock on that lock or recurse Connect without a bound.
 type connectScoped struct{}
 
+// skipAutoLogin marks the context of a Connect whose caller owns the sign-in:
+// a replayed login, or a redirect inside the sign-in transaction. Carried on
+// the context rather than on the client, so it cannot outlive the call that
+// meant it -- a client-wide flag leaks when Connect returns early on the
+// already-connected gate, and then suppresses somebody else's auto-login.
+type skipAutoLogin struct{}
+
+// suppressAutoLogin returns ctx marked so the Connect it drives does not sign
+// in by itself.
+func suppressAutoLogin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipAutoLogin{}, struct{}{})
+}
+
 // localPreconditionError marks a request that failed before its frame was
 // written. The connection is healthy, so exchange must not tear it down and
 // re-dial over what is purely local state.
@@ -482,18 +492,10 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 		return response, err
 	}
 
-	// A stale-client eviction is the server ending this session
-	// authoritatively, like a logout: the remembered sign-in ends with it, so
-	// only a configured auto-login may bring the session back. Remembered
-	// credentials exist for transport loss, where the session died with the
-	// socket rather than by anyone's decision. This runs before the gates
-	// below because they all return: with reconnection disabled the eviction
-	// would otherwise never be forgotten, and the next manual Connect would
-	// sign in with the evicted session's credentials.
-	if errors.Is(err, ierror.ErrStaleClient) {
-		c.forgetLogin()
-	}
-
+	// A stale-client eviction is not caller intent: the heartbeat verifier
+	// sends it after a gc pause or a laptop sleep, so the remembered sign-in
+	// survives it and the reconnect re-establishes the session. Only an
+	// explicit sign-out ends it. Same rule in every SDK.
 	var precondition *localPreconditionError
 	if errors.As(err, &precondition) {
 		return nil, err
@@ -532,22 +534,20 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 	if disconnectErr := c.disconnect(); disconnectErr != nil {
 		return nil, disconnectErr
 	}
+	reconnectCtx := ctx
 	if login {
-		c.mtx.Lock()
-		c.skipAutoLoginOnce = true
-		c.mtx.Unlock()
+		// The caller replays the login itself, so the reconnect must not.
+		reconnectCtx = suppressAutoLogin(ctx)
 	}
 
+	c.mtx.Lock()
+	serverAddress := c.currentServerAddress
+	c.mtx.Unlock()
 	c.logger.Info("Reconnecting to the server...",
-		slog.String("server_address", c.currentServerAddress),
+		slog.String("server_address", serverAddress),
 		slog.Any("error", err))
 
-	if reconnectErr := c.Connect(ctx); reconnectErr != nil {
-		if login {
-			c.mtx.Lock()
-			c.skipAutoLoginOnce = false
-			c.mtx.Unlock()
-		}
+	if reconnectErr := c.Connect(reconnectCtx); reconnectErr != nil {
 		return nil, reconnectErr
 	}
 	return c.sendFrame(ctx, code, frame)
@@ -648,18 +648,15 @@ func (c *IggyTcpClient) sendFrame(ctx context.Context, code uint32, frame []byte
 				// on the reconnect path would wait on that lock forever. The
 				// transaction signs in itself on the node it lands on, so the
 				// reconnect must not.
-				connectScopedRequest := ctx.Value(connectScoped{}) != nil
-				if connectScopedRequest {
-					c.mtx.Lock()
-					c.skipAutoLoginOnce = true
-					c.mtx.Unlock()
+				redirectCtx := ctx
+				if ctx.Value(connectScoped{}) != nil {
+					// Issued from inside the sign-in transaction, which holds
+					// registerMtx: the automatic sign-in on the reconnect path
+					// would wait on that lock forever. The transaction signs in
+					// itself on the node it lands on, so the reconnect must not.
+					redirectCtx = suppressAutoLogin(ctx)
 				}
-				if connectErr := c.Connect(ctx); connectErr != nil {
-					if connectScopedRequest {
-						c.mtx.Lock()
-						c.skipAutoLoginOnce = false
-						c.mtx.Unlock()
-					}
+				if connectErr := c.Connect(redirectCtx); connectErr != nil {
 					return nil, connectErr
 				}
 				stamped = false
@@ -1029,12 +1026,14 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	// The server fence does not survive the old socket, so the new connection
 	// starts from a fresh client identity.
 	c.session.Reset()
-	skipAutoLogin := c.skipAutoLoginOnce
-	c.skipAutoLoginOnce = false
-	c.logger.Info("Iggy client has connected to the Iggy server", slog.String("client_address", c.clientAddress), slog.String("server_address", c.currentServerAddress))
+	clientAddress := c.clientAddress
+	serverAddress := c.currentServerAddress
 	c.mtx.Unlock()
+	c.logger.Info("Iggy client has connected to the Iggy server",
+		slog.String("client_address", clientAddress),
+		slog.String("server_address", serverAddress))
 
-	if err := c.establishSession(ctx, skipAutoLogin); err != nil {
+	if err := c.establishSession(ctx, ctx.Value(skipAutoLogin{}) != nil); err != nil {
 		_ = c.disconnect()
 		return err
 	}

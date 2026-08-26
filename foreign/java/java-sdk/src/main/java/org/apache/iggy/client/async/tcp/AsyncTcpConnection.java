@@ -841,21 +841,6 @@ public class AsyncTcpConnection {
         sessionResetListener.accept(errorCode);
     }
 
-    /**
-     * Drops the captured sign-in, so the next channel comes up
-     * unauthenticated instead of replaying it.
-     *
-     * The channel replays the payload it captured to re-authenticate a
-     * replacement channel, which is right for a lost connection and wrong
-     * after an eviction the server decided on: that would resurrect the very
-     * session the server ended.
-     */
-    void forgetCapturedLogin() {
-        authenticated = false;
-        authGeneration.incrementAndGet();
-        releaseLoginPayload();
-    }
-
     private void captureLoginPayloadIfNeeded(int commandCode, ByteBuf payload) {
         if (isLoginCode(commandCode)) {
             updateLoginPayload(commandCode, payload);

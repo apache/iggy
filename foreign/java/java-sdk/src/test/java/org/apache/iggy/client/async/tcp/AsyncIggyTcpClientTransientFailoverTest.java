@@ -213,13 +213,14 @@ class AsyncIggyTcpClientTransientFailoverTest {
     }
 
     /**
-     * The user an eviction re-establishes must not depend on which failure
-     * ran. Configured credentials are what every connect of this client signs
-     * in as, so they are what comes back -- not whoever the caller signed in
-     * as by hand, which is what the connection's captured login would replay.
+     * A stale-client eviction is not caller intent: the server's heartbeat
+     * verifier sends it after a gc pause or a laptop sleep. A client that
+     * signed in by hand recovers from it exactly like one whose credentials
+     * were configured (the test above), and the sign-in it recovers with is the
+     * one that last succeeded. Same rule in every SDK.
      */
     @Test
-    void shouldSignInAsTheConfiguredUserAfterAnEviction() throws Exception {
+    void shouldReviveTheSignInAfterAStaleClientEviction() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket serverSocket = new ServerSocket(0, 4, loopback)) {
             AtomicInteger registrations = new AtomicInteger();
@@ -233,69 +234,13 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     registeredLogins.add(request.bodyAsText());
                     return Response.success(OPERATION_REGISTER, registerBody(registrations.incrementAndGet()));
                 }
-                if (request.operation() == OPERATION_CREATE_STREAM && evict.compareAndSet(true, false)) {
-                    return Response.eviction(EVICTION_STALE_CLIENT);
-                }
-                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
-            });
-
-            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
-                    .host(loopback.getHostAddress())
-                    .port(serverSocket.getLocalPort())
-                    .credentials("configured", "configured")
-                    .requestTimeout(Duration.ofSeconds(2))
-                    .build();
-            try {
-                client.connect().get(5, TimeUnit.SECONDS);
-                client.login().get(5, TimeUnit.SECONDS);
-                client.users().login("handrun", "handrun").get(5, TimeUnit.SECONDS);
-                int registrationsBeforeEviction = registrations.get();
-
-                assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
-                                .get(5, TimeUnit.SECONDS))
-                        .hasCauseInstanceOf(IggyServerException.class);
-
-                // The sign-in that follows the eviction runs on its own, so
-                // give it a moment to land.
-                long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-                while (registrations.get() == registrationsBeforeEviction && System.nanoTime() < deadline) {
-                    Thread.sleep(25);
-                }
-                assertThat(registrations.get())
-                        .as("the eviction was not followed by a sign-in")
-                        .isGreaterThan(registrationsBeforeEviction);
-                assertThat(registeredLogins.get(registeredLogins.size() - 1))
-                        .as("the eviction revived the hand-run sign-in instead of the configured one")
-                        .contains("configured")
-                        .doesNotContain("handrun");
-            } finally {
-                client.close().get(5, TimeUnit.SECONDS);
-            }
-            server.completeExceptionally(new IllegalStateException("test over"));
-        }
-    }
-
-    /**
-     * A stale-client eviction is the server ending the session
-     * authoritatively, like a logout. A client whose credentials were
-     * configured signs in again on every connect and recovers (the test
-     * above); one whose session came from a caller's own sign-in must not have
-     * that session revived behind the caller's back.
-     */
-    @Test
-    void shouldNotReviveAHandRunSignInAfterAStaleClientEviction() throws Exception {
-        InetAddress loopback = InetAddress.getLoopbackAddress();
-        try (ServerSocket serverSocket = new ServerSocket(0, 4, loopback)) {
-            AtomicInteger registrations = new AtomicInteger();
-            CompletableFuture<Void> server = serve(serverSocket, 4, request -> {
-                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
-                    return Response.success(OPERATION_NON_REPLICATED, singleNodeMetadata(serverSocket.getLocalPort()));
-                }
-                if (request.operation() == OPERATION_REGISTER) {
-                    return Response.success(OPERATION_REGISTER, registerBody(registrations.incrementAndGet()));
-                }
                 if (request.operation() == OPERATION_CREATE_STREAM) {
-                    return Response.eviction(EVICTION_STALE_CLIENT);
+                    if (evict.compareAndSet(true, false)) {
+                        return Response.eviction(EVICTION_STALE_CLIENT);
+                    }
+                    ByteBuf body = Unpooled.buffer(Integer.BYTES);
+                    body.writeIntLE(0);
+                    return Response.success(OPERATION_CREATE_STREAM, body);
                 }
                 return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
             });
@@ -308,27 +253,26 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     .build();
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
-                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                client.users().login("handrun", "handrun").get(5, TimeUnit.SECONDS);
                 int registrationsBeforeEviction = registrations.get();
 
                 assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
                                 .get(5, TimeUnit.SECONDS))
                         .hasCauseInstanceOf(IggyServerException.class);
 
-                // Whatever the caller does next, nothing may sign this session
-                // back in on its own.
-                assertThatThrownBy(() -> client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                assertThat(client.hasRememberedLogin())
+                        .as("an eviction is not a sign-out; the credentials stay")
+                        .isTrue();
+
+                // The next request brings the session back, under the sign-in
+                // that last succeeded.
+                assertThat(client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
                                 .get(5, TimeUnit.SECONDS))
-                        .isNotNull();
-                assertThat(registrations)
-                        .as("the evicted session was signed back in")
-                        .hasValue(registrationsBeforeEviction);
-                // The connection replays the login it captured to bring up a
-                // replacement channel, so that copy has to go too: kept, the
-                // next channel revives exactly the session the server ended.
-                assertThat(client.currentConnection().authenticationSnapshot())
-                        .as("the captured login outlived the session it established")
                         .isEmpty();
+                assertThat(registrations.get())
+                        .as("the evicted session was not re-established")
+                        .isGreaterThan(registrationsBeforeEviction);
+                assertThat(registeredLogins.get(registeredLogins.size() - 1)).contains("handrun");
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }

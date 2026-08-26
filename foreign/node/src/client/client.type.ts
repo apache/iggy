@@ -47,7 +47,13 @@ export type SendCommandOptions = {
   /** Whether the response uses the standard command response decoder */
   handleResponse?: boolean,
   /** Whether to append rather than prepend the command to the queue */
-  last?: boolean
+  last?: boolean,
+  /**
+   * Whether a not-admitted refusal re-checks the leader and re-issues the
+   * command. False for the roster read a re-check itself runs: answering a
+   * leader check with another leader check would recurse.
+   */
+  followsLeaderMoves?: boolean
 };
 
 /**

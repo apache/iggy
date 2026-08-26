@@ -569,11 +569,9 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
                 if (attempt.Error is VsrSessionEvictedException evicted)
                 {
-                    // Whatever the eviction interrupted, the session it evicted is gone. Reported as an
-                    // outcome-unknown write it never reaches the lost-connection path, so the remembered
-                    // sign-in would otherwise survive it and the next reconnect would resurrect the session.
-                    ForgetSessionAfterEviction(evicted.Verdict);
-
+                    // The session is gone, but the sign-in that established it is not: a stale-client
+                    // eviction comes off the server's heartbeat timer, so the reconnect re-establishes it.
+                    // Only an explicit sign-out or Dispose ends it.
                     if (attempt.RequestStarted && !VsrOperations.IsReplaySafeRead(code, isLoginRegister, body.Span))
                     {
                         throw new VsrRequestOutcomeUnknownException(evicted);

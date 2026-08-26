@@ -381,7 +381,14 @@ export class IggyConnection extends EventEmitter {
     let lastError = initialError;
     let expectedSocket = this.socket;
     let firstPass = true;
-    while (enabled && this.reconnectCount < maxRetries) {
+    // Reconnection settings bound the retries, not the endpoints. With them off
+    // and several endpoints known - the address the client was configured with,
+    // the nodes the roster named - those endpoints were made known in order to
+    // be tried, so they get one pass and no backoff, as in the other SDKs. A
+    // client that knows one endpoint and turned reconnection off redials
+    // nothing, which is what it asked for.
+    const sweepOnce = !enabled && this._redialCandidates().length > 1;
+    while (this.reconnectCount < maxRetries || (sweepOnce && firstPass)) {
       this.connecting = true;
       this.reconnectCount += 1;
       const candidates = this._redialCandidates();
@@ -389,7 +396,7 @@ export class IggyConnection extends EventEmitter {
       // endpoints known there is somewhere else to go, and pausing first only
       // pushes the failover past the interval a caller is willing to wait;
       // later passes still back off.
-      if (!firstPass || candidates.length === 1)
+      if (enabled && (!firstPass || candidates.length === 1))
         await waitForReconnect(interval);
       firstPass = false;
       if (this.ending)

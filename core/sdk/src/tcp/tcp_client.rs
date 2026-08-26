@@ -104,6 +104,11 @@ pub struct TcpClient {
     /// onto this node or, after a failover, another one -- can re-establish
     /// the session instead of surfacing `Unauthenticated`. Cleared on logout.
     session_credentials: Mutex<Option<RememberedSignIn>>,
+    /// The password a committed change gave the user a configured `AutoLogin`
+    /// signs in as. The configured credentials cannot be rewritten, and the
+    /// password they carry is dead once the change commits, so every later
+    /// sign-in reads this instead.
+    configured_password: Mutex<Option<SecretString>>,
     // `std::sync::Mutex` (not `tokio::sync::Mutex`): the critical section
     // is `encode_request_header`, which is pure CPU and never awaits. The
     // tokio variant would pay a waker alloc + internal semaphore on
@@ -120,11 +125,6 @@ pub struct TcpClient {
 struct RememberedSignIn {
     credentials: Credentials,
     user_id: u32,
-    /// Set by a committed password change for `user_id`. The configured
-    /// `AutoLogin` credentials cannot be rewritten -- the config is shared and
-    /// immutable -- so this marks the remembered copy as the newer one for
-    /// that same user, and [`TcpClient::sign_in_credentials`] prefers it.
-    password_refreshed: bool,
 }
 
 /// A connection that completed every step of coming up, TLS included.
@@ -364,7 +364,6 @@ impl iggy_common::VsrSessionControl for TcpClient {
             .replace(RememberedSignIn {
                 credentials,
                 user_id,
-                password_refreshed: false,
             });
     }
 
@@ -388,9 +387,27 @@ impl iggy_common::VsrSessionControl for TcpClient {
                 .get_cow_str_value()
                 .is_ok_and(|name| name.as_ref() == username),
         };
-        if targets_session_user {
-            *password = SecretString::from(new_password.to_owned());
-            sign_in.password_refreshed = true;
+        if !targets_session_user {
+            return;
+        }
+
+        *password = SecretString::from(new_password.to_owned());
+        // The configured credentials cannot be rewritten -- the config is
+        // shared and immutable -- and the password they carry will never work
+        // again, so the new one is kept here instead. Kept outside the
+        // remembered sign-in on purpose: that record is replaced wholesale by
+        // every later login, so a marker on it would survive exactly one
+        // reconnect and the one after that would replay the dead password.
+        let configured_user_changed = matches!(
+            &self.config.auto_login,
+            AutoLogin::Enabled(Credentials::UsernamePassword(configured, _))
+                if configured == username
+        );
+        if configured_user_changed {
+            self.configured_password
+                .lock()
+                .await
+                .replace(SecretString::from(new_password.to_owned()));
         }
     }
 
@@ -457,6 +474,7 @@ impl TcpClient {
             leader_redirection_state: Mutex::new(LeaderRedirectionState::new()),
             current_server_address: Mutex::new(server_address),
             roster_endpoints: Mutex::new(Vec::new()),
+            configured_password: Mutex::new(None),
             session_credentials: Mutex::new(None),
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
@@ -759,44 +777,44 @@ impl TcpClient {
     /// else the ones a manual sign-in on this client succeeded with. A manual
     /// sign-in is otherwise less reconnectable than a configured one, which
     /// is a surprising difference between two ways of doing the same thing.
+    ///
+    /// A password change this client committed for the configured user is
+    /// applied on top: the configured password will never work again, and every
+    /// later reconnect would otherwise fail `InvalidCredentials`.
     async fn sign_in_credentials(&self) -> Option<Credentials> {
-        let remembered =
-            self.session_credentials
+        match &self.config.auto_login {
+            AutoLogin::Enabled(Credentials::UsernamePassword(username, configured_password)) => {
+                let password = self
+                    .configured_password
+                    .lock()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| configured_password.clone());
+                Some(Credentials::UsernamePassword(username.clone(), password))
+            }
+            AutoLogin::Enabled(credentials) => Some(credentials.clone()),
+            AutoLogin::Disabled => self
+                .session_credentials
                 .lock()
                 .await
                 .as_ref()
-                .map(|remembered: &RememberedSignIn| {
-                    (
-                        remembered.credentials.clone(),
-                        remembered.password_refreshed,
-                    )
-                });
-
-        match (&self.config.auto_login, remembered) {
-            // A committed password change for the configured user outranks the
-            // configured password: the config cannot be rewritten, and signing
-            // in with the password this client itself replaced would fail
-            // `InvalidCredentials` on every later reconnect. Same user either
-            // way -- `refresh_session_password` only marks a change that
-            // targeted the signed-in one.
-            (
-                AutoLogin::Enabled(Credentials::UsernamePassword(configured_username, _)),
-                Some((Credentials::UsernamePassword(username, password), true)),
-            ) if configured_username == &username => {
-                Some(Credentials::UsernamePassword(username, password))
-            }
-            (AutoLogin::Enabled(configured), _) => Some(configured.clone()),
-            (AutoLogin::Disabled, remembered) => remembered.map(|(credentials, _)| credentials),
+                .map(|remembered| remembered.credentials.clone()),
         }
     }
 
     /// Endpoints to dial for one connect, likeliest first: where the client
-    /// currently is, then the roster it learned while connected, then the
-    /// configured seeds.
+    /// currently is, the addresses it was configured with, then the roster it
+    /// learned while connected.
+    ///
+    /// Configured before learned, as in the other SDKs: those are the endpoints
+    /// the caller vouched for, while a roster read from a cluster that has since
+    /// changed shape may name nodes that are gone.
     async fn dial_candidates(&self) -> Vec<String> {
         let mut candidates = vec![self.current_server_address.lock().await.clone()];
         let roster = self.roster_endpoints.lock().await.clone();
-        for endpoint in roster.iter().chain(self.config.failover_addresses.iter()) {
+        let configured = std::iter::once(&self.config.server_address)
+            .chain(self.config.failover_addresses.iter());
+        for endpoint in configured.chain(roster.iter()) {
             let mut known = false;
             for candidate in &candidates {
                 if is_same_address(candidate, endpoint).await {
@@ -1609,15 +1627,16 @@ mod tests {
             "127.0.0.1:8092".to_string(),
         ];
 
-        // The current endpoint leads, the roster follows, and neither the
-        // roster's copy of the current endpoint nor a seed that only spells
-        // the same endpoint differently earns a second dial.
+        // The current endpoint leads, the configured ones follow, and the
+        // roster comes last -- the same order as the other SDKs. Neither the
+        // roster's copy of an endpoint already named nor a seed that only
+        // spells one differently earns a second dial.
         assert_eq!(
             client.dial_candidates().await,
             vec![
                 "127.0.0.1:8090".to_string(),
-                "127.0.0.1:8091".to_string(),
                 "127.0.0.1:8092".to_string(),
+                "127.0.0.1:8091".to_string(),
             ]
         );
     }
@@ -1804,12 +1823,31 @@ mod tests {
             )
             .await;
 
-        match client.sign_in_credentials().await {
-            Some(Credentials::UsernamePassword(username, password)) => {
-                assert_eq!(username, "iggy");
-                assert_eq!(password.expose_secret(), "new");
+        // Every later reconnect, not just the next one: each of them signs in
+        // and remembers that sign-in afresh, and the configured password is
+        // dead for good once the change commits.
+        for reconnect in 0..3 {
+            match client.sign_in_credentials().await {
+                Some(Credentials::UsernamePassword(username, password)) => {
+                    assert_eq!(username, "iggy");
+                    assert_eq!(
+                        password.expose_secret(),
+                        "new",
+                        "the configured password came back on reconnect {reconnect}"
+                    );
+                    // What the reconnect's own login does with what it signed
+                    // in with.
+                    client
+                        .remember_session_credentials(
+                            Credentials::UsernamePassword(username, password),
+                            SESSION_USER_ID,
+                        )
+                        .await;
+                }
+                other => {
+                    panic!("expected the configured user with the new password, got {other:?}")
+                }
             }
-            other => panic!("expected the configured user with the new password, got {other:?}"),
         }
     }
 

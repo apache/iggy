@@ -104,28 +104,28 @@ public class HeartbeatTests
         me.ConsumerGroupsCount.ShouldBe(0);
     }
 
+    /// <summary>
+    ///     An eviction is the server's heartbeat verifier reacting to silence, not caller intent, so a client
+    ///     that signed in by hand recovers from it exactly like one whose credentials were configured: the
+    ///     sign-in it remembered re-establishes the session. Only an explicit sign-out or Dispose ends it.
+    /// </summary>
     [Test]
-    public async Task EvictedClient_WithoutAutoLogin_Should_FailFast_And_NotReconnect()
+    public async Task EvictedClient_WithoutAutoLogin_Should_ReestablishItsSession()
     {
         using var client = await CreateClient(TimeSpan.FromHours(1), false);
         await client.LoginUserAsync("iggy", "iggy");
         var (streamName, _) = await JoinFreshGroup(client);
 
-        var reconnected = false;
-        client.SubscribeConnectionEvents(args =>
-        {
-            reconnected |= args.CurrentState == ConnectionState.Connecting;
-            return Task.CompletedTask;
-        });
-
         await Task.Delay(IdleFor);
 
-        // A reconnect could not bring the session back, so the request surfaces the loss instead of coming back
-        // over an unauthenticated connection.
+        // The evicted request surfaces the loss; the one after it comes back over a session the remembered
+        // sign-in re-established.
         await Should.ThrowAsync<Exception>(() => client.GetMeAsync());
-        reconnected.ShouldBeFalse();
-        await Should.ThrowAsync<NotConnectedException>(() =>
-            client.GetStreamByIdAsync(Identifier.String(streamName)));
+
+        var stream = await client.GetStreamByIdAsync(Identifier.String(streamName));
+        stream.ShouldNotBeNull();
+        var me = await client.GetMeAsync();
+        me.ShouldNotBeNull();
     }
 
     private Task<IIggyClient> CreateClient(TimeSpan heartbeatInterval, bool autoLogin = true)

@@ -105,12 +105,12 @@ public sealed class EndpointFailoverTests
 
     /// <summary>
     ///     Mirrors the integration contract (HeartbeatTests
-    ///     EvictedClient_WithoutAutoLogin_Should_FailFast_And_NotReconnect): a server-side eviction ends the
-    ///     session authoritatively, so the credentials a manual sign-in remembered must not resurrect it - the
-    ///     evicted request surfaces the loss with no reconnect attempt.
+    ///     EvictedClient_WithoutAutoLogin_Should_ReestablishItsSession): an eviction comes off the server's
+    ///     heartbeat timer rather than from the caller, so the sign-in this client remembered survives it and
+    ///     the reconnect re-establishes the session. Same rule in every SDK.
     /// </summary>
     [Fact]
-    public async Task ServerEvictionForgetsTheRememberedSignIn()
+    public async Task ServerEvictionReplaysTheRememberedSignIn()
     {
         using var node = new MockNode();
         var evict = false;
@@ -121,11 +121,15 @@ public sealed class EndpointFailoverTests
                 return Reply(OperationRegister, RegisterBody(session: 128));
             }
 
-            return evict
-                ? EvictionFrame(EvictionStaleClient)
-                : Reply(OperationNonReplicated, request.Code == GetClusterMetadataCode
-                    ? ClusterMetadata(node.Port, node.Port, node.Port)
-                    : []);
+            if (evict)
+            {
+                evict = false;
+                return EvictionFrame(EvictionStaleClient);
+            }
+
+            return Reply(OperationNonReplicated, request.Code == GetClusterMetadataCode
+                ? ClusterMetadata(node.Port, node.Port, node.Port)
+                : []);
         });
 
         var configuration = new IggyClientConfigurator
@@ -144,29 +148,25 @@ public sealed class EndpointFailoverTests
         await client.ConnectAsync(TestContext.Current.CancellationToken);
         await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
         await client.PingAsync(TestContext.Current.CancellationToken);
-        var connectionsBeforeEviction = node.Connections;
+        var registrationsBeforeEviction = node.Registrations;
 
+        // A ping is replay-safe, so the eviction is absorbed: the reconnect signs in again with the
+        // remembered credentials and the request completes over the session it re-established.
         evict = true;
-        var evicted = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
-            client.PingAsync(TestContext.Current.CancellationToken));
-        Assert.Equal(VsrError.STALE_CLIENT, evicted.StatusCode);
-        Assert.True(evicted.FromServer);
-        Assert.Equal(connectionsBeforeEviction, node.Connections);
+        await client.PingAsync(TestContext.Current.CancellationToken);
 
-        // The dropped connection leaves the next call transport-shaped, but the eviction forgot the remembered
-        // sign-in, so it must fail fast instead of reconnecting into a resurrected session.
-        await Assert.ThrowsAsync<NotConnectedException>(() =>
-            client.PingAsync(TestContext.Current.CancellationToken));
-        Assert.Equal(connectionsBeforeEviction, node.Connections);
+        Assert.True(node.Registrations > registrationsBeforeEviction,
+            "the reconnect signed in again with the remembered credentials");
+        await client.PingAsync(TestContext.Current.CancellationToken);
     }
 
     /// <summary>
-    ///     The same contract when the eviction lands on a replicated write: that request is reported as
-    ///     outcome-unknown rather than as a lost connection, so it never passes through the lost-connection
-    ///     path, and the session it evicted still has to be forgotten.
+    ///     The same rule when the eviction lands on a replicated write: that request is reported as
+    ///     outcome-unknown, because its own outcome is unknown, but the session behind it is still
+    ///     re-established for the requests that follow.
     /// </summary>
     [Fact]
-    public async Task ServerEvictionDuringAReplicatedWriteForgetsTheRememberedSignIn()
+    public async Task ServerEvictionDuringAReplicatedWriteReplaysTheRememberedSignIn()
     {
         using var node = new MockNode();
         var evict = false;
@@ -177,11 +177,15 @@ public sealed class EndpointFailoverTests
                 return Reply(OperationRegister, RegisterBody(session: 128));
             }
 
-            return evict
-                ? EvictionFrame(EvictionStaleClient)
-                : Reply(OperationNonReplicated, request.Code == GetClusterMetadataCode
-                    ? ClusterMetadata(node.Port, node.Port, node.Port)
-                    : []);
+            if (evict)
+            {
+                evict = false;
+                return EvictionFrame(EvictionStaleClient);
+            }
+
+            return Reply(OperationNonReplicated, request.Code == GetClusterMetadataCode
+                ? ClusterMetadata(node.Port, node.Port, node.Port)
+                : []);
         });
 
         var configuration = new IggyClientConfigurator
@@ -200,28 +204,27 @@ public sealed class EndpointFailoverTests
         await client.ConnectAsync(TestContext.Current.CancellationToken);
         await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
         await client.PingAsync(TestContext.Current.CancellationToken);
-        var connectionsBeforeEviction = node.Connections;
+        var registrationsBeforeEviction = node.Registrations;
 
         evict = true;
         await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
             client.CreateStreamAsync("evicted-mid-write", token: TestContext.Current.CancellationToken));
-        Assert.Equal(connectionsBeforeEviction, node.Connections);
 
-        await Assert.ThrowsAsync<NotConnectedException>(() =>
-            client.PingAsync(TestContext.Current.CancellationToken));
-        Assert.Equal(connectionsBeforeEviction, node.Connections);
+        await client.PingAsync(TestContext.Current.CancellationToken);
+        Assert.True(node.Registrations > registrationsBeforeEviction,
+            "the reconnect signed in again with the remembered credentials");
     }
 
     /// <summary>
-    ///     A survivor that only comes up after the first rotation still has to be found. The reconnection
-    ///     budget counts rotations, not dials, so one retry is one full pass over every endpoint the client
-    ///     knows rather than one dial of the endpoint it started from.
+    ///     A survivor that is not listening yet when its node dies still has to be found: the client keeps
+    ///     rotating over every endpoint it knows, so one that comes up while it is retrying is dialed on a
+    ///     later pass rather than only on the first.
     /// </summary>
     [Fact]
-    public async Task ResumesOnASurvivorThatComesUpAfterTheFirstRotation()
+    public async Task ResumesOnASurvivorThatComesUpWhileTheClientIsRetrying()
     {
-        // A port nothing listens on yet: the survivor comes up on it only after the first rotation has
-        // already failed on both endpoints.
+        // A port nothing listens on: the survivor binds it only after the client has already failed on both
+        // endpoints, so the first pass cannot be the one that finds it.
         var probe = new TcpListener(IPAddress.Loopback, 0);
         probe.Start();
         var survivorPort = (ushort)((IPEndPoint)probe.LocalEndpoint).Port;
@@ -240,10 +243,8 @@ public sealed class EndpointFailoverTests
             ReconnectionSettings = new ReconnectionSettings
             {
                 Enabled = true,
-                // One retry: the rotation after the first failure is the last one, which is where the
-                // budget check used to cut the sweep short.
-                MaxRetries = 1,
-                InitialDelay = TimeSpan.FromMilliseconds(600)
+                MaxRetries = 4,
+                InitialDelay = TimeSpan.FromMilliseconds(200)
             }
         };
         using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
@@ -253,19 +254,32 @@ public sealed class EndpointFailoverTests
         await client.PingAsync(TestContext.Current.CancellationToken);
 
         primary.Kill();
-        using var survivor = new MockNode(survivorPort);
+        MockNode? survivor = null;
+        // Constructed inside the delay, because the listener starts in the constructor: built up front, the
+        // survivor would be answering from the very first dial and nothing about the later passes would be
+        // exercised.
         var comesUp = Task.Run(async () =>
         {
-            await Task.Delay(250, TestContext.Current.CancellationToken);
+            await Task.Delay(300, TestContext.Current.CancellationToken);
+            survivor = new MockNode(survivorPort);
             survivor.Serve(request => request.Code == GetClusterMetadataCode
                 ? Reply(OperationNonReplicated, ClusterMetadata(primary.Port, survivorPort, survivorPort))
                 : Answer(request));
         }, TestContext.Current.CancellationToken);
 
-        await client.PingAsync(TestContext.Current.CancellationToken);
-        await comesUp;
+        try
+        {
+            await client.PingAsync(TestContext.Current.CancellationToken);
+            await comesUp;
 
-        Assert.True(survivor.Registrations >= 1, "the session was re-established on the survivor");
+            Assert.NotNull(survivor);
+            Assert.True(survivor!.Registrations >= 1, "the session was re-established on the survivor");
+        }
+        finally
+        {
+            await comesUp;
+            survivor?.Dispose();
+        }
     }
 
     private static byte[] EvictionFrame(byte reason)

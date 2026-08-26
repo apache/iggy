@@ -495,7 +495,18 @@ func TestExchange_DoesNotPreemptAReplayedSignIn(t *testing.T) {
 	// The connect sign-in, the dropped explicit one, and its replay. An
 	// automatic sign-in on the new connection would make a fourth.
 	assert.Equal(t, 3, signIns)
-	assert.False(t, client.skipAutoLoginOnce, "the suppression fires exactly once")
+
+	// The suppression rides the replay's own context, so nothing about it
+	// outlives that call: the next Connect signs in again.
+	require.NoError(t, client.disconnect())
+	require.NoError(t, client.Connect(context.Background()))
+	signIns = 0
+	for _, recorded := range server.recorded() {
+		if recorded.operation() == vsr.OperationRegister {
+			signIns++
+		}
+	}
+	assert.Equal(t, 4, signIns, "the suppression leaked past the call that meant it")
 }
 
 func TestExchange_FailsFastWhenAutoLoginIsOff(t *testing.T) {

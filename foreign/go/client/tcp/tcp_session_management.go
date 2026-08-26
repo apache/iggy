@@ -76,7 +76,10 @@ func (c *IggyTcpClient) register(
 	c.registerMtx.Lock()
 	defer c.registerMtx.Unlock()
 
-	c.logger.Info("Iggy client is signing in...", slog.String("client_address", c.clientAddress))
+	c.mtx.Lock()
+	clientAddress := c.clientAddress
+	c.mtx.Unlock()
+	c.logger.Info("Iggy client is signing in...", slog.String("client_address", clientAddress))
 
 	if err := c.endBoundSession(ctx); err != nil {
 		return nil, err
@@ -136,8 +139,11 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 		return nil, err
 	}
 
+	c.mtx.Lock()
+	signedInAddress := c.clientAddress
+	c.mtx.Unlock()
 	c.logger.Info("Iggy client has signed in successfully.",
-		slog.String("client_address", c.clientAddress),
+		slog.String("client_address", signedInAddress),
 		slog.String("server_version", registered.ServerVersion))
 	return &iggcon.IdentityInfo{UserId: registered.UserID}, nil
 }
@@ -169,13 +175,7 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 
 		// The replayed sign-in below owns the session; the redirected Connect
 		// must not sign in on its own, or the replay commits a second Register.
-		c.mtx.Lock()
-		c.skipAutoLoginOnce = true
-		c.mtx.Unlock()
-		if err := c.Connect(ctx); err != nil {
-			c.mtx.Lock()
-			c.skipAutoLoginOnce = false
-			c.mtx.Unlock()
+		if err := c.Connect(suppressAutoLogin(ctx)); err != nil {
 			return nil, err
 		}
 		settled, err = c.signIn(ctx, code, body)

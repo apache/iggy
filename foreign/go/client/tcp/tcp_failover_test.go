@@ -124,17 +124,20 @@ func TestFailover_FailsFastWhenNothingEverSignedIn(t *testing.T) {
 		"a client that never signed in cannot restore a session by reconnecting")
 }
 
-// A stale-client eviction is the server ending the session authoritatively,
-// like a logout: the remembered sign-in must not resurrect it, so the evicted
-// request surfaces the loss instead of reconnecting into a fresh session.
-func TestFailover_ServerEvictionForgetsTheRememberedSignIn(t *testing.T) {
+// A stale-client eviction is not caller intent: the heartbeat verifier sends it
+// after a gc pause or a laptop sleep, and a client that signed in by hand has
+// to recover from it exactly like one with a configured auto-login. Same rule
+// in every SDK.
+func TestFailover_ServerEvictionReplaysTheRememberedSignIn(t *testing.T) {
 	var server *testListener
 	var evict atomic.Bool
+	var registers atomic.Int32
 	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
 		if read.operation() == vsr.OperationRegister {
+			registers.Add(1)
 			return registerReplyFrame(7, 128)
 		}
-		if evict.Load() {
+		if evict.CompareAndSwap(true, false) {
 			return evictionFrame(vsr.EvictionStaleClient, 0, 0)
 		}
 		if read.code() == uint32(command.GetClusterMetadataCode) {
@@ -148,15 +151,19 @@ func TestFailover_ServerEvictionForgetsTheRememberedSignIn(t *testing.T) {
 	require.NoError(t, client.Connect(ctx))
 	_, err := client.LoginUser(ctx, "iggy", "iggy")
 	require.NoError(t, err)
-	connectionsBefore := server.connections()
+	registersBefore := registers.Load()
 
 	evict.Store(true)
-	require.Error(t, client.Ping(ctx), "the evicted request surfaces the loss")
+	// The evicted request is answered by the eviction, and the reconnect it
+	// triggers signs in again with the credentials the sign-in remembered.
+	_ = client.Ping(ctx)
 
 	_, remembered := client.signInCredentials()
-	assert.False(t, remembered, "the eviction forgot the remembered sign-in")
-	assert.Equal(t, connectionsBefore, server.connections(),
-		"no reconnect dial resurrected the evicted session")
+	assert.True(t, remembered, "an eviction is not a sign-out; the credentials stay")
+	require.NoError(t, client.Ping(ctx), "the session came back on its own")
+	assert.Greater(t, registers.Load(), registersBefore,
+		"the reconnect re-established the session")
+	assert.True(t, client.session.Bound())
 }
 
 // An explicit sign-out is caller intent: the reconnect must not sign back in

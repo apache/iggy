@@ -91,7 +91,8 @@ public sealed partial class TcpMessageStream : IIggyClient
     // The credentials a sign-in succeeded with, so a reconnect - on this node or, after a failover, another one -
     // can re-establish the session instead of leaving every later request unauthenticated. A caller that signs in
     // by hand is otherwise less reconnectable than one that configures auto login, which is a surprising
-    // difference between two ways of doing the same thing. Cleared on sign-out and on a server eviction.
+    // difference between two ways of doing the same thing. Cleared on sign-out and on Dispose; a server-side
+    // eviction is not caller intent and leaves them in place.
     private AutoLoginSettings? _rememberedLogin;
 
     private bool IsConnecting => Volatile.Read(ref _isConnecting) != 0;
@@ -1348,7 +1349,16 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// </summary>
     private static bool IsTlsConfigurationFault(Exception e)
     {
-        return e is AuthenticationException or InvalidCertificatePathException;
+        if (e is InvalidCertificatePathException)
+        {
+            return true;
+        }
+
+        // AuthenticationException also carries a handshake that died on the wire - a reset, a closed socket -
+        // and that says nothing about the configuration. Only a verdict reached without transport trouble is
+        // one no retry can change.
+        return e is AuthenticationException
+               && e.InnerException is not (IOException or SocketException);
     }
 
     private async Task SendAckAsync(int code, ReadOnlyMemory<byte> body, CancellationToken token)
@@ -1367,12 +1377,9 @@ public sealed partial class TcpMessageStream : IIggyClient
         {
             _logger.LogWarning("Connection lost");
 
-            // A server-side eviction is the server ending this session authoritatively, like a logout: the
-            // remembered sign-in ends with it, so only a configured auto login may bring the session back.
-            // Remembered credentials exist for transport loss, where the session died with the socket rather
-            // than by anyone's decision.
-            ForgetSessionAfterEviction(e);
-
+            // A stale-client eviction is not caller intent: the server's heartbeat verifier sends it after a
+            // gc pause or a laptop sleep, so the remembered sign-in survives it and the reconnect below
+            // re-establishes the session. Only an explicit sign-out or Dispose ends it. Same rule in every SDK.
             if (!_configuration.ReconnectionSettings.Enabled)
             {
                 _logger.LogWarning("Reconnection is disabled");
@@ -1400,18 +1407,6 @@ public sealed partial class TcpMessageStream : IIggyClient
     {
         return VsrConnection.IsConnectionException(e)
                || e is IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true };
-    }
-
-    // An eviction ends this session authoritatively, like a logout: the sign-in this client remembered goes
-    // with it, so only a configured auto login may bring the session back. Called from the consensus layer,
-    // which sees the eviction whatever it interrupted - an eviction that landed on a replicated write is
-    // reported as VsrRequestOutcomeUnknownException and never reaches the lost-connection path at all.
-    private void ForgetSessionAfterEviction(Exception verdict)
-    {
-        if (verdict is IggyInvalidStatusCodeException { StatusCode: VsrError.STALE_CLIENT, FromServer: true })
-        {
-            _rememberedLogin = null;
-        }
     }
 
     private async Task<IMemoryOwner<byte>> HandleReconnectionAsync(int code, ReadOnlyMemory<byte> body,
