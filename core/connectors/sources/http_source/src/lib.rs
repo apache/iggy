@@ -87,6 +87,11 @@ pub struct HttpSource {
     /// to produce it again. Draining the bridge is destructive, so without this
     /// the events would exist nowhere else and the NACK would be silent loss.
     staged: Mutex<Option<StagedBatch>>,
+    /// Why the persisted registry could not be restored, if it could not be.
+    ///
+    /// Held rather than acted on in `new` so `open` can fail with it, which is
+    /// what puts it on the control API as `last_error`.
+    restore_error: Option<String>,
 }
 
 /// Unacknowledged batch, kept whole so a NACK can be re-polled verbatim.
@@ -149,6 +154,17 @@ impl SharedState {
         self.registry_dirty.load(Ordering::Acquire)
     }
 
+    /// Re-arms a flush whose state was taken but never persisted.
+    ///
+    /// `take_dirty_state` clears the flag and marks every endpoint submitted
+    /// before the state leaves the plugin, so a caller that later learns the
+    /// save did not land has to put the flag back. Without it the mutation is
+    /// never retried and nothing on the control API says so.
+    pub fn rearm_state_flush(&self) {
+        self.registry_dirty.store(true, Ordering::Release);
+        self.state_flush.notify_one();
+    }
+
     /// Hands the registry to the runtime for persistence, once per mutation.
     ///
     /// Only ever called for an empty batch. The runtime saves state solely on
@@ -179,8 +195,7 @@ impl SharedState {
         let Some(state) = snapshot.to_connector_state(self.id) else {
             // Serialization logged the cause. Re-arm and re-notify, or the
             // retry this promises would wait for unrelated traffic.
-            self.registry_dirty.store(true, Ordering::Release);
-            self.state_flush.notify_one();
+            self.rearm_state_flush();
             return None;
         };
         let mut persisted = EndpointRegistry::clone(&snapshot);
@@ -380,7 +395,15 @@ impl HttpSourceConfig {
 
 impl HttpSource {
     pub fn new(id: u32, config: HttpSourceConfig, state: Option<ConnectorState>) -> Self {
-        let registry = EndpointRegistry::restore(&config.endpoints, state, id);
+        // An unreadable registry cannot be served, but `new` has 21 callers and
+        // the SDK builds the source before it calls `open`, so the failure is
+        // carried to `open` rather than widening this signature. The empty
+        // registry it starts from serves nothing if that ever changed.
+        let (registry, restore_error) =
+            match EndpointRegistry::restore(&config.endpoints, state, id) {
+                Ok(registry) => (registry, None),
+                Err(error) => (EndpointRegistry::default(), Some(error.to_string())),
+            };
         let (sender, receiver) = crossfire::mpsc::bounded_async(config.buffer_capacity);
         let instance_name = config
             .instance_name
@@ -413,6 +436,7 @@ impl HttpSource {
             shared: Arc::new(shared),
             receiver: Mutex::new(receiver),
             staged: Mutex::new(None),
+            restore_error,
         }
     }
 
@@ -467,6 +491,17 @@ impl HttpSource {
     async fn on_nack(&self) -> Result<(), Error> {
         let mut staged = self.staged.lock().await;
         let Some(batch) = staged.as_mut() else {
+            drop(staged);
+            // Nothing staged means the batch carried state and no messages,
+            // and an empty send cannot fail, so the NACK is the state save.
+            // `take_dirty_state` already cleared the flag and marked every
+            // endpoint submitted, so re-arming here is the only thing that
+            // stops a revocation being lost while the API reports it durable.
+            self.shared.rearm_state_flush();
+            warn!(
+                "Runtime NACKed the state flush for {CONNECTOR_NAME} connector ID: {}, re-arming it",
+                self.id
+            );
             return Ok(());
         };
         batch.nacks += 1;
@@ -484,6 +519,9 @@ impl HttpSource {
 #[async_trait]
 impl Source for HttpSource {
     async fn open(&mut self) -> Result<(), Error> {
+        if let Some(error) = self.restore_error.take() {
+            return Err(Error::InitError(error));
+        }
         self.shared.config.validate()?;
         server::join(Arc::clone(&self.shared)).await?;
         info!(
@@ -1247,7 +1285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_state_only_batch_when_nacked_should_not_stage_a_replay() {
+    async fn given_state_only_batch_when_nacked_should_rearm_the_flush() {
         let config = test_support::config(None, &[ENDPOINT_ONE]);
         let source = HttpSource::new(1, config, None);
         source
@@ -1258,11 +1296,24 @@ mod tests {
         let flushed = source.poll().await.expect("poll must succeed");
         assert!(flushed.messages.is_empty());
         assert!(flushed.state.is_some(), "the mutation must arm a flush");
+        assert!(
+            !source.shared.has_pending_state(),
+            "and handing it out must clear the flag"
+        );
 
         source
             .on_batch_result(SourceBatchResult::Nack)
             .await
             .expect("nack must succeed");
+
+        assert!(
+            source.shared.has_pending_state(),
+            "a NACKed state flush is a revocation the runtime never persisted, and `take_dirty_state` already marked it submitted, so without the re-arm it is lost for good"
+        );
+
+        // Consume the permit the re-arm posted, so `select!` has exactly one
+        // ready branch and the traffic poll below is deterministic.
+        source.shared.state_flush.notified().await;
         source
             .shared
             .sender
@@ -1272,7 +1323,23 @@ mod tests {
         let next = source.poll().await.expect("poll must succeed");
         assert_eq!(
             next.messages[0].payload, b"one",
-            "an empty batch stages nothing, so its NACK must not wedge the poll loop"
+            "and an empty batch stages nothing, so its NACK must not wedge the poll loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_unreadable_state_when_opened_should_fail_before_binding() {
+        let mut source = HttpSource::new(
+            1,
+            test_support::config(None, &[ENDPOINT_ONE]),
+            Some(ConnectorState(b"not valid msgpack".to_vec())),
+        );
+
+        let opened = source.open().await;
+
+        assert!(
+            matches!(opened, Err(Error::InitError(_))),
+            "an unreadable registry has lost every tombstone, so open must fail rather than serve the static config, and it must fail before the listener binds"
         );
     }
 

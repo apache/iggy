@@ -27,12 +27,12 @@
 //! the TOML those endpoints would otherwise live in; the README requires
 //! `chmod 700` on the state path.
 
-use iggy_connector_sdk::ConnectorState;
+use iggy_connector_sdk::{ConnectorState, Error};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::routes::{Endpoint, EndpointOrigin};
 use crate::types::EndpointId;
@@ -56,11 +56,20 @@ impl EndpointRegistry {
     /// exception is a revocation tombstone, which always wins, so an operator
     /// who revoked a compromised endpoint does not get it back by restarting
     /// against a TOML file nobody remembered to edit.
+    /// Rebuilds the registry from persisted state, falling back to the static
+    /// TOML only when there was no state to begin with.
+    ///
+    /// Returns `Err` when state existed and could not be decoded. That case
+    /// cannot be served: every revocation tombstone lives in the state, so
+    /// continuing on the TOML alone would put an endpoint that was revoked for
+    /// being compromised straight back on the wire. Failing here surfaces as
+    /// `last_error` on the control API, which is the only way an operator
+    /// learns the tombstones are unreadable.
     pub fn restore(
         static_endpoints: &[StaticEndpointConfig],
         state: Option<ConnectorState>,
         connector_id: u32,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let mut endpoints: BTreeMap<EndpointId, Endpoint> = static_endpoints
             .iter()
             .map(|config| (config.endpoint_id.clone(), Endpoint::from(config)))
@@ -72,18 +81,14 @@ impl EndpointRegistry {
             .and_then(|state| state.deserialize::<EndpointRegistry>(CONNECTOR_NAME, connector_id))
         else {
             if had_state {
-                // Unreadable state is not a clean start: every revocation
-                // tombstone is gone, so an endpoint revoked because it was
-                // compromised is about to come back live from TOML.
-                warn!(
-                    "Discarded an unreadable registry for {CONNECTOR_NAME} connector ID: {connector_id}; revocation tombstones are lost and static endpoints will be served again, static endpoints: {static_count}"
-                );
-            } else {
-                info!(
-                    "Started {CONNECTOR_NAME} connector ID: {connector_id} with no persisted registry, static endpoints: {static_count}"
-                );
+                return Err(Error::InitError(format!(
+                    "Cannot decode the persisted registry for {CONNECTOR_NAME} connector ID: {connector_id}. Refusing to serve {static_count} static endpoints without its revocation tombstones"
+                )));
             }
-            return EndpointRegistry { endpoints };
+            info!(
+                "Started {CONNECTOR_NAME} connector ID: {connector_id} with no persisted registry, static endpoints: {static_count}"
+            );
+            return Ok(EndpointRegistry { endpoints });
         };
 
         let mut restored = 0;
@@ -111,7 +116,7 @@ impl EndpointRegistry {
             "Restored registry for {CONNECTOR_NAME} connector ID: {connector_id}, static endpoints: {static_count}, dynamic endpoints: {restored}, revoked: {tombstones}"
         );
 
-        EndpointRegistry { endpoints }
+        Ok(EndpointRegistry { endpoints })
     }
 
     pub fn endpoints(&self) -> impl Iterator<Item = &Endpoint> {
@@ -271,7 +276,8 @@ mod tests {
         let mut original = EndpointRegistry::default();
         assert!(original.insert(dynamic_endpoint(ENDPOINT_TWO)));
 
-        let restored = EndpointRegistry::restore(&[], Some(registry_state(&original)), 1);
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&original)), 1)
+            .expect("the registry must restore");
 
         let endpoint = restored
             .endpoint(ENDPOINT_TWO)
@@ -290,7 +296,8 @@ mod tests {
 
     #[test]
     fn given_no_state_should_start_from_static_config_only() {
-        let restored = EndpointRegistry::restore(&[static_endpoint(ENDPOINT_ONE)], None, 1);
+        let restored = EndpointRegistry::restore(&[static_endpoint(ENDPOINT_ONE)], None, 1)
+            .expect("the registry must restore");
 
         assert_eq!(restored.len(), 1);
         assert!(restored.endpoint(ENDPOINT_ONE).is_some());
@@ -298,14 +305,16 @@ mod tests {
     }
 
     #[test]
-    fn given_invalid_state_should_start_from_static_config_only() {
+    fn given_invalid_state_when_restored_should_refuse_to_serve_static_config() {
         let invalid = ConnectorState(b"not valid msgpack".to_vec());
 
         let restored =
             EndpointRegistry::restore(&[static_endpoint(ENDPOINT_ONE)], Some(invalid), 1);
 
-        assert_eq!(restored.len(), 1);
-        assert!(restored.endpoint(ENDPOINT_ONE).is_some());
+        assert!(
+            restored.is_err(),
+            "state that existed and cannot be decoded has lost every tombstone, so serving the static config would put a revoked endpoint back on the wire"
+        );
     }
 
     #[test]
@@ -433,10 +442,17 @@ mod tests {
             "a record that cannot supply its lifecycle state must fail the decode"
         );
 
-        let restored = EndpointRegistry::restore(&[], Some(ConnectorState(bytes)), 1);
+        // Static config carrying the same id is the case that matters: with
+        // `&[]` there is nothing to resurrect, so the assertion passed however
+        // restore behaved.
+        let restored = EndpointRegistry::restore(
+            &[static_endpoint(ENDPOINT_ONE)],
+            Some(ConnectorState(bytes)),
+            1,
+        );
         assert!(
-            restored.endpoint(ENDPOINT_ONE).is_none(),
-            "and restore must fall back to static-only rather than serve it"
+            restored.is_err(),
+            "and restore must refuse rather than serve the static twin of a record it could not decode"
         );
     }
 
@@ -450,7 +466,8 @@ mod tests {
             &[static_endpoint(ENDPOINT_ONE)],
             Some(registry_state(&persisted)),
             1,
-        );
+        )
+        .expect("the registry must restore");
 
         let endpoint = restored.endpoint(ENDPOINT_ONE).expect("entry must exist");
         assert!(
@@ -468,7 +485,8 @@ mod tests {
         assert!(persisted.insert(dynamic_endpoint(ENDPOINT_TWO)));
         persisted.revoke(ENDPOINT_TWO, "compromised".to_string(), 42);
 
-        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1);
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1)
+            .expect("the registry must restore");
 
         let endpoint = restored
             .endpoint(ENDPOINT_TWO)
@@ -503,7 +521,8 @@ mod tests {
             &[static_endpoint(ENDPOINT_ONE)],
             Some(registry_state(&persisted)),
             1,
-        );
+        )
+        .expect("the registry must restore");
 
         let endpoint = restored.endpoint(ENDPOINT_ONE).expect("entry must exist");
         assert_eq!(
