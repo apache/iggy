@@ -17,7 +17,7 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
-use crate::prelude::{IggyDuration, IggyError};
+use crate::prelude::{IggyError, NonZeroIggyDuration};
 use async_trait::async_trait;
 use iggy_common::Snapshot;
 use iggy_common::Stats;
@@ -86,7 +86,7 @@ impl SystemClient for HttpClient {
         Ok(())
     }
 
-    async fn heartbeat_interval(&self) -> IggyDuration {
+    async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
 

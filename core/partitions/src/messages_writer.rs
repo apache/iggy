@@ -45,7 +45,8 @@ impl MessagesWriter {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be opened, synchronized, or queried for metadata.
+    /// Returns an error if the file cannot be opened, synchronized, or queried for
+    /// metadata, or if the on-disk length does not match the seeded size counter.
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
@@ -78,7 +79,21 @@ impl MessagesWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            messages_size_bytes.store(actual_messages_size, Ordering::Relaxed);
+            // Refusal rationale documented on `IggyError::SegmentSizeMismatchAtOpen`.
+            let expected_messages_size = messages_size_bytes.load(Ordering::Relaxed);
+            if actual_messages_size != expected_messages_size {
+                error!(
+                    target: "iggy.partitions.storage",
+                    file = file_path,
+                    on_disk_size = actual_messages_size,
+                    expected_size = expected_messages_size,
+                    "segment messages file size does not match the seeded size at open"
+                );
+                return Err(IggyError::SegmentSizeMismatchAtOpen(
+                    actual_messages_size,
+                    expected_messages_size,
+                ));
+            }
         }
 
         Ok(Self {
@@ -122,9 +137,9 @@ impl MessagesWriter {
     /// save then failed. The committed prefix stays resident and is
     /// re-persisted on the next `commit_messages`; rewinding the cursor makes
     /// that retry overwrite the same region instead of appending a second copy
-    /// of the committed batch. The on-disk bytes are left in place (they are
-    /// committed data the retry overwrites), and after a crash the cursor
-    /// reinitializes from the file length, so no truncation is needed.
+    /// of the committed batch. Crash-safe without truncating: the rewound
+    /// bytes are whole batch records past the last index entry, so boot
+    /// recovery's indexed walk absorbs them and its truncate is a no-op.
     pub(crate) fn rewind(&self, bytes: u64) {
         debug_assert!(
             bytes <= self.messages_size_bytes.load(Ordering::Relaxed),
@@ -255,5 +270,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(writer.file.metadata().await.unwrap().len(), 0);
+    }
+
+    #[compio::test]
+    async fn given_seeded_size_diverging_from_disk_when_opening_existing_file_should_return_size_mismatch_error()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("segment.log");
+        std::fs::write(&path, [7u8; 128]).unwrap();
+
+        let result = MessagesWriter::new(
+            path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(129)),
+            false,
+            true,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(IggyError::SegmentSizeMismatchAtOpen(128, 129))
+        ));
     }
 }
