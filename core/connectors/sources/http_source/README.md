@@ -11,7 +11,7 @@ Every instance of this plugin shares one listener, so a single port can serve ma
 Loss windows, explicitly:
 
 1. **Process crash** between HTTP 200 and the producer send. Buffered messages are volatile.
-2. **Producer failure.** Narrowed by #3855, which gave sources a delivery result: the runtime NACKs a batch it could not send, or whose state it could not persist, and this connector holds that batch and replays it on the next `poll()` rather than dropping it. Nothing is ever abandoned, because answering 200 already told the sender this gateway owns the event, and the only honest way to shed load is the 429 the handlers return once the bridge fills.
+2. **Producer failure.** Narrowed by #3855, which gave sources a delivery result. The runtime NACKs a batch it could not send, or whose state it could not persist, and neither is abandoned here: a message batch is held and replayed on the next `poll()`, and a state-only batch re-arms the flush so the mutation is handed out again. Answering 200 already told the sender this gateway owns the event, and the only honest way to shed load is the 429 handlers return once the bridge fills.
 3. **Shutdown.** Narrowed by #3321, which closes the plugin before tearing down the forwarding channel so in-flight batches drain. Messages still in the bridge when the poll task stops are lost; the connector logs the count and increments `http_source_dropped_on_close_total`.
 4. **Poll task stopped by the SDK.** A source is stopped after five consecutive NACKs, roughly 1.5s of backoff plus five send rounds, so a broker outage longer than that ends the poll task while the listener keeps accepting. Whatever the bridge holds is then lost on the next restart, and the stop is unobservable: the runtime's forwarding loop stays parked, so the source keeps being counted as running while nothing polls. Tracked in #3941.
 
@@ -227,9 +227,11 @@ Rotation deliberately keeps the path: a webhook sender configures the URL once, 
 | 500 | The route table could not be rebuilt |
 | 503 | The owning instance closed while the request was in flight |
 
-Revocation writes a tombstone rather than deleting the entry. The tombstone persists, so a restart against a stale TOML file cannot resurrect an endpoint someone revoked.
+Revocation writes a tombstone rather than deleting the entry. The tombstone persists, so a restart against a stale TOML file cannot resurrect an endpoint someone revoked. That rests on `open()` failing when the state file cannot be decoded, rather than falling back to the TOML: the connector reports the decode failure as `last_error` and serves nothing, instead of quietly putting revoked endpoints back on the wire.
 
-The 204 means the endpoint stopped serving *now*, in memory. Durability follows the same path as registration below, with one asymmetry worth knowing: losing an unsaved registration fails closed, but losing an unsaved revocation fails **open** — the endpoint would come back after a restart. Check `submitted` on `GET /admin/endpoints/{id}` before treating a revocation as final, and if the connector cannot reach Iggy, remove the endpoint from the TOML too.
+The 204 means the endpoint stopped serving *now*, in memory. Durability follows the same path as registration below, with one asymmetry worth knowing: losing an unsaved registration fails closed, but losing an unsaved revocation fails **open**, so the endpoint would come back after a restart.
+
+`submitted` on `GET /admin/endpoints/{id}` is not the durability check. It flips when the mutation is handed to the runtime, which happens before the runtime persists it. A save that failed shows up as `last_error` on the connector and re-arms the flush for the next poll, so treat a revocation as final only once the connector is error-free. If it cannot reach Iggy, remove the endpoint from the TOML too.
 
 Dynamic endpoints ride the SDK's `ConnectorState`, which the runtime writes after the next successful send. A management response therefore means "accepted", not "durable": if Iggy is unreachable, the endpoint is live in memory but not yet on disk, and a crash in that window loses it.
 
