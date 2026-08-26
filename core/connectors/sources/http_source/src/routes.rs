@@ -79,7 +79,7 @@ pub struct Endpoint {
     pub hmac_header: String,
     #[serde(default)]
     pub hmac_prefix: String,
-    /// Unix seconds; requests arriving at or after this answer 410 Gone.
+    /// Unix seconds; requests arriving at or after this answer 404.
     #[serde(default)]
     pub expires_at: Option<u64>,
     #[serde(default)]
@@ -114,6 +114,12 @@ impl Endpoint {
     pub fn revoke(&mut self, reason: String, revoked_at: u64) {
         self.state = EndpointState::Revoked { reason, revoked_at };
         self.submitted = false;
+        // The handler 404s on a revoked entry before `authorize()` runs, so
+        // the secret is already dead weight. Keeping it would serialize a
+        // leaked credential into the state file, and nothing compacts
+        // tombstones, so revoking *because* it leaked would persist it
+        // indefinitely.
+        self.auth_secret = None;
     }
 }
 

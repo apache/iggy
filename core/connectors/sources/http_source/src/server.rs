@@ -299,7 +299,7 @@ impl SharedServer {
             )),
             tokio::spawn(run(
                 admin,
-                admin_router(state.clone()),
+                admin_router(state.clone(), config.max_body_size_bytes),
                 shutdown.subscribe(),
                 "admin",
             )),
@@ -422,11 +422,15 @@ fn public_router(state: Arc<ServerState>, max_body_size_bytes: usize) -> Router 
         .with_state(state)
 }
 
-fn admin_router(state: Arc<ServerState>) -> Router {
+fn admin_router(state: Arc<ServerState>, max_body_size_bytes: usize) -> Router {
     Router::new()
         .route("/admin/health", get(handle_admin_health))
         .route("/admin/metrics", get(handle_admin_metrics))
         .merge(management::router(Arc::clone(&state)))
+        // Without this the admin listener silently used axum's 2 MiB default
+        // instead of the operator's cap, so the two listeners disagreed about
+        // how large a body they would read.
+        .layer(DefaultBodyLimit::max(max_body_size_bytes))
         .with_state(state)
 }
 
@@ -529,10 +533,13 @@ fn secret_path_outcome(
                 error_response(StatusCode::NOT_FOUND, "not found"),
             );
         }
+        // Expired answers 404 for the same reason revoked does. A 410 is
+        // returned before any credential is checked, so it told anyone holding
+        // a leaked or guessed id that the endpoint had once been real.
         RouteLookup::Expired(entry) => {
             return (
                 entry.instance.instance_name.clone(),
-                error_response(StatusCode::GONE, "gone"),
+                error_response(StatusCode::NOT_FOUND, "not found"),
             );
         }
         RouteLookup::Unknown => {
@@ -923,7 +930,11 @@ mod tests {
 
         let response = post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
 
-        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "expired must not be distinguishable from never-existed by an unauthenticated caller"
+        );
         close(&mut source).await;
     }
 
@@ -1153,7 +1164,7 @@ mod tests {
         let instance = &body["instances"][0];
         assert_eq!(
             instance["endpoints_static"], 0,
-            "an endpoint that answers 410 to everything is not serving"
+            "an endpoint that answers 404 to everything is not serving"
         );
         assert_eq!(instance["endpoints_expired"], 1);
         assert_eq!(instance["endpoints_revoked"], 0);
