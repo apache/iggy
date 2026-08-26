@@ -32,6 +32,19 @@ pub struct TcpClientReconnectionConfig {
     /// addresses it was configured with, and every node the roster named, so a
     /// survivor is reached inside the first pass rather than one delay per
     /// endpoint.
+    ///
+    /// The number is not portable across SDKs. Each counts the same setting in
+    /// its own terms, and `0` means something different in every one of them, so
+    /// a deployment that runs several has to set this per SDK rather than copy
+    /// one value across:
+    ///
+    /// | SDK  | `N`                                    | `0`                                       | unlimited        |
+    /// | ---- | -------------------------------------- | ----------------------------------------- | ---------------- |
+    /// | Rust | `N` passes after a first, unpaced one   | that first pass alone                     | `None`           |
+    /// | C#   | as Rust                                | unlimited                                 | `0`              |
+    /// | Go   | `N` passes, the first one of them       | unlimited                                 | `0`              |
+    /// | Java | `N` passes, the first one of them       | one pass, and only with several endpoints  | a large `N`      |
+    /// | Node | `N` passes, the first one of them       | no pass at all                            | a large `N`      |
     pub max_retries: Option<u32>,
     /// Delay between passes. The first pass runs at once when the client knows
     /// more than one endpoint.
