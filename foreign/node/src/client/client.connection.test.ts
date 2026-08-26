@@ -472,6 +472,82 @@ describe('IggyConnection', () => {
     }
   );
 
+  it('does not redial at all when reconnection is disabled',
+    async () => {
+      // `enabled: false` is what a caller says to opt out. The retry budget is
+      // whatever the defaults hold, so a loop that reads it without checking
+      // this flag would run every one of those passes - and with the backoff
+      // gated on the same flag, back to back.
+      //
+      // The endpoint accepts and hangs up, so the drop that would start a
+      // redial happens and every dial of it is counted.
+      const hangup = await startServer();
+      const hangupPort = (hangup.address() as AddressInfo).port;
+      let accepted = 0;
+      hangup.on('connection', (socket) => {
+        accepted += 1;
+        socket.destroy();
+      });
+
+      const connection = new IggyConnection({
+        transport: 'TCP',
+        options: { host: '127.0.0.1', port: hangupPort },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        await connection.connect().catch(() => undefined);
+        await new Promise<void>((resolve) => setTimeout(resolve, 300));
+
+        assert.equal(accepted, 1,
+          'a client that turned reconnection off redialed anyway'
+        );
+        assert.equal(connection.connected, false);
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => hangup.close(() => resolve()));
+      }
+    }
+  );
+
+  it('sweeps the endpoints it knows once when reconnection is disabled',
+    async () => {
+      // Opting out of retries is not opting out of the endpoints: with more
+      // than one known, they get exactly one pass and no backoff, as in the
+      // other SDKs.
+      const dead = await startServer();
+      const deadPort = (dead.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => dead.close(() => resolve()));
+      const live = await startServer();
+      const livePort = (live.address() as AddressInfo).port;
+      let accepted = 0;
+      live.on('connection', () => { accepted += 1; });
+
+      const connection = new IggyConnection({
+        transport: 'TCP',
+        options: { host: '127.0.0.1', port: deadPort },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: livePort }]);
+        await connection.connect().catch(() => undefined);
+        await new Promise<void>((resolve) => setTimeout(resolve, 200));
+
+        assert.equal(accepted, 1,
+          'the known endpoints got either no pass or more than one'
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => live.close(() => resolve()));
+      }
+    }
+  );
+
   it('skips the first backoff when another endpoint is known',
     async () => {
       // The endpoint the client is on is dead and a live one sits behind it in

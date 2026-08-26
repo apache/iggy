@@ -20,10 +20,23 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct TcpClientReconnectionConfig {
+    /// Whether a lost connection is redialed at all. With this off the
+    /// endpoints the client knows still get one pass, since they were
+    /// configured to be tried, but nothing is retried after it.
     pub enabled: bool,
+    /// How many passes over the known endpoints, or `None` for unlimited.
+    ///
+    /// Passes, not dials: one pass tries the endpoint the client is on, the
+    /// addresses it was configured with, and every node the roster named, so a
+    /// survivor is reached inside the first pass rather than one delay per
+    /// endpoint.
     pub max_retries: Option<u32>,
-    /// Delay between connection attempts.
+    /// Delay between passes. The first pass runs at once when the client knows
+    /// more than one endpoint.
     pub interval: NonZeroIggyDuration,
+    /// Cooldown before redialing the endpoint that was just lost. It is owed to
+    /// that endpoint alone: the others are dialed without waiting, and the
+    /// paced one goes last in the pass.
     pub reestablish_after: IggyDuration,
 }
 

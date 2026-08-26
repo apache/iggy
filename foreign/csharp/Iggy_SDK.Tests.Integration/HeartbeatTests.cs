@@ -118,14 +118,17 @@ public class HeartbeatTests
 
         await Task.Delay(IdleFor);
 
-        // The evicted request surfaces the loss; the one after it comes back over a session the remembered
-        // sign-in re-established.
-        await Should.ThrowAsync<Exception>(() => client.GetMeAsync());
-
+        // A read is replay-safe, so the eviction is absorbed: the reconnect signs in again with the
+        // credentials the hand-run login remembered, and the request completes over the session it
+        // re-established.
         var stream = await client.GetStreamByIdAsync(Identifier.String(streamName));
         stream.ShouldNotBeNull();
+
+        // The session is a new one, though: what the server evicted stays evicted, so the group membership
+        // that belonged to it is gone.
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
+        me.ConsumerGroupsCount.ShouldBe(0);
     }
 
     private Task<IIggyClient> CreateClient(TimeSpan heartbeatInterval, bool autoLogin = true)

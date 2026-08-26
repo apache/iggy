@@ -82,6 +82,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
             int survivorPort = survivorSocket.getLocalPort();
             AtomicInteger survivorRegistrations = new AtomicInteger();
             AtomicInteger survivorPings = new AtomicInteger();
+            List<String> survivorLogins = new CopyOnWriteArrayList<>();
 
             // The primary leads, so the sign-in settles there and the roster is
             // only remembered -- not acted on -- until the node dies.
@@ -102,6 +103,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 }
                 if (request.operation() == OPERATION_REGISTER) {
                     survivorRegistrations.incrementAndGet();
+                    survivorLogins.add(request.bodyAsText());
                     return Response.success(OPERATION_REGISTER, registerBody(2));
                 }
                 if (request.is(PING_CODE, OPERATION_NON_REPLICATED)) {
@@ -110,14 +112,16 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
             });
 
-            // No builder credentials: the replay can only come from the
-            // sign-in the caller ran, which is the shape that could not
-            // reconnect at all before. With credentials configured, the replay
-            // falls back to them and the test would pass without a remembered
-            // sign-in at all.
+            // Credentials on the builder and a hand-run login for somebody
+            // else. The redial replays the sign-in that last succeeded, which
+            // is also what the connection replays from the login it captured
+            // when the pool swaps a channel: replaying a different user here
+            // would make the same failure land on a different session depending
+            // on which path got there first.
             AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
                     .host(loopback.getHostAddress())
                     .port(primaryPort)
+                    .credentials("configured", "configured")
                     .requestTimeout(Duration.ofSeconds(2))
                     // A whole rotation dials every endpoint the client knows, so
                     // the survivor is reached before this delay is ever spent.
@@ -126,7 +130,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                     .build();
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
-                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                client.users().login("handrun", "handrun").get(5, TimeUnit.SECONDS);
                 client.sendBinaryRequest(PING_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
                 assertThat(client.getConnectionInfo().port()).isEqualTo(primaryPort);
 
@@ -148,6 +152,10 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 assertThat(survivorPings)
                         .as("the request landed on the survivor")
                         .hasValueGreaterThanOrEqualTo(1);
+                assertThat(survivorLogins.get(survivorLogins.size() - 1))
+                        .as("the redial replayed the configured user instead of the last sign-in")
+                        .contains("handrun")
+                        .doesNotContain("configured");
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
                 survivor.close();
@@ -353,7 +361,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         return new Request(
                 Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]),
                 fields.getInt(REQUEST_CODE_OFFSET),
-                fields.getLong(REQUEST_ID_OFFSET));
+                fields.getLong(REQUEST_ID_OFFSET),
+                body);
     }
 
     private static void writeResponse(OutputStream output, Request request, Response response) throws IOException {
@@ -372,9 +381,14 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         output.flush();
     }
 
-    private record Request(int operation, int commandCode, long requestId) {
+    private record Request(int operation, int commandCode, long requestId, byte[] body) {
         boolean is(int expectedCode, int expectedOperation) {
             return commandCode == expectedCode && operation == expectedOperation;
+        }
+
+        /** The request body as text, for asserting which user a login names. */
+        String bodyAsText() {
+            return new String(body, StandardCharsets.UTF_8);
         }
     }
 

@@ -35,7 +35,7 @@ import {
 import { Operation } from '../wire/vsr/operation.js';
 import { VsrEvictionError } from '../wire/vsr/reply.js';
 import { CommandResponseStream } from './client.socket.js';
-import type { ClientConfig } from './client.type.js';
+import type { ClientConfig, CommandResponse } from './client.type.js';
 
 const TEST_SESSION = 42n;
 const TLS_CERTIFICATE = readFileSync(
@@ -209,6 +209,23 @@ const vsrConfig = (port: number): ClientConfig => ({
 });
 
 /** Shrinks the leaderless poll so a test observes it without waiting on it. */
+/** The queue a command waits in, for parking one the way the client does. */
+const execQueue = (client: CommandResponseStream): {
+  command: number,
+  payload: Buffer,
+  handleResponse: boolean,
+  deadline: number,
+  resolve: (v: CommandResponse | PromiseLike<CommandResponse>) => void,
+  reject: (e: unknown) => void
+}[] => (client as unknown as { _execQueue: never[] })._execQueue;
+
+/** The connection under a stream, for driving a redirect the way a move does. */
+const connectionOf = (client: CommandResponseStream): {
+  redirect: (host: string, port: number) => Promise<void>
+} => (client as unknown as {
+  connection: { redirect: (host: string, port: number) => Promise<void> }
+}).connection;
+
 /** Drives the leader re-check a refused request runs. */
 const followLeaderMove = (client: CommandResponseStream): Promise<boolean> =>
   (client as unknown as {
@@ -1037,6 +1054,126 @@ describe('VSR client socket', () => {
         client.destroy();
         await leader.close();
         await demoted.close();
+      }
+    }
+  );
+
+  it('re-issues a command queued behind a leader move instead of failing it',
+    async () => {
+      // A move replaces the socket, which looks like a drop to everything
+      // waiting in the queue. Nothing queued was written, though, so it belongs
+      // on the node the client moves to rather than in a lost-connection error
+      // the caller can do nothing about.
+      const leader = await startVsrServer((frame, socket) => {
+        singleNodeHandler(leader.port)(frame, socket);
+      });
+      const demoted = await startVsrServer((frame, socket) => {
+        singleNodeHandler(demoted.port)(frame, socket);
+      });
+
+      const client = new CommandResponseStream(vsrConfig(demoted.port));
+      try {
+        await client.authenticate(vsrConfig(demoted.port).credentials);
+
+        // Parked the way a command is while something else holds the queue.
+        const queued = new Promise<CommandResponse>((resolve, reject) => {
+          execQueue(client).push({
+            command: 60_034,
+            payload: Buffer.alloc(0),
+            handleResponse: true,
+            deadline: Date.now() + 30_000,
+            resolve,
+            reject
+          });
+        });
+
+        await connectionOf(client).redirect('127.0.0.1', leader.port);
+        await queued;
+
+        const landedOnLeader = leader.frames.some(
+          (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_034
+        );
+        assert.ok(landedOnLeader,
+          'the queued command never reached the node the client moved to'
+        );
+      } finally {
+        client.destroy();
+        await leader.close();
+        await demoted.close();
+      }
+    }
+  );
+
+  it('surfaces the refusal rather than a timeout when the budget runs out',
+    async () => {
+      const server = await startVsrServer((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_036) {
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream(vsrConfig(server.port));
+      const realNow = Date.now;
+      try {
+        await client.authenticate(vsrConfig(server.port).credentials);
+        // The request's own budget, then the clock jumped past it: what is left
+        // cannot carry another attempt, so the caller has to see the answer the
+        // server gave and not the timeout a doomed re-issue would produce.
+        // The request's budget, the first exchange, the window that hands the
+        // refusal out, and then a clock 10ms short of the deadline: too little
+        // to carry another attempt, so the caller has to see the answer the
+        // server gave rather than the timeout a doomed re-issue would produce.
+        const times = [0, 1, 2_001, 29_990];
+        Date.now = () => times.shift() ?? 30_050;
+
+        await assert.rejects(
+          () => client.sendCommand(60_036, Buffer.alloc(0)),
+          (error: unknown) =>
+            error instanceof ResponseError &&
+            error.commandCode === 60_036 &&
+            error.errorCode === 58
+        );
+      } finally {
+        Date.now = realNow;
+        client.destroy();
+        await server.close();
+      }
+    }
+  );
+
+  it('paces the re-issues while the roster still names this node',
+    async () => {
+      // Re-issuing is right, spinning is not: the in-connection replay window
+      // belongs to the request's budget and is spent after the first pass, so
+      // without a wait the client would hammer the node for the whole budget.
+      let refusals = 0;
+      const server = await startVsrServer((frame, socket) => {
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_035) {
+          refusals += 1;
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream(vsrConfig(server.port));
+      try {
+        await client.authenticate(vsrConfig(server.port).credentials);
+
+        const pending = client.sendCommand(60_035, Buffer.alloc(0));
+        pending.catch(() => undefined);
+        await new Promise((resolve) => {
+          setTimeout(resolve, 5_000).unref();
+        });
+
+        // The first 2s window replays on the connection at its own interval;
+        // every window after it costs one refusal per pace.
+        assert.ok(refusals < 200,
+          `the re-issues were not paced: ${refusals} refusals in 5s`
+        );
+      } finally {
+        client.destroy();
+        await server.close();
       }
     }
   );

@@ -64,6 +64,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int OPERATION_CREATE_STREAM = 128;
     private static final int GET_CLUSTER_METADATA_CODE = 12;
     private static final int CREATE_STREAM_CODE = 202;
+    private static final int PING_CODE = 1;
     private static final int TRANSIENT_NOT_ACCEPTED = 58;
     private static final int EVICTION_STALE_CLIENT = 13;
 

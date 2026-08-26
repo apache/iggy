@@ -52,6 +52,15 @@ const TRANSIENT_NOT_ACCEPTED = 58;
 const VSR_FAILOVER_CHECK_MS = 2_000;
 
 /**
+ * Whether a request's budget still holds enough for another attempt. One
+ * exchange needs at least a replay interval to be worth starting; below that
+ * the attempt can only end in a timeout, which would hide the refusal that
+ * actually came back.
+ */
+const worthAnotherAttempt = (deadline: number): boolean =>
+  deadline - Date.now() > VSR_RETRY_INTERVAL_MS;
+
+/**
  * A request the current node keeps refusing as not-admitted. Carries the
  * refusal so the caller can surface it when the roster turns out to still name
  * this node as the leader. Never escapes `sendCommand`.
@@ -177,10 +186,38 @@ export class CommandResponseStream extends EventEmitter {
     });
     this.connection.on('disconnected', () => {
       this._resetSession();
+      if (this.connection.redirecting) {
+        // The client is moving to the leader, which is its own doing: a queued
+        // command has not been written, so it belongs on the node being moved
+        // to rather than in an error.
+        this._reissueQueue();
+        return;
+      }
       this._failQueue(
         new Error('connection closed before queued commands were sent')
       );
     });
+  }
+
+  /**
+   * Re-submits queued commands through the full send path, so each one
+   * reconnects, re-authenticates and re-checks the leader as if it had just
+   * been called.
+   *
+   * Only for a drop the client caused. Nothing here was written, so there is no
+   * outcome in doubt: a command still in the queue when the socket is replaced
+   * would otherwise fail with a lost-connection error the caller can do nothing
+   * about.
+   */
+  private _reissueQueue(): void {
+    const queued = this._execQueue;
+    this._execQueue = [];
+    for (const job of queued) {
+      debug('re-issuing a queued command after a leader move', job.command);
+      this.sendCommand(job.command, job.payload, {
+        handleResponse: job.handleResponse
+      }).then(job.resolve, job.reject);
+    }
   }
 
   /**
@@ -240,7 +277,12 @@ export class CommandResponseStream extends EventEmitter {
           // be refused this way, and answering a leader check with another
           // leader check would recurse. Its caller reads a failure as "stay
           // where you are".
-          if (!followsLeaderMoves || Date.now() >= deadline)
+          //
+          // A budget too small to carry another attempt ends it here, with the
+          // refusal the server actually gave: re-issued into what is left, the
+          // request would time out instead and the caller would see a timeout
+          // where the answer was "not admitted".
+          if (!followsLeaderMoves || !worthAnotherAttempt(deadline))
             throw responseError(command, error.refusal.errorCode);
 
           const moved = await this._followLeaderMove();
@@ -249,11 +291,13 @@ export class CommandResponseStream extends EventEmitter {
             // could not be read. Paced, because the in-connection replay
             // window belongs to the request's budget and has already been
             // spent -- re-issuing straight away would spin.
-            const remaining = deadline - Date.now();
-            if (remaining <= 0)
-              throw responseError(command, error.refusal.errorCode);
-            await delay(Math.min(VSR_FAILOVER_CHECK_MS, remaining));
+            await delay(Math.min(
+              VSR_FAILOVER_CHECK_MS,
+              Math.max(0, deadline - Date.now())
+            ));
           }
+          if (!worthAnotherAttempt(deadline))
+            throw responseError(command, error.refusal.errorCode);
           // A move drops the session with the socket it was bound to, so the
           // re-issue would otherwise go out under no session: a replicated
           // command fails client-side, a non-replicated one goes out with
@@ -374,8 +418,15 @@ export class CommandResponseStream extends EventEmitter {
         reject(err);
       }
     }
-    if (this._execQueue.length > 0)
-      this._failQueue(new Error('connection is not writable'));
+    if (this._execQueue.length > 0) {
+      // The same distinction as on 'disconnected': the socket a leader move
+      // replaced stops being writable, and what is still queued belongs on the
+      // node being moved to.
+      if (this.connection.redirecting)
+        this._reissueQueue();
+      else
+        this._failQueue(new Error('connection is not writable'));
+    }
     this.busy = false;
     this._emitFinishQueue();
   }

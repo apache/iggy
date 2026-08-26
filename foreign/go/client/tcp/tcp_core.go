@@ -82,6 +82,11 @@ type IggyTcpClient struct {
 	// loggedOut records an explicit sign-out, so a reconnect's automatic
 	// sign-in does not silently reverse it; guarded by c.mtx.
 	loggedOut bool
+	// connectInFlight is the attempt a Connect is running, shared with every
+	// caller that arrives while it is in progress: closed when the attempt
+	// settles, with connectErr carrying its outcome. Guarded by c.mtx.
+	connectInFlight chan struct{}
+	connectErr      error
 	// rememberedLogin holds the credentials a manual sign-in succeeded with,
 	// so a reconnect -- on this node or, after a failover, another one -- can
 	// re-establish the session instead of surfacing an unauthenticated error.
@@ -908,7 +913,12 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 }
 
 // Connect establishes the TCP connection to the server.
-func (c *IggyTcpClient) Connect(ctx context.Context) error {
+//
+// Single-flighted: one attempt dials, and every caller that arrives while it
+// runs waits for it and shares its outcome. Reporting success to those callers
+// instead would hand them a client with no connection yet, and their next
+// request would fail ErrNotConnected for no reason of its own.
+func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
 	c.mtx.Lock()
 	switch c.transportState {
 	case iggcon.TransportStateShutdown:
@@ -921,14 +931,41 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		c.logger.Debug("Client is already connected.", slog.String("client_address", clientAddress))
 		return nil
 	case iggcon.TransportStateConnecting:
+		inFlight := c.connectInFlight
 		c.mtx.Unlock()
-		c.logger.Debug("Client is already connecting.")
-		return nil
+		c.logger.Debug("Client is already connecting; waiting for that attempt.")
+		if inFlight == nil {
+			return nil
+		}
+		select {
+		case <-inFlight:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.closed:
+			return ierror.ErrClientShutdown
+		}
+		c.mtx.Lock()
+		attemptErr := c.connectErr
+		c.mtx.Unlock()
+		return attemptErr
 	default:
 		c.transportState = iggcon.TransportStateConnecting
+		c.connectInFlight = make(chan struct{})
+		c.connectErr = nil
 	}
 	connectedAt := c.connectedAt
 	c.mtx.Unlock()
+
+	// Settles the attempt for whoever is waiting on it, whichever way it ends.
+	defer func() {
+		c.mtx.Lock()
+		c.connectErr = err
+		if c.connectInFlight != nil {
+			close(c.connectInFlight)
+			c.connectInFlight = nil
+		}
+		c.mtx.Unlock()
+	}()
 
 	candidates := c.connectionCandidates()
 	if len(candidates) == 0 {
@@ -1019,6 +1056,25 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	}
 
 	c.mtx.Lock()
+	if c.transportState != iggcon.TransportStateConnecting {
+		// Disconnected or shut down while this attempt was dialing: the
+		// connection it just made is not wanted, and installing it would
+		// resurrect a client somebody asked to stop.
+		state := c.transportState
+		c.mtx.Unlock()
+		_ = conn.Close()
+		c.logger.Debug("The connect was superseded while dialing; dropping the connection.")
+		if state == iggcon.TransportStateShutdown {
+			return ierror.ErrClientShutdown
+		}
+		return ierror.ErrNotConnected
+	}
+	// A connection installed over another one leaks its socket: two Connects
+	// can race here, and the loser's conn would otherwise stay open with
+	// nothing left holding it.
+	if previous := c.conn; previous != nil {
+		_ = previous.Close()
+	}
 	c.conn = conn
 	c.reader = bufio.NewReaderSize(conn, 64*1024)
 	c.transportState = iggcon.TransportStateConnected

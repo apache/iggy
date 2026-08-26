@@ -124,6 +124,13 @@ export class IggyConnection extends EventEmitter {
   public connecting: boolean;
   /** Whether the connection is being intentionally closed */
   public ending: boolean;
+  /**
+   * Whether the socket is being replaced by a deliberate leader redirect
+   * rather than lost. The drop looks the same from the outside, but nothing a
+   * caller submitted is in doubt: work waiting to be sent belongs on the node
+   * the client moves to, not in an error.
+   */
+  public redirecting: boolean;
   /** Reconnection configuration */
   private reconnectOption: ReconnectOption;
   /** Number of reconnection attempts made */
@@ -156,6 +163,7 @@ export class IggyConnection extends EventEmitter {
     this.connected = false;
     this.connecting = false;
     this.ending = false;
+    this.redirecting = false;
     this.reconnectOption = { ...DefaultReconnectOption, ...config.reconnect };
     this.seedOptions = { ...config.options };
     this.rosterEndpoints = [];
@@ -388,7 +396,7 @@ export class IggyConnection extends EventEmitter {
     // client that knows one endpoint and turned reconnection off redials
     // nothing, which is what it asked for.
     const sweepOnce = !enabled && this._redialCandidates().length > 1;
-    while (this.reconnectCount < maxRetries || (sweepOnce && firstPass)) {
+    while ((enabled && this.reconnectCount < maxRetries) || (sweepOnce && firstPass)) {
       this.connecting = true;
       this.reconnectCount += 1;
       const candidates = this._redialCandidates();
@@ -502,19 +510,24 @@ export class IggyConnection extends EventEmitter {
       ...this.config,
       options: redirectedOptions
     };
-    // Destroying the old socket settles any dial still waiting on it. Its
-    // lifecycle listeners stay attached but go inert once the socket is
-    // replaced below, so surface the drop to in-flight exchanges ourselves.
-    this.socket.destroy();
-    this.connected = false;
-    this.connecting = false;
-    this.connectPromise = undefined;
-    this.reconnectPromise = undefined;
-    this._endResponseWait();
-    this.socket = this._installSocket(getTransport(redirectedConfig));
-    this.emit('disconnected', false);
-    await this.connect();
-    this.config.options = redirectedOptions;
+    this.redirecting = true;
+    try {
+      // Destroying the old socket settles any dial still waiting on it. Its
+      // lifecycle listeners stay attached but go inert once the socket is
+      // replaced below, so surface the drop to in-flight exchanges ourselves.
+      this.socket.destroy();
+      this.connected = false;
+      this.connecting = false;
+      this.connectPromise = undefined;
+      this.reconnectPromise = undefined;
+      this._endResponseWait();
+      this.socket = this._installSocket(getTransport(redirectedConfig));
+      this.emit('disconnected', false);
+      await this.connect();
+      this.config.options = redirectedOptions;
+    } finally {
+      this.redirecting = false;
+    }
   }
 
   abort(): void {

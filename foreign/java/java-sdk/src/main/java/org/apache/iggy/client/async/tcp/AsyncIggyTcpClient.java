@@ -119,6 +119,12 @@ public class AsyncIggyTcpClient {
     private static final int INVALID_COMMAND_ERROR_CODE = 3;
     private static final Logger log = LoggerFactory.getLogger(AsyncIggyTcpClient.class);
     private static final RetryPolicy DEFAULT_RECONNECT_POLICY = RetryPolicy.fixedDelay(12, Duration.ofSeconds(5));
+    /**
+     * Bound on one dial while other endpoints are queued behind it, matching
+     * the Rust, Go, C# and Node SDKs. Netty's own connect timeout would
+     * otherwise let a node whose syns are dropped hold the whole rotation.
+     */
+    private static final Duration FAILOVER_DIAL_TIMEOUT = Duration.ofSeconds(2);
 
     private final ConnectionInfo seedConnectionInfo;
     private final AtomicBoolean reconnecting = new AtomicBoolean();
@@ -489,13 +495,29 @@ public class AsyncIggyTcpClient {
                 enableTls,
                 tlsCertificate,
                 poolConfig,
-                connectionTimeout,
+                dialTimeout(),
                 requestTimeout,
                 heartbeatInterval,
                 maxVsrFrameSize,
                 this::retryTransientOnLeader,
                 this::onSessionReset,
                 this::onConnectionFailure);
+    }
+
+    /**
+     * How long one dial may take.
+     *
+     * With other endpoints queued behind this one, a node whose syns are
+     * dropped must not hold the rotation, so the wait is capped at
+     * {@link #FAILOVER_DIAL_TIMEOUT} - the bound the other SDKs use. A caller
+     * who configured a connection timeout gets exactly that, and a client that
+     * knows one endpoint keeps the ordinary default.
+     */
+    private Optional<Duration> dialTimeout() {
+        if (connectionTimeout.isPresent() || redialCandidates().size() < 2) {
+            return connectionTimeout;
+        }
+        return Optional.of(FAILOVER_DIAL_TIMEOUT);
     }
 
     /**

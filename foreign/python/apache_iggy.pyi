@@ -2016,14 +2016,18 @@ class TcpReconnectionConfig:
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
-            max_retries: Attempts before giving up, or `None` for unlimited.
-                Defaults to unlimited, which means a call awaited while the server
-                is down never returns: `connect()`, `send_messages()` and
+            max_retries: Passes over the known endpoints before giving up, or
+                `None` for unlimited. One pass tries the endpoint the client is
+                on, the address it was configured with, and every node the
+                roster named, so this counts passes rather than dials. Defaults
+                to unlimited, which means a call awaited while the server is
+                down never returns: `connect()`, `send_messages()` and
                 `poll_messages()` all wait inside the retry loop. Set a finite
                 number for request/reply style usage, so a call fails instead.
-            interval: Delay between attempts. Defaults to 1 second.
-            reestablish_after: Cooldown before reconnecting after a previously
-                successful connection. Defaults to 5 seconds.
+            interval: Delay between passes. Defaults to 1 second. The first pass
+                runs at once when more than one endpoint is known.
+            reestablish_after: Cooldown before redialing the endpoint that was
+                just lost, owed to that endpoint alone. Defaults to 5 seconds.
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the

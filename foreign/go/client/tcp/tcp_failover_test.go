@@ -154,9 +154,10 @@ func TestFailover_ServerEvictionReplaysTheRememberedSignIn(t *testing.T) {
 	registersBefore := registers.Load()
 
 	evict.Store(true)
-	// The evicted request is answered by the eviction, and the reconnect it
-	// triggers signs in again with the credentials the sign-in remembered.
-	_ = client.Ping(ctx)
+	// A ping is non-replicated, so the eviction is absorbed: the reconnect it
+	// triggers signs in again with the credentials the sign-in remembered and
+	// the request completes over the session it re-established.
+	require.NoError(t, client.Ping(ctx), "the evicted request was not recovered")
 
 	_, remembered := client.signInCredentials()
 	assert.True(t, remembered, "an eviction is not a sign-out; the credentials stay")
@@ -551,6 +552,53 @@ func TestFailover_RejectsAConnectWithNoEndpointToDial(t *testing.T) {
 
 	require.ErrorIs(t, client.Connect(context.Background()), ierror.ErrCannotEstablishConnection)
 	assert.Error(t, client.Ping(context.Background()))
+}
+
+// Concurrent Connects are one attempt, and a caller that did not run it still
+// gets a client it can use the moment its Connect returns. Told "connected"
+// while the attempt is still signing in, its next request fails
+// ErrNotConnected for no reason of its own.
+func TestConnect_ConcurrentCallersShareOneAttempt(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister {
+			// The sign-in is the slow part of an attempt, and it runs after the
+			// dial: a caller that returned early would use the client here.
+			time.Sleep(300 * time.Millisecond)
+		}
+		return singleNodeHandler(t, func() string { return server.address() })(0, 0, read)
+	})
+
+	client := newDialingClient(t, server.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+
+	const callers = 8
+	results := make(chan error, callers)
+	start := make(chan struct{})
+	for range callers {
+		go func() {
+			<-start
+			if err := client.Connect(context.Background()); err != nil {
+				results <- err
+				return
+			}
+			// Usable right away, or the Connect that returned was a lie.
+			results <- client.Ping(context.Background())
+		}()
+	}
+	close(start)
+	for range callers {
+		require.NoError(t, <-results, "a caller was handed a client it could not use")
+	}
+
+	assert.Equal(t, 1, server.connections(), "the callers dialed more than once")
+	var registers int
+	for _, read := range server.recorded() {
+		if read.operation() == vsr.OperationRegister {
+			registers++
+		}
+	}
+	assert.Equal(t, 1, registers, "one attempt, one sign-in")
 }
 
 // deadAddress returns an address nothing listens on, so a dial to it is
