@@ -21,7 +21,7 @@ use integration::harness::TestBinaryError;
 use lapin::{
     Connection, ConnectionProperties, ExchangeKind,
     options::{BasicConsumeOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions},
-    types::FieldTable,
+    types::{AMQPValue, FieldTable},
 };
 use std::time::Duration;
 use testcontainers_modules::testcontainers::core::{IntoContainerPort, WaitFor};
@@ -60,10 +60,12 @@ pub(super) const ENV_SINK_PATH: &str = "IGGY_CONNECTORS_SINK_RABBITMQ_PATH";
 pub(super) const ENV_SINK_INCLUDE_METADATA: &str =
     "IGGY_CONNECTORS_SINK_RABBITMQ_PLUGIN_CONFIG_INCLUDE_METADATA";
 
+#[derive(PartialEq)]
 pub(super) enum RabbitMqExchangeSetup {
     Topic,
     Fanout,
     Direct,
+    Headers,
 }
 pub struct RabbitMqContainer {
     #[allow(dead_code)]
@@ -136,6 +138,10 @@ impl RabbitMqContainer {
         Self::start_with(RabbitMqExchangeSetup::Direct, 1).await
     }
 
+    pub(super) async fn start_headers() -> Result<Self, TestBinaryError> {
+        Self::start_with(RabbitMqExchangeSetup::Headers, 1).await
+    }
+
     async fn wait_until_ready(&self) -> Result<(), TestBinaryError> {
         let mut last_error = None;
 
@@ -177,12 +183,16 @@ impl RabbitMqContainer {
             RabbitMqExchangeSetup::Topic => ExchangeKind::Topic,
             RabbitMqExchangeSetup::Fanout => ExchangeKind::Fanout,
             RabbitMqExchangeSetup::Direct => ExchangeKind::Direct,
+            RabbitMqExchangeSetup::Headers => ExchangeKind::Headers,
         };
         channel
             .exchange_declare(
                 DEFAULT_EXCHANGE,
                 exchange_kind,
-                ExchangeDeclareOptions::default(),
+                ExchangeDeclareOptions {
+                    durable: true,
+                    ..Default::default()
+                },
                 FieldTable::default(),
             )
             .await
@@ -207,13 +217,18 @@ impl RabbitMqContainer {
                     message: format!("Failed to create queue for consume: {e}"),
                 })?;
 
+            let mut bind_arguments = FieldTable::default();
+            if self.exchange_setup == RabbitMqExchangeSetup::Headers {
+                bind_arguments.insert("x-match".into(), AMQPValue::LongString("all".into()));
+                bind_arguments.insert("x-user".into(), AMQPValue::LongString("alice".into()));
+            }
             channel
                 .queue_bind(
                     queue_name,
                     DEFAULT_EXCHANGE,
                     DEFAULT_ROUTING_KEY,
                     QueueBindOptions::default(),
-                    FieldTable::default(),
+                    bind_arguments,
                 )
                 .await
                 .map_err(|e| TestBinaryError::FixtureSetup {
@@ -251,6 +266,16 @@ pub trait RabbitMqOps: Sync {
         queue_name: &str,
         count: usize,
     ) -> Result<Vec<ConsumedDelivery>, TestBinaryError> {
+        self.consume_messages_from_with_timeout(queue_name, count, Duration::from_secs(60))
+            .await
+    }
+
+    async fn consume_messages_from_with_timeout(
+        &self,
+        queue_name: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Vec<ConsumedDelivery>, TestBinaryError> {
         let conn = Connection::connect(&self.container().amqp_url, ConnectionProperties::default())
             .await
             .map_err(|e| TestBinaryError::InvalidState {
@@ -276,7 +301,7 @@ pub trait RabbitMqOps: Sync {
             })?;
 
         let mut messages = Vec::with_capacity(count);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + timeout;
         while messages.len() < count && tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_secs(1), consumer.next()).await {
                 Ok(Some(delivery)) => {

@@ -85,7 +85,8 @@ pub use postgres::{
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
 pub use rabbitmq::{
     RabbitMqOps, RabbitMqSinkDirectFixture, RabbitMqSinkFanoutFixture, RabbitMqSinkFixture,
-    RabbitMqSinkRawSchemaFixture, RabbitMqSinkWithoutMetadataFixture,
+    RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
+    RabbitMqSinkWithoutMetadataFixture,
 };
 pub use redshift::{
     RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,

@@ -21,5 +21,6 @@ mod sink;
 pub use container::RabbitMqOps;
 pub use sink::{
     RabbitMqSinkDirectFixture, RabbitMqSinkFanoutFixture, RabbitMqSinkFixture,
-    RabbitMqSinkRawSchemaFixture, RabbitMqSinkWithoutMetadataFixture,
+    RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
+    RabbitMqSinkWithoutMetadataFixture,
 };

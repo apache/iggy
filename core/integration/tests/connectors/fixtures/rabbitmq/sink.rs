@@ -209,3 +209,65 @@ impl TestFixture for RabbitMqSinkDirectFixture {
         envs
     }
 }
+
+pub struct RabbitMqSinkHeadersFixture {
+    inner: RabbitMqSinkFixture,
+}
+
+impl std::ops::Deref for RabbitMqSinkHeadersFixture {
+    type Target = RabbitMqSinkFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for RabbitMqSinkHeadersFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = RabbitMqContainer::start_headers().await?;
+        Ok(Self {
+            inner: RabbitMqSinkFixture {
+                container,
+                include_metadata: true,
+                schema: Schema::Json,
+            },
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_EXCHANGE_TYPE.to_string(), "headers".into());
+        envs
+    }
+}
+
+pub struct RabbitMqSinkUnroutableFixture {
+    inner: RabbitMqSinkFixture,
+}
+
+impl std::ops::Deref for RabbitMqSinkUnroutableFixture {
+    type Target = RabbitMqSinkFixture;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl TestFixture for RabbitMqSinkUnroutableFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = RabbitMqContainer::start().await?;
+        Ok(Self {
+            inner: RabbitMqSinkFixture {
+                container,
+                include_metadata: true,
+                schema: Schema::Json,
+            },
+        })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = self.inner.connectors_runtime_envs();
+        envs.insert(ENV_SINK_ROUTING_KEY.to_string(), "unroutable.key".into());
+        envs
+    }
+}
