@@ -15,19 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Errors;
+mod container;
+mod redshift_mock;
+mod sink;
 
-namespace Apache.Iggy.Tests.Utils.Errors;
-
-public static class ErrorModelFactory
-{
-    public static ErrorModel CreateErrorModelBadRequest()
-    {
-        return new ErrorModel(69, "bad_request", "Bad Request");
-    }
-
-    public static ErrorModel CreateErrorModelNotFound()
-    {
-        return new ErrorModel(69, "not_found", "Not Found");
-    }
-}
+pub use container::{MinioContainer, PostgresContainer, RedshiftContainer};
+pub use sink::{
+    RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
+    RedshiftSinkVarbyteFixture,
+};

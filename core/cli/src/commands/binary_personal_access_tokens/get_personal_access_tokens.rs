@@ -61,7 +61,7 @@ impl CliCommand for GetPersonalAccessTokensCmd {
 
                 tokens.iter().for_each(|token| {
                     table.add_row(vec![
-                        format!("{}", token.name.clone()),
+                        token.name.clone(),
                         match token.expiry_at {
                             None => String::from("unlimited"),
                             Some(value) => value.to_local_string("%Y-%m-%d %H:%M:%S"),

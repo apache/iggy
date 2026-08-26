@@ -32,7 +32,8 @@ use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_C
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
-    IggyError, IggyTimestamp, WebSocketClientConfig, WebSocketConnectionStringOptions,
+    IggyError, IggyTimestamp, NonZeroIggyDuration, WebSocketClientConfig,
+    WebSocketConnectionStringOptions,
 };
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use secrecy::ExposeSecret;
@@ -178,7 +179,7 @@ impl BinaryTransport for WebSocketClient {
         self.send_raw(code, payload).await
     }
 
-    fn get_heartbeat_interval(&self) -> IggyDuration {
+    fn get_heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.config.heartbeat_interval
     }
 
@@ -763,7 +764,7 @@ mod tests {
         assert_eq!(client.config.server_address, "127.0.0.1:8092");
         assert_eq!(
             client.config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
         assert!(matches!(client.config.auto_login, AutoLogin::Disabled));
         assert!(client.config.reconnection.enabled);
@@ -786,7 +787,7 @@ mod tests {
     fn should_create_with_custom_config() {
         let config = WebSocketClientConfig {
             server_address: "localhost:9090".to_string(),
-            heartbeat_interval: IggyDuration::from_str("10s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("10s").unwrap(),
             ..Default::default()
         };
 
@@ -797,8 +798,26 @@ mod tests {
         assert_eq!(client.config.server_address, "localhost:9090");
         assert_eq!(
             client.config.heartbeat_interval,
-            IggyDuration::from_str("10s").unwrap()
+            NonZeroIggyDuration::from_str("10s").unwrap()
         );
+    }
+
+    #[test]
+    fn should_fail_with_a_zero_heartbeat_interval() {
+        let value = "iggy+ws://user:secret@127.0.0.1:1234?heartbeat_interval=none";
+
+        let error = WebSocketClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
+    }
+
+    #[test]
+    fn should_fail_with_a_zero_reconnection_interval() {
+        let value = "iggy+ws://user:secret@127.0.0.1:1234?reconnection_interval=0";
+
+        let error = WebSocketClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
     }
 
     #[test]

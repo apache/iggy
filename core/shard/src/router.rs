@@ -23,7 +23,7 @@ use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFra
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
-use iggy_binary_protocol::{GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
@@ -60,19 +60,48 @@ where
     /// made every frame pay `bytemuck::checked::try_from_bytes` plus the
     /// header's `validate()` twice.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
+        let command = message.header().command;
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
+            Err(ConsensusError::UnsupportedOperation { operation }) => {
+                // For a replication frame this is terminal for its consensus
+                // group, not a per-frame hiccup: the op is never journaled,
+                // never acked, and every later prepare dies on the resulting
+                // gap while quorum hides the outage. Repair wraps the same
+                // typed header, so it cannot rescue this node either -- only
+                // upgrading it can. A routed request, by contrast, is dropped
+                // before journaling and stalls nothing; the consequence in the
+                // log follows the frame. Nothing fences the sending peer, so
+                // the log and the counter are the whole signal an operator
+                // gets.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNSUPPORTED_OPERATION,
+                );
+                let consequence = match command {
+                    Command::Prepare | Command::RepairPrepare | Command::PrepareOk => {
+                        "this node cannot journal or ack it, so its consensus group stops \
+                         making progress until this node is upgraded"
+                    }
+                    _ => "the frame is dropped before journaling, with no reply to the sender",
+                };
+                tracing::error!(
+                    shard = self.id,
+                    operation = format_args!("{operation:#04x}"),
+                    command = ?command,
+                    build_release = %iggy_binary_protocol::ProtocolVersion(
+                        iggy_binary_protocol::IGGY_PROTOCOL_VERSION
+                    ),
+                    "frame carries an operation this build does not know; a newer release \
+                     likely added it. {consequence}"
+                );
+                return;
+            }
             Err(e) => {
-                // TODO(hubcio): this drop is the whole story for a consensus
-                // frame carrying an Operation this build does not know: no
-                // metric, no peer error, no eviction. An old node in a mixed
-                // cluster silently gap-stops the group here (never journals
-                // the op, never PrepareOks, every later prepare dies on the
-                // gap check) while quorum hides it, and repair wraps the same
-                // typed header so it cannot rescue. Rolling upgrades across
-                // consensus-op additions need a version fence (release_min /
-                // release_max bounds on the replica plane) before this arm is
-                // safe to hit.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNPARSABLE,
+                );
                 tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
                 return;
             }
@@ -798,34 +827,30 @@ enum ReplicaHandshakeOutcome {
 #[cfg(test)]
 mod tests {
     use iggy_binary_protocol::{
-        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader, frame_checksum_bytes,
+        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
+        prepare_identity_checksum_bytes,
     };
     use server_common::iobuf::Owned;
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
     use std::mem::offset_of;
 
-    /// RED SPEC, expected to FAIL: pins the mixed-cluster upgrade hole in
-    /// `dispatch`'s decode seam.
-    ///
     /// An `Operation` discriminant this build does not know, arriving on an
     /// otherwise wire-valid consensus frame (correct command, size, checksum:
-    /// exactly what a newer release sends after an op addition), decodes to
-    /// the same undifferentiated `ConsensusError::InvalidBitPattern` as random
-    /// memory corruption. `dispatch` answers both identically: a warn log and
-    /// a dropped frame. No metric, no peer error, no eviction, no version
-    /// fence. An old node in a mixed cluster therefore gap-stops its consensus
-    /// group silently (never journals the op, never sends a `PrepareOk`, every
-    /// later prepare dies on the gap check) while quorum hides the outage.
+    /// exactly what a newer release sends after an op addition), must decode to
+    /// its own error rather than the `InvalidBitPattern` that random memory
+    /// corruption produces.
     ///
-    /// Passes once the decode surfaces a dedicated unsupported-operation
-    /// signal the router can fence and account, instead of collapsing it into
-    /// the corruption error.
+    /// The two need different operator actions: version skew is fixed by
+    /// upgrading this node, and until it is, the frame's consensus group makes
+    /// no progress (the op is never journaled, never acked, and every later
+    /// prepare dies on the gap). `dispatch` splits its drop arms on this
+    /// distinction; the accounting half is pinned in the server crate by
+    /// `given_an_unknown_operation_when_dispatched_should_account_an_upgrade_fence_drop`.
     #[test]
-    // TODO(hubcio): fix this test
-    #[ignore = "unknown operation collapses into InvalidBitPattern; no upgrade fence"]
     fn given_an_unknown_operation_when_a_consensus_frame_decodes_should_surface_an_upgrade_fence_signal()
      {
-        // Far past every defined Operation discriminant (the highest is 165).
+        // Far past every defined Operation discriminant (the highest is 162,
+        // `DeleteConsumerOffset`).
         const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
 
         let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
@@ -838,13 +863,15 @@ mod tests {
             let client_offset = offset_of!(PrepareHeader, client);
             frame[client_offset..client_offset + 16].copy_from_slice(&0xCAFE_u128.to_le_bytes());
             frame[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
-            // Seal the checksum the way a real sender does, so the frame's
-            // only anomaly is the operation byte itself.
+            // A prepare's `checksum` carries the identity checksum, computed
+            // over the operation byte among others; stamping it the way a real
+            // sender does leaves the unknown byte as the frame's only anomaly
+            // and is what lets the classifier trust that byte.
             let header: &[u8; HEADER_SIZE] = frame[..HEADER_SIZE]
                 .try_into()
                 .expect("frame spans a full header");
-            let checksum = frame_checksum_bytes(header);
-            frame[..size_of::<u128>()].copy_from_slice(&checksum.to_le_bytes());
+            let identity = prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
         }
 
         // The generic view carries no operation field, so the receive path
@@ -858,7 +885,12 @@ mod tests {
         };
 
         assert!(
-            !matches!(error, ConsensusError::InvalidBitPattern),
+            matches!(
+                error,
+                ConsensusError::UnsupportedOperation {
+                    operation: OPERATION_FROM_A_NEWER_RELEASE
+                }
+            ),
             "unknown operation {OPERATION_FROM_A_NEWER_RELEASE:#x} is silently dropped: the \
              typed decode collapses a wire-valid frame from a newer release into the same \
              InvalidBitPattern as corruption, and dispatch drops both with only a warn log, \
