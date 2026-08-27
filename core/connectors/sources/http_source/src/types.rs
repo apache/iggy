@@ -22,7 +22,7 @@ use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Iggy `HeaderValue` rejects values above this size, and forwarded HTTP
 /// header values (e.g. `User-Agent`) routinely exceed it.
@@ -55,10 +55,11 @@ impl EndpointId {
     }
 
     pub fn log_prefix_of(endpoint_id: &str) -> String {
-        format!(
-            "{}...",
-            &endpoint_id[..Self::LOG_PREFIX_LENGTH.min(endpoint_id.len())]
-        )
+        // `chars`, not a byte slice: ids are validated hex so the boundary is
+        // never split today, but this also runs on rejected input from
+        // `EndpointIdError`, and a byte index into UTF-8 would panic there.
+        let prefix: String = endpoint_id.chars().take(Self::LOG_PREFIX_LENGTH).collect();
+        format!("{prefix}...")
     }
 }
 
@@ -139,9 +140,6 @@ pub struct QueuedMessage {
     /// Already filtered, clamped, and converted by the handler, so draining
     /// the queue cannot fail on a malformed header.
     pub headers: Option<BTreeMap<HeaderKey, HeaderValue>>,
-    /// Accept time, kept for a queue-latency metric that does not exist yet.
-    /// Never serialized into the message.
-    pub received_at: Instant,
 }
 
 impl From<QueuedMessage> for ProducedMessage {

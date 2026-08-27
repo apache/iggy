@@ -674,9 +674,13 @@ fn enqueue(
 ) -> Response {
     let (headers, clamped, dropped) = message_headers(instance, request_headers, remote_addr);
     let message = QueuedMessage {
+        // `to_vec`, deliberately, not `Vec::from(body)`. The latter hands back
+        // hyper's read buffer, which at typical webhook sizes is several times
+        // the body, and the bridge is bounded by message count rather than
+        // bytes. Copying the exact length is what keeps `buffer_capacity`
+        // meaning what an operator thinks it means.
         payload: body.to_vec(),
         headers,
-        received_at: Instant::now(),
     };
     if instance.sender.try_send(message).is_err() {
         metrics.record_rejected_full(&instance.instance_name);
@@ -742,13 +746,13 @@ fn message_headers(
     let mut dropped = 0;
     let mut clamped = 0;
     if instance.config.include_http_metadata {
-        insert_header(&mut headers, INSTANCE_HEADER, &instance.instance_name);
+        insert_header(&mut headers, &INSTANCE_HEADER_KEY, &instance.instance_name);
         insert_header(
             &mut headers,
-            REMOTE_ADDR_HEADER,
+            &REMOTE_ADDR_HEADER_KEY,
             &remote_addr.ip().to_string(),
         );
-        insert_header(&mut headers, RECEIVED_AT_HEADER, &received_at_micros());
+        insert_header(&mut headers, &RECEIVED_AT_HEADER_KEY, &received_at_micros());
     }
 
     for (name, key) in &instance.forward_headers {
@@ -779,11 +783,25 @@ fn message_headers(
     ((!headers.is_empty()).then_some(headers), clamped, dropped)
 }
 
-fn insert_header(headers: &mut BTreeMap<HeaderKey, HeaderValue>, key: &str, value: &str) {
-    let (Ok(key), Ok(value)) = (HeaderKey::try_from(key), HeaderValue::from_str(value)) else {
+/// The three metadata keys, parsed once. They are compile-time constants, so
+/// re-parsing them per request repeated validation that can only ever succeed,
+/// the same reason `forward_headers` is resolved at construction.
+static INSTANCE_HEADER_KEY: LazyLock<Option<HeaderKey>> =
+    LazyLock::new(|| HeaderKey::try_from(INSTANCE_HEADER).ok());
+static REMOTE_ADDR_HEADER_KEY: LazyLock<Option<HeaderKey>> =
+    LazyLock::new(|| HeaderKey::try_from(REMOTE_ADDR_HEADER).ok());
+static RECEIVED_AT_HEADER_KEY: LazyLock<Option<HeaderKey>> =
+    LazyLock::new(|| HeaderKey::try_from(RECEIVED_AT_HEADER).ok());
+
+fn insert_header(
+    headers: &mut BTreeMap<HeaderKey, HeaderValue>,
+    key: &Option<HeaderKey>,
+    value: &str,
+) {
+    let (Some(key), Ok(value)) = (key.as_ref(), HeaderValue::from_str(value)) else {
         return;
     };
-    headers.insert(key, value);
+    headers.insert(key.clone(), value);
 }
 
 fn received_at_micros() -> String {
@@ -1481,7 +1499,7 @@ mod tests {
         let mut source = open(1, config(free_port(), free_port(), &[])).await;
         // Readiness needs a poll task behind the route, and nothing drives one
         // in these tests, so stand in for the poll that would be in flight.
-        let shared = Arc::clone(source.shared());
+        let shared = Arc::clone(&source.shared);
         let _polling = shared.enter_poll();
 
         let response = client()

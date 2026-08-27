@@ -18,6 +18,7 @@
 use ring::hmac;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 /// HMAC algorithms accepted for signature validation. SHA-256 covers GitHub,
 /// Stripe, and most modern providers; SHA-1 exists only for legacy senders.
@@ -69,10 +70,16 @@ pub fn secrets_match(left: &SecretString, right: &SecretString) -> bool {
 // ring deprecated its direct comparison helper; `hmac::verify` compares
 // tags in constant time, so equal inputs iff the tag over one verifies
 // against the other.
+/// Built once. The key material is empty and fixed, so rebuilding it per
+/// comparison only repeated the block-size padding work on the token path.
+static COMPARE_KEY: LazyLock<hmac::Key> = LazyLock::new(|| hmac::Key::new(hmac::HMAC_SHA256, &[]));
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, &[]);
-    let left_tag = hmac::sign(&key, left);
-    hmac::verify(&key, right, left_tag.as_ref()).is_ok()
+    // Signing one side and verifying the other compares tags of a fixed
+    // length, so neither the result nor the timing depends on where the
+    // inputs first differ, or on how long they are.
+    let left_tag = hmac::sign(&COMPARE_KEY, left);
+    hmac::verify(&COMPARE_KEY, right, left_tag.as_ref()).is_ok()
 }
 
 /// Validates an HMAC signature over the raw request body bytes, never a

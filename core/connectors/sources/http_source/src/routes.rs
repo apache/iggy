@@ -43,6 +43,15 @@ pub enum EndpointState {
     Revoked { reason: String, revoked_at: u64 },
 }
 
+impl EndpointState {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Revoked { .. } => "revoked",
+        }
+    }
+}
+
 /// Where an endpoint came from, which decides whether a TOML edit plus an
 /// instance restart or a management API call is the way to change it.
 #[derive(Debug, Clone, Copy, Default, Hash, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +59,17 @@ pub enum EndpointOrigin {
     #[default]
     Static,
     Dynamic,
+}
+
+impl EndpointOrigin {
+    /// Deliberately not `Display`: the metrics encoder wants a `&str` and
+    /// would allocate one per series on every scrape.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Dynamic => "dynamic",
+        }
+    }
 }
 
 /// A secret-path endpoint served at `POST /e/{endpoint_id}`.

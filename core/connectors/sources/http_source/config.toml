@@ -35,7 +35,10 @@ linger_time = "5ms"
 # Naming a different address binds a second listener instead, which then fails
 # on the shared admin port - so keep this identical across instances that are
 # meant to share.
-listen_addr = "0.0.0.0:9090"
+#
+# Loopback here so a copied default cannot expose a port. Production wants
+# 0.0.0.0 behind a load balancer, with TLS terminated in front of it.
+listen_addr = "127.0.0.1:9090"
 # Management API, admin health, and metrics. Never route this through the
 # public load balancer.
 admin_listen_addr = "127.0.0.1:9091"
@@ -43,10 +46,10 @@ instance_name = "http_github"
 # Exposes POST /topics/github_events. Omit for secret-path endpoints only.
 topic_path = "github_events"
 # Guards the named path. Omit when an authenticating gateway fronts it.
-auth_bearer_token = "global-webhook-secret"
+auth_bearer_token = "replace_with_secret_token"
 # Enables POST/GET/PATCH/DELETE /admin/endpoints. Omit to leave the
 # management API unmounted.
-management_token = "admin-secret"
+management_token = "replace_with_admin_token"
 max_body_size_bytes = 1048576
 buffer_capacity = 10000
 max_batch_size = 500
