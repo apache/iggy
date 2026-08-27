@@ -35,6 +35,9 @@ mod sink;
 mod source;
 
 const NAME: &str = env!("CARGO_PKG_NAME");
+/// Where the full exposure surface is written down, so the startup warnings
+/// can name one thing each instead of restating it.
+const EXPOSURE_DOC: &str = "core/connectors/runtime/README.md";
 
 pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
     if !config.enabled {
@@ -124,18 +127,21 @@ pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
     });
 }
 
-/// Warns once for each way this API is less contained than its defaults look.
+/// Warns once for each configuration change that removes a layer of
+/// containment from this API.
 ///
 /// Separate warnings rather than one, because the three compose independently
-/// and an operator who closes one has not necessarily closed the others. All
-/// three are the paths the runtime README documents.
+/// and an operator who closes one has not necessarily closed the others. Each
+/// carries a pointer instead of its own remediation: the README holds the full
+/// exposure surface, including the parts no startup warning can help with
+/// because they are already true of the shipped defaults.
 async fn warn_on_weak_containment(config: &HttpConfig) {
     let unauthenticated = config.api_key.expose_secret().is_empty();
     let beyond_loopback = resolves_beyond_loopback(&config.address).await;
 
     if unauthenticated && beyond_loopback {
         warn!(
-            "{NAME} HTTP API is enabled on {} with no api_key configured. Anyone able to reach that address can read or rewrite every connector configuration, credentials included, and restart connectors from it. Set http.api_key, or bind the API to loopback.",
+            "{NAME} HTTP API on {} has no api_key, so anyone who can reach it can read and rewrite every connector configuration, credentials included. See {EXPOSURE_DOC}.",
             config.address
         );
     }
@@ -147,13 +153,13 @@ async fn warn_on_weak_containment(config: &HttpConfig) {
     // header at all, so neither is warned about.
     if unauthenticated && config.cors.enabled && config.cors.allows_any_origin() {
         warn!(
-            "{NAME} HTTP API has http.cors enabled with no api_key configured. Any page the operator visits can read the configuration endpoints, credentials included, cross-origin. Set http.api_key, or disable http.cors."
+            "{NAME} HTTP API has http.cors enabled for any origin with no api_key, so any page the operator visits can read and rewrite connector configuration. See {EXPOSURE_DOC}."
         );
     }
 
     if beyond_loopback && !config.tls.enabled {
         warn!(
-            "{NAME} HTTP API is enabled on {} with http.tls disabled. The api-key header and the configuration responses carrying connector credentials both cross the network in cleartext. Enable http.tls, or bind the API to loopback.",
+            "{NAME} HTTP API on {} has http.tls disabled, so the api-key header and the credentials in its responses cross the network in cleartext. See {EXPOSURE_DOC}.",
             config.address
         );
     }
@@ -380,6 +386,13 @@ mod tests {
                 .any(|warning| warning.contains(UNASSIGNABLE_ROUTABLE_ADDRESS)),
             "init must consult the guard and name the address it is exposing"
         );
+        assert!(
+            warnings(&captured)
+                .iter()
+                .all(|warning| warning.contains(EXPOSURE_DOC)),
+            "each warning carries the pointer instead of its own remediation: {:?}",
+            warnings(&captured)
+        );
     }
 
     #[tokio::test]
@@ -423,6 +436,13 @@ mod tests {
                 .any(|warning| warning.contains("http.cors")),
             "loopback does not contain CORS: a browser is a local process and the \
              layer wraps outside authentication"
+        );
+        assert!(
+            warnings(&captured)
+                .iter()
+                .all(|warning| warning.contains(EXPOSURE_DOC)),
+            "each warning carries the pointer instead of its own remediation: {:?}",
+            warnings(&captured)
         );
     }
 
