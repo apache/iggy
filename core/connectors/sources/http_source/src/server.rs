@@ -752,7 +752,9 @@ fn message_headers(
             &REMOTE_ADDR_HEADER_KEY,
             &remote_addr.ip().to_string(),
         );
-        insert_header(&mut headers, &RECEIVED_AT_HEADER_KEY, &received_at_micros());
+        if let Some(received_at) = received_at_micros() {
+            insert_header(&mut headers, &RECEIVED_AT_HEADER_KEY, &received_at);
+        }
     }
 
     for (name, key) in &instance.forward_headers {
@@ -804,12 +806,17 @@ fn insert_header(
     headers.insert(key.clone(), value);
 }
 
-fn received_at_micros() -> String {
+/// `None` when the clock predates the epoch, which is the only way this fails.
+///
+/// Defaulting to 0 would stamp every message with the epoch, and the header
+/// exists so a consumer can measure queue latency, so a plausible wrong value
+/// is worse than an absent one. `unix_now_seconds` saturates instead because
+/// its callers gate on expiry, where failing closed is the safe direction.
+fn received_at_micros() -> Option<String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_micros())
-        .unwrap_or_default()
-        .to_string()
+        .ok()
+        .map(|elapsed| elapsed.as_micros().to_string())
 }
 
 fn bearer_header(request_headers: &HeaderMap) -> Option<&str> {
@@ -1497,6 +1504,24 @@ mod tests {
             "messages accepted but never polled are lost, and the loss must be visible"
         );
         close(&mut second).await;
+    }
+
+    #[test]
+    fn given_constant_metadata_keys_when_parsed_should_all_resolve() {
+        // They are parsed once into `Option` rather than `expect`ed, because a
+        // panic in a `LazyLock` on the request path unwinds out of the cdylib
+        // and aborts the whole connectors process. That safety costs a silent
+        // skip if one is ever mistyped, so pin it here instead.
+        for (name, key) in [
+            (INSTANCE_HEADER, &*INSTANCE_HEADER_KEY),
+            (REMOTE_ADDR_HEADER, &*REMOTE_ADDR_HEADER_KEY),
+            (RECEIVED_AT_HEADER, &*RECEIVED_AT_HEADER_KEY),
+        ] {
+            assert!(
+                key.is_some(),
+                "{name} must be a valid Iggy header key, or it vanishes from every message in silence"
+            );
+        }
     }
 
     #[tokio::test]
