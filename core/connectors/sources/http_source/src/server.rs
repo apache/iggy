@@ -115,8 +115,9 @@ pub async fn join(instance: Arc<SharedState>) -> Result<(), Error> {
 
 /// Deregisters an instance's routes, and shuts the listeners down once the
 /// last instance has left.
-/// Deregisters an instance, folding `staged_dropped` into the same shutdown
-/// loss metric as whatever is still queued in the bridge.
+///
+/// `staged_dropped` is folded into the same shutdown loss metric as whatever
+/// is still queued in the bridge.
 pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
     let listen_addr = &instance.config.listen_addr;
     let mut servers = SERVERS.lock().await;
