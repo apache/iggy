@@ -140,11 +140,12 @@ async fn warn_on_weak_containment(config: &HttpConfig) {
         );
     }
 
-    // Loopback does not contain this one. A browser is a local process, and the
+    // Loopback does not contain this one. A browser is a local process and the
     // CORS layer wraps outside authentication, so the shipped
-    // `allowed_origins = ["*"]` lets any page the operator visits read these
-    // endpoints cross-origin.
-    if unauthenticated && config.cors.enabled {
+    // `allowed_origins = ["*"]` lets any page the operator visits reach these
+    // endpoints cross-origin. A pinned list does not, and an empty one emits no
+    // header at all, so neither is warned about.
+    if unauthenticated && config.cors.enabled && config.cors.allows_any_origin() {
         warn!(
             "{NAME} HTTP API has http.cors enabled with no api_key configured. Any page the operator visits can read the configuration endpoints, credentials included, cross-origin. Set http.api_key, or disable http.cors."
         );
@@ -406,11 +407,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_cors_enabled_and_no_key_when_initialized_should_warn_despite_loopback() {
+    async fn given_wildcard_cors_and_no_key_when_initialized_should_warn_despite_loopback() {
         let (_capture, captured) = capture_events();
         let (context, _directory) = context("").await;
         let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "");
         config.cors.enabled = true;
+        config.cors.allowed_origins = vec!["*".to_owned()];
 
         init(&config, context).await;
 
@@ -421,6 +423,28 @@ mod tests {
                 .any(|warning| warning.contains("http.cors")),
             "loopback does not contain CORS: a browser is a local process and the \
              layer wraps outside authentication"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_pinned_cors_origins_when_initialized_should_not_warn_about_cors() {
+        let (_capture, captured) = capture_events();
+        let (context, _directory) = context("").await;
+        let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "");
+        config.cors.enabled = true;
+        config.cors.allowed_origins = vec!["https://console.example".to_owned()];
+
+        init(&config, context).await;
+
+        assert!(
+            started_serving(&captured),
+            "init must reach the listener, or the assertion below proves nothing"
+        );
+        assert!(
+            warnings(&captured).is_empty(),
+            "an operator who pinned their origins closed the cross-origin path, and \
+             warning at them is what teaches everyone to ignore the rest: {:?}",
+            warnings(&captured)
         );
     }
 

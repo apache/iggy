@@ -73,6 +73,21 @@ pub struct HttpCorsConfig {
     pub allow_private_network: bool,
 }
 
+impl HttpCorsConfig {
+    /// Whether `configure_cors` will turn this into `AllowOrigin::any()`.
+    ///
+    /// Only the first entry decides, because that is what the mapping below
+    /// reads. A `"*"` in any later position goes through `AllowOrigin::list`
+    /// as a literal header value, which no real `Origin` can equal, so it
+    /// allows nothing. Callers that warn about cross-origin exposure share
+    /// this rather than restating it, so the two cannot drift apart.
+    pub fn allows_any_origin(&self) -> bool {
+        self.allowed_origins
+            .first()
+            .is_some_and(|origin| origin == "*")
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
@@ -111,7 +126,7 @@ pub fn map_connector_config(
 pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
     let allowed_origins = match &config.allowed_origins {
         origins if origins.is_empty() => AllowOrigin::default(),
-        origins if origins.first().unwrap() == "*" => AllowOrigin::any(),
+        _ if config.allows_any_origin() => AllowOrigin::any(),
         origins => AllowOrigin::list(origins.iter().map(|s| s.parse().unwrap())),
     };
 
@@ -221,5 +236,36 @@ impl std::fmt::Display for HttpCorsConfig {
             self.allow_credentials,
             self.allow_private_network
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cors(allowed_origins: &[&str]) -> HttpCorsConfig {
+        HttpCorsConfig {
+            allowed_origins: allowed_origins.iter().map(|s| (*s).to_owned()).collect(),
+            ..HttpCorsConfig::default()
+        }
+    }
+
+    #[test]
+    fn given_a_leading_wildcard_when_classified_should_allow_any_origin() {
+        assert!(cors(&["*"]).allows_any_origin());
+    }
+
+    #[test]
+    fn given_pinned_or_absent_origins_when_classified_should_allow_none() {
+        assert!(
+            !cors(&[]).allows_any_origin(),
+            "an empty list emits no header"
+        );
+        assert!(!cors(&["https://console.example"]).allows_any_origin());
+        assert!(
+            !cors(&["https://console.example", "*"]).allows_any_origin(),
+            "only the first entry reaches `AllowOrigin::any`; a later `*` goes \
+             through `AllowOrigin::list` as a header value no `Origin` can equal"
+        );
     }
 }
