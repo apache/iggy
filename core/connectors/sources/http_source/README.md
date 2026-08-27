@@ -48,12 +48,15 @@ batch_length = 100
 linger_time = "5ms"
 
 [plugin_config]
-listen_addr = "0.0.0.0:9090"
+# Loopback so a copied snippet cannot expose a port. Production wants 0.0.0.0
+# behind a load balancer, with TLS terminated in front of it, and real secrets
+# supplied through the runtime's env overrides rather than written here.
+listen_addr = "127.0.0.1:9090"
 admin_listen_addr = "127.0.0.1:9091"
 instance_name = "http_github"
 topic_path = "github_events"
-auth_bearer_token = "global-webhook-secret"
-management_token = "admin-secret"
+auth_bearer_token = "replace_with_secret_token"
+management_token = "replace_with_admin_token"
 max_body_size_bytes = 1048576
 buffer_capacity = 10000
 max_batch_size = 500
@@ -83,10 +86,10 @@ topic = "partner_events"
 schema = "raw"
 
 [plugin_config]
-listen_addr = "0.0.0.0:9090"
+listen_addr = "127.0.0.1:9090"
 admin_listen_addr = "127.0.0.1:9091"
 instance_name = "http_partner"
-management_token = "admin-secret"
+management_token = "replace_with_admin_token"
 # no topic_path: this instance serves secret-path endpoints only
 
 [[plugin_config.endpoints]]
@@ -115,7 +118,6 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
 | `forward_headers` | array | `[]` | Request headers copied onto the message. Invalid names fail `open()`, as do `Authorization`, `Proxy-Authorization`, and `Cookie` — forwarding a reusable credential would copy it onto every message and persist it in the log. |
 | `endpoints` | array | `[]` | Static secret-path endpoints. |
-| `verbose_logging` | bool | `false` | Log per-batch detail at info instead of debug. |
 
 ### Endpoint options
 
@@ -213,7 +215,7 @@ DELETE /admin/endpoints/{id}     revoke                               -> 204
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9091/admin/endpoints \
-  -H 'Authorization: Bearer admin-secret' \
+  -H 'Authorization: Bearer replace_with_admin_token' \
   -H 'Content-Type: application/json' \
   -d '{"instance":"http_github","auth_type":"hmac-sha256","auth_secret":"whsec_new"}'
 # {"endpoint_id":"9f2c...","path":"/e/9f2c..."}

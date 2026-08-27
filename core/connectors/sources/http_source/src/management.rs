@@ -459,20 +459,17 @@ struct EndpointSummary {
 
 impl EndpointSummary {
     fn new(instance: &Arc<SharedState>, endpoint: &Endpoint) -> Self {
-        let (state, revoked_at, revoked_reason) = match &endpoint.state {
-            EndpointState::Active => ("active", None, None),
+        let (revoked_at, revoked_reason) = match &endpoint.state {
+            EndpointState::Active => (None, None),
             EndpointState::Revoked { reason, revoked_at } => {
-                ("revoked", Some(*revoked_at), Some(reason.clone()))
+                (Some(*revoked_at), Some(reason.clone()))
             }
         };
         EndpointSummary {
             endpoint_id: endpoint.endpoint_id.clone(),
             instance: instance.instance_name.clone(),
-            state,
-            origin: match endpoint.origin {
-                EndpointOrigin::Static => "static",
-                EndpointOrigin::Dynamic => "dynamic",
-            },
+            state: endpoint.state.as_str(),
+            origin: endpoint.origin.as_str(),
             auth_type: endpoint.auth_type,
             expires_at: endpoint.expires_at,
             submitted: endpoint.submitted,

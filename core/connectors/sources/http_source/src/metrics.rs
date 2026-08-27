@@ -64,6 +64,7 @@ pub enum PathKind {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum StatusClass {
     Success,
+    Redirect,
     ClientError,
     ServerError,
 }
@@ -71,7 +72,8 @@ pub enum StatusClass {
 impl From<u16> for StatusClass {
     fn from(status: u16) -> Self {
         match status {
-            200..=399 => Self::Success,
+            200..=299 => Self::Success,
+            300..=399 => Self::Redirect,
             400..=499 => Self::ClientError,
             _ => Self::ServerError,
         }
@@ -335,6 +337,7 @@ impl EncodeLabelValue for StatusClass {
     fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), fmt::Error> {
         match self {
             Self::Success => "2xx",
+            Self::Redirect => "3xx",
             Self::ClientError => "4xx",
             Self::ServerError => "5xx",
         }
@@ -344,11 +347,7 @@ impl EncodeLabelValue for StatusClass {
 
 impl EncodeLabelValue for EndpointOrigin {
     fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), fmt::Error> {
-        match self {
-            Self::Static => "static",
-            Self::Dynamic => "dynamic",
-        }
-        .encode(encoder)
+        self.as_str().encode(encoder)
     }
 }
 

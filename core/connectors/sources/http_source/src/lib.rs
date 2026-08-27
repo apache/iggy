@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod auth;
-pub mod management;
-pub mod metrics;
-pub mod routes;
-pub mod server;
-pub mod state;
-pub mod types;
+mod auth;
+mod management;
+mod metrics;
+mod routes;
+mod server;
+mod state;
+mod types;
 
 use arc_swap::{ArcSwap, Guard};
 use async_trait::async_trait;
@@ -175,7 +175,9 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Wait-free snapshot of the registry, one atomic load per request.
+    /// Wait-free snapshot of the registry, one atomic load per call. Requests
+    /// do not come through here: they resolve against the prebuilt
+    /// `RouteTable`, and this serves the control plane and the scrape path.
     pub fn registry(&self) -> Guard<Arc<EndpointRegistry>> {
         self.registry.load()
     }
@@ -350,8 +352,6 @@ pub struct HttpSourceConfig {
     /// Statically configured secret-path endpoints.
     #[serde(default)]
     pub endpoints: Vec<StaticEndpointConfig>,
-    #[serde(default)]
-    pub verbose_logging: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -572,10 +572,6 @@ impl HttpSource {
         }
     }
 
-    pub fn shared(&self) -> &Arc<SharedState> {
-        &self.shared
-    }
-
     /// A poisoned `staged` means a panic while a batch was held. The batch is
     /// still intact, and refusing to look at it would lose it for certain.
     fn lock_staged(&self) -> std::sync::MutexGuard<'_, Option<StagedBatch>> {
@@ -705,21 +701,6 @@ impl Source for HttpSource {
             _ = self.shared.state_flush.notified() => {}
         }
 
-        if !queued.is_empty() {
-            let count = queued.len();
-            if self.shared.config.verbose_logging.unwrap_or(false) {
-                info!(
-                    "Polled {count} messages for {CONNECTOR_NAME} connector ID: {}",
-                    self.id
-                );
-            } else {
-                debug!(
-                    "Polled {count} messages for {CONNECTOR_NAME} connector ID: {}",
-                    self.id
-                );
-            }
-        }
-
         // State rides an empty batch and nothing else, so the send it depends
         // on cannot fail. Under traffic that means deferring to a later poll;
         // re-arming the notify is what stops it waiting on traffic to arrive.
@@ -846,7 +827,6 @@ pub(crate) mod test_support {
                 .iter()
                 .map(|raw_id| static_endpoint(raw_id))
                 .collect(),
-            verbose_logging: None,
         }
     }
 
@@ -875,7 +855,7 @@ pub(crate) mod test_support {
     /// and state tests resolve and mutate, they never send.
     pub fn instance(id: u32, topic_path: Option<&str>, endpoint_ids: &[&str]) -> Arc<SharedState> {
         let source = HttpSource::new(id, config(topic_path, endpoint_ids), None);
-        Arc::clone(source.shared())
+        Arc::clone(&source.shared)
     }
 }
 
@@ -884,7 +864,6 @@ mod tests {
     use super::*;
     use crate::test_support::{ENDPOINT_ONE, ENDPOINT_TWO};
     use iggy_connector_sdk::source::SourceBatchResult;
-    use std::time::Instant;
 
     fn minimal_config_json() -> &'static str {
         r#"{"listen_addr": "0.0.0.0:9090"}"#
@@ -1248,7 +1227,6 @@ mod tests {
         QueuedMessage {
             payload: payload.as_bytes().to_vec(),
             headers: None,
-            received_at: Instant::now(),
         }
     }
 

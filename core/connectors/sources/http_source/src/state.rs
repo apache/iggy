@@ -174,14 +174,6 @@ impl EndpointRegistry {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.endpoints.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.endpoints.is_empty()
-    }
-
     /// Endpoints that would accept a request right now: neither revoked nor
     /// past their expiry. An expired endpoint is still `Active` in lifecycle
     /// terms but answers 404, so counting it as serving would mislead.
@@ -325,7 +317,7 @@ mod tests {
         let restored = EndpointRegistry::restore(&[static_endpoint(ENDPOINT_ONE)], None, 1)
             .expect("the registry must restore");
 
-        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.endpoints().count(), 1);
         assert!(restored.endpoint(ENDPOINT_ONE).is_some());
         assert!(restored.endpoint(ENDPOINT_TWO).is_none());
     }
@@ -353,7 +345,10 @@ mod tests {
         let deserialized: EndpointRegistry =
             rmp_serde::from_slice(&bytes).expect("registry must deserialize");
 
-        assert_eq!(original.len(), deserialized.len());
+        assert_eq!(
+            original.endpoints().count(),
+            deserialized.endpoints().count()
+        );
         assert_eq!(
             deserialized
                 .endpoint(ENDPOINT_ONE)
@@ -535,7 +530,7 @@ mod tests {
         // Outright, not tombstoned: this only undoes a registration that never
         // became reachable, so there is no revocation to preserve.
         assert!(registry.endpoint(ENDPOINT_ONE).is_none());
-        assert!(registry.is_empty());
+        assert_eq!(registry.endpoints().count(), 0);
     }
 
     #[test]
@@ -574,7 +569,7 @@ mod tests {
 
         assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
         assert!(!registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
-        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.endpoints().count(), 1);
     }
 
     #[test]
@@ -584,7 +579,7 @@ mod tests {
         assert!(registry.insert(dynamic_endpoint(ENDPOINT_TWO)));
         registry.revoke(ENDPOINT_TWO, "compromised".to_string(), 42);
 
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.endpoints().count(), 2);
         assert_eq!(registry.serving_count(0), 1);
     }
 }
