@@ -206,7 +206,7 @@ api_key = "" # Optional API key for authentication to be passed as `api-key` hea
 [http.cors] # Optional CORS configuration for HTTP API
 # Enabling this with the shipped allowed_origins = ["*"] lets any page the
 # operator visits read these endpoints cross-origin, whatever address is bound.
-# Pin the origins, or set api_key, before turning it on.
+# Pin the origins you own, or set api_key, before turning it on.
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 allowed_origins = ["*"]
@@ -230,24 +230,24 @@ key_file = "core/certs/iggy_key.pem"
 >
 > The configuration endpoints return plugin configuration exactly as stored,
 > credentials included - a database connection string, an S3 secret key, a
-> webhook signing secret. Nothing redacts them on the way out. The runtime does
-> redact its own secrets, the `api-key` and the state-store headers among them,
-> but nothing touches plugin configuration.
+> webhook signing secret. Nothing redacts them on the way out. The runtime
+> masks the `api-key` in its own logs and redacts the state-store headers when
+> it serializes them, but no such path exists for plugin configuration.
 >
 > The exposure is not limited to disclosure. Publishing a configuration with
 > `POST /{sinks,sources}/{key}/configs` and then calling `POST .../restart` is
 > enough to repoint a connector at a destination of the caller's choosing,
 > because `restart` re-reads the stored configuration and starts the connector
 > from it - on the local provider that is whatever version was published last,
-> with no activation step in between. The runtime then forwards your topic data
-> using its own Iggy credentials. `PUT .../configs/active` and
+> with no activation step in between. The runtime then forwards the operator's
+> topic data using its own Iggy credentials. `PUT .../configs/active` and
 > `DELETE .../configs` sit behind the same key.
 >
 > A rewritten plugin `path` is not loaded by the restart. `start_connector`
 > reuses the container `dlopen`ed at boot and only re-runs the plugin's init
 > with the new configuration, so a hostile path sits in the stored config until
-> the next time the runtime process starts. Deferred code execution rather than
-> immediate, which is the difference between a restart and a redeploy.
+> the next time the runtime process starts, which makes it deferred code
+> execution rather than immediate.
 >
 > `api_key` is empty by default, which means authentication is **off** by
 > default. Only `/` and `/health` are exempt once it is set, so everything above
@@ -270,17 +270,19 @@ key_file = "core/certs/iggy_key.pem"
 >   `allowed_headers`, both of which the shipped block grants.
 >
 >   Setting `api_key` closes it, since an attacker's page cannot supply the
->   header. Pinning `allowed_origins` to origins you own closes the cross-origin
->   *read*, and the startup warning stays quiet for that case on purpose. It
->   does not stay quiet for `null`, which is what a browser sends from a
->   sandboxed iframe, a `data:` URL and a `file://` page, so listing it is no
->   narrower than `*`. Neither closes the CORS-simple route below.
+>   header. Pinning `allowed_origins` to origins the operator owns closes the
+>   cross-origin *read*, and no startup warning fires for that case. One fires
+>   for `null`, which is narrower than `*` but not owned by anyone: a browser
+>   sends it from a sandboxed iframe, a `data:` URL and a `file://` page, all of
+>   which an attacker can produce, so pinning it buys nothing. No origin setting
+>   closes the CORS-simple route below; `api_key` does.
 > - **Leaving `http.tls.enabled = false`.** It ships disabled, so the `api-key`
->   header and the responses carrying your credentials both travel in cleartext.
->   Enable TLS alongside `api_key` whenever this API leaves loopback. The runtime
->   warns at startup whenever the address resolves beyond loopback with TLS off,
->   including after you have set `api_key`, because the key crosses in the clear
->   too.
+>   header and the credential-bearing responses both travel in cleartext. Enable
+>   TLS alongside `api_key` whenever this API leaves loopback. The runtime warns
+>   at startup whenever the address resolves beyond loopback with TLS off, and
+>   keeps warning after `api_key` is set, because the key crosses in the clear
+>   too. Terminating TLS at an ingress or a service mesh is a valid answer to
+>   that warning; the runtime cannot see it, so the line stays.
 >
 > And one that needs no edit at all. `POST .../restart` carries no body and no
 > content type, which makes it a CORS-simple request: a page can issue it with
@@ -289,8 +291,10 @@ key_file = "core/certs/iggy_key.pem"
 > shipped keyless default, any page the operator visits can restart any
 > connector, and no startup warning covers it because it is true of the defaults
 > rather than of an edit. Chrome's private network access blocks the
-> public-origin case; Firefox and Safari do not, and a page served from a local
-> origin bypasses it everywhere. `api_key` is what closes this one.
+> public-origin case; Firefox and Safari do not, a page served from a local
+> origin bypasses it everywhere, and setting `allow_private_network = true`
+> hands back the case Chrome would otherwise block. `api_key` is what closes
+> this one.
 
 Currently, it does expose the following endpoints:
 
@@ -302,7 +306,7 @@ Currently, it does expose the following endpoints:
 - `GET /sinks/{key}`: sink details.
 - `GET /sinks/{key}/configs`: list of configuration versions for the sink.
 - `POST /sinks/{key}/configs`: add a new configuration version for the sink.
-- `DELETE /sinks/{key}/configs`: delete one configuration version for the sink - the `version` query parameter, or the active version when it is omitted.
+- `DELETE /sinks/{key}/configs`: delete one configuration version for the sink - the `version` query parameter, or on the local provider the active version when it is omitted.
 - `GET /sinks/{key}/configs/{version}`: configuration details for a specific version.
 - `GET /sinks/{key}/configs/active`: active configuration details.
 - `PUT /sinks/{key}/configs/active`: activate a specific configuration version for the sink.
@@ -313,7 +317,7 @@ Currently, it does expose the following endpoints:
 - `GET /sources/{key}`: source details.
 - `GET /sources/{key}/configs`: list of configuration versions for the source.
 - `POST /sources/{key}/configs`: add a new configuration version for the source.
-- `DELETE /sources/{key}/configs`: delete one configuration version for the source - the `version` query parameter, or the active version when it is omitted.
+- `DELETE /sources/{key}/configs`: delete one configuration version for the source - the `version` query parameter, or on the local provider the active version when it is omitted.
 - `GET /sources/{key}/configs/{version}`: configuration details for a specific version.
 - `GET /sources/{key}/configs/active`: active configuration details.
 - `PUT /sources/{key}/configs/active`: activate a specific configuration version for the source.
