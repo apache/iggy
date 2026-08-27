@@ -138,8 +138,7 @@ pub const CLIENTS_TABLE_SLOT_MAX: usize = 1 << 16;
 /// live client can be waiting for is its latest (`request == watermark`).
 /// Older entries answer old retransmits and post-rebind stragglers with the
 /// original bytes instead of a bare "already applied"; losing one
-/// degrades the answer, never correctness. In-memory only: ring contents are
-/// refcount bumps and are never persisted or transferred.
+/// degrades the answer, never correctness.
 ///
 /// This many replies are retained unconditionally, whatever they weigh, which
 /// is what bounds the memory a client holding megabyte replies can pin.
@@ -147,28 +146,55 @@ pub const CLIENTS_TABLE_SLOT_MAX: usize = 1 << 16;
 /// sending small operations -- the common case -- keeps a far deeper replay
 /// history for the same memory, so a retry that arrives late still replays its
 /// original bytes instead of drawing a bare "already applied".
+///
+/// # What the deeper retention is worth
+///
+/// It is a live-memory property of the replica that served the request, and it
+/// survives neither rebuild path. `transferable_replies` ships at most this
+/// many replies in a state transfer, and [`ClientTable::from_snapshot`]
+/// restores only each entry's latest reply from a checkpoint, so a retry that
+/// would have replayed on the serving replica draws
+/// [`RequestStatus::AlreadyApplied`] once the receiving replica installs a
+/// transfer, or once this one restarts. Bounded cache depth, not a durable
+/// guarantee; `state_transfer_cuts_retention_back_to_the_floor` and
+/// `snapshot_drops_stale_ring_replies_but_keeps_at_most_once` pin each path.
+///
+/// What is durable is at-most-once itself: the watermark rides both paths
+/// intact, so a lost reply costs the caller its result bytes and never
+/// re-executes the operation.
 pub const REPLY_RING_CAPACITY: usize = 5;
 
 /// Byte budget for the replies retained past [`REPLY_RING_CAPACITY`].
 ///
 /// Deep retention exists for the slow retrier: a request whose reply aged out
 /// can only be answered "already applied, reply gone", which tells the caller
-/// its operation succeeded but hands back no result. Sizing the extra
-/// retention in bytes rather than in replies spends the same memory where it
-/// buys the most history.
+/// its operation succeeded but hands back no result. Budgeting in bytes rather
+/// than in replies puts the depth where it is cheapest: a session sending
+/// metadata operations keeps a long history, one pulling large batches keeps
+/// none past the floor.
 ///
-/// The added cost is bounded by this budget per occupied slot, and it is less
-/// than the [`REPLY_RING_CAPACITY`] floor already costs for any reply above
-/// roughly 1.6 KiB, so a table full of large replies is dominated by the floor
-/// exactly as it was before.
+/// # Depth
+///
+/// A reply is never shorter than its 256-byte [`ReplyHeader`], so this budget
+/// is also the only thing bounding the ring's length: 8 KiB / 256 B = 32
+/// replies at the deepest, against a floor of [`REPLY_RING_CAPACITY`].
+///
+/// The 32 is a chosen bound, not a measured one. The SDK holds one request in
+/// flight per session, so what has to fit is the number of newer requests the
+/// same session commits between a reply going unacknowledged and its retry
+/// landing, and nothing in the tree measures that today.
+///
+/// # Cost
+///
+/// Not a wash on the common case. The common metadata reply is header-only, so
+/// per-slot retention goes from 5 x 256 B = 1.25 KiB to 8 KiB, a 6.4x rise: a
+/// saturated table at the default `clients_table_max` of 8192 goes from 10 MiB
+/// to 64 MiB, and from 41k live [`Frozen`] buffers to 262k. At the
+/// [`CLIENTS_TABLE_SLOT_MAX`] ceiling it is 512 MiB. Replies carrying a payload
+/// exhaust the budget sooner and cost proportionally less; above roughly
+/// 1.6 KiB apiece the [`REPLY_RING_CAPACITY`] floor dominates and this budget
+/// adds nothing at all.
 pub const REPLY_RING_RETENTION_BYTES: usize = 8 * 1024;
-
-/// Hard cap on retained replies, so a stream of tiny replies cannot grow the
-/// ring without bound under [`REPLY_RING_RETENTION_BYTES`].
-///
-/// Stays well inside `u8`: [`ClientTable::encode`] writes the ring length as
-/// one byte for state transfer.
-pub const REPLY_RING_MAX_CAPACITY: usize = 64;
 
 /// What eviction and disconnect cleanup keep after reclaiming an entry's slot.
 ///
@@ -1371,9 +1397,10 @@ pub enum ClientTableWireError {
     /// slot occupied but unindexed, which desynchronizes the capacity check in
     /// [`ClientTable::commit_register`] from the actual occupancy.
     DuplicateClientId { slot: usize, client_id: u128 },
-    /// A reply ring longer than [`REPLY_RING_MAX_CAPACITY`]. `encode` writes
-    /// the length as a `u8`, and a peer that sends more replies than this crate
-    /// ever retains is reporting state this one cannot have produced.
+    /// A reply ring longer than [`REPLY_RING_CAPACITY`], which is every reply
+    /// `transferable_replies` ever writes. `encode` writes the length as a
+    /// `u8`, and a peer that sends more replies than this crate transfers is
+    /// reporting state this one cannot have produced.
     RingTooLong { slot: usize, len: u8, max: usize },
 }
 
@@ -1588,14 +1615,15 @@ impl ClientTable {
                 return Err(ClientTableWireError::EmptyRing);
             }
             // The artifact checksum only proves the bytes survived transit; it
-            // says nothing about the peer that computed them. A ring longer
-            // than this crate retains eventually wraps `encode`'s `u8` length,
-            // making this table permanently un-transferable onward.
-            if usize::from(ring_len) > REPLY_RING_MAX_CAPACITY {
+            // says nothing about the peer that computed them. Bounding at what
+            // `transferable_replies` emits keeps an installed ring inside the
+            // unconditional floor, so it satisfies `trim_ring`'s byte budget on
+            // arrival and needs no trimming of its own.
+            if usize::from(ring_len) > REPLY_RING_CAPACITY {
                 return Err(ClientTableWireError::RingTooLong {
                     slot: slot_idx,
                     len: ring_len,
-                    max: REPLY_RING_MAX_CAPACITY,
+                    max: REPLY_RING_CAPACITY,
                 });
             }
             let mut ring = VecDeque::with_capacity(REPLY_RING_CAPACITY);
@@ -1715,8 +1743,9 @@ impl ClientEntry {
     /// Capped at [`REPLY_RING_CAPACITY`] rather than shipping whatever
     /// retention holds locally: an artifact a recovering node has to fetch is
     /// worth keeping small, and the deeper history rebuilds itself from the
-    /// receiver's own commits. Dropping it costs a late retrier its bytes on
-    /// the transferred node, which the watermark still refuses to re-execute.
+    /// receiver's own commits. The cost is a late retrier's result bytes on the
+    /// transferred node, never its at-most-once fence, which is the bound
+    /// [`REPLY_RING_CAPACITY`] documents.
     fn transferable_replies(&self) -> impl Iterator<Item = &CachedReply> {
         self.ring
             .iter()
@@ -1740,17 +1769,16 @@ impl ClientEntry {
     }
 
     /// Drop the oldest replies once the entry holds more than
-    /// [`REPLY_RING_CAPACITY`] and either retention bound is exceeded.
+    /// [`REPLY_RING_CAPACITY`] and exceeds [`REPLY_RING_RETENTION_BYTES`].
     ///
-    /// The total is summed here rather than denormalized onto the entry: the
-    /// ring is capped at [`REPLY_RING_MAX_CAPACITY`], so this is a bounded walk
-    /// of buffer lengths with no header casts, and it leaves no running total
-    /// for the sites that write the ring to drift out of sync with.
+    /// The total is summed here rather than denormalized onto the entry: no
+    /// reply is shorter than a header, so the budget holds the ring to 32
+    /// entries and this is a bounded walk of buffer lengths with no header
+    /// casts, and it leaves no running total for the sites that write the ring
+    /// to drift out of sync with.
     fn trim_ring(&mut self) {
         let mut bytes: usize = self.ring.iter().map(CachedReply::byte_len).sum();
-        while self.ring.len() > REPLY_RING_CAPACITY
-            && (self.ring.len() > REPLY_RING_MAX_CAPACITY || bytes > REPLY_RING_RETENTION_BYTES)
-        {
+        while self.ring.len() > REPLY_RING_CAPACITY && bytes > REPLY_RING_RETENTION_BYTES {
             let dropped = self.ring.pop_front().expect("length checked above");
             bytes -= dropped.byte_len();
         }
@@ -3078,6 +3106,43 @@ mod tests {
         assert_eq!(decoded.encode(), encoded);
     }
 
+    // Deep retention is a live-memory property, not a transferred one: the
+    // artifact carries the floor, so a retry the serving replica would have
+    // replayed loses its bytes on the receiver. The fence still rides along, so
+    // the answer degrades and the operation is still never re-executed.
+    #[test]
+    fn state_transfer_cuts_retention_back_to_the_floor() {
+        let (mut table, epoch) = table_with_client();
+        let requests = REPLY_RING_CAPACITY as u64 + 3;
+        for request in 1..=requests {
+            table.commit_reply(1, TEST_USER_ID, make_reply_for(1, request, 10 + request));
+        }
+        // The whole run is still cached locally: retention is byte-budgeted and
+        // these replies are headers.
+        assert!(matches!(
+            table.check_request(1, epoch, 1, 0),
+            RequestStatus::Duplicate(_)
+        ));
+
+        let decoded = ClientTable::decode(&table.encode(), 10).expect("roundtrip decodes");
+
+        assert_eq!(decoded.get_watermark(1), Some(requests));
+        let oldest_transferred = requests - REPLY_RING_CAPACITY as u64 + 1;
+        match decoded.check_request(1, epoch, oldest_transferred - 1, 0) {
+            RequestStatus::AlreadyApplied { request, watermark } => {
+                assert_eq!(request, oldest_transferred - 1);
+                assert_eq!(watermark, requests, "the fence survives the transfer");
+            }
+            other => panic!("expected AlreadyApplied past the transferred floor, got {other:?}"),
+        }
+        match decoded.check_request(1, epoch, oldest_transferred, 0) {
+            RequestStatus::Duplicate(cached) => {
+                assert_eq!(cached.header().request, oldest_transferred);
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
     // The denormalized `latest_commit` is rebuilt from the ring on decode, so
     // eviction ranks a transferred table exactly like the original.
     #[test]
@@ -3208,9 +3273,9 @@ mod tests {
         ));
     }
 
-    // A ring longer than this crate ever retains comes from a peer this one
-    // cannot model; admitting it would eventually wrap `encode`'s u8 length and
-    // leave the table untransferable onward.
+    // A ring longer than `transferable_replies` emits comes from a peer this
+    // one cannot model; admitting it would eventually wrap `encode`'s u8 length
+    // and leave the table untransferable onward.
     #[test]
     fn decode_rejects_a_ring_longer_than_capacity() {
         let mut table = ClientTable::new(1);
@@ -3224,7 +3289,7 @@ mod tests {
         assert_eq!(oversized[ring_len_at], 1, "entry's ring holds one reply");
         #[allow(clippy::cast_possible_truncation)]
         {
-            oversized[ring_len_at] = REPLY_RING_MAX_CAPACITY as u8 + 1;
+            oversized[ring_len_at] = REPLY_RING_CAPACITY as u8 + 1;
         }
 
         assert!(matches!(
