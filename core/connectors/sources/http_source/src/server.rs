@@ -561,9 +561,9 @@ fn secret_path_outcome(
                 error_response(StatusCode::NOT_FOUND, "not found"),
             );
         }
-        // Expired answers 404 for the same reason revoked does. A 410 is
-        // returned before any credential is checked, so it told anyone holding
-        // a leaked or guessed id that the endpoint had once been real.
+        // Expired answers 404 for the same reason revoked does. A 410 would
+        // be returned before any credential is checked, so it would tell anyone
+        // holding a leaked or guessed id that the endpoint had once been real.
         RouteLookup::Expired(entry) => {
             return (
                 entry.instance.instance_name.clone(),
@@ -982,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_expired_endpoint_when_posted_should_answer_gone() {
+    async fn given_expired_endpoint_when_posted_should_answer_not_found() {
         let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
         source
             .shared

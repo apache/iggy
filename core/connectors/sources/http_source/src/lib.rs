@@ -55,9 +55,9 @@ pub const DEFAULT_BUFFER_CAPACITY: usize = 10_000;
 pub const DEFAULT_MAX_BATCH_SIZE: usize = 500;
 /// Ceilings for the three sizing values, mirroring their `> 0` floors.
 ///
-/// `buffer_capacity` is the dangerous one: crossfire asserts `cap < 1 << 31`
-/// while building the ring and allocates every slot eagerly, so a typo either
-/// panics or OOMs. That panic unwinds out of `iggy_source_open`, which is
+/// `buffer_capacity` is the dangerous one: crossfire asserts `bound <=
+/// u32::MAX` while building the ring and allocates every slot eagerly, each
+/// holding an inline `MaybeUninit<T>`, so a typo either panics or OOMs. That panic unwinds out of `iggy_source_open`, which is
 /// `extern "C"` with no `catch_unwind` around it, and takes down the whole
 /// connectors process along with every other plugin loaded into it. The ring
 /// is built in `new`, before the SDK ever calls `open`, so `validate` cannot
@@ -175,9 +175,11 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Wait-free snapshot of the registry, one atomic load per call. Requests
-    /// do not come through here: they resolve against the prebuilt
-    /// `RouteTable`, and this serves the control plane and the scrape path.
+    /// Wait-free snapshot of the registry. Requests do not come through here:
+    /// they resolve against the prebuilt `RouteTable`, and this serves the
+    /// control plane and the scrape path. Cheap rather than free, since
+    /// arc-swap's hybrid strategy takes a debt slot and can fall back to a
+    /// full clone once a thread exhausts them.
     pub fn registry(&self) -> Guard<Arc<EndpointRegistry>> {
         self.registry.load()
     }
@@ -642,10 +644,11 @@ impl HttpSource {
         let mut staged = self.lock_staged();
         let Some(batch) = staged.as_mut() else {
             drop(staged);
-            // Nothing staged means the batch carried state and no messages,
-            // so the NACK is about that state: either the runtime could not
-            // persist it, or it short-circuited the send stage because its own
-            // state storage was unavailable. `take_dirty_state` already cleared
+            // Nothing staged means the batch carried no messages, which is
+            // usually a state flush the runtime could not persist or would not
+            // attempt. It can also be an empty batch that carried no state at
+            // all, when the writer gate was contended or nothing was dirty, and
+            // re-arming then costs one redundant flush rather than a lost one. `take_dirty_state` already cleared
             // the flag and marked every endpoint submitted, so re-arming here
             // is the only thing that stops a revocation being lost while the
             // API reports it durable. This is load-bearing, not defensive.

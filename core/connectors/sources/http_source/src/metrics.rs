@@ -356,7 +356,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_status_codes_when_classified_should_collapse_to_three_classes() {
+    fn given_status_codes_when_classified_should_collapse_to_a_class() {
         assert_eq!(StatusClass::from(200), StatusClass::Success);
         assert_eq!(StatusClass::from(204), StatusClass::Success);
         assert_eq!(StatusClass::from(404), StatusClass::ClientError);

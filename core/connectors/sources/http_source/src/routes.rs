@@ -20,7 +20,7 @@
 //! Every instance joining a listener contributes its named topic path and its
 //! secret-path endpoints. The merged table is rebuilt and swapped whole on
 //! join, leave, and management mutations, so a request resolves its auth
-//! requirements and its destination bridge from a single atomic load.
+//! requirements and its destination bridge from one wait-free snapshot.
 
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};

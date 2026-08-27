@@ -56,9 +56,6 @@ impl EndpointRegistry {
     /// exception is a revocation tombstone, which always wins, so an operator
     /// who revoked a compromised endpoint does not get it back by restarting
     /// against a TOML file nobody remembered to edit.
-    /// Rebuilds the registry from persisted state, falling back to the static
-    /// TOML only when there was no state to begin with.
-    ///
     /// Returns `Err` when state existed and could not be decoded. That case
     /// cannot be served: every revocation tombstone lives in the state, so
     /// continuing on the TOML alone would put an endpoint that was revoked for
