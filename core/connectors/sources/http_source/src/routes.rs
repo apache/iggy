@@ -90,8 +90,10 @@ impl EndpointOrigin {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Endpoint {
     pub endpoint_id: EndpointId,
-    // No default: an absent auth_type must fail the decode, not silently
-    // read as `None` and drop the second factor.
+    // No default, for symmetry with `state` rather than because it can save
+    // us: msgpack compact encodes this struct as a positional array, so a
+    // record can only be short from the end, and this sits second of eight.
+    // `state` is last, which is why the guard there is the one that works.
     pub auth_type: EndpointAuthType,
     #[serde(default, serialize_with = "crate::state::serialize_secret_to_state")]
     pub auth_secret: Option<SecretString>,
@@ -205,10 +207,18 @@ pub enum RouteConflict {
 }
 
 impl RouteTable {
-    /// Whether anything is routable. An instance with every endpoint revoked
-    /// or expired and no named path serves nothing, however joined it is.
-    pub fn is_empty(&self) -> bool {
-        self.secret_paths.is_empty() && self.named_paths.is_empty()
+    /// Whether any path would accept a request right now.
+    ///
+    /// `build` inserts revoked and expired endpoints too, so that a leaked id
+    /// resolves to a 404 attributed to its owner rather than to `unrouted`.
+    /// That makes a bare emptiness check useless for readiness: an instance
+    /// whose endpoints have all been revoked would still look routable.
+    pub fn serves_anything(&self, now_seconds: u64) -> bool {
+        !self.named_paths.is_empty()
+            || self
+                .secret_paths
+                .values()
+                .any(|entry| entry.endpoint.is_serving(now_seconds))
     }
 
     /// Projects every joined instance's registry into one lookup table.

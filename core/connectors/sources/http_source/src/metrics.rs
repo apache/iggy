@@ -112,6 +112,7 @@ pub struct Metrics {
     requests: Family<RequestLabels, Counter>,
     request_duration_seconds: Family<DurationLabels, Histogram, fn() -> Histogram>,
     rejected_full: Family<InstanceLabel, Counter>,
+    rejected_disconnected: Family<InstanceLabel, Counter>,
     dropped_on_close: Family<InstanceLabel, Counter>,
     headers_clamped: Family<InstanceLabel, Counter>,
     headers_dropped: Family<InstanceLabel, Counter>,
@@ -127,6 +128,7 @@ impl Metrics {
         let request_duration_seconds: Family<DurationLabels, Histogram, fn() -> Histogram> =
             Family::new_with_constructor(request_histogram);
         let rejected_full = Family::<InstanceLabel, Counter>::default();
+        let rejected_disconnected = Family::<InstanceLabel, Counter>::default();
         let dropped_on_close = Family::<InstanceLabel, Counter>::default();
         let headers_clamped = Family::<InstanceLabel, Counter>::default();
         let headers_dropped = Family::<InstanceLabel, Counter>::default();
@@ -148,6 +150,11 @@ impl Metrics {
             "http_source_rejected_full",
             "Requests answered 429 because the instance bridge was full",
             rejected_full.clone(),
+        );
+        registry.register(
+            "http_source_rejected_disconnected",
+            "Requests answered 503 because the instance bridge had no receiver",
+            rejected_disconnected.clone(),
         );
         registry.register(
             "http_source_dropped_on_close",
@@ -185,6 +192,7 @@ impl Metrics {
             requests,
             request_duration_seconds,
             rejected_full,
+            rejected_disconnected,
             dropped_on_close,
             headers_clamped,
             headers_dropped,
@@ -216,6 +224,15 @@ impl Metrics {
 
     pub fn record_rejected_full(&self, instance: &str) {
         self.rejected_full.get_or_create(&label(instance)).inc();
+    }
+
+    /// Separate from `rejected_full` on purpose: backpressure tells a sender to
+    /// retry, a bridge with no receiver never will, and folding them together
+    /// would hide the second inside the first.
+    pub fn record_rejected_disconnected(&self, instance: &str) {
+        self.rejected_disconnected
+            .get_or_create(&label(instance))
+            .inc();
     }
 
     pub fn record_dropped_on_close(&self, instance: &str, dropped: u64) {
