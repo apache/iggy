@@ -4488,12 +4488,9 @@ where
         // A metadata-plane op that did not match above (no metadata consensus on
         // this shard, or a namespace neither plane claims) is DROPPED, never
         // offered to the partition arm. Falling through let a metadata prepare
-        // reach `apply_repaired_prepare`: it journals nothing, but it resets the
-        // partition repair session's idle ticks (masking a genuine stall) and
-        // carries the metadata prepare's checksum into the partition consensus
-        // via `set_last_prepare_checksum` -- inert only while prepare checksums
-        // are structurally zero, and a cross-plane parent stamp the moment the
-        // checksum chain is activated (see the note in `consensus::impls`).
+        // reach `apply_repaired_prepare`: it journals nothing and never reaches
+        // the frontier update, but it resets the partition repair session's
+        // idle ticks, masking a genuine stall.
         if metadata_plane_op {
             tracing::debug!(
                 shard = self.id,
