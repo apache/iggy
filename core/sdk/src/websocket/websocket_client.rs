@@ -32,7 +32,8 @@ use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_C
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{
     AutoLogin, ClientState, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
-    IggyError, IggyTimestamp, WebSocketClientConfig, WebSocketConnectionStringOptions,
+    IggyError, IggyTimestamp, NonZeroIggyDuration, WebSocketClientConfig,
+    WebSocketConnectionStringOptions,
 };
 use iggy_common::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use secrecy::ExposeSecret;
@@ -178,7 +179,7 @@ impl BinaryTransport for WebSocketClient {
         self.send_raw(code, payload).await
     }
 
-    fn get_heartbeat_interval(&self) -> IggyDuration {
+    fn get_heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.config.heartbeat_interval
     }
 
@@ -224,6 +225,12 @@ impl iggy_common::VsrSessionControl for WebSocketClient {
 impl BinaryClient for WebSocketClient {}
 
 impl WebSocketClient {
+    /// Whether an `AutoLogin` is configured on this client, which makes the
+    /// session after any connect the configured user's rather than whoever
+    /// signed in by hand.
+    pub(crate) fn auto_login_configured(&self) -> bool {
+        matches!(self.config.auto_login, AutoLogin::Enabled(_))
+    }
     /// Create a new WebSocket client with the provided configuration.
     pub fn create(config: Arc<WebSocketClientConfig>) -> Result<Self, IggyError> {
         let (sender, receiver) = broadcast(1000);
@@ -533,12 +540,15 @@ impl WebSocketClient {
     /// Returns true if redirection occurred and reconnection is needed.
     pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
         let current_address = self.current_server_address.lock().await.clone();
+        // The roster's other endpoints are dropped here: only the TCP client
+        // dials failover candidates so far.
         let leader_address = check_and_redirect_to_leader(
             self,
             &current_address,
             iggy_common::TransportProtocol::WebSocket,
         )
-        .await?;
+        .await?
+        .redirect;
 
         if let Some(new_leader_address) = leader_address {
             let mut redirection_state = self.leader_redirection_state.lock().await;
@@ -763,7 +773,7 @@ mod tests {
         assert_eq!(client.config.server_address, "127.0.0.1:8092");
         assert_eq!(
             client.config.heartbeat_interval,
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
         assert!(matches!(client.config.auto_login, AutoLogin::Disabled));
         assert!(client.config.reconnection.enabled);
@@ -786,7 +796,7 @@ mod tests {
     fn should_create_with_custom_config() {
         let config = WebSocketClientConfig {
             server_address: "localhost:9090".to_string(),
-            heartbeat_interval: IggyDuration::from_str("10s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("10s").unwrap(),
             ..Default::default()
         };
 
@@ -797,8 +807,26 @@ mod tests {
         assert_eq!(client.config.server_address, "localhost:9090");
         assert_eq!(
             client.config.heartbeat_interval,
-            IggyDuration::from_str("10s").unwrap()
+            NonZeroIggyDuration::from_str("10s").unwrap()
         );
+    }
+
+    #[test]
+    fn should_fail_with_a_zero_heartbeat_interval() {
+        let value = "iggy+ws://user:secret@127.0.0.1:1234?heartbeat_interval=none";
+
+        let error = WebSocketClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
+    }
+
+    #[test]
+    fn should_fail_with_a_zero_reconnection_interval() {
+        let value = "iggy+ws://user:secret@127.0.0.1:1234?reconnection_interval=0";
+
+        let error = WebSocketClient::from_connection_string(value).err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
     }
 
     #[test]

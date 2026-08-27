@@ -15,12 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.ConnectionStream;
+using System.Buffers;
 
-internal interface IConnectionStream : IDisposable
+namespace Apache.Iggy.Utils;
+
+internal static class ArrayPoolHelper
 {
-    ValueTask SendAsync(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default);
-    ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default);
-    Task FlushAsync(CancellationToken cancellationToken = default);
-    void Close();
+    public static SlicedMemoryOwner Rent(int minimumLength, bool clearOnReturn = false)
+    {
+        return new SlicedMemoryOwner(minimumLength, clearOnReturn);
+    }
+
+    internal sealed class SlicedMemoryOwner(int minimumLength, bool clearOnReturn = false) : IMemoryOwner<byte>
+    {
+        private readonly byte[] _value = ArrayPool<byte>.Shared.Rent(minimumLength);
+        private int _disposed;
+
+        public Memory<byte> Memory => _value.AsMemory()[..minimumLength];
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            ArrayPool<byte>.Shared.Return(_value, clearOnReturn);
+        }
+    }
 }

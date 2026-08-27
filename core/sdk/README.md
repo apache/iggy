@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut consumer = client
         .consumer_group(CONSUMER_GROUP, STREAM, TOPIC)?
         .auto_commit(AutoCommit::IntervalOrWhen(
-            IggyDuration::from_str("1s")?,
+            NonZeroIggyDuration::from_str("1s")?,
             AutoCommitWhen::ConsumingAllMessages,
         ))
         .create_consumer_group_if_not_exists()

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Encryption;
@@ -26,24 +25,6 @@ namespace Apache.Iggy.Utils;
 
 internal static class TcpMessageStreamHelpers
 {
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void CreatePayload(Span<byte> result, Span<byte> message, int command)
-    {
-        var messageLength = message.Length + 4;
-        BinaryPrimitives.WriteInt32LittleEndian(result[..4], messageLength);
-        BinaryPrimitives.WriteInt32LittleEndian(result[4..8], command);
-        message.CopyTo(result[8..]);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static (int Status, int Length) GetResponseLengthAndStatus(Span<byte> buffer)
-    {
-        var status = BinaryPrimitives.ReadInt32LittleEndian(buffer[..4]);
-        var length = BinaryPrimitives.ReadInt32LittleEndian(buffer[4..]);
-
-        return (status, length);
-    }
-
     internal static int CalculateMessageBytesCount(ReadOnlySpan<Message> messages, IMessageEncryptor? encryptor)
     {
         var bytesCount = BatchWireFormat.BATCH_HEADER_SIZE;
