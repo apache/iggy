@@ -95,23 +95,23 @@ pub(crate) fn encode_request_header(
                     session.current_request_id(),
                     session.session().unwrap_or(0),
                 )
-            } else if operation.is_partition() {
-                // Consumes an id even though no partition-plane dedup exists
-                // yet: dedup needs each send to carry a distinct number, and
-                // the metadata watermark tolerates the resulting gaps
-                // (`client_table.rs`: "There is no `RequestGap`").
-                let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
-                (operation, session.next_request_id(), session_id)
             } else {
+                // Partition ops consume an id too, even though nothing dedups
+                // them yet: dedup needs each send to carry a distinct number,
+                // and the metadata watermark tolerates the resulting gaps
+                // (`client_table.rs`: "There is no `RequestGap`").
                 let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
                 (operation, session.next_request_id(), session_id)
             }
         }
     };
-    // Every replicated op stamps: the stamp is what lets a dedup layer tell a
-    // genuine retry from a request id reused for different bytes.
-    // NonReplicated ops bypass dedup, so the hash pass buys nothing there.
-    let request_checksum = if operation == Operation::NonReplicated {
+    // Stamped only for the ops the server's `ClientTable` dedups, and only by this
+    // SDK: the others leave the field zero, which the server reads as unstamped.
+    // Partition ops are the large payloads and already carry `batch_checksum` over
+    // the same bytes, and nothing dedups them, so hashing here would only buy the
+    // server a second full-payload pass in `verify_request_checksum`. NonReplicated
+    // ops bypass dedup too.
+    let request_checksum = if operation.is_partition() || operation == Operation::NonReplicated {
         0
     } else {
         u128::from(calculate_checksum(payload))
@@ -485,27 +485,29 @@ mod tests {
     }
 
     #[test]
-    fn request_checksum_is_stamped_for_replicated_operations() {
+    fn request_checksum_is_stamped_only_for_deduped_operations() {
         // The stamp exists to stop a reused `request` number matching a dedup
-        // entry recorded for different bytes, so every replicated op carries
-        // it; NonReplicated ops bypass dedup and skip the hashing pass.
+        // entry recorded for different bytes, so it is worth its hashing pass only
+        // where `ClientTable` dedups. Partition ops are the large payloads and
+        // already carry `batch_checksum` over the same bytes; NonReplicated ops
+        // bypass dedup. Neither stamps.
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
         let payload = Bytes::from_static(b"payload");
 
         let metadata =
             encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        // Hashed against the framed body rather than the `payload` the encoder was
+        // handed, so a slice mistake between what is stamped and what is sent fails
+        // here instead of reaching the server's `verify_request_checksum`.
         assert_eq!(
             decode_request_header(&metadata).request_checksum,
-            u128::from(calculate_checksum(&payload)),
+            u128::from(calculate_checksum(&metadata[HEADER_SIZE..])),
         );
 
         let partition =
             encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload).unwrap();
-        assert_eq!(
-            decode_request_header(&partition).request_checksum,
-            u128::from(calculate_checksum(&payload)),
-        );
+        assert_eq!(decode_request_header(&partition).request_checksum, 0);
 
         let ping = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
         assert_eq!(decode_request_header(&ping).request_checksum, 0);

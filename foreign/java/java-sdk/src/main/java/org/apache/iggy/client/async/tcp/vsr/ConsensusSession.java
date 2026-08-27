@@ -71,10 +71,18 @@ public final class ConsensusSession {
         this.session = sessionEpoch;
     }
 
-    /** Replicated ops (metadata and partition) consume the monotonic VSR dedup counter. */
+    /**
+     * Replicated ops (metadata and partition) consume the monotonic VSR dedup
+     * counter. The wire field is a u64 but Java has no unsigned long, so the
+     * counter is refused at {@link Long#MAX_VALUE} rather than wrapping
+     * negative and sending an id below the server's watermark.
+     */
     synchronized long nextRequestId() {
         if (session == null) {
             throw new IggyNotConnectedException("Not authenticated, call login first");
+        }
+        if (requestCounter == Long.MAX_VALUE) {
+            throw new IllegalStateException("VSR request counter exhausted, reconnect to register a fresh session");
         }
         return requestCounter++;
     }
