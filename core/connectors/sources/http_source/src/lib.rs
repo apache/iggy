@@ -306,9 +306,12 @@ impl SharedState {
         // and losing that race just leaves the flag armed for the next poll.
         let Ok(_writer) = self.registry_writer.try_lock() else {
             // Mid-mutation. If the permit that woke this poll was theirs we
-            // have just consumed it, so re-arm rather than sleep on a flush
-            // that no further traffic would ever carry.
-            self.state_flush.notify_one();
+            // have just consumed it, so re-post rather than sleep on a flush
+            // that no further traffic would ever carry. Gated on the flag so a
+            // poll that raced a mutation carrying nothing does not wake itself.
+            if self.registry_dirty.load(Ordering::Acquire) {
+                self.state_flush.notify_one();
+            }
             return None;
         };
         if !self.registry_dirty.swap(false, Ordering::AcqRel) {
@@ -316,9 +319,13 @@ impl SharedState {
         }
         let snapshot = self.registry.load_full();
         let Some(state) = snapshot.to_connector_state(self.id) else {
-            // Serialization logged the cause. Re-arm and re-notify, or the
-            // retry this promises would wait for unrelated traffic.
-            self.rearm_state_flush();
+            // Serialization logged the cause. The flag goes back so the next
+            // poll retries, but deliberately without re-posting the permit:
+            // doing that makes the next poll immediate, and since nothing
+            // about the registry has changed it fails identically, re-arms,
+            // and spins the poll task through a full FFI round trip per
+            // iteration with no exit. Traffic or the next mutation carries it.
+            self.registry_dirty.store(true, Ordering::Release);
             return None;
         };
         let mut persisted = EndpointRegistry::clone(&snapshot);
@@ -1540,6 +1547,29 @@ mod tests {
         assert_eq!(
             fresh.messages[0].payload, b"three",
             "the acked replay must release the bridge, not repeat itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_contended_writer_when_state_taken_should_not_wake_itself_for_nothing() {
+        // The re-post exists so a poll that consumed a mutation's permit does
+        // not sleep on a flush nobody will carry. With no flush owed there is
+        // nothing to carry, and waking anyway spins the poll task through an
+        // FFI round trip per iteration.
+        let source = HttpSource::new(1, test_support::config(None, &[]), None);
+        let held = source.shared.registry_writer.lock().await;
+
+        assert!(source.shared.take_dirty_state().is_none());
+        drop(held);
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                source.shared.state_flush.notified()
+            )
+            .await
+            .is_err(),
+            "no flush was owed, so no permit may be waiting"
         );
     }
 

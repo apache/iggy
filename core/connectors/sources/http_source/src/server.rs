@@ -24,7 +24,7 @@
 //! `close()` releases the ports, which the runtime's stop-then-start restart
 //! flow depends on.
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -216,6 +216,14 @@ struct SharedServer {
 
 /// The part of a shared server the request handlers see.
 #[derive(Debug)]
+/// The instance set and the routes derived from it, published as one value so
+/// no reader can see them disagree.
+#[derive(Default)]
+pub(crate) struct Published {
+    pub(crate) instances: Vec<Arc<SharedState>>,
+    pub(crate) routes: RouteTable,
+}
+
 pub(crate) struct ServerState {
     pub(crate) listen_addr: String,
     /// Taken from the first instance to bind, like `management_token`.
@@ -227,8 +235,13 @@ pub(crate) struct ServerState {
     /// listener must present the same token, so this is unambiguous.
     pub(crate) management_token: Option<SecretString>,
     pub(crate) metrics: Metrics,
-    routes: ArcSwap<RouteTable>,
-    instances: ArcSwap<Vec<Arc<SharedState>>>,
+    /// Instances and the table built from them, swapped together.
+    ///
+    /// Two `ArcSwap`s let a reader land between the stores and resolve a
+    /// request against the old table while holding the new instance set, which
+    /// on a departure means routing into a bridge nobody drains. One swap makes
+    /// that unrepresentable rather than merely narrow.
+    published: ArcSwap<Published>,
     started_at: Instant,
 }
 
@@ -239,19 +252,24 @@ impl ServerState {
             max_body_size_bytes: config.max_body_size_bytes,
             management_token: config.management_token.clone(),
             metrics: Metrics::new(),
-            routes: ArcSwap::from_pointee(RouteTable::default()),
-            instances: ArcSwap::from_pointee(Vec::new()),
+            published: ArcSwap::from_pointee(Published::default()),
             started_at: Instant::now(),
         }
     }
 
     pub(crate) fn instances(&self) -> Vec<Arc<SharedState>> {
-        (**self.instances.load()).clone()
+        self.published.load().instances.clone()
+    }
+
+    /// One consistent view of both. Callers that need the instance set and the
+    /// routes to agree must read them from a single guard, not two loads.
+    pub(crate) fn published(&self) -> Guard<Arc<Published>> {
+        self.published.load()
     }
 
     pub(crate) fn instance(&self, instance_name: &str) -> Option<Arc<SharedState>> {
-        self.instances
-            .load()
+        self.published()
+            .instances
             .iter()
             .find(|instance| instance.instance_name == instance_name)
             .map(Arc::clone)
@@ -261,24 +279,29 @@ impl ServerState {
     /// removes access but the table cannot be rebuilt: stale routes would keep
     /// honouring a credential the operator believes is gone.
     pub(crate) fn serve_nothing(&self) {
-        let dropped = self.routes.load();
+        let dropped = self.published.load();
         error!(
             "Serving no {CONNECTOR_NAME} routes on {}: dropped {} secret paths and {} named paths across {} instances until the next successful publish",
             self.listen_addr,
-            dropped.secret_path_count(),
-            dropped.named_path_count(),
-            self.instances.load().len()
+            dropped.routes.secret_path_count(),
+            dropped.routes.named_path_count(),
+            dropped.instances.len()
         );
-        self.routes.store(Arc::new(RouteTable::default()));
+        // Instances are kept: they are still joined and still own bridges, and
+        // it is only the routing that is being withdrawn.
+        self.published.store(Arc::new(Published {
+            instances: dropped.instances.clone(),
+            routes: RouteTable::default(),
+        }));
     }
 
     /// Swaps in a new instance set and the routes it projects to, or leaves
     /// both untouched if the instances collide on a path.
     fn publish(&self, instances: Vec<Arc<SharedState>>) -> Result<(), Error> {
-        let table = RouteTable::build(&instances)
+        let routes = RouteTable::build(&instances)
             .map_err(|conflict| Error::InvalidConfigValue(conflict.to_string()))?;
-        self.instances.store(Arc::new(instances));
-        self.routes.store(Arc::new(table));
+        self.published
+            .store(Arc::new(Published { instances, routes }));
         Ok(())
     }
 }
@@ -532,7 +555,7 @@ async fn named_path_outcome(
     // Cloned before the body is taken, since reading it consumes the request.
     let request_headers = request.headers().clone();
     let instance = {
-        let routes = state.routes.load();
+        let routes = &state.published().routes;
         let Some(instance) = routes.lookup_named_path(topic_path) else {
             return (
                 UNROUTED.to_owned(),
@@ -576,7 +599,7 @@ fn secret_path_outcome(
     request_headers: &HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> (String, Response) {
-    let routes = state.routes.load();
+    let routes = &state.published().routes;
     let entry = match routes.lookup_secret_path(endpoint_id, unix_now_seconds()) {
         RouteLookup::Active(entry) => entry,
         // Revoked endpoints answer as if they never existed, so a leaked URL
@@ -641,7 +664,10 @@ async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> String {
 /// task still running behind it.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
     let now = unix_now_seconds();
-    let instances = state.instances.load();
+    // One guard for both, so readiness cannot be computed from a route table
+    // and an instance set that were never published together.
+    let published = state.published();
+    let instances = &published.instances;
     // Every instance, not any. One load balancer fronts the whole listener, so
     // it can only take all of these in or out together. If one instance's poll
     // task has stopped while a sibling's is alive, `any` keeps the address in
@@ -649,7 +675,7 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
     // drains, which is the exact failure this gate exists to catch. Shedding
     // the healthy sibling's traffic too costs availability that senders recover
     // by retrying; the alternative loses data that was already answered 200.
-    let ready = !state.routes.load().is_empty()
+    let ready = !published.routes.is_empty()
         && !instances.is_empty()
         && instances.iter().all(|instance| instance.poll_is_live(now));
     if !ready {
@@ -666,8 +692,8 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
 
 async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response {
     let instances = state
+        .published()
         .instances
-        .load()
         .iter()
         .map(|instance| {
             let registry = instance.registry();
@@ -721,7 +747,25 @@ fn enqueue(
         payload: body.to_vec(),
         headers,
     };
-    if instance.sender.try_send(message).is_err() {
+    if let Err(error) = instance.sender.try_send(message) {
+        // A disconnected bridge is not a full one. It cannot happen while the
+        // route table holds an `Arc` to this `SharedState`, but reporting it as
+        // backpressure would tell a sender to retry into a channel that no
+        // longer has a receiver, and would file the loss under the wrong metric.
+        if matches!(error, crossfire::TrySendError::Disconnected(_)) {
+            metrics.record_rejected_full(&instance.instance_name);
+            error!(
+                "Rejected a request for {CONNECTOR_NAME} connector ID: {}, its bridge has no receiver",
+                instance.id
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "service unavailable",
+                }),
+            )
+                .into_response();
+        }
         metrics.record_rejected_full(&instance.instance_name);
         debug!(
             "Rejected a request for {CONNECTOR_NAME} connector ID: {}, bridge is full at {} messages",
@@ -1746,13 +1790,13 @@ mod tests {
                 &[ENDPOINT_ONE],
             )])
             .expect("a single instance cannot collide with itself");
-        assert_eq!(state.routes.load().secret_path_count(), 1);
-        assert_eq!(state.routes.load().named_path_count(), 1);
+        assert_eq!(state.published().routes.secret_path_count(), 1);
+        assert_eq!(state.published().routes.named_path_count(), 1);
 
         state.serve_nothing();
 
-        assert_eq!(state.routes.load().secret_path_count(), 0);
-        assert_eq!(state.routes.load().named_path_count(), 0);
+        assert_eq!(state.published().routes.secret_path_count(), 0);
+        assert_eq!(state.published().routes.named_path_count(), 0);
         assert_eq!(
             state.instances().len(),
             1,
