@@ -27,12 +27,14 @@
 //! the TOML those endpoints would otherwise live in; the README requires
 //! `chmod 700` on the state path.
 
+use axum::http::HeaderName;
 use iggy_connector_sdk::{ConnectorState, Error};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use tracing::info;
+use std::str::FromStr;
+use tracing::{info, warn};
 
 use crate::routes::{Endpoint, EndpointOrigin};
 use crate::types::EndpointId;
@@ -93,6 +95,22 @@ impl EndpointRegistry {
         for (endpoint_id, mut endpoint) in persisted.endpoints {
             endpoint.submitted = true;
             let revoked = !endpoint.is_active();
+            // Registration rejects a malformed `hmac_header`, but state written
+            // by an older build, or edited by hand, can still carry one. Such an
+            // endpoint 401s every signed request forever because `HeaderMap::get`
+            // answers `None` for a name it cannot parse, and nothing else would
+            // ever say why. Restoring it anyway is deliberate: refusing to start
+            // over one bad entry would take the whole instance down with it.
+            if !revoked
+                && endpoint.auth_type.hmac_algorithm().is_some()
+                && HeaderName::from_str(&endpoint.hmac_header).is_err()
+            {
+                warn!(
+                    "Restored endpoint {} for {CONNECTOR_NAME} connector ID: {connector_id} with hmac_header '{}', which is not a valid HTTP header name; every signed request to it will be rejected until it is re-registered",
+                    endpoint_id.log_prefix(),
+                    endpoint.hmac_header
+                );
+            }
             match endpoints.entry(endpoint_id) {
                 Entry::Occupied(mut occupied) if revoked => {
                     occupied.insert(endpoint);
@@ -160,11 +178,13 @@ impl EndpointRegistry {
 
     /// Flags the whole registry as handed to the runtime for persistence.
     ///
-    /// The plugin never learns whether the save itself succeeded: the runtime
-    /// writes state only after the batch carrying it lands in Iggy, and no
-    /// acknowledgement comes back across the FFI. That is why the flag is
-    /// `submitted` rather than `persisted` - it is the strongest claim this
-    /// side of the boundary can honestly make.
+    /// Set when the registry is handed to the runtime, which is why the flag
+    /// is `submitted` rather than `persisted`. The runtime does acknowledge
+    /// the batch, and a failed save comes back as a NACK that re-arms the
+    /// flush without clearing this, so between a failed save and the retry
+    /// that succeeds the flag over-reports. Nothing here may assume the save
+    /// landed, and `HttpSource::on_nack`'s re-arm is what makes the retry
+    /// happen: it is load-bearing, not defensive.
     pub fn mark_submitted(&mut self) {
         for endpoint in self.endpoints.values_mut() {
             endpoint.submitted = true;

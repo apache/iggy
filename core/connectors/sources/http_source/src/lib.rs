@@ -184,8 +184,8 @@ impl SharedState {
         self.registry.load()
     }
 
-    /// Applies a control-plane mutation and arms the next state flush.
-    /// Applies a control-plane mutation and arms the next state flush.
+    /// Applies a control-plane mutation, arming the next state flush only if
+    /// it changed something.
     ///
     /// The closure reports whether it changed anything, and a `false` costs
     /// nothing beyond the clone. Arming unconditionally let an authenticated
@@ -196,7 +196,7 @@ impl SharedState {
         &self,
         mutation: impl FnOnce(&mut EndpointRegistry) -> bool,
     ) -> bool {
-        let changed = {
+        {
             let _writer = self.registry_writer.lock().await;
             let mut next = EndpointRegistry::clone(&self.registry.load());
             if !mutation(&mut next) {
@@ -204,12 +204,11 @@ impl SharedState {
             }
             self.registry.store(Arc::new(next));
             self.registry_dirty.store(true, Ordering::Release);
-            true
-        };
+        }
         // Notified after the gate is free, so the woken poll finds it open
         // rather than bouncing off `try_lock` and relying on the re-arm there.
         self.state_flush.notify_one();
-        changed
+        true
     }
 
     /// Whether a mutation is still waiting to be handed to the runtime.

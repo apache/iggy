@@ -195,7 +195,7 @@ The first instance to open binds both ports. Later instances validate their conf
 
 `listen_addr` is not validated that way, because it is what groups instances onto a listener in the first place. Two spellings of the same socket, `0.0.0.0:9090` and `127.0.0.1:9090`, are two groups, so the second instance tries to bind a port the first already holds and fails with an address-in-use error naming that field. Instances meant to share a listener must spell `listen_addr` identically.
 
-`instance_name` must also be unique on the listener, since it is how the management API addresses an instance and how every metric series is labelled. Instances that leave it unset get their distinct numeric plugin id, so they cannot collide.
+`instance_name` must also be unique on the listener, since it is how the management API addresses an instance and how every metric series is labelled. Instances that leave it unset get their distinct numeric plugin id, so they cannot collide. It cannot be `unrouted`, which is reserved for the series counting requests that matched no route; `open()` fails naming the field.
 
 Closing an instance deregisters its routes immediately, so its paths answer 404 while its siblings keep serving. The last instance to close shuts both listeners down gracefully and releases the ports, which the runtime's stop-then-start restart flow depends on.
 
@@ -225,7 +225,7 @@ Rotation deliberately keeps the path: a webhook sender configures the URL once, 
 
 | Status | Condition |
 | ------ | --------- |
-| 400 | Empty `auth_secret`, or an `expires_at` already in the past |
+| 400 | Empty `auth_secret`, an `expires_at` already in the past, or an `hmac_header` that is not a valid HTTP header name |
 | 401 | Missing or wrong `management_token` |
 | 404 | Unknown endpoint, unknown `instance`, or the API is not configured |
 | 409 | Rotating a static endpoint, or a generated id collision |

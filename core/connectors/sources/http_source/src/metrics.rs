@@ -356,8 +356,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn given_status_codes_when_classified_should_collapse_to_a_class() {
+    fn given_status_codes_when_classified_should_collapse_to_its_class() {
         assert_eq!(StatusClass::from(200), StatusClass::Success);
+        // `from` ends in a catch-all, so without this the redirect arm could be
+        // deleted and every 3xx would silently meter as 5xx.
+        assert_eq!(StatusClass::from(302), StatusClass::Redirect);
         assert_eq!(StatusClass::from(204), StatusClass::Success);
         assert_eq!(StatusClass::from(404), StatusClass::ClientError);
         assert_eq!(StatusClass::from(429), StatusClass::ClientError);
