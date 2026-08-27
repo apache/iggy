@@ -40,8 +40,11 @@ mod source;
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 /// Where the full exposure surface is written down, so the startup warnings
-/// can name one thing each instead of restating it.
-const EXPOSURE_DOC: &str = "core/connectors/runtime/README.md";
+/// can name one thing each instead of restating it. A URL rather than a repo
+/// path: the published image carries the binary and its licences, nothing else,
+/// so the reader most likely to see these lines has no source tree.
+const EXPOSURE_DOC: &str =
+    "https://github.com/apache/iggy/blob/master/core/connectors/runtime/README.md";
 
 pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
     if !config.enabled {
@@ -146,7 +149,7 @@ async fn warn_on_weak_containment(config: &HttpConfig) {
 
     if unauthenticated && beyond_loopback {
         warn!(
-            "{NAME} HTTP API on {} has no api_key, so anyone who can reach it can read and rewrite every connector configuration, credentials included. See {EXPOSURE_DOC}.",
+            "{NAME} HTTP API on {} has no api_key: anyone who reaches it can read and rewrite every connector configuration. {EXPOSURE_DOC}",
             config.address
         );
     }
@@ -154,19 +157,21 @@ async fn warn_on_weak_containment(config: &HttpConfig) {
     // Loopback does not contain this one. A browser is a local process and the
     // CORS layer wraps outside authentication, so the shipped
     // `allowed_origins = ["*"]` lets any page the operator visits read these
-    // endpoints cross-origin. A pinned list closes that read and an empty one
-    // emits no header at all, so neither is warned about. Neither closes
-    // `POST .../restart`, which is CORS-simple and reaches the handler whatever
-    // this says; that one is true of the defaults, so the README carries it.
+    // endpoints cross-origin. Pinning origins the operator owns closes that
+    // read, and an empty list emits no header at all, so neither is warned
+    // about. `null` is not such an origin, so a list holding it still is. No
+    // origin setting closes `POST .../restart`, which is CORS-simple and
+    // reaches the handler regardless; that one is true of the defaults, so the
+    // README carries it rather than a warning.
     if unauthenticated && config.cors.enabled && config.cors.allows_unowned_origin() {
         warn!(
-            "{NAME} HTTP API has http.cors open to * or null with no api_key, so any page the operator visits can read and rewrite connector configuration. See {EXPOSURE_DOC}."
+            "{NAME} HTTP API has http.cors open to * or null with no api_key: any page the operator visits can read and rewrite its config. {EXPOSURE_DOC}"
         );
     }
 
     if beyond_loopback && !config.tls.enabled {
         warn!(
-            "{NAME} HTTP API on {} has http.tls disabled, so the api-key header and the credentials in its responses cross the network in cleartext. See {EXPOSURE_DOC}.",
+            "{NAME} HTTP API on {} has http.tls disabled: the api-key header and the credentials in its responses cross in cleartext. {EXPOSURE_DOC}",
             config.address
         );
     }
@@ -227,6 +232,7 @@ mod tests {
     use iggy::prelude::IggyClient;
     use iggy_common::IggyTimestamp;
     use secrecy::SecretString;
+    use std::fmt::Write as _;
     use std::sync::Mutex;
     use tempfile::TempDir;
     use tracing::Level;
@@ -300,23 +306,13 @@ mod tests {
 
     /// Whether this host binds an address RFC 5737 reserves for documentation.
     ///
-    /// `net.ipv4.ip_nonlocal_bind=1` makes it succeed, which turns a failed
-    /// bind into an unavailable control and leaves the test serving on a
-    /// routable address. Both tests that rely on the bind failing check this
-    /// first rather than going red over a sysctl.
+    /// `net.ipv4.ip_nonlocal_bind=1`, which keepalived and haproxy boxes set,
+    /// makes it succeed. The two tests that read a failed bind as their
+    /// ordering control stand those two assertions down there rather than going
+    /// red over a sysctl. They do not skip: a skipped test reports `ok` with no
+    /// signal, and the warning itself is required on every host.
     fn routable_address_binds() -> bool {
         std::net::TcpListener::bind(UNASSIGNABLE_ROUTABLE_ADDRESS).is_ok()
-    }
-
-    fn skip_unless_unbindable() -> bool {
-        if routable_address_binds() {
-            eprintln!(
-                "skipping: this host binds {UNASSIGNABLE_ROUTABLE_ADDRESS}, so a failed \
-                 bind is not available as a control"
-            );
-            return true;
-        }
-        false
     }
 
     struct CaptureEvents {
@@ -340,7 +336,7 @@ mod tests {
 
     impl Visit for Recorded {
         fn record_debug(&mut self, _field: &Field, value: &dyn std::fmt::Debug) {
-            self.0.push_str(&format!("{value:?} "));
+            let _ = write!(self.0, "{value:?} ");
         }
     }
 
@@ -406,9 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_no_key_and_a_routable_address_when_initialized_should_warn_before_binding() {
-        if skip_unless_unbindable() {
-            return;
-        }
+        let bind_is_refused = !routable_address_binds();
         // Fixture first: `create_connectors_config_provider` logs, and anything
         // it warns about later would otherwise land in this buffer.
         let (context, _directory) = context("").await;
@@ -422,15 +416,16 @@ mod tests {
             .await
             .is_err();
 
-        assert!(
-            bind_failed,
-            "a documentation-range address must be unbindable here; the pre-flight \
-             above already excused the hosts where it is not"
-        );
-        assert!(
-            !started_serving(&captured),
-            "the bind must not have completed, or this proves nothing about ordering"
-        );
+        if bind_is_refused {
+            assert!(
+                bind_failed,
+                "a documentation-range address must not bind here"
+            );
+            assert!(
+                !started_serving(&captured),
+                "the bind must not have completed, or this proves nothing about ordering"
+            );
+        }
         assert!(
             warnings(&captured)
                 .iter()
@@ -498,7 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_pinned_cors_origins_when_initialized_should_not_warn_about_cors() {
+    async fn given_owned_cors_origins_when_initialized_should_not_warn_about_cors() {
         let (context, _directory) = context("").await;
         let (_capture, captured) = capture_events();
         let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "");
@@ -513,17 +508,35 @@ mod tests {
         );
         assert!(
             warnings(&captured).is_empty(),
-            "an operator who pinned their origins closed the cross-origin read, and \
-             warning at them is what teaches everyone to ignore the rest: {:?}",
+            "an operator who pinned origins they own closed the cross-origin read, \
+             and warning at them is what teaches everyone to ignore the rest: {:?}",
             warnings(&captured)
         );
     }
 
     #[tokio::test]
+    async fn given_a_null_cors_origin_when_initialized_should_warn_despite_the_pin() {
+        let (context, _directory) = context("").await;
+        let (_capture, captured) = capture_events();
+        let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "");
+        config.cors.enabled = true;
+        config.cors.allowed_origins = vec!["null".to_owned()];
+
+        init(&config, context).await;
+
+        assert!(started_serving(&captured));
+        assert!(
+            warnings(&captured)
+                .iter()
+                .any(|warning| warning.contains("http.cors")),
+            "`null` is a pinned origin that nobody owns, so pinning it buys nothing \
+             a wildcard would not have given away"
+        );
+    }
+
+    #[tokio::test]
     async fn given_a_key_but_no_tls_beyond_loopback_when_initialized_should_still_warn() {
-        if skip_unless_unbindable() {
-            return;
-        }
+        let bind_is_refused = !routable_address_binds();
         let (context, _directory) = context("configured").await;
         let (_capture, captured) = capture_events();
         let config = config(UNASSIGNABLE_ROUTABLE_ADDRESS, "configured");
@@ -532,22 +545,24 @@ mod tests {
             .await
             .is_err();
 
-        assert!(
-            bind_failed,
-            "a documentation-range address must be unbindable here; the pre-flight \
-             above already excused the hosts where it is not"
-        );
+        if bind_is_refused {
+            assert!(
+                bind_failed,
+                "a documentation-range address must not bind here"
+            );
+        }
         let warnings = warnings(&captured);
         assert!(
             warnings.iter().any(|warning| warning.contains("http.tls")),
             "setting a key does not stop the key and the credential-bearing \
              responses crossing the network in cleartext"
         );
-        assert!(
-            !warnings
-                .iter()
-                .any(|warning| warning.contains("no api_key")),
-            "and the key that was set must not still be reported as missing"
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the key that was set must not still be reported as missing, and a \
+             count cannot go vacuous the way matching on the old wording would: \
+             {warnings:?}"
         );
         assert!(
             warnings

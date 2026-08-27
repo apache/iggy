@@ -86,7 +86,9 @@ impl HttpCorsConfig {
             .is_some_and(|origin| origin == "*")
     }
 
-    /// Whether the resulting policy admits an origin nobody owns.
+    /// Whether the resulting policy admits an origin nobody owns, assuming one
+    /// gets built: a wildcard past the first position panics `configure_cors`,
+    /// so that shape warns and then dies.
     ///
     /// `*` is one. `null` is the other: a browser sends it from a sandboxed
     /// iframe, a `data:` URL and a `file://` page, so listing it hands the
@@ -276,6 +278,7 @@ mod tests {
             !cors(&[]).allows_any_origin(),
             "an empty list emits no header"
         );
+        assert!(!cors(&[]).allows_unowned_origin());
         assert!(!cors(&["https://console.example"]).allows_any_origin());
         assert!(!cors(&["https://console.example"]).allows_unowned_origin());
         assert!(
