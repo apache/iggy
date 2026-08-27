@@ -183,19 +183,31 @@ impl SharedState {
     }
 
     /// Applies a control-plane mutation and arms the next state flush.
-    pub async fn mutate_registry<R>(&self, mutation: impl FnOnce(&mut EndpointRegistry) -> R) -> R {
-        let outcome = {
+    /// Applies a control-plane mutation and arms the next state flush.
+    ///
+    /// The closure reports whether it changed anything, and a `false` costs
+    /// nothing beyond the clone. Arming unconditionally let an authenticated
+    /// caller turn a stream of no-ops, repeatedly revoking an already-revoked
+    /// endpoint, into one registry serialization and one state-store write per
+    /// 404, which is a remote write on the HTTP state backend.
+    pub async fn mutate_registry(
+        &self,
+        mutation: impl FnOnce(&mut EndpointRegistry) -> bool,
+    ) -> bool {
+        let changed = {
             let _writer = self.registry_writer.lock().await;
             let mut next = EndpointRegistry::clone(&self.registry.load());
-            let outcome = mutation(&mut next);
+            if !mutation(&mut next) {
+                return false;
+            }
             self.registry.store(Arc::new(next));
             self.registry_dirty.store(true, Ordering::Release);
-            outcome
+            true
         };
         // Notified after the gate is free, so the woken poll finds it open
         // rather than bouncing off `try_lock` and relying on the re-arm there.
         self.state_flush.notify_one();
-        outcome
+        changed
     }
 
     /// Whether a mutation is still waiting to be handed to the runtime.
