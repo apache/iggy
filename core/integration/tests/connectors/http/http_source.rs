@@ -79,6 +79,48 @@ async fn webhook_post_produces_message_to_iggy(harness: &TestHarness, fixture: H
     );
 }
 
+/// The secret path is covered above; nothing exercised the named one, which is
+/// the route an operator gets by setting `topic_path` and the one a typo in
+/// `auth_bearer_token` would leave open.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/http/source.toml")),
+    seed = seeds::connector_multi_topic_stream
+)]
+async fn named_path_post_produces_message_to_iggy(
+    harness: &TestHarness,
+    fixture: HttpSourceFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let http = webhook_client();
+    wait_for_gateway(&http, &fixture).await;
+
+    let body = r#"{"event":"deployment","environment":"staging"}"#;
+    let response = http
+        .post(fixture.named_url(seeds::names::TOPIC))
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to POST to the named path");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let messages = poll_payloads(&client, seeds::names::TOPIC, "http_source_cg_named", 1).await;
+    assert_eq!(
+        String::from_utf8_lossy(&messages[0].0),
+        body,
+        "the named path must deliver the raw body byte for byte, same as the secret path"
+    );
+    let headers = messages[0]
+        .1
+        .as_ref()
+        .expect("HTTP metadata forwarding is enabled");
+    assert_eq!(
+        header_value(headers, "iggy_source_instance").as_deref(),
+        Some(GITHUB_INSTANCE),
+        "and must attribute the message to the instance that owns the topic_path"
+    );
+}
+
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/http/source.toml")),
     seed = seeds::connector_multi_topic_stream
@@ -332,19 +374,37 @@ fn webhook_client() -> Client {
 
 /// The listener binds during the connector's `open()`, which happens after the
 /// runtime's own HTTP API is already answering.
+///
+/// Waits for *both* instances by name. The public `/health` answers as soon as
+/// one instance is serving, and the two open independently, so returning on the
+/// first left every later request racing the second: a post to
+/// `PARTNER_ENDPOINT_ID` would 404, and a registration against `GITHUB_INSTANCE`
+/// would come back "unknown instance", depending on which won.
 async fn wait_for_gateway(http: &Client, fixture: &HttpSourceFixture) {
     for _ in 0..POLL_ATTEMPTS {
         if let Ok(response) = http
-            .get(format!("{}/health", fixture.public_url()))
+            .get(format!("{}/admin/health", fixture.admin_url()))
             .send()
             .await
             && response.status() == StatusCode::OK
+            && let Ok(health) = response.json::<Value>().await
         {
-            return;
+            let joined: Vec<&str> = health["instances"]
+                .as_array()
+                .map(|instances| {
+                    instances
+                        .iter()
+                        .filter_map(|instance| instance["instance"].as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if joined.contains(&GITHUB_INSTANCE) && joined.contains(&PARTNER_INSTANCE) {
+                return;
+            }
         }
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
-    panic!("The webhook gateway did not become healthy in time");
+    panic!("Both webhook gateway instances did not join in time");
 }
 
 /// Registers a bearer-guarded endpoint, so a test can prove the secret and not

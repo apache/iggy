@@ -64,6 +64,12 @@ impl HttpSourceFixture {
         format!("{}/e/{endpoint_id}", self.public_url())
     }
 
+    /// The named path, which is the other half of the routing surface and the
+    /// one a sender reaches without a per-endpoint secret.
+    pub fn named_url(&self, topic_path: &str) -> String {
+        format!("{}/topics/{topic_path}", self.public_url())
+    }
+
     /// GitHub-style `sha256=<hex>` over the exact bytes that will be sent.
     pub fn github_signature(&self, body: &[u8]) -> String {
         let key = hmac::Key::new(hmac::HMAC_SHA256, GITHUB_HMAC_SECRET.as_bytes());

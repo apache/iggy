@@ -1584,12 +1584,16 @@ mod tests {
     #[tokio::test]
     async fn given_full_bridge_when_message_sent_should_reject() {
         let mut config = test_support::config(None, &[]);
-        config.buffer_capacity = 1;
+        // Two, not one: crossfire routes a capacity of 1 to a single-slot
+        // channel with different mechanics from the array every real
+        // deployment gets, so testing at 1 exercises code that never runs.
+        config.buffer_capacity = 2;
         let source = HttpSource::new(1, config, None);
 
         assert!(source.shared.sender.try_send(queued("one")).is_ok());
+        assert!(source.shared.sender.try_send(queued("two")).is_ok());
         assert!(
-            source.shared.sender.try_send(queued("two")).is_err(),
+            source.shared.sender.try_send(queued("three")).is_err(),
             "a full bridge is what turns into a 429"
         );
     }

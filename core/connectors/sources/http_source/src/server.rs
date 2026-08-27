@@ -1014,14 +1014,19 @@ mod tests {
     #[tokio::test]
     async fn given_full_bridge_when_posted_should_answer_too_many_requests() {
         let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
-        config.buffer_capacity = 1;
+        // Two, not one: crossfire routes a capacity of 1 to a single-slot
+        // channel with different mechanics from the array every real
+        // deployment gets, so testing at 1 exercises code that never runs.
+        config.buffer_capacity = 2;
         let mut source = open(1, config).await;
         let base = base_url(&source);
 
-        assert_eq!(
-            post_signed(&base, ENDPOINT_ONE, "{}").await.status(),
-            StatusCode::OK
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                post_signed(&base, ENDPOINT_ONE, "{}").await.status(),
+                StatusCode::OK
+            );
+        }
         let response = post_signed(&base, ENDPOINT_ONE, "{}").await;
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
