@@ -128,10 +128,14 @@ pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
     if !joined.iter().any(|candidate| candidate.id == instance.id) {
         // `SourceContainer::open` keeps the source even when `open()` failed,
         // and stop closes unconditionally, so this runs for instances that
-        // never joined. Tearing down on their behalf would rebuild the route
-        // table for nothing, log a deregistration that never happened, and,
-        // when the failure was the duplicate-name rejection, wipe the metrics
-        // of the sibling that legitimately owns that name.
+        // never joined. Tearing down on their behalf rebuilds the route table
+        // for nothing and logs a deregistration that never happened.
+        //
+        // Deliberately untested, because the effects are not observable. The
+        // republished route set is unchanged, and `forget_instance` drops only
+        // gauges, which `Metrics::encode` re-derives from the live instances on
+        // the next scrape. A test written against those would pass with this
+        // guard removed.
         return;
     }
 
