@@ -239,9 +239,9 @@ key_file = "core/certs/iggy_key.pem"
 > enough to repoint a connector at a destination of the caller's choosing,
 > because `restart` re-reads the stored configuration and starts the connector
 > from it - on the local provider that is whatever version was published last,
-> with no activation step in between. The runtime then forwards your topic data using its own Iggy
-> credentials. `PUT .../configs/active` and `DELETE .../configs` sit behind the
-> same key.
+> with no activation step in between. The runtime then forwards your topic data
+> using its own Iggy credentials. `PUT .../configs/active` and
+> `DELETE .../configs` sit behind the same key.
 >
 > A rewritten plugin `path` is not loaded by the restart. `start_connector`
 > reuses the container `dlopen`ed at boot and only re-runs the plugin's init
@@ -265,13 +265,16 @@ key_file = "core/certs/iggy_key.pem"
 >   runs. A browser is a local process, so with a wildcard origin and no key any
 >   page the operator visits gets a green preflight for a configuration `POST`
 >   and can then read *and rewrite* configuration cross-origin - the whole
->   publish-then-restart repoint above, not just disclosure. Setting `api_key`
->   closes it, since an attacker's page
->   cannot supply the header. The rewrite half needs the method on
->   `allowed_methods` and `content-type` on `allowed_headers`, both of which the
->   shipped block grants. Pinning `allowed_origins` to real origins closes
->   the cross-origin path too, and the startup warning stays quiet about that
->   case on purpose.
+>   publish-then-restart repoint above, not just disclosure. The rewrite half
+>   needs the method on `allowed_methods` and `content-type` on
+>   `allowed_headers`, both of which the shipped block grants.
+>
+>   Setting `api_key` closes it, since an attacker's page cannot supply the
+>   header. Pinning `allowed_origins` to origins you own closes the cross-origin
+>   *read*, and the startup warning stays quiet for that case on purpose. It
+>   does not stay quiet for `null`, which is what a browser sends from a
+>   sandboxed iframe, a `data:` URL and a `file://` page, so listing it is no
+>   narrower than `*`. Neither closes the CORS-simple route below.
 > - **Leaving `http.tls.enabled = false`.** It ships disabled, so the `api-key`
 >   header and the responses carrying your credentials both travel in cleartext.
 >   Enable TLS alongside `api_key` whenever this API leaves loopback. The runtime
