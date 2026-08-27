@@ -772,13 +772,6 @@ export class CommandResponseStream extends EventEmitter {
         // read, leaderless ones included: a roster with no leader still names
         // where the nodes are.
         const metadata = GET_CLUSTER_METADATA.deserialize(response);
-        // Every read feeds the redial candidates, leaderless ones included: a
-        // roster with no leader still names where the nodes are.
-        this.connection.rememberRoster(
-          metadata.nodes
-            .filter((node) => node.endpoints.tcp !== 0)
-            .map((node) => ({ host: node.ip, port: node.endpoints.tcp }))
-        );
         if (metadata.nodes.length <= 1)
           return undefined;
         const leader = metadata.nodes.find(
