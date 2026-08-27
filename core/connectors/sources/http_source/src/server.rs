@@ -133,10 +133,9 @@ pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
         // for nothing and logs a deregistration that never happened.
         //
         // Deliberately untested, because the effects are not observable. The
-        // republished route set is unchanged, and `forget_instance` drops only
-        // gauges, which `Metrics::encode` re-derives from the live instances on
-        // the next scrape. A test written against those would pass with this
-        // guard removed.
+        // republished route set is unchanged, and the sampled gauges are
+        // rebuilt from the live instances on every scrape. A test written
+        // against those would pass with this guard removed.
         return;
     }
 
@@ -144,7 +143,6 @@ pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
         .into_iter()
         .filter(|candidate| candidate.id != instance.id)
         .collect();
-    let remaining_count = remaining.len();
     if let Err(error) = server.state.publish(remaining) {
         // Dropping an instance cannot introduce a collision, so this is
         // unreachable; serve nothing rather than stale routes if it happens.
@@ -154,15 +152,16 @@ pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
         );
         server.state.serve_nothing();
     }
+    // Read back rather than trusting the vec we hoped to publish. `publish` is
+    // all-or-nothing, so on its failure branch the departed instance is still
+    // in `instances`, and counting the local vec would leave a listener bound
+    // for the life of the process: the next `leave` would see two instances,
+    // compute one remaining, and never reach the shutdown branch.
+    let remaining_count = server.state.instances().len();
     info!(
         "Deregistered {CONNECTOR_NAME} routes for connector ID: {}, instances left on {listen_addr}: {remaining_count}",
         instance.id
     );
-
-    server
-        .state
-        .metrics
-        .forget_instance(&instance.instance_name);
 
     // Counted after the routes are gone, which narrows the window but does
     // not close it: a handler that already loaded the old table can still

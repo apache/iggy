@@ -253,23 +253,6 @@ impl Metrics {
             .map_or(0, |counter| counter.get())
     }
 
-    /// Drops a departed instance's sampled gauges.
-    ///
-    /// Counters stay: they are cumulative and their last value remains true.
-    /// Gauges are instantaneous, so leaving them behind would report a queue
-    /// depth for an instance that no longer exists.
-    pub fn forget_instance(&self, instance: &str) {
-        let label = label(instance);
-        self.buffer_used.remove(&label);
-        self.buffer_capacity.remove(&label);
-        for origin in [EndpointOrigin::Static, EndpointOrigin::Dynamic] {
-            self.endpoints_active.remove(&EndpointLabels {
-                instance: instance.to_owned(),
-                kind: origin,
-            });
-        }
-    }
-
     /// Refreshes the sampled gauges and renders the Prometheus text format.
     ///
     /// The gauges are read from the instances at scrape time rather than
@@ -277,6 +260,14 @@ impl Metrics {
     /// meaningful as instantaneous values, and nothing observes them between
     /// scrapes.
     pub fn encode(&self, instances: &[Arc<SharedState>]) -> String {
+        // Cleared and rebuilt, so a scrape is always exactly the live set.
+        // These are instantaneous readings, so a departed instance's queue
+        // depth is not merely stale but meaningless, and reconciling here is
+        // what keeps that impossible. Counters are untouched: they are
+        // cumulative and their last value stays true after an instance goes.
+        self.buffer_used.clear();
+        self.buffer_capacity.clear();
+        self.endpoints_active.clear();
         for instance in instances {
             let label = label(&instance.instance_name);
             self.buffer_used
