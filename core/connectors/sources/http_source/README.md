@@ -252,6 +252,8 @@ The chain below holds end to end. It did not always: the runtime's forwarding ch
 
 What closed the gap instead was #3855. The SDK now keeps one batch in flight and will not call `poll()` again until the runtime acknowledges the last one, so a slow Iggy stalls the poll loop directly. The bridge then fills on arrival and the handlers answer 429, which is the coupling that was missing.
 
+That coupling holds only while the runtime answers inside the SDK's batch-result timeout, 30s. Past it the SDK stops waiting, NACKs, and polls again, so the bridge drains and the pressure moves into the runtime's unbounded forwarding channel instead of reaching the sender. Tracked in #3981.
+
 ```text
 Iggy slow -> forwarding loop blocks -> bounded channel fills -> poll() stalls
           -> instance bridge fills -> HTTP 429 + Retry-After: 1
