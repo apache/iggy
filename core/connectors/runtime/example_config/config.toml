@@ -27,6 +27,7 @@ api_key = "" # Optional API key for authentication to be passed as `api-key` hea
 # Enabling this with the shipped allowed_origins = ["*"] lets any page the
 # operator visits read these endpoints cross-origin, whatever address is bound.
 # Pin the origins you own, or set api_key, before turning it on.
+# "*" is honored only as the first entry; anywhere else it panics at startup.
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 allowed_origins = ["*"]

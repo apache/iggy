@@ -559,6 +559,13 @@ mod tests {
             "`null` is a pinned origin that nobody owns, so pinning it buys nothing \
              a wildcard would not have given away"
         );
+        assert!(
+            warnings(&captured)
+                .iter()
+                .all(|warning| warning.contains(EXPOSURE_DOC)),
+            "each warning carries the pointer instead of its own remediation: {:?}",
+            warnings(&captured)
+        );
     }
 
     #[tokio::test]

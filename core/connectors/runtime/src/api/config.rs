@@ -80,6 +80,13 @@ impl HttpCorsConfig {
     /// reads. A `"*"` in any later position never reaches a served request:
     /// `AllowOrigin::list` panics on a wildcard, so such a config takes the
     /// process down at startup rather than allowing anything.
+    ///
+    /// Compared untrimmed, because `configure_cors` compares untrimmed: `" *"`
+    /// becomes a list entry no `Origin` matches, so it allows nothing and there
+    /// is nothing to warn about. `core/server/src/http.rs` trims before the same
+    /// comparison; porting that here means trimming in both places at once,
+    /// since trimming only this one would warn about a closed config and
+    /// trimming only the mapping would open one silently.
     pub fn allows_any_origin(&self) -> bool {
         self.allowed_origins
             .first()
@@ -94,7 +101,7 @@ impl HttpCorsConfig {
     /// iframe, a `data:` URL and a `file://` page, so listing it hands the
     /// cross-origin read to whoever gets the operator to open a page.
     /// `AllowOrigin::list` echoes any listed value back on a match, so a
-    /// `null` anywhere counts, not only first.
+    /// `null` anywhere counts, not only first. Untrimmed for the reason above.
     ///
     /// Separate from `allows_any_origin` because `configure_cors` has to keep
     /// mapping `["null"]` to a one-entry list rather than widening it, and
