@@ -240,7 +240,9 @@ The 204 means the endpoint stopped serving *now*, in memory. Durability follows 
 
 Dynamic endpoints ride the SDK's `ConnectorState`, which the runtime writes after the next successful send. A management response therefore means "accepted", not "durable": if Iggy is unreachable, the endpoint is live in memory but not yet on disk, and a crash in that window loses it.
 
-`GET /admin/endpoints` reports `submitted` per endpoint. It is named that, and not `persisted`, on purpose: the plugin hands state to the runtime and gets no acknowledgement back across the FFI, so `submitted: true` means the registry reached the runtime, not that the write landed. Watch the connector's status for save failures.
+`GET /admin/endpoints` reports `submitted` per endpoint. It is named that, and not `persisted`, on purpose: the flag is set when the registry is handed to the runtime, so `submitted: true` means it reached the runtime, not that the write landed.
+
+Since #3855 the runtime does acknowledge the batch, and a failed save comes back as a NACK that re-arms the flush for the next poll. That re-arm does not clear `submitted`, so between a failed save and the retry that succeeds, the flag over-reports. Clearing it would mean rewriting the registry from a sync path that cannot take the writer lock, and would risk discarding a revocation that landed in the meantime. Watch the connector's `last_error` for save failures rather than this flag.
 
 ## Backpressure
 

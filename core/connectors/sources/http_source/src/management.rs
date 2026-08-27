@@ -679,6 +679,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_repeated_revoke_of_a_tombstone_should_not_rearm_the_flush() {
+        // Each no-op used to clone the registry, arm the flush and post a
+        // notify, so an authenticated caller could turn a stream of 404s into
+        // one serialization and one state-store write apiece, which is a remote
+        // write on the HTTP state backend.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+        let endpoint = format!("{}/admin/endpoints/{ENDPOINT_ONE}", fixture.admin);
+        let http = client();
+        let revoke = || {
+            http.delete(&endpoint)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .send()
+        };
+
+        assert_eq!(
+            revoke().await.expect("first revoke").status(),
+            StatusCode::NO_CONTENT
+        );
+        fixture
+            .source
+            .shared
+            .take_dirty_state()
+            .expect("the revoke must arm a flush");
+
+        assert_eq!(
+            revoke().await.expect("second revoke").status(),
+            StatusCode::NOT_FOUND,
+            "the endpoint is already a tombstone"
+        );
+        assert!(
+            fixture.source.shared.take_dirty_state().is_none(),
+            "and a no-op must not arm another state write"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
     async fn given_invalid_hmac_header_when_registered_should_reject() {
         // `HeaderMap::get` answers `None` for a name it cannot parse instead of
         // failing, so accepting one here mints an endpoint that 401s every

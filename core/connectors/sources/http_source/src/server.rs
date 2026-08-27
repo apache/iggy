@@ -991,6 +991,7 @@ mod tests {
                     .endpoint_mut(ENDPOINT_ONE)
                     .expect("the static endpoint is registered")
                     .expires_at = Some(1);
+                true
             })
             .await;
         rebuild_routes(&source).await;
@@ -1221,6 +1222,7 @@ mod tests {
                     .endpoint_mut(ENDPOINT_ONE)
                     .expect("the static endpoint is registered")
                     .expires_at = Some(1);
+                true
             })
             .await;
 

@@ -416,6 +416,7 @@ mod tests {
                     .endpoint_mut(ENDPOINT_ONE)
                     .expect("static endpoint is registered")
                     .expires_at = Some(NOW);
+                true
             })
             .await;
 
@@ -441,6 +442,7 @@ mod tests {
                     .expect("static endpoint is registered");
                 endpoint.expires_at = Some(NOW);
                 endpoint.revoke("compromised".to_string(), NOW);
+                true
             })
             .await;
 
