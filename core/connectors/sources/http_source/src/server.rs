@@ -1025,9 +1025,9 @@ mod tests {
     #[tokio::test]
     async fn given_full_bridge_when_posted_should_answer_too_many_requests() {
         let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
-        // Two, not one: crossfire routes a capacity of 1 to a single-slot
-        // channel with different mechanics from the array every real
-        // deployment gets, so testing at 1 exercises code that never runs.
+        // Two, not one: at 1 the ring is degenerate, so a test cannot tell a
+        // real capacity bound from an off-by-one. `bounded_async` always builds
+        // an `Array` whatever the size, so the flavour is not what differs.
         config.buffer_capacity = 2;
         let mut source = open(1, config).await;
         let base = base_url(&source);

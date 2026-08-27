@@ -268,10 +268,14 @@ impl SharedState {
     /// Hands the registry to the runtime for persistence, once per mutation.
     ///
     /// Only ever called for an empty batch. The runtime saves state solely on
-    /// the success branch of the Iggy send, and an empty send always succeeds,
-    /// so attaching state to a batch that could fail would let the save be
-    /// skipped while this side had already cleared the flag and marked the
-    /// registry submitted - losing a revocation tombstone with no trace.
+    /// the success branch of the Iggy send, so attaching state to a batch of
+    /// messages would let a failed send skip the save while this side had
+    /// already cleared the flag and marked the registry submitted, losing a
+    /// revocation tombstone with no trace. An empty batch cannot fail *for
+    /// want of a successful publish*, which is what makes it the safe carrier.
+    /// It can still be NACKed: the runtime short-circuits the send stage when
+    /// its own state storage is latched or a pending checkpoint will not
+    /// resolve, which is why `on_nack` re-arms rather than assuming success.
     ///
     /// Static-only instances never arm the flag, so their polls return
     /// `state: None` and the runtime writes no state file at all.
@@ -525,7 +529,7 @@ impl HttpSource {
                 config.buffer_capacity
             );
         }
-        // An unreadable registry cannot be served, but `new` has 21 callers and
+        // An unreadable registry cannot be served, but `new` has many callers and
         // the SDK builds the source before it calls `open`, so the failure is
         // carried to `open` rather than widening this signature. The empty
         // registry it starts from serves nothing if that ever changed.
@@ -627,10 +631,12 @@ impl HttpSource {
         let Some(batch) = staged.as_mut() else {
             drop(staged);
             // Nothing staged means the batch carried state and no messages,
-            // and an empty send cannot fail, so the NACK is the state save.
-            // `take_dirty_state` already cleared the flag and marked every
-            // endpoint submitted, so re-arming here is the only thing that
-            // stops a revocation being lost while the API reports it durable.
+            // so the NACK is about that state: either the runtime could not
+            // persist it, or it short-circuited the send stage because its own
+            // state storage was unavailable. `take_dirty_state` already cleared
+            // the flag and marked every endpoint submitted, so re-arming here
+            // is the only thing that stops a revocation being lost while the
+            // API reports it durable. This is load-bearing, not defensive.
             self.shared.rearm_state_flush();
             warn!(
                 "Runtime NACKed the state flush for {CONNECTOR_NAME} connector ID: {}, re-arming it",
@@ -701,9 +707,9 @@ impl Source for HttpSource {
             _ = self.shared.state_flush.notified() => {}
         }
 
-        // State rides an empty batch and nothing else, so the send it depends
-        // on cannot fail. Under traffic that means deferring to a later poll;
-        // re-arming the notify is what stops it waiting on traffic to arrive.
+        // State rides an empty batch and nothing else, so no failed publish
+        // can skip its save. Under traffic that means deferring to a later
+        // poll; re-arming the notify stops it waiting on traffic to arrive.
         let state = if queued.is_empty() {
             self.shared.take_dirty_state()
         } else {
@@ -1584,9 +1590,9 @@ mod tests {
     #[tokio::test]
     async fn given_full_bridge_when_message_sent_should_reject() {
         let mut config = test_support::config(None, &[]);
-        // Two, not one: crossfire routes a capacity of 1 to a single-slot
-        // channel with different mechanics from the array every real
-        // deployment gets, so testing at 1 exercises code that never runs.
+        // Two, not one: at 1 the ring is degenerate, so a test cannot tell a
+        // real capacity bound from an off-by-one. `bounded_async` always builds
+        // an `Array` whatever the size, so the flavour is not what differs.
         config.buffer_capacity = 2;
         let source = HttpSource::new(1, config, None);
 

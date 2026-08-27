@@ -76,8 +76,11 @@ static COMPARE_KEY: LazyLock<hmac::Key> = LazyLock::new(|| hmac::Key::new(hmac::
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     // Signing one side and verifying the other compares tags of a fixed
-    // length, so neither the result nor the timing depends on where the
-    // inputs first differ, or on how long they are.
+    // length, so neither the result nor the timing depends on where the inputs
+    // first differ. Total time is still proportional to their length, since
+    // each HMAC runs one compression per block, so a presented token's length
+    // remains observable. That is the known caveat of this construction and is
+    // acceptable here: length alone does not narrow a secret's content.
     let left_tag = hmac::sign(&COMPARE_KEY, left);
     hmac::verify(&COMPARE_KEY, right, left_tag.as_ref()).is_ok()
 }
