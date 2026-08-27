@@ -105,7 +105,7 @@ impl IggyIndexWriter {
     /// # Errors
     ///
     /// Returns an error if the index bytes cannot be written or synced to disk.
-    pub async fn save_indexes(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
+    pub(crate) async fn save_indexes(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
         if indexes.is_empty() {
             return Ok(0);
         }

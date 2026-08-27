@@ -112,7 +112,7 @@ impl MessagesWriter {
     /// # Errors
     ///
     /// Returns an error if any chunk cannot be written or synced to disk.
-    pub async fn save_frozen_batches<const ALIGN: usize>(
+    pub(crate) async fn save_frozen_batches<const ALIGN: usize>(
         &self,
         buffers: &[Frozen<ALIGN>],
     ) -> Result<IggyByteSize, IggyError> {
