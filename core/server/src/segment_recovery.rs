@@ -64,6 +64,14 @@ const SCAN_WINDOW_CAPACITY: usize = 4 * 1024 * 1024;
 /// batch always gets one.
 const REBUILT_INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 
+/// Sparse index entries the anchor search steps through between reactor
+/// yields, on top of the per-refill yield it shares with the walks. An entry
+/// whose position is past the log end is rejected on arithmetic alone, so it
+/// never refills the scan window, and an index floored back to a short log is
+/// mostly those: without this the search would hold the shard core -- signal
+/// handling included -- for one pread per entry over the whole file.
+const ANCHOR_SEARCH_YIELD_STRIDE: u64 = 1024;
+
 /// Units the damage probes of one partition load may spend per byte of
 /// residue they are asked to classify, at one unit per candidate offset
 /// examined. Candidates never outnumber residue bytes, so an honest
@@ -413,6 +421,13 @@ struct PlannedSegment {
 /// Scoped to the LOAD, not to one probe: pass A probes every segment before
 /// pass B can refuse the chain, so a per-probe budget would multiply the
 /// worst case by the segment count.
+///
+/// The limits are therefore a sum of grants, not a function of any one
+/// residue: the index anchor search grows them over the log spans it steps
+/// across and the damage probe grows them again over residue that can overlap
+/// those spans, so a segment whose index was walked backward carries a larger
+/// allowance than its own residue would buy. Exhaustion only ever refuses and
+/// never truncates, so the looser bound buys boot work, not a weaker verdict.
 #[derive(Default)]
 struct ProbeBudget {
     limit_units: u64,
@@ -1140,6 +1155,14 @@ async fn recover_segment_bounds(
                     anchor,
                 )
                 .await?;
+                // The anchor passed the same checks this walk applies to its
+                // first batch, so it proves at least that one. Pass C relies
+                // on it: the retained entries stop at the anchor, and only a
+                // walk that got past it leaves them inside the truncated log.
+                debug_assert!(
+                    walk.proved_any,
+                    "a provable anchor must prove its own batch to the walk"
+                );
             }
             refuse_if_survivor_past_damage(
                 identity,
@@ -1451,7 +1474,10 @@ async fn walk_chain_from_anchor(
 /// every such span and its verify always fits the residue multiple; entries
 /// packed closer together than the batches they claim exhaust it and refuse,
 /// rather than paying a verify per entry over an index that never proves.
-/// Yields once per window of disk reads, like the walks.
+/// Yields once per window of disk reads, like the walks, and additionally
+/// every [`ANCHOR_SEARCH_YIELD_STRIDE`] entries: an entry that overshoots the
+/// log reads nothing from it, so there is no refill to key the yield on, and
+/// a floored index is full of exactly those.
 async fn find_provable_index_anchor(
     identity: PartitionIdentity<'_>,
     index_path: &str,
@@ -1527,9 +1553,9 @@ async fn find_provable_index_anchor(
                     return Ok(Some((entry_index + 1, entry)));
                 }
             }
-            if scanner.take_refilled() {
-                yield_to_reactor().await;
-            }
+        }
+        if scanner.take_refilled() || entry_index.is_multiple_of(ANCHOR_SEARCH_YIELD_STRIDE) {
+            yield_to_reactor().await;
         }
         let Some(next) = entry_index.checked_sub(1) else {
             return Ok(None);
