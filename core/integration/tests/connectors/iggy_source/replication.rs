@@ -24,22 +24,27 @@ use iggy::prelude::{
 use iggy_common::{
     Consumer, Identifier, MessageClient, PollingStrategy, StreamClient, TopicClient,
 };
+use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use integration::harness::{
     ServerHandle, TestBinary, TestBinaryError, TestContext, TestFixture, TestHarness,
     TestServerConfig, seeds,
 };
 use integration::iggy_harness;
+use reqwest::Client;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
+const API_KEY: &str = "test-api-key";
+const SOURCE_KEY: &str = "iggy";
 const UPSTREAM_STREAM: &str = "upstream_stream";
 const UPSTREAM_TOPIC: &str = "upstream_topic";
 const TEST_MESSAGE_COUNT: usize = 5;
-const POLL_ATTEMPTS: usize = 100;
+const POLL_ATTEMPTS: usize = 200;
 const POLL_INTERVAL_MS: u64 = 50;
 const POLL_BATCH: u32 = 100;
+const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const HEADER_PRODUCER_KEY: &str = "producer";
 const HEADER_PRODUCER_VALUE: &str = "integration-test";
 const HEADER_SEQ_KEY: &str = "seq";
@@ -251,7 +256,50 @@ fn assert_headers(message: &IggyMessage, expected_seq: u64) {
     );
 }
 
+async fn source_errors(http: &Client, api_url: &str) -> u64 {
+    let stats = http
+        .get(format!("{api_url}/stats"))
+        .header("api-key", API_KEY)
+        .send()
+        .await
+        .expect("runtime stats should be available")
+        .json::<ConnectorRuntimeStats>()
+        .await
+        .expect("runtime stats should be valid");
+    stats
+        .connectors
+        .iter()
+        .find(|connector| connector.key == SOURCE_KEY)
+        .expect("Iggy source stats should be present")
+        .errors
+}
+
+async fn wait_for_source_error_after(http: &Client, api_url: &str, previous_errors: u64) {
+    timeout(WAIT_TIMEOUT, async {
+        loop {
+            if let Ok(response) = http
+                .get(format!("{api_url}/stats"))
+                .header("api-key", API_KEY)
+                .send()
+                .await
+                && let Ok(stats) = response.json::<ConnectorRuntimeStats>().await
+                && let Some(source) = stats
+                    .connectors
+                    .iter()
+                    .find(|connector| connector.key == SOURCE_KEY)
+                && source.errors > previous_errors
+            {
+                break;
+            }
+            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+    })
+    .await
+    .expect("Iggy source did not report a downstream send failure");
+}
+
 #[iggy_harness(
+    cluster_nodes = 1,
     server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
     seed = seeds::connector_stream
 )]
@@ -287,6 +335,80 @@ async fn iggy_source_replicates_messages_with_headers(
 }
 
 #[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn downstream_outage_replays_nacked_batch_after_recovery(
+    harness: &mut TestHarness,
+    fixture: IggySourceUpstreamFixture,
+) {
+    let upstream_client = fixture.client().await.expect("upstream client");
+    fixture.ensure_upstream_topic(&upstream_client).await;
+
+    let downstream_address = harness
+        .server()
+        .tcp_addr()
+        .expect("downstream server TCP address");
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        .add_env(
+            "IGGY_CONNECTORS_IGGY_ADDRESS",
+            format!("{downstream_address}?reconnection_retries=1&reconnection_interval=100ms"),
+        );
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime with finite reconnection retries");
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = Client::new();
+    let errors_before_outage = source_errors(&http, &api_url).await;
+
+    harness
+        .server_mut()
+        .stop()
+        .expect("Failed to stop downstream server");
+
+    let payloads: Vec<String> = (0..TEST_MESSAGE_COUNT)
+        .map(|i| format!("outage-message-{i}"))
+        .collect();
+    fixture.produce_messages(&upstream_client, &payloads).await;
+    wait_for_source_error_after(&http, &api_url, errors_before_outage).await;
+
+    harness
+        .server_mut()
+        .start()
+        .expect("Failed to restart downstream server");
+
+    let received =
+        drain_downstream_topic(harness, "iggy_source_outage_consumer", TEST_MESSAGE_COUNT).await;
+    assert_eq!(
+        received.len(),
+        TEST_MESSAGE_COUNT,
+        "Expected the NACKed batch to be replayed after downstream recovery"
+    );
+    for (index, message) in received.iter().enumerate() {
+        assert_eq!(
+            String::from_utf8_lossy(&message.payload),
+            payloads[index],
+            "Payload mismatch at index {index}"
+        );
+    }
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
     server(connectors_runtime(config_path = "tests/connectors/iggy_source/source.toml")),
     seed = seeds::connector_stream
 )]
