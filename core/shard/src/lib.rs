@@ -4487,10 +4487,10 @@ where
         }
         // A metadata-plane op that did not match above (no metadata consensus on
         // this shard, or a namespace neither plane claims) is DROPPED, never
-        // offered to the partition arm. Falling through let a metadata prepare
-        // reach `apply_repaired_prepare`: it journals nothing and never reaches
-        // the frontier update, but it resets the partition repair session's
-        // idle ticks, masking a genuine stall.
+        // offered to the partition arm. Falling through would let a metadata
+        // prepare reach `apply_repaired_prepare`: it journals nothing and never
+        // reaches the frontier update, but it resets the partition repair
+        // session's idle ticks, masking a genuine stall.
         if metadata_plane_op {
             tracing::debug!(
                 shard = self.id,
