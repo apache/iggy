@@ -112,8 +112,8 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `topic_path` | string | none | Exposes `POST /topics/{topic_path}`. Unset leaves only secret-path endpoints. |
 | `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
-| `max_body_size_bytes` | usize | `1048576` | Request body limit, enforced by the `Bytes` extractor. Routing wins over it: an oversized POST to an unknown path answers 404, not 413. On a known path the body is buffered before authentication, which HMAC-over-raw-body requires. Must match across instances sharing a listener. |
-| `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, though see Backpressure: until #3795 lands that signals an arrival burst, not a slow Iggy. |
+| `max_body_size_bytes` | usize | `1048576` | Request body limit. Routing wins over it: an oversized POST to an unknown path answers 404, not 413. On `/e/{id}` the `Bytes` extractor enforces it and the body is read before authentication, which HMAC over the raw body requires. On the named path the bearer token is checked first and the cap is applied by hand afterwards, so an unauthenticated caller never makes the process buffer. Must match across instances sharing a listener. |
+| `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. |
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
 | `forward_headers` | array | `[]` | Request headers copied onto the message. Invalid names fail `open()`, as do `Authorization`, `Proxy-Authorization`, and `Cookie` — forwarding a reusable credential would copy it onto every message and persist it in the log. |
@@ -163,7 +163,7 @@ Content-Type: application/json
 | 400 | Malformed request body, e.g. the client reset mid-send | `{"error":"bad request"}` |
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
 | 429 | Bridge full | `{"error":"service temporarily unavailable"}` plus `Retry-After: 1` |
-| 503 | `GET /health` with no instance serving | `{"status":"unavailable"}` |
+| 503 | `GET /health` when any instance on the listener has stopped polling, or a POST whose instance bridge has no receiver | `{"status":"unavailable"}` or `{"error":"service unavailable"}` |
 
 Revoked and expired endpoints both answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. The lookup runs before any credential is checked, so anything other than 404 would answer that question for an unauthenticated caller. Error bodies carry no internals; diagnostics live on the admin listener.
 
@@ -248,9 +248,9 @@ That errs toward reporting not-yet-durable, which is the safe direction. It also
 
 ## Backpressure
 
-The chain below is the **target** behaviour and is not yet complete: it needs the bounded runtime forwarding channel from #3795.
+The chain below holds end to end. It did not always: the runtime's forwarding channel is unbounded, so a slow Iggy used to show up as memory growth rather than backpressure, and #3795 proposed bounding it.
 
-The bridge is bounded today, so 429 does fire on an arrival burst the poll loop cannot keep up with. What is missing is the coupling: until #3795 lands, `poll()` drains into an unbounded runtime channel, so a slow Iggy does not propagate back into 429 and shows up as memory growth instead.
+What closed the gap instead was #3855. The SDK now keeps one batch in flight and will not call `poll()` again until the runtime acknowledges the last one, so a slow Iggy stalls the poll loop directly. The bridge then fills on arrival and the handlers answer 429, which is the coupling that was missing.
 
 ```text
 Iggy slow -> forwarding loop blocks -> bounded channel fills -> poll() stalls
@@ -277,7 +277,8 @@ The bridge is bounded by message count, not bytes, so worst-case memory is `buff
 | ------ | ---- | ------ | ----- |
 | `http_source_requests_total` | counter | `instance`, `kind`, `status` | |
 | `http_source_request_duration_seconds` | histogram | `instance`, `status` | |
-| `http_source_rejected_full_total` | counter | `instance` | |
+| `http_source_rejected_full_total` | counter | `instance` | 429, the bridge was full |
+| `http_source_rejected_disconnected_total` | counter | `instance` | 503, the bridge had no receiver |
 | `http_source_dropped_on_close_total` | counter | `instance` | |
 | `http_source_headers_clamped_total` | counter | `instance` | |
 | `http_source_headers_dropped_total` | counter | `instance` | |

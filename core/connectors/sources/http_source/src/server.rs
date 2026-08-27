@@ -214,16 +214,16 @@ struct SharedServer {
     draining: bool,
 }
 
-/// The part of a shared server the request handlers see.
-#[derive(Debug)]
 /// The instance set and the routes derived from it, published as one value so
 /// no reader can see them disagree.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct Published {
     pub(crate) instances: Vec<Arc<SharedState>>,
     pub(crate) routes: RouteTable,
 }
 
+/// The part of a shared server the request handlers see.
+#[derive(Debug)]
 pub(crate) struct ServerState {
     pub(crate) listen_addr: String,
     /// Taken from the first instance to bind, like `management_token`.
@@ -675,7 +675,7 @@ async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
     // drains, which is the exact failure this gate exists to catch. Shedding
     // the healthy sibling's traffic too costs availability that senders recover
     // by retrying; the alternative loses data that was already answered 200.
-    let ready = !published.routes.is_empty()
+    let ready = published.routes.serves_anything(now)
         && !instances.is_empty()
         && instances.iter().all(|instance| instance.poll_is_live(now));
     if !ready {
@@ -753,7 +753,7 @@ fn enqueue(
         // backpressure would tell a sender to retry into a channel that no
         // longer has a receiver, and would file the loss under the wrong metric.
         if matches!(error, crossfire::TrySendError::Disconnected(_)) {
-            metrics.record_rejected_full(&instance.instance_name);
+            metrics.record_rejected_disconnected(&instance.instance_name);
             error!(
                 "Rejected a request for {CONNECTOR_NAME} connector ID: {}, its bridge has no receiver",
                 instance.id
@@ -1721,6 +1721,42 @@ mod tests {
         );
         close(&mut second).await;
         close(&mut first).await;
+    }
+
+    #[tokio::test]
+    async fn given_all_endpoints_revoked_when_health_checked_should_report_unavailable() {
+        // `build` inserts revoked endpoints so a leaked id resolves to a 404
+        // attributed to its owner rather than to `unrouted`, which means a bare
+        // emptiness check on the table would call this instance routable.
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.topic_path = None;
+        let mut source = open(1, config).await;
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        assert!(
+            shared
+                .mutate_registry(|registry| registry.revoke(
+                    ENDPOINT_ONE,
+                    "compromised".to_string(),
+                    1
+                ))
+                .await
+        );
+        rebuild_routes(&source).await;
+
+        let response = client()
+            .get(format!("{}/health", base_url(&source)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an instance that would refuse every request is not ready"
+        );
+        close(&mut source).await;
     }
 
     #[tokio::test]
