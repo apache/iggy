@@ -23,6 +23,7 @@ use iggy::prelude::{
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
     retry::{exponential_backoff, jitter, parse_duration},
+    source::SourceBatchResult,
     source_connector,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -82,11 +83,10 @@ impl FromStr for InitialOffset {
     }
 }
 
-/// Persisted state. `offsets` maps each upstream partition to the offset of
-/// the last message that was handed to the runtime and therefore successfully
-/// produced to the downstream cluster; the runtime persists the state only
-/// after a successful downstream send, so a restart resumes from `offset + 1`.
-#[derive(Debug, Serialize, Deserialize)]
+/// Committed state. `offsets` maps each upstream partition to the offset of
+/// the last message confirmed by the runtime after both the downstream send
+/// and checkpoint save succeeded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     offsets: HashMap<u32, u64>,
     messages_synced: u64,
@@ -99,6 +99,7 @@ pub struct IggySource {
     config: IggySourceConfig,
     client: Option<IggyClient>,
     state: Mutex<State>,
+    pending_state: Mutex<Option<State>>,
     partitions: Vec<u32>,
     stream_id: Option<Identifier>,
     topic_id: Option<Identifier>,
@@ -159,6 +160,7 @@ impl IggySource {
                 messages_synced: 0,
                 errors_count: 0,
             })),
+            pending_state: Mutex::new(None),
             partitions: Vec::new(),
             stream_id: None,
             topic_id: None,
@@ -345,14 +347,9 @@ impl Source for IggySource {
 
         let consumer = Consumer::default();
 
-        let saved_offsets: HashMap<u32, u64> = {
-            let state = self.state.lock().await;
-            state.offsets.clone()
-        };
+        let mut candidate_state = self.state.lock().await.clone();
 
         let mut messages = Vec::with_capacity(self.partitions.len() * self.batch_size as usize);
-        let mut new_offsets: HashMap<u32, u64> = HashMap::new();
-        let mut reset_offsets: Vec<u32> = Vec::new();
         let mut errors_in_cycle: u64 = 0;
         let mut any_success = false;
         let mut connection_failure = false;
@@ -360,7 +357,7 @@ impl Source for IggySource {
         for &partition_id in &self.partitions {
             let strategy = next_strategy(
                 self.initial_offset,
-                saved_offsets.get(&partition_id).copied(),
+                candidate_state.offsets.get(&partition_id).copied(),
             );
             let polled = client
                 .poll_messages(
@@ -399,7 +396,7 @@ impl Source for IggySource {
                             }
                         }
                     }
-                    new_offsets.insert(partition_id, last_offset);
+                    candidate_state.offsets.insert(partition_id, last_offset);
                 }
                 Err(IggyError::InvalidOffset(offset)) => {
                     warn!(
@@ -407,7 +404,7 @@ impl Source for IggySource {
                          for {CONNECTOR_NAME} connector ID: {}, resetting to initial offset",
                         self.id
                     );
-                    reset_offsets.push(partition_id);
+                    candidate_state.offsets.remove(&partition_id);
                     errors_in_cycle += 1;
                 }
                 Err(e) => {
@@ -423,19 +420,13 @@ impl Source for IggySource {
             }
         }
 
-        let (persisted_state, total_synced) = {
-            let mut state = self.state.lock().await;
-            for (partition_id, offset) in new_offsets {
-                state.offsets.insert(partition_id, offset);
-            }
-            for partition_id in reset_offsets {
-                state.offsets.remove(&partition_id);
-            }
-            state.messages_synced += messages.len() as u64;
-            state.errors_count += errors_in_cycle;
-            let persisted = self.serialize_state(&state);
-            (persisted, state.messages_synced)
-        };
+        candidate_state.messages_synced += messages.len() as u64;
+        candidate_state.errors_count += errors_in_cycle;
+        let total_synced = candidate_state.messages_synced;
+        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
+            Error::Serialization("failed to serialize Iggy source state".to_string())
+        })?;
+        *self.pending_state.lock().await = Some(candidate_state);
 
         if connection_failure && !any_success {
             self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
@@ -468,8 +459,18 @@ impl Source for IggySource {
         Ok(ProducedMessages {
             schema: Schema::Raw,
             messages,
-            state: persisted_state,
+            state: Some(persisted_state),
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let candidate_state = self.pending_state.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(candidate_state) = candidate_state
+        {
+            *self.state.lock().await = candidate_state;
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -650,6 +651,66 @@ mod tests {
         let bytes = connector_state.unwrap().0;
         let restored: State = rmp_serde::from_slice(&bytes).expect("Failed to deserialize state");
         assert_eq!(restored.messages_synced, 42);
+    }
+
+    #[test]
+    fn given_nack_when_state_is_staged_should_keep_committed_state() {
+        let source = IggySource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = State {
+                offsets: HashMap::from([(0, 9)]),
+                messages_synced: 10,
+                errors_count: 1,
+            };
+            *source.pending_state.lock().await = Some(State {
+                offsets: HashMap::from([(0, 19)]),
+                messages_synced: 20,
+                errors_count: 2,
+            });
+
+            source
+                .on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+
+            let committed = source.state.lock().await;
+            assert_eq!(committed.offsets, HashMap::from([(0, 9)]));
+            assert_eq!(committed.messages_synced, 10);
+            assert_eq!(committed.errors_count, 1);
+            drop(committed);
+            assert!(source.pending_state.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    fn given_ack_when_state_is_staged_should_commit_candidate_state() {
+        let source = IggySource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            *source.state.lock().await = State {
+                offsets: HashMap::from([(0, 9)]),
+                messages_synced: 10,
+                errors_count: 1,
+            };
+            *source.pending_state.lock().await = Some(State {
+                offsets: HashMap::from([(0, 19)]),
+                messages_synced: 20,
+                errors_count: 2,
+            });
+
+            source
+                .on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+
+            let committed = source.state.lock().await;
+            assert_eq!(committed.offsets, HashMap::from([(0, 19)]));
+            assert_eq!(committed.messages_synced, 20);
+            assert_eq!(committed.errors_count, 2);
+            drop(committed);
+            assert!(source.pending_state.lock().await.is_none());
+        });
     }
 
     #[test]
