@@ -20,7 +20,7 @@ description: Python pre-merge testing with maturin github iggy actions
 
 inputs:
   task:
-    description: "Task to run (lint, test, build)"
+    description: "Task to run (lint, test)"
     required: true
 
 runs:
@@ -90,6 +90,21 @@ runs:
         echo "pyrefly version: $(uv run pyrefly --version)"
       shell: bash
 
+    - name: Build Python wheel
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/python
+
+        # Build the module
+        echo "Building Python wheel..."
+        uv run maturin build -o dist
+
+        # List built artifacts
+        echo ""
+        echo "Build artifacts:"
+        ls -la dist/
+      shell: bash
+
     - name: Build Python wheel with coverage instrumentation
       if: inputs.task == 'test'
       run: |
@@ -103,21 +118,6 @@ runs:
         cargo llvm-cov clean --workspace
         echo "Building Python wheel with coverage instrumentation..."
         uv run --no-sync maturin develop
-      shell: bash
-
-    - name: Build Python wheel
-      if: inputs.task == 'build'
-      run: |
-        cd foreign/python
-
-        # Build the module
-        echo "Building Python wheel..."
-        uv run maturin build -o dist
-
-        # List built artifacts
-        echo ""
-        echo "Build artifacts:"
-        ls -la dist/
       shell: bash
 
     - name: Build server Docker image for TLS tests
