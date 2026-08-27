@@ -158,7 +158,7 @@ impl ConnectionStringUtils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IggyDuration;
+    use crate::NonZeroIggyDuration;
     use crate::TcpConnectionStringOptions;
     use secrecy::ExposeSecret;
 
@@ -255,7 +255,7 @@ mod tests {
         assert!(connection_string.options.retries().is_none());
         assert_eq!(
             connection_string.options.heartbeat_interval(),
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
     }
 
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(connection_string.options.retries().unwrap(), 3);
         assert_eq!(
             connection_string.options.heartbeat_interval(),
-            IggyDuration::from_str("10s").unwrap()
+            NonZeroIggyDuration::from_str("10s").unwrap()
         );
     }
 
@@ -317,7 +317,7 @@ mod tests {
         assert!(connection_string.options.retries().is_none());
         assert_eq!(
             connection_string.options.heartbeat_interval(),
-            IggyDuration::from_str("5s").unwrap()
+            NonZeroIggyDuration::from_str("5s").unwrap()
         );
     }
 }

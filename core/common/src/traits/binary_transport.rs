@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ClientState, Credentials, DiagnosticEvent, IggyDuration, IggyError};
+use crate::{
+    ClientState, Credentials, DiagnosticEvent, Identifier, IggyError, NonZeroIggyDuration,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -28,7 +30,7 @@ pub trait BinaryTransport {
     async fn set_state(&self, state: ClientState);
     async fn publish_event(&self, event: DiagnosticEvent);
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
-    fn get_heartbeat_interval(&self) -> IggyDuration;
+    fn get_heartbeat_interval(&self) -> NonZeroIggyDuration;
 
     /// Per-transport consumer-group + partitioning cache used to resolve
     /// partitioning client-side under VSR (the broker never picks a
@@ -57,10 +59,20 @@ pub trait VsrSessionControl: vsr_session_sealed::Sealed + BinaryTransport {
     /// otherwise less reconnectable than one that configures `AutoLogin`,
     /// which is a surprising difference between two ways of doing the same
     /// thing. Transports that cannot reconnect leave this a no-op.
-    async fn remember_session_credentials(&self, _credentials: Credentials) {}
+    async fn remember_session_credentials(&self, _credentials: Credentials, _user_id: u32) {}
     /// Drop them: after an explicit logout there is no session to restore,
     /// and a reconnect must not resurrect one.
     async fn forget_session_credentials(&self) {}
+    /// A committed password change for `user`: when it is the signed-in user,
+    /// the credentials the next reconnect signs in with switch to the new
+    /// password, or that reconnect would replay the old one and fail an
+    /// unrelated request with `InvalidCredentials`. Other users' changes are
+    /// ignored.
+    ///
+    /// This covers a configured `AutoLogin` as well as a sign-in the caller
+    /// ran: the configured credentials still decide *who* the client signs in
+    /// as, and a committed change decides what that user's password is.
+    async fn refresh_session_password(&self, _user: &Identifier, _new_password: &str) {}
     /// SDK crate version sent in the login-register version prefix.
     /// Implemented by the transports so the value is the SDK crate's own
     /// `CARGO_PKG_VERSION` (`iggy` for Rust), not `iggy_common`'s.

@@ -159,7 +159,7 @@ pub(crate) fn encode_request_header(
 /// the authority: an unmapped code is forwarded as non-replicated (the code
 /// rides `RequestHeader.reserved`, which that path already stamps) and the
 /// server answers with a proper error if it does not know it.
-fn operation_for_code(code: u32) -> Operation {
+pub(crate) fn operation_for_code(code: u32) -> Operation {
     if code == LOGOUT_USER_CODE {
         return Operation::Logout;
     }

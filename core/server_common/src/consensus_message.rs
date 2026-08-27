@@ -20,11 +20,12 @@ use crate::sharding::METADATA_GROUP;
 use iggy_binary_protocol::{
     Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
     ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
-    ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader, RequestPreparesHeader,
-    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
-    RoutedRequestHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-    StateTransferTargetHeader,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
+    PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+    StateChunkHeader, StateTransferTargetHeader, frame_checksum_bytes,
+    prepare_identity_checksum_bytes,
 };
 use smallvec::SmallVec;
 use std::{
@@ -787,10 +788,53 @@ where
     if let Some(offset) = H::OPERATION_OFFSET
         && let Some(&code) = bytes.get(offset)
         && !Operation::is_known_code(code)
+        && operation_byte_is_trustworthy::<H>(bytes)
     {
         return ConsensusError::UnsupportedOperation { operation: code };
     }
     ConsensusError::InvalidBitPattern
+}
+
+/// Whether the operation byte may be read as the sender's release rather than
+/// as damage.
+///
+/// This classification runs before `verify_frame`, so the byte is still
+/// unverified: a flipped bit landing in an undefined discriminant would
+/// otherwise be reported as "upgrade this node", and for a `PrepareOk` --
+/// which echoes an operation this primary minted itself -- corruption is the
+/// likelier cause anyway. Sealed headers verify the frame checksum; the
+/// Prepare family verifies the identity checksum, which covers the operation
+/// byte, recomputed over the raw bytes because the unknown discriminant blocks
+/// the typed view.
+///
+/// A `Request` has neither (its `checksum` crosses the client boundary
+/// unsealed), so its byte is taken at face value and the error text claims
+/// only *likely* skew.
+fn operation_byte_is_trustworthy<H>(bytes: &[u8]) -> bool
+where
+    H: ConsensusHeader,
+{
+    if !H::FRAME_SEALED && !H::IDENTITY_CHECKSUMMED {
+        return true;
+    }
+    let Some(header) = bytes
+        .get(..HEADER_SIZE)
+        .and_then(|slice| <&[u8; HEADER_SIZE]>::try_from(slice).ok())
+    else {
+        return false;
+    };
+    let Some(stored) = header
+        .get(..size_of::<u128>())
+        .and_then(|slice| <[u8; size_of::<u128>()]>::try_from(slice).ok())
+    else {
+        return false;
+    };
+    let expected = if H::FRAME_SEALED {
+        frame_checksum_bytes(header)
+    } else {
+        prepare_identity_checksum_bytes(header)
+    };
+    u128::from_le_bytes(stored) == expected
 }
 
 impl<T> TryFrom<Message<T>> for MessageBag
@@ -936,6 +980,144 @@ mod tests {
             seal_header_bytes(buf);
         }
         owned
+    }
+
+    /// An operation byte from a newer release, on a frame whose seal proves the
+    /// byte arrived as the sender wrote it.
+    fn sealed_prepare_ok_with_operation(operation: u8) -> Owned<MESSAGE_ALIGN> {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = Command::PrepareOk as u8;
+            buf[offset_of!(PrepareOkHeader, operation)] = operation;
+            seal_header_bytes(buf);
+        }
+        owned
+    }
+
+    const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+    #[test]
+    fn given_a_sealed_frame_when_its_operation_is_unknown_should_report_version_skew() {
+        let owned = sealed_prepare_ok_with_operation(OPERATION_FROM_A_NEWER_RELEASE);
+
+        assert!(matches!(
+            classify_failed_cast::<PrepareOkHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
+    }
+
+    // The classification runs before `verify_frame`, so on a sealed header the
+    // operation byte is unverified. A flipped bit landing in an undefined
+    // discriminant must not be reported as "the sender runs a newer release":
+    // that sends an operator upgrading a node over a corrupt link, and a
+    // `PrepareOk` echoes an operation this primary minted itself, so corruption
+    // is the likelier cause to begin with.
+    #[test]
+    fn given_a_corrupt_sealed_frame_when_its_operation_is_unknown_should_not_claim_version_skew() {
+        let mut owned = sealed_prepare_ok_with_operation(0);
+        // Flip the operation byte AFTER sealing, the way damage in flight does.
+        owned.as_mut_slice()[offset_of!(PrepareOkHeader, operation)] =
+            OPERATION_FROM_A_NEWER_RELEASE;
+
+        assert!(matches!(
+            classify_failed_cast::<PrepareOkHeader>(owned.as_slice()),
+            ConsensusError::InvalidBitPattern
+        ));
+    }
+
+    /// A Prepare frame stamped the way a real sender stamps it: `checksum`
+    /// carries the prepare identity, which covers the operation byte.
+    fn identity_stamped_prepare(command: Command, operation: u8) -> Owned<MESSAGE_ALIGN> {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = command as u8;
+            buf[offset_of!(PrepareHeader, operation)] = operation;
+            let header: &[u8; HEADER_SIZE] =
+                buf[..HEADER_SIZE].try_into().expect("frame is a header");
+            let identity = prepare_identity_checksum_bytes(header);
+            buf[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
+        }
+        owned
+    }
+
+    // A prepare's `checksum` carries its identity, which covers the operation
+    // byte, so an intact identity authenticates the unknown byte as the
+    // sender's release rather than damage.
+    #[test]
+    fn given_an_identity_stamped_prepare_when_its_operation_is_unknown_should_report_version_skew()
+    {
+        let owned = identity_stamped_prepare(Command::Prepare, OPERATION_FROM_A_NEWER_RELEASE);
+
+        const { assert!(!PrepareHeader::FRAME_SEALED) };
+        assert!(matches!(
+            classify_failed_cast::<PrepareHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
+    }
+
+    // The identity was computed over a DIFFERENT operation byte, so the flip
+    // happened after stamping: damage, not a release.
+    #[test]
+    fn given_a_corrupt_prepare_when_its_operation_is_unknown_should_not_claim_version_skew() {
+        let mut owned = identity_stamped_prepare(Command::Prepare, 0);
+        owned.as_mut_slice()[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+
+        assert!(matches!(
+            classify_failed_cast::<PrepareHeader>(owned.as_slice()),
+            ConsensusError::InvalidBitPattern
+        ));
+    }
+
+    // A client `Request` has neither a frame seal nor a prepare identity, so
+    // its operation byte is taken at face value; the error text claims only
+    // likely skew for exactly this reason.
+    #[test]
+    fn given_a_client_request_when_its_operation_is_unknown_should_report_version_skew() {
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let buf = owned.as_mut_slice();
+            buf[SIZE_OFF..SIZE_OFF + 4].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+            buf[COMMAND_OFF] = Command::Request as u8;
+            buf[offset_of!(RequestHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+        }
+
+        const { assert!(!RequestHeader::FRAME_SEALED && !RequestHeader::IDENTITY_CHECKSUMMED) };
+        assert!(matches!(
+            classify_failed_cast::<RequestHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
+    }
+
+    // Transparent over `PrepareHeader`, so a repaired prepare from a newer
+    // release must reach the same fence instead of reading as corruption.
+    #[test]
+    fn given_a_repaired_prepare_when_its_operation_is_unknown_should_report_version_skew() {
+        assert_eq!(
+            RepairPrepareHeader::OPERATION_OFFSET,
+            PrepareHeader::OPERATION_OFFSET,
+            "the newtype carries the same operation field"
+        );
+        const { assert!(RepairPrepareHeader::IDENTITY_CHECKSUMMED) };
+
+        let owned =
+            identity_stamped_prepare(Command::RepairPrepare, OPERATION_FROM_A_NEWER_RELEASE);
+
+        assert!(matches!(
+            classify_failed_cast::<RepairPrepareHeader>(owned.as_slice()),
+            ConsensusError::UnsupportedOperation {
+                operation: OPERATION_FROM_A_NEWER_RELEASE
+            }
+        ));
     }
 
     #[test]

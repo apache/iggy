@@ -2420,15 +2420,18 @@ mod tests {
             frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
             frame[std::mem::offset_of!(PrepareHeader, command)] = Command::Prepare as u8;
             frame[std::mem::offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+            // A prepare's `checksum` carries the identity checksum, computed
+            // over the operation byte among others; stamping it the way a real
+            // sender does is what lets the classifier trust that byte.
             let header: &[u8; iggy_binary_protocol::HEADER_SIZE] = frame
                 [..iggy_binary_protocol::HEADER_SIZE]
                 .try_into()
                 .expect("frame spans a full header");
-            let checksum = iggy_binary_protocol::frame_checksum_bytes(header);
-            frame[..size_of::<u128>()].copy_from_slice(&checksum.to_le_bytes());
+            let identity = iggy_binary_protocol::prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
         }
         let message = Message::<iggy_binary_protocol::GenericHeader>::try_from(owned)
-            .expect("a sealed Prepare frame is wire-valid in the generic view");
+            .expect("an identity-stamped Prepare frame is wire-valid in the generic view");
 
         let before = shard.metrics().frame_drop_count(
             shard::metrics::frame_drop_variant::CONSENSUS,
@@ -2451,6 +2454,68 @@ mod tests {
             ),
             0,
             "version skew must not read as header corruption"
+        );
+    }
+
+    /// The complement of the upgrade-fence accounting: an operation byte that
+    /// landed in undefined space by CORRUPTION (the prepare identity no longer
+    /// matches) must count as `unparsable`, never as version skew -- the two
+    /// counters send an operator to opposite remedies.
+    #[compio::test]
+    async fn given_a_corrupt_operation_byte_when_dispatched_should_account_an_unparsable_drop() {
+        const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let shard = build_test_shard(0, &config, TestMux::default());
+
+        let mut owned = server_common::iobuf::Owned::<{ server_common::MESSAGE_ALIGN }>::zeroed(
+            iggy_binary_protocol::HEADER_SIZE,
+        );
+        {
+            let frame = owned.as_mut_slice();
+            let size_offset = std::mem::offset_of!(PrepareHeader, size);
+            let frame_size =
+                u32::try_from(iggy_binary_protocol::HEADER_SIZE).expect("header size fits in u32");
+            frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
+            frame[std::mem::offset_of!(PrepareHeader, command)] = Command::Prepare as u8;
+            // Identity stamped over operation 0, then the byte flipped in
+            // flight: the checksum mismatch is what proves corruption.
+            let header: &[u8; iggy_binary_protocol::HEADER_SIZE] = frame
+                [..iggy_binary_protocol::HEADER_SIZE]
+                .try_into()
+                .expect("frame spans a full header");
+            let identity = iggy_binary_protocol::prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
+            frame[std::mem::offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+        }
+        let message = Message::<iggy_binary_protocol::GenericHeader>::try_from(owned)
+            .expect("the frame is wire-valid in the generic view");
+
+        let unparsable_before = shard.metrics().frame_drop_count(
+            shard::metrics::frame_drop_variant::CONSENSUS,
+            shard::metrics::frame_drop_reason::UNPARSABLE,
+        );
+        let skew_before = shard.metrics().frame_drop_count(
+            shard::metrics::frame_drop_variant::CONSENSUS,
+            shard::metrics::frame_drop_reason::UNSUPPORTED_OPERATION,
+        );
+        shard.dispatch(message);
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::CONSENSUS,
+                shard::metrics::frame_drop_reason::UNPARSABLE,
+            ),
+            unparsable_before + 1,
+            "a corrupt operation byte is header damage and must be accounted as such"
+        );
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::CONSENSUS,
+                shard::metrics::frame_drop_reason::UNSUPPORTED_OPERATION,
+            ),
+            skew_before,
+            "corruption must not tell an operator to upgrade the node"
         );
     }
 

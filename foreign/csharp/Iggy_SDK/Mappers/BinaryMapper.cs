@@ -25,9 +25,9 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
-using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Utils;
+using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Mappers;
 
@@ -593,7 +593,7 @@ internal static class BinaryMapper
             });
         }
 
-        return new PolledMessagesRental(TcpMessageStream.EmptyMemoryOwner.Instance)
+        return new PolledMessagesRental(EmptyMemoryOwner.Instance)
         {
             PartitionId = messages.PartitionId,
             CurrentOffset = messages.CurrentOffset,

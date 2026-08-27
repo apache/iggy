@@ -78,7 +78,8 @@ pub use consensus::{
     ReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
     RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET,
     StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
-    frame_body, frame_checksum_bytes, read_size_field, result_code, result_section_len,
+    frame_body, frame_checksum_bytes, prepare_identity_checksum_bytes, read_size_field,
+    result_code, result_section_len,
 };
 pub use dispatch::{COMMAND_TABLE, CommandMeta, lookup_by_operation, lookup_command};
 pub use error::WireError;

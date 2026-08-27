@@ -36,6 +36,7 @@ import io.netty.channel.pool.FixedChannelPool;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.SslHandler;
 import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
@@ -68,16 +69,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.IntConsumer;
 
 /**
  * Async TCP connection using Netty for non-blocking I/O.
  * Manages the connection lifecycle and request/response correlation.
  */
 public class AsyncTcpConnection {
-    private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
-    private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
-    // A missing reply must not hold the single VSR-pinned channel forever.
-    private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
     // Transient VSR denials (not-committed / not-accepted) are replayed with
     // the same encoded frame so the server's dedup sees the same request id.
     // A not-committed outcome is unknown, so it replays for the whole budget.
@@ -85,8 +83,15 @@ public class AsyncTcpConnection {
     // so after a short same-node retry it is handed to the owning client for
     // a leader recheck and safe replay; mirrors TRANSIENT_FAILOVER_CHECK_INTERVAL
     // in core/sdk/src/tcp/tcp_client.rs.
-    private static final int TRANSIENT_NOT_COMMITTED = 57;
-    private static final int TRANSIENT_NOT_ACCEPTED = 58;
+    //
+    // Package-private: the client classifies a failed sign-in by these codes,
+    // and a transient one is not a rejected credential.
+    static final int TRANSIENT_NOT_COMMITTED = 57;
+    static final int TRANSIENT_NOT_ACCEPTED = 58;
+    private static final Logger log = LoggerFactory.getLogger(AsyncTcpConnection.class);
+    private static final Duration DEFAULT_CONNECTION_TIMEOUT = Duration.ofMillis(3000);
+    // A missing reply must not hold the single VSR-pinned channel forever.
+    private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(30);
     private static final long TRANSIENT_RETRY_INTERVAL_MS = 50;
     private static final Duration TRANSIENT_RETRY_BUDGET = Duration.ofSeconds(30);
     private static final Duration NOT_ACCEPTED_RETRY_BUDGET = Duration.ofSeconds(2);
@@ -97,7 +102,7 @@ public class AsyncTcpConnection {
     private final AtomicLong authGeneration = new AtomicLong(0);
     private final VsrRequestEncoder vsrEncoder;
     private final TransientFailoverHandler transientFailoverHandler;
-    private final Runnable sessionResetListener;
+    private final IntConsumer sessionResetListener;
     private final Consumer<Throwable> connectionFailureListener;
     private final long requestTimeoutNanos;
     private final long heartbeatIntervalNanos;
@@ -127,7 +132,7 @@ public class AsyncTcpConnection {
                 Duration.ofSeconds(5),
                 VsrFrameDecoder.DEFAULT_MAX_FRAME_SIZE,
                 null,
-                () -> {},
+                errorCode -> {},
                 ignored -> {});
     }
 
@@ -143,7 +148,7 @@ public class AsyncTcpConnection {
             Duration heartbeatInterval,
             int maxVsrFrameSize,
             TransientFailoverHandler transientFailoverHandler,
-            Runnable sessionResetListener,
+            IntConsumer sessionResetListener,
             Consumer<Throwable> connectionFailureListener) {
         this.transientFailoverHandler = transientFailoverHandler;
         this.sessionResetListener = sessionResetListener;
@@ -165,12 +170,13 @@ public class AsyncTcpConnection {
         this.vsrEncoder = new VsrRequestEncoder(consensusSession);
         this.eventLoopGroup = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
 
+        long dialTimeoutMillis =
+                connectionTimeout.orElse(DEFAULT_CONNECTION_TIMEOUT).toMillis();
         var bootstrap = new Bootstrap()
                 .group(eventLoopGroup)
                 .channel(NioSocketChannel.class)
                 .option(ChannelOption.TCP_NODELAY, true)
-                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int)
-                        connectionTimeout.orElse(DEFAULT_CONNECTION_TIMEOUT).toMillis())
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) dialTimeoutMillis)
                 .option(ChannelOption.SO_KEEPALIVE, true)
                 .remoteAddress(host, port);
 
@@ -180,7 +186,14 @@ public class AsyncTcpConnection {
         this.channelPool = new FixedChannelPool(
                 bootstrap,
                 new PoolChannelHandler(
-                        host, port, enableTls, sslContext, consensusSession, maxVsrFrameSize, this::onSessionEvicted),
+                        host,
+                        port,
+                        enableTls,
+                        sslContext,
+                        dialTimeoutMillis,
+                        consensusSession,
+                        maxVsrFrameSize,
+                        this::onSessionEvicted),
                 ChannelHealthChecker.ACTIVE,
                 FixedChannelPool.AcquireTimeoutAction.FAIL,
                 poolConfig.getAcquireTimeoutMillis(),
@@ -827,10 +840,15 @@ public class AsyncTcpConnection {
      * channel. Bumping the generation makes the replacement channel re-run
      * login and Register. The fresh session invalidates cached routing state
      * such as consumer-group assignments.
+     *
+     * The reason travels to the listener so it can drop what belonged to the
+     * evicted session and log what happened. The session itself is kept
+     * whichever way the sign-in was made: only an explicit sign-out or close
+     * ends one.
      */
-    private void onSessionEvicted() {
+    private void onSessionEvicted(int errorCode) {
         authGeneration.incrementAndGet();
-        sessionResetListener.run();
+        sessionResetListener.accept(errorCode);
     }
 
     private void captureLoginPayloadIfNeeded(int commandCode, ByteBuf payload) {
@@ -892,22 +910,26 @@ public class AsyncTcpConnection {
         private final int port;
         private final boolean enableTls;
         private final SslContext sslContext;
+        private final long dialTimeoutMillis;
         private final ConsensusSession consensusSession;
         private final int maxVsrFrameSize;
-        private final Runnable onEviction;
+        private final IntConsumer onEviction;
 
+        @SuppressWarnings("checkstyle:ParameterNumber")
         PoolChannelHandler(
                 String host,
                 int port,
                 boolean enableTls,
                 SslContext sslContext,
+                long dialTimeoutMillis,
                 ConsensusSession consensusSession,
                 int maxVsrFrameSize,
-                Runnable onEviction) {
+                IntConsumer onEviction) {
             this.host = host;
             this.port = port;
             this.enableTls = enableTls;
             this.sslContext = sslContext;
+            this.dialTimeoutMillis = dialTimeoutMillis;
             this.consensusSession = consensusSession;
             this.maxVsrFrameSize = maxVsrFrameSize;
             this.onEviction = onEviction;
@@ -917,7 +939,12 @@ public class AsyncTcpConnection {
         public void channelCreated(Channel ch) {
             ChannelPipeline pipeline = ch.pipeline();
             if (enableTls) {
-                pipeline.addLast("ssl", sslContext.newHandler(ch.alloc(), host, port));
+                SslHandler ssl = sslContext.newHandler(ch.alloc(), host, port);
+                // A peer that accepts TCP and then never answers the
+                // ClientHello would otherwise hold the dial for Netty's own
+                // 10s default, well past the bound the rotation dials under.
+                ssl.setHandshakeTimeoutMillis(dialTimeoutMillis);
+                pipeline.addLast("ssl", ssl);
             }
             pipeline.addLast("frameDecoder", new VsrFrameDecoder(maxVsrFrameSize));
             pipeline.addLast("responseHandler", new VsrResponseHandler(consensusSession, onEviction));

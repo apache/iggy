@@ -21,7 +21,11 @@ package org.apache.iggy.client.async.tcp;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.config.RetryPolicy;
+import org.apache.iggy.exception.IggyConnectionException;
+import org.apache.iggy.exception.IggyErrorCode;
+import org.apache.iggy.exception.IggyServerException;
 import org.junit.jupiter.api.Test;
 
 import java.io.EOFException;
@@ -36,6 +40,7 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -77,6 +82,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
             int survivorPort = survivorSocket.getLocalPort();
             AtomicInteger survivorRegistrations = new AtomicInteger();
             AtomicInteger survivorPings = new AtomicInteger();
+            List<String> survivorLogins = new CopyOnWriteArrayList<>();
 
             // The primary leads, so the sign-in settles there and the roster is
             // only remembered -- not acted on -- until the node dies.
@@ -97,6 +103,7 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 }
                 if (request.operation() == OPERATION_REGISTER) {
                     survivorRegistrations.incrementAndGet();
+                    survivorLogins.add(request.bodyAsText());
                     return Response.success(OPERATION_REGISTER, registerBody(2));
                 }
                 if (request.is(PING_CODE, OPERATION_NON_REPLICATED)) {
@@ -105,18 +112,25 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
             });
 
+            // Credentials on the builder and a hand-run login for somebody
+            // else. The redial replays the sign-in that last succeeded, which
+            // is also what the connection replays from the login it captured
+            // when the pool swaps a channel: replaying a different user here
+            // would make the same failure land on a different session depending
+            // on which path got there first.
             AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
                     .host(loopback.getHostAddress())
                     .port(primaryPort)
-                    .credentials("iggy", "iggy")
-                    .requestTimeout(Duration.ofSeconds(5))
-                    // A redial rotates one endpoint per attempt, so the survivor
-                    // is the second: keep the pacing short enough to observe.
-                    .retryPolicy(RetryPolicy.fixedDelay(8, Duration.ofMillis(50)))
+                    .credentials("configured", "configured")
+                    .requestTimeout(Duration.ofSeconds(2))
+                    // A whole rotation dials every endpoint the client knows, so
+                    // the survivor is reached before this delay is ever spent.
+                    // One endpoint per attempt would need it first.
+                    .retryPolicy(RetryPolicy.fixedDelay(8, Duration.ofSeconds(5)))
                     .build();
             try {
                 client.connect().get(5, TimeUnit.SECONDS);
-                client.login().get(5, TimeUnit.SECONDS);
+                client.users().login("handrun", "handrun").get(5, TimeUnit.SECONDS);
                 client.sendBinaryRequest(PING_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
                 assertThat(client.getConnectionInfo().port()).isEqualTo(primaryPort);
 
@@ -125,8 +139,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 // The request in flight when the node died is allowed to fail;
                 // what is not allowed is never completing one, which is what a
                 // client that only knows the dead endpoint does.
-                assertThat(resumeWithin(client, Duration.ofSeconds(10)))
-                        .as("the client has to resume on the survivor the roster named")
+                assertThat(resumeWithin(client, Duration.ofSeconds(4)))
+                        .as("the client has to resume on the survivor inside the first rotation")
                         .isTrue();
 
                 assertThat(client.getConnectionInfo().port())
@@ -138,6 +152,73 @@ class AsyncIggyTcpClientEndpointFailoverTest {
                 assertThat(survivorPings)
                         .as("the request landed on the survivor")
                         .hasValueGreaterThanOrEqualTo(1);
+                assertThat(survivorLogins.get(survivorLogins.size() - 1))
+                        .as("the redial replayed the configured user instead of the last sign-in")
+                        .contains("handrun")
+                        .doesNotContain("configured");
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                survivor.close();
+            }
+        }
+    }
+
+    /**
+     * An explicit sign-out is caller intent, like a close: the redial after it
+     * must not sign back in with the credentials that sign-in used.
+     */
+    @Test
+    void shouldNotResurrectASignedOutSessionOnASurvivor() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
+                ServerSocket survivorSocket = new ServerSocket(0, 4, loopback)) {
+            int primaryPort = primarySocket.getLocalPort();
+            int survivorPort = survivorSocket.getLocalPort();
+            AtomicInteger survivorRegistrations = new AtomicInteger();
+
+            MockNode primary = MockNode.serve(primarySocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, primaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+            MockNode survivor = MockNode.serve(survivorSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, survivorPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    survivorRegistrations.incrementAndGet();
+                    return Response.success(OPERATION_REGISTER, registerBody(2));
+                }
+                // Echoed, so a logout is answered as a logout: the client
+                // checks the reply's operation against the request's.
+                return Response.success(request.operation(), Unpooled.EMPTY_BUFFER);
+            });
+
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(primaryPort)
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .retryPolicy(RetryPolicy.fixedDelay(4, Duration.ofMillis(50)))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.users().login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+                client.users().logout().get(5, TimeUnit.SECONDS);
+
+                primary.kill();
+
+                // Every attempt is allowed to fail; none of them may register.
+                resumeWithin(client, Duration.ofSeconds(2));
+
+                assertThat(survivorRegistrations)
+                        .as("a signed-out client has no session to restore")
+                        .hasValue(0);
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
                 survivor.close();
@@ -280,7 +361,8 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         return new Request(
                 Byte.toUnsignedInt(header[REQUEST_OPERATION_OFFSET]),
                 fields.getInt(REQUEST_CODE_OFFSET),
-                fields.getLong(REQUEST_ID_OFFSET));
+                fields.getLong(REQUEST_ID_OFFSET),
+                body);
     }
 
     private static void writeResponse(OutputStream output, Request request, Response response) throws IOException {
@@ -299,9 +381,14 @@ class AsyncIggyTcpClientEndpointFailoverTest {
         output.flush();
     }
 
-    private record Request(int operation, int commandCode, long requestId) {
+    private record Request(int operation, int commandCode, long requestId, byte[] body) {
         boolean is(int expectedCode, int expectedOperation) {
             return commandCode == expectedCode && operation == expectedOperation;
+        }
+
+        /** The request body as text, for asserting which user a login names. */
+        String bodyAsText() {
+            return new String(body, StandardCharsets.UTF_8);
         }
     }
 
@@ -314,5 +401,162 @@ class AsyncIggyTcpClientEndpointFailoverTest {
     @FunctionalInterface
     private interface RequestHandler {
         Response handle(Request request);
+    }
+
+    /**
+     * A retry budget of zero still gets one rotation when several endpoints are
+     * known: those endpoints -- the address the client was configured with, the
+     * nodes the roster named -- were made known in order to be tried, and every
+     * other SDK sweeps them once too. With one endpoint known, zero retries
+     * redials nothing, which is what it asked for.
+     */
+    @Test
+    void shouldSweepTheKnownEndpointsOnceWithNoRetries() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket primarySocket = new ServerSocket(0, 4, loopback);
+                ServerSocket survivorSocket = new ServerSocket(0, 4, loopback)) {
+            int primaryPort = primarySocket.getLocalPort();
+            int survivorPort = survivorSocket.getLocalPort();
+            AtomicInteger survivorRegistrations = new AtomicInteger();
+
+            MockNode primary = MockNode.serve(primarySocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, primaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+            });
+            MockNode survivor = MockNode.serve(survivorSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, clusterMetadata(primaryPort, survivorPort, survivorPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    survivorRegistrations.incrementAndGet();
+                    return Response.success(OPERATION_REGISTER, registerBody(2));
+                }
+                return Response.success(OPERATION_NON_REPLICATED, Unpooled.EMPTY_BUFFER);
+            });
+
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(primaryPort)
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(Duration.ofSeconds(2))
+                    .retryPolicy(RetryPolicy.noRetry())
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                client.sendBinaryRequest(PING_CODE, new byte[0]).get(5, TimeUnit.SECONDS);
+
+                primary.kill();
+
+                assertThat(resumeWithin(client, Duration.ofSeconds(4)))
+                        .as("zero retries skipped the one rotation the known endpoints are for")
+                        .isTrue();
+                assertThat(client.getConnectionInfo().port()).isEqualTo(survivorPort);
+                assertThat(survivorRegistrations)
+                        .as("the sign-in was replayed on the survivor")
+                        .hasValueGreaterThanOrEqualTo(1);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+                survivor.close();
+            }
+        }
+    }
+
+    /**
+     * Every dial is capped once more than one endpoint is known, a configured
+     * connection timeout included: it says how long one endpoint may take, and a
+     * rotation that spends it on each of them reaches the survivor long after
+     * the caller gave up. A timeout shorter than the cap is what the caller
+     * asked for and stands; with one endpoint known nothing is queued behind
+     * the dial, so the configured value stands there too.
+     */
+    @Test
+    void shouldCapEveryDialWhenMoreThanOneEndpointIsKnown() {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        List<ConnectionInfo> roster = List.of(new ConnectionInfo("iggy-1", 8091));
+
+        AsyncIggyTcpClient patient = AsyncIggyTcpClient.builder()
+                .host(loopback.getHostAddress())
+                .port(8090)
+                .connectionTimeout(Duration.ofSeconds(30))
+                .build();
+        assertThat(patient.dialTimeout()).contains(Duration.ofSeconds(30));
+        patient.rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), roster));
+        assertThat(patient.dialTimeout())
+                .as("a configured timeout exempted the dial from the failover cap")
+                .contains(AsyncIggyTcpClient.FAILOVER_DIAL_TIMEOUT);
+
+        AsyncIggyTcpClient impatient = AsyncIggyTcpClient.builder()
+                .host(loopback.getHostAddress())
+                .port(8090)
+                .connectionTimeout(Duration.ofMillis(500))
+                .build();
+        impatient.rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), roster));
+        assertThat(impatient.dialTimeout())
+                .as("a timeout shorter than the cap is what the caller asked for")
+                .contains(Duration.ofMillis(500));
+
+        AsyncIggyTcpClient unconfigured = AsyncIggyTcpClient.builder()
+                .host(loopback.getHostAddress())
+                .port(8090)
+                .build();
+        assertThat(unconfigured.dialTimeout()).isEmpty();
+        unconfigured.rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), roster));
+        assertThat(unconfigured.dialTimeout()).contains(AsyncIggyTcpClient.FAILOVER_DIAL_TIMEOUT);
+    }
+
+    /**
+     * A roster read that learned nothing must leave the last one standing:
+     * emptying the redial candidates when the cluster is unreachable takes them
+     * away exactly when they are needed.
+     */
+    @Test
+    void shouldKeepTheLastRosterWhenALookupLearnedNothing() {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                .host(loopback.getHostAddress())
+                .port(8090)
+                .build();
+        List<ConnectionInfo> roster = List.of(new ConnectionInfo("iggy-0", 8091), new ConnectionInfo("iggy-1", 8092));
+
+        client.rememberRoster(new LeaderAwareness.LeaderLookup(Optional.empty(), roster));
+        assertThat(client.rosterTargets()).isEqualTo(roster);
+
+        client.rememberRoster(LeaderAwareness.LeaderLookup.inconclusive());
+        assertThat(client.rosterTargets())
+                .as("an inconclusive check erased the endpoints the client still needs")
+                .isEqualTo(roster);
+    }
+
+    /**
+     * Only the server answering "no" ends a redial. A channel that closed
+     * before the reply, or a node that refuses because it is not the primary,
+     * says nothing about the credentials -- treated as a rejection, they are
+     * dropped and the client is published on a node that is already gone.
+     */
+    @Test
+    void shouldTreatOnlyANonTransientServerVerdictAsASignInRejection() {
+        assertThat(AsyncIggyTcpClient.isSignInRejection(
+                        IggyServerException.fromTcpResponse(IggyErrorCode.INVALID_CREDENTIALS.getCode(), new byte[0])))
+                .isTrue();
+        assertThat(AsyncIggyTcpClient.isSignInRejection(new IggyConnectionException("channel closed")))
+                .as("a channel that died mid sign-in is not a rejected credential")
+                .isFalse();
+        assertThat(AsyncIggyTcpClient.isSignInRejection(new IOException("connection reset")))
+                .isFalse();
+        assertThat(AsyncIggyTcpClient.isSignInRejection(
+                        IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_ACCEPTED, new byte[0])))
+                .as("a node that is not the primary refuses transiently; another endpoint answers")
+                .isFalse();
+        assertThat(AsyncIggyTcpClient.isSignInRejection(
+                        IggyServerException.fromTcpResponse(AsyncTcpConnection.TRANSIENT_NOT_COMMITTED, new byte[0])))
+                .isFalse();
     }
 }

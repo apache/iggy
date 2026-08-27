@@ -33,12 +33,12 @@ func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password
 	if err != nil {
 		return nil, err
 	}
-	identity, err := c.register(ctx, uint32(command.LoginRegisterCode), body)
-	if err != nil {
-		return nil, err
-	}
-	c.rememberLogin(NewUsernamePasswordCredentials(username, password))
-	return identity, nil
+	return c.register(
+		ctx,
+		uint32(command.LoginRegisterCode),
+		body,
+		NewUsernamePasswordCredentials(username, password),
+	)
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
@@ -46,17 +46,28 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token 
 	if err != nil {
 		return nil, err
 	}
-	identity, err := c.register(ctx, uint32(command.LoginRegisterWithPATCode), body)
-	if err != nil {
-		return nil, err
-	}
-	c.rememberLogin(NewPersonalAccessTokenCredentials(token))
-	return identity, nil
+	return c.register(
+		ctx,
+		uint32(command.LoginRegisterWithPATCode),
+		body,
+		NewPersonalAccessTokenCredentials(token),
+	)
 }
 
 // register runs the sign-in handshake, binds the session the server assigned,
-// and settles the connection on the cluster leader.
-func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+// settles the connection on the cluster leader, and remembers the credentials
+// it succeeded with so a reconnect can re-establish the session.
+//
+// The credentials are remembered here rather than by the callers because this
+// is what holds registerMtx: remembered outside it, two concurrent sign-ins
+// could leave A remembered while the session is B, and the next reconnect
+// would sign in as A.
+func (c *IggyTcpClient) register(
+	ctx context.Context,
+	code uint32,
+	body []byte,
+	credentials Credentials,
+) (*iggcon.IdentityInfo, error) {
 	// One sign-in at a time. BeginRegister runs inside the exchange lock but
 	// Bind runs after it, so two interleaved sign-ins would let the second
 	// BeginRegister reset the identity the first is about to bind: one
@@ -65,7 +76,10 @@ func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) 
 	c.registerMtx.Lock()
 	defer c.registerMtx.Unlock()
 
-	c.logger.Info("Iggy client is signing in...", slog.String("client_address", c.clientAddress))
+	c.mtx.Lock()
+	clientAddress := c.clientAddress
+	c.mtx.Unlock()
+	c.logger.Info("Iggy client is signing in...", slog.String("client_address", clientAddress))
 
 	if err := c.endBoundSession(ctx); err != nil {
 		return nil, err
@@ -80,6 +94,7 @@ func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) 
 	if err != nil {
 		return nil, err
 	}
+	c.rememberLogin(credentials)
 	if settled != nil {
 		return settled, nil
 	}
@@ -124,8 +139,11 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 		return nil, err
 	}
 
+	c.mtx.Lock()
+	signedInAddress := c.clientAddress
+	c.mtx.Unlock()
 	c.logger.Info("Iggy client has signed in successfully.",
-		slog.String("client_address", c.clientAddress),
+		slog.String("client_address", signedInAddress),
 		slog.String("server_version", registered.ServerVersion))
 	return &iggcon.IdentityInfo{UserId: registered.UserID}, nil
 }
@@ -157,13 +175,7 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 
 		// The replayed sign-in below owns the session; the redirected Connect
 		// must not sign in on its own, or the replay commits a second Register.
-		c.mtx.Lock()
-		c.skipAutoLoginOnce = true
-		c.mtx.Unlock()
-		if err := c.Connect(ctx); err != nil {
-			c.mtx.Lock()
-			c.skipAutoLoginOnce = false
-			c.mtx.Unlock()
+		if err := c.Connect(suppressAutoLogin(ctx)); err != nil {
 			return nil, err
 		}
 		settled, err = c.signIn(ctx, code, body)
@@ -175,6 +187,14 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 
 // endBoundSession logs out a live session before a re-login, so the server
 // drops its client-table entry instead of leaving it to be fenced.
+//
+// The logout runs connect-scoped, and a failure it could recover from is
+// swallowed. Both because this call holds registerMtx: a logout that entered
+// the reconnect path would reconnect, sign in with the remembered credentials,
+// and deadlock on that lock. There is nothing to salvage either way -- a
+// session whose logout cannot be delivered died with its socket, and the
+// server fences what it left behind -- and the sign-in that follows replays
+// through its own reconnect.
 func (c *IggyTcpClient) endBoundSession(ctx context.Context) error {
 	c.mtx.Lock()
 	bound := c.session.Bound()
@@ -182,7 +202,29 @@ func (c *IggyTcpClient) endBoundSession(ctx context.Context) error {
 	if !bound {
 		return nil
 	}
-	return c.LogoutUser(ctx)
+
+	err := c.LogoutUser(context.WithValue(ctx, connectScoped{}, struct{}{}))
+	if err == nil {
+		return nil
+	}
+	if !isReconnectable(err) {
+		return err
+	}
+
+	c.logger.Debug("The bound session's logout was not delivered; its socket ended it.",
+		slog.Any("error", err))
+	c.mtx.Lock()
+	c.sessionState = iggcon.SessionStateUnauthenticated
+	c.session.Reset()
+	c.groups.clear()
+	c.topics.clearCounts()
+	c.mtx.Unlock()
+	// The session this sign-in belonged to is over either way, so the
+	// credentials that established it go with it. Kept, a sign-in that then
+	// fails would leave them behind for the next dropped request to replay --
+	// signing the old user back in after the caller asked for another one.
+	c.forgetLogin()
+	return nil
 }
 
 func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {

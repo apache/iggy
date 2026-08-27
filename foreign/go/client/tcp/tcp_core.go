@@ -52,6 +52,21 @@ func GetDefaultOptions() Options {
 	}
 }
 
+// connectAttempt is one run of Connect, shared with the callers waiting on it.
+//
+// The outcome is kept per attempt rather than in a field on the client: a
+// waiter that read a shared field would read whatever the attempt after the one
+// it waited on had written there, and a fresh attempt has no outcome yet.
+type connectAttempt struct {
+	// done is closed once the attempt settles, whichever way it ends.
+	done chan struct{}
+	// err is the attempt's outcome, written before done is closed.
+	err error
+	// suppressesLogin records that the owner does not sign in, which is what
+	// makes the attempt safe to wait on from inside the sign-in transaction.
+	suppressesLogin bool
+}
+
 type IggyTcpClient struct {
 	conn net.Conn
 	// reader buffers reads off conn, so a reply costs one syscall instead of
@@ -79,12 +94,12 @@ type IggyTcpClient struct {
 	// session carries the consensus client identity and request watermark;
 	// guarded by c.mtx.
 	session *vsr.Session
-	// skipAutoLoginOnce suppresses the next automatic sign-in so a replayed
-	// login is not preempted by one the reconnect issues; guarded by c.mtx.
-	skipAutoLoginOnce bool
 	// loggedOut records an explicit sign-out, so a reconnect's automatic
 	// sign-in does not silently reverse it; guarded by c.mtx.
 	loggedOut bool
+	// connectAttempt is the attempt a Connect is running, shared with every
+	// caller that arrives while it is in progress. Guarded by c.mtx.
+	connectAttempt *connectAttempt
 	// rememberedLogin holds the credentials a manual sign-in succeeded with,
 	// so a reconnect -- on this node or, after a failover, another one -- can
 	// re-establish the session instead of surfacing an unauthenticated error.
@@ -302,6 +317,11 @@ const (
 	// A node that stopped being primary answers transient forever, so
 	// replaying alone never recovers.
 	failoverCheckInterval = 2 * time.Second
+	// failoverDialTimeout bounds one endpoint's dial and handshake while other
+	// endpoints are queued behind it. Neither step has a deadline of its own,
+	// so a node whose syns are dropped would hold the sweep for the whole
+	// kernel connect timeout while a survivor goes untried.
+	failoverDialTimeout = 2 * time.Second
 )
 
 // requestBufPool reuses wire-payload buffers across RPCs. A fresh buffer
@@ -461,6 +481,19 @@ func appendCommandFrame(buf []byte, cmd command.Command) ([]byte, error) {
 // deadlock on that lock or recurse Connect without a bound.
 type connectScoped struct{}
 
+// skipAutoLogin marks the context of a Connect whose caller owns the sign-in:
+// a replayed login, or a redirect inside the sign-in transaction. Carried on
+// the context rather than on the client, so it cannot outlive the call that
+// meant it -- a client-wide flag leaks when Connect returns early on the
+// already-connected gate, and then suppresses somebody else's auto-login.
+type skipAutoLogin struct{}
+
+// suppressAutoLogin returns ctx marked so the Connect it drives does not sign
+// in by itself.
+func suppressAutoLogin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipAutoLogin{}, struct{}{})
+}
+
 // localPreconditionError marks a request that failed before its frame was
 // written. The connection is healthy, so exchange must not tear it down and
 // re-dial over what is purely local state.
@@ -476,6 +509,11 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 	if err == nil || !isReconnectable(err) {
 		return response, err
 	}
+
+	// A stale-client eviction is not caller intent: the heartbeat verifier
+	// sends it after a gc pause or a laptop sleep, so the remembered sign-in
+	// survives it and the reconnect re-establishes the session. Only an
+	// explicit sign-out ends it. Same rule in every SDK.
 	var precondition *localPreconditionError
 	if errors.As(err, &precondition) {
 		return nil, err
@@ -486,15 +524,6 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 	if !c.config.reconnection.enabled {
 		c.logger.Warn("Automatic reconnection is disabled.")
 		return nil, err
-	}
-
-	// A stale-client eviction is the server ending this session
-	// authoritatively, like a logout: the remembered sign-in ends with it, so
-	// only a configured auto-login may bring the session back. Remembered
-	// credentials exist for transport loss, where the session died with the
-	// socket rather than by anyone's decision.
-	if errors.Is(err, ierror.ErrStaleClient) {
-		c.forgetLogin()
 	}
 
 	// With no credentials -- neither configured nor remembered from a
@@ -523,22 +552,20 @@ func (c *IggyTcpClient) exchange(ctx context.Context, code uint32, frame []byte)
 	if disconnectErr := c.disconnect(); disconnectErr != nil {
 		return nil, disconnectErr
 	}
+	reconnectCtx := ctx
 	if login {
-		c.mtx.Lock()
-		c.skipAutoLoginOnce = true
-		c.mtx.Unlock()
+		// The caller replays the login itself, so the reconnect must not.
+		reconnectCtx = suppressAutoLogin(ctx)
 	}
 
+	c.mtx.Lock()
+	serverAddress := c.currentServerAddress
+	c.mtx.Unlock()
 	c.logger.Info("Reconnecting to the server...",
-		slog.String("server_address", c.currentServerAddress),
+		slog.String("server_address", serverAddress),
 		slog.Any("error", err))
 
-	if reconnectErr := c.Connect(ctx); reconnectErr != nil {
-		if login {
-			c.mtx.Lock()
-			c.skipAutoLoginOnce = false
-			c.mtx.Unlock()
-		}
+	if reconnectErr := c.Connect(reconnectCtx); reconnectErr != nil {
 		return nil, reconnectErr
 	}
 	return c.sendFrame(ctx, code, frame)
@@ -634,7 +661,15 @@ func (c *IggyTcpClient) sendFrame(ctx context.Context, code uint32, frame []byte
 				return nil, redirectErr
 			}
 			if redirect {
-				if connectErr := c.Connect(ctx); connectErr != nil {
+				redirectCtx := ctx
+				if ctx.Value(connectScoped{}) != nil {
+					// Issued from inside the sign-in transaction, which holds
+					// registerMtx: the automatic sign-in on the reconnect path
+					// would wait on that lock forever. The transaction signs in
+					// itself on the node it lands on, so the reconnect must not.
+					redirectCtx = suppressAutoLogin(ctx)
+				}
+				if connectErr := c.Connect(redirectCtx); connectErr != nil {
 					return nil, connectErr
 				}
 				stamped = false
@@ -886,7 +921,13 @@ func (c *IggyTcpClient) GetConnectionInfo() *iggcon.ConnectionInfo {
 }
 
 // Connect establishes the TCP connection to the server.
-func (c *IggyTcpClient) Connect(ctx context.Context) error {
+//
+// Single-flighted: one attempt dials, and every caller that arrives while it
+// runs waits for it and shares its outcome. Reporting success to those callers
+// instead would hand them a client with no connection yet, and their next
+// request would fail ErrNotConnected for no reason of its own.
+func (c *IggyTcpClient) Connect(ctx context.Context) (err error) {
+	suppressesLogin := ctx.Value(skipAutoLogin{}) != nil
 	c.mtx.Lock()
 	switch c.transportState {
 	case iggcon.TransportStateShutdown:
@@ -899,32 +940,73 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 		c.logger.Debug("Client is already connected.", slog.String("client_address", clientAddress))
 		return nil
 	case iggcon.TransportStateConnecting:
+		attempt := c.connectAttempt
 		c.mtx.Unlock()
-		c.logger.Debug("Client is already connecting.")
-		return nil
-	default:
-		c.transportState = iggcon.TransportStateConnecting
+		if attempt == nil {
+			return nil
+		}
+		if suppressesLogin && !attempt.suppressesLogin {
+			// Only the sign-in transaction suppresses the automatic sign-in,
+			// and it holds registerMtx while it does. The attempt in flight
+			// ends in a sign-in that needs that same lock, so waiting here
+			// would close a cycle: the owner blocked on registerMtx, this
+			// goroutine blocked on the owner, and neither context cancelled.
+			c.logger.Debug("Another connect is signing in; not waiting for it.")
+			return ierror.ErrCannotEstablishConnection
+		}
+		c.logger.Debug("Client is already connecting; waiting for that attempt.")
+		select {
+		case <-attempt.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.closed:
+			return ierror.ErrClientShutdown
+		}
+		return attempt.err
 	}
+	attempt := &connectAttempt{
+		done:            make(chan struct{}),
+		suppressesLogin: suppressesLogin,
+	}
+	c.transportState = iggcon.TransportStateConnecting
+	c.connectAttempt = attempt
 	connectedAt := c.connectedAt
 	c.mtx.Unlock()
 
-	candidates := c.connectionCandidates()
-
-	// The reestablish interval paces reconnects to the one endpoint a
-	// single-address client has. With other endpoints known there is somewhere
-	// else to go, and pausing first only pushes the failover past the window
-	// the caller is willing to wait; the retry interval still paces the loop.
-	if !connectedAt.IsZero() && len(candidates) == 1 {
-		now := time.Now()
-		elapsed := now.Sub(connectedAt)
-		reestablishAfter := c.config.reconnection.reestablishAfter
-
-		c.logger.Debug("Elapsed time since last connection", slog.Duration("elapsed", elapsed))
-		if elapsed < reestablishAfter {
-			remaining := reestablishAfter - elapsed
-			c.logger.Info("Trying to connect to the server", slog.Duration("remaining", remaining))
-			time.Sleep(remaining)
+	// Settles the attempt for whoever is waiting on it, whichever way it ends.
+	defer func() {
+		attempt.err = err
+		c.mtx.Lock()
+		if c.connectAttempt == attempt {
+			c.connectAttempt = nil
 		}
+		c.mtx.Unlock()
+		close(attempt.done)
+	}()
+
+	candidates := c.connectionCandidates()
+	if len(candidates) == 0 {
+		// Nowhere to dial: a client configured with an empty server address
+		// and no roster. Reporting success here would leave every request
+		// answering ErrNotConnected while Connect keeps saying it is
+		// connected.
+		c.mtx.Lock()
+		c.transportState = iggcon.TransportStateDisconnected
+		c.mtx.Unlock()
+		c.logger.Error("No server address to connect to.")
+		return ierror.ErrCannotEstablishConnection
+	}
+
+	// reestablishAfter paces reconnects to the endpoint this client was last
+	// on, and to that one only: the other endpoints owe it no cooldown, and
+	// pausing before dialing them would push the failover past the window the
+	// caller is willing to wait. So when there is somewhere else to go, the
+	// paced endpoint goes last -- by which time its window has usually
+	// elapsed anyway -- instead of the wait being skipped outright.
+	pacedEndpoint := candidates[0]
+	if !connectedAt.IsZero() && len(candidates) > 1 &&
+		time.Since(connectedAt) < c.config.reconnection.reestablishAfter {
+		candidates = append(candidates[1:], pacedEndpoint)
 	}
 	attempts := uint(1)
 	interval := time.Duration(0)
@@ -948,15 +1030,34 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 			// a pass that stopped at the first refusal would never reach the
 			// survivors of a client configured for a single retry.
 			var lastErr error
+			// A fault no retry can fix, kept aside rather than returned at
+			// once: it belongs to the endpoint that raised it, and the
+			// endpoints behind that one may be perfectly usable.
+			var configFault error
 			for _, address := range candidates {
-				connection, err := c.dialCandidate(ctx, address)
+				if address == pacedEndpoint {
+					c.awaitReestablish(ctx, connectedAt)
+				}
+				connection, err := c.dialCandidate(ctx, address, len(candidates) > 1)
 				if err != nil {
 					lastErr = err
+					if isTLSConfigFault(err) {
+						configFault = err
+					}
 					continue
 				}
 
 				conn = connection
 				return nil
+			}
+
+			// An unreadable CA file, an unparsable domain, a certificate this
+			// client will never accept: no endpoint answered, and at least one
+			// said why in a way no retry changes. Reported as unrecoverable so
+			// the default unlimited retries do not redial it every interval
+			// forever and bury it.
+			if configFault != nil {
+				return retry.Unrecoverable(configFault)
 			}
 
 			return lastErr
@@ -972,6 +1073,24 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	}
 
 	c.mtx.Lock()
+	if state := c.transportState; state != iggcon.TransportStateConnecting {
+		// Superseded while this attempt was dialing. The connection it just
+		// made is surplus either way, but what to report differs: a client
+		// another attempt already connected is connected, and saying
+		// otherwise would fail a caller whose client is up.
+		c.mtx.Unlock()
+		_ = conn.Close()
+		c.logger.Debug("The connect was superseded while dialing; dropping the connection.",
+			slog.Any("transport_state", state))
+		switch state {
+		case iggcon.TransportStateShutdown:
+			return ierror.ErrClientShutdown
+		case iggcon.TransportStateConnected:
+			return nil
+		default:
+			return ierror.ErrNotConnected
+		}
+	}
 	c.conn = conn
 	c.reader = bufio.NewReaderSize(conn, 64*1024)
 	c.transportState = iggcon.TransportStateConnected
@@ -979,23 +1098,85 @@ func (c *IggyTcpClient) Connect(ctx context.Context) error {
 	// The server fence does not survive the old socket, so the new connection
 	// starts from a fresh client identity.
 	c.session.Reset()
-	skipAutoLogin := c.skipAutoLoginOnce
-	c.skipAutoLoginOnce = false
-	c.logger.Info("Iggy client has connected to the Iggy server", slog.String("client_address", c.clientAddress), slog.String("server_address", c.currentServerAddress))
+	clientAddress := c.clientAddress
+	serverAddress := c.currentServerAddress
 	c.mtx.Unlock()
+	c.logger.Info("Iggy client has connected to the Iggy server",
+		slog.String("client_address", clientAddress),
+		slog.String("server_address", serverAddress))
 
-	if err := c.establishSession(ctx, skipAutoLogin); err != nil {
+	if err := c.establishSession(ctx, ctx.Value(skipAutoLogin{}) != nil); err != nil {
 		_ = c.disconnect()
 		return err
 	}
 	return nil
 }
 
-// dialCandidate opens one connection, wrapping it in TLS when configured, and
-// records the endpoint that answered: the leader check compares against it and
-// the next reconnect starts from it.
-func (c *IggyTcpClient) dialCandidate(ctx context.Context, address string) (net.Conn, error) {
+// isTLSConfigFault reports whether a dial failed for a reason that says the
+// client's own TLS configuration is wrong -- an unreadable or unparsable CA
+// file, a domain that yields no server name, or a certificate this client will
+// never accept. None of those change on a retry.
+//
+// A peer that answered the ClientHello in plaintext is not one of them: that
+// says something about the endpoint, not about this client, and the endpoints
+// behind it in the roster may be speaking TLS perfectly well.
+func isTLSConfigFault(err error) bool {
+	if errors.Is(err, ierror.ErrInvalidTlsCertificatePath) ||
+		errors.Is(err, ierror.ErrInvalidTlsCertificate) ||
+		errors.Is(err, ierror.ErrInvalidTlsDomain) {
+		return true
+	}
+
+	var certificateError *tls.CertificateVerificationError
+	return errors.As(err, &certificateError)
+}
+
+// awaitReestablish waits out what is left of the reestablishAfter window since
+// the last successful connection, if any.
+//
+// The wait ends early on the caller's context or on Close: a sweep that found
+// every other endpoint refused reaches the paced one in milliseconds, and
+// sleeping the rest of the window regardless would hold the client in
+// Connecting long past the deadline the caller gave it.
+func (c *IggyTcpClient) awaitReestablish(ctx context.Context, connectedAt time.Time) {
+	if connectedAt.IsZero() {
+		return
+	}
+
+	elapsed := time.Since(connectedAt)
+	c.logger.Debug("Elapsed time since last connection", slog.Duration("elapsed", elapsed))
+	remaining := c.config.reconnection.reestablishAfter - elapsed
+	if remaining <= 0 {
+		return
+	}
+
+	c.logger.Info("Trying to connect to the server", slog.Duration("remaining", remaining))
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	case <-c.closed:
+	}
+}
+
+// dialCandidate brings one endpoint all the way up, wrapping it in TLS when
+// configured, and records the endpoint that answered: the leader check
+// compares against it and the next reconnect starts from it.
+//
+// bounded caps the whole attempt at failoverDialTimeout, for when other
+// endpoints are queued behind this one. Neither the dial nor the handshake has
+// a deadline of its own, and a node whose syns are dropped -- or one that
+// accepts TCP and then never answers the ClientHello -- would hold the sweep
+// for minutes while a survivor goes untried.
+func (c *IggyTcpClient) dialCandidate(ctx context.Context, address string, bounded bool) (net.Conn, error) {
 	c.logger.Info("Iggy client is connecting to server...", slog.String("server_address", address))
+	if bounded {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, failoverDialTimeout)
+		defer cancel()
+	}
+
 	connection, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
 	if err != nil {
 		c.logger.Error("Failed to establish TCP connection to the server", slog.Any("error", err))
@@ -1007,29 +1188,32 @@ func (c *IggyTcpClient) dialCandidate(ctx context.Context, address string) (net.
 		c.logger.Error("Failed to set the nodelay option on the client, continuing...", slog.Any("error", err))
 	}
 
+	established := connection
+	if c.config.tlsEnabled {
+		tlsConfig, err := c.createTLSConfig(address)
+		if err != nil {
+			_ = connection.Close()
+			return nil, err
+		}
+
+		tlsConn := tls.Client(connection, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			c.logger.Error("Failed to establish a TLS connection to the server", slog.Any("error", err))
+			_ = connection.Close()
+			return nil, fmt.Errorf("TLS handshake failed: %w", err)
+		}
+		established = tlsConn
+	}
+
+	// Recorded only once the connection is usable: an endpoint that accepts
+	// TCP but fails the handshake is not where this client lives, and leading
+	// the next pass with it would shadow every endpoint behind it.
 	c.mtx.Lock()
 	c.clientAddress = tc.LocalAddr().String()
 	c.currentServerAddress = address
 	c.mtx.Unlock()
 
-	if !c.config.tlsEnabled {
-		return connection, nil
-	}
-
-	tlsConfig, err := c.createTLSConfig()
-	if err != nil {
-		_ = connection.Close()
-		return nil, err
-	}
-
-	tlsConn := tls.Client(connection, tlsConfig)
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		c.logger.Error("Failed to establish a TLS connection to the server", slog.Any("error", err))
-		_ = connection.Close()
-		return nil, fmt.Errorf("TLS handshake failed: %w", err)
-	}
-
-	return tlsConn, nil
+	return established, nil
 }
 
 func (c *IggyTcpClient) connectionCandidates() []string {
@@ -1092,7 +1276,9 @@ func (c *IggyTcpClient) signInCredentials() (Credentials, bool) {
 	return c.rememberedLogin.credentials, c.rememberedLogin.enabled
 }
 
-// rememberLogin keeps the credentials a sign-in just succeeded with.
+// rememberLogin keeps the credentials a sign-in succeeded with. Call it from
+// under registerMtx (register does): remembered outside that lock, two
+// concurrent sign-ins can leave A remembered while the session is B.
 func (c *IggyTcpClient) rememberLogin(credentials Credentials) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -1107,7 +1293,14 @@ func (c *IggyTcpClient) forgetLogin() {
 	c.rememberedLogin = AutoLogin{}
 }
 
-func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
+// createTLSConfig builds the client config for one dial.
+//
+// address is the candidate being dialed, which is where the SNI comes from
+// when no domain is configured. Taking it from currentServerAddress instead
+// would name the endpoint the client just lost: with validation on, a failover
+// to a node with another name or address then fails the handshake against a
+// certificate that never covered the old one.
+func (c *IggyTcpClient) createTLSConfig(address string) (*tls.Config, error) {
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: !c.config.tls.tlsValidateCertificate,
 	}
@@ -1115,9 +1308,9 @@ func (c *IggyTcpClient) createTLSConfig() (*tls.Config, error) {
 	// Set server name for SNI
 	serverName := c.config.tls.tlsDomain
 	if serverName == "" {
-		host, _, err := net.SplitHostPort(c.currentServerAddress)
+		host, _, err := net.SplitHostPort(address)
 		if err != nil {
-			host = c.currentServerAddress
+			host = address
 		}
 		serverName = host
 	}
@@ -1156,6 +1349,15 @@ func (c *IggyTcpClient) disconnect() error {
 	defer c.mtx.Unlock()
 
 	if c.transportState == iggcon.TransportStateDisconnected || c.transportState == iggcon.TransportStateShutdown {
+		return nil
+	}
+	if c.transportState == iggcon.TransportStateConnecting {
+		// An attempt is already dialing. Every caller here is tearing the
+		// connection down to reconnect, which that attempt is doing anyway:
+		// resetting the state under it would let the next Connect start a
+		// second attempt, and the two would fight over which socket ends up
+		// installed and which error the waiters are told about.
+		c.logger.Debug("Not disconnecting; a connect is already in flight.")
 		return nil
 	}
 

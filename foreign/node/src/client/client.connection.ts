@@ -67,9 +67,25 @@ const getTransport = (config: ClientConfig): Socket => {
   }
 };
 
+/** One node of the cluster, as a redial candidate. */
+export type Endpoint = { host: string, port: number };
+
+/**
+ * Bound on one dial while other endpoints are queued behind it. Neither the
+ * connect nor the TLS handshake has a deadline of its own, so a node whose syns
+ * are dropped -- or one that accepts TCP and never answers the ClientHello --
+ * would hold the whole pass. Matches the Rust SDK.
+ */
+const FAILOVER_DIAL_TIMEOUT_MS = 2_000;
+
 /**
  * Default reconnection settings.
- * Attempts reconnection every 5 seconds, up to 12 times.
+ *
+ * One retry is one full pass over every endpoint the client knows, so this is
+ * twelve passes rather than twelve dials, waiting 5 seconds between them. The
+ * first pass runs at once when more than one endpoint is known: the node just
+ * lost may be gone for good, and pausing before dialing a survivor only pushes
+ * the failover past the interval a caller is willing to wait.
  */
 const DefaultReconnectOption: ReconnectOption = {
   enabled: true,
@@ -108,9 +124,20 @@ export class IggyConnection extends EventEmitter {
   public connecting: boolean;
   /** Whether the connection is being intentionally closed */
   public ending: boolean;
+  /**
+   * Whether the socket is being replaced by a deliberate leader redirect
+   * rather than lost. The drop looks the same from the outside, but nothing a
+   * caller submitted is in doubt: work waiting to be sent belongs on the node
+   * the client moves to, not in an error.
+   */
+  public redirecting: boolean;
   /** Reconnection configuration */
   private reconnectOption: ReconnectOption;
-  /** Number of reconnection attempts made */
+  /**
+   * Number of passes made over the known endpoints. One pass dials the
+   * endpoint the client is on, the endpoint it was configured with, and every
+   * node the roster named.
+   */
   private reconnectCount: number;
   /** Shared promise for concurrent callers waiting on one connection attempt */
   private connectPromise?: Promise<this>;
@@ -124,7 +151,7 @@ export class IggyConnection extends EventEmitter {
    * exactly when it is needed, so it has to have been remembered while the
    * connection was still healthy.
    */
-  private rosterEndpoints: { host: string, port: number }[];
+  private rosterEndpoints: Endpoint[];
 
   /** Incremental response frame decoder */
   private responseDecoder: ResponseFrameDecoder;
@@ -140,6 +167,7 @@ export class IggyConnection extends EventEmitter {
     this.connected = false;
     this.connecting = false;
     this.ending = false;
+    this.redirecting = false;
     this.reconnectOption = { ...DefaultReconnectOption, ...config.reconnect };
     this.seedOptions = { ...config.options };
     this.rosterEndpoints = [];
@@ -181,7 +209,10 @@ export class IggyConnection extends EventEmitter {
       this.emit('error', err);
     });
 
-    socket.once('connect', () => {
+    // The readiness event, not 'connect': on TLS the socket is only usable
+    // once the handshake completes, and writing a request before that would
+    // announce a connection the peer has not agreed to yet.
+    socket.once(this._readyEvent(), () => {
       if (this.socket !== socket)
         return;
       debug('socket/connect event');
@@ -225,7 +256,13 @@ export class IggyConnection extends EventEmitter {
 
     this.connecting = true;
     const socket = this.socket;
-    const connectPromise = this._waitForConnection(socket);
+    // Bounded here too when the client knows somewhere else to go: this dial
+    // is not part of a pass, so an endpoint that never becomes usable would
+    // hold it with no timer of its own and the redial pass would never start.
+    const connectPromise = this._dialWithin(
+      socket,
+      this._redialCandidates().length > 1
+    );
     this.connectPromise = connectPromise;
     const clearConnectPromise = () => {
       if (this.connectPromise === connectPromise)
@@ -235,10 +272,57 @@ export class IggyConnection extends EventEmitter {
     return connectPromise;
   }
 
+  /**
+   * Waits for one dial, bounded while other endpoints are queued behind it.
+   *
+   * A socket has no connect deadline of its own and there is no 'timeout'
+   * listener on it, so a node whose syns are dropped holds the pass for the
+   * whole OS connect timeout -- and it leads every pass, because the current
+   * endpoint only moves on success. The bound covers the TLS handshake too,
+   * which is what `_readyEvent()` waits for and has no deadline of its own
+   * either. It matches the Rust, Go and C# SDKs'.
+   */
+  private async _dialWithin(socket: Socket, bounded: boolean): Promise<this> {
+    if (!bounded)
+      return this._waitForConnection(socket);
+
+    let expire: NodeJS.Timeout | undefined;
+    const bound = new Promise<never>((_resolve, reject) => {
+      expire = setTimeout(() => {
+        // Destroying it makes the pending dial settle and releases the handle;
+        // left alone it would keep the event loop alive.
+        socket.destroy();
+        reject(new Error(
+          `dial exceeded ${FAILOVER_DIAL_TIMEOUT_MS}ms`
+        ));
+      }, FAILOVER_DIAL_TIMEOUT_MS);
+      expire.unref?.();
+    });
+
+    try {
+      return await Promise.race([this._waitForConnection(socket), bound]);
+    } finally {
+      clearTimeout(expire);
+    }
+  }
+
+  /**
+   * The event that says a socket can carry a request.
+   *
+   * On TLS that is 'secureConnect', not 'connect': the latter fires as soon as
+   * the TCP handshake completes, so waiting on it would treat a peer that
+   * never answers the ClientHello as connected and leave the handshake with no
+   * deadline at all.
+   */
+  private _readyEvent(): 'connect' | 'secureConnect' {
+    return this.config.transport === 'TLS' ? 'secureConnect' : 'connect';
+  }
+
   private _waitForConnection(socket: Socket): Promise<this> {
+    const ready = this._readyEvent();
     return new Promise<this>((resolve, reject) => {
       const cleanup = () => {
-        socket.removeListener('connect', resolveConnect);
+        socket.removeListener(ready, resolveConnect);
         socket.removeListener('error', rejectConnect);
         socket.removeListener('close', rejectClosed);
       };
@@ -255,7 +339,7 @@ export class IggyConnection extends EventEmitter {
       };
       socket.once('error', rejectConnect);
       socket.once('close', rejectClosed);
-      socket.once('connect', resolveConnect);
+      socket.once(ready, resolveConnect);
     });
   }
 
@@ -308,10 +392,31 @@ export class IggyConnection extends EventEmitter {
   ): Promise<this> {
     let lastError = initialError;
     let expectedSocket = this.socket;
-    while (enabled && this.reconnectCount < maxRetries) {
+    let firstPass = true;
+    // Reconnection settings bound the retries, not the endpoints. With them off
+    // and several endpoints known - the address the client was configured with,
+    // the nodes the roster named - those endpoints were made known in order to
+    // be tried, so they get one pass and no backoff, as in the other SDKs. A
+    // client that knows one endpoint and turned reconnection off redials
+    // nothing, which is what it asked for.
+    // Counted rather than tracked within this call: every dial the pass fails
+    // closes a socket, and a close starts a reconnect of its own. Bounded by
+    // `firstPass` alone, each of those closes would open another sweep and the
+    // pass would repeat for as long as the endpoints stay down. The count is
+    // reset when a connection is established, so a later loss sweeps again.
+    const sweepOnce = !enabled && this._redialCandidates().length > 1;
+    while ((enabled && this.reconnectCount < maxRetries) ||
+      (sweepOnce && this.reconnectCount < 1)) {
       this.connecting = true;
       this.reconnectCount += 1;
-      await waitForReconnect(interval);
+      const candidates = this._redialCandidates();
+      // The backoff paces retries against a single endpoint. With other
+      // endpoints known there is somewhere else to go, and pausing first only
+      // pushes the failover past the interval a caller is willing to wait;
+      // later passes still back off.
+      if (enabled && (!firstPass || candidates.length === 1))
+        await waitForReconnect(interval);
+      firstPass = false;
       if (this.ending)
         throw new Error('connection is closed', { cause: lastError });
       // A redirect may replace the socket at any point. Defer to the active
@@ -323,14 +428,27 @@ export class IggyConnection extends EventEmitter {
       // the cluster costs one retry rather than one per endpoint: a pass that
       // stopped at the first refusal would never reach the survivors of a
       // client configured for a single retry.
-      for (const options of this._redialCandidates()) {
+      for (const options of candidates) {
+        // Re-checked every iteration, not once above the loop: a destroy or a
+        // redirect mid-pass has to stop the pass. Left running, the next
+        // endpoint that answers would leave an open socket nobody closes, a
+        // 'connect' event after the destroy, and the process alive.
+        if (this.ending)
+          throw new Error('connection is closed', { cause: lastError });
+        if (this.socket !== expectedSocket)
+          return this.connect();
+
         const socket = this._installSocket(
           getTransport({ ...this.config, options })
         );
         this.socket = socket;
         expectedSocket = socket;
         try {
-          await this._waitForConnection(socket);
+          await this._dialWithin(socket, candidates.length > 1);
+          if (this.ending) {
+            socket.destroy();
+            throw new Error('connection is closed', { cause: lastError });
+          }
           if (this.socket !== socket)
             return this.connect();
           this.config.options = options;
@@ -358,7 +476,7 @@ export class IggyConnection extends EventEmitter {
    * answer about where its nodes are, so a node it dropped stops being
    * dialed. The configured seed is kept separately and outlives it.
    */
-  rememberRoster(endpoints: { host: string, port: number }[]): void {
+  rememberRoster(endpoints: Endpoint[]): void {
     if (endpoints.length === 0)
       return;
     this.rosterEndpoints = endpoints;
@@ -369,8 +487,13 @@ export class IggyConnection extends EventEmitter {
    * currently is, the endpoint it was configured with, then the roster it
    * learned while connected. After a leader redirect the current endpoint may
    * die with the leader, and the rest of the list is the way back to the
-   * cluster. Duplicates are dropped, so an endpoint the roster merely spells
-   * differently does not earn a second attempt.
+   * cluster.
+   *
+   * Duplicates are dropped by spelling: the loopback aliases and an
+   * IPv4-mapped IPv6 address collapse onto one endpoint. Names are not
+   * resolved, so a seed given as a DNS name and the roster's IP for the same
+   * node still count as two candidates -- one wasted dial per pass, not a
+   * correctness problem.
    */
   _redialCandidates(): ClientConfig['options'][] {
     const candidates = [this.config.options];
@@ -382,8 +505,8 @@ export class IggyConnection extends EventEmitter {
     ];
     for (const candidate of known) {
       const duplicate = candidates.some(
-        (known) => known.port === candidate.port &&
-          normalizeHost(known.host) === normalizeHost(candidate.host)
+        (existing) => existing.port === candidate.port &&
+          normalizeHost(existing.host) === normalizeHost(candidate.host)
       );
       if (!duplicate)
         candidates.push(candidate);
@@ -397,19 +520,24 @@ export class IggyConnection extends EventEmitter {
       ...this.config,
       options: redirectedOptions
     };
-    // Destroying the old socket settles any dial still waiting on it. Its
-    // lifecycle listeners stay attached but go inert once the socket is
-    // replaced below, so surface the drop to in-flight exchanges ourselves.
-    this.socket.destroy();
-    this.connected = false;
-    this.connecting = false;
-    this.connectPromise = undefined;
-    this.reconnectPromise = undefined;
-    this._endResponseWait();
-    this.socket = this._installSocket(getTransport(redirectedConfig));
-    this.emit('disconnected', false);
-    await this.connect();
-    this.config.options = redirectedOptions;
+    this.redirecting = true;
+    try {
+      // Destroying the old socket settles any dial still waiting on it. Its
+      // lifecycle listeners stay attached but go inert once the socket is
+      // replaced below, so surface the drop to in-flight exchanges ourselves.
+      this.socket.destroy();
+      this.connected = false;
+      this.connecting = false;
+      this.connectPromise = undefined;
+      this.reconnectPromise = undefined;
+      this._endResponseWait();
+      this.socket = this._installSocket(getTransport(redirectedConfig));
+      this.emit('disconnected', false);
+      await this.connect();
+      this.config.options = redirectedOptions;
+    } finally {
+      this.redirecting = false;
+    }
   }
 
   abort(): void {
