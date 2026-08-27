@@ -439,12 +439,21 @@ impl HttpSourceConfig {
                 self.max_body_size_bytes
             )));
         }
-        if let Some(instance_name) = &self.instance_name
-            && HeaderKey::try_from(instance_name.as_str()).is_err()
-        {
-            return Err(Error::InvalidConfigValue(format!(
-                "instance_name '{instance_name}' must be a valid Iggy header key: non-empty and at most 255 bytes"
-            )));
+        if let Some(instance_name) = &self.instance_name {
+            if HeaderKey::try_from(instance_name.as_str()).is_err() {
+                return Err(Error::InvalidConfigValue(format!(
+                    "instance_name '{instance_name}' must be a valid Iggy header key: non-empty and at most 255 bytes"
+                )));
+            }
+            if instance_name == crate::metrics::UNROUTED {
+                // Requests to a genuinely unknown path are metered under this
+                // name, and that series is what an operator watches for
+                // endpoint-id scanning. An instance claiming it would merge
+                // real traffic into the signal.
+                return Err(Error::InvalidConfigValue(format!(
+                    "instance_name '{instance_name}' is reserved for requests that match no route"
+                )));
+            }
         }
         for header in &self.forward_headers {
             // Forwarding a reusable credential would copy it onto every
@@ -980,6 +989,18 @@ mod tests {
                 Err(Error::InvalidConfigValue(message)) if message.contains("buffer_capacity")
             ),
             "and open() must still report the misconfiguration rather than serve it"
+        );
+    }
+
+    #[test]
+    fn given_reserved_instance_name_when_validated_should_reject() {
+        let config = parse(r#"{"listen_addr": "0.0.0.0:9090", "instance_name": "unrouted"}"#);
+        assert!(
+            matches!(
+                config.validate(),
+                Err(Error::InvalidConfigValue(message)) if message.contains("reserved")
+            ),
+            "requests matching no route are metered under this name, and that series is the endpoint-id scan signal"
         );
     }
 
