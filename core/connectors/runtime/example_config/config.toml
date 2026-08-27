@@ -24,6 +24,9 @@ address = "127.0.0.1:8081"
 api_key = "" # Optional API key for authentication to be passed as `api-key` header; empty disables authentication
 
 [http.cors] # Optional CORS configuration for HTTP API
+# Enabling this with the shipped allowed_origins = ["*"] lets any page the
+# operator visits read these endpoints cross-origin, whatever address is bound.
+# Pin the origins, or set api_key, before turning it on.
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 allowed_origins = ["*"]
