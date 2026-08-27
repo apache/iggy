@@ -771,6 +771,25 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
     }
 }
 
+/// Resolve a repair's new contiguous head and its hash-chain checksum.
+///
+/// A DVC can put the sequencer above holes that repair later backfills. Such a
+/// lower entry changes durable coverage, but not the head the next prepare must
+/// parent. Updating the checksum from the incoming entry would rewind the chain
+/// while leaving the sequencer ahead of it.
+pub fn repaired_frontier_update(
+    previous_frontier: u64,
+    mut header_at: impl FnMut(u64) -> Option<PrepareHeader>,
+) -> Option<(u64, u128)> {
+    let mut frontier = previous_frontier;
+    let mut update = None;
+    while let Some(header) = header_at(frontier + 1) {
+        frontier += 1;
+        update = Some((frontier, header.checksum));
+    }
+    update
+}
+
 /// Ack a prepare back to its primary once the owning plane vouches for it.
 ///
 /// `is_persisted` is the caller's journal-containment verdict for `header`:
@@ -856,6 +875,7 @@ mod tests {
     use iggy_common::calculate_checksum;
     use message_bus::SendError;
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
+    use std::collections::BTreeMap;
 
     /// `PrepareHeader`'s alignment, which every suffix body has to satisfy.
     const BODY_ALIGN: usize = align_of::<PrepareHeader>();
@@ -2021,5 +2041,40 @@ mod tests {
             "deny reply body must be empty"
         );
         assert!(header.validate().is_ok());
+    }
+
+    fn header_with_checksum(op: u64, checksum: u128) -> PrepareHeader {
+        PrepareHeader {
+            command: Command::Prepare,
+            op,
+            checksum,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn given_lower_backfill_when_resolving_repaired_frontier_should_not_rewind() {
+        let headers = BTreeMap::from([
+            (169, header_with_checksum(169, 1690)),
+            (170, header_with_checksum(170, 1700)),
+            (171, header_with_checksum(171, 1710)),
+        ]);
+
+        let update = repaired_frontier_update(171, |op| headers.get(&op).copied());
+
+        assert_eq!(update, None);
+    }
+
+    #[test]
+    fn given_gap_closure_when_resolving_repaired_frontier_should_use_new_head_checksum() {
+        let headers = BTreeMap::from([
+            (170, header_with_checksum(170, 1700)),
+            (171, header_with_checksum(171, 1710)),
+            (172, header_with_checksum(172, 1720)),
+        ]);
+
+        let update = repaired_frontier_update(169, |op| headers.get(&op).copied());
+
+        assert_eq!(update, Some((172, 1720)));
     }
 }

@@ -32,7 +32,8 @@ use consensus::{
     DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
     PlaneKind, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer,
     Status, VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank,
-    dvc_header_kind, encode_prepare_headers, fatal, restamp_prepare_view, verify_prepare_integrity,
+    dvc_header_kind, encode_prepare_headers, fatal, repaired_frontier_update, restamp_prepare_view,
+    verify_prepare_integrity,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
@@ -4473,15 +4474,15 @@ where
             // `apply_repaired_prepare`: DVC advertises the sequencer, so a
             // hole below a repaired op must stall the advance rather than
             // mint an election candidate with an unwalkable log.
-            let mut frontier = consensus.sequencer().current_sequence();
+            let previous_frontier = consensus.sequencer().current_sequence();
             #[allow(clippy::cast_possible_truncation)]
-            while journal.header((frontier + 1) as usize).is_some() {
-                frontier += 1;
-            }
-            if frontier > consensus.sequencer().current_sequence() {
+            let update = repaired_frontier_update(previous_frontier, |op| {
+                journal.header(op as usize).map(|header| *header)
+            });
+            if let Some((frontier, frontier_checksum)) = update {
                 consensus.sequencer().set_sequence(frontier);
+                consensus.set_last_prepare_checksum(frontier_checksum);
             }
-            consensus.set_last_prepare_checksum(header.checksum);
             return;
         }
         // A metadata-plane op that did not match above (no metadata consensus on
@@ -9417,8 +9418,9 @@ mod persist_gate_tests {
 mod repair_scope_tests {
     //! Who parked the log decides what it means.
 
-    use super::{MergedLog, repair_op_in_scope, repair_serve_ceiling};
     use iggy_binary_protocol::{Command, PrepareHeader};
+
+    use super::{MergedLog, repair_op_in_scope, repair_serve_ceiling};
 
     fn header(op: u64) -> PrepareHeader {
         PrepareHeader {
