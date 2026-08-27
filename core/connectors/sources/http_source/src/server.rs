@@ -28,7 +28,7 @@ use arc_swap::ArcSwap;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -219,6 +219,11 @@ struct SharedServer {
 #[derive(Debug)]
 pub(crate) struct ServerState {
     pub(crate) listen_addr: String,
+    /// Taken from the first instance to bind, like `management_token`.
+    /// `ensure_compatible` refuses a join that disagrees, so it is unambiguous.
+    /// Held here so a handler can read the body itself, after authorizing,
+    /// rather than letting an extractor buffer it first.
+    pub(crate) max_body_size_bytes: usize,
     /// Taken from the first instance to bind. Every instance joining the same
     /// listener must present the same token, so this is unambiguous.
     pub(crate) management_token: Option<SecretString>,
@@ -232,6 +237,7 @@ impl ServerState {
     pub(crate) fn new(config: &HttpSourceConfig) -> Self {
         ServerState {
             listen_addr: config.listen_addr.clone(),
+            max_body_size_bytes: config.max_body_size_bytes,
             management_token: config.management_token.clone(),
             metrics: Metrics::new(),
             routes: ArcSwap::from_pointee(RouteTable::default()),
@@ -471,16 +477,22 @@ fn same_token(left: &Option<SecretString>, right: &Option<SecretString>) -> bool
     }
 }
 
+/// Takes the whole `Request` rather than a `Bytes` extractor, because axum runs
+/// extractors before the handler body: with one, an unauthenticated caller who
+/// guessed the operator-chosen `topic_path` could make the process buffer
+/// `max_body_size_bytes` before receiving its 401. The credential here is a
+/// header, so the body is only read once the request has earned it. The secret
+/// paths cannot do this for HMAC, whose signature covers the body, and there
+/// the endpoint id is itself a 128-bit secret the caller must already hold.
 async fn handle_named_path(
     State(state): State<Arc<ServerState>>,
     Path(topic_path): Path<String>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
-    request_headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    request: Request,
 ) -> Response {
     let started = Instant::now();
     let (instance_name, response) =
-        named_path_outcome(&state, &topic_path, remote_addr, &request_headers, body);
+        named_path_outcome(&state, &topic_path, remote_addr, request).await;
     state.metrics.record_request(
         &instance_name,
         PathKind::Named,
@@ -512,34 +524,49 @@ async fn handle_secret_path(
 /// Returns the instance the request resolved to alongside the response, so
 /// the caller can label the metrics. Requests that never resolved are still
 /// counted, under [`UNROUTED`].
-fn named_path_outcome(
+async fn named_path_outcome(
     state: &ServerState,
     topic_path: &str,
     remote_addr: SocketAddr,
-    request_headers: &HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    request: Request,
 ) -> (String, Response) {
-    let routes = state.routes.load();
-    let Some(instance) = routes.lookup_named_path(topic_path) else {
-        return (
-            UNROUTED.to_owned(),
-            error_response(StatusCode::NOT_FOUND, "not found"),
-        );
+    // Cloned before the body is taken, since reading it consumes the request.
+    let request_headers = request.headers().clone();
+    let instance = {
+        let routes = state.routes.load();
+        let Some(instance) = routes.lookup_named_path(topic_path) else {
+            return (
+                UNROUTED.to_owned(),
+                error_response(StatusCode::NOT_FOUND, "not found"),
+            );
+        };
+        Arc::clone(instance)
     };
     let name = instance.instance_name.clone();
-    let body = match body {
-        Ok(body) => body,
-        Err(rejection) => return (name, rejected_body_response(rejection)),
-    };
+
+    // Before the body: the whole point of taking the request whole.
     if let Some(expected) = &instance.config.auth_bearer_token
-        && !validate_bearer(bearer_header(request_headers), expected)
+        && !validate_bearer(bearer_header(&request_headers), expected)
     {
         return (
             name,
             error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
         );
     }
-    let response = enqueue(instance, request_headers, remote_addr, body, &state.metrics);
+
+    // `DefaultBodyLimit` guards the extractor, which is no longer in play, so
+    // the cap is applied here instead.
+    let body = match axum::body::to_bytes(request.into_body(), state.max_body_size_bytes).await {
+        Ok(body) => body,
+        Err(error) => return (name, oversized_body_response(&error)),
+    };
+    let response = enqueue(
+        &instance,
+        &request_headers,
+        remote_addr,
+        body,
+        &state.metrics,
+    );
     (name, response)
 }
 
@@ -844,6 +871,21 @@ fn header_str<'a>(request_headers: &'a HeaderMap, name: &str) -> Option<&'a str>
         .and_then(|value| value.to_str().ok())
 }
 
+/// `to_bytes` reports the cap and a truncated stream through the same error, so
+/// the status mirrors what the `Bytes` extractor would have returned: a body
+/// that ran past the limit is 413, anything else is a 400.
+fn oversized_body_response(error: &axum::Error) -> Response {
+    let too_large = error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("length limit exceeded");
+    if too_large {
+        error_response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large")
+    } else {
+        error_response(StatusCode::BAD_REQUEST, "bad request")
+    }
+}
+
 fn rejected_body_response(rejection: BytesRejection) -> Response {
     let status = rejection.status();
     let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
@@ -1024,6 +1066,54 @@ mod tests {
         let response = client()
             .post(format!("{}/e/{ENDPOINT_ONE}", base_url(&source)))
             .body("x".repeat(1024))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_unauthenticated_oversized_body_should_refuse_before_reading_it() {
+        // The status is the whole assertion. axum runs extractors before the
+        // handler body, so while the named path took a `Bytes` extractor an
+        // unauthenticated caller who guessed `topic_path` could make the
+        // process buffer up to `max_body_size_bytes` before its 401. If the
+        // body were still read first this would answer 413.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.auth_bearer_token = Some(SecretString::from("named-path-secret"));
+        config.max_body_size_bytes = 1024;
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .header(header::AUTHORIZATION, "Bearer not-the-token")
+            .body("x".repeat(4096))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unauthenticated caller must not reach the body reader"
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_authenticated_oversized_body_should_answer_payload_too_large() {
+        // And the cap still applies once the request has earned the read.
+        let mut config = config(free_port(), free_port(), &[]);
+        config.auth_bearer_token = Some(SecretString::from("named-path-secret"));
+        config.max_body_size_bytes = 1024;
+        let mut source = open(1, config).await;
+
+        let response = client()
+            .post(format!("{}/topics/github", base_url(&source)))
+            .header(header::AUTHORIZATION, "Bearer named-path-secret")
+            .body("x".repeat(4096))
             .send()
             .await
             .expect("the request must reach the listener");
