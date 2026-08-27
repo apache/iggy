@@ -220,9 +220,10 @@ mod tests {
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
 
-    /// Reserved for documentation by RFC 5737, so the bind fails and the test
-    /// reaches the warning without listening anywhere. A routable address that
-    /// binds would put a port on every interface for the life of the binary.
+    /// Reserved for documentation by RFC 5737, so the bind fails and the tests
+    /// that use it reach the warning without listening anywhere. Hosts running
+    /// `net.ipv4.ip_nonlocal_bind=1`, which keepalived and haproxy boxes set,
+    /// bind it regardless; `routable_address_binds` excuses those.
     const UNASSIGNABLE_ROUTABLE_ADDRESS: &str = "192.0.2.1:8081";
     const EPHEMERAL_LOOPBACK_ADDRESS: &str = "127.0.0.1:0";
 
@@ -270,11 +271,36 @@ mod tests {
     /// Whether `init` got as far as serving. The positive control for tests
     /// whose real assertion is that something was not warned about.
     fn started_serving(captured: &Captured) -> bool {
+        logged_info(captured, "Started")
+    }
+
+    fn logged_info(captured: &Captured, needle: &str) -> bool {
         captured
             .lock()
             .expect("the capture mutex is only held to push a line")
             .iter()
-            .any(|(level, message)| *level == Level::INFO && message.contains("Started"))
+            .any(|(level, message)| *level == Level::INFO && message.contains(needle))
+    }
+
+    /// Whether this host binds an address RFC 5737 reserves for documentation.
+    ///
+    /// `net.ipv4.ip_nonlocal_bind=1` makes it succeed, which turns a failed
+    /// bind into an unavailable control and leaves the test serving on a
+    /// routable address. Both tests that rely on the bind failing check this
+    /// first rather than going red over a sysctl.
+    fn routable_address_binds() -> bool {
+        std::net::TcpListener::bind(UNASSIGNABLE_ROUTABLE_ADDRESS).is_ok()
+    }
+
+    fn skip_unless_unbindable() -> bool {
+        if routable_address_binds() {
+            eprintln!(
+                "skipping: this host binds {UNASSIGNABLE_ROUTABLE_ADDRESS}, so a failed \
+                 bind is not available as a control"
+            );
+            return true;
+        }
+        false
     }
 
     struct CaptureEvents {
@@ -359,8 +385,13 @@ mod tests {
 
     #[tokio::test]
     async fn given_no_key_and_a_routable_address_when_initialized_should_warn_before_binding() {
-        let (_capture, captured) = capture_events();
+        if skip_unless_unbindable() {
+            return;
+        }
+        // Fixture first: `create_connectors_config_provider` logs, and anything
+        // it warns about later would otherwise land in this buffer.
         let (context, _directory) = context("").await;
+        let (_capture, captured) = capture_events();
         let config = config(UNASSIGNABLE_ROUTABLE_ADDRESS, "");
 
         // `init` panics when the bind fails, which is what makes this the
@@ -372,9 +403,8 @@ mod tests {
 
         assert!(
             bind_failed,
-            "a documentation-range address is expected to be unbindable. A host with \
-             net.ipv4.ip_nonlocal_bind=1, which keepalived and haproxy boxes set, binds \
-             it instead, and this test has then started a listener that outlives the run"
+            "a documentation-range address must be unbindable here; the pre-flight \
+             above already excused the hosts where it is not"
         );
         assert!(
             !started_serving(&captured),
@@ -397,8 +427,8 @@ mod tests {
 
     #[tokio::test]
     async fn given_loopback_address_when_initialized_should_serve_without_warning() {
-        let (_capture, captured) = capture_events();
         let (context, _directory) = context("").await;
+        let (_capture, captured) = capture_events();
 
         init(&config(EPHEMERAL_LOOPBACK_ADDRESS, ""), context).await;
 
@@ -421,8 +451,8 @@ mod tests {
 
     #[tokio::test]
     async fn given_wildcard_cors_and_no_key_when_initialized_should_warn_despite_loopback() {
-        let (_capture, captured) = capture_events();
         let (context, _directory) = context("").await;
+        let (_capture, captured) = capture_events();
         let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "");
         config.cors.enabled = true;
         config.cors.allowed_origins = vec!["*".to_owned()];
@@ -448,8 +478,8 @@ mod tests {
 
     #[tokio::test]
     async fn given_pinned_cors_origins_when_initialized_should_not_warn_about_cors() {
-        let (_capture, captured) = capture_events();
         let (context, _directory) = context("").await;
+        let (_capture, captured) = capture_events();
         let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "");
         config.cors.enabled = true;
         config.cors.allowed_origins = vec!["https://console.example".to_owned()];
@@ -470,12 +500,22 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_key_but_no_tls_beyond_loopback_when_initialized_should_still_warn() {
-        let (_capture, captured) = capture_events();
+        if skip_unless_unbindable() {
+            return;
+        }
         let (context, _directory) = context("configured").await;
+        let (_capture, captured) = capture_events();
         let config = config(UNASSIGNABLE_ROUTABLE_ADDRESS, "configured");
 
-        let _ = tokio::spawn(async move { init(&config, context).await }).await;
+        let bind_failed = tokio::spawn(async move { init(&config, context).await })
+            .await
+            .is_err();
 
+        assert!(
+            bind_failed,
+            "a documentation-range address must be unbindable here; the pre-flight \
+             above already excused the hosts where it is not"
+        );
         let warnings = warnings(&captured);
         assert!(
             warnings.iter().any(|warning| warning.contains("http.tls")),
@@ -492,8 +532,8 @@ mod tests {
 
     #[tokio::test]
     async fn given_a_disabled_api_when_initialized_should_warn_about_nothing() {
-        let (_capture, captured) = capture_events();
         let (context, _directory) = context("").await;
+        let (_capture, captured) = capture_events();
         // Routable, keyless and untrusting in every direction, but switched off.
         let mut config = config(UNASSIGNABLE_ROUTABLE_ADDRESS, "");
         config.enabled = false;
@@ -501,6 +541,12 @@ mod tests {
 
         init(&config, context).await;
 
+        // Positive control: without it this passes for any reason `init` returns
+        // early, including one that never reaches the guard at all.
+        assert!(
+            logged_info(&captured, "HTTP API is disabled"),
+            "init must take the disabled path, or the assertion below proves nothing"
+        );
         assert!(
             warnings(&captured).is_empty(),
             "an API that is not listening exposes nothing, and warning about one \
