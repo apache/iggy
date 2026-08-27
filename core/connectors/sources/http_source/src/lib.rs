@@ -127,10 +127,16 @@ pub(crate) struct PollGuard<'a>(&'a SharedState);
 
 impl Drop for PollGuard<'_> {
     fn drop(&mut self) {
-        self.0.poll_active.store(false, Ordering::Release);
+        // Timestamp first. `poll_is_live` reads the two as an unsynchronised
+        // pair, so clearing the flag first leaves a window where a reader sees
+        // "not polling" beside the *previous* timestamp. On the first return
+        // that previous value is the constructor's 0, which reads as an hour
+        // stale, and `/health` answers 503 for a source that is perfectly
+        // healthy. Writing this way the pair is only ever seen as live.
         self.0
             .last_poll_at
             .store(unix_now_seconds(), Ordering::Release);
+        self.0.poll_active.store(false, Ordering::Release);
     }
 }
 

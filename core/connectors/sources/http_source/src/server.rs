@@ -651,7 +651,10 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
                 endpoints_expired: registry.expired_count(now),
                 endpoints_revoked: registry.revoked_count(),
                 named_path: instance.config.topic_path.is_some(),
-                state_submitted: registry.all_submitted(),
+                // Same derivation as the per-endpoint flag: submitted is set
+                // before the state leaves, so it only means durable if no
+                // flush is still owed.
+                state_submitted: registry.all_submitted() && !instance.has_pending_state(),
                 dropped_headers: state.metrics.headers_dropped(&instance.instance_name),
                 clamped_headers: state.metrics.headers_clamped(&instance.instance_name),
             }

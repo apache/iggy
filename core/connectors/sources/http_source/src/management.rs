@@ -484,7 +484,12 @@ impl EndpointSummary {
             origin: endpoint.origin.as_str(),
             auth_type: endpoint.auth_type,
             expires_at: endpoint.expires_at,
-            submitted: endpoint.submitted,
+            // Derived, not read straight off the endpoint: `take_dirty_state`
+            // marks the whole registry submitted before the state leaves, and a
+            // NACK re-arms the flush without clearing that. Pairing it with the
+            // outstanding-flush bit turns the flag honest for free, and errs
+            // toward reporting not-yet-durable, which is the safe direction.
+            submitted: endpoint.submitted && !instance.has_pending_state(),
             revoked_at,
             revoked_reason,
         }
@@ -711,6 +716,53 @@ mod tests {
         assert!(
             fixture.source.shared.take_dirty_state().is_none(),
             "and a no-op must not arm another state write"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_owed_flush_when_listed_should_not_claim_submitted() {
+        // `take_dirty_state` marks the whole registry submitted before the
+        // state leaves the plugin, and a NACK re-arms the flush without
+        // clearing that, so the stored flag alone would claim a revocation was
+        // durable when nothing had been written.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+        let http = client();
+        let list = format!("{}/admin/endpoints", fixture.admin);
+
+        // Mutate so a flush is owed, hand it over so the registry is marked
+        // submitted, then re-arm as a NACK would.
+        assert!(
+            fixture
+                .source
+                .shared
+                .mutate_registry(|registry| registry.revoke(
+                    ENDPOINT_ONE,
+                    "compromised".to_string(),
+                    1
+                ))
+                .await
+        );
+        fixture
+            .source
+            .shared
+            .take_dirty_state()
+            .expect("the mutation must arm a flush");
+        fixture.source.shared.rearm_state_flush();
+
+        let body: Value = http
+            .get(&list)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .json()
+            .await
+            .expect("a json body");
+
+        assert_eq!(
+            body[0]["submitted"], false,
+            "a flush is still owed, so nothing may be reported durable"
         );
         fixture.close().await;
     }
