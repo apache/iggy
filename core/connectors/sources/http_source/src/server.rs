@@ -615,12 +615,17 @@ async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> String {
 /// task still running behind it.
 async fn handle_health(State(state): State<Arc<ServerState>>) -> Response {
     let now = unix_now_seconds();
+    let instances = state.instances.load();
+    // Every instance, not any. One load balancer fronts the whole listener, so
+    // it can only take all of these in or out together. If one instance's poll
+    // task has stopped while a sibling's is alive, `any` keeps the address in
+    // rotation and the dead one's webhooks are accepted into a bridge nobody
+    // drains, which is the exact failure this gate exists to catch. Shedding
+    // the healthy sibling's traffic too costs availability that senders recover
+    // by retrying; the alternative loses data that was already answered 200.
     let ready = !state.routes.load().is_empty()
-        && state
-            .instances
-            .load()
-            .iter()
-            .any(|instance| instance.poll_is_live(now));
+        && !instances.is_empty()
+        && instances.iter().all(|instance| instance.poll_is_live(now));
     if !ready {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1550,6 +1555,39 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_one_stopped_instance_when_health_checked_should_report_unavailable() {
+        // One address fronts both instances, so a sibling whose poll task has
+        // stopped would keep receiving traffic into a bridge nothing drains.
+        let public_port = free_port();
+        let admin_port = free_port();
+        let mut first_config = config(public_port, admin_port, &[ENDPOINT_ONE]);
+        first_config.instance_name = Some("http_github".to_string());
+        let mut first = open(1, first_config).await;
+
+        let mut second_config = config(public_port, admin_port, &[ENDPOINT_TWO]);
+        second_config.instance_name = Some("http_partner".to_string());
+        second_config.topic_path = Some("stripe".to_string());
+        let mut second = open(2, second_config).await;
+
+        let live = Arc::clone(&first.shared);
+        let _polling = live.enter_poll();
+
+        let response = client()
+            .get(format!("{}/health", base_url(&first)))
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "one instance polling is not enough when the listener is shared"
+        );
+        close(&mut second).await;
+        close(&mut first).await;
     }
 
     #[tokio::test]
