@@ -23,7 +23,11 @@ use axum_server::tls_rustls::RustlsConfig;
 use config::{HttpConfig, configure_cors};
 use iggy_connector_sdk::api::ConnectorRuntimeStats;
 use secrecy::ExposeSecret;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::{net::lookup_host, spawn};
 use tracing::{error, info, warn};
 
@@ -127,8 +131,9 @@ pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
     });
 }
 
-/// Warns once for each configuration change that removes a layer of
-/// containment from this API.
+/// Warns once for each configuration change that leaves this API without a
+/// compensating control: no key beyond loopback, no key with an unowned CORS
+/// origin, no TLS beyond loopback.
 ///
 /// Separate warnings rather than one, because the three compose independently
 /// and an operator who closes one has not necessarily closed the others. Each
@@ -148,12 +153,14 @@ async fn warn_on_weak_containment(config: &HttpConfig) {
 
     // Loopback does not contain this one. A browser is a local process and the
     // CORS layer wraps outside authentication, so the shipped
-    // `allowed_origins = ["*"]` lets any page the operator visits reach these
-    // endpoints cross-origin. A pinned list does not, and an empty one emits no
-    // header at all, so neither is warned about.
-    if unauthenticated && config.cors.enabled && config.cors.allows_any_origin() {
+    // `allowed_origins = ["*"]` lets any page the operator visits read these
+    // endpoints cross-origin. A pinned list closes that read and an empty one
+    // emits no header at all, so neither is warned about. Neither closes
+    // `POST .../restart`, which is CORS-simple and reaches the handler whatever
+    // this says; that one is true of the defaults, so the README carries it.
+    if unauthenticated && config.cors.enabled && config.cors.allows_unowned_origin() {
         warn!(
-            "{NAME} HTTP API has http.cors enabled for any origin with no api_key, so any page the operator visits can read and rewrite connector configuration. See {EXPOSURE_DOC}."
+            "{NAME} HTTP API has http.cors open to * or null with no api_key, so any page the operator visits can read and rewrite connector configuration. See {EXPOSURE_DOC}."
         );
     }
 
@@ -187,7 +194,16 @@ async fn resolves_beyond_loopback(address: &str) -> bool {
     let addresses: Vec<SocketAddr> = resolved.collect();
     // Empty is reported as exposed rather than confined: `all` over nothing is
     // vacuously true, which would quietly invert the policy above.
-    addresses.is_empty() || !addresses.iter().all(|address| address.ip().is_loopback())
+    addresses.is_empty()
+        || !addresses.iter().all(|address| match address.ip() {
+            // `Ipv6Addr::is_loopback` matches only `::1`, so an IPv4-mapped
+            // `::ffff:127.0.0.1` binds to 127.0.0.1 and would still read as
+            // exposed.
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or(v6.is_loopback(), |v4| v4.is_loopback()),
+            ip => ip.is_loopback(),
+        })
 }
 
 async fn get_metrics(State(context): State<Arc<RuntimeContext>>) -> String {
@@ -368,6 +384,11 @@ mod tests {
             !resolves_beyond_loopback("localhost:8081").await,
             "`address` accepts a hostname, and parsing alone would misjudge one"
         );
+        assert!(
+            !resolves_beyond_loopback("[::ffff:127.0.0.1]:8081").await,
+            "an IPv4-mapped address binds to 127.0.0.1, and `Ipv6Addr::is_loopback` \
+             alone matches only `::1`"
+        );
     }
 
     #[tokio::test]
@@ -492,7 +513,7 @@ mod tests {
         );
         assert!(
             warnings(&captured).is_empty(),
-            "an operator who pinned their origins closed the cross-origin path, and \
+            "an operator who pinned their origins closed the cross-origin read, and \
              warning at them is what teaches everyone to ignore the rest: {:?}",
             warnings(&captured)
         );
@@ -527,6 +548,12 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("no api_key")),
             "and the key that was set must not still be reported as missing"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains(EXPOSURE_DOC)),
+            "each warning carries the pointer instead of its own remediation: {warnings:?}"
         );
     }
 

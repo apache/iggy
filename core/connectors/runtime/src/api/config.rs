@@ -77,14 +77,28 @@ impl HttpCorsConfig {
     /// Whether `configure_cors` will turn this into `AllowOrigin::any()`.
     ///
     /// Only the first entry decides, because that is what the mapping below
-    /// reads. A `"*"` in any later position goes through `AllowOrigin::list`
-    /// as a literal header value, which no real `Origin` can equal, so it
-    /// allows nothing. Callers that warn about cross-origin exposure share
-    /// this rather than restating it, so the two cannot drift apart.
+    /// reads. A `"*"` in any later position never reaches a served request:
+    /// `AllowOrigin::list` panics on a wildcard, so such a config takes the
+    /// process down at startup rather than allowing anything.
     pub fn allows_any_origin(&self) -> bool {
         self.allowed_origins
             .first()
             .is_some_and(|origin| origin == "*")
+    }
+
+    /// Whether the resulting policy admits an origin nobody owns.
+    ///
+    /// `*` is one. `null` is the other: a browser sends it from a sandboxed
+    /// iframe, a `data:` URL and a `file://` page, so listing it hands the
+    /// cross-origin read to whoever gets the operator to open a page.
+    /// `AllowOrigin::list` echoes any listed value back on a match, so a
+    /// `null` anywhere counts, not only first.
+    ///
+    /// Separate from `allows_any_origin` because `configure_cors` has to keep
+    /// mapping `["null"]` to a one-entry list rather than widening it, and
+    /// defined in terms of it so the two cannot disagree about `*`.
+    pub fn allows_unowned_origin(&self) -> bool {
+        self.allows_any_origin() || self.allowed_origins.iter().any(|origin| origin == "null")
     }
 }
 
@@ -253,6 +267,7 @@ mod tests {
     #[test]
     fn given_a_leading_wildcard_when_classified_should_allow_any_origin() {
         assert!(cors(&["*"]).allows_any_origin());
+        assert!(cors(&["*"]).allows_unowned_origin());
     }
 
     #[test]
@@ -262,10 +277,27 @@ mod tests {
             "an empty list emits no header"
         );
         assert!(!cors(&["https://console.example"]).allows_any_origin());
+        assert!(!cors(&["https://console.example"]).allows_unowned_origin());
         assert!(
             !cors(&["https://console.example", "*"]).allows_any_origin(),
-            "only the first entry reaches `AllowOrigin::any`; a later `*` goes \
-             through `AllowOrigin::list` as a header value no `Origin` can equal"
+            "only the first entry reaches `AllowOrigin::any`; a later `*` makes \
+             `AllowOrigin::list` panic, so that config never serves a request"
+        );
+    }
+
+    #[test]
+    fn given_a_null_origin_when_classified_should_report_an_unowned_one() {
+        assert!(
+            cors(&["null"]).allows_unowned_origin(),
+            "a sandboxed iframe, a data: URL and a file:// page all send Origin: null"
+        );
+        assert!(
+            cors(&["https://console.example", "null"]).allows_unowned_origin(),
+            "`AllowOrigin::list` echoes any listed value, so position does not matter"
+        );
+        assert!(
+            !cors(&["null"]).allows_any_origin(),
+            "`configure_cors` still has to build a one-entry list, not widen to any()"
         );
     }
 }
