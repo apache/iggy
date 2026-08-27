@@ -15,8 +15,12 @@ A Helm chart for Apache Iggy server and web-ui
 
 Iggy server uses `io_uring` for high-performance async I/O. This requires:
 
-1. **IPC_LOCK capability** - For locking memory required by io_uring
-2. **Unconfined seccomp profile** - To allow io_uring syscalls
+1. **Linux kernel 5.19 or newer on the node** - The shard executor sets up its
+   rings with `IORING_SETUP_COOP_TASKRUN` and `IORING_SETUP_TASKRUN_FLAG`, which
+   the kernel rejects below 5.19. The server fails during startup on older
+   kernels. The node kernel is what matters, not the container image.
+2. **IPC_LOCK capability** - For locking memory required by io_uring
+3. **Unconfined seccomp profile** - To allow io_uring syscalls
 
 These are configured by default for the Iggy server via the chart's root-level
 `securityContext` and `podSecurityContext`. The web UI uses `ui.securityContext`

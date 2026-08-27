@@ -243,12 +243,7 @@ async fn truncate_or_fail(
         reason,
         "truncating torn WAL tail; no complete entry follows the damage"
     );
-    storage.truncate(pos).await?;
-    // The repair must be crash-durable. `FileStorage::truncate` is a
-    // bare `set_len`; without this fsync a power loss right after the
-    // repair re-presents the torn tail on the next boot. Mirrors the
-    // write-then-fsync the `append` path already does.
-    storage.fsync().await?;
+    storage.truncate(pos)?;
     Ok(())
 }
 
@@ -1745,8 +1740,7 @@ mod tests {
             let storage = FileStorage::open(&path).await.unwrap();
             let full_len = storage.file_len();
             // Remove the last 10 bytes (partial second entry)
-            storage.truncate(full_len - 10).await.unwrap();
-            storage.fsync().await.unwrap();
+            storage.truncate(full_len - 10).unwrap();
         }
 
         // Reopen, should recover only the first entry
