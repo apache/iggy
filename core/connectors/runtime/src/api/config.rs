@@ -289,6 +289,27 @@ mod tests {
     }
 
     #[test]
+    fn given_the_classified_origin_shapes_when_built_should_produce_a_layer() {
+        // The predicates above describe what `configure_cors` does with each
+        // shape, so a shape that cannot build would make the warning the last
+        // line an operator sees before the process dies.
+        for origins in [
+            &["*"][..],
+            &[][..],
+            &["https://console.example"][..],
+            &["null"][..],
+        ] {
+            let _layer = configure_cors(&cors(origins));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Wildcard origin")]
+    fn given_a_trailing_wildcard_when_built_should_panic_rather_than_allow_nothing() {
+        let _layer = configure_cors(&cors(&["https://console.example", "*"]));
+    }
+
+    #[test]
     fn given_a_null_origin_when_classified_should_report_an_unowned_one() {
         assert!(
             cors(&["null"]).allows_unowned_origin(),

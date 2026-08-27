@@ -573,6 +573,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_wildcard_cors_and_a_key_when_initialized_should_not_warn_about_cors() {
+        let (context, _directory) = context("configured").await;
+        let (_capture, captured) = capture_events();
+        let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "configured");
+        config.cors.enabled = true;
+        config.cors.allowed_origins = vec!["*".to_owned()];
+
+        init(&config, context).await;
+
+        assert!(started_serving(&captured));
+        assert!(
+            warnings(&captured).is_empty(),
+            "an attacker's page cannot supply the api-key header, so a key closes \
+             the cross-origin path a wildcard opens: {:?}",
+            warnings(&captured)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_cors_switched_off_when_initialized_should_not_warn_about_its_origins() {
+        let (context, _directory) = context("").await;
+        let (_capture, captured) = capture_events();
+        // The shipped block verbatim: a wildcard list that is not switched on.
+        // Warning here would fire on every stock deployment.
+        let mut config = config(EPHEMERAL_LOOPBACK_ADDRESS, "");
+        config.cors.allowed_origins = vec!["*".to_owned()];
+
+        init(&config, context).await;
+
+        assert!(started_serving(&captured));
+        assert!(
+            warnings(&captured).is_empty(),
+            "no CORS layer is installed unless http.cors is enabled, so the origin \
+             list allows nothing on its own: {:?}",
+            warnings(&captured)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_tls_enabled_beyond_loopback_when_initialized_should_not_warn_about_cleartext() {
+        let (context, _directory) = context("configured").await;
+        let (_capture, captured) = capture_events();
+        let mut config = config(UNASSIGNABLE_ROUTABLE_ADDRESS, "configured");
+        config.tls.enabled = true;
+
+        // The TLS branch loads a certificate this config does not name, so
+        // `init` panics there. That is after the warning block, which is what
+        // makes the panic the positive control.
+        let reached_the_certificate = tokio::spawn(async move { init(&config, context).await })
+            .await
+            .is_err();
+
+        assert!(
+            reached_the_certificate,
+            "init must get past the warning block, or the assertion below proves nothing"
+        );
+        assert!(
+            warnings(&captured).is_empty(),
+            "TLS on the listener is exactly what the cleartext warning asks for: {:?}",
+            warnings(&captured)
+        );
+    }
+
+    #[tokio::test]
     async fn given_a_disabled_api_when_initialized_should_warn_about_nothing() {
         let (context, _directory) = context("").await;
         let (_capture, captured) = capture_events();
