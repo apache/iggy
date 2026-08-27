@@ -97,7 +97,6 @@ Every installation below compiles the Rust extension, so you'll need:
    ```bash
    # run from foreign/python
    cargo run --bin stub_gen
-   # TODO: Known bug: running this from a subdirectory of `foreign/python` corrupts the tracked stub, see https://github.com/apache/iggy/pull/3825/changes/BASE..773a27971b4ddb7b44773ded395ed23afb1de4c9#r3727691619
    ```
 
 5. Before committing, test the pre-commit and pre-push hooks. `prek` only inspects staged content, so stage your work first:
