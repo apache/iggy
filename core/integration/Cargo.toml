@@ -110,6 +110,11 @@ zip = { workspace = true }
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 zbus-secret-service-keyring-store = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Runs the RWF_DONTCACHE probe the server boots with, so the uncached segment
+# tests skip where the kernel or the filesystem cannot take the flag.
+server_common = { workspace = true }
+
 [build-dependencies]
 cfg_aliases = { workspace = true }
 

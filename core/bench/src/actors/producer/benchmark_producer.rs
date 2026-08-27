@@ -86,12 +86,22 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
         let mut batch_generator =
             BenchmarkBatchGenerator::new(self.config.message_size, self.config.messages_per_batch);
 
+        // One limiter shared by warmup and the measured loop, so warmup cannot run at
+        // drive speed and hand the measured window a different cache / FTL state per arm.
+        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+
         if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
             self.log_warmup_info();
             let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
 
             while Instant::now() < warmup_end {
-                let _ = self.client.produce_batch(&mut batch_generator).await?;
+                if let Some(batch) = self.client.produce_batch(&mut batch_generator).await?
+                    && let Some(rate_limiter) = &rate_limiter
+                {
+                    rate_limiter
+                        .wait_until_necessary(batch.user_data_bytes)
+                        .await;
+                }
             }
         }
 
@@ -104,7 +114,6 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
         let mut user_data_bytes_processed = 0;
         let mut total_bytes_processed = 0;
 
-        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
         let start_timestamp = Instant::now();
 
         while !self.finish_condition.is_done() {

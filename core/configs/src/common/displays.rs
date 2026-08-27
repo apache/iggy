@@ -154,7 +154,11 @@ impl Display for PartitionConfig {
 
 impl Display for SegmentConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ archive_expired: {} }}", self.archive_expired,)
+        write!(
+            f,
+            "{{ archive_expired: {}, write_io: {} }}",
+            self.archive_expired, self.write_io
+        )
     }
 }
 

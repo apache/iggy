@@ -126,15 +126,19 @@ pub trait Benchmarkable: Send {
             let enforce_fsync = self.args().enforce_fsync();
             let messages_required_to_save =
                 self.args().messages_required_to_save().map(NonZeroU32::get);
+            let preallocate_segments = self.args().preallocate_segments();
+            let segment_size = self.args().segment_size();
 
             info!(
-                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, enforce fsync: {}, messages required to save: {:?}",
+                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, enforce fsync: {}, messages required to save: {:?}, preallocate segments: {:?}, segment size: {:?}",
                 topic_name,
                 stream_name,
                 max_topic_size,
                 message_expiry,
                 enforce_fsync,
-                messages_required_to_save
+                messages_required_to_save,
+                preallocate_segments,
+                segment_size
             );
 
             client
@@ -147,8 +151,10 @@ pub trait Benchmarkable: Send {
                             .then_some(message_expiry),
                         max_topic_size: (max_topic_size != MaxTopicSize::ServerDefault)
                             .then_some(max_topic_size),
+                        segment_size,
                         enforce_fsync: enforce_fsync.then_some(true),
                         messages_required_to_save,
+                        preallocate_segments,
                         ..TopicCreateOptions::default()
                     },
                 )

@@ -132,6 +132,16 @@ pub enum ServerError {
     },
     #[error("failed to initialize server logging")]
     Logging(#[source] LogError),
+    // `main` returns this enum, so boot prints it through `Debug` and no
+    // `Display` text here reaches the operator: `bootstrap` writes the failed
+    // requirement and the remedy to stderr itself.
+    #[cfg(target_os = "linux")]
+    #[error("system.segment.write_io = \"uncached\" is unusable under {path}")]
+    UncachedWriteUnsupported {
+        path: PathBuf,
+        #[source]
+        source: server_common::uncached_io::UncachedIoError,
+    },
     #[error("failed to recover metadata snapshot and journal")]
     MetadataRecovery(#[source] RecoveryError),
     #[error("failed to open partition superblock at {dir}")]

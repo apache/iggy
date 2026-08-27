@@ -379,6 +379,7 @@ pub fn new_shard(
         validate_checksum: true,
         segment_size: IggyByteSize::from(1024 * 1024 * 1024),
         preallocate_segments: false,
+        write_io: server_common::segment_io::SegmentIoMode::Buffered,
         encryptor: None,
         path_layout: PartitionPathLayout::default(),
     };

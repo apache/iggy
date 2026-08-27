@@ -207,6 +207,7 @@ iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.3" }
 indexmap = "2.14.1"
 integration = { path = "core/integration" }
+io-uring = "0.7.13"
 ipnet = "2.12.1"
 journal = { path = "core/journal" }
 js-sys = "0.3"

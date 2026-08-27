@@ -77,4 +77,8 @@ mod message_retrieval;
 // a restarted replica rejoins via the view probe + journal repair.
 mod purge_delete;
 mod scenarios;
+// `[system.segment] write_io = "uncached"`: boot refusal on a filesystem that
+// rejects RWF_DONTCACHE, and uncached-flushed segments read back after a restart.
+#[cfg(target_os = "linux")]
+mod segment_write_io;
 mod specific;

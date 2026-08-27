@@ -49,6 +49,7 @@ use metadata::{IdentityField, ReplicaIdentity};
 use partitions::{IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, Segment};
 use server_common::SegmentStorage;
 use server_common::fs_utils::remove_dir_all;
+use server_common::segment_io::SegmentIoMode;
 use server_common::sharding::IggyNamespace;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -384,6 +385,7 @@ pub async fn ensure_initial_segment(
                 &messages_path,
                 messages_size_counter,
                 enforce_fsync,
+                config.system.segment.write_io,
                 false,
                 preallocate_segments.then_some(segment_size),
             )
@@ -401,19 +403,25 @@ pub async fn ensure_initial_segment(
             })?,
         )),
         Some(Rc::new(
-            IggyIndexWriter::new(&index_path, index_size_counter, enforce_fsync, false)
-                .await
-                .map_err(|source| {
-                    error!(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        path = %index_path,
-                        error = %source,
-                        "failed to initialize initial sparse index writer"
-                    );
-                    source
-                })?,
+            IggyIndexWriter::new(
+                &index_path,
+                index_size_counter,
+                enforce_fsync,
+                config.system.segment.write_io,
+                false,
+            )
+            .await
+            .map_err(|source| {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    path = %index_path,
+                    error = %source,
+                    "failed to initialize initial sparse index writer"
+                );
+                source
+            })?,
         )),
     );
     partition.stats.increment_segments_count(1);
@@ -810,6 +818,7 @@ async fn load_partition(
         topic_id,
         partition_id,
         recovered_segments,
+        config.system.segment.write_io,
     )
     .await?;
 
@@ -913,6 +922,7 @@ async fn recover_partition_segments(
 ///
 /// Takes no `&ServerConfig`: every knob it needs is the partition's own
 /// resolved topic option now, which is the whole point of the per-topic move.
+/// `write_io` is the one exception, a host-wide filesystem property.
 async fn hydrate_partition_log(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     partition_dir: &str,
@@ -920,6 +930,7 @@ async fn hydrate_partition_log(
     topic_id: usize,
     partition_id: usize,
     recovered_segments: Vec<RecoveredSegment>,
+    write_io: SegmentIoMode,
 ) -> Result<(), ServerError> {
     // The partition's own resolved knobs, not the shard-wide config: a topic
     // created with `enforce_fsync` or a per-topic `segment_size` must get them
@@ -966,6 +977,7 @@ async fn hydrate_partition_log(
                     &messages_reader.path(),
                     messages_size_counter,
                     enforce_fsync,
+                    write_io,
                     true,
                     preallocate_segments.then_some(segment_size),
                 )
@@ -990,26 +1002,32 @@ async fn hydrate_partition_log(
                 })?,
             ));
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
-                IggyIndexWriter::new(&index_path, index_size_counter, enforce_fsync, true)
-                    .await
-                    .map_err(|source| {
-                        error!(
-                            stream_id,
-                            topic_id,
-                            partition_id,
-                            path = %index_path,
-                            error = %source,
-                            "failed to initialize persisted sparse index writer"
-                        );
-                        hydrate_reopen_error(
-                            source,
-                            partition_dir,
-                            stream_id,
-                            topic_id,
-                            partition_id,
-                            start_offset,
-                        )
-                    })?,
+                IggyIndexWriter::new(
+                    &index_path,
+                    index_size_counter,
+                    enforce_fsync,
+                    write_io,
+                    true,
+                )
+                .await
+                .map_err(|source| {
+                    error!(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        path = %index_path,
+                        error = %source,
+                        "failed to initialize persisted sparse index writer"
+                    );
+                    hydrate_reopen_error(
+                        source,
+                        partition_dir,
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        start_offset,
+                    )
+                })?,
             ));
         }
     }

@@ -4095,6 +4095,7 @@ where
                 &messages_path,
                 messages_size_bytes,
                 enforce_fsync,
+                config.write_io,
                 false,
                 preallocate_segments.then_some(segment_size),
             )
@@ -4107,9 +4108,15 @@ where
             .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
             .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(&index_path, index_size_bytes, enforce_fsync, false)
-                .await
-                .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
+            IggyIndexWriter::new(
+                &index_path,
+                index_size_bytes,
+                enforce_fsync,
+                config.write_io,
+                false,
+            )
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
 
         let old_storage = &mut self.log.storages_mut()[old_segment_index];
@@ -4365,6 +4372,7 @@ where
                 &messages_path,
                 messages_size_bytes,
                 enforce_fsync,
+                config.write_io,
                 false,
                 preallocate_segments.then_some(segment_size),
             )
@@ -4377,9 +4385,15 @@ where
             .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
             .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(&index_path, index_size_bytes, enforce_fsync, false)
-                .await
-                .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
+            IggyIndexWriter::new(
+                &index_path,
+                index_size_bytes,
+                enforce_fsync,
+                config.write_io,
+                false,
+            )
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
         self.log
             .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
@@ -5382,6 +5396,7 @@ mod tests {
     use iggy_binary_protocol::{Command, ReplyHeader, WireConsumer, WireEncode};
     use message_bus::{BusMessage, SendError};
     use server_common::MESSAGE_ALIGN;
+    use server_common::segment_io::SegmentIoMode;
     use server_common::send_messages::{
         COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
@@ -6949,6 +6964,13 @@ mod tests {
     }
 
     pub(super) fn repair_config() -> PartitionsConfig {
+        repair_config_with_io(SegmentIoMode::Buffered)
+    }
+
+    /// Most fixtures run on `std::env::temp_dir()`, which is tmpfs on many
+    /// boxes and refuses `RWF_DONTCACHE`; only a fixture that placed its
+    /// segments on a supported filesystem may ask for `Uncached`.
+    pub(super) fn repair_config_with_io(write_io: SegmentIoMode) -> PartitionsConfig {
         PartitionsConfig {
             messages_required_to_save: 1,
             size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
@@ -6956,6 +6978,7 @@ mod tests {
             validate_checksum: true,
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,
+            write_io,
             encryptor: None,
             path_layout: crate::PartitionPathLayout::default(),
         }
@@ -7675,13 +7698,25 @@ mod tests {
         async fn new(log_path: &str, index_path: &str) -> Self {
             let log_cursor = Rc::new(AtomicU64::new(0));
             let index_cursor = Rc::new(AtomicU64::new(0));
-            let messages_writer =
-                MessagesWriter::new(log_path, log_cursor.clone(), true, false, None)
-                    .await
-                    .expect("open segment log writer");
-            let index_writer = IggyIndexWriter::new(index_path, index_cursor.clone(), true, false)
-                .await
-                .expect("open segment index writer");
+            let messages_writer = MessagesWriter::new(
+                log_path,
+                log_cursor.clone(),
+                true,
+                SegmentIoMode::Buffered,
+                false,
+                None,
+            )
+            .await
+            .expect("open segment log writer");
+            let index_writer = IggyIndexWriter::new(
+                index_path,
+                index_cursor.clone(),
+                true,
+                SegmentIoMode::Buffered,
+                false,
+            )
+            .await
+            .expect("open segment index writer");
 
             let mut partition = test_partition();
             partition.log.add_persisted_segment(
@@ -7875,6 +7910,7 @@ mod tests {
             log_path.to_str().expect("utf-8 path"),
             log_cursor,
             true,
+            SegmentIoMode::Buffered,
             false,
             None,
         )
@@ -7882,9 +7918,10 @@ mod tests {
         .expect("open segment log writer");
         // The index half writes to a device that is always full, so the
         // persist fails the way a full disk fails.
-        let index_writer = IggyIndexWriter::new(DEV_FULL, index_cursor, true, false)
-            .await
-            .expect("open segment index writer");
+        let index_writer =
+            IggyIndexWriter::new(DEV_FULL, index_cursor, true, SegmentIoMode::Buffered, false)
+                .await
+                .expect("open segment index writer");
 
         let mut partition = test_partition();
         partition.log.add_persisted_segment(
@@ -7968,6 +8005,7 @@ mod tests {
             index_path.to_str().expect("utf-8 path"),
             fixture.index_cursor.clone(),
             true,
+            SegmentIoMode::Buffered,
             false,
         )
         .await
@@ -8834,5 +8872,179 @@ mod purge_floor_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Partition-level coverage for the uncached (`RWF_DONTCACHE`) segment write
+/// path. Every other partition fixture pins `Buffered`, so nothing above the
+/// leaf writer methods would otherwise drive rotation or the index-failure
+/// rewind with the flag set.
+#[cfg(all(test, target_os = "linux"))]
+mod uncached_disk_tests {
+    use super::tests::{journal_send_batch, repair_config_with_io, test_partition};
+    use super::*;
+    use crate::uncached_test_support::{tmpfs_scratch_dir, uncached_scratch_dir};
+    use server_common::segment_io::SegmentIoMode;
+    use tempfile::TempDir;
+
+    /// A partition whose segment 0 is backed by real writers in `write_io`
+    /// mode. The index path is a parameter: putting it on tmpfs is the only
+    /// deterministic way to make an uncached index save fail while the
+    /// uncached batch write next to it succeeds. Returns the shared segment
+    /// write cursor so a caller can observe a rewind.
+    async fn disk_partition(
+        directory: &TempDir,
+        index_path: &str,
+        write_io: SegmentIoMode,
+        max_segment_size: IggyByteSize,
+    ) -> (IggyPartition<IggyMessageBus>, Rc<AtomicU64>) {
+        let partition_dir = directory.path().to_string_lossy().into_owned();
+        let messages_path = format!("{partition_dir}/{:0>20}.log", 0u64);
+
+        let mut partition = test_partition();
+        partition.set_partition_dir(partition_dir);
+        partition.log.segments_mut()[0].max_size = max_segment_size;
+
+        let storage = SegmentStorage::new(&messages_path, index_path, 0, 0, false)
+            .await
+            .expect("create segment storage");
+        let messages_size = storage
+            .messages_writer
+            .as_ref()
+            .expect("storage opens a messages writer")
+            .size_counter();
+        let index_size = storage
+            .index_writer
+            .as_ref()
+            .expect("storage opens an index writer")
+            .size_counter();
+        partition.log.storages_mut()[0] = storage;
+        partition.log.messages_writers_mut()[0] = Some(Rc::new(
+            MessagesWriter::new(
+                &messages_path,
+                Rc::clone(&messages_size),
+                false,
+                write_io,
+                false,
+                None,
+            )
+            .await
+            .expect("open messages writer"),
+        ));
+        partition.log.index_writers_mut()[0] = Some(Rc::new(
+            IggyIndexWriter::new(index_path, index_size, false, write_io, false)
+                .await
+                .expect("open index writer"),
+        ));
+        (partition, messages_size)
+    }
+
+    fn file_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+            .len()
+    }
+
+    #[compio::test]
+    async fn given_uncached_mode_when_committing_past_the_cap_should_rotate_and_append_on_disk() {
+        let Some(directory) = uncached_scratch_dir().await else {
+            return;
+        };
+        let index_path = format!("{}/{:0>20}.index", directory.path().display(), 0u64);
+        // A one-byte cap makes every committed batch fill the segment, so the
+        // flush loop rotates between the two batches and the second one is
+        // appended through writers the rotation itself created.
+        let (mut partition, _) = Box::pin(disk_partition(
+            &directory,
+            &index_path,
+            SegmentIoMode::Uncached,
+            IggyByteSize::from(1u64),
+        ))
+        .await;
+
+        journal_send_batch(&mut partition, 1).await;
+        journal_send_batch(&mut partition, 2).await;
+        partition.consensus().advance_commit_max(2);
+        partition
+            .commit_journal(&repair_config_with_io(SegmentIoMode::Uncached))
+            .await;
+
+        // The cap is read once per flush, so both batches trip the eager
+        // seal: two written segments plus the empty one the last seal opened.
+        assert_eq!(
+            partition.log.segments().len(),
+            3,
+            "each batch must fill and seal its segment"
+        );
+        assert!(
+            partition.log.segments()[0].sealed && partition.log.segments()[1].sealed,
+            "rotation must seal the segments it leaves behind"
+        );
+        for start_offset in [0u64, 1] {
+            let log = directory.path().join(format!("{start_offset:0>20}.log"));
+            let index = directory.path().join(format!("{start_offset:0>20}.index"));
+            assert!(file_len(&log) > 0, "segment {start_offset} log is empty");
+            assert!(
+                file_len(&index) > 0,
+                "segment {start_offset} index is empty"
+            );
+        }
+    }
+
+    /// The index save is forced to fail by keeping the index file on tmpfs
+    /// while the log sits on a filesystem that takes the flag: tmpfs refuses
+    /// an uncached write, the log's filesystem does not. Only the uncached
+    /// path can produce that split, so this drives the rewind AND proves the
+    /// branch ran.
+    #[compio::test]
+    async fn given_uncached_mode_when_index_save_fails_should_rewind_the_write_cursor() {
+        let Some(directory) = uncached_scratch_dir().await else {
+            return;
+        };
+        let Some(tmpfs) = tmpfs_scratch_dir() else {
+            return;
+        };
+        let index_path = tmpfs
+            .path()
+            .join("segment.index")
+            .to_string_lossy()
+            .into_owned();
+        let (mut partition, messages_size) = Box::pin(disk_partition(
+            &directory,
+            &index_path,
+            SegmentIoMode::Uncached,
+            IggyByteSize::from(1024 * 1024_u64),
+        ))
+        .await;
+
+        journal_send_batch(&mut partition, 1).await;
+        partition.consensus().advance_commit_max(1);
+        // The commit path treats a persist failure as fatal and panics, so
+        // drive the flush directly to observe what it left behind.
+        partition
+            .flush_committed_messages(&repair_config_with_io(SegmentIoMode::Uncached))
+            .await
+            .expect_err("the uncached index write on tmpfs must be refused");
+
+        let log = directory.path().join(format!("{:0>20}.log", 0u64));
+        assert!(
+            file_len(&log) > 0,
+            "the batch bytes must land before the index save fails"
+        );
+        assert_eq!(
+            messages_size.load(Ordering::Relaxed),
+            0,
+            "a failed index save must rewind the segment write cursor"
+        );
+        assert_eq!(
+            partition.log.active_segment().size.as_bytes_u64(),
+            0,
+            "a failed persist must not stamp the segment size"
+        );
+        assert_eq!(
+            file_len(std::path::Path::new(&index_path)),
+            0,
+            "the refused index write must leave the file empty"
+        );
     }
 }

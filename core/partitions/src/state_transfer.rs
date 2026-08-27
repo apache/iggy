@@ -2579,6 +2579,7 @@ where
                     &messages_reader.path(),
                     messages_w.size_counter(),
                     enforce_fsync,
+                    config.write_io,
                     true,
                     preallocate_segments.then_some(segment_size),
                 )
@@ -2591,6 +2592,7 @@ where
                     &index_reader.path(),
                     index_w.size_counter(),
                     enforce_fsync,
+                    config.write_io,
                     true,
                 )
                 .await

@@ -409,7 +409,7 @@ fn report_io_uring_environment() {
 
 /// Parses "major.minor[.patch...][-suffix]" from a kernel release string.
 #[cfg(target_os = "linux")]
-fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
+pub(crate) fn parse_kernel_version(release: &str) -> Option<(u32, u32)> {
     let mut parts = release
         .split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty());

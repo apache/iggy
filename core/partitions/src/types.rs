@@ -18,6 +18,7 @@
 use iggy_binary_protocol::Operation;
 use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
 use server_common::iobuf::Frozen;
+use server_common::segment_io::SegmentIoMode;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -356,6 +357,9 @@ pub struct PartitionsConfig {
     pub segment_size: IggyByteSize,
     /// Whether local message files reserve the configured segment size on open.
     pub preallocate_segments: bool,
+    /// Page-cache policy for segment `.log` and `.index` writes; host-wide
+    /// because it depends on the kernel and filesystem under `system.path`.
+    pub write_io: SegmentIoMode,
     /// Server-side at-rest encryption. Applied ONCE, on the primary at
     /// ingestion, so the ciphertext replicates verbatim: every replica
     /// journals, acks, and persists identical bytes (checksums and the

@@ -27,10 +27,13 @@ pub mod iobuf;
 pub mod log;
 mod memory_pool;
 mod reactor_yield;
+pub mod segment_io;
 mod segment_storage;
 pub mod send_messages;
 pub mod sharding;
 mod storage;
+#[cfg(target_os = "linux")]
+pub mod uncached_io;
 
 pub use bootstrap::create_directories;
 pub use buffer::PooledBuffer;

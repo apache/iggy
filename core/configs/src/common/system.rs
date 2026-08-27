@@ -25,6 +25,8 @@ use serde_with::serde_as;
 use server_common::bootstrap::SystemPaths;
 use server_common::log::LoggingSettings;
 
+pub use server_common::segment_io::SegmentIoMode;
+
 pub const INDEX_EXTENSION: &str = "index";
 pub const LOG_EXTENSION: &str = "log";
 
@@ -127,6 +129,9 @@ pub struct RecoveryConfig {
 #[derive(Debug, Deserialize, Serialize, ConfigEnv)]
 pub struct SegmentConfig {
     pub archive_expired: bool,
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub write_io: SegmentIoMode,
 }
 
 impl<S: ConfigEnvMappings> SystemConfig<S> {

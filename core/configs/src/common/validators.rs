@@ -67,6 +67,14 @@ impl Validatable<ConfigurationError> for SegmentConfig {
         // Segment size is a per-topic creation option now; its ceiling, floor
         // and 512 B-multiple rule are enforced by
         // `iggy_common::validate_topic_segment_size` at admission.
+
+        // `RWF_DONTCACHE` rides on io_uring `rw_flags`, which only the Linux
+        // driver has; kernel and filesystem support is probed at boot.
+        #[cfg(not(target_os = "linux"))]
+        if self.write_io == server_common::segment_io::SegmentIoMode::Uncached {
+            eprintln!("Configured system.segment.write_io = \"uncached\" requires Linux");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         Ok(())
     }
 }

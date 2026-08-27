@@ -51,6 +51,17 @@ pub use types::{
     RepairConclusion, RepairSession, SendMessagesResult,
 };
 
+#[cfg(target_os = "linux")]
+use nix::libc::EOPNOTSUPP;
+#[cfg(target_os = "linux")]
+use server_common::segment_io::SegmentIoMode;
+#[cfg(target_os = "linux")]
+use std::io;
+#[cfg(target_os = "linux")]
+use std::sync::Once;
+#[cfg(target_os = "linux")]
+use tracing::error;
+
 /// A partition's message log, named so a caller can carry one across a rebuild.
 ///
 /// Exists for the simulator, which has no segment files and so must hold the log
@@ -103,5 +114,144 @@ pub trait Partition {
 
     fn offsets(&self) -> PartitionOffsets {
         PartitionOffsets::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+const WRITE_IO_CONFIG_KEY: &str = "system.segment.write_io";
+
+/// Names the `write_io` knob when a segment write is rejected because the
+/// filesystem underneath it cannot serve `RWF_DONTCACHE`.
+///
+/// The boot probe only reaches directories that exist at boot, so a per-stream
+/// submount added later fails here instead, with an errno that says nothing
+/// about the config that asked for the flag. Deliberately not fatal: one
+/// stream's mount must not take the node down. Reported once per process,
+/// because the remedy is a config edit plus a restart and a per-commit line
+/// would only bury it.
+#[cfg(target_os = "linux")]
+pub(crate) fn report_uncached_write_unsupported(
+    write_io: SegmentIoMode,
+    error: &io::Error,
+    file_path: &str,
+) {
+    static REPORTED: Once = Once::new();
+
+    if !is_uncached_write_unsupported(write_io, error) {
+        return;
+    }
+
+    REPORTED.call_once(|| {
+        error!(
+            target: "iggy.partitions.storage",
+            file = file_path,
+            config_key = WRITE_IO_CONFIG_KEY,
+            "segment write rejected RWF_DONTCACHE, so this filesystem cannot serve \
+             {WRITE_IO_CONFIG_KEY} = \"uncached\": set {WRITE_IO_CONFIG_KEY} = \"buffered\", \
+             or keep segments on ext4/XFS under Linux >= 6.14"
+        );
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn is_uncached_write_unsupported(write_io: SegmentIoMode, error: &io::Error) -> bool {
+    write_io == SegmentIoMode::Uncached && error.raw_os_error() == Some(EOPNOTSUPP)
+}
+
+/// Shared fixtures for the tests that exercise the uncached (`RWF_DONTCACHE`)
+/// segment write path.
+#[cfg(all(test, target_os = "linux"))]
+mod uncached_test_support {
+    use nix::sys::statfs;
+    use server_common::uncached_io::{
+        UncachedIoError, probe_uncached_write, require_uncached_io_tests,
+    };
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    const SHM_DIR: &str = "/dev/shm";
+    const REQUIRE_ENV: &str = "IGGY_REQUIRE_UNCACHED_IO";
+
+    /// A directory whose filesystem takes `RWF_DONTCACHE`, or `None` with the
+    /// reason reported. `tempdir()` lands on tmpfs on many boxes and tmpfs
+    /// refuses the flag, so the fixture sits next to the test binary instead.
+    pub async fn uncached_scratch_dir() -> Option<TempDir> {
+        let exe = std::env::current_exe().expect("current_exe");
+        let base = exe.parent().expect("test binary has a parent directory");
+        let directory = tempfile::tempdir_in(base).expect("scratch directory next to the binary");
+        match probe_uncached_write(directory.path()).await {
+            Ok(()) => Some(directory),
+            Err(error @ UncachedIoError::Unsupported { .. }) => {
+                skip_or_fail(&error.to_string());
+                None
+            }
+            Err(error) => panic!("uncached probe hit an I/O error: {error}"),
+        }
+    }
+
+    /// A tmpfs directory: the negative control for the uncached path, since
+    /// tmpfs is the filesystem guaranteed to refuse `RWF_DONTCACHE` while
+    /// taking the very same buffered write.
+    pub fn tmpfs_scratch_dir() -> Option<TempDir> {
+        let shm = Path::new(SHM_DIR);
+        let is_tmpfs =
+            statfs::statfs(shm).is_ok_and(|stat| stat.filesystem_type() == statfs::TMPFS_MAGIC);
+        if !is_tmpfs {
+            skip_or_fail(&format!("{SHM_DIR} is not tmpfs"));
+            return None;
+        }
+        match tempfile::tempdir_in(shm) {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                skip_or_fail(&format!(
+                    "cannot create a directory under {SHM_DIR}: {error}"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Loud enough to spot in a scrolling CI log, and a hard failure wherever
+    /// the uncached path is required to have run. A silent skip on a build
+    /// tree that sits on overlayfs is how this whole suite goes green without
+    /// ever submitting an uncached write.
+    pub fn skip_or_fail(reason: &str) {
+        assert!(
+            !require_uncached_io_tests(),
+            "### {REQUIRE_ENV}=1 forbids skipping: {reason} ###"
+        );
+        eprintln!("######## SKIPPING UNCACHED TEST: {reason} ########");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::is_uncached_write_unsupported;
+    use nix::libc::{EIO, EOPNOTSUPP};
+    use server_common::segment_io::SegmentIoMode;
+    use std::io;
+
+    #[test]
+    fn given_uncached_mode_when_write_is_rejected_as_unsupported_should_blame_the_knob() {
+        assert!(is_uncached_write_unsupported(
+            SegmentIoMode::Uncached,
+            &io::Error::from_raw_os_error(EOPNOTSUPP)
+        ));
+    }
+
+    #[test]
+    fn given_buffered_mode_when_write_is_rejected_as_unsupported_should_stay_silent() {
+        assert!(!is_uncached_write_unsupported(
+            SegmentIoMode::Buffered,
+            &io::Error::from_raw_os_error(EOPNOTSUPP)
+        ));
+    }
+
+    #[test]
+    fn given_uncached_mode_when_write_fails_for_another_reason_should_stay_silent() {
+        assert!(!is_uncached_write_unsupported(
+            SegmentIoMode::Uncached,
+            &io::Error::from_raw_os_error(EIO)
+        ));
     }
 }

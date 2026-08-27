@@ -21,6 +21,7 @@ use compio::{
 };
 use iggy_common::{IggyByteSize, IggyError};
 use server_common::iobuf::{Frozen, IOV_MAX};
+use server_common::segment_io::SegmentIoMode;
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
@@ -28,7 +29,13 @@ use std::{
 use tracing::{error, warn};
 
 #[cfg(target_os = "linux")]
+use crate::report_uncached_write_unsupported;
+#[cfg(target_os = "linux")]
+use compio::driver::ToSharedFd;
+#[cfg(target_os = "linux")]
 use nix::fcntl::{FallocateFlags, fallocate};
+#[cfg(target_os = "linux")]
+use server_common::uncached_io::write_vectored_all_at_uncached;
 
 #[derive(Debug)]
 pub struct MessagesWriter {
@@ -36,6 +43,8 @@ pub struct MessagesWriter {
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
     fsync: bool,
+    #[cfg(target_os = "linux")]
+    write_io: SegmentIoMode,
 }
 
 impl MessagesWriter {
@@ -49,9 +58,15 @@ impl MessagesWriter {
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
         fsync: bool,
+        write_io: SegmentIoMode,
         file_exists: bool,
         preallocate_size: Option<IggyByteSize>,
     ) -> Result<Self, IggyError> {
+        // Config validation rejects uncached writes off Linux (no io_uring
+        // `rw_flags` there), so the mode is only ever `Buffered` here.
+        #[cfg(not(target_os = "linux"))]
+        debug_assert_eq!(write_io, SegmentIoMode::Buffered);
+
         let mut opts = OpenOptions::new();
         opts.write(true);
         if !file_exists {
@@ -99,6 +114,8 @@ impl MessagesWriter {
             file,
             messages_size_bytes,
             fsync,
+            #[cfg(target_os = "linux")]
+            write_io,
         })
     }
 
@@ -121,7 +138,7 @@ impl MessagesWriter {
         }
 
         let position = self.messages_size_bytes.load(Ordering::Relaxed);
-        write_frozen_chunked(&self.file, &self.file_path, position, buffers).await?;
+        self.write_frozen_chunked(position, buffers).await?;
 
         if self.fsync {
             self.fsync().await?;
@@ -157,6 +174,52 @@ impl MessagesWriter {
             .await
             .map_err(|_| IggyError::CannotWriteToFile)?;
         Ok(())
+    }
+
+    async fn write_frozen_chunked<const ALIGN: usize>(
+        &self,
+        mut position: u64,
+        buffers: &[Frozen<ALIGN>],
+    ) -> Result<(), IggyError> {
+        for chunk in buffers.chunks(IOV_MAX) {
+            let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
+            let chunk_vec: Vec<_> = chunk.to_vec();
+
+            self.write_vectored_all(chunk_vec, position)
+                .await
+                .map_err(|err| {
+                    #[cfg(target_os = "linux")]
+                    report_uncached_write_unsupported(self.write_io, &err, self.file_path.as_str());
+                    error!(
+                        target: "iggy.partitions.storage",
+                        file = self.file_path.as_str(),
+                        write_position = position,
+                        %err,
+                        "failed to write frozen messages to segment file"
+                    );
+                    IggyError::CannotWriteToFile
+                })?;
+
+            position += chunk_size as u64;
+        }
+
+        Ok(())
+    }
+
+    /// Uncached writes take our own `io_uring` op: compio's carries no
+    /// `rw_flags`, and `RWF_DONTCACHE` is a per-write flag, not an open flag.
+    async fn write_vectored_all<const ALIGN: usize>(
+        &self,
+        chunk: Vec<Frozen<ALIGN>>,
+        position: u64,
+    ) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.write_io == SegmentIoMode::Uncached {
+            return write_vectored_all_at_uncached(&self.file.to_shared_fd(), chunk, position)
+                .await
+                .0;
+        }
+        (&self.file).write_vectored_all_at(chunk, position).await.0
     }
 }
 
@@ -209,40 +272,13 @@ fn preallocate_file(_file: &File, file_path: &str, _len: u64) {
     );
 }
 
-async fn write_frozen_chunked<const ALIGN: usize>(
-    file: &File,
-    file_path: &str,
-    mut position: u64,
-    buffers: &[Frozen<ALIGN>],
-) -> Result<(), IggyError> {
-    for chunk in buffers.chunks(IOV_MAX) {
-        let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
-        let chunk_vec: Vec<_> = chunk.to_vec();
-
-        let (result, _) = (&*file)
-            .write_vectored_all_at(chunk_vec, position)
-            .await
-            .into();
-        result.map_err(|err| {
-            error!(
-                target: "iggy.partitions.storage",
-                file = file_path,
-                write_position = position,
-                %err,
-                "failed to write frozen messages to segment file"
-            );
-            IggyError::CannotWriteToFile
-        })?;
-
-        position += chunk_size as u64;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::uncached_test_support::{tmpfs_scratch_dir, uncached_scratch_dir};
+    #[cfg(target_os = "linux")]
+    use server_common::iobuf::Owned;
 
     #[compio::test]
     async fn preallocated_file_keeps_logical_length() {
@@ -252,6 +288,7 @@ mod tests {
             path.to_str().unwrap(),
             Rc::new(AtomicU64::new(0)),
             false,
+            SegmentIoMode::Buffered,
             false,
             Some(IggyByteSize::from(1024 * 1024_u64)),
         )
@@ -272,6 +309,7 @@ mod tests {
             path.to_str().unwrap(),
             Rc::new(AtomicU64::new(129)),
             false,
+            SegmentIoMode::Buffered,
             true,
             None,
         )
@@ -281,5 +319,104 @@ mod tests {
             result,
             Err(IggyError::SegmentSizeMismatchAtOpen(128, 129))
         ));
+    }
+
+    /// Unaligned lengths with per-offset content, so a misplaced or repeated
+    /// write cannot pass a byte-exact comparison.
+    #[cfg(target_os = "linux")]
+    fn frozen_batch(len: usize, seed: usize) -> Frozen<4096> {
+        let bytes: Vec<u8> = (1u8..=251).cycle().skip(seed).take(len).collect();
+        Frozen::from(Owned::<4096>::copy_from_slice(&bytes))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn open_writer(
+        directory: &tempfile::TempDir,
+        name: &str,
+        write_io: SegmentIoMode,
+        size: &Rc<AtomicU64>,
+    ) -> MessagesWriter {
+        let path = directory.path().join(name);
+        MessagesWriter::new(
+            path.to_str().expect("utf-8 path"),
+            Rc::clone(size),
+            false,
+            write_io,
+            false,
+            None,
+        )
+        .await
+        .expect("open messages writer")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_uncached_mode_when_saving_batches_should_persist_bytes_and_advance_cursor() {
+        let Some(directory) = uncached_scratch_dir().await else {
+            return;
+        };
+        let size = Rc::new(AtomicU64::new(0));
+        let writer = open_writer(&directory, "segment.log", SegmentIoMode::Uncached, &size).await;
+
+        let batches: Vec<Frozen<4096>> = [300usize, 4113, 70_000]
+            .iter()
+            .enumerate()
+            .map(|(seed, len)| frozen_batch(*len, seed))
+            .collect();
+        let expected: Vec<u8> = batches
+            .iter()
+            .flat_map(|batch| batch.as_slice().to_vec())
+            .collect();
+
+        let saved = writer.save_frozen_batches(&batches).await.unwrap();
+        writer.advance(saved.as_bytes_u64());
+
+        assert_eq!(saved.as_bytes_u64(), expected.len() as u64);
+        assert_eq!(size.load(Ordering::Relaxed), expected.len() as u64);
+        assert_eq!(
+            std::fs::read(directory.path().join("segment.log")).unwrap(),
+            expected
+        );
+    }
+
+    /// The negative control: tmpfs refuses `RWF_DONTCACHE` while taking the
+    /// identical buffered write, so only a submission that really carries the
+    /// flag can fail here. Without this, deleting the uncached branch of
+    /// `write_vectored_all` leaves every other test in this file green.
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_tmpfs_when_saving_batches_should_fail_uncached_but_succeed_buffered() {
+        let Some(directory) = tmpfs_scratch_dir() else {
+            return;
+        };
+        let batches = vec![frozen_batch(300, 0), frozen_batch(4113, 1)];
+        let total: u64 = batches.iter().map(|batch| batch.len() as u64).sum();
+
+        let uncached_size = Rc::new(AtomicU64::new(0));
+        let uncached = open_writer(
+            &directory,
+            "uncached.log",
+            SegmentIoMode::Uncached,
+            &uncached_size,
+        )
+        .await;
+        let error = uncached.save_frozen_batches(&batches).await.expect_err(
+            "tmpfs must reject RWF_DONTCACHE; a write that succeeds here never carried the flag",
+        );
+        assert!(matches!(error, IggyError::CannotWriteToFile), "{error}");
+
+        let buffered_size = Rc::new(AtomicU64::new(0));
+        let buffered = open_writer(
+            &directory,
+            "buffered.log",
+            SegmentIoMode::Buffered,
+            &buffered_size,
+        )
+        .await;
+        let saved = buffered
+            .save_frozen_batches(&batches)
+            .await
+            .expect("the same directory takes buffered writes");
+        assert_eq!(saved.as_bytes_u64(), total);
     }
 }

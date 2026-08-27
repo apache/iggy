@@ -180,6 +180,7 @@ pub fn test_shard(bus: &SpyBus, replica: u8, replica_count: u8, incarnation: u12
             validate_checksum: true,
             segment_size: iggy_common::IggyByteSize::from(1_048_576_u64),
             preallocate_segments: false,
+            write_io: server_common::segment_io::SegmentIoMode::Buffered,
             encryptor: None,
             path_layout: PartitionPathLayout::default(),
         },

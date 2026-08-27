@@ -111,6 +111,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
             validate_checksum: config.system.partition.validate_checksum,
             segment_size: IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
             preallocate_segments: iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+            write_io: config.system.segment.write_io,
             encryptor,
             path_layout: partitions::PartitionPathLayout {
                 streams_root: config.system.get_streams_path(),

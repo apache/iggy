@@ -60,6 +60,9 @@ const IGNORED_ENV_VARS: &[&str] = &[
     "IGGY_SHARD_RUNTIME_CAPACITY",
     "IGGY_TEST_CLEANUP_DISABLED",
     "IGGY_TEST_VERBOSE",
+    // Test-harness knob: forbids the uncached-I/O tests from skipping
+    // themselves; leaks to spawned servers via the IGGY_ env forwarding.
+    "IGGY_REQUIRE_UNCACHED_IO",
 ];
 
 /// Prefixes for env vars handled by separate providers with runtime prefixes.

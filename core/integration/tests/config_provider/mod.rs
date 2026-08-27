@@ -16,6 +16,7 @@
 // under the License.
 
 use configs::server::ServerConfig;
+use configs::system::SegmentIoMode;
 use configs::{ConfigEnvMappings, ConfigProvider, TypedEnvProvider};
 use configs_derive::ConfigEnv;
 use figment::providers::{Format, Toml};
@@ -61,6 +62,33 @@ async fn validate_config_env_override() {
         env::remove_var("IGGY_HTTP_ENABLED");
         env::remove_var("IGGY_TCP_ENABLED");
         env::remove_var("IGGY_SYSTEM_PARTITION_VALIDATE_CHECKSUM");
+    }
+}
+
+#[serial]
+#[tokio::test]
+async fn validate_segment_write_io_env_override() {
+    let expected_write_io = SegmentIoMode::Uncached;
+
+    unsafe {
+        env::set_var(
+            "IGGY_SYSTEM_SEGMENT_WRITE_IO",
+            expected_write_io.to_string(),
+        );
+    }
+
+    let config_path = get_root_path().join("../server/config.toml");
+    let file_config_provider =
+        ServerConfig::config_provider(&config_path.as_path().display().to_string());
+    let config: ServerConfig = file_config_provider
+        .load_config()
+        .await
+        .expect("Failed to load config.toml config with segment write_io override");
+
+    assert_eq!(config.system.segment.write_io, expected_write_io);
+
+    unsafe {
+        env::remove_var("IGGY_SYSTEM_SEGMENT_WRITE_IO");
     }
 }
 

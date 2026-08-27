@@ -113,6 +113,21 @@ pub struct IggyBenchArgs {
     /// Topic option at creation, so it has no effect with `--reuse-streams`.
     #[arg(long)]
     pub messages_required_to_save: Option<NonZeroU32>,
+
+    /// Reserve each segment's bytes on disk when it is created (server
+    /// default: false). Admission rejects the topic when
+    /// `segment_size * partitions` exceeds 64 GiB.
+    /// Topic option at creation, so it has no effect with `--reuse-streams`.
+    #[arg(long)]
+    pub preallocate_segments: Option<bool>,
+
+    /// Bytes a segment holds before it is closed and a new one started
+    /// (server default: 1 GiB). Accepts human-readable formats like "256MB"
+    /// or "1GiB". Admission requires at least 1 MiB, at most 1 GiB, and a
+    /// multiple of 512 B.
+    /// Topic option at creation, so it has no effect with `--reuse-streams`.
+    #[arg(long)]
+    pub segment_size: Option<IggyByteSize>,
 }
 
 impl IggyBenchArgs {
@@ -346,6 +361,14 @@ impl IggyBenchArgs {
 
     pub const fn messages_required_to_save(&self) -> Option<NonZeroU32> {
         self.messages_required_to_save
+    }
+
+    pub const fn preallocate_segments(&self) -> Option<bool> {
+        self.preallocate_segments
+    }
+
+    pub const fn segment_size(&self) -> Option<IggyByteSize> {
+        self.segment_size
     }
 
     pub fn username(&self) -> &str {

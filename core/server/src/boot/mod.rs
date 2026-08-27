@@ -83,6 +83,10 @@ use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
+#[cfg(target_os = "linux")]
+use server_common::segment_io::SegmentIoMode;
+#[cfg(target_os = "linux")]
+use server_common::uncached_io::{probe_uncached_write, uncached_write_kernel_warning};
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
@@ -150,13 +154,17 @@ pub async fn load_config() -> Result<ServerConfig, ServerError> {
 ///
 /// # Errors
 ///
-/// Returns an error if the wipe, directory preparation, or logging setup
-/// fails.
+/// Returns an error if the uncached write probe, the wipe, directory
+/// preparation, or logging setup fails.
 pub async fn prepare_runtime_dirs(
     config: &ServerConfig,
     logging: &mut Logging,
     fresh: bool,
 ) -> Result<(), ServerError> {
+    // Ahead of the wipe: a write mode this box cannot honour must cost the
+    // operator a refused boot, never their data.
+    #[cfg(target_os = "linux")]
+    ensure_uncached_write_support(config).await?;
     if fresh {
         wipe_system_path(config).await?;
     }
@@ -175,8 +183,57 @@ pub async fn prepare_runtime_dirs(
             &TelemetrySettings::from(&config.telemetry),
         )
         .map_err(ServerError::Logging)?;
+    #[cfg(target_os = "linux")]
+    warn_on_inline_writeback_kick(config);
 
     Ok(())
+}
+
+/// Refuses boot when `system.segment.write_io = "uncached"` cannot work where
+/// the segments will live: one probe write here beats the first segment flush
+/// failing after clients are connected.
+#[cfg(target_os = "linux")]
+async fn ensure_uncached_write_support(config: &ServerConfig) -> Result<(), ServerError> {
+    if config.system.segment.write_io != SegmentIoMode::Uncached {
+        return Ok(());
+    }
+    let path = segment_probe_dir(config);
+    probe_uncached_write(&path).await.map_err(|source| {
+        // The only channel the operator sees: this runs before `late_init`,
+        // where tracing still writes to a null stdout and to an in-memory
+        // buffer a refused boot never flushes, and `main` prints the returned
+        // error through `Debug`, which drops every `Display` message.
+        eprintln!(
+            "system.segment.write_io = \"uncached\" is unusable under {}: {source}",
+            path.display()
+        );
+        ServerError::UncachedWriteUnsupported { path, source }
+    })
+}
+
+/// Deepest existing ancestor of the streams path, which is where the segment
+/// files land. Boot has created nothing yet, and a submount can only attach to
+/// a directory that already exists, so no unprobed filesystem can slip in
+/// between this directory and the segments created under it later.
+#[cfg(target_os = "linux")]
+fn segment_probe_dir(config: &ServerConfig) -> PathBuf {
+    PathBuf::from(config.system.get_streams_path())
+        .ancestors()
+        .find(|ancestor| ancestor.is_dir())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Kernels between 6.14 and 7.2 take `RWF_DONTCACHE` but kick writeback inline
+/// on the writing shard. Reported after `late_init` so the warning reaches the
+/// operator's stdout instead of the pre-boot buffer.
+#[cfg(target_os = "linux")]
+fn warn_on_inline_writeback_kick(config: &ServerConfig) {
+    if config.system.segment.write_io != SegmentIoMode::Uncached {
+        return;
+    }
+    if let Some(warning) = uncached_write_kernel_warning() {
+        warn!("{warning}");
+    }
 }
 
 /// Delete the configured system path so the server boots on empty state.

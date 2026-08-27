@@ -478,6 +478,35 @@ validate_checksum = true
 # Unsupported: setting this to `true` aborts boot.
 archive_expired = false
 
+# How segment `.log` and `.index` writes go through the kernel (string).
+# `buffered` keeps the kernel's page-cache behaviour: writes land in the page
+# cache and writeback runs on the kernel's schedule.
+# `uncached` sets RWF_DONTCACHE on every segment write: writeback is kicked at
+# once, and a page leaves the page cache when that writeback COMPLETES, only
+# where the flush wrote that whole 4 KiB block (a 1 MiB flush leaves nothing
+# resident). With `enforce_fsync = false` nothing waits on that completion, so
+# the pages linger until the bdi flusher reaches them - 15-30 s under stock
+# `dirty_writeback_centisecs` / `dirty_expire_centisecs`, longer on a loaded
+# box. Small appends stay fully resident just as with `buffered`, so the
+# default flush sizes get no page-cache saving at all. Dirty pages still peak
+# during a burst either way: the flag starts writeback, it does not make the
+# device keep up with the writer.
+# Cost, for the flushes whose pages do leave: a consumer reading more than one
+# flush behind the producer is served from the device instead of the page
+# cache, and each newly allocated 4 KiB block costs one synchronous read-back
+# on the append that follows its first writeback.
+# Measured on ext4 (XFS not yet measured). With `enforce_fsync = true`,
+# `uncached` was never slower (p50 neutral to 9% faster in a micro-bench).
+# Without fsync, tiny flushes (small `messages_required_to_save`) are a clear
+# loss: about 9x the device writes for 300 B appends and about 190 us more at
+# p99, because every append re-dirties a page the flusher just cleaned. Keep
+# the default flush thresholds or enable fsync.
+# `uncached` needs Linux >= 6.14 (>= 7.2 recommended: older kernels submit the
+# writeback inline in the writer) and a filesystem that supports it (ext4,
+# XFS; not btrfs, tmpfs, overlayfs, FUSE). The server refuses to start when
+# the mode is requested but unsupported.
+write_io = "buffered"
+
 # Recovery configuration in case of lost data
 [system.recovery]
 # Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).

@@ -482,6 +482,7 @@ fn parse_bind_address(context: &str, address: &str) -> Result<SocketAddr, Config
 mod tests {
     use super::super::cluster::{ClusterNodeConfig, TransportPorts};
     use super::*;
+    use crate::common::system::SegmentIoMode;
     use figment::Figment;
     use figment::providers::{Format, Toml};
 
@@ -624,6 +625,35 @@ mod tests {
     fn given_archive_expired_enabled_when_validating_should_reject() {
         let config = config_with_override("[system.segment]\narchive_expired = true\n");
         assert!(config.validate().is_err());
+    }
+
+    // Flipping the shipped default to `uncached` would refuse boot on every
+    // host without RWF_DONTCACHE support; the shipped file must stay buffered.
+    #[test]
+    fn given_shipped_default_config_when_deserializing_should_write_buffered() {
+        let config = config_with_override("");
+        assert_eq!(config.system.segment.write_io, SegmentIoMode::Buffered);
+    }
+
+    #[test]
+    fn given_segment_write_io_uncached_when_deserializing_should_parse() {
+        let config = config_with_override("[system.segment]\nwrite_io = \"uncached\"\n");
+        assert_eq!(config.system.segment.write_io, SegmentIoMode::Uncached);
+        config
+            .validate()
+            .expect("write_io support is probed at boot, not bounded by config validation");
+    }
+
+    #[test]
+    fn given_unknown_segment_write_io_when_deserializing_should_reject() {
+        let result: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(DEFAULT_CONFIG))
+            .merge(Toml::string("[system.segment]\nwrite_io = \"direct\"\n"))
+            .extract();
+        assert!(
+            result.is_err(),
+            "unknown system.segment.write_io must fail config load"
+        );
     }
 
     #[test]

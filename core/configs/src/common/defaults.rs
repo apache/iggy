@@ -276,6 +276,7 @@ impl Default for SegmentConfig {
     fn default() -> SegmentConfig {
         SegmentConfig {
             archive_expired: SERVER_CONFIG.system.segment.archive_expired,
+            write_io: SERVER_CONFIG.system.segment.write_io.parse().unwrap(),
         }
     }
 }

@@ -1608,6 +1608,7 @@ mod tests {
                 validate_checksum: true,
                 segment_size: iggy_common::IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE),
                 preallocate_segments: false,
+                write_io: server_common::segment_io::SegmentIoMode::Buffered,
                 encryptor: None,
                 path_layout: PartitionPathLayout::default(),
             },
