@@ -1643,20 +1643,22 @@ where
         let (start_segment, start_position) = self.disk_poll_start(&query);
         // Cap resident sealed read handles: touch this poll's start segment so
         // the LRU keeps the hot set and drops the least-recently-used fd +
-        // index (a no-op for the active segment, whose handle never caches).
+        // index (a no-op for the active segment, whose slot is bounded by
+        // rotation instead).
         self.log.touch_sealed_read_state(start_segment);
         // Snapshot only the segments the disk walk visits (`start_segment..`),
-        // so `start_position` applies to the first snapshotted segment. A sealed
-        // segment carries its shared read-state handle (fd + sparse index) so
-        // the off-borrow read reuses (or fills) it; the active segment opens
-        // fresh and resolves from its resident index.
+        // so `start_position` applies to the first snapshotted segment. Every
+        // segment carries its shared read-state handle so the off-borrow read
+        // reuses (or fills) the cached fd; only a sealed one also resolves its
+        // start byte from the shared sparse index.
         let segments = self.log.segments()[start_segment..]
             .iter()
             .zip(self.log.sealed_read_state()[start_segment..].iter())
             .map(|(segment, read_state)| DiskSegment {
                 start_offset: segment.start_offset,
                 persisted: segment.size.as_bytes_u64(),
-                read_state: segment.sealed.then(|| Rc::clone(read_state)),
+                read_state: Rc::clone(read_state),
+                sealed: segment.sealed,
             })
             .collect();
         let disk = DiskReadPlan {
@@ -3840,6 +3842,10 @@ where
         // segment's cache is ever read (the `commit_messages` flush staging),
         // so a sealed cache is dead weight.
         self.log.indexes_mut()[old_segment_index] = None;
+        // The read fd cached while this segment was active is not counted by
+        // the sealed LRU budget, so it must not survive the seal; the next
+        // sealed poll re-fills the fresh slot under the LRU's rules.
+        self.log.reset_read_state(old_segment_index);
 
         self.log
             .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
@@ -5936,12 +5942,14 @@ mod tests {
                 DiskSegment {
                     start_offset: 0,
                     persisted: 512,
-                    read_state: None,
+                    read_state: SealedSegmentHandle::default(),
+                    sealed: false,
                 },
                 DiskSegment {
                     start_offset: 5,
                     persisted: later_len,
-                    read_state: None,
+                    read_state: SealedSegmentHandle::default(),
+                    sealed: false,
                 },
             ],
             start_position: 0,
@@ -6022,12 +6030,14 @@ mod tests {
                 DiskSegment {
                     start_offset: 0,
                     persisted: corrupt_len,
-                    read_state: None,
+                    read_state: SealedSegmentHandle::default(),
+                    sealed: false,
                 },
                 DiskSegment {
                     start_offset: 5,
                     persisted: later_len,
-                    read_state: None,
+                    read_state: SealedSegmentHandle::default(),
+                    sealed: false,
                 },
             ],
             start_position: 0,
@@ -6094,7 +6104,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: None,
+                read_state: SealedSegmentHandle::default(),
+                sealed: false,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6131,7 +6142,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
-                read_state: None,
+                read_state: SealedSegmentHandle::default(),
+                sealed: false,
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
@@ -6162,7 +6174,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
-                read_state: None,
+                read_state: SealedSegmentHandle::default(),
+                sealed: false,
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
@@ -6229,7 +6242,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6260,7 +6274,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6320,7 +6335,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6404,7 +6420,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: log_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             // Byte 0, exactly what disk_poll_start returns for a sealed segment
             // whose resident index was dropped.
@@ -6503,7 +6520,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: log_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6580,7 +6598,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6628,7 +6647,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
