@@ -43,6 +43,7 @@ __all__ = [
     "MaxTopicSize",
     "OptionSpec",
     "Partition",
+    "Partitioning",
     "Permissions",
     "PollingStrategy",
     "ReceiveMessage",
@@ -1335,15 +1336,28 @@ class IggyClient:
         messages: list[SendMessage],
     ) -> collections.abc.Awaitable[SendMessagesResponse]:
         r"""
-        Sends a list of messages to the specified topic.
-        Returns a SendMessagesResponse carrying the per-partition commit
-        confirmations, or a PyRuntimeError on failure. The confirmation list is
-        empty when the server reports no offsets, and the legacy server never
-        reports any.
+        Sends a batch of messages to a topic using the selected partitioning strategy.
 
-        `partitioning` is required. Pass `Partitioning.balanced()`,
-        `Partitioning.partition_id(id)`, or `Partitioning.messages_key(key)`.
-        An integer remains supported as shorthand for `partition_id`.
+        Args:
+            stream: Stream identifier as `str | int`.
+            topic: Topic identifier as `str | int`.
+            partitioning: A `Partitioning` strategy or an integer partition ID.
+                Use `Partitioning.balanced()`, `Partitioning.partition_id(id)`, or
+                `Partitioning.messages_key(key)`. An integer is shorthand for
+                `Partitioning.partition_id(id)`.
+            messages: Messages to send as `list[SendMessage]`.
+
+        Returns:
+            An awaitable that resolves to `SendMessagesResponse`. Its confirmations
+            report the committed partition and batch base offset. The list is empty
+            when the server reports no offsets, including on the legacy server.
+
+        Raises:
+            ValueError: If a string stream or topic identifier is invalid.
+            TypeError: If `partitioning` or `messages` has an unsupported type.
+            OverflowError: If a numeric stream, topic, or partition ID is outside
+                the supported unsigned 32-bit range.
+            RuntimeError: If the request fails.
         """
     def poll_messages(
         self,
@@ -1651,20 +1665,27 @@ class Partitioning:
     @staticmethod
     def balanced() -> Partitioning:
         r"""
-        Routes the batch to partitions using server-side round-robin selection.
+        Routes the batch to one partition selected by round-robin.
         """
     @staticmethod
     def partition_id(partition_id: builtins.int) -> Partitioning:
         r"""
         Routes the batch to the specified partition.
+
+        `partition_id` must be between 0 and `2**32 - 1`. The topic must contain
+        that partition when the batch is sent.
         """
     @staticmethod
-    def messages_key(key: builtins.str | builtins.bytes) -> Partitioning:
+    def messages_key(key: builtins.str | bytes) -> Partitioning:
         r"""
-        Routes the batch using a binary key hashed by the server.
+        Routes the batch to one partition selected by hashing `key`.
 
-        String keys are encoded as UTF-8. The encoded key must contain between
-        1 and 255 bytes.
+        `key` may be `str` or `bytes`. Strings are encoded as UTF-8; the encoded
+        key must contain between 1 and 255 bytes.
+
+        Raises:
+            ValueError: If the encoded key is empty or exceeds 255 bytes.
+            TypeError: If `key` is not `str` or `bytes`.
         """
 
 @typing.final

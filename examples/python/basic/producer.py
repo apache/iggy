@@ -19,7 +19,7 @@ import argparse
 import asyncio
 from typing import NamedTuple
 
-from apache_iggy import IggyClient, StreamDetails, TopicDetails
+from apache_iggy import IggyClient, Partitioning, StreamDetails, TopicDetails
 from apache_iggy import SendMessage as Message
 from loguru import logger
 
@@ -106,7 +106,11 @@ async def produce_messages(client: IggyClient):
             await client.send_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
-                partitioning=PARTITION_ID,
+                # A fixed strategy sends the whole batch to this partition.
+                # For topics with multiple partitions, Partitioning.balanced()
+                # distributes batches round-robin, while
+                # Partitioning.messages_key(key) keeps equal keys on the same partition.
+                partitioning=Partitioning.partition_id(PARTITION_ID),
                 messages=messages,
             )
             n_sent_batches += 1

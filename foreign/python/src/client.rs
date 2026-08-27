@@ -19,7 +19,7 @@ use bytes::Bytes;
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, Consumer as RustConsumer, IggyClient as RustIggyClient,
     IggyExpiry as RustIggyExpiry, IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
-    PollingStrategy as RustPollingStrategy, *,
+    Partitioning as RustPartitioning, PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
 use pyo3::prelude::*;
@@ -996,15 +996,28 @@ impl IggyClient {
         })
     }
 
-    /// Sends a list of messages to the specified topic.
-    /// Returns a SendMessagesResponse carrying the per-partition commit
-    /// confirmations, or a PyRuntimeError on failure. The confirmation list is
-    /// empty when the server reports no offsets, and the legacy server never
-    /// reports any.
+    /// Sends a batch of messages to a topic using the selected partitioning strategy.
     ///
-    /// `partitioning` is required. Pass `Partitioning.balanced()`,
-    /// `Partitioning.partition_id(id)`, or `Partitioning.messages_key(key)`.
-    /// An integer remains supported as shorthand for `partition_id`.
+    /// Args:
+    ///     stream: Stream identifier as `str | int`.
+    ///     topic: Topic identifier as `str | int`.
+    ///     partitioning: A `Partitioning` strategy or an integer partition ID.
+    ///         Use `Partitioning.balanced()`, `Partitioning.partition_id(id)`, or
+    ///         `Partitioning.messages_key(key)`. An integer is shorthand for
+    ///         `Partitioning.partition_id(id)`.
+    ///     messages: Messages to send as `list[SendMessage]`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `SendMessagesResponse`. Its confirmations
+    ///     report the committed partition and batch base offset. The list is empty
+    ///     when the server reports no offsets, including on the legacy server.
+    ///
+    /// Raises:
+    ///     ValueError: If a string stream or topic identifier is invalid.
+    ///     TypeError: If `partitioning` or `messages` has an unsupported type.
+    ///     OverflowError: If a numeric stream, topic, or partition ID is outside
+    ///         the supported unsigned 32-bit range.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
@@ -1029,7 +1042,7 @@ impl IggyClient {
 
         let stream = Identifier::try_from(stream)?;
         let topic = Identifier::try_from(topic)?;
-        let partitioning = partitioning.into();
+        let partitioning = RustPartitioning::from(partitioning);
         let inner = self.inner.clone();
 
         future_into_py(py, async move {

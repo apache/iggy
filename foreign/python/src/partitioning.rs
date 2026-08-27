@@ -33,7 +33,7 @@ pub struct Partitioning {
 #[gen_stub_pymethods]
 #[pymethods]
 impl Partitioning {
-    /// Routes the batch to partitions using server-side round-robin selection.
+    /// Routes the batch to one partition selected by round-robin.
     #[staticmethod]
     pub fn balanced() -> Self {
         Self {
@@ -42,6 +42,9 @@ impl Partitioning {
     }
 
     /// Routes the batch to the specified partition.
+    ///
+    /// `partition_id` must be between 0 and `2**32 - 1`. The topic must contain
+    /// that partition when the batch is sent.
     #[staticmethod]
     pub fn partition_id(partition_id: u32) -> Self {
         Self {
@@ -49,10 +52,14 @@ impl Partitioning {
         }
     }
 
-    /// Routes the batch using a binary key hashed by the server.
+    /// Routes the batch to one partition selected by hashing `key`.
     ///
-    /// String keys are encoded as UTF-8. The encoded key must contain between
-    /// 1 and 255 bytes.
+    /// `key` may be `str` or `bytes`. Strings are encoded as UTF-8; the encoded
+    /// key must contain between 1 and 255 bytes.
+    ///
+    /// Raises:
+    ///     ValueError: If the encoded key is empty or exceeds 255 bytes.
+    ///     TypeError: If `key` is not `str` or `bytes`.
     #[staticmethod]
     pub fn messages_key(py: Python<'_>, key: PyMessagesKey) -> PyResult<Self> {
         let key = match key {
@@ -76,7 +83,7 @@ impl_stub_type!(PyMessagesKey = String | PyBytes);
 
 #[derive(FromPyObject)]
 pub(crate) enum PyPartitioning {
-    #[pyo3(transparent)]
+    #[pyo3(transparent, annotation = "Partitioning")]
     Strategy(Partitioning),
     #[pyo3(transparent, annotation = "int")]
     PartitionId(u32),

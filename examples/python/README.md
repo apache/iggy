@@ -12,7 +12,7 @@ docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 \
   -e IGGY_NODE_ADVERTISED_ADDRESS=localhost apache/iggy:latest
 
 # Or build from source (recommended for development)
-cd ../../ && cargo run --bin iggy-server
+cd ../../ && cargo run --bin iggy-server -- --with-default-root-credentials
 ```
 
 For server configuration options and help:
@@ -71,19 +71,6 @@ python basic/consumer.py
 ```
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
-
-### Message Partitioning
-
-Shows how to route message batches to a fixed partition, use server-side
-balanced routing, or keep the same message key on the same partition.
-
-```bash
-# Using uv
-uv run partitioning/producer.py
-
-# Without using uv
-python partitioning/producer.py
-```
 
 ### Message Headers
 

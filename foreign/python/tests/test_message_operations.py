@@ -39,6 +39,7 @@ class TestPartitioning:
     def test_balanced_and_partition_id_strategies(self):
         assert isinstance(Partitioning.balanced(), Partitioning)
         assert isinstance(Partitioning.partition_id(1), Partitioning)
+        assert isinstance(Partitioning.partition_id(2**32 - 1), Partitioning)
 
     @pytest.mark.unit
     @pytest.mark.parametrize("key", [b"customer-42", "customer-42", "客户-42"])
@@ -46,7 +47,7 @@ class TestPartitioning:
         assert isinstance(Partitioning.messages_key(key), Partitioning)
 
     @pytest.mark.unit
-    @pytest.mark.parametrize("key", [b"a" * 255, "a" * 255])
+    @pytest.mark.parametrize("key", [b"a" * 255, "a" * 255, "界" * 85])
     def test_messages_key_accepts_255_bytes(self, key):
         assert isinstance(Partitioning.messages_key(key), Partitioning)
 
@@ -170,11 +171,19 @@ class TestMessageOperations:
             stream=stream_name,
             topic=topic_name,
             partitioning=Partitioning.partition_id(partition_id),
-            messages=[Message("fixed partition")],
+            messages=[Message("fixed partition 1"), Message("fixed partition 2")],
         )
 
         assert len(response.confirmations) == 1
         assert response.confirmations[0].partition_id == partition_id
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.send_messages(
+                stream=stream_name,
+                topic=topic_name,
+                partitioning=Partitioning.partition_id(3),
+                messages=[Message("missing partition")],
+            )
 
     @pytest.mark.asyncio
     async def test_send_messages_with_balanced_strategy(
@@ -191,15 +200,21 @@ class TestMessageOperations:
             partitions_count=partitions_count,
         )
 
-        response = await iggy_client.send_messages(
-            stream=stream_name,
-            topic=topic_name,
-            partitioning=Partitioning.balanced(),
-            messages=[Message("balanced")],
-        )
+        responses = [
+            await iggy_client.send_messages(
+                stream=stream_name,
+                topic=topic_name,
+                partitioning=Partitioning.balanced(),
+                messages=[Message(f"balanced {index}")],
+            )
+            for index in range(partitions_count)
+        ]
 
-        assert len(response.confirmations) == 1
-        assert response.confirmations[0].partition_id < partitions_count
+        assert all(len(response.confirmations) == 1 for response in responses)
+        assert (
+            len({response.confirmations[0].partition_id for response in responses})
+            == partitions_count
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("key", [b"customer-42", "customer-42"])
