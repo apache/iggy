@@ -16,16 +16,15 @@
 // under the License.
 
 using System.Buffers;
-using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.ExceptionServices;
-using Apache.Iggy.ConnectionStream;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Utils;
 using Apache.Iggy.Vsr;
@@ -39,7 +38,7 @@ namespace Apache.Iggy.IggyClient.Implementations;
 ///     register handshake, and the client-side partitioning and consumer-group assignment the broker does not
 ///     resolve server-side. The command surface lives in <see cref="TcpMessageStream" />.
 /// </summary>
-public sealed partial class TcpMessageStream
+public sealed partial class TcpMessageStream : ISessionGenerationProvider
 {
     /// <summary>
     ///     Upper bound for a whole VSR request: the transient replays and the leader failovers share it, and so
@@ -47,15 +46,6 @@ public sealed partial class TcpMessageStream
     ///     sending semaphore forever and wedge every later request.
     /// </summary>
     private const int VsrRequestTimeoutMs = 30_000;
-
-    /// <summary>Backoff between replays of a transiently refused request.</summary>
-    private const int VsrTransientRetryIntervalMs = 50;
-
-    /// <summary>
-    ///     Largest body still sent as one contiguous frame with its header. Beyond this the copy outweighs the
-    ///     syscall and the extra segment it saves, so header and body go out as two writes.
-    /// </summary>
-    private const int VsrContiguousFrameLimit = 4 * 1024;
 
     /// <summary>
     ///     How long a <see cref="VsrError.TRANSIENT_NOT_ACCEPTED" /> request replays on the same connection
@@ -75,11 +65,17 @@ public sealed partial class TcpMessageStream
 
     /// <summary>
     ///     Cap on consecutive leader redirects, so a flapping roster cannot spin the connect loop or the
-    ///     transient failover path. The budget is client-wide and resets on a roster check that finds the
-    ///     current node is the leader, and on every request that completes, so a client that outlives more
-    ///     leader changes than the cap does not latch onto a follower for good.
+    ///     transient failover path. Each operation - a request, a connect, a register - spends its own local
+    ///     budget, so a long-lived client never latches onto a follower for good.
     /// </summary>
     private const int VsrMaxLeaderRedirects = 3;
+
+    /// <summary>
+    ///     Bound on one endpoint's dial while other endpoints are queued behind it. Neither the connect nor the
+    ///     TLS handshake has a deadline of its own, so a node whose syns are dropped would hold the sweep for
+    ///     the whole kernel connect timeout - minutes - while a survivor goes untried. Matches the Rust SDK.
+    /// </summary>
+    private const int FailoverDialTimeout = 2_000;
 
     /// <summary>
     ///     Attempts a consumer-group poll gets before it gives up and reports an empty poll: one re-sync after
@@ -108,12 +104,9 @@ public sealed partial class TcpMessageStream
 
     private readonly ConsensusSession _consensusSession = new();
     private readonly ConsumerGroupClientState _groupState = new();
-    private readonly byte[] _vsrReplyHeaderBuffer = new byte[VsrHeader.HEADER_SIZE];
 
-    // The redirect budget is refunded by a completed request, and the roster check a redirect runs is itself a
-    // request. Without this the refund lands between the check and the increment that reads the budget, and the
-    // counter never leaves zero. Nonzero for the duration of a roster read, so that refund is skipped.
-    private int _leaderProbeDepth;
+    /// <inheritdoc />
+    ulong ISessionGenerationProvider.SessionGeneration => _consensusSession.Generation;
 
     /// <summary>
     ///     Runs the consensus register handshake and binds the session it commits. Everything before the bind
@@ -133,21 +126,18 @@ public sealed partial class TcpMessageStream
             {
                 await LogoutUserAsync(token);
             }
-            else if (_state == ConnectionState.Authenticated)
+            else if (State == ConnectionState.Authenticated)
             {
-                SetConnectionStateAsync(ConnectionState.Connected);
+                SetConnectionState(ConnectionState.Connected);
             }
 
-            var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
-            TcpMessageStreamHelpers.CreatePayload(payload, message, code);
-
-            SetConnectionStateAsync(ConnectionState.Authenticating);
+            SetConnectionState(ConnectionState.Authenticating);
 
             LoginRegisterResponse response;
             try
             {
-                Interlocked.Exchange(ref _skipAutoLoginOnce, 1);
-                using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
+                using IMemoryOwner<byte> responseBuffer =
+                    await SendWithResponseAsync(code, message, autoLoginOnReconnect: false, token: token);
 
                 response = LoginRegister.Deserialize(responseBuffer.Memory.Span);
                 _consensusSession.Bind(response.Session);
@@ -155,22 +145,18 @@ public sealed partial class TcpMessageStream
             catch
             {
                 await ResetConsensusSessionAsync();
-                if (_state == ConnectionState.Authenticating)
+                if (State == ConnectionState.Authenticating)
                 {
-                    SetConnectionStateAsync(ConnectionState.Connected);
+                    SetConnectionState(ConnectionState.Connected);
                 }
 
                 throw;
-            }
-            finally
-            {
-                Interlocked.Exchange(ref _skipAutoLoginOnce, 0);
             }
 
             _logger.LogInformation(
                 "Authenticated against the server, version {ServerVersion}, protocol version {ServerProtocolVersion}",
                 response.ServerVersion, response.ServerProtocolVersion);
-            SetConnectionStateAsync(ConnectionState.Authenticated);
+            SetConnectionState(ConnectionState.Authenticated);
 
             var authResponse = new AuthResponse((int)response.UserId, null);
             if (IsConnecting)
@@ -182,16 +168,21 @@ public sealed partial class TcpMessageStream
             {
                 _logger.LogWarning("Maximum leader redirections reached while registering, staying on {Address}",
                     _currentAddress);
-
-                return authResponse;
             }
-
-            if (!await RedirectAsync(token))
+            else if (await RedirectAsync(token))
             {
-                return authResponse;
+                await ConnectAsync(false, token);
+                continue;
             }
 
-            await ConnectAsync(false, token);
+            // The redirect probe can tear the connection down without throwing, and success on a client that is
+            // no longer bound would leave the caller unauthenticated with nothing left to re-authenticate it.
+            if (State != ConnectionState.Authenticated)
+            {
+                throw new NotConnectedException();
+            }
+
+            return authResponse;
         }
     }
 
@@ -328,10 +319,8 @@ public sealed partial class TcpMessageStream
         CancellationToken token)
     {
         var message = TcpContracts.GetGroup(streamId, topicId, groupId);
-        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
-        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.SYNC_CONSUMER_GROUP_CODE);
-
-        using IMemoryOwner<byte> responseBuffer = await SendWithResponseAsync(payload, token);
+        using IMemoryOwner<byte> responseBuffer =
+            await SendWithResponseAsync(CommandCodes.SYNC_CONSUMER_GROUP_CODE, message, token: token);
 
         var key = new GroupKey(streamId, topicId, groupId);
         if (responseBuffer.Memory.Length == 0)
@@ -373,9 +362,9 @@ public sealed partial class TcpMessageStream
 
     /// <summary>
     ///     Points the client at the current leader when it is not the node this connection is on, leaving the
-    ///     stream closed for the caller to reconnect. The redirect budget is client-wide: the connect loop and
-    ///     the transient failover path spend the same counter, and it is refunded as soon as a roster check
-    ///     lands on the leader.
+    ///     stream closed for the caller to reconnect. The caller owns the redirect budget: every operation that
+    ///     follows redirects - a request, a connect, a register - counts them locally against
+    ///     <see cref="VsrMaxLeaderRedirects" />.
     /// </summary>
     private async Task<bool> RedirectAsync(CancellationToken token)
     {
@@ -384,24 +373,19 @@ public sealed partial class TcpMessageStream
         var currentLeaderNode = await GetCurrentLeaderNodeAsync(token);
         if (currentLeaderNode == null)
         {
-            Interlocked.Exchange(ref _leaderRedirectCount, 0);
             return false;
         }
 
         var leaderAddress = ServerAddress.HostPort(currentLeaderNode.Ip, currentLeaderNode.Endpoints.Tcp);
-        // Compare against the endpoint the socket resolved, not the configured string: a client
-        // configured with a hostname is otherwise never "on" the leader the roster names by IP,
-        // and every login would reconnect it to the node it is already talking to.
-        var connectedAddress = _currentRemoteAddress.Length > 0 ? _currentRemoteAddress : _currentAddress;
-        if (ServerAddress.IsSame(leaderAddress, connectedAddress))
+        // The roster may name the leader by either side of this connection: the address the client dialed
+        // (a hostname, an advertised_address) or the endpoint the socket resolved to. IsSame does no DNS
+        // resolution, so a match on either means the client is already on the leader; checking only one
+        // side redirect-loops the other kind of roster. Both are evidence of where the socket landed, so
+        // both come from the connect loop: _currentAddress may already name a leader the client never
+        // reached, and matching on it would silently refuse the redirect that gets it there.
+        if ((_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(leaderAddress, _currentRemoteAddress))
+            || (_connectedAddress.Length > 0 && ServerAddress.IsSame(leaderAddress, _connectedAddress)))
         {
-            Interlocked.Exchange(ref _leaderRedirectCount, 0);
-            return false;
-        }
-
-        if (Interlocked.Increment(ref _leaderRedirectCount) > VsrMaxLeaderRedirects)
-        {
-            _logger.LogWarning("Maximum leader redirections reached, continuing on {Address}", _currentAddress);
             return false;
         }
 
@@ -414,7 +398,7 @@ public sealed partial class TcpMessageStream
         try
         {
             _currentAddress = leaderAddress;
-            DropVsrConnectionLocked(_stream);
+            DropVsrConnectionLocked(_connection);
         }
         finally
         {
@@ -424,19 +408,39 @@ public sealed partial class TcpMessageStream
         return true;
     }
 
+    /// <summary>
+    ///     Keeps every node the roster names as a dial candidate. Replaced wholesale rather than merged: the
+    ///     roster is the cluster's own answer about where its nodes are, so a node it dropped stops being dialed.
+    ///     The configured address is kept separately and outlives it. A node that does not expose the tcp
+    ///     transport reports port 0 and is skipped, since dialing it would burn an attempt on an endpoint that
+    ///     cannot answer.
+    /// </summary>
+    private void RememberRoster(ClusterMetadata clusterMetadata)
+    {
+        var endpoints = clusterMetadata.Nodes
+            .Where(node => node.Endpoints.Tcp != 0)
+            .Select(node => ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp))
+            .ToArray();
+        if (endpoints.Length > 0)
+        {
+            _rosterAddresses = endpoints;
+        }
+    }
+
     private async Task<ClusterNode?> GetCurrentLeaderNodeAsync(CancellationToken token)
     {
         var leaderlessDeadline = Environment.TickCount64 + VsrLeaderlessWaitMs;
-        Interlocked.Increment(ref _leaderProbeDepth);
         try
         {
             while (true)
             {
-                var clusterMetadata = await GetClusterMetadataAsync(token);
+                var clusterMetadata = await ReadClusterMetadataNoRedirectAsync(token);
                 if (clusterMetadata == null)
                 {
                     return null;
                 }
+
+                RememberRoster(clusterMetadata);
 
                 if (clusterMetadata.Nodes.Count() == 1)
                 {
@@ -469,38 +473,58 @@ public sealed partial class TcpMessageStream
         {
             return null;
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e) when (e is not OperationCanceledException && !VsrConnection.IsConnectionException(e))
         {
             _logger.LogWarning(e, "Failed to read the cluster metadata, continuing on {Address}", _currentAddress);
 
             return null;
         }
-        finally
-        {
-            Interlocked.Decrement(ref _leaderProbeDepth);
-        }
     }
 
     /// <summary>
-    ///     Sends a consensus-framed request. The call sites still build the classic
-    ///     <c>[size u32][code u32][body]</c> buffer, so the code is read back from it here and the body is written
-    ///     right after the 256-byte consensus header - two writes, no concatenation.
+    ///     Reads the roster without following redirects: the probe is what redirects are decided from, so a
+    ///     probe that redirected or reconnected would reenter the very loop that called it. A probe the current
+    ///     node keeps refusing simply fails, and the caller stays where it is.
+    /// </summary>
+    private async Task<ClusterMetadata?> ReadClusterMetadataNoRedirectAsync(CancellationToken token)
+    {
+        using IMemoryOwner<byte> responseBuffer = await SendRawAsync(CommandCodes.GET_CLUSTER_METADATA_CODE,
+            ReadOnlyMemory<byte>.Empty, token, allowRedirect: false);
+
+        if (responseBuffer.Memory.Length == 0)
+        {
+            return null;
+        }
+
+        return BinaryMapper.MapClusterMetadata(responseBuffer.Memory.Span);
+    }
+
+    /// <summary>
+    ///     Sends a consensus-framed request: small frames go out as a single coalesced write, larger bodies
+    ///     as a second write straight from the caller's buffer.
     /// </summary>
     /// <remarks>
     ///     One deadline bounds the whole request across transient replays AND leader failovers. Login and
     ///     register replay on this connection for the whole budget instead: the connect flow owns leader
     ///     redirection for the handshake, and reconnecting from underneath it would recurse.
     /// </remarks>
-    private async Task<IMemoryOwner<byte>> SendRawVsrAsync(ReadOnlyMemory<byte> payload, CancellationToken token)
+    private async Task<IMemoryOwner<byte>> SendRawAsync(int code, ReadOnlyMemory<byte> body,
+        CancellationToken token, bool allowRedirect = true)
     {
-        var code = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload.Span.Slice(4, 4));
-        ReadOnlyMemory<byte> body = payload[8..];
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (State is ConnectionState.Disconnected or ConnectionState.Connecting)
+        {
+            throw new NotConnectedException();
+        }
+
         var isLoginRegister = code is CommandCodes.LOGIN_REGISTER_CODE or CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE;
+        var clearSensitiveReply = HasSensitiveReply(code);
         var overallDeadline = Environment.TickCount64 + VsrRequestTimeoutMs;
-        var headerBuffer = ArrayPool<byte>.Shared.Rent(VsrHeader.HEADER_SIZE);
-        Memory<byte> header = headerBuffer.AsMemory(0, VsrHeader.HEADER_SIZE);
         var requestEncoded = false;
-        TcpConnectionStream? lastStream = null;
+        var redirects = 0;
+        var redirectBudgetLogged = false;
+        VsrConnection? lastConnection = null;
 
         try
         {
@@ -510,20 +534,13 @@ public sealed partial class TcpMessageStream
                     ? overallDeadline
                     : Math.Min(overallDeadline, Environment.TickCount64 + VsrTransientFailoverCheckMs);
 
-                var attempt = await SendVsrAttemptAsync(code, body, header, transientDeadline, overallDeadline,
-                    token);
+                var attempt = await SendVsrAttemptAsync(code, body, transientDeadline, overallDeadline,
+                    clearSensitiveReply, token);
                 requestEncoded |= attempt.Encoded;
-                lastStream = attempt.Stream;
+                lastConnection = attempt.Connection;
 
                 if (attempt.Error is null)
                 {
-                    // A roster read taken by RedirectAsync must not refund the budget it is about to be charged
-                    // against, or the cap can never be reached.
-                    if (Volatile.Read(ref _leaderRedirectCount) != 0 && Volatile.Read(ref _leaderProbeDepth) == 0)
-                    {
-                        Interlocked.Exchange(ref _leaderRedirectCount, 0);
-                    }
-
                     return attempt.Response!;
                 }
 
@@ -532,11 +549,19 @@ public sealed partial class TcpMessageStream
                         StatusCode: VsrError.TRANSIENT_NOT_ACCEPTED, FromServer: true
                     }
                     && !isLoginRegister
+                    && allowRedirect
                     && Environment.TickCount64 < overallDeadline)
                 {
-                    if (await RedirectAsync(token))
+                    if (redirects < VsrMaxLeaderRedirects && await RedirectAsync(token))
                     {
+                        redirects++;
                         await ConnectAsync(token);
+                    }
+                    else if (redirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
+                    {
+                        redirectBudgetLogged = true;
+                        _logger.LogWarning("Maximum leader redirections reached, continuing on {Address}",
+                            _currentAddress);
                     }
 
                     continue;
@@ -544,6 +569,9 @@ public sealed partial class TcpMessageStream
 
                 if (attempt.Error is VsrSessionEvictedException evicted)
                 {
+                    // The session is gone, but the sign-in that established it is not: a stale-client
+                    // eviction comes off the server's heartbeat timer, so the reconnect re-establishes it.
+                    // Only an explicit sign-out or Dispose ends it.
                     if (attempt.RequestStarted && !VsrOperations.IsReplaySafeRead(code, isLoginRegister, body.Span))
                     {
                         throw new VsrRequestOutcomeUnknownException(evicted);
@@ -566,14 +594,10 @@ public sealed partial class TcpMessageStream
         {
             if (requestEncoded)
             {
-                await DropVsrConnectionAsync(lastStream);
+                await DropVsrConnectionAsync(lastConnection);
             }
 
             throw;
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(headerBuffer);
         }
     }
 
@@ -582,6 +606,19 @@ public sealed partial class TcpMessageStream
     ///     the client refused or discarded, and a NOT_COMMITTED that outlived its replay deadline all leave the
     ///     outcome of a request the server may still commit unknowable.
     /// </summary>
+    /// <summary>
+    ///     Whether the reply body may carry a credential - a raw personal access token, a session secret - and
+    ///     therefore must be zeroed before its pooled buffer is handed back for reuse.
+    /// </summary>
+    private static bool HasSensitiveReply(int code)
+    {
+        return code is CommandCodes.LOGIN_USER_CODE
+            or CommandCodes.LOGIN_REGISTER_CODE
+            or CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
+            or CommandCodes.LOGIN_REGISTER_WITH_PAT_CODE
+            or CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE;
+    }
+
     private static bool IsDefinitiveVerdict(Exception error)
     {
         return error is IggyInvalidStatusCodeException
@@ -592,233 +629,28 @@ public sealed partial class TcpMessageStream
     }
 
     /// <summary>
-    ///     One attempt on the current connection: encode the header into <paramref name="header" />, write the
-    ///     frame, and replay it - same session, same request id - while the server answers transiently.
+    ///     One attempt on the current connection, resolved under the sending lock so the frame and its reply
+    ///     cannot be split across two sockets, and so a teardown after the lock is gone can tell this
+    ///     connection from a replacement a reconnect installed since.
     /// </summary>
-    private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body, Memory<byte> header,
-        long transientDeadline, long readDeadline, CancellationToken token)
+    private async ValueTask<VsrAttempt> SendVsrAttemptAsync(int code, ReadOnlyMemory<byte> body,
+        long transientDeadline, long readDeadline, bool clearSensitiveReply, CancellationToken token)
     {
         await _sendingSemaphore.WaitAsync(token);
-
-        var encoded = false;
-        var requestStarted = false;
-        byte[]? frameBuffer = null;
-
-        // Read the stream once for the whole attempt. Nothing may swap the field without the sending lock this
-        // call holds, so the frame and its reply cannot be split across two sockets, and a teardown after the
-        // lock is gone can tell this connection from a replacement a reconnect installed since.
-        var stream = _stream;
         try
         {
-            // A small request goes out as one write. Two writes cost two syscalls and, with Nagle disabled, two
-            // TCP segments (two TLS records when encrypted) for what the reference encoder sends as a single
-            // contiguous frame. Above the threshold the copy costs more than the extra write saves. Renting
-            // inside the try keeps the semaphore paired with its release even if the pool throws.
-            if (body.Length <= VsrContiguousFrameLimit)
+            var connection = _connection;
+            if (connection is null)
             {
-                frameBuffer = ArrayPool<byte>.Shared.Rent(VsrHeader.HEADER_SIZE + body.Length);
+                return VsrAttempt.Failed(false, new NotConnectedException(), false, null);
             }
 
-            VsrHeader.EncodeRequestHeader(header.Span, _consensusSession, code, body.Span);
-
-            encoded = true;
-
-            var frame = Memory<byte>.Empty;
-            if (frameBuffer is not null)
-            {
-                frame = frameBuffer.AsMemory(0, VsrHeader.HEADER_SIZE + body.Length);
-                header.CopyTo(frame);
-                body.CopyTo(frame[VsrHeader.HEADER_SIZE..]);
-            }
-
-            while (true)
-            {
-                try
-                {
-                    // Everything that fails without reaching the socket has to fail before this point: past it a
-                    // failure is reported as an outcome the server alone knows, which for a replicated write
-                    // tells the caller its request may have committed twice.
-                    token.ThrowIfCancellationRequested();
-                    requestStarted = true;
-
-                    if (frameBuffer is not null)
-                    {
-                        await stream.SendAsync(frame, token);
-                    }
-                    else
-                    {
-                        await stream.SendAsync(header, token);
-                        await stream.SendAsync(body, token);
-                    }
-
-                    await stream.FlushAsync(token);
-
-                    IMemoryOwner<byte> response = await ReadVsrReplyAsync(stream, readDeadline, token);
-
-                    return VsrAttempt.Ok(response, stream);
-                }
-                catch (IggyInvalidStatusCodeException e) when (IsReplayableTransient(e, transientDeadline,
-                                                                   readDeadline))
-                {
-                    var governingDeadline = e.StatusCode == VsrError.TRANSIENT_NOT_COMMITTED
-                        ? readDeadline
-                        : transientDeadline;
-                    var remaining = governingDeadline - Environment.TickCount64;
-                    await Task.Delay((int)Math.Clamp(remaining, 0, VsrTransientRetryIntervalMs), token);
-                }
-                catch (Exception e) when (IsConnectionException(e))
-                {
-                    DropVsrConnectionLocked(stream);
-
-                    return VsrAttempt.Failed(encoded, e, requestStarted, stream);
-                }
-                catch (OperationCanceledException e)
-                {
-                    DropVsrConnectionLocked(stream);
-
-                    return VsrAttempt.Failed(encoded, e, requestStarted, stream);
-                }
-                catch (Exception e)
-                {
-                    return VsrAttempt.Failed(encoded, e, requestStarted, stream);
-                }
-            }
-        }
-        catch (OperationCanceledException e)
-        {
-            if (encoded)
-            {
-                DropVsrConnectionLocked(stream);
-            }
-
-            return VsrAttempt.Failed(encoded, e, requestStarted, stream);
-        }
-        catch (Exception e)
-        {
-            return VsrAttempt.Failed(encoded, e, requestStarted, stream);
+            return await connection.SendAttemptAsync(code, body, transientDeadline, readDeadline,
+                clearSensitiveReply, token);
         }
         finally
         {
-            if (frameBuffer is not null)
-            {
-                ArrayPool<byte>.Shared.Return(frameBuffer);
-            }
-
             _sendingSemaphore.Release();
-        }
-    }
-
-    private async Task<IMemoryOwner<byte>> ReadVsrReplyAsync(TcpConnectionStream stream, long readDeadline,
-        CancellationToken token)
-    {
-        var remaining = readDeadline - Environment.TickCount64;
-        if (remaining <= 0)
-        {
-            throw new IOException($"Timed out after {VsrRequestTimeoutMs} ms waiting for a consensus reply.");
-        }
-
-        // One timer for the whole reply: the deadline covers the frame, not each partial read, so a per-read
-        // source would both re-arm the budget and allocate a timer per socket read.
-        using var readCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        readCancellation.CancelAfter((int)Math.Min(remaining, VsrRequestTimeoutMs));
-
-        await ReadExactVsrAsync(stream, _vsrReplyHeaderBuffer, readCancellation.Token, token);
-
-        var command = VsrHeader.PeekCommand(_vsrReplyHeaderBuffer);
-        if (command == Command.Eviction)
-        {
-            var eviction = VsrHeader.ReadEviction(_vsrReplyHeaderBuffer);
-            _logger.LogWarning("Consensus session evicted by the server: {Reason}", eviction.Reason);
-            DropVsrConnectionLocked(stream);
-
-            throw new VsrSessionEvictedException(VsrReplyDecoder.ToException(eviction));
-        }
-
-        if (command != Command.Reply)
-        {
-            // Neither a reply nor an eviction: this frame was never an answer to the outstanding request, so
-            // whatever the peer does send for it would be read as the next request's reply and handed to the
-            // wrong caller. The size field of a frame the client cannot model is no basis for resynchronising.
-            DropVsrConnectionLocked(stream);
-
-            throw VsrError.Exception(VsrError.INVALID_COMMAND,
-                $"Unexpected consensus frame {command} on a client connection.");
-        }
-
-        int bodySize;
-        try
-        {
-            bodySize = VsrReplyDecoder.ReadBodySize(_vsrReplyHeaderBuffer);
-            if (VsrHeader.HEADER_SIZE + (long)bodySize > _configuration.MaxResponseFrameSize)
-            {
-                throw VsrError.Exception(VsrError.INVALID_COMMAND,
-                    $"Reply frame of {VsrHeader.HEADER_SIZE + bodySize} bytes exceeds the configured maximum of " +
-                    $"{_configuration.MaxResponseFrameSize} bytes.");
-            }
-        }
-        catch
-        {
-            // An announced size the client refuses to read - undersized, oversized - leaves the body on the
-            // wire, so the stream no longer sits on a frame boundary and the next reply would decode body bytes
-            // as a header.
-            DropVsrConnectionLocked(stream);
-
-            throw;
-        }
-
-        if (bodySize == 0)
-        {
-            VsrReplyDecoder.Decode(_vsrReplyHeaderBuffer, ReadOnlyMemory<byte>.Empty);
-
-            return EmptyMemoryOwner.Instance;
-        }
-
-        var buffer = ArrayPool<byte>.Shared.Rent(bodySize);
-        try
-        {
-            await ReadExactVsrAsync(stream, buffer.AsMemory(0, bodySize), readCancellation.Token, token);
-            ReadOnlyMemory<byte> decoded = VsrReplyDecoder.Decode(_vsrReplyHeaderBuffer, buffer.AsMemory(0, bodySize));
-            if (decoded.IsEmpty)
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-
-                return EmptyMemoryOwner.Instance;
-            }
-
-            // The decoded payload is always a suffix of the body - the funnel only strips the leading
-            // committed result section.
-            return new PooledMemoryOwner(buffer, bodySize - decoded.Length, decoded.Length);
-        }
-        catch
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-            throw;
-        }
-    }
-
-    private async ValueTask ReadExactVsrAsync(TcpConnectionStream stream, Memory<byte> buffer,
-        CancellationToken readToken,
-        CancellationToken token)
-    {
-        var totalRead = 0;
-        while (totalRead < buffer.Length)
-        {
-            int readBytes;
-            try
-            {
-                readBytes = await stream.ReadAsync(buffer[totalRead..], readToken);
-            }
-            catch (OperationCanceledException) when (!token.IsCancellationRequested)
-            {
-                throw new IOException($"Timed out after {VsrRequestTimeoutMs} ms waiting for a consensus reply.");
-            }
-
-            if (readBytes == 0)
-            {
-                throw new IggyZeroBytesException();
-            }
-
-            totalRead += readBytes;
         }
     }
 
@@ -877,27 +709,28 @@ public sealed partial class TcpMessageStream
 
     /// <summary>
     ///     Drops the connection along with the session. A late or half-read reply would desync the framing of the
-    ///     next request, so the stream cannot be reused. The caller must hold <see cref="_sendingSemaphore" />,
-    ///     which owns every write to <see cref="_stream" />.
+    ///     next request, so the socket cannot be reused. The caller must hold <see cref="_sendingSemaphore" />,
+    ///     which owns every write to <see cref="_connection" />.
     /// </summary>
-    /// <param name="stream">
+    /// <param name="connection">
     ///     The connection the caller was using. A reconnect that completed in the meantime already closed it and
     ///     re-armed the session, so dropping anything but the live one would tear down a healthy replacement.
     /// </param>
-    private void DropVsrConnectionLocked(TcpConnectionStream? stream)
+    private void DropVsrConnectionLocked(VsrConnection? connection)
     {
-        if (!ReferenceEquals(_stream, stream))
+        if (connection is null || !ReferenceEquals(_connection, connection))
         {
             return;
         }
 
         ResetConsensusSession();
-        _stream?.Close();
-        SetConnectionStateAsync(ConnectionState.Disconnected);
+        _connection = null;
+        SetConnectionState(ConnectionState.Disconnected);
+        connection.Dispose();
     }
 
     /// <summary>Drops the connection on behalf of a caller that no longer holds the sending lock.</summary>
-    private async ValueTask DropVsrConnectionAsync(TcpConnectionStream? stream)
+    private async ValueTask DropVsrConnectionAsync(VsrConnection? connection)
     {
         // Dispose already closed the stream, and taking a disposed semaphore here would replace the
         // cancellation the caller is about to rethrow with an ObjectDisposedException. Dispose can still land
@@ -910,73 +743,11 @@ public sealed partial class TcpMessageStream
 
         try
         {
-            DropVsrConnectionLocked(stream);
+            DropVsrConnectionLocked(connection);
         }
         finally
         {
             _sendingSemaphore.Release();
-        }
-    }
-
-    private static bool IsReplayableTransient(IggyInvalidStatusCodeException error, long transientDeadline,
-        long readDeadline)
-    {
-        if (!error.FromServer)
-        {
-            return false;
-        }
-
-        return error.StatusCode switch
-        {
-            VsrError.TRANSIENT_NOT_COMMITTED => Environment.TickCount64 < readDeadline,
-            VsrError.TRANSIENT_NOT_ACCEPTED => Environment.TickCount64 < transientDeadline,
-            _ => false
-        };
-    }
-
-    /// <summary>Outcome of one <see cref="SendVsrAttemptAsync" /> call on the current connection.</summary>
-    /// <param name="Encoded">Whether the header was encoded, i.e. whether a request id may have been consumed.</param>
-    /// <param name="Response">The decoded reply payload, non-null exactly when <paramref name="Error" /> is null.</param>
-    /// <param name="Error">The failure that ended the attempt, or null on success.</param>
-    /// <param name="RequestStarted">
-    ///     Whether any byte of the frame was written, which makes the server-side outcome unknowable on failure.
-    /// </param>
-    /// <param name="Stream">
-    ///     The connection the attempt ran on, so a caller that drops it after releasing the sending lock can tell
-    ///     its own connection from a replacement a reconnect installed since.
-    /// </param>
-    private readonly record struct VsrAttempt(
-        bool Encoded,
-        IMemoryOwner<byte>? Response,
-        Exception? Error,
-        bool RequestStarted,
-        TcpConnectionStream? Stream)
-    {
-        public static VsrAttempt Ok(IMemoryOwner<byte> response, TcpConnectionStream stream)
-        {
-            return new VsrAttempt(true, response, null, true, stream);
-        }
-
-        public static VsrAttempt Failed(bool encoded, Exception error, bool requestStarted,
-            TcpConnectionStream? stream)
-        {
-            return new VsrAttempt(encoded, null, error, requestStarted, stream);
-        }
-    }
-
-    /// <summary>Owns a pooled buffer while exposing only the decoded payload slice inside it.</summary>
-    internal sealed class PooledMemoryOwner(byte[] buffer, int start, int length) : IMemoryOwner<byte>
-    {
-        private int _disposed;
-
-        public Memory<byte> Memory => buffer.AsMemory(start, length);
-
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref _disposed, 1) == 0)
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
         }
     }
 }

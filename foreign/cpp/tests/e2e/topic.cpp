@@ -290,11 +290,11 @@ TEST_F(LowLevelE2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicit
     constexpr std::uint64_t size_of_messages_required_to_save = 2ULL * 1024ULL * 1024ULL;
 
     rust::Vec<iggy::ffi::HeaderEntry> options;
-    options.push_back(iggy::TopicOption::segment_size(segment_size_bytes));
-    options.push_back(iggy::TopicOption::enforce_fsync(true));
-    options.push_back(iggy::TopicOption::messages_required_to_save(messages_required_to_save));
-    options.push_back(iggy::TopicOption::size_of_messages_required_to_save(size_of_messages_required_to_save));
-    options.push_back(iggy::TopicOption::preallocate_segments(false));
+    options.push_back(iggy::TopicOption::SegmentSize(segment_size_bytes));
+    options.push_back(iggy::TopicOption::EnforceFsync(true));
+    options.push_back(iggy::TopicOption::MessagesRequiredToSave(messages_required_to_save));
+    options.push_back(iggy::TopicOption::SizeOfMessagesRequiredToSave(size_of_messages_required_to_save));
+    options.push_back(iggy::TopicOption::PreallocateSegments(false));
 
     ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
                                          0, "server_default", std::move(options)));

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
+use crate::iggy_index::IggyIndexCache;
 use crate::iggy_index_writer::IggyIndexWriter;
 use crate::messages_writer::MessagesWriter;
 use crate::poll_plan::SealedSegmentHandle;
@@ -30,8 +30,6 @@ use std::rc::Rc;
 
 const SEGMENTS_CAPACITY: usize = 1024;
 const ACCESS_MAP_CAPACITY: usize = 8;
-const SIZE_16MB: usize = 16 * 1024 * 1024;
-
 /// Max sealed segments per partition that keep a resident read handle (fd +
 /// sparse index). Without a cap every sealed segment a reader ever touched pins
 /// one fd for the partition's lifetime; the server-wide budget is this cap times
@@ -394,8 +392,7 @@ where
             .last_mut()
             .expect("active indexes called on empty log");
         if indexes.is_none() {
-            let capacity = SIZE_16MB / IGGY_INDEX_SIZE;
-            *indexes = Some(IggyIndexCache::with_capacity(capacity));
+            *indexes = Some(IggyIndexCache::empty());
         }
     }
 

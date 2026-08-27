@@ -393,6 +393,365 @@ describe('IggyConnection', () => {
     }
   );
 
+  it('rotates a redial through the roster it learned while connected',
+    async () => {
+      const seed = await startServer();
+      const seedPort = (seed.address() as AddressInfo).port;
+      const connection = new IggyConnection(connectionConfig(seed));
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([
+          { host: '127.0.0.1', port: seedPort },
+          { host: '127.0.0.1', port: seedPort + 1 },
+          { host: '127.0.0.1', port: seedPort + 2 }
+        ]);
+        // The endpoint the client is on leads, the roster follows, and the
+        // roster's copy of that endpoint does not earn a second attempt.
+        assert.deepEqual(
+          connection._redialCandidates().map((options) => options.port),
+          [seedPort, seedPort + 1, seedPort + 2]
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => seed.close(() => resolve()));
+      }
+    }
+  );
+
+  it('dials the endpoint it is on, then the seed, then the roster',
+    async () => {
+      const seed = await startServer();
+      const seedPort = (seed.address() as AddressInfo).port;
+      const connection = new IggyConnection(connectionConfig(seed));
+      connection.on('error', () => undefined);
+      try {
+        // A redirect moves the client off its seed; the seed is still the one
+        // endpoint the caller vouched for, so it comes before a roster the
+        // cluster may have reshaped since.
+        connection.config.options = {
+          ...connection.config.options,
+          port: seedPort + 9
+        };
+        connection.rememberRoster([{ host: '127.0.0.1', port: seedPort + 5 }]);
+
+        assert.deepEqual(
+          connection._redialCandidates().map((options) => options.port),
+          [seedPort + 9, seedPort, seedPort + 5]
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => seed.close(() => resolve()));
+      }
+    }
+  );
+
+  it('counts endpoints that only differ in spelling once',
+    async () => {
+      const seed = await startServer();
+      const seedPort = (seed.address() as AddressInfo).port;
+      const connection = new IggyConnection(connectionConfig(seed));
+      connection.on('error', () => undefined);
+      try {
+        // The loopback aliases and an IPv4-mapped address all name the endpoint
+        // the client is already on, so none of them earns a dial of its own.
+        connection.rememberRoster([
+          { host: 'localhost', port: seedPort },
+          { host: '::1', port: seedPort },
+          { host: '::ffff:127.0.0.1', port: seedPort },
+          { host: '127.0.0.1', port: seedPort + 1 }
+        ]);
+
+        assert.deepEqual(
+          connection._redialCandidates().map((options) => options.port),
+          [seedPort, seedPort + 1]
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => seed.close(() => resolve()));
+      }
+    }
+  );
+
+  it('does not redial at all when reconnection is disabled',
+    async () => {
+      // `enabled: false` is what a caller says to opt out. The retry budget is
+      // whatever the defaults hold, so a loop that reads it without checking
+      // this flag would run every one of those passes - and with the backoff
+      // gated on the same flag, back to back.
+      //
+      // The endpoint accepts and hangs up, so the drop that would start a
+      // redial happens and every dial of it is counted.
+      const hangup = await startServer();
+      const hangupPort = (hangup.address() as AddressInfo).port;
+      let accepted = 0;
+      hangup.on('connection', (socket) => {
+        accepted += 1;
+        socket.destroy();
+      });
+
+      const connection = new IggyConnection({
+        transport: 'TCP',
+        options: { host: '127.0.0.1', port: hangupPort },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        await connection.connect().catch(() => undefined);
+        await new Promise<void>((resolve) => setTimeout(resolve, 300));
+
+        assert.equal(accepted, 1,
+          'a client that turned reconnection off redialed anyway'
+        );
+        assert.equal(connection.connected, false);
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => hangup.close(() => resolve()));
+      }
+    }
+  );
+
+  it('sweeps the endpoints it knows once when reconnection is disabled',
+    async () => {
+      // Opting out of retries is not opting out of the endpoints: with more
+      // than one known, they get exactly one pass and no backoff, as in the
+      // other SDKs.
+      const dead = await startServer();
+      const deadPort = (dead.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => dead.close(() => resolve()));
+      const live = await startServer();
+      const livePort = (live.address() as AddressInfo).port;
+      let accepted = 0;
+      live.on('connection', () => { accepted += 1; });
+
+      const connection = new IggyConnection({
+        transport: 'TCP',
+        options: { host: '127.0.0.1', port: deadPort },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: livePort }]);
+        await connection.connect().catch(() => undefined);
+        await new Promise<void>((resolve) => setTimeout(resolve, 200));
+
+        assert.equal(accepted, 1,
+          'the known endpoints got either no pass or more than one'
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => live.close(() => resolve()));
+      }
+    }
+  );
+
+  it('makes one pass when every endpoint is down and reconnection is disabled',
+    async () => {
+      // One pass, not the whole retry budget: with the budget read but the
+      // flag ignored, a client that opted out of retries dials every endpoint
+      // once per pass for all of them -- and with the backoff gated on the same
+      // flag, back to back.
+      //
+      // Plain TCP behind a TLS client, closed at once: the dial fails, so the
+      // pass moves on, and every dial is counted where it lands.
+      const first = await startServer();
+      const firstPort = (first.address() as AddressInfo).port;
+      let firstDials = 0;
+      first.on('connection', (socket) => {
+        firstDials += 1;
+        socket.destroy();
+      });
+      const second = await startServer();
+      const secondPort = (second.address() as AddressInfo).port;
+      let secondDials = 0;
+      second.on('connection', (socket) => {
+        secondDials += 1;
+        socket.destroy();
+      });
+
+      const connection = new IggyConnection({
+        transport: 'TLS',
+        options: {
+          host: '127.0.0.1',
+          port: firstPort,
+          rejectUnauthorized: false
+        },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: false, interval: 10, maxRetries: 12 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: secondPort }]);
+        await connection.connect().catch(() => undefined);
+        await new Promise<void>((resolve) => setTimeout(resolve, 300));
+
+        assert.equal(connection.connected, false);
+        // The connect's own dial of the configured endpoint, then one pass over
+        // both: the endpoint the client starts on is dialed twice, the one
+        // behind it once.
+        assert.deepEqual([firstDials, secondDials], [2, 1],
+          'a client that opted out of retries swept more than once'
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => first.close(() => resolve()));
+        await new Promise<void>((resolve) => second.close(() => resolve()));
+      }
+    }
+  );
+
+  it('skips the first backoff when another endpoint is known',
+    async () => {
+      // The endpoint the client is on is dead and a live one sits behind it in
+      // the roster: waiting out the interval before the first pass would push
+      // the failover past what the caller waits for, and the node just lost may
+      // be gone for good.
+      const dead = await startServer();
+      const deadPort = (dead.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => dead.close(() => resolve()));
+      const live = await startServer();
+      const livePort = (live.address() as AddressInfo).port;
+
+      const interval = 3000;
+      const connection = new IggyConnection({
+        transport: 'TCP',
+        options: { host: '127.0.0.1', port: deadPort },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: true, interval, maxRetries: 3 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: livePort }]);
+        const dialed = once(live, 'connection');
+        const started = Date.now();
+        void connection.connect().catch(() => undefined);
+        await dialed;
+
+        assert.ok(Date.now() - started < interval,
+          'the failover waited out the backoff before its first pass'
+        );
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => live.close(() => resolve()));
+      }
+    }
+  );
+
+  it('bounds a dial that never becomes usable when others are queued behind it',
+    async () => {
+      // Plain TCP behind a TLS client: the socket connects, so only a bound on
+      // the handshake ends the attempt. The endpoint behind it is dead, so the
+      // pass has to end on its own rather than hang on the first one.
+      const silent = await startServer();
+      const silentPort = (silent.address() as AddressInfo).port;
+      const held: Socket[] = [];
+      silent.on('connection', (socket) => { held.push(socket); });
+      const dead = await startServer();
+      const deadPort = (dead.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => dead.close(() => resolve()));
+
+      const connection = new IggyConnection({
+        transport: 'TLS',
+        options: {
+          host: '127.0.0.1',
+          port: silentPort,
+          rejectUnauthorized: false
+        },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: true, interval: 10, maxRetries: 3 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      connection.on('error', () => undefined);
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: deadPort }]);
+        void connection.connect().catch(() => undefined);
+
+        // Unbounded, the first dial never ends and this endpoint is dialed
+        // exactly once, forever.
+        const deadline = Date.now() + 8_000;
+        while (held.length < 2 && Date.now() < deadline)
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+        assert.ok(held.length >= 2,
+          'a dial that never became usable held the pass'
+        );
+        assert.equal(connection.connected, false);
+      } finally {
+        connection._destroy();
+        held.forEach((socket) => socket.destroy());
+        await new Promise<void>((resolve) => silent.close(() => resolve()));
+      }
+    }
+  );
+
+  it('stops a redial pass that is destroyed part-way through',
+    async () => {
+      // The endpoint the client is on is dead, so every dial to it is refused
+      // - and the live roster endpoint behind it is what the pass would reach
+      // next, unless the destroy in between stops the pass.
+      const dead = await startServer();
+      const deadPort = (dead.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => dead.close(() => resolve()));
+      const live = await startServer();
+      const livePort = (live.address() as AddressInfo).port;
+      let accepted = 0;
+      live.on('connection', () => { accepted += 1; });
+
+      const connection = new IggyConnection({
+        transport: 'TCP',
+        options: { host: '127.0.0.1', port: deadPort },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: true, interval: 10, maxRetries: 3 },
+        maxResponseFrameSize: FRAME_LIMIT
+      });
+      let destroyed = false;
+      let connectsAfterDestroy = 0;
+      connection.on('connect', () => {
+        if (destroyed)
+          connectsAfterDestroy += 1;
+      });
+      try {
+        connection.rememberRoster([{ host: '127.0.0.1', port: livePort }]);
+
+        // The first failure is the initial connect, which is what starts the
+        // redial pass; the next one is that pass's first candidate, so
+        // destroying there lands between two candidates rather than before the
+        // pass.
+        const destroyedMidPass = new Promise<void>((resolve) => {
+          let failures = 0;
+          connection.on('error', () => {
+            failures += 1;
+            if (failures < 2 || destroyed)
+              return;
+            connection._destroy();
+            destroyed = true;
+            resolve();
+          });
+        });
+
+        await connection.connect().catch(() => undefined);
+        await destroyedMidPass;
+        await new Promise<void>((resolve) => setTimeout(resolve, 100));
+
+        assert.equal(accepted, 0,
+          'a destroyed connection must not keep dialing the rest of the pass'
+        );
+        assert.equal(connectsAfterDestroy, 0,
+          'a destroyed connection must not announce a connection'
+        );
+        assert.equal(connection.connected, false);
+      } finally {
+        connection._destroy();
+        await new Promise<void>((resolve) => live.close(() => resolve()));
+      }
+    }
+  );
+
   it('settles a dial in flight when a redirect replaces the socket',
     async () => {
       const seed = await startServer();
