@@ -199,6 +199,7 @@ mod tests {
     use crate::manager::sink::SinkManager;
     use crate::manager::source::SourceManager;
     use crate::metrics::Metrics;
+    use crate::state::FileStateFactory;
     use crate::stream::IggyClients;
     use iggy::prelude::IggyClient;
     use iggy_common::IggyTimestamp;
@@ -319,7 +320,9 @@ mod tests {
                 producer: IggyClient::default(),
                 consumer: IggyClient::default(),
             }),
-            state_path: directory.path().display().to_string(),
+            state_factory: Arc::new(FileStateFactory::new(
+                directory.path().display().to_string(),
+            )),
         };
         (Arc::new(context), directory)
     }
