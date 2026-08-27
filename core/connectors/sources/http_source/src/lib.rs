@@ -713,7 +713,11 @@ impl Source for HttpSource {
         }
 
         let max_batch_size = self.shared.config.max_batch_size;
-        let mut queued: Vec<QueuedMessage> = Vec::with_capacity(max_batch_size);
+        // Empty until traffic actually arrives. Reserving up front cost a
+        // `max_batch_size` allocation on every flush-only and idle poll, which
+        // at the configurable ceiling is megabytes allocated and freed to carry
+        // nothing.
+        let mut queued: Vec<QueuedMessage> = Vec::new();
         let receiver = self.receiver.lock().await;
         tokio::select! {
             // The SDK races poll() against its own shutdown watch, so blocking
