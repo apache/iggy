@@ -18,9 +18,11 @@
 //! Gateway-side Prometheus metrics, served on the admin listener.
 //!
 //! The runtime's own stage histograms start at `poll()`, so they cannot see
-//! the number that matters most for a webhook gateway: how long a sender
-//! waited between TCP accept and its 200. This connector is an HTTP server,
-//! so it measures that itself.
+//! anything a webhook sender experiences. This connector is an HTTP server, so
+//! it measures its own handling: the clock starts once axum has run the
+//! extractors, which means the request body has already been read. Time spent
+//! receiving a slow or large upload therefore sits outside the histogram, and
+//! accept-to-200 would need a tower layer wrapping the extractors.
 //!
 //! Names carry an `http_source_` prefix to keep them clear of the runtime's
 //! `iggy_connector_` family. One registry per shared listener, with every

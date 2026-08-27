@@ -271,7 +271,7 @@ The bridge is bounded by message count, not bytes, so worst-case memory is `buff
 
 `GET /admin/health` returns per-instance JSON: queue depth and capacity, serving endpoint counts by origin plus expired and revoked counts, `state_submitted`, and header loss counters.
 
-`GET /admin/metrics` returns Prometheus text format. The runtime's own stage histograms begin at `poll()`, so they cannot see accept-to-200 latency; these fill that gap.
+`GET /admin/metrics` returns Prometheus text format. The runtime's own stage histograms begin at `poll()`, so they see nothing a sender experiences; these cover the gateway's own handling. The clock starts after the request body has been read, so a slow or large upload is not counted in `http_source_request_duration_seconds`.
 
 | Metric | Type | Labels | Notes |
 | ------ | ---- | ------ | ----- |

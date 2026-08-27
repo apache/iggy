@@ -56,7 +56,11 @@ pub fn validate_bearer(authorization_header: Option<&str>, expected_token: &Secr
 /// sender using `bearer` is legitimate and must not be turned away.
 pub fn strip_bearer(header_value: &str) -> Option<&str> {
     let (scheme, token) = header_value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+    // RFC 9110's grammar is `auth-scheme [ 1*SP token68 ]`, so more than one
+    // space is legal and the extra would otherwise fail the compare.
+    scheme
+        .eq_ignore_ascii_case("Bearer")
+        .then(|| token.trim_start_matches(' '))
 }
 
 /// Compares two secrets without leaking their contents through timing.
@@ -142,6 +146,14 @@ mod tests {
     #[test]
     fn given_missing_header_when_bearer_validated_should_reject() {
         assert!(!validate_bearer(None, &secret()));
+    }
+
+    #[test]
+    fn given_extra_spaces_after_scheme_when_bearer_validated_should_accept() {
+        // RFC 9110 allows `1*SP` between the scheme and the token, so the extra
+        // space belongs to the separator rather than to the credential.
+        let header = format!("Bearer   {SECRET}");
+        assert!(validate_bearer(Some(&header), &secret()));
     }
 
     #[test]
