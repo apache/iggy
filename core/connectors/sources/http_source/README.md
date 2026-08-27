@@ -242,7 +242,7 @@ Dynamic endpoints ride the SDK's `ConnectorState`, which the runtime writes afte
 
 `GET /admin/endpoints` reports `submitted` per endpoint. It is named that, and not `persisted`, on purpose: the flag is set when the registry is handed to the runtime, so `submitted: true` means it reached the runtime, not that the write landed.
 
-Since #3855 the runtime does acknowledge the batch, and a failed save comes back as a NACK that re-arms the flush for the next poll. That re-arm does not clear `submitted`, so between a failed save and the retry that succeeds, the flag over-reports. Clearing it would mean rewriting the registry from a sync path that cannot take the writer lock, and would risk discarding a revocation that landed in the meantime. Watch the connector's `last_error` for save failures rather than this flag.
+Since #3855 the runtime does acknowledge the batch, and a failed save comes back as a NACK that re-arms the flush for the next poll. The stored flag is not cleared by that re-arm, so what the API reports pairs it with whether a flush is still owed: an endpoint reads `submitted: true` only once it has been handed over and nothing is outstanding. That errs toward reporting not-yet-durable, which is the safe direction, and it means a mutation arriving after a successful save shows every endpoint as unsubmitted until the next flush lands.
 
 ## Backpressure
 
