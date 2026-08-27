@@ -105,6 +105,24 @@ runs:
         ls -la dist/
       shell: bash
 
+    - name: Check apache_iggy.pyi is up to date
+      if: inputs.task == 'test'
+      run: |
+        # stub_gen must run from foreign/python; a subdirectory corrupts the stub.
+        cd foreign/python
+        cargo run --bin stub_gen
+
+        # The tracked stub is post-ruff. Format first: the raw output leaves
+        # whitespace on blank lines, which `check` reports but only `format` fixes.
+        uv run --no-sync ruff format apache_iggy.pyi
+        uv run --no-sync ruff check --fix apache_iggy.pyi
+
+        if ! git diff --exit-code -- apache_iggy.pyi; then
+          echo "::error::apache_iggy.pyi is out of date. Run 'cargo run --bin stub_gen' from foreign/python, let the ruff hooks format it, and commit the result."
+          exit 1
+        fi
+      shell: bash
+
     - name: Build Python wheel with coverage instrumentation
       if: inputs.task == 'test'
       run: |

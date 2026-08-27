@@ -92,7 +92,7 @@ Every installation below compiles the Rust extension, so you'll need:
    pytest tests/ -v # make sure iggy-server is running and the venv is activated
    ```
 
-4. To update the stubs, only after changing the pyo3 API surface (nothing in CI checks stub freshness, so unconditional regen just invites `.pyi` churn), use
+4. To update the stubs, after changing the pyo3 API surface, use
 
    ```bash
    # run from foreign/python
