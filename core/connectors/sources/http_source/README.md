@@ -159,7 +159,7 @@ Content-Type: application/json
 | ------ | --------- | ---- |
 | 200 | Accepted into the bridge | `{"status":"queued"}` |
 | 401 | Bearer or HMAC validation failed | `{"error":"unauthorized"}` |
-| 404 | Unknown path, or a revoked endpoint | `{"error":"not found"}` |
+| 404 | Unknown path, or a revoked or expired endpoint | `{"error":"not found"}` |
 | 400 | Malformed request body, e.g. the client reset mid-send | `{"error":"bad request"}` |
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
 | 429 | Bridge full | `{"error":"service temporarily unavailable"}` plus `Retry-After: 1` |
@@ -283,7 +283,7 @@ The bridge is bounded by message count, not bytes, so worst-case memory is `buff
 | `http_source_buffer_capacity` | gauge | `instance` | |
 | `http_source_endpoints_active` | gauge | `instance`, `kind` | endpoints that would accept a request now: neither revoked nor past `expires_at` |
 
-`kind` is `named` or `secret` for requests and `static` or `dynamic` for endpoints. `status` is the response class, `2xx`, `4xx`, or `5xx`, rather than the exact code, so a caller cannot inflate cardinality by probing. Only requests to a genuinely unknown path are counted under `instance="unrouted"`, which is where a scan for live endpoint ids shows up; a revoked or expired endpoint is still metered against the instance that owns it.
+`kind` is `named` or `secret` for requests and `static` or `dynamic` for endpoints. `status` is the response class, `2xx`, `3xx`, `4xx`, or `5xx`, rather than the exact code, so a caller cannot inflate cardinality by probing. Only requests to a genuinely unknown path are counted under `instance="unrouted"`, which is where a scan for live endpoint ids shows up; a revoked or expired endpoint is still metered against the instance that owns it.
 
 A metric with no series yet is absent from the scrape rather than reported as zero, which is how Prometheus client libraries represent labelled families. Write dashboard queries accordingly.
 
