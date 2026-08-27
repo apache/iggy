@@ -247,6 +247,17 @@ mod tests {
     /// `net.ipv4.ip_nonlocal_bind=1`, which keepalived and haproxy boxes set,
     /// bind it regardless; `routable_address_binds` excuses those.
     const UNASSIGNABLE_ROUTABLE_ADDRESS: &str = "192.0.2.1:8081";
+
+    /// The pointer has to be fetchable by whoever reads the warning, and the
+    /// published image ships no source tree. Asserting the const against itself
+    /// elsewhere cannot catch a value that stops being a URL.
+    #[test]
+    fn given_the_exposure_pointer_when_read_should_be_a_fetchable_url() {
+        assert!(
+            EXPOSURE_DOC.starts_with("https://"),
+            "a repo-relative path does not exist for an operator running the image"
+        );
+    }
     const EPHEMERAL_LOOPBACK_ADDRESS: &str = "127.0.0.1:0";
 
     type Captured = Arc<Mutex<Vec<(Level, String)>>>;
@@ -426,18 +437,34 @@ mod tests {
                 "the bind must not have completed, or this proves nothing about ordering"
             );
         }
-        assert!(
-            warnings(&captured)
-                .iter()
-                .any(|warning| warning.contains(UNASSIGNABLE_ROUTABLE_ADDRESS)),
-            "init must consult the guard and name the address it is exposing"
+        // Keyless and untrusting on a routable address, so the address warning
+        // and the cleartext one both fire. Asserted with `all` and a count
+        // rather than `any`: either message could stop naming the address and
+        // the other would still satisfy an `any`.
+        let warnings = warnings(&captured);
+        assert_eq!(
+            warnings.len(),
+            2,
+            "init must consult the guard for both the missing key and the missing \
+             TLS: {warnings:?}"
         );
         assert!(
-            warnings(&captured)
+            warnings
+                .iter()
+                .all(|warning| warning.contains(UNASSIGNABLE_ROUTABLE_ADDRESS)),
+            "each names the address it is exposing: {warnings:?}"
+        );
+        assert!(
+            warnings
                 .iter()
                 .all(|warning| warning.contains(EXPOSURE_DOC)),
-            "each warning carries the pointer instead of its own remediation: {:?}",
-            warnings(&captured)
+            "each carries the pointer instead of its own remediation: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("read and rewrite")),
+            "the exposure is not read-only, and saying so is the point: {warnings:?}"
         );
     }
 
