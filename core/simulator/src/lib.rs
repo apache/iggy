@@ -3661,6 +3661,23 @@ mod repair_frontier_tests {
             journaled = current;
         }
 
+        // The contract itself, not just the absence of a rewind: after the
+        // repair stream the pair has to describe one and the same entry, or
+        // the next projected prepare parents on something that is not its
+        // predecessor.
+        let (head, parent) = metadata_chain_head(&sim, LAGGING);
+        let journaled = metadata_journal_checksums(&sim, LAGGING);
+        assert_eq!(
+            journaled.get(&head).copied(),
+            Some(parent),
+            "the sequencer sits at op {head} but last_prepare_checksum describes \
+             op {:?}, so the next projected prepare would parent past op {head}",
+            journaled
+                .iter()
+                .find(|&(_, &checksum)| checksum == parent)
+                .map(|(&op, _)| op)
+        );
+
         assert!(
             backfills_below_head > 0,
             "the rejoined replica never repaired an op below its own head, so \

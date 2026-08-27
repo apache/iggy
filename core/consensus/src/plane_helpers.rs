@@ -771,23 +771,27 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
     }
 }
 
-/// Resolve a repair's new contiguous head and its hash-chain checksum.
+/// Resolve a repair's contiguous head and the checksum of the entry sitting at it.
 ///
-/// A DVC can put the sequencer above holes that repair later backfills. Such a
-/// lower entry changes durable coverage, but not the head the next prepare must
-/// parent. Updating the checksum from the incoming entry would rewind the chain
-/// while leaving the sequencer ahead of it.
+/// A view change can put the sequencer above holes that repair later backfills.
+/// Such a lower entry changes durable coverage, but not the head the next prepare
+/// must parent: taking its checksum would rewind the chain while leaving the
+/// sequencer ahead of it. `None` until the journal holds the entry at the head.
 pub fn repaired_frontier_update(
     previous_frontier: u64,
     mut header_at: impl FnMut(u64) -> Option<PrepareHeader>,
 ) -> Option<(u64, u128)> {
     let mut frontier = previous_frontier;
-    let mut update = None;
+    // Re-anchored on the head the journal can prove, not only on an advance:
+    // `handle_start_view` moves the sequencer to the announced head without
+    // touching the checksum, so the frame that finally delivers that head is
+    // the only chance to make the pair agree again.
+    let mut checksum = header_at(frontier).map(|header| header.checksum);
     while let Some(header) = header_at(frontier + 1) {
         frontier += 1;
-        update = Some((frontier, header.checksum));
+        checksum = Some(header.checksum);
     }
-    update
+    checksum.map(|checksum| (frontier, checksum))
 }
 
 /// Ack a prepare back to its primary once the owning plane vouches for it.
@@ -2062,7 +2066,10 @@ mod tests {
 
         let update = repaired_frontier_update(171, |op| headers.get(&op).copied());
 
-        assert_eq!(update, None);
+        // Not a rewind: the frontier does not move, and the checksum re-anchors
+        // on the entry the sequencer already points at rather than on the
+        // backfill that just arrived below it.
+        assert_eq!(update, Some((171, 1710)));
     }
 
     #[test]
