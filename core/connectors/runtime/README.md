@@ -198,7 +198,8 @@ Connector runtime has an optional HTTP API that can be enabled by setting the `e
 [http] # Optional HTTP API configuration
 enabled = true
 # Loopback on purpose: the configuration endpoints return plugin credentials in
-# plaintext. Set api_key in the same edit if you move this off loopback.
+# plaintext and also accept writes. Set api_key in the same edit if you move
+# this off loopback, and http.tls unless cleartext is acceptable.
 address = "127.0.0.1:8081"
 api_key = "" # Optional API key for authentication to be passed as `api-key` header; empty disables authentication
 
@@ -233,27 +234,49 @@ key_file = "core/certs/iggy_key.pem"
 > enough to repoint a connector at a destination of the caller's choosing,
 > because `restart` re-reads the stored configuration and starts the connector
 > from it. The runtime then forwards your topic data using its own Iggy
-> credentials, and the stored plugin `path` is `dlopen`ed on the next start.
-> `PUT .../configs/active` and `DELETE .../configs` sit behind the same key.
+> credentials. `PUT .../configs/active` and `DELETE .../configs` sit behind the
+> same key.
+>
+> A rewritten plugin `path` is not loaded by the restart. `start_connector`
+> reuses the container `dlopen`ed at boot and only re-runs the plugin's init
+> with the new configuration, so a hostile path sits in the stored config until
+> the next time the runtime process starts. Deferred code execution rather than
+> immediate, which is the difference between a restart and a redeploy.
 >
 > `api_key` is empty by default, which means authentication is **off** by
 > default. Only `/` and `/health` are exempt once it is set, so everything above
 > sits behind that one empty string, and the loopback default `address` is what
 > confines it to local processes.
 >
-> Three ways that containment goes away:
+> Three edits take that containment away:
 >
 > - **Moving `address` off loopback.** Set `api_key` in the same edit. The
 >   runtime warns at startup when the address resolves beyond loopback with no
 >   key configured, but nothing prevents it.
-> - **Enabling `[http.cors]`.** It ships `allowed_origins = ["*"]`, which becomes
->   `AllowOrigin::any()`, and the CORS layer wraps *outside* authentication. A
->   browser is a local process, so with CORS enabled and no key, any page the
->   operator visits can read the configuration endpoints cross-origin. Setting
->   `api_key` closes it, since an attacker's page cannot supply the header.
+> - **Enabling `[http.cors]` with the shipped `allowed_origins = ["*"]`.** That
+>   becomes `AllowOrigin::any()`, and the CORS layer wraps *outside*
+>   authentication, so tower-http answers the preflight before `resolve_api_key`
+>   runs. A browser is a local process, so with a wildcard origin and no key any
+>   page the operator visits gets a green preflight for a configuration `POST`
+>   and can then read *and rewrite* configuration cross-origin - the whole
+>   publish-then-restart repoint above, not just disclosure. Setting `api_key`
+>   closes it, since an attacker's page
+>   cannot supply the header. Pinning `allowed_origins` to real origins closes
+>   the cross-origin path too, and the startup warning stays quiet about that
+>   case on purpose.
 > - **Leaving `http.tls.enabled = false`.** It ships disabled, so the `api-key`
 >   header and the responses carrying your credentials both travel in cleartext.
 >   Enable TLS alongside `api_key` whenever this API leaves loopback.
+>
+> And one that needs no edit at all. `POST .../restart` carries no body and no
+> content type, which makes it a CORS-simple request: a page can issue it with
+> `mode: 'no-cors'` and the browser sends it whatever `[http.cors]` says,
+> because CORS gates reading a response rather than issuing a request. So on the
+> shipped keyless default, any page the operator visits can restart any
+> connector, and no startup warning covers it because it is true of the defaults
+> rather than of an edit. Chrome's private network access blocks the
+> public-origin case; Firefox and Safari do not, and a page served from a local
+> origin bypasses it everywhere. `api_key` is what closes this one.
 
 Currently, it does expose the following endpoints:
 
@@ -270,7 +293,7 @@ Currently, it does expose the following endpoints:
 - `GET /sinks/{key}/configs/active`: active configuration details.
 - `PUT /sinks/{key}/configs/active`: activate a specific configuration version for the sink.
 - `GET /sinks/{key}/configs/plugin`: sink plugin config, including the optional `format` query parameter to specify the config format.
-- `POST /sinks/{key}/restart`: stop the sink and start it again from its stored active configuration.
+- `POST /sinks/{key}/restart`: stop the sink and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sinks/{key}/transforms`: sink transforms to be applied to the fields.
 - `GET /sources`: list of sources.
 - `GET /sources/{key}`: source details.
@@ -281,7 +304,7 @@ Currently, it does expose the following endpoints:
 - `GET /sources/{key}/configs/active`: active configuration details.
 - `PUT /sources/{key}/configs/active`: activate a specific configuration version for the source.
 - `GET /sources/{key}/configs/plugin`: source plugin config, including the optional `format` query parameter to specify the config format.
-- `POST /sources/{key}/restart`: stop the source and start it again from its stored active configuration.
+- `POST /sources/{key}/restart`: stop the source and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sources/{key}/transforms`: source transforms to be applied to the fields.
 
 ## Telemetry
