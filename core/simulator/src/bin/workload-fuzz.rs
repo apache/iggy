@@ -150,6 +150,16 @@ struct Args {
     shell: bool,
     #[arg(long)]
     no_quiesce: bool,
+    /// Before the drain, restart every crashed replica and stop the network drawing
+    /// new faults, then require convergence of the healed cluster.
+    ///
+    /// Off by default, and that default is load-bearing: a drain failing with a
+    /// replica still down is how a wedge shows up, and healing first resolves it
+    /// instead of reporting it. `TigerBeetle`'s VOPR heals only AFTER its request
+    /// target goes unmet. A run at `--min-survivors 0` wants the flag: ending with
+    /// everyone down cannot drain by arithmetic, not by wedge.
+    #[arg(long)]
+    heal_before_quiesce: bool,
 
     /// Network fault profile. Individual network flags below override single
     /// fields of the profile.
@@ -494,6 +504,89 @@ fn validate_network_options(options: &PacketSimulatorOptions) -> Result<(), Stri
     Ok(())
 }
 
+/// The liveness phase: drain every outstanding request, settle on one view, and
+/// compare the replicas against each other and against the oracle.
+///
+/// Split out of `main` only for length. Every assert here is a hard failure by
+/// design; see the individual comments for why each one is not a warning.
+fn run_quiesce_phase(
+    args: &Args,
+    sim: &mut Simulator,
+    workload: &mut Workload,
+    seed: u64,
+    replicas: u8,
+) {
+    // Liveness phase, opt-in: a drain against a handicapped cluster has no
+    // verdict, but healing unconditionally resolves the wedges worth reporting.
+    // See the flag's own doc.
+    if args.heal_before_quiesce {
+        let revived: Vec<u8> = (0..replicas).filter(|idx| sim.is_crashed(*idx)).collect();
+        for replica_idx in &revived {
+            sim.replica_restart(*replica_idx);
+        }
+        sim.network.heal();
+        println!(
+            "liveness phase: network healed, {} replica(s) restarted {revived:?}",
+            revived.len(),
+        );
+    }
+
+    // A failed drain is a hard failure, not a warning. It was a warning while a
+    // lost request could not be retried, making stalls expected and
+    // unactionable; with the client resending, a request unanswered inside the
+    // budget is either a wedge or a liveness bug.
+    assert!(
+        oracle::drive_to_quiesce(sim, workload, 50_000),
+        "{}",
+        oracle::quiesce_failure_report(sim, workload),
+    );
+    // Then wait for one agreed view before asserting. `assert_converged` resolves
+    // the leader as whichever live replica claims to be primary, so asserting
+    // mid-view-change finds none or finds a deposed one, both false failures.
+    assert!(
+        oracle::settle_to_stable_view(sim, workload, 50_000),
+        "metadata views never converged after the drain\n{}",
+        oracle::quiesce_failure_report(sim, workload),
+    );
+    let convergence = oracle::assert_converged(sim, workload);
+    // Named, not implied. `assert_converged` skips the entity oracle when an
+    // eviction disarmed it and the shadow has not been proven consistent since,
+    // so "converged" alone would report a run that asserted nothing about entity
+    // state exactly like one that asserted everything.
+    let entity_oracle = if !workload.serial_run() {
+        "skipped (concurrent run)"
+    } else if workload.strict_outcome_oracle() {
+        "held"
+    } else {
+        "DISARMED by an eviction and never re-armed"
+    };
+    println!(
+        "quiesced and converged (leader-relative; entity oracle: {entity_oracle}; \
+         evictions={}; ops_compared={} replicas_compared={} namespaces_checked={})",
+        workload.evictions(),
+        convergence.ops_compared,
+        convergence.replicas_compared,
+        convergence.namespaces_checked,
+    );
+    assert!(
+        !args.require_entity_oracle || workload.strict_outcome_oracle(),
+        "--require-entity-oracle: the entity oracle was {entity_oracle}, so this run \
+         proved nothing about entity state (seed={seed:#x})"
+    );
+    let live = usize::from(replicas) - sim.crashed.len();
+    assert!(
+        args.min_ops_compared == 0 || live < 2 || convergence.ops_compared >= args.min_ops_compared,
+        "--min-ops-compared {}: {live} replicas live but only {} op(s) witnessed \
+         by more than one, so cross-replica agreement went untested \
+         (seed={seed:#x})",
+        args.min_ops_compared,
+        convergence.ops_compared,
+    );
+    // Again after the drain: the drain both answers outstanding requests and
+    // issues its own resends, so the pre-drain numbers are not the final ones.
+    print_coverage(workload);
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -579,76 +672,7 @@ fn main() {
     print_coverage(&workload);
 
     if quiesce {
-        // Liveness phase, before anything is asserted. A drain against a handicapped
-        // cluster has no verdict: a replica still down cannot answer or be compared
-        // against, and on a solo run leaves nobody to drain at all. TigerBeetle's VOPR
-        // does the same (`transition_to_liveness_mode`).
-        let revived: Vec<u8> = (0..replicas).filter(|idx| sim.is_crashed(*idx)).collect();
-        for replica_idx in &revived {
-            sim.replica_restart(*replica_idx);
-        }
-        sim.network.heal();
-        println!(
-            "liveness phase: network healed, {} replica(s) restarted {revived:?}",
-            revived.len(),
-        );
-
-        // A failed drain is a hard failure, not a warning. It was a warning while a
-        // lost request could not be retried, making stalls expected and
-        // unactionable; with the client resending, a request unanswered inside the
-        // budget is either a wedge or a liveness bug.
-        assert!(
-            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000),
-            "{}",
-            oracle::quiesce_failure_report(&sim, &workload),
-        );
-        // Then wait for one agreed view before asserting. `assert_converged` resolves
-        // the leader as whichever live replica claims to be primary, so asserting
-        // mid-view-change finds none or finds a deposed one, both false failures.
-        assert!(
-            oracle::settle_to_stable_view(&mut sim, &mut workload, 50_000),
-            "metadata views never converged after the drain\n{}",
-            oracle::quiesce_failure_report(&sim, &workload),
-        );
-        let convergence = oracle::assert_converged(&sim, &mut workload);
-        // Named, not implied. `assert_converged` skips the entity oracle when an
-        // eviction disarmed it and the shadow has not been proven consistent since,
-        // so "converged" alone would report a run that asserted nothing about entity
-        // state exactly like one that asserted everything.
-        let entity_oracle = if !workload.serial_run() {
-            "skipped (concurrent run)"
-        } else if workload.strict_outcome_oracle() {
-            "held"
-        } else {
-            "DISARMED by an eviction and never re-armed"
-        };
-        println!(
-            "quiesced and converged (leader-relative; entity oracle: {entity_oracle}; \
-             evictions={}; ops_compared={} replicas_compared={} namespaces_checked={})",
-            workload.evictions(),
-            convergence.ops_compared,
-            convergence.replicas_compared,
-            convergence.namespaces_checked,
-        );
-        assert!(
-            !args.require_entity_oracle || workload.strict_outcome_oracle(),
-            "--require-entity-oracle: the entity oracle was {entity_oracle}, so this run \
-             proved nothing about entity state (seed={seed:#x})"
-        );
-        let live = usize::from(replicas) - sim.crashed.len();
-        assert!(
-            args.min_ops_compared == 0
-                || live < 2
-                || convergence.ops_compared >= args.min_ops_compared,
-            "--min-ops-compared {}: {live} replicas live but only {} op(s) witnessed \
-             by more than one, so cross-replica agreement went untested \
-             (seed={seed:#x})",
-            args.min_ops_compared,
-            convergence.ops_compared,
-        );
-        // Again after the drain: the drain both answers outstanding requests and
-        // issues its own resends, so the pre-drain numbers are not the final ones.
-        print_coverage(&workload);
+        run_quiesce_phase(&args, &mut sim, &mut workload, seed, replicas);
     }
 
     // After the quiesce block, so the drain's own commits count. Rejections are added
@@ -752,8 +776,14 @@ fn build_cluster(
 /// directory an earlier run left is INPUT to this one and seeded naming would let a
 /// run silently boot off its predecessor's state while reporting only the seed.
 fn checkpoint_data_dir(args: &Args, seed: u64) -> std::path::PathBuf {
-    let root = match &args.data_dir {
-        Some(explicit) => {
+    let root = args.data_dir.as_ref().map_or_else(
+        || {
+            std::env::temp_dir().join(format!(
+                "iggy-workload-fuzz-{seed:#x}-{}",
+                std::process::id()
+            ))
+        },
+        |explicit| {
             assert!(
                 args.reuse_data_dir || !explicit.exists(),
                 "--data-dir {} already exists; the run would boot off what it holds. \
@@ -761,12 +791,8 @@ fn checkpoint_data_dir(args: &Args, seed: u64) -> std::path::PathBuf {
                 explicit.display(),
             );
             explicit.clone()
-        }
-        None => std::env::temp_dir().join(format!(
-            "iggy-workload-fuzz-{seed:#x}-{}",
-            std::process::id()
-        )),
-    };
+        },
+    );
     std::fs::create_dir_all(&root).expect("fuzz data directory must be creatable");
     root
 }

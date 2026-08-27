@@ -25,6 +25,7 @@ use iggy_common::IggyByteSize;
 use iggy_common::variadic;
 use journal::Journal;
 use metadata::impls::metadata::IggySnapshot;
+use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::RestoreSnapshot;
 use metadata::stm::stream::{Streams, StreamsInner};
@@ -154,6 +155,7 @@ pub fn new_shard(
     recovered_state: Option<VsrState>,
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
+    seed_namespaces: &[server_common::sharding::IggyNamespace],
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
@@ -316,6 +318,17 @@ pub fn new_shard(
                 metadata.install_client_table(restored),
                 "a freshly built plane holds no sessions, so this must install"
             );
+        }
+    }
+
+    // BEFORE the replay, matching a fresh boot: `CreateStream::apply` takes
+    // `vacant_key()`, so seeding after would put a restarted replica's `wl-*` streams
+    // below its fillers, the reverse of every peer. Idempotent, so
+    // `materialise_partition`'s own seed is then a no-op.
+    if shard_idx == 0 {
+        let streams = metadata.mux_stm.streams();
+        for &namespace in seed_namespaces {
+            streams.seed_namespace(namespace, namespace.inner());
         }
     }
 

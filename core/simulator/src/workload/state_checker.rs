@@ -124,7 +124,7 @@ impl StateChecker {
             }
             // Again, even when the loop already walked it. A replica whose point does
             // not move is otherwise never compared, while what it holds there can
-            // change under it (recovery, repair, transfer install). TigerBeetle
+            // change under it (recovery, repair, transfer install).
             // re-derives the checksum at `commit_min` every tick for this reason.
             if committed > 0 {
                 self.verify(replica_idx, replica, committed, committed, seed);
@@ -302,7 +302,6 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
 /// drains `0..=snapshot_op - 1`, retaining the commit-point header for view-change
 /// merging (`checkpoint_drain_retains_the_commit_point_header`), so on a healthy
 /// replica it is always there and the exemption only hid a missing committed head.
-/// TigerBeetle draws the same line at `commit_min == op_checkpoint()`.
 fn absent_header_is_legitimate(replica: &crate::SimReplica, op: u64) -> bool {
     op <= replica.metadata_journal.snapshot_op()
 }

@@ -1494,6 +1494,21 @@ where
         self.reply_inbox.len()
     }
 
+    /// The armed metadata repair window as `(to_op, peer)`, `None` when no session
+    /// is running.
+    ///
+    /// Diagnostic accessor, like the two above. `maybe_request_metadata_repair`
+    /// refuses to arm while any session exists, so a stale one reads as repairing
+    /// forever and only this separates that from real progress.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn metadata_repair_window(&self) -> Option<(u64, u8)> {
+        self.metadata_repair
+            .borrow()
+            .as_ref()
+            .map(|session| (session.to_op, session.peer))
+    }
+
     /// Create a new shard with channel links and a shards table.
     ///
     /// * `bus` - shard-local bus handle (kept alongside the buses owned

@@ -191,6 +191,17 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
                 consensus.is_transferring(),
                 consensus.is_primary(),
             );
+            // `commit_min < commit_max` with no session is a backup blocked from
+            // arming one; a session whose window the commit point already covers is
+            // the stale one holding that gate shut.
+            match sim.replicas[usize::from(replica_idx)].shards[0].metadata_repair_window() {
+                Some((to_op, peer)) => {
+                    let _ = write!(report, " repair=..{to_op}@{peer}");
+                }
+                None => {
+                    let _ = write!(report, " repair=none");
+                }
+            }
         }
         for &ns in &workload.options.namespaces {
             let view = sim.consensus_view(usize::from(replica_idx), ns);
@@ -545,9 +556,10 @@ fn assert_live_namespaces_have_a_primary(
 /// different baseline, which is what a botched restart leaves.
 ///
 /// Grouped by commit point because a replica that trails legitimately holds less.
-/// Workload-owned only because `seed_stream_topic_partition` seeds the `sim-*` filler
-/// straight into each LIVE replica's STM, bypassing consensus, so those differ across
-/// replicas on a healthy cluster.
+///
+/// Every committed entity, the harness fillers (`sim-*`) included: those bypass
+/// consensus, so they agree only while the seed runs at the same point on every
+/// replica, and a divergence there is the slab-order bug.
 fn assert_committed_metadata_agrees(sim: &Simulator, live: &[usize], seed: u64) -> usize {
     let mut by_commit: BTreeMap<u64, (usize, CommittedMetadata)> = BTreeMap::new();
     let mut compared = 0;
@@ -560,8 +572,7 @@ fn assert_committed_metadata_agrees(sim: &Simulator, live: &[usize], seed: u64) 
         else {
             continue;
         };
-        let committed =
-            read_committed_metadata(&sim.replicas[replica_idx].shards[0]).workload_owned();
+        let committed = read_committed_metadata(&sim.replicas[replica_idx].shards[0]);
         match by_commit.get(&consensus.commit_min()) {
             Some((owner, canonical)) => {
                 assert_eq!(

@@ -301,8 +301,7 @@ pub struct PacketSimulator {
     ///
     /// A layer ABOVE the link filters, never written into them, so a crash and a
     /// partition compose. Folding availability into `Link::filter` meant restarting a
-    /// process wrote `ALLOW_ALL` over whatever the partition had set. Mirrors
-    /// TigerBeetle's `buses_enabled`.
+    /// process wrote `ALLOW_ALL` over whatever the partition had set.
     process_up: Vec<bool>,
     /// Maximum number of processes (determines link array size).
     max_processes: usize,
@@ -614,6 +613,10 @@ impl PacketSimulator {
     ///
     /// Link filters are untouched, so a partition or command filter standing at crash
     /// time still stands at restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `process` was never registered with this simulator.
     pub fn process_disable(&mut self, process: ProcessId) {
         let idx = self
             .process_index(process)
@@ -623,6 +626,10 @@ impl PacketSimulator {
 
     /// Mark a process up again. Restores nothing else: whatever the link layer was
     /// applying before the crash still applies after the restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `process` was never registered with this simulator.
     pub fn process_enable(&mut self, process: ProcessId) {
         let idx = self
             .process_index(process)
@@ -675,7 +682,7 @@ impl PacketSimulator {
         let process_count = *next_index;
 
         for from in 0..process_count {
-            for to in 0..process_count {
+            for (to, &target_up) in process_up.iter().enumerate().take(process_count) {
                 let idx = from * *max_processes + to;
                 let link = &mut links[idx];
 
@@ -690,9 +697,9 @@ impl PacketSimulator {
                     };
 
                     // Discarded on arrival rather than by blocking the link, which is
-                    // what lets a crash and a partition stand at once. Target only, as
-                    // in TigerBeetle: a packet sent before the sender died still lands.
-                    if !process_up[to] {
+                    // what lets a crash and a partition stand at once. Target only,
+                    // a packet sent before the sender died still lands.
+                    if !target_up {
                         tracing::trace!(to, "packet dropped (target process is down)");
                         continue;
                     }
@@ -885,7 +892,7 @@ impl PacketSimulator {
     /// End fault injection: heal what is broken and stop drawing new faults.
     ///
     /// A drain cannot prove convergence while the generator that broke connectivity
-    /// keeps breaking it. Mirrors TigerBeetle's `transition_to_liveness_mode`. Delays
+    /// keeps breaking it. Delays
     /// stay: they slow a drain, they do not prevent it.
     pub fn heal(&mut self) {
         self.options.packet_loss_probability = 0.0;
