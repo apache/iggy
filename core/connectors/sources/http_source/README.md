@@ -167,7 +167,7 @@ Content-Type: application/json
 
 Revoked and expired endpoints both answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. The lookup runs before any credential is checked, so anything other than 404 would answer that question for an unauthenticated caller. Error bodies carry no internals; diagnostics live on the admin listener.
 
-`GET /health` on the public listener answers 200 while at least one instance is serving and 503 otherwise, which is what a load balancer should watch.
+`GET /health` on the public listener answers 200 only while every instance on it is serving, and 503 otherwise, which is what a load balancer should watch. It is deliberately all rather than any: one address fronts every instance sharing the listener, so a sibling whose poll task has stopped would otherwise keep receiving traffic into a bridge nothing drains. Shedding the healthy siblings costs availability the sender recovers by retrying, where the alternative loses requests already answered 200.
 
 HMAC signatures are validated over the raw request body exactly as received, never over a re-serialized form, and compared in constant time.
 
