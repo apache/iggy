@@ -27,7 +27,7 @@
 //! reports `submitted` per endpoint for callers that need the difference.
 
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -35,6 +35,7 @@ use axum::{Json, Router};
 use rand::RngExt;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -115,6 +116,17 @@ async fn register_endpoint(
         .is_some_and(|expires_at| expires_at <= unix_now_seconds())
     {
         return error_response(StatusCode::BAD_REQUEST, "expires_at is already past");
+    }
+    // The same check the static config gets. `HeaderMap::get` answers `None`
+    // for a name it cannot parse rather than failing, so an endpoint
+    // registered with a malformed one would 401 every signed request forever,
+    // survive a restart, and give no clue why. Recovery would mean revoking,
+    // re-registering, and reconfiguring the sender.
+    if HeaderName::from_str(&request.hmac_header).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "hmac_header is not a valid HTTP header name",
+        );
     }
 
     let endpoint_id = generate_endpoint_id();
@@ -663,6 +675,30 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "an unauthenticated caller must not reach the body parser"
         );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_invalid_hmac_header_when_registered_should_reject() {
+        // `HeaderMap::get` answers `None` for a name it cannot parse instead of
+        // failing, so accepting one here mints an endpoint that 401s every
+        // signed request forever and survives a restart.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+
+        let response = client()
+            .post(format!("{}/admin/endpoints", fixture.admin))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .json(&json!({
+                "instance": "http_github",
+                "auth_type": "hmac-sha256",
+                "auth_secret": "whsec_x",
+                "hmac_header": "X Hub Signature 256"
+            }))
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         fixture.close().await;
     }
 
