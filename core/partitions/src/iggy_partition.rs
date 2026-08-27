@@ -3769,9 +3769,7 @@ where
         self.log.index_writers_mut()[old_segment_index] = None;
         // Drop the sealed segment's in-memory index cache: only the ACTIVE
         // segment's cache is ever read (the `commit_messages` flush staging),
-        // so a sealed cache is dead weight -- and `ensure_indexes` preallocates
-        // a 16 MiB-capacity `Vec` per segment, which under small-segment
-        // workloads retains hundreds of MB across thousands of sealed segments.
+        // so a sealed cache is dead weight.
         self.log.indexes_mut()[old_segment_index] = None;
 
         self.log

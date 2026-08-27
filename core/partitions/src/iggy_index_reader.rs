@@ -122,7 +122,8 @@ impl IggyIndexReader {
     /// Load every whole entry into an `IggyIndexCache` for offset / timestamp
     /// lower-bound lookups in one read. Density is one sparse entry per flushed
     /// chunk, so an aggressive flush cadence (`messages_required_to_save = 1`)
-    /// makes the file track every message: callers that cannot afford an
+    /// makes the file track every produced batch - every message only when
+    /// producers send one message per batch: callers that cannot afford an
     /// unbounded read must gate on [`Self::entry_count`] and fall back to the
     /// on-file lower-bound lookups. A trailing partial entry (torn write) is
     /// ignored (see [`Self::entry_count`]).
