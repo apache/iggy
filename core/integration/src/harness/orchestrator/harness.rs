@@ -298,7 +298,9 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Restart the primary server and reconnect all clients.
+    /// Restart the node at index 0 and reconnect all clients. Index 0 is not
+    /// "the primary" (see [`Self::running_server`]); use
+    /// [`Self::restart_node`] to name a different one.
     pub async fn restart_server(&mut self) -> Result<(), TestBinaryError> {
         if self.servers.is_empty() {
             return Err(TestBinaryError::MissingServer);
@@ -416,12 +418,38 @@ impl TestHarness {
         Ok(())
     }
 
-    /// Get reference to the first (primary) server handle.
+    /// The node client helpers dial when the caller names none: node 0 while
+    /// it is alive, otherwise the lowest-indexed node whose process is.
+    ///
+    /// Index 0 is a default, not a role. It carries no leadership: the
+    /// metadata primary is `view % replica_count` and moves on every
+    /// election, and the SDK redirects to whoever that is on connect. Pinning
+    /// these helpers to node 0 meant every client helper failed outright once
+    /// a test stopped it, which is why cluster tests reach for
+    /// [`Self::root_client_for_node`] instead. Preferring 0 keeps the common
+    /// case deterministic; falling through keeps the harness usable with it
+    /// down.
+    pub fn running_server(&self) -> Result<&ServerHandle, TestBinaryError> {
+        if self.servers.is_empty() {
+            return Err(TestBinaryError::MissingServer);
+        }
+        self.servers
+            .iter()
+            .find(|server| server.is_running())
+            .ok_or(TestBinaryError::MissingServer)
+    }
+
+    /// Get reference to the node at index 0.
+    ///
+    /// Index 0 is not "the primary": see [`Self::running_server`]. Use
+    /// [`Self::node`] when the index matters and `running_server` when any
+    /// live node will do.
     pub fn server(&self) -> &ServerHandle {
         self.servers.first().expect("No servers configured")
     }
 
-    /// Get mutable reference to the first (primary) server handle.
+    /// Get mutable reference to the node at index 0. Index 0 is not "the
+    /// primary": see [`Self::running_server`].
     pub fn server_mut(&mut self) -> &mut ServerHandle {
         self.servers.first_mut().expect("No servers configured")
     }
@@ -556,7 +584,7 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<ClientBuilder, TestBinaryError> {
-        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let server = self.running_server()?;
         match transport {
             TransportProtocol::Tcp => server.tcp_client(),
             TransportProtocol::Http => server.http_client(),
@@ -583,7 +611,7 @@ impl TestHarness {
         &self,
         transport: TransportProtocol,
     ) -> Result<IggyClient, TestBinaryError> {
-        let server = self.servers.first().ok_or(TestBinaryError::MissingServer)?;
+        let server = self.running_server()?;
         let builder = match transport {
             TransportProtocol::Tcp => server.tcp_client()?,
             TransportProtocol::Http => server.http_client()?,
