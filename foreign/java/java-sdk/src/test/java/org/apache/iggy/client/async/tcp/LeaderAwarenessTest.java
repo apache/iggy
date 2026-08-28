@@ -206,6 +206,10 @@ class LeaderAwarenessTest {
         private final ConnectionInfo currentTarget = new ConnectionInfo("iggy-follower", 8092);
 
         private Optional<ConnectionInfo> findLeader(Supplier<CompletableFuture<ClusterMetadata>> fetch) {
+            return lookUpLeader(fetch).redirect();
+        }
+
+        private LeaderAwareness.LeaderLookup lookUpLeader(Supplier<CompletableFuture<ClusterMetadata>> fetch) {
             return LeaderAwareness.findLeaderElsewhere(fetch, currentTarget, BUDGET, INTERVAL)
                     .orTimeout(30, TimeUnit.SECONDS)
                     .join();
@@ -248,7 +252,8 @@ class LeaderAwarenessTest {
                             Duration.ofMillis(100),
                             INTERVAL)
                     .orTimeout(30, TimeUnit.SECONDS)
-                    .join();
+                    .join()
+                    .redirect();
 
             assertThat(leader).isEmpty();
             assertThat(fetchCount.get()).isGreaterThan(1);
@@ -277,6 +282,22 @@ class LeaderAwarenessTest {
         }
 
         @Test
+        void shouldRememberEveryNodeTheRosterNamesEvenWhileLeaderless() {
+            var lookup = LeaderAwareness.findLeaderElsewhere(
+                            () -> CompletableFuture.completedFuture(leaderlessCluster()),
+                            currentTarget,
+                            Duration.ofMillis(100),
+                            INTERVAL)
+                    .orTimeout(30, TimeUnit.SECONDS)
+                    .join();
+
+            // A leaderless roster still names where the nodes are, and that is
+            // what a redial needs.
+            assertThat(lookup.redirect()).isEmpty();
+            assertThat(lookup.endpoints()).isNotEmpty();
+        }
+
+        @Test
         void shouldStayWithoutPollingWhenAlreadyOnLeader() {
             var fetchCount = new AtomicInteger();
 
@@ -289,10 +310,84 @@ class LeaderAwarenessTest {
                             BUDGET,
                             INTERVAL)
                     .orTimeout(30, TimeUnit.SECONDS)
-                    .join();
+                    .join()
+                    .redirect();
 
             assertThat(leader).isEmpty();
             assertThat(fetchCount).hasValue(1);
+        }
+    }
+
+    @Nested
+    class NodeTargets {
+
+        // A node with the tcp transport disabled cannot be dialed over tcp, so
+        // it must not join the redial candidates: dialing port 0 fails, and it
+        // would spend one turn of every rotation.
+        @Test
+        void shouldSkipNodesWithoutATcpEndpoint() {
+            var metadata = cluster(
+                    node("tcp-node", "iggy-0", 8091, ClusterNodeRole.Leader, ClusterNodeStatus.Healthy),
+                    node("http-only-node", "iggy-1", 0, ClusterNodeRole.Follower, ClusterNodeStatus.Healthy));
+
+            var targets = LeaderAwareness.nodeTargets(metadata);
+
+            assertThat(targets).containsExactly(new ConnectionInfo("iggy-0", 8091));
+        }
+
+        // Unhealthy nodes stay: a node that is down now is where the cluster
+        // says it lives, and a redial candidate is a place to try, not a
+        // promise that it answers.
+        @Test
+        void shouldKeepUnhealthyNodesThatStillHaveATcpEndpoint() {
+            var metadata = cluster(
+                    node("leader-node", "iggy-0", 8091, ClusterNodeRole.Leader, ClusterNodeStatus.Healthy),
+                    node("down-node", "iggy-1", 8092, ClusterNodeRole.Follower, ClusterNodeStatus.Unreachable));
+
+            var targets = LeaderAwareness.nodeTargets(metadata);
+
+            assertThat(targets).containsExactly(new ConnectionInfo("iggy-0", 8091), new ConnectionInfo("iggy-1", 8092));
+        }
+
+        // An inconclusive check names no endpoint, which is what lets the
+        // client keep the last roster it read: replacing it with an empty list
+        // would erase the candidates exactly when the cluster is unreachable.
+        @Test
+        void shouldNameNoEndpointWhenTheRosterCannotBeRead() {
+            var lookup = LeaderAwareness.LeaderLookup.inconclusive();
+
+            assertThat(lookup.redirect()).isEmpty();
+            assertThat(lookup.endpoints()).isEmpty();
+        }
+    }
+
+    @Nested
+    class SameAddress {
+
+        // The redial dedup runs on the Netty event loop, so it compares
+        // spellings only. A hostname and the address it resolves to are two
+        // candidates there, and one endpoint for the leader check.
+        @Test
+        void shouldCompareSpellingsWithoutResolving() {
+            assertThat(LeaderAwareness.isSameSpelling(
+                            new ConnectionInfo("IGGY-0", 8090), new ConnectionInfo("iggy-0", 8090)))
+                    .isTrue();
+            assertThat(LeaderAwareness.isSameSpelling(
+                            new ConnectionInfo("[::1]", 8090), new ConnectionInfo("::1", 8090)))
+                    .isTrue();
+            assertThat(LeaderAwareness.isSameSpelling(
+                            new ConnectionInfo("localhost", 8090), new ConnectionInfo("127.0.0.1", 8090)))
+                    .isFalse();
+            assertThat(LeaderAwareness.isSameSpelling(
+                            new ConnectionInfo("iggy-0", 8090), new ConnectionInfo("iggy-0", 8091)))
+                    .isFalse();
+        }
+
+        @Test
+        void shouldTreatLoopbackSpellingsAsOneEndpointForTheLeaderCheck() {
+            assertThat(LeaderAwareness.isSameAddress(
+                            new ConnectionInfo("localhost", 8090), new ConnectionInfo("127.0.0.1", 8090)))
+                    .isTrue();
         }
     }
 

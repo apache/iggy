@@ -230,6 +230,12 @@ impl iggy_common::VsrSessionControl for QuicClient {
 impl BinaryClient for QuicClient {}
 
 impl QuicClient {
+    /// Whether an `AutoLogin` is configured on this client, which makes the
+    /// session after any connect the configured user's rather than whoever
+    /// signed in by hand.
+    pub(crate) fn auto_login_configured(&self) -> bool {
+        matches!(self.config.auto_login, AutoLogin::Enabled(_))
+    }
     /// Creates a new QUIC client for the provided client and server addresses.
     pub fn new(
         client_address: &str,
@@ -510,12 +516,15 @@ impl QuicClient {
     /// Returns true if redirection occurred and reconnection is needed.
     pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
         let current_address = self.current_server_address.lock().await.clone();
+        // The roster's other endpoints are dropped here: only the TCP client
+        // dials failover candidates so far.
         let leader_address = check_and_redirect_to_leader(
             self,
             &current_address,
             iggy_common::TransportProtocol::Quic,
         )
-        .await?;
+        .await?
+        .redirect;
 
         if let Some(new_leader_address) = leader_address {
             let mut redirection_state = self.leader_redirection_state.lock().await;

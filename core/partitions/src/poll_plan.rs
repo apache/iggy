@@ -48,11 +48,12 @@ use std::sync::atomic::Ordering;
 use tracing::{error, warn};
 
 /// Byte cap for materializing a sealed segment's sparse index into its shared
-/// read-state handle. Index density is one entry per flush: at the default
-/// cadence a 1 GiB segment yields ~24 KiB of index, but
-/// `messages_required_to_save = 1` tracks every message and the same segment
-/// yields hundreds of MB, which a single poll must never read (or pin
-/// resident) in one go. At or under the cap the whole file loads once and is
+/// read-state handle. Index density is one entry per flush, never per message:
+/// at the default cadence a 1 GiB segment yields ~24 KiB of index, but
+/// `messages_required_to_save = 1` flushes once per produced batch and the same
+/// segment yields tens of MB (hundreds only when producers send one message per
+/// batch), which a single poll must never read (or pin resident) in one go.
+/// At or under the cap the whole file loads once and is
 /// cached; above it every poll binary-searches the file with single-entry
 /// preads instead, so resident index bytes per partition stay bounded by the
 /// sealed-LRU capacity times this cap.
