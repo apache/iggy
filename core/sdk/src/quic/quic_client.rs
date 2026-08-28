@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::leader_aware::{
-    ConnectCoordinator, LeaderRedirectionState, RosterWalk, check_and_redirect_to_leader,
-    is_unauthenticated_metadata_probe,
+    ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
+    check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
 };
 use crate::prelude::AutoLogin;
 use crate::session::ConsensusSession;
@@ -47,7 +47,6 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -96,10 +95,6 @@ pub struct QuicClient {
     /// as walk candidates for a request the current node keeps refusing to
     /// admit (its replica of the target partition group is not the primary).
     roster_endpoints: Mutex<Vec<String>>,
-    /// Set when the next connect must stay on the endpoint it dialed instead
-    /// of settling on the metadata leader: the roster walk has to survive its
-    /// own sign-in's leader check. See the TCP client's twin field.
-    settle_off_leader_once: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent QUIC streams cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -152,6 +147,7 @@ impl BinaryTransport for QuicClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
         let mut result = self.send_raw(code, payload.clone()).await;
 
         // A persistent not-admitted refusal is a verdict about who leads the
@@ -166,10 +162,23 @@ impl BinaryTransport for QuicClient {
             && self.config.reconnection.enabled
             && !matches!(self.config.auto_login, AutoLogin::Disabled)
         {
-            let _routing_guard = self.routing_lock.lock().await;
+            let _routing_guard =
+                match tokio::time::timeout_at(roster_deadline, self.routing_lock.lock()).await {
+                    Ok(guard) => guard,
+                    Err(_) => return Err(IggyError::TransientNotAccepted),
+                };
+            let overall_deadline = roster_deadline;
             // A concurrent refused request may have completed the movement
             // while this request waited for the gate.
-            result = self.send_raw(code, payload.clone()).await;
+            result = match tokio::time::timeout_at(
+                overall_deadline,
+                self.send_raw(code, payload.clone()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(IggyError::TransientNotAccepted),
+            };
             let mut roster_walk: Option<RosterWalk> = None;
             // Once the walk starts it keeps walking: a leader recheck between
             // hops would put the request straight back on the node whose
@@ -181,28 +190,90 @@ impl BinaryTransport for QuicClient {
                     false
                 } else {
                     checked_metadata_leader = true;
-                    let redirected = matches!(self.handle_leader_redirection().await, Ok(true));
+                    let redirected = match tokio::time::timeout_at(
+                        overall_deadline,
+                        self.handle_leader_redirection(),
+                    )
+                    .await
+                    {
+                        Ok(result) => matches!(result, Ok(true)),
+                        Err(_) => return Err(IggyError::TransientNotAccepted),
+                    };
                     let roster = self.roster_endpoints.lock().await.clone();
                     roster_walk = Some(RosterWalk::new(&current, &roster));
                     redirected
                 };
-                if !redirected {
-                    let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) else {
-                        break;
-                    };
-                    self.settle_on_endpoint(next).await?;
-                } else {
+                let (mut target, mut needs_settle) = if redirected {
                     let target = self.current_server_address.lock().await.clone();
                     if let Some(walk) = roster_walk.as_mut() {
                         walk.record_attempt(&target);
                     }
+                    (target, false)
+                } else if let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) {
+                    (next, true)
+                } else {
+                    break;
+                };
+
+                loop {
+                    if tokio::time::Instant::now() >= overall_deadline {
+                        return Err(IggyError::TransientNotAccepted);
+                    }
+                    let settled = if needs_settle {
+                        match tokio::time::timeout_at(
+                            overall_deadline,
+                            self.settle_on_endpoint(target.clone()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => true,
+                            Ok(Err(IggyError::CannotEstablishConnection)) => false,
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => return Err(IggyError::TransientNotAccepted),
+                        }
+                    } else {
+                        true
+                    };
+                    if settled {
+                        let connect_result = if needs_settle {
+                            tokio::time::timeout_at(overall_deadline, self.connect_off_leader())
+                                .await
+                        } else {
+                            tokio::time::timeout_at(overall_deadline, self.connect()).await
+                        };
+                        match connect_result {
+                            Ok(Ok(())) => {
+                                let connected = self.current_server_address.lock().await.clone();
+                                let first_visit = roster_walk
+                                    .as_mut()
+                                    .is_some_and(|walk| walk.record_attempt(&connected));
+                                if crate::leader_aware::is_same_spelling(&connected, &target)
+                                    || first_visit
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(Err(IggyError::CannotEstablishConnection)) => {}
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => return Err(IggyError::TransientNotAccepted),
+                        }
+                    }
+
+                    let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) else {
+                        return Err(IggyError::TransientNotAccepted);
+                    };
+                    target = next;
+                    needs_settle = true;
                 }
-                self.connect().await?;
-                let connected = self.current_server_address.lock().await.clone();
-                if let Some(walk) = roster_walk.as_mut() {
-                    walk.record_attempt(&connected);
-                }
-                result = self.send_raw(code, payload.clone()).await;
+                result = match tokio::time::timeout_at(
+                    overall_deadline,
+                    self.send_raw(code, payload.clone()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(IggyError::TransientNotAccepted),
+                };
             }
         }
 
@@ -248,7 +319,10 @@ impl BinaryTransport for QuicClient {
 
         let replay_after_reconnect = replay_after_session_reset_is_safe(code, &error);
         let skip_auto_login = is_login_register_code(code);
-        let nested_connect = skip_auto_login && self.connect_coordinator.is_active();
+        let owner_context = skip_auto_login
+            .then(|| self.connect_coordinator.current_owner_context())
+            .flatten();
+        let nested_connect = owner_context.is_some();
         let _routing_guard = if nested_connect {
             None
         } else {
@@ -271,7 +345,8 @@ impl BinaryTransport for QuicClient {
             server_address, self.config.client_address
         );
         let reconnect = if nested_connect {
-            self.connect_inner().await
+            self.connect_inner(owner_context.expect("owner context checked above"))
+                .await
         } else {
             self.connect().await
         };
@@ -405,7 +480,6 @@ impl QuicClient {
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
-            settle_off_leader_once: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -446,20 +520,36 @@ impl QuicClient {
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
+        self.connect_with_settlement(false).await
+    }
+
+    pub(crate) async fn connect_off_leader(&self) -> Result<(), IggyError> {
+        self.connect_with_settlement(true).await
+    }
+
+    async fn connect_with_settlement(&self, settle_off_leader: bool) -> Result<(), IggyError> {
         self.connect_coordinator
-            .run(|abandoned| async move {
-                if abandoned {
-                    self.clear_abandoned_connect().await?;
-                }
-                self.connect_inner().await
+            .run(|abandoned, token| async move {
+                let context = self.connect_coordinator.owner_context(
+                    token,
+                    settle_off_leader,
+                    settle_off_leader,
+                );
+                self.connect_coordinator
+                    .scope_owner(context, async move {
+                        if abandoned {
+                            self.clear_abandoned_connect().await?;
+                        }
+                        self.connect_inner(context).await
+                    })
+                    .await
             })
             .await
     }
 
-    async fn connect_inner(&self) -> Result<(), IggyError> {
-        // Consume before fallible connection work. A walk target that cannot
-        // connect must not make an unrelated later reconnect skip settlement.
-        let settle_off_leader = self.settle_off_leader_once.swap(false, Ordering::SeqCst);
+    async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
+        let settle_off_leader = context.settle_off_leader();
+        let single_attempt = context.single_attempt();
         loop {
             match self.get_state().await {
                 ClientState::Shutdown => {
@@ -480,7 +570,7 @@ impl QuicClient {
             }
 
             self.set_state(ClientState::Connecting).await;
-            if let Some(connected_at) = self.connected_at.lock().await.as_ref() {
+            if !single_attempt && let Some(connected_at) = self.connected_at.lock().await.as_ref() {
                 let now = IggyTimestamp::now();
                 let elapsed = now.as_micros() - connected_at.as_micros();
                 let interval = self.config.reconnection.reestablish_after.as_micros();
@@ -518,14 +608,26 @@ impl QuicClient {
                     "{NAME} client is connecting to server: {}...",
                     server_address
                 );
-                let connection_result = self
+                let connection_result = match self
                     .endpoint
                     .connect(server_address, &self.config.server_name)
-                    .unwrap()
-                    .await;
+                {
+                    Ok(connecting) => connecting.await,
+                    Err(error) => {
+                        error!("Failed to start QUIC connection: {error}");
+                        self.set_state(ClientState::Disconnected).await;
+                        self.publish_event(DiagnosticEvent::Disconnected).await;
+                        return Err(IggyError::CannotEstablishConnection);
+                    }
+                };
 
                 if connection_result.is_err() {
                     error!("Failed to connect to server: {}", server_address);
+                    if single_attempt {
+                        self.set_state(ClientState::Disconnected).await;
+                        self.publish_event(DiagnosticEvent::Disconnected).await;
+                        return Err(IggyError::CannotEstablishConnection);
+                    }
                     if !self.config.reconnection.enabled {
                         warn!("Automatic reconnection is disabled.");
                         return Err(IggyError::CannotEstablishConnection);
@@ -717,7 +819,6 @@ impl QuicClient {
         self.connected_at.lock().await.take();
         self.disconnect().await?;
         *self.current_server_address.lock().await = next;
-        self.settle_off_leader_once.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -978,6 +1079,25 @@ fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_roster_hop_does_not_enter_the_reconnect_ladder() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve UDP address");
+        let server_address = socket.local_addr().unwrap().to_string();
+        drop(socket);
+        let client = QuicClient::create(Arc::new(QuicClientConfig {
+            server_address,
+            max_idle_timeout: 100,
+            ..QuicClientConfig::default()
+        }))
+        .expect("create QUIC client");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), client.connect_off_leader())
+            .await
+            .expect("one QUIC dial must not enter unlimited reconnect");
+        assert!(matches!(result, Err(IggyError::CannotEstablishConnection)));
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+    }
 
     #[tokio::test]
     async fn should_fail_with_a_zero_heartbeat_interval() {

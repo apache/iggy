@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::leader_aware::{
-    ConnectCoordinator, LeaderRedirectionState, RosterWalk, check_and_redirect_to_leader,
-    is_same_spelling, is_unauthenticated_metadata_probe, read_transport_endpoints,
+    ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
+    check_and_redirect_to_leader, is_same_spelling, is_unauthenticated_metadata_probe,
+    read_transport_endpoints,
 };
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
@@ -125,12 +126,6 @@ pub struct TcpClient {
     // contention with zero correctness benefit.
     consensus_session: Arc<StdMutex<ConsensusSession>>,
     skip_auto_login_once: Mutex<bool>,
-    /// Set when the next connect must stay on the endpoint it dialed instead
-    /// of settling on the metadata leader. Metadata and partition consensus
-    /// groups elect independently, so the metadata leader can hold a follower
-    /// replica of the partition a request targets; the failover that walks the
-    /// roster past it has to survive its own sign-in's leader check.
-    settle_off_leader_once: AtomicBool,
     /// Serializes connection movement after a refused request. The stream is
     /// lockstep, but the refusal releases it before the leader check and
     /// reconnect, where another request could otherwise run a competing walk.
@@ -266,7 +261,10 @@ impl BinaryTransport for TcpClient {
         let replay_after_reconnect = replay_after_session_reset_is_safe(code, &error);
 
         let skip_auto_login = is_login_register_code(code);
-        let nested_connect = skip_auto_login && self.connect_coordinator.is_active();
+        let owner_context = skip_auto_login
+            .then(|| self.connect_coordinator.current_owner_context())
+            .flatten();
+        let nested_connect = owner_context.is_some();
         let _routing_guard = if nested_connect {
             None
         } else {
@@ -277,6 +275,7 @@ impl BinaryTransport for TcpClient {
             if !replay_after_reconnect {
                 return Err(error);
             }
+            drop(_routing_guard);
             return self.send_raw(code, payload).await;
         }
         self.disconnect_transport().await?;
@@ -295,7 +294,8 @@ impl BinaryTransport for TcpClient {
         }
 
         let reconnect = if nested_connect {
-            self.connect_inner().await
+            self.connect_inner(owner_context.expect("owner context checked above"))
+                .await
         } else {
             self.connect().await
         };
@@ -313,6 +313,7 @@ impl BinaryTransport for TcpClient {
             return Err(error);
         }
 
+        drop(_routing_guard);
         self.send_raw(code, payload).await
     }
 
@@ -498,7 +499,6 @@ impl TcpClient {
             session_credentials: Mutex::new(None),
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
-            settle_off_leader_once: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -506,20 +506,33 @@ impl TcpClient {
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
+        self.connect_with_settlement(false).await
+    }
+
+    async fn connect_off_leader(&self) -> Result<(), IggyError> {
+        self.connect_with_settlement(true).await
+    }
+
+    async fn connect_with_settlement(&self, settle_off_leader: bool) -> Result<(), IggyError> {
         self.connect_coordinator
-            .run(|abandoned| async move {
-                if abandoned {
-                    self.clear_abandoned_connect().await?;
-                }
-                self.connect_inner().await
+            .run(|abandoned, token| async move {
+                let context =
+                    self.connect_coordinator
+                        .owner_context(token, settle_off_leader, false);
+                self.connect_coordinator
+                    .scope_owner(context, async move {
+                        if abandoned {
+                            self.clear_abandoned_connect().await?;
+                        }
+                        self.connect_inner(context).await
+                    })
+                    .await
             })
             .await
     }
 
-    async fn connect_inner(&self) -> Result<(), IggyError> {
-        // Consume before fallible connection work. A walk target that cannot
-        // connect must not make an unrelated later reconnect skip settlement.
-        let settle_off_leader = self.settle_off_leader_once.swap(false, Ordering::SeqCst);
+    async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
+        let settle_off_leader = context.settle_off_leader();
         loop {
             // Read and claimed under one lock acquisition. Apart, two callers
             // both find `Disconnected` and both sweep: the loser's
@@ -887,7 +900,6 @@ impl TcpClient {
         self.connected_at.lock().await.take();
         self.disconnect_transport().await?;
         *self.current_server_address.lock().await = next;
-        self.settle_off_leader_once.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1312,7 +1324,12 @@ impl TcpClient {
                         if needs_settle {
                             self.settle_on_endpoint(target.clone()).await?;
                         }
-                        match self.connect().await {
+                        let connect = if needs_settle {
+                            self.connect_off_leader().await
+                        } else {
+                            self.connect().await
+                        };
+                        match connect {
                             Ok(()) => {
                                 let connected = self.current_server_address.lock().await.clone();
                                 let first_visit = roster_walk
@@ -1648,6 +1665,41 @@ mod tests {
             waiter.await.unwrap(),
             Err(IggyError::Disconnected)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_public_login_cannot_take_over_a_connect_owner() {
+        let (_listener, silent) = live_endpoint().await;
+        let client = Arc::new(
+            TcpClient::create(Arc::new(TcpClientConfig {
+                server_address: silent,
+                tls_enabled: true,
+                tls_validate_certificate: false,
+                ..TcpClientConfig::default()
+            }))
+            .expect("create the client"),
+        );
+        let owner = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { TcpClient::connect(&client).await })
+        };
+        while client.get_state().await != ClientState::Connecting {
+            tokio::task::yield_now().await;
+        }
+        let mut login = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.login_user("iggy", "iggy").await })
+        };
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut login)
+                .await
+                .is_err(),
+            "an unrelated login bypassed the connect owner instead of waiting"
+        );
+        assert_eq!(client.get_state().await, ClientState::Connecting);
+        owner.abort();
+        assert!(login.await.unwrap().is_err());
     }
 
     // With reconnection off there are no retries, but the endpoints the roster

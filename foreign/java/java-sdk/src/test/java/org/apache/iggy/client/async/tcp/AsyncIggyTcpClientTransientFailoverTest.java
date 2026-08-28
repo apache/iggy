@@ -457,23 +457,38 @@ class AsyncIggyTcpClientTransientFailoverTest {
         return serve(server, 1, handler);
     }
 
+    /**
+     * Runs blocking socket I/O on one dedicated daemon thread per mock node.
+     * The common fork-join pool has only cores minus one workers on small CI
+     * runners, so three blocking nodes can starve the client continuations the
+     * test is waiting for when the full suite runs concurrently.
+     */
     private static CompletableFuture<Void> serve(ServerSocket server, int connectionCount, RequestHandler handler) {
-        return CompletableFuture.runAsync(() -> {
-            try {
-                for (int connection = 0; connection < connectionCount; connection++) {
-                    try (Socket socket = server.accept()) {
-                        InputStream input = socket.getInputStream();
-                        OutputStream output = socket.getOutputStream();
-                        Request request;
-                        while ((request = readRequest(input)) != null) {
-                            writeResponse(output, request, handler.handle(request));
+        CompletableFuture<Void> serving = new CompletableFuture<>();
+        Thread serverThread = new Thread(
+                () -> {
+                    try {
+                        for (int connection = 0; connection < connectionCount; connection++) {
+                            try (Socket socket = server.accept()) {
+                                InputStream input = socket.getInputStream();
+                                OutputStream output = socket.getOutputStream();
+                                Request request;
+                                while ((request = readRequest(input)) != null) {
+                                    writeResponse(output, request, handler.handle(request));
+                                }
+                            }
                         }
+                        serving.complete(null);
+                    } catch (IOException error) {
+                        serving.completeExceptionally(new IllegalStateException("Mock VSR server failed", error));
+                    } catch (RuntimeException error) {
+                        serving.completeExceptionally(error);
                     }
-                }
-            } catch (IOException error) {
-                throw new IllegalStateException("Mock VSR server failed", error);
-            }
-        });
+                },
+                "transient-failover-server-" + server.getLocalPort());
+        serverThread.setDaemon(true);
+        serverThread.start();
+        return serving;
     }
 
     private static Request readRequest(InputStream input) throws IOException {

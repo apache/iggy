@@ -4463,10 +4463,29 @@ where
     /// commit walk runs at `RepairDone`, after the floor is known.
     pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
         let header = *message.header();
-        let Some(session) = &self.repair else {
+        let Some(session) = self.repair else {
             return;
         };
-        if header.op <= self.consensus().commit_min() || header.op > session.to_op {
+        let consensus = self.consensus();
+        if !consensus.is_normal() || consensus.view() != session.view {
+            self.repair = None;
+            return;
+        }
+        if header.op <= consensus.commit_min() || header.op > session.fetch_to_op {
+            return;
+        }
+        let canonical_checksum = consensus
+            .with_pending_view_log(|pending| {
+                pending
+                    .headers
+                    .iter()
+                    .find(|expected| expected.op == header.op)
+                    .map(|expected| expected.checksum)
+            })
+            .flatten();
+        if canonical_checksum.is_some_and(|expected| expected != header.checksum)
+            || (header.op > session.commit_to_op && canonical_checksum.is_none())
+        {
             return;
         }
         // Any in-window frame proves the stream is alive; only silence
@@ -4480,7 +4499,9 @@ where
         let applied = if header.operation == Operation::SendMessages {
             match self.append_repaired_send_messages(message).await {
                 Ok(base_offset) => {
-                    if let (Some(base_offset), Some(session)) = (base_offset, self.repair.as_mut())
+                    if header.op <= session.commit_to_op
+                        && let (Some(base_offset), Some(session)) =
+                            (base_offset, self.repair.as_mut())
                     {
                         session.first_batch_offset = Some(
                             session
@@ -4535,6 +4556,10 @@ where
         let Some(session) = self.repair else {
             return RepairConclusion::Done;
         };
+        if !self.consensus().is_normal() || self.consensus().view() != session.view {
+            self.repair = None;
+            return RepairConclusion::Done;
+        }
         if let Some(floor) = session.floor {
             // A peer may have evicted past this replica's commit frontier;
             // an unclamped floor would drive commit_min above commit_max and
@@ -4555,6 +4580,11 @@ where
             let stand_in = durable_end
                 .map(|durable| durable.saturating_add(1))
                 .max(self.installed_frontier);
+            let committed_shape = self
+                .log
+                .journal()
+                .inner
+                .repaired_window_shape(floor, session.commit_to_op);
             let connected = match (session.first_batch_offset, stand_in) {
                 (Some(first), Some(bound)) => first <= bound,
                 (Some(first), None) => first == 0,
@@ -4566,7 +4596,11 @@ where
                 // a fully evicted window -- is indistinguishable from a
                 // message range below the floor that this replica does not
                 // durably own, and accepting it would serve a holed log.
-                (None, _) => self.repaired_window_is_offsets_only(floor, session.to_op),
+                (None, _) => {
+                    floor < session.commit_to_op
+                        && committed_shape.complete
+                        && !committed_shape.holds_messages
+                }
             };
             if !connected {
                 tracing::error!(
@@ -4591,11 +4625,11 @@ where
                 // Both are the state-transfer trigger; the session is
                 // dropped here so the caller's arming funnel starts clean,
                 // and a transfer-unavailable fallback re-arms repair fresh.
-                if self.repaired_window_is_complete(floor, session.to_op) {
+                if committed_shape.complete {
                     self.repair = None;
                     return RepairConclusion::FloorRefused {
                         floor,
-                        to_op: session.to_op,
+                        to_op: session.commit_to_op,
                     };
                 }
                 return RepairConclusion::InProgress;
@@ -4614,7 +4648,14 @@ where
         // that reached the requested frontier closes the session; anything
         // less keeps it armed and the stall retry re-requests the remains
         // (`commit_min + 1..`), converging over rounds.
-        let done = commit_min >= session.to_op;
+        let fetch_complete = session.fetch_to_op <= session.commit_to_op
+            || self
+                .log
+                .journal()
+                .inner
+                .repaired_window_shape(session.commit_to_op, session.fetch_to_op)
+                .complete;
+        let done = commit_min >= session.commit_to_op && fetch_complete;
         if done {
             self.repair = None;
         }
@@ -4625,7 +4666,9 @@ where
             commit_min_before = before,
             commit_min_after = commit_min,
             commit_max = self.consensus().commit_max(),
-            to_op = session.to_op,
+            commit_to_op = session.commit_to_op,
+            fetch_to_op = session.fetch_to_op,
+            fetch_complete,
             done,
             "repair window commit walk finished"
         );
@@ -4634,31 +4677,6 @@ where
         } else {
             RepairConclusion::InProgress
         }
-    }
-
-    /// Whether every op in `(floor, to_op]` is journaled. An empty window
-    /// (`floor >= to_op`) counts as complete: there is nothing left that
-    /// could arrive and change the floor verdict.
-    fn repaired_window_is_complete(&self, floor: u64, to_op: u64) -> bool {
-        self.log
-            .journal()
-            .inner
-            .repaired_window_shape(floor, to_op)
-            .complete
-    }
-
-    /// Whether the served repair window `(floor, to_op]` arrived complete and
-    /// holds no `SendMessages` op. Only then may a commit floor be accepted
-    /// without a batch anchor: the window demonstrably moved no messages, so
-    /// the consumer-offset table on disk stands in below the floor. An empty
-    /// window (`floor >= to_op`) carries no evidence at all and never
-    /// qualifies.
-    fn repaired_window_is_offsets_only(&self, floor: u64, to_op: u64) -> bool {
-        if floor >= to_op {
-            return false;
-        }
-        let shape = self.log.journal().inner.repaired_window_shape(floor, to_op);
-        shape.complete && !shape.holds_messages
     }
 
     /// Journal a repaired `SendMessages` prepare, preserving its embedded
@@ -6630,9 +6648,20 @@ mod tests {
     }
 
     fn armed_session(to_op: u64, floor: u64, first_batch_offset: Option<u64>) -> RepairSession {
+        armed_fetch_session(to_op, to_op, floor, first_batch_offset)
+    }
+
+    fn armed_fetch_session(
+        to_op: u64,
+        fetch_to_op: u64,
+        floor: u64,
+        first_batch_offset: Option<u64>,
+    ) -> RepairSession {
         RepairSession {
             nonce: 1,
-            to_op,
+            view: 0,
+            commit_to_op: to_op,
+            fetch_to_op,
             floor: Some(floor),
             peer: 0,
             first_batch_offset,
@@ -6760,6 +6789,26 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_prior_view_repair_when_a_new_view_started_should_discard_it() {
+        let mut partition = test_partition();
+        partition.repair = Some(armed_fetch_session(0, 1, 0, None));
+        partition.consensus.set_view(1);
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, 0x11))
+            .await;
+
+        assert!(
+            partition.repair.is_none(),
+            "the prior-view session is obsolete"
+        );
+        assert!(
+            partition.log.journal().inner.header_by_op(1).is_none(),
+            "a delayed prior-view body must not enter the new view's journal"
+        );
+    }
+
+    #[compio::test]
     async fn given_session_remint_when_attempts_burned_should_survive_on_partition() {
         let mut partition = test_partition();
         for round in 0..consensus::STATE_TRANSFER_MAX_STALL_RETRIES {
@@ -6878,6 +6927,37 @@ mod tests {
         );
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(partition.repair.is_none());
+    }
+
+    #[compio::test]
+    async fn given_empty_committed_window_with_a_suffix_fetch_should_escape_to_state_transfer() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(5);
+        partition.repair = Some(armed_fetch_session(5, 9, 5, None));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused { floor: 5, to_op: 5 },
+            "the uncommitted fetch ceiling must not postpone a definitive committed-floor refusal"
+        );
+        assert!(partition.repair.is_none());
+    }
+
+    #[compio::test]
+    async fn given_suffix_fetch_when_its_view_is_discarded_should_clear_the_session() {
+        let mut partition = test_partition();
+        partition.repair = Some(armed_fetch_session(0, 3, 0, None));
+        partition.consensus.set_view(1);
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::Done);
+        assert!(
+            partition.repair.is_none(),
+            "a discarded view must not leave its suffix fetch blocking future repair"
+        );
     }
 
     #[compio::test]

@@ -3976,6 +3976,10 @@ where
                 .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
         let adopted = !actions.is_empty();
         if adopted {
+            // Any stream armed before this adoption belongs to the superseded
+            // view. Repair bodies carry no nonce, so drop the receiving session
+            // before reconciling or arming the new view's canonical range.
+            partition.repair = None;
             // Ahead of the local dispatch, which rebuilds the pipeline out of the
             // journal this rewrites. Same position as the metadata arm's twin, and
             // like it, pending-less adoptions (empty StartView suffix) still sweep
@@ -4725,6 +4729,10 @@ where
         if header.nonce != session.nonce {
             return;
         }
+        if !partition.consensus().is_normal() || partition.consensus().view() != session.view {
+            partition.repair = None;
+            return;
+        }
         // Receiver half of the serve-side purge gate: while a committed purge
         // is not yet locally applied, this replica's `recovered_durable_offset`
         // still describes the PRE-purge segments, so a floor from a peer that
@@ -4834,7 +4842,7 @@ where
                 } else {
                     let commit_min = partition.consensus().commit_min();
                     let next = partition.repair.as_ref().and_then(|live| {
-                        (commit_min > before).then_some((live.peer, live.nonce, live.to_op))
+                        (commit_min > before).then_some((live.peer, live.nonce, live.fetch_to_op))
                     });
                     let cluster = partition.consensus().cluster();
                     let self_id = partition.consensus().replica();
@@ -6515,19 +6523,31 @@ where
                     continue;
                 };
                 let consensus_normal = partition.consensus().is_normal();
+                let consensus_view = partition.consensus().view();
                 let commit_min = partition.consensus().commit_min();
                 let cluster = partition.consensus().cluster();
                 let self_id = partition.consensus().replica();
-                if partition
-                    .repair
-                    .is_some_and(|session| commit_min >= session.to_op)
-                {
+                let repair_finished = partition.repair.is_some_and(|session| {
+                    if !consensus_normal || consensus_view != session.view {
+                        return true;
+                    }
+                    let fetch_complete = session.fetch_to_op <= session.commit_to_op
+                        || partition
+                            .log
+                            .journal()
+                            .inner
+                            .repaired_window_shape(session.commit_to_op, session.fetch_to_op)
+                            .complete;
+                    commit_min >= session.commit_to_op && fetch_complete
+                });
+                if repair_finished {
                     partition.repair = None;
                     tracing::info!(
                         shard = self.id,
                         namespace_raw = namespace.inner(),
                         commit_min,
-                        "partition journal repair completed after the commit frontier advanced"
+                        consensus_view,
+                        "partition journal repair completed or was superseded"
                     );
                     continue;
                 }
@@ -6543,8 +6563,8 @@ where
                     Some((
                         session.peer,
                         session.nonce,
-                        commit_min + 1,
-                        session.to_op,
+                        commit_min.saturating_add(1),
+                        session.fetch_to_op,
                         cluster,
                         self_id,
                     ))
@@ -7468,27 +7488,36 @@ where
         // commit-bounded window nothing ever delivers those bodies, the
         // primary cannot gather quorum for the suffix, and the group wedges
         // one op below its head with the client write never confirmed.
+        let commit_to_op = consensus.commit_max();
+        let commit_lag = consensus.commit_min() < commit_to_op;
         let head = consensus.sequencer().current_sequence();
-        let commit_lag = consensus.commit_min() < consensus.commit_max();
-        let missing_suffix = consensus.commit_max().checked_add(1).is_some_and(|first| {
-            (first..=head).any(|op| partition.log.journal().inner.header_by_op(op).is_none())
-        });
+        if !commit_lag && head <= commit_to_op {
+            return;
+        }
+        let canonical_suffix = consensus
+            .with_pending_view_log(|pending| pending_covers_suffix(pending, commit_to_op, head))
+            .unwrap_or(false);
+        let missing_suffix = canonical_suffix
+            && !partition
+                .log
+                .journal()
+                .inner
+                .repaired_window_shape(commit_to_op, head)
+                .complete;
         if !commit_lag && !missing_suffix {
             return;
         }
         let nonce = iggy_common::random_id::get_uuid();
         let from_op = consensus.commit_min() + 1;
-        let to_op = if missing_suffix {
-            head
-        } else {
-            consensus.commit_max()
-        };
+        let fetch_to_op = if missing_suffix { head } else { commit_to_op };
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
         let namespace = consensus.group();
         partition.repair = Some(partitions::RepairSession {
             nonce,
-            to_op,
+            view: consensus.view(),
+            commit_to_op,
+            fetch_to_op,
             floor: None,
             peer,
             first_batch_offset: None,
@@ -7498,11 +7527,20 @@ where
             shard = self.id,
             namespace_raw = namespace,
             from_op,
-            to_op,
+            commit_to_op,
+            fetch_to_op,
             "partition behind the group frontier; requesting repair"
         );
-        self.send_request_prepares(cluster, self_id, peer, nonce, from_op, to_op, namespace)
-            .await;
+        self.send_request_prepares(
+            cluster,
+            self_id,
+            peer,
+            nonce,
+            from_op,
+            fetch_to_op,
+            namespace,
+        )
+        .await;
     }
 
     /// Receiver side of a partition descriptor: accept the manifest, adopt
@@ -8754,6 +8792,27 @@ fn repair_serve_ceiling(requested_to_op: u64, commit_max: u64, head: u64) -> u64
     requested_to_op.min(commit_max.max(head))
 }
 
+/// Whether the parked `StartView` log names every op in the uncommitted
+/// suffix `(commit_max, head]`, in descending order. Only this canonical list
+/// makes fetching bodies above the commit point safe.
+fn pending_covers_suffix(pending: &MergedLog, commit_max: u64, head: u64) -> bool {
+    if head <= commit_max || pending.commit_max != commit_max || pending.op_head != head {
+        return false;
+    }
+    let mut expected = head;
+    for header in pending
+        .headers
+        .iter()
+        .filter(|header| header.op > commit_max)
+    {
+        if header.op != expected {
+            return false;
+        }
+        expected -= 1;
+    }
+    expected == commit_max
+}
+
 /// Read this replica's uncommitted suffix out of the metadata journal, for the
 /// window `commit..=op`.
 ///
@@ -9525,7 +9584,7 @@ mod repair_scope_tests {
 
     use iggy_binary_protocol::{Command, PrepareHeader};
 
-    use super::{MergedLog, repair_op_in_scope, repair_serve_ceiling};
+    use super::{MergedLog, pending_covers_suffix, repair_op_in_scope, repair_serve_ceiling};
 
     fn header(op: u64) -> PrepareHeader {
         PrepareHeader {
@@ -9595,6 +9654,20 @@ mod repair_scope_tests {
         assert_eq!(repair_serve_ceiling(90, 40, 90), 90);
         // `commit_max` above the local head still counts: heartbeats outrun prepares.
         assert_eq!(repair_serve_ceiling(u64::MAX, 120, 90), 120);
+    }
+
+    #[test]
+    fn given_a_parked_view_when_fetching_above_commit_should_require_dense_canonical_suffix() {
+        let pending = parked();
+        assert!(pending_covers_suffix(&pending, 98, 100));
+
+        let mut missing = pending.clone();
+        missing.headers.retain(|header| header.op != 99);
+        assert!(!pending_covers_suffix(&missing, 98, 100));
+
+        let mut wrong_frontier = pending;
+        wrong_frontier.commit_max = 97;
+        assert!(!pending_covers_suffix(&wrong_frontier, 98, 100));
     }
 }
 

@@ -213,10 +213,20 @@ pub const REPAIR_RETRY_TICKS: u32 = 100;
 /// One in-flight journal-repair stream for a partition group.
 #[derive(Debug, Clone, Copy)]
 pub struct RepairSession {
-    /// Fences stale repair frames from an earlier attempt.
+    /// Fences range replies from an earlier attempt. Repair bodies carry the
+    /// stored prepare header instead, so [`Self::view`] and canonical suffix
+    /// checks fence their ingest.
     pub nonce: u128,
-    /// Last op the stream is expected to serve (the frontier at request time).
-    pub to_op: u64,
+    /// Consensus view in which this session was armed. A later view discards
+    /// the session before any delayed repair body can enter its journal.
+    pub view: u32,
+    /// Committed frontier this repair must make locally walkable. Floor
+    /// completeness and session completion are bounded here.
+    pub commit_to_op: u64,
+    /// Highest op requested from the peer. This may extend above
+    /// [`Self::commit_to_op`] only for the canonical suffix carried by the
+    /// adopted `StartView`.
+    pub fetch_to_op: u64,
     /// Commit floor learned from `RangeEvicted { retained_from }`:
     /// `retained_from - 1`. `None` until (unless) the serving peer reports a
     /// truncated prefix.

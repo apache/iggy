@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::leader_aware::{
-    ConnectCoordinator, LeaderRedirectionState, RosterWalk, check_and_redirect_to_leader,
-    is_unauthenticated_metadata_probe,
+    ConnectCoordinator, ConnectOwnerContext, LeaderRedirectionState, RosterWalk,
+    check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
 };
 use crate::session::ConsensusSession;
 use crate::vsr::replay_after_session_reset_is_safe;
@@ -44,7 +44,6 @@ use secrecy::ExposeSecret;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -92,10 +91,6 @@ pub struct WebSocketClient {
     /// as walk candidates for a request the current node keeps refusing to
     /// admit (its replica of the target partition group is not the primary).
     roster_endpoints: Mutex<Vec<String>>,
-    /// Set when the next connect must stay on the endpoint it dialed instead
-    /// of settling on the metadata leader: the roster walk has to survive its
-    /// own sign-in's leader check. See the TCP client's twin field.
-    settle_off_leader_once: AtomicBool,
     /// Serializes leader checks and roster walks after refused requests, so
     /// concurrent callers cannot tear down each other's new connection.
     routing_lock: Mutex<()>,
@@ -145,6 +140,7 @@ impl BinaryTransport for WebSocketClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        let roster_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
         let mut result = self.send_raw(code, payload.clone()).await;
 
         // A persistent not-admitted refusal is a verdict about who leads the
@@ -159,10 +155,23 @@ impl BinaryTransport for WebSocketClient {
             && self.config.reconnection.enabled
             && !matches!(self.config.auto_login, AutoLogin::Disabled)
         {
-            let _routing_guard = self.routing_lock.lock().await;
+            let _routing_guard =
+                match tokio::time::timeout_at(roster_deadline, self.routing_lock.lock()).await {
+                    Ok(guard) => guard,
+                    Err(_) => return Err(IggyError::TransientNotAccepted),
+                };
+            let overall_deadline = roster_deadline;
             // A concurrent refused request may have completed the movement
             // while this request waited for the gate.
-            result = self.send_raw(code, payload.clone()).await;
+            result = match tokio::time::timeout_at(
+                overall_deadline,
+                self.send_raw(code, payload.clone()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(IggyError::TransientNotAccepted),
+            };
             let mut roster_walk: Option<RosterWalk> = None;
             // Once the walk starts it keeps walking: a leader recheck between
             // hops would put the request straight back on the node whose
@@ -174,28 +183,90 @@ impl BinaryTransport for WebSocketClient {
                     false
                 } else {
                     checked_metadata_leader = true;
-                    let redirected = matches!(self.handle_leader_redirection().await, Ok(true));
+                    let redirected = match tokio::time::timeout_at(
+                        overall_deadline,
+                        self.handle_leader_redirection(),
+                    )
+                    .await
+                    {
+                        Ok(result) => matches!(result, Ok(true)),
+                        Err(_) => return Err(IggyError::TransientNotAccepted),
+                    };
                     let roster = self.roster_endpoints.lock().await.clone();
                     roster_walk = Some(RosterWalk::new(&current, &roster));
                     redirected
                 };
-                if !redirected {
-                    let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) else {
-                        break;
-                    };
-                    self.settle_on_endpoint(next).await?;
-                } else {
+                let (mut target, mut needs_settle) = if redirected {
                     let target = self.current_server_address.lock().await.clone();
                     if let Some(walk) = roster_walk.as_mut() {
                         walk.record_attempt(&target);
                     }
+                    (target, false)
+                } else if let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) {
+                    (next, true)
+                } else {
+                    break;
+                };
+
+                loop {
+                    if tokio::time::Instant::now() >= overall_deadline {
+                        return Err(IggyError::TransientNotAccepted);
+                    }
+                    let settled = if needs_settle {
+                        match tokio::time::timeout_at(
+                            overall_deadline,
+                            self.settle_on_endpoint(target.clone()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => true,
+                            Ok(Err(IggyError::CannotEstablishConnection)) => false,
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => return Err(IggyError::TransientNotAccepted),
+                        }
+                    } else {
+                        true
+                    };
+                    if settled {
+                        let connect_result = if needs_settle {
+                            tokio::time::timeout_at(overall_deadline, self.connect_off_leader())
+                                .await
+                        } else {
+                            tokio::time::timeout_at(overall_deadline, self.connect()).await
+                        };
+                        match connect_result {
+                            Ok(Ok(())) => {
+                                let connected = self.current_server_address.lock().await.clone();
+                                let first_visit = roster_walk
+                                    .as_mut()
+                                    .is_some_and(|walk| walk.record_attempt(&connected));
+                                if crate::leader_aware::is_same_spelling(&connected, &target)
+                                    || first_visit
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(Err(IggyError::CannotEstablishConnection)) => {}
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => return Err(IggyError::TransientNotAccepted),
+                        }
+                    }
+
+                    let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) else {
+                        return Err(IggyError::TransientNotAccepted);
+                    };
+                    target = next;
+                    needs_settle = true;
                 }
-                self.connect().await?;
-                let connected = self.current_server_address.lock().await.clone();
-                if let Some(walk) = roster_walk.as_mut() {
-                    walk.record_attempt(&connected);
-                }
-                result = self.send_raw(code, payload.clone()).await;
+                result = match tokio::time::timeout_at(
+                    overall_deadline,
+                    self.send_raw(code, payload.clone()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(IggyError::TransientNotAccepted),
+                };
             }
         }
 
@@ -238,7 +309,10 @@ impl BinaryTransport for WebSocketClient {
 
         let replay_after_reconnect = replay_after_session_reset_is_safe(code, &error);
         let skip_auto_login = is_login_register_code(code);
-        let nested_connect = skip_auto_login && self.connect_coordinator.is_active();
+        let owner_context = skip_auto_login
+            .then(|| self.connect_coordinator.current_owner_context())
+            .flatten();
+        let nested_connect = owner_context.is_some();
         let _routing_guard = if nested_connect {
             None
         } else {
@@ -266,7 +340,8 @@ impl BinaryTransport for WebSocketClient {
         }
 
         let reconnect = if nested_connect {
-            self.connect_inner().await
+            self.connect_inner(owner_context.expect("owner context checked above"))
+                .await
         } else {
             self.connect().await
         };
@@ -352,7 +427,6 @@ impl WebSocketClient {
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
             roster_endpoints: Mutex::new(Vec::new()),
-            settle_off_leader_once: AtomicBool::new(false),
             routing_lock: Mutex::new(()),
             connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
@@ -376,20 +450,36 @@ impl WebSocketClient {
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
+        self.connect_with_settlement(false).await
+    }
+
+    pub(crate) async fn connect_off_leader(&self) -> Result<(), IggyError> {
+        self.connect_with_settlement(true).await
+    }
+
+    async fn connect_with_settlement(&self, settle_off_leader: bool) -> Result<(), IggyError> {
         self.connect_coordinator
-            .run(|abandoned| async move {
-                if abandoned {
-                    self.clear_abandoned_connect().await?;
-                }
-                self.connect_inner().await
+            .run(|abandoned, token| async move {
+                let context = self.connect_coordinator.owner_context(
+                    token,
+                    settle_off_leader,
+                    settle_off_leader,
+                );
+                self.connect_coordinator
+                    .scope_owner(context, async move {
+                        if abandoned {
+                            self.clear_abandoned_connect().await?;
+                        }
+                        self.connect_inner(context).await
+                    })
+                    .await
             })
             .await
     }
 
-    async fn connect_inner(&self) -> Result<(), IggyError> {
-        // Consume before fallible connection work. A walk target that cannot
-        // connect must not make an unrelated later reconnect skip settlement.
-        let settle_off_leader = self.settle_off_leader_once.swap(false, Ordering::SeqCst);
+    async fn connect_inner(&self, context: ConnectOwnerContext) -> Result<(), IggyError> {
+        let settle_off_leader = context.settle_off_leader();
+        let single_attempt = context.single_attempt();
         loop {
             if self.get_state().await == ClientState::Connected {
                 return Ok(());
@@ -441,7 +531,10 @@ impl WebSocketClient {
                     })?;
 
                 let connection_stream = if self.config.tls_enabled {
-                    match self.connect_tls(server_addr, &mut retry_count).await {
+                    match self
+                        .connect_tls(server_addr, &mut retry_count, single_attempt)
+                        .await
+                    {
                         Ok(stream) => stream,
                         Err(IggyError::CannotEstablishConnection) => {
                             return Err(IggyError::CannotEstablishConnection);
@@ -449,7 +542,10 @@ impl WebSocketClient {
                         Err(_) => continue, // retry
                     }
                 } else {
-                    match self.connect_plain(server_addr, &mut retry_count).await {
+                    match self
+                        .connect_plain(server_addr, &mut retry_count, single_attempt)
+                        .await
+                    {
                         Ok(stream) => stream,
                         Err(IggyError::CannotEstablishConnection) => {
                             return Err(IggyError::CannotEstablishConnection);
@@ -491,6 +587,7 @@ impl WebSocketClient {
         &self,
         server_addr: SocketAddr,
         retry_count: &mut u32,
+        single_attempt: bool,
     ) -> Result<WebSocketStreamKind, IggyError> {
         let tcp_stream = match TcpStream::connect(&server_addr).await {
             Ok(stream) => stream,
@@ -499,7 +596,9 @@ impl WebSocketClient {
                     "Failed to connect to server: {}. Error: {}",
                     self.config.server_address, error
                 );
-                return self.handle_connection_error(retry_count).await;
+                return self
+                    .handle_connection_error(retry_count, single_attempt)
+                    .await;
             }
         };
 
@@ -516,7 +615,9 @@ impl WebSocketClient {
                 Ok(result) => result,
                 Err(error) => {
                     error!("WebSocket handshake failed: {}", error);
-                    return self.handle_connection_error(retry_count).await;
+                    return self
+                        .handle_connection_error(retry_count, single_attempt)
+                        .await;
                 }
             };
 
@@ -533,12 +634,15 @@ impl WebSocketClient {
         &self,
         server_addr: SocketAddr,
         retry_count: &mut u32,
+        single_attempt: bool,
     ) -> Result<WebSocketStreamKind, IggyError> {
         let tcp_stream = match TcpStream::connect(server_addr).await {
             Ok(stream) => stream,
             Err(error) => {
                 error!("Failed to connect to server: {server_addr}. Error: {error}");
-                return self.handle_connection_error(retry_count).await;
+                return self
+                    .handle_connection_error(retry_count, single_attempt)
+                    .await;
             }
         };
         let tls_config = self.build_tls_config()?;
@@ -570,7 +674,9 @@ impl WebSocketClient {
             Ok(result) => result,
             Err(error) => {
                 error!("WebSocket TLS handshake failed: {}", error);
-                return self.handle_connection_error(retry_count).await;
+                return self
+                    .handle_connection_error(retry_count, single_attempt)
+                    .await;
             }
         };
 
@@ -629,7 +735,16 @@ impl WebSocketClient {
         Ok(config)
     }
 
-    async fn handle_connection_error<T>(&self, retry_count: &mut u32) -> Result<T, IggyError> {
+    async fn handle_connection_error<T>(
+        &self,
+        retry_count: &mut u32,
+        single_attempt: bool,
+    ) -> Result<T, IggyError> {
+        if single_attempt {
+            self.set_state(ClientState::Disconnected).await;
+            self.publish_event(DiagnosticEvent::Disconnected).await;
+            return Err(IggyError::CannotEstablishConnection);
+        }
         if !self.config.reconnection.enabled {
             warn!("Automatic reconnection is disabled.");
             return Err(IggyError::CannotEstablishConnection);
@@ -745,7 +860,6 @@ impl WebSocketClient {
         self.connected_at.lock().await.take();
         self.disconnect().await?;
         *self.current_server_address.lock().await = next;
-        self.settle_off_leader_once.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -969,6 +1083,29 @@ const fn is_login_register_code(code: u32) -> bool {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[tokio::test]
+    async fn a_roster_hop_does_not_enter_the_reconnect_ladder() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve TCP address");
+        let server_address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let client = WebSocketClient::create(Arc::new(WebSocketClientConfig {
+            server_address,
+            ..WebSocketClientConfig::default()
+        }))
+        .expect("create WebSocket client");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.connect_off_leader(),
+        )
+        .await
+        .expect("one WebSocket dial must not enter unlimited reconnect");
+        assert!(matches!(result, Err(IggyError::CannotEstablishConnection)));
+        assert_eq!(client.get_state().await, ClientState::Disconnected);
+    }
 
     #[test]
     fn should_be_created_with_default_config() {

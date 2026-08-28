@@ -94,17 +94,34 @@ async fn create_stream_and_topic(harness: &TestHarness) {
 
 /// Connect one client pinned to the current primary's own endpoint, the way a
 /// leader-aware SDK ends up connected to whichever node answers as leader.
-async fn pinned_producer(harness: &TestHarness, leader: usize) -> (IggyClient, String) {
-    let primary_endpoint = harness
-        .node(leader)
-        .tcp_addr()
-        .expect("leader exposes a TCP endpoint")
-        .to_string();
-    let producer = harness
-        .node(leader)
-        .tcp_client()
-        .expect("leader exposes a TCP endpoint")
-        .with_root_login()
+async fn pinned_producer(
+    harness: &TestHarness,
+    leader: usize,
+    transport: TransportProtocol,
+    reestablish_after: Option<IggyDuration>,
+) -> (IggyClient, String) {
+    let node = harness.node(leader);
+    let primary_endpoint = match transport {
+        TransportProtocol::Tcp => node.tcp_addr(),
+        TransportProtocol::Quic => node.quic_addr(),
+        TransportProtocol::WebSocket => node.websocket_addr(),
+        TransportProtocol::Http => panic!("HTTP does not expose a persistent Iggy client"),
+    }
+    .unwrap_or_else(|| panic!("leader exposes a {transport} endpoint"))
+    .to_string();
+    let builder = match transport {
+        TransportProtocol::Tcp => node.tcp_client(),
+        TransportProtocol::Quic => node.quic_client(),
+        TransportProtocol::WebSocket => node.websocket_client(),
+        TransportProtocol::Http => panic!("HTTP does not expose a persistent Iggy client"),
+    }
+    .unwrap_or_else(|error| panic!("leader exposes a {transport} client: {error}"));
+    let builder = match reestablish_after {
+        Some(duration) => builder.with_reestablish_after(duration),
+        None => builder,
+    };
+    let producer = builder
+        .with_reconnecting_root_login()
         .connect()
         .await
         .expect("connect the producer to the primary");
@@ -223,10 +240,13 @@ async fn require_readback(producer: &IggyClient, expected: &[(u64, String)]) {
 /// primary it is pinned to.
 async fn warmed_producer_past_follower_restart(
     harness: &mut TestHarness,
+    transport: TransportProtocol,
+    reestablish_after: Option<IggyDuration>,
 ) -> (IggyClient, usize, String, Vec<(u64, String)>) {
     create_stream_and_topic(harness).await;
     let leader = disk::leader_node_index(harness).await;
-    let (producer, primary_endpoint) = pinned_producer(harness, leader).await;
+    let (producer, primary_endpoint) =
+        pinned_producer(harness, leader, transport, reestablish_after).await;
     let mut acked = require_acked_sends(&producer, "warmup", WARM_ACKS, WARMUP_TIMEOUT).await;
 
     let follower = (0..harness.cluster_size())
@@ -240,14 +260,12 @@ async fn warmed_producer_past_follower_restart(
     (producer, leader, primary_endpoint, acked)
 }
 
-/// Baseline sibling: the primary stops gracefully and stays down. The same
-/// client must settle on a survivor, write, and read back.
-#[iggy_harness(cluster_nodes = 3)]
-async fn given_a_pinned_producer_when_its_primary_stops_and_stays_down_should_resume(
+async fn require_resume_after_primary_stop(
     harness: &mut TestHarness,
+    transport: TransportProtocol,
 ) {
     let (producer, leader, primary_endpoint, mut acked) =
-        warmed_producer_past_follower_restart(harness).await;
+        warmed_producer_past_follower_restart(harness, transport, None).await;
 
     harness.stop_node(leader).expect("stop the primary");
 
@@ -260,6 +278,48 @@ async fn given_a_pinned_producer_when_its_primary_stops_and_stays_down_should_re
     require_readback(&producer, &acked).await;
 }
 
+async fn require_resume_after_fast_primary_rejoin(
+    harness: &mut TestHarness,
+    transport: TransportProtocol,
+) {
+    let (producer, leader, _primary_endpoint, mut acked) =
+        warmed_producer_past_follower_restart(harness, transport, None).await;
+
+    harness
+        .restart_node(leader)
+        .expect("restart the primary with its data intact");
+
+    acked.extend(require_acked_sends(&producer, "post-primary-restart", 1, RESUME_BUDGET).await);
+    require_readback(&producer, &acked).await;
+}
+
+async fn require_resume_after_fast_primary_rejoin_with_dead_roster_hop(
+    harness: &mut TestHarness,
+    transport: TransportProtocol,
+) {
+    let (producer, leader, _primary_endpoint, mut acked) =
+        warmed_producer_past_follower_restart(harness, transport, None).await;
+    let dead_hop = (leader + 1) % harness.cluster_size();
+    harness
+        .stop_node(dead_hop)
+        .expect("stop the first roster hop after the original primary");
+    harness
+        .restart_node(leader)
+        .expect("restart the primary with its data intact");
+
+    acked.extend(require_acked_sends(&producer, "post-dead-roster-hop", 1, RESUME_BUDGET).await);
+    require_readback(&producer, &acked).await;
+}
+
+/// Baseline sibling: the primary stops gracefully and stays down. The same
+/// client must settle on a survivor, write, and read back.
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_pinned_producer_when_its_primary_stops_and_stays_down_should_resume(
+    harness: &mut TestHarness,
+) {
+    require_resume_after_primary_stop(harness, TransportProtocol::Tcp).await;
+}
+
 /// Fast-rejoin sibling: the primary stops gracefully and is started again
 /// immediately, so its endpoint answers TCP and metadata as a rejoining
 /// follower while the group primaryship settles elsewhere. The same client
@@ -268,15 +328,59 @@ async fn given_a_pinned_producer_when_its_primary_stops_and_stays_down_should_re
 async fn given_a_pinned_producer_when_its_primary_restarts_quickly_should_resume(
     harness: &mut TestHarness,
 ) {
-    let (producer, leader, _primary_endpoint, mut acked) =
-        warmed_producer_past_follower_restart(harness).await;
+    require_resume_after_fast_primary_rejoin(harness, TransportProtocol::Tcp).await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_zero_cooldown_tcp_producer_when_replay_lands_on_a_partition_backup_should_resume(
+    harness: &mut TestHarness,
+) {
+    let (producer, leader, _primary_endpoint, mut acked) = warmed_producer_past_follower_restart(
+        harness,
+        TransportProtocol::Tcp,
+        Some(IggyDuration::from(0u64)),
+    )
+    .await;
 
     harness
         .restart_node(leader)
         .expect("restart the primary with its data intact");
 
-    acked.extend(require_acked_sends(&producer, "post-primary-restart", 1, RESUME_BUDGET).await);
+    acked.extend(require_acked_sends(&producer, "zero-cooldown-replay", 1, RESUME_BUDGET).await);
     require_readback(&producer, &acked).await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_quic_producer_when_its_primary_restarts_quickly_should_resume(
+    harness: &mut TestHarness,
+) {
+    require_resume_after_fast_primary_rejoin(harness, TransportProtocol::Quic).await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_quic_producer_when_its_first_roster_hop_is_down_should_reach_the_partition_primary(
+    harness: &mut TestHarness,
+) {
+    require_resume_after_fast_primary_rejoin_with_dead_roster_hop(harness, TransportProtocol::Quic)
+        .await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_websocket_producer_when_its_primary_restarts_quickly_should_resume(
+    harness: &mut TestHarness,
+) {
+    require_resume_after_fast_primary_rejoin(harness, TransportProtocol::WebSocket).await;
+}
+
+#[iggy_harness(cluster_nodes = 3)]
+async fn given_a_websocket_producer_when_its_first_roster_hop_is_down_should_reach_the_partition_primary(
+    harness: &mut TestHarness,
+) {
+    require_resume_after_fast_primary_rejoin_with_dead_roster_hop(
+        harness,
+        TransportProtocol::WebSocket,
+    )
+    .await;
 }
 
 /// The stateless HTTP transport has no client-side partition routing. After
@@ -293,7 +397,7 @@ async fn given_http_writes_on_a_rejoined_backup_when_the_primary_moved_should_fo
     harness: &mut TestHarness,
 ) {
     let (producer, leader, primary_endpoint, mut acked) =
-        warmed_producer_past_follower_restart(harness).await;
+        warmed_producer_past_follower_restart(harness, TransportProtocol::Tcp, None).await;
     harness
         .restart_node(leader)
         .expect("restart the primary with its data intact");

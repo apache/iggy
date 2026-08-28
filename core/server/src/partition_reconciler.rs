@@ -2545,7 +2545,9 @@ mod tests {
             .expect("partition is materialised")
             .repair = Some(RepairSession {
             nonce: NONCE,
-            to_op: 5,
+            view: 0,
+            commit_to_op: 5,
+            fetch_to_op: 5,
             floor: None,
             peer: 1,
             first_batch_offset: None,
