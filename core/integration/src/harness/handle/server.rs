@@ -675,6 +675,17 @@ impl ServerHandle {
         self.test_transport = Some(transport);
     }
 
+    /// Point the next `start()` at a different server binary.
+    ///
+    /// `start()` re-reads `config.executable_path` on every call, so a test
+    /// can boot one build, then restart the SAME data directory under another
+    /// one. `None` restores the cargo-built binary of the crate under test,
+    /// which is why this takes an explicit `Option` rather than
+    /// `impl Into<String>`.
+    pub fn set_executable_path(&mut self, path: Option<String>) {
+        self.config.executable_path = path;
+    }
+
     /// Configure MCP server for this iggy server.
     pub fn set_mcp_config(&mut self, config: McpConfig) {
         self.mcp = Some(McpHandle::with_server_id(

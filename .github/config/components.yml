@@ -135,6 +135,38 @@ components:
       - "core/message_bus/**"
       - "core/partitions/**"
 
+  # On-disk format backwards compatibility. Boots a server built from
+  # origin/master, seeds a data directory, then swaps in a HEAD-built binary
+  # and asserts it reads everything back. Paths are the crates that own the
+  # on-disk representation plus the boot path that reads it back; a change to
+  # any of them can silently break rollforward for existing deployments, which
+  # no other check covers. Matching is literal glob with no crate-graph
+  # expansion, so every crate has to be spelled out: `core/server/**` does not
+  # cover `core/server_common/**`.
+  # `breaking:storage` on the PR skips it (see .github/workflows/_test.yml).
+  rust-storage-compat:
+    depends_on:
+      - "rust-workspace"
+      - "ci-infrastructure" # action.yml/workflow edits should re-run the check
+    paths:
+      - "core/server/**"
+      - "core/server_common/**" # per-message segment record + segment readers/writers
+      - "core/binary_protocol/**"
+      - "core/common/**"
+      - "core/consensus/**" # VsrState is the superblock payload
+      - "core/journal/**"
+      - "core/metadata/**"
+      - "core/partitions/**"
+      - "core/shard/**" # drives the shutdown flush and boot-time partition recovery
+      - "scripts/ci/storage-compat.sh"
+      # The check itself, so weakening it re-runs it. Scoped to the test and
+      # the harness it drives rather than `core/integration/**`, which would
+      # fire this lane on every unrelated integration test change.
+      - "core/integration/tests/data_integrity/storage_compat.rs"
+      - "core/integration/src/harness/**"
+    tasks:
+      - "test-storage-compat"
+
   # Standalone simulation tool, does NOT affect server binary or foreign SDKs.
   # Split from rust-cluster to avoid triggering SDK tests on simulator-only changes.
   rust-simulator:

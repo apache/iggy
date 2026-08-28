@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, test-3, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, test-3, test-storage-compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -208,12 +208,19 @@ runs:
         tool: cargo-llvm-cov
 
     - name: Build and test with coverage
-      if: startsWith(inputs.task, 'test-')
+      # test-storage-compat drives its own nextest invocation from
+      # scripts/ci/storage-compat.sh. Without this exclusion it would also run
+      # here with an empty PARTITION_FLAG, i.e. a fourth *unpartitioned* copy
+      # of the whole suite on top of test-1/2/3.
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: |
         # Parse partition index from task name (test-1 -> hash:1/3, test-2 -> hash:2/3, ...).
         # TEST_PARTITIONS must match the number of test-N tasks in
         # .github/config/components.yml. Cluster bootstrap makes each test
         # CPU-heavy, so partitions stay small.
+        # The regex is numeric-only on purpose: non-numeric test-* tasks
+        # (test-storage-compat) opt out of partitioning rather than producing
+        # an out-of-range hash:N/3.
         TEST_PARTITIONS=3
         TASK="${{ inputs.task }}"
         PARTITION_FLAG=""
@@ -381,6 +388,16 @@ runs:
         cargo llvm-cov report --codecov --output-path codecov.json
         echo "Coverage report generated: codecov.json"
         ls -la codecov.json
+      shell: bash
+
+    # On-disk format backwards compatibility. The script builds an iggy-server
+    # from origin/master and one from HEAD, seeds a data directory with the
+    # former and reads it back with the latter. It does its own shallow fetch
+    # of the baseline ref and exits non-zero if it cannot resolve one, so the
+    # default depth-1 checkout is sufficient here.
+    - name: Storage format backwards compatibility
+      if: inputs.task == 'test-storage-compat'
+      run: ./scripts/ci/storage-compat.sh
       shell: bash
 
     # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /

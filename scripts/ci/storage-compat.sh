@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+set -euo pipefail
+
+# shellcheck source-path=SCRIPTDIR
+source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
+
+# storage-compat.sh -- Prove HEAD still reads a data directory written by master.
+#
+# Builds two iggy-server binaries and hands both to one integration test:
+#   baseline  built from --baseline-ref (default origin/master), copied aside
+#   HEAD      built from the working tree, left at target/debug/iggy-server
+# The test boots the baseline, seeds a data directory, swaps the binary to HEAD
+# and restarts against that same directory.
+#
+# Both binaries MUST be built here. `core/integration` has no dependency on the
+# `server` package; the harness only LOCATES a binary, through
+# `assert_cmd::Command::cargo_bin`, which falls back to whatever file happens to
+# sit at target/debug/iggy-server (assert_cmd 2.2.2 `legacy_cargo_bin`). So
+# `cargo nextest run -p integration` compiles no server at all, and a lane that
+# does not build both halves compares a stale binary against itself and reports
+# green forever.
+#
+# Exit codes: 0 = compatible, non-zero = build failure or format regression.
+
+BASELINE_REF="origin/master"
+REBUILD_BASELINE=0
+
+# The single #[ignore]d test this script exists to drive. The integration crate
+# is one binary built from tests/mod.rs, so tests are selected by module path.
+TEST_FILTER="data_integrity::storage_compat"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --baseline-ref)
+      BASELINE_REF="${2:-}"
+      if [ -z "${BASELINE_REF}" ]; then
+        echo "--baseline-ref requires a git ref"
+        exit 1
+      fi
+      shift 2
+      ;;
+    --rebuild-baseline)
+      REBUILD_BASELINE=1
+      shift
+      ;;
+    --help|-h)
+      echo "Usage: $0 [--baseline-ref <ref>] [--rebuild-baseline]"
+      echo ""
+      echo "Options:"
+      echo "  --baseline-ref <ref>  Ref to build the baseline server from (default: origin/master)"
+      echo "  --rebuild-baseline    Rebuild the baseline even when its binary is already on disk"
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Use --help for usage information"
+      exit 1
+      ;;
+  esac
+done
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${REPO_ROOT}"
+
+if ! command -v cargo-nextest &>/dev/null; then
+  echo "cargo-nextest is not installed"
+  echo ""
+  echo "Install with:"
+  echo "  cargo install cargo-nextest --locked"
+  exit 1
+fi
+
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+HEAD_SERVER="${TARGET_DIR}/debug/iggy-server"
+
+WORKTREE_DIR=""
+
+# Every command is guarded: under `set -e` a failure inside an EXIT trap would
+# replace the script's real exit status with the trap's.
+cleanup() {
+  if [ -n "${WORKTREE_DIR}" ]; then
+    git worktree remove --force "${WORKTREE_DIR}" 2>/dev/null || rm -rf "${WORKTREE_DIR}" || true
+  fi
+  git worktree prune 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# The remote side of a fetch takes a branch or tag name, never a
+# remote-tracking name, so drop the remote prefix before asking origin for it.
+FETCHED=0
+if git fetch --no-tags --depth=1 origin "${BASELINE_REF#origin/}" 2>/dev/null; then
+  FETCHED=1
+fi
+
+BASELINE_SHA=""
+if [ "${FETCHED}" -eq 1 ]; then
+  # FETCH_HEAD in preference to the named ref: actions/checkout narrows
+  # remote.origin.fetch on a shallow clone, so refs/remotes/origin/master can
+  # stay absent or stale straight through a successful fetch.
+  BASELINE_SHA="$(git rev-parse --verify --quiet "FETCH_HEAD^{commit}" || true)"
+fi
+if [ -z "${BASELINE_SHA}" ]; then
+  BASELINE_SHA="$(git rev-parse --verify --quiet "${BASELINE_REF}^{commit}" || true)"
+fi
+if [ -z "${BASELINE_SHA}" ]; then
+  echo "Could not resolve baseline ref '${BASELINE_REF}' locally or from origin"
+  exit 1
+fi
+
+HEAD_SHA="$(git rev-parse --verify HEAD)"
+echo "Baseline: ${BASELINE_SHA} (${BASELINE_REF})"
+echo "HEAD:     ${HEAD_SHA}"
+if [ "${BASELINE_SHA}" = "${HEAD_SHA}" ]; then
+  echo "WARNING: baseline and HEAD are the same commit, this run proves nothing"
+fi
+
+# Keyed by baseline commit, which also pins that commit's Cargo.lock and
+# rust-toolchain.toml. Drop a cache restore/save around this path to skip the
+# per-PR baseline build.
+BASELINE_SERVER="${TARGET_DIR}/storage-compat/${BASELINE_SHA}/iggy-server"
+
+if [ "${REBUILD_BASELINE}" -eq 1 ]; then
+  rm -f "${BASELINE_SERVER}"
+fi
+
+if [ -x "${BASELINE_SERVER}" ]; then
+  echo "Reusing baseline server at ${BASELINE_SERVER}"
+else
+  # Outside the repo on purpose: an in-tree worktree gets swept up by the
+  # repo-wide find(1) in the lint scripts and by cargo's workspace globs.
+  # A fresh mktemp path per run cannot collide with an aborted run; the only
+  # residue such a run leaves is an admin entry under .git/worktrees, which
+  # prune clears.
+  git worktree prune
+  WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/iggy-storage-compat.XXXXXX")"
+  git worktree add --detach "${WORKTREE_DIR}" "${BASELINE_SHA}"
+
+  # Symmetric to the guard before the HEAD build below: a HEAD binary left by an
+  # earlier run makes cargo skip the uplift, and the cp further down would then
+  # capture that HEAD binary as the baseline, comparing HEAD against itself.
+  rm -f "${HEAD_SERVER}"
+
+  echo "Building baseline iggy-server from ${BASELINE_SHA}..."
+  # Built from the worktree as CWD so the baseline's own rust-toolchain.toml
+  # applies, into the shared target dir so the registry graph compiles once.
+  #
+  # Debug profile on both sides, and no --all-features: release would compile
+  # debug_assert! out of the baseline while HEAD still panics on it, and
+  # --all-features turns on the server's `disable-mimalloc`, so the two halves
+  # would differ in ways the storage format never changed.
+  (
+    cd "${WORKTREE_DIR}"
+    cargo build --locked --target-dir "${TARGET_DIR}" -p server --bin iggy-server
+  )
+
+  if [ ! -x "${HEAD_SERVER}" ]; then
+    echo "Baseline build did not produce ${HEAD_SERVER}"
+    exit 1
+  fi
+
+  # Copy before HEAD builds: both trees uplift to the same target/debug path.
+  mkdir -p "$(dirname "${BASELINE_SERVER}")"
+  cp "${HEAD_SERVER}" "${BASELINE_SERVER}"
+fi
+
+# Delete the uplifted binary before building HEAD. Cargo skips re-uplifting when
+# the destination already looks current, and the baseline build just refreshed
+# it, so on a second run the BASELINE binary could survive at
+# target/debug/iggy-server and the test would compare master against master.
+rm -f "${HEAD_SERVER}"
+
+echo "Building HEAD iggy-server from ${HEAD_SHA}..."
+cargo build --locked --target-dir "${TARGET_DIR}" -p server --bin iggy-server
+
+if [ ! -x "${HEAD_SERVER}" ]; then
+  echo "HEAD build did not produce ${HEAD_SERVER}"
+  exit 1
+fi
+
+# Absolute path: ServerHandle only treats this value as a literal path when it
+# has more than one component, otherwise it falls back to a cargo_bin lookup.
+export COMPAT_BASELINE_SERVER="${BASELINE_SERVER}"
+
+echo "Running storage compatibility test..."
+# --run-ignored only: the test is #[ignore]d, so the normal lanes skip it.
+# --no-tests=fail: a filter matching nothing has to be an error here, unlike the
+# main lane's --no-tests=warn, which would report a typo'd filter as green.
+# No --profile ci on purpose: its retries = 3 would re-run and hide a read-back
+# that only fails sometimes, which is exactly the signal this check exists for.
+cargo nextest run --locked -p integration \
+  --run-ignored only \
+  --no-tests=fail \
+  -E "test(${TEST_FILTER})"
+
+echo "Storage format compatible: ${BASELINE_SHA} -> ${HEAD_SHA}"
