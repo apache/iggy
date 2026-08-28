@@ -1282,6 +1282,7 @@ async fn shard_main(
         topology.cluster_id,
         topology.self_replica_id,
         topology.replica_count,
+        Arc::clone(&metadata_view),
     ));
     let reconcile_periodic = config
         .system
@@ -2034,6 +2035,10 @@ async fn build_shard_for_thread(
                     topology.cluster_id,
                     topology.self_replica_id,
                     topology.replica_count,
+                    // Quarantine-and-rebuild always finds a partition
+                    // directory already there, so this joins as a probing
+                    // backup and learns the live view; nothing to seed.
+                    None,
                     Rc::clone(&bus),
                 )
                 .await?

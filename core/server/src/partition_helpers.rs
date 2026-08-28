@@ -516,6 +516,11 @@ pub(crate) async fn open_partition_superblock(
 /// The namespace arrives packed, so its components are in range by
 /// construction. Metadata admission is what bounds them.
 ///
+/// `view_seed` is the view a group with no durable record of its own starts
+/// in, and it is the metadata plane's current view: see the `view_fallback`
+/// comment below for why a group left at view 0 is unreachable. `None` where
+/// no view is published yet, which keeps the historical view-0 start.
+///
 /// The returned partition's `offset` / `dirty_offset` are `0` and
 /// `should_increment_offset` is `false`, mirroring a clean append starting
 /// at the empty segment.
@@ -534,6 +539,7 @@ pub async fn build_partition_fresh(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
+    view_seed: Option<u32>,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
     let stream_id = namespace.stream_id();
@@ -613,7 +619,18 @@ pub async fn build_partition_fresh(
             durable_view: recovered_state
                 .as_ref()
                 .map(|state| (state.view, state.log_view)),
-            view_fallback: None,
+            // Both planes pick their primary as `view % replica_count` from
+            // their OWN view counter. A group left at view 0 while the
+            // metadata plane sits elsewhere therefore names a different node
+            // than the roster advertises as leader, and nothing routes a
+            // partition write across that gap: the client is sent to the
+            // metadata leader and refused there for the whole budget. Seeding
+            // from the metadata view keeps the two congruent for a group born
+            // after a metadata election. Peers materialise the same namespace
+            // from the same committed event and read the same published view,
+            // so they agree; a seed that races an election lands one replica a
+            // view behind, which its `StartView` catch-up already covers.
+            view_fallback: view_seed,
             incarnation: None,
             join,
         },

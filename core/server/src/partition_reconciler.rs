@@ -170,6 +170,7 @@
 //! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
 use crate::bootstrap::ServerShard;
+use crate::cluster_meta::METADATA_VIEW_UNKNOWN;
 use crate::partition_helpers::{build_partition_fresh, delete_partitions_from_disk};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -187,6 +188,7 @@ use shard::{Receiver, Sender};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
 
@@ -225,6 +227,11 @@ pub struct ReconcilerCtx {
     pub cluster_id: u128,
     pub self_replica_id: u8,
     pub replica_count: u8,
+    /// The metadata plane's view, published by shard 0 and shared with every
+    /// shard's roster. Read when materialising a partition so its consensus
+    /// group starts in the same view the roster's advertised leader comes
+    /// from; [`METADATA_VIEW_UNKNOWN`] until the first publish.
+    pub metadata_view: Arc<AtomicU64>,
     failure_state: RefCell<AHashMap<(IggyNamespace, FailureCause), FailureRecord>>,
     /// `Streams::revision` observed at the end of the last pass that fully
     /// converged. Paired with `last_pass_noop` for the fast-skip in
@@ -244,6 +251,7 @@ impl ReconcilerCtx {
         cluster_id: u128,
         self_replica_id: u8,
         replica_count: u8,
+        metadata_view: Arc<AtomicU64>,
     ) -> Self {
         Self {
             shard,
@@ -252,10 +260,21 @@ impl ReconcilerCtx {
             cluster_id,
             self_replica_id,
             replica_count,
+            metadata_view,
             failure_state: RefCell::new(AHashMap::new()),
             last_revision: Cell::new(None),
             last_pass_noop: Cell::new(false),
         }
+    }
+
+    /// The view a partition group materialised now should start in, or `None`
+    /// while the metadata plane has published no view yet.
+    fn partition_view_seed(&self) -> Option<u32> {
+        let view = self.metadata_view.load(Ordering::Relaxed);
+        if view == METADATA_VIEW_UNKNOWN {
+            return None;
+        }
+        u32::try_from(view).ok()
     }
 
     fn is_backed_off(&self, ns: IggyNamespace, cause: FailureCause, now: Instant) -> bool {
@@ -676,6 +695,7 @@ async fn reconcile_additions(
             ctx.cluster_id,
             ctx.self_replica_id,
             ctx.replica_count,
+            ctx.partition_view_seed(),
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -1211,8 +1231,8 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureCause, FailureRecord, ReconcilerCtx, build_partition_fresh,
-        delete_partitions_from_disk, fetch_partition_stats, reconcile_once,
+        AtomicU64, FailureCause, FailureRecord, METADATA_VIEW_UNKNOWN, ReconcilerCtx,
+        build_partition_fresh, delete_partitions_from_disk, fetch_partition_stats, reconcile_once,
     };
     use configs::server::{ServerConfig, ServerSystemConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
@@ -1664,6 +1684,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
         ))
     }
 
@@ -1809,6 +1830,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            None,
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -1838,6 +1860,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            None,
             Rc::clone(&ctx.shard.bus),
         )
         .await
