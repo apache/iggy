@@ -45,7 +45,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::*;
-use integration::harness::TestHarness;
+use integration::harness::disk::leader_node_index_via;
 use integration::iggy_harness;
 use tokio::time::{Instant, sleep};
 
@@ -58,9 +58,9 @@ const PARTITION_ID: u32 = 0;
 const ELECTION_SETTLE: Duration = Duration::from_secs(15);
 /// Long enough for the late replica 0 to probe for the live view and rejoin.
 const REJOIN_SETTLE: Duration = Duration::from_secs(10);
-/// Well past a healthy send, so exceeding it means the client is not going to
-/// recover on its own.
-const SEND_BUDGET: Duration = Duration::from_secs(45);
+/// Under the SDK's own `RESPONSE_READ_TIMEOUT` (30s), so this fires first and
+/// names the failure rather than being shadowed by it.
+const SEND_BUDGET: Duration = Duration::from_secs(20);
 /// How long the late replica gets to show it has caught up.
 const CONVERGE_BUDGET: Duration = Duration::from_secs(30);
 const MARKER_POLL: Duration = Duration::from_millis(250);
@@ -86,25 +86,6 @@ fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
 }
 
-/// The roster's current leader as a node index, read through an already
-/// connected client so no new connection is attempted while the cluster may
-/// still be settling.
-async fn read_leader_index(harness: &TestHarness, client: &IggyClient) -> Option<usize> {
-    let metadata = client.get_cluster_metadata().await.ok()?;
-    let leader_port = metadata
-        .nodes
-        .iter()
-        .find(|node| node.role == ClusterNodeRole::Leader)?
-        .endpoints
-        .tcp;
-    (0..harness.cluster_size()).find(|index| {
-        harness
-            .node(*index)
-            .tcp_addr()
-            .is_some_and(|address| address.port() == leader_port)
-    })
-}
-
 #[iggy_harness(cluster_nodes = 3, manual_start)]
 async fn given_replica_zero_arrives_late_when_producing_to_a_fresh_topic_should_reach_the_advertised_leader(
     harness: &mut TestHarness,
@@ -118,17 +99,16 @@ async fn given_replica_zero_arrives_late_when_producing_to_a_fresh_topic_should_
         .expect("replicas 1 and 2 must form a quorum without replica 0");
     sleep(ELECTION_SETTLE).await;
 
-    let probe = harness
-        .root_client_for_node(1)
-        .await
-        .expect("root client on node 1 after the election");
-    let leader = read_leader_index(harness, &probe)
-        .await
-        .expect("the cluster must name a leader once the election settled");
+    // Read through node 1: node 0 is not running, so it can answer no login,
+    // and the roster read is auth-gated.
+    //
+    // Unlike the restart-driven twin of this test, this one is an invariant
+    // rather than a precondition: replica 0 has never been started, so no view
+    // it could be elected in exists yet.
+    let leader = leader_node_index_via(harness, 1).await;
     assert_ne!(
         leader, 0,
-        "replica 0 was never started, so it cannot be the metadata leader; \
-         with the leader at node 0 the planes agree and the split cannot show"
+        "replica 0 was never started, so it cannot be the metadata leader"
     );
 
     // Replica 0 arrives into a cluster that has already elected past it.

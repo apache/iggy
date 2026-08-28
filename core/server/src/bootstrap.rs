@@ -2453,6 +2453,9 @@ fn restore_metadata_consensus(
             // re-derives, and it re-probes as a backup.
             durable_view: recovered_state.map(|state| (state.view, state.log_view)),
             view_fallback: last_header.map(|header| header.view),
+            // Metadata, not a partition group: it has a journal to infer from
+            // and no second plane to line up with.
+            seed_view: None,
             // Fresh random incarnation each boot, so a StartView addressed to
             // a previous incarnation still in flight is ignored
             // (`handle_start_view` guard). `| 1` guarantees the non-zero the
@@ -2644,6 +2647,7 @@ async fn load_partition(
                 .as_ref()
                 .map(|state| (state.view, state.log_view)),
             view_fallback: None,
+            seed_view: None,
             incarnation: None,
             join,
         },

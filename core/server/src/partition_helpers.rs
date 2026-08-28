@@ -517,9 +517,10 @@ pub(crate) async fn open_partition_superblock(
 /// construction. Metadata admission is what bounds them.
 ///
 /// `view_seed` is the view a group with no durable record of its own starts
-/// in, and it is the metadata plane's current view: see the `view_fallback`
-/// comment below for why a group left at view 0 is unreachable. `None` where
-/// no view is published yet, which keeps the historical view-0 start.
+/// in, and it is the metadata plane's current view: see the `seed_view`
+/// comment below for why a group left at view 0 is unreachable. `None` keeps
+/// the historical view-0 start, and is also what a restart materialization
+/// gets, since it probes for the live view instead.
 ///
 /// The returned partition's `offset` / `dirty_offset` are `0` and
 /// `should_increment_offset` is `false`, mirroring a clean append starting
@@ -603,6 +604,15 @@ pub async fn build_partition_fresh(
     } else {
         JoinMode::Init
     };
+    // Only a plain `Init` may be seeded. A probing backup must sit at or below
+    // the group's real view for the primary's `StartView` to move it forward;
+    // seeded above it, the probe reply reads as stale and is dropped, and the
+    // replica never rejoins. The probe exists precisely to learn the view, so
+    // there is nothing for a seed to add there.
+    let seed_view = match join {
+        JoinMode::Init => view_seed,
+        JoinMode::ProbeAsBackup { .. } => None,
+    };
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
@@ -619,6 +629,7 @@ pub async fn build_partition_fresh(
             durable_view: recovered_state
                 .as_ref()
                 .map(|state| (state.view, state.log_view)),
+            view_fallback: None,
             // Both planes pick their primary as `view % replica_count` from
             // their OWN view counter. A group left at view 0 while the
             // metadata plane sits elsewhere therefore names a different node
@@ -626,11 +637,16 @@ pub async fn build_partition_fresh(
             // partition write across that gap: the client is sent to the
             // metadata leader and refused there for the whole budget. Seeding
             // from the metadata view keeps the two congruent for a group born
-            // after a metadata election. Peers materialise the same namespace
-            // from the same committed event and read the same published view,
-            // so they agree; a seed that races an election lands one replica a
-            // view behind, which its `StartView` catch-up already covers.
-            view_fallback: view_seed,
+            // after a metadata election.
+            //
+            // Replicas can still disagree on the seed: each publishes its own
+            // metadata view on a 100ms poll, so one may read V while another
+            // has yet to see the election. That resolves the way any view
+            // disagreement does, the higher view winning through `StartView` -
+            // but only because the seed sets `log_view` too. The caller is
+            // what keeps a replica from seeding a view it has no opinion on;
+            // see `ReconcilerCtx::partition_view_seed`.
+            seed_view,
             incarnation: None,
             join,
         },

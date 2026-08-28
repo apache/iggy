@@ -29,22 +29,23 @@
 //!
 //! This test forces the views apart: it moves the metadata plane off view 0,
 //! brings every node back, then creates a topic whose partition group is brand
-//! new and therefore still at view 0. The two assertions are deliberately
-//! separate, because they distinguish the two candidate defects:
+//! new. Seeded from the metadata view it lands on the advertised leader; left
+//! at view 0 it would name node 0, and no client could be told to go there.
 //!
-//! - Node 0 accepts the write. A partition primary EXISTS; "partition groups
-//!   never elect" is refuted.
-//! - The advertised leader accepts the write. If this fails while the first
-//!   passes, the defect is purely that the roster advertises the metadata
-//!   leader as the destination for partition traffic.
+//! Both assertions are about the SAME node, and deliberately so. The SDK
+//! follows the roster's leader on connect, so a client asking for node 0 does
+//! not stay there - which is itself worth pinning down, since a test that
+//! believes it is exercising node 0 while sitting on the leader proves
+//! nothing. One assertion records where the client actually lands, the other
+//! is the contract: the node the roster advertises accepts a partition write.
 
 use std::str::FromStr;
 use std::time::Duration;
 
 use iggy::prelude::*;
-use integration::harness::TestHarness;
+use integration::harness::disk::leader_node_index_via;
 use integration::iggy_harness;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 const STREAM_NAME: &str = "partition-routing-stream";
 const TOPIC_NAME: &str = "partition-routing-topic";
@@ -55,31 +56,17 @@ const PARTITION_ID: u32 = 0;
 const ELECTION_SETTLE: Duration = Duration::from_secs(15);
 /// Long enough for the restarted node 0 to rejoin at the new view.
 const REJOIN_SETTLE: Duration = Duration::from_secs(10);
-/// Well past a healthy send and past the SDK's own transient replay window, so
-/// exceeding it means the client is not going to recover on its own.
-const SEND_BUDGET: Duration = Duration::from_secs(45);
+/// Under the SDK's own `RESPONSE_READ_TIMEOUT` (30s), so this fires first and
+/// names the failure. Above it the SDK's timeout always wins and the budget is
+/// dead code.
+const SEND_BUDGET: Duration = Duration::from_secs(20);
+/// How long the metadata plane gets to settle on a leader that is not node 0,
+/// the state this test needs before it can observe anything.
+const PRECONDITION_BUDGET: Duration = Duration::from_secs(20);
+const PRECONDITION_POLL: Duration = Duration::from_millis(500);
 
 fn message(payload: &str) -> IggyMessage {
     IggyMessage::from_str(payload).expect("build message")
-}
-
-/// The roster's current leader as a node index, read through an already
-/// connected client so no new connection is attempted while the cluster may
-/// still be settling.
-async fn read_leader_index(harness: &TestHarness, client: &IggyClient) -> Option<usize> {
-    let metadata = client.get_cluster_metadata().await.ok()?;
-    let leader_port = metadata
-        .nodes
-        .iter()
-        .find(|node| node.role == ClusterNodeRole::Leader)?
-        .endpoints
-        .tcp;
-    (0..harness.cluster_size()).find(|index| {
-        harness
-            .node(*index)
-            .tcp_addr()
-            .is_some_and(|address| address.port() == leader_port)
-    })
 }
 
 #[iggy_harness(cluster_nodes = 3)]
@@ -96,21 +83,35 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
     harness.restart_node(0).expect("restart node 0");
     sleep(REJOIN_SETTLE).await;
 
-    let probe = harness
-        .root_client_for_node(1)
-        .await
-        .expect("root client on node 1 after the election");
-    let leader = read_leader_index(harness, &probe)
-        .await
-        .expect("the cluster must name a leader once the election settled");
-    assert_ne!(
-        leader, 0,
-        "killing node 0 must have moved the metadata plane off view 0; \
-         with the leader back at node 0 the two planes agree and the split cannot show"
-    );
+    // Read through node 1: node 0 has only just restarted, and the roster read
+    // is auth-gated, so it needs a node that can complete a login now.
+    //
+    // A SETUP PRECONDITION, not an invariant of the system. `primary_index` is
+    // `view % replica_count` with no `Status::Normal` gate, so a cluster that
+    // elected three times is back to advertising node 0 while perfectly
+    // healthy. Polled rather than asserted once: the split this test is about
+    // is only observable while the planes disagree, and one kill normally
+    // lands view 1 immediately.
+    let leader = {
+        let deadline = Instant::now() + PRECONDITION_BUDGET;
+        loop {
+            let index = leader_node_index_via(harness, 1).await;
+            if index != 0 {
+                break index;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the metadata plane never settled on a leader other than node 0 within \
+                 {PRECONDITION_BUDGET:?}; with the leader at node 0 both planes agree and \
+                 the split this test is about cannot show"
+            );
+            sleep(PRECONDITION_POLL).await;
+        }
+    };
 
-    // A brand-new topic: its partition consensus group starts at view 0, so
-    // its primary is replica 0, while the metadata leader is not node 0.
+    // A brand-new topic. Its partition group is seeded from the metadata view,
+    // so its primary is the advertised leader; left at view 0 it would be
+    // replica 0, the node that was just killed and restarted.
     let setup = harness
         .root_client_for_node(leader)
         .await
@@ -135,39 +136,35 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
     let topic_id = Identifier::named(TOPIC_NAME).expect("topic identifier");
     let partitioning = Partitioning::partition_id(PARTITION_ID);
 
-    // Where a client dialing node 0 actually ends up. If the SDK's leader
-    // check moves it to the metadata leader, that redirect is itself the
-    // defect: it walks the client off the only node that can accept the write.
-    let node_zero_address = harness
-        .node(0)
+    // Where a client asking for node 0 actually ends up.
+    let leader_address = harness
+        .node(leader)
         .tcp_addr()
-        .expect("node 0 exposes a TCP endpoint")
+        .expect("the leader exposes a TCP endpoint")
         .to_string();
     let on_node_zero = harness
         .root_client_for_node(0)
         .await
         .expect("root client on node 0");
     let landed_on = on_node_zero.get_connection_info().await.server_address;
-    println!(
-        "client dialed node 0 ({node_zero_address}); it settled on {landed_on}; \
-         metadata leader is node {leader}"
+
+    // Asserted, not printed. `root_client_for_node` signs in, and sign-in ends
+    // in the SDK's leader check, so this client is on the LEADER whatever node
+    // it dialed. Pinning that down is what stops the send below from being
+    // read as "node 0 accepted it": nothing here ever reaches node 0, and a
+    // reader who assumes otherwise draws the opposite conclusion from a pass.
+    assert_eq!(
+        landed_on, leader_address,
+        "a signed-in client follows the roster's leader, so one dialing node 0 must settle on \
+         node {leader}; landing anywhere else means the redirect did not run and the send below \
+         is testing a different node than this test claims"
     );
 
-    // Assertion 1: node 0 accepts. Proves a partition primary exists, so the
-    // failure mode is NOT "partition groups never elect". Retried briefly so a
-    // post-CreateTopic materialisation window is not mistaken for the defect.
-    let accepted_by_node_zero =
-        send_once(&on_node_zero, &stream_id, &topic_id, &partitioning).await;
-    assert!(
-        accepted_by_node_zero.is_ok(),
-        "a client dialing node 0 (the view-0 primary of this fresh partition group) must land on \
-         a node that accepts the write; it settled on {landed_on} and got \
-         {accepted_by_node_zero:?}"
-    );
-
-    // Assertion 2: the advertised leader accepts. This is the contract a
-    // leader-aware SDK relies on, and the one the live cluster violated.
-    let accepted_by_leader = send_once(&setup, &stream_id, &topic_id, &partitioning).await;
+    // The contract: the node the roster advertises accepts a partition write.
+    // Seeded from the metadata view the group's primary IS that node; left at
+    // view 0 it would be replica 0, and every client would be steered away
+    // from the only node that could accept.
+    let accepted_by_leader = send_once(&on_node_zero, &stream_id, &topic_id, &partitioning).await;
     assert!(
         accepted_by_leader.is_ok(),
         "node {leader} is advertised as the cluster leader, so a partition write sent there must \
@@ -177,8 +174,8 @@ async fn given_metadata_view_moved_when_producing_to_a_fresh_topic_should_reach_
 
 /// One send, bounded. The SDK replays `TransientNotAccepted` and then hands the
 /// request to its failover path, which re-reads the same roster and returns to
-/// the same wrong node, so an unbounded send never returns while the defect is
-/// present. The timeout turns that livelock into a readable failure.
+/// the same wrong node, so with the defect present the send burns its whole
+/// budget. The timeout fires before the SDK's own and names which it was.
 async fn send_once(
     client: &IggyClient,
     stream_id: &Identifier,

@@ -1151,6 +1151,20 @@ pub struct VsrRestore<'a> {
     /// View inferred from the last journaled prepare, consulted only when no
     /// durable record exists; `log_view` cannot be inferred and stays 0.
     pub view_fallback: Option<u32>,
+    /// Starting `(view, log_view)` for a group with NO history of its own,
+    /// consulted only when neither of the two above applies.
+    ///
+    /// Sets `log_view` as well as `view`, unlike `view_fallback`: the log is
+    /// empty, so there is no history to misattribute to the view, and a
+    /// primary whose `log_view` lags its `view` is treated as mid-transition
+    /// and answers no `RequestStartView` probe (see
+    /// [`Self::handle_request_start_view`]) - it would hold its own group's
+    /// probes open forever.
+    ///
+    /// Deliberately NOT marked superblock-durable: nothing has been written
+    /// yet, and claiming otherwise would let a restart resume a view no record
+    /// holds. The group persists on its first tick instead.
+    pub seed_view: Option<u32>,
     /// Non-zero boot incarnation; `None` keeps the default.
     pub incarnation: Option<u128>,
     pub join: JoinMode,
@@ -1230,6 +1244,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             consensus.mark_superblock_durable(view, log_view);
         } else if let Some(view) = restore.view_fallback {
             consensus.set_view(view);
+        } else if let Some(view) = restore.seed_view {
+            tracing::info!(
+                group,
+                view,
+                "seeded a group with no history of its own into the current view"
+            );
+            consensus.set_view(view);
+            consensus.set_log_view(view);
         }
         match restore.join {
             JoinMode::Init => consensus.init(),

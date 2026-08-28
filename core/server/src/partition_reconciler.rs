@@ -267,14 +267,39 @@ impl ReconcilerCtx {
         }
     }
 
-    /// The view a partition group materialised now should start in, or `None`
-    /// while the metadata plane has published no view yet.
+    /// The view a partition group materialised now should start in.
+    ///
+    /// `None` means this replica has no opinion yet, NOT "start at view 0":
+    /// shard 0 publishes [`METADATA_VIEW_UNKNOWN`] before its first tick and
+    /// for as long as it has ceded a recovered view's primaryship. Treating
+    /// that as 0 is how a single replica of a group ends up view-0 while its
+    /// peers are at V, which is the split this seed exists to close. Callers
+    /// on a replicated group defer materialising instead; see
+    /// [`Self::partition_view_seed_ready`].
+    ///
+    /// # Panics
+    /// If the published view does not fit a `u32`. The publisher writes
+    /// `u64::from(consensus.view())` or the sentinel handled above, so a value
+    /// past `u32::MAX` is memory corruption, not a state a retry can clear.
+    /// Silently falling back to `None` here would restore the view-0 start
+    /// this change exists to remove, on the one path nobody would look at.
     fn partition_view_seed(&self) -> Option<u32> {
         let view = self.metadata_view.load(Ordering::Relaxed);
         if view == METADATA_VIEW_UNKNOWN {
             return None;
         }
-        u32::try_from(view).ok()
+        Some(u32::try_from(view).expect("published metadata view must fit a u32"))
+    }
+
+    /// Whether a group may be materialised now.
+    ///
+    /// A solo replica is always ready: with one replica every view names it
+    /// primary, so there is no peer to disagree with and no split to cause.
+    /// A replicated group waits until this replica knows the metadata view,
+    /// so it cannot seed a view-0 group underneath peers that already moved.
+    /// The wait is one reconcile pass; shard 0 republishes every 100ms.
+    fn partition_view_seed_ready(&self) -> bool {
+        self.replica_count <= 1 || self.partition_view_seed().is_some()
     }
 
     fn is_backed_off(&self, ns: IggyNamespace, cause: FailureCause, now: Instant) -> bool {
@@ -676,6 +701,18 @@ async fn reconcile_additions(
         if ctx.is_backed_off(ns, FailureCause::Add, now) {
             counters.backoff_skipped += 1;
             continue;
+        }
+
+        // Materialising before this replica knows the metadata view would seed
+        // the group at view 0 under peers that already elected past it. Defer
+        // the whole pass rather than the namespace: every group on this shard
+        // reads the same view, so none of them can be seeded correctly yet.
+        if !ctx.partition_view_seed_ready() {
+            debug!(
+                shard = shard_id,
+                "metadata view not published yet; deferring partition materialisation"
+            );
+            break;
         }
 
         // Resolve the shared stats `Arc` only for namespaces actually
