@@ -1297,6 +1297,33 @@ impl Simulator {
     /// `--crash-primary`, so a crash-triggered view change can run mid-run and this
     /// may name a stale or crashed primary. Callers needing a real answer run
     /// `workload::oracle::settle_to_stable_view` first.
+    /// The replica the METADATA plane currently names primary, read from the
+    /// first live replica that owns a metadata consensus.
+    ///
+    /// The twin of [`Self::primary_index`], which answers for a partition
+    /// group. The two planes count views independently, so they agree only
+    /// while their views are congruent mod the replica count, and a group
+    /// materialised after a metadata election is the case where they part.
+    ///
+    /// Test-only. The workload oracle deliberately does NOT assert the two
+    /// planes agree: that holds for a group at the view it was seeded in, and
+    /// a later election on either plane parts them again with nothing to pull
+    /// them back, so a live invariant would fire on correct runs.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn metadata_primary_index(&self) -> Option<u8> {
+        (0..self.replica_count)
+            .filter(|replica_idx| !self.crashed.contains(replica_idx))
+            .find_map(|replica_idx| {
+                let consensus = self.replicas[usize::from(replica_idx)].shards[0]
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()?;
+                Some(consensus.primary_index(consensus.view()))
+            })
+    }
+
     #[must_use]
     pub(crate) fn primary_index(&self, namespace: IggyNamespace) -> Option<u8> {
         (0..self.replica_count)
@@ -1355,12 +1382,24 @@ fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace, restore
     // a second materialisation with no restart between would otherwise resurrect a
     // log the live partition has moved past.
     let retained = replica.partition_logs.borrow_mut().remove(&namespace);
+    // The view this replica's metadata plane is in, which is what a fresh
+    // group seeds from. Production reads it off the roster value shard 0
+    // publishes; here shard 0's consensus is right there. Without it the
+    // simulator materialises every group at view 0 and can never produce the
+    // plane split that costs production its writes.
+    let metadata_view = replica.shards[0]
+        .plane
+        .metadata()
+        .consensus
+        .as_ref()
+        .map(consensus::VsrConsensus::view);
     replica.shards[usize::from(owner)].init_partition(
         namespace,
         Some(superblock),
         recovered_state,
         retained,
         restore_frontier,
+        metadata_view,
     );
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -1473,6 +1512,99 @@ mod tests {
             got_reply_after,
             "expected reply from new primary after view change"
         );
+    }
+
+    /// A partition group materialised AFTER a metadata election starts in the
+    /// metadata plane's view, so both planes name the same primary.
+    ///
+    /// Left at view 0 the group names replica 0 whatever the metadata plane has
+    /// got to. Nothing on the wire can express a partition primary
+    /// (`ClusterNode` carries one cluster-wide `role`) and partition ops route
+    /// within a node rather than to a peer, so the node clients are sent to
+    /// refuses every write to that group and the SDK burns its budget
+    /// rediscovering the same wrong answer.
+    ///
+    /// The simulator reaches this where the integration tests cannot: no
+    /// client, no transport, just the two planes' views read directly. It is
+    /// also the only place the SEED itself is asserted rather than inferred
+    /// from a send succeeding.
+    #[test]
+    fn given_a_metadata_election_when_a_group_materialises_should_seed_the_metadata_view() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+
+        // Move the metadata plane off view 0 by crashing its view-0 primary.
+        // Nothing has been written, so no partition group exists to move with
+        // it: the group created below is genuinely fresh.
+        sim.replica_crash(0);
+        for _ in 0..800 {
+            sim.step();
+        }
+
+        let metadata_primary = sim
+            .metadata_primary_index()
+            .expect("a live replica must own metadata consensus");
+        assert_ne!(
+            metadata_primary, 0,
+            "crashing replica 0 must have moved the metadata plane off view 0; with the \
+             primary back at replica 0 both planes agree and the split cannot show"
+        );
+
+        // Materialise a brand-new group. Every live replica seeds from its own
+        // metadata view, which is the value production reads off the roster.
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+
+        let partition_primary = sim
+            .primary_index(namespace)
+            .expect("the group must exist on a live replica after materialisation");
+        assert_eq!(
+            partition_primary, metadata_primary,
+            "a group materialised after a metadata election must name the same primary as the \
+             metadata plane; seeded at view 0 instead it names replica 0, which no client can \
+             be routed to"
+        );
+
+        // Per replica, not just the aggregate: the seed is read locally on each
+        // one, so a single replica left at view 0 would still elect itself
+        // primary of that group while its peers disagree, and the aggregate
+        // read above would not see it.
+        for replica_idx in 0..replica_count {
+            if sim.is_crashed(replica_idx) {
+                continue;
+            }
+            let state = sim
+                .partition_consensus_state(usize::from(replica_idx), namespace)
+                .expect("a live replica must host the freshly materialised group");
+            // Compared as primaries, not as view numbers: the two coincide only
+            // while the view is below `replica_count`, and pinning the view
+            // itself would make this fail on a second election for no reason.
+            let seeded_primary = u8::try_from(state.view % u32::from(replica_count))
+                .expect("a value modulo replica_count fits the u8 replica_count");
+            assert_eq!(
+                seeded_primary, metadata_primary,
+                "replica {replica_idx} seeded its group at view {}, naming replica \
+                 {seeded_primary} primary while the metadata plane names {metadata_primary}; \
+                 replicas that seed different views disagree on their own group's primary",
+                state.view
+            );
+        }
     }
 
     /// A replica that advanced its view, persisted it through the superblock gate,
@@ -2389,7 +2521,7 @@ mod tests {
             executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
             let grow = Rc::clone(&sim.replicas[0].shards[0]);
             executor.spawn(async move {
-                grow.init_partition(ns_grow, None, None, None, false);
+                grow.init_partition(ns_grow, None, None, None, false, None);
             });
             executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
         }))
@@ -2424,7 +2556,7 @@ mod tests {
         executor.run_until_stalled(POLL_BUDGET);
         let grow = Rc::clone(&sim.replicas[0].shards[0]);
         executor.spawn(async move {
-            grow.init_partition(ns_grow, None, None, None, false);
+            grow.init_partition(ns_grow, None, None, None, false, None);
         });
         executor.run_until_stalled(POLL_BUDGET);
 
