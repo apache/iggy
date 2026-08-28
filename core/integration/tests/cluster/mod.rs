@@ -27,3 +27,4 @@ mod multi_shard_partition_convergence;
 mod partition_primary_routing;
 mod partition_state_transfer;
 mod register_forwarding;
+mod staggered_bootstrap;
