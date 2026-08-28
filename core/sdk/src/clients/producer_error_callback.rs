@@ -33,7 +33,7 @@ use tracing::error;
 ///
 /// # What to do with it
 ///
-/// [`messages`](Self::messages) is a batch that failed to commit to the server and therefore can be may again.
+/// [`messages`](Self::messages) is a batch that failed to commit to the server and therefore may be sent again.
 /// [`stream`](Self::stream), [`topic`](Self::topic) and [`partitioning`](Self::partitioning) are the
 /// destination it was meant for. Note, that configured retries at the dispatcher are already spent at this point.
 /// A callback can resend it, park it in a dead letter store, write it to disk, or raise an
@@ -41,8 +41,6 @@ use tracing::error;
 /// loses every message a background write fails on. However, you can also
 /// implement the [`ErrorCallback`] trait yourself and come up with your own logic that defines
 /// what should be done with failures.
-///
-/// todo(haubur): Make a list of all possible error `cause`s or guide the user how to match-handle errors.
 ///
 /// [`background()`]: crate::clients::producer_builder::IggyProducerBuilder::background
 /// [`direct()`]: crate::clients::producer_builder::IggyProducerBuilder::direct
@@ -53,6 +51,7 @@ use tracing::error;
 /// [`shutdown()`]: crate::clients::producer::IggyProducer::shutdown
 /// [`BackgroundConfig::error_callback`]: crate::clients::producer_config::BackgroundConfig::error_callback
 /// [`ProducerDispatcher`]: crate::clients::producer_dispatcher::ProducerDispatcher
+/// [`Shard`]: crate::clients::producer_sharding::Shard
 #[derive(Debug)]
 pub struct ErrorCtx {
     pub cause: Box<IggyError>,

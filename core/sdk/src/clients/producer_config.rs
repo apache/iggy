@@ -32,10 +32,9 @@ use std::sync::Arc;
 /// [`IggyError::BackgroundSendBufferOverflow`]: iggy_common::IggyError::BackgroundSendBufferOverflow
 #[derive(Debug, Clone)]
 pub enum BackpressureMode {
-    /// Waits for as long as it takes for the budget to free up. The default.
+    /// Waits for as long as it takes for the budget to free up (default).
     ///
-    /// Paces the caller to the rate the workers write at without ever dropping a batch, at the cost
-    /// of a send that waits indefinitely while the server refuses writes.
+    /// Never drops a batch, at the cost of a send that waits indefinitely while the server refuses writes.
     Block,
     /// Waits for the given duration, then fails the send with
     /// [`IggyError::BackgroundSendTimeout`](iggy_common::IggyError::BackgroundSendTimeout).
@@ -207,7 +206,7 @@ pub struct BackgroundConfig {
 ///
 /// A send that fails part way through returns [`IggyError::ProducerSendFailed`], where `committed`
 /// holds the confirmations of the requests that went through and `failed` the tail that did not, so
-/// resending `failed` completes the send.
+/// resending `failed` manually completes the send.
 ///
 /// # Examples
 ///
@@ -234,22 +233,20 @@ pub struct BackgroundConfig {
 /// [`IggyError::ProducerSendFailed`]: iggy_common::IggyError::ProducerSendFailed
 #[derive(Clone, Builder)]
 pub struct DirectConfig {
-    /// Maximum number of messages packed into one request.
+    /// Maximum number of messages per one request.
     ///
     /// A send carrying more than this is split into consecutive requests of this size, each awaited
-    /// before the next one starts, so a batch of 2500 becomes three requests at the default. A
+    /// before the next one starts. So a batch of 2500 becomes three requests at the default. A
     /// failure therefore leaves the requests before it written.
     ///
-    /// `0` means the client's ceiling of 1,000,000 messages per request.
+    /// `0` limits to 1,000,000 messages per request.
     #[builder(default = 1000)]
     pub batch_length: u32,
     /// Smallest gap between two requests of this producer.
     ///
-    /// A send waits out whatever is left of this interval since the last request before issuing its
-    /// first one, which paces a producer sending in a tight loop. It does not space out the requests
-    /// within one send. The default of zero does not wait at all.
-    ///
-    /// Note that [`IggyDuration::from`] reads a plain number as **microseconds**.
+    /// A send waits out whatever is left of this interval since the last send request.
+    /// Note, if messages are configured to be chunked (`batch_length`) the linger time does not delay
+    /// the send of those chunks. The default of zero does not wait at all.
     #[builder(default = IggyDuration::from(0))]
     pub linger_time: IggyDuration,
 }

@@ -31,16 +31,18 @@ use tokio::task::JoinHandle;
 /// [`IggyProducerBuilder::background`](crate::clients::producer_builder::IggyProducerBuilder::background).
 ///
 /// The dispatcher owns the background workers responsible for writing messages (the [`Shard`]s)
-/// and coordinates the memory budget that puts an upper bound on the number of message bytes (`max_bytes_size`)
-/// it handles simultaneously and the limit on the number of requests that are allowed to be in-flight per `Shard` (`max_in_flight`).
-/// todo(haubur): link both to the BackgroundConfig.
+/// and coordinates two limits, both configured on [`BackgroundConfig`]:
+/// [`max_buffer_size`](BackgroundConfig::max_buffer_size), the upper bound on the message bytes it
+/// holds at once, and [`max_in_flight`](BackgroundConfig::max_in_flight), the upper bound on the
+/// requests being written at once across all of its workers.
 ///
 /// A background send is a dispatch of messages to a [`Shard`]. Dispatching means, that the messages are send down the
 /// sending end of a channel, where the receiver is listened on a [`Shard`] worker.
 /// So a batch is queued and the write happens later, on one of the [`Shard`] workers this type owns.
 /// Consequently, errors from writes surface on `Shard`s which channel those errors back to the dispatcher's callback
-/// (comp. [`Self::new()`]. These errors are logged with the default [`LogErrorCallback`], but other implementations are possible through
-/// todo(haubur): link to ErrorCallback trait.
+/// (comp. [`Self::new()`]). These errors are logged with the default [`LogErrorCallback`], but other
+/// implementations of the [`ErrorCallback`] trait can be set through
+/// [`BackgroundConfig::error_callback`].
 ///
 /// Which worker a batch lands on, and what that means for ordering, is described on
 /// [`IggyProducer`](crate::clients::producer::IggyProducer).
@@ -133,8 +135,9 @@ use tokio::task::JoinHandle;
 ///
 /// ## In-flight Limit
 ///
-/// You can configure the `ProducerDispatcher` with a maximum number of requests that are allowed to be handled
-/// concurrently per `Shard` through [`max_in_flight`]. The default equals to one. Note, that you risk losing the ordering of batches
+/// You can configure the `ProducerDispatcher` with a maximum number of requests that are allowed to be
+/// written concurrently through [`BackgroundConfig::max_in_flight`]. That budget is shared by every
+/// worker rather than granted per worker, and its default is one. Note, that you risk losing the ordering of batches
 /// if you increase that number. For adjacent messages split in two batches sending of the first batch might fail and trigger a retry.
 /// However, that batch might be raced by the second batch should it succeed immediately.
 ///
@@ -143,6 +146,9 @@ use tokio::task::JoinHandle;
 /// [`shutdown()`](Self::shutdown) is what makes the queued batches observable. It stops the workers,
 /// waits for their last flush, and only then returns. Dropping the dispatcher instead ends the
 /// workers wherever they are and discards whatever they still hold.
+///
+/// [`ErrorCallback`]: crate::clients::producer_error_callback::ErrorCallback
+/// [`LogErrorCallback`]: crate::clients::producer_error_callback::LogErrorCallback
 pub struct ProducerDispatcher {
     shards: Vec<Shard>,
     config: Arc<BackgroundConfig>,
@@ -153,20 +159,25 @@ pub struct ProducerDispatcher {
 }
 
 impl ProducerDispatcher {
-    /// Spawns the [`Shards`], i.e. the workers that can write messages to the server.
+    /// Spawns the [`Shard`]s, i.e. the workers that can write messages to the server.
     ///
     /// The `ProducerDispatcher` spawns and owns the `Shards` on which the write load
-    /// is distributed. Which of the `num_shards` is picked to write is decided
-    /// by the sharding strategy. todo(haubur): add link to sharding config.
+    /// is distributed. Which of the [`BackgroundConfig::num_shards`] is picked to write is decided
+    /// by [`BackgroundConfig::sharding`].
     ///
     /// Additionally, a dispatcher starts a task that listens for error callbacks. So should a `Shard` fail
     /// to write some messages (including retries), that failure is not received on the same task,
-    /// but hits the error callback. todo(haubur): add link to ErrorCallback trait.
+    /// but hits the [`ErrorCallback`] set as [`BackgroundConfig::error_callback`].
     ///
-    /// To cap the amount of data a dispatcher handles two limits are initialized: the
-    /// [`BackgroundConfig::max_in_flight`] and [`BackgroundConfig::max_buffer_size`] semaphores.
-    /// Both are passed to the `Shard`s and therefore hold for the entire producer, rather than per worker.
-    /// todo(haubur): how do they relate?
+    /// To cap the amount of data a dispatcher handles two semaphores are initialized from
+    /// [`BackgroundConfig::max_buffer_size`] and [`BackgroundConfig::max_in_flight`]. Both are shared
+    /// by every `Shard` and therefore hold for the entire producer, rather than per worker. They
+    /// count different things at different points of a batch's life: `max_buffer_size` is charged in
+    /// bytes by [`dispatch()`](Self::dispatch) before the batch is queued and released once it has
+    /// been written, so it bounds queued and in-flight bytes together, while `max_in_flight` is taken
+    /// as one permit by the worker that is about to write and released when that request returns, so
+    /// it bounds concurrent requests and says nothing about their size. A batch therefore has to pass
+    /// the byte budget to enter a queue, and to take a request slot to leave it.
     ///
     /// # Examples
     ///
@@ -237,6 +248,8 @@ impl ProducerDispatcher {
     /// );
     /// # }
     /// ```
+    ///
+    /// [`ErrorCallback`]: crate::clients::producer_error_callback::ErrorCallback
     pub fn new(core: Arc<impl ProducerCoreBackend>, config: BackgroundConfig) -> Self {
         let num_shards = if config.num_shards == 0 {
             1

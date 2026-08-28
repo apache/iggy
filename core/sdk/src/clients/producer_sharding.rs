@@ -156,9 +156,8 @@ impl ShardMessageWithPermit {
 /// Each shard owns a task that builds the batches from messages routed to it, merges adjacent batches that share a
 /// destination, and writes them out through [`ProducerCoreBackend::send_internal`].
 ///
-/// Batches are enqueued with [`Shard::send`], which returns once the batch is on the
-/// channel. Shards are created and owned by the dispatcher, so they are rarely handled
-/// directly.
+/// The dispatcher enqueues a batch by sending it on that channel, which returns once the batch is
+/// queued. Shards are created and owned by the dispatcher, so they are rarely handled directly.
 ///
 /// # Worker loop
 ///
@@ -176,6 +175,8 @@ impl ShardMessageWithPermit {
 ///   queued, flushes once, then ends the loop.
 ///   Note, should the [`ProducerDispatcher`] be dropped instead of gracefully shutdown, already enqueued messages
 ///   will be dropped and lost.
+///
+/// [`ProducerDispatcher`]: crate::clients::producer_dispatcher::ProducerDispatcher
 pub struct Shard {
     tx: flume::Sender<ShardMessageWithPermit>,
     closed: Arc<AtomicBool>,
@@ -191,7 +192,7 @@ impl Shard {
         err_sender: flume::Sender<ErrorCtx>,
         mut stop_rx: broadcast::Receiver<()>,
     ) -> Self {
-        let (tx, rx) = flume::bounded::<ShardMessageWithPermit>(256); //todo(haubur): Why hard code to 256?
+        let (tx, rx) = flume::bounded::<ShardMessageWithPermit>(256);
         let closed = Arc::new(AtomicBool::new(false));
 
         let closed_clone = closed.clone();
