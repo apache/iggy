@@ -6531,12 +6531,20 @@ where
                     if !consensus_normal || consensus_view != session.view {
                         return true;
                     }
+                    // Floored at the LIVE commit point, like `complete_repair`:
+                    // committing past `commit_to_op` evicts exactly the suffix
+                    // headers this shape would look for, and ops at or below
+                    // `commit_min` are committed and applied, a monotone fact
+                    // the flush cannot erase.
                     let fetch_complete = session.fetch_to_op <= session.commit_to_op
                         || partition
                             .log
                             .journal()
                             .inner
-                            .repaired_window_shape(session.commit_to_op, session.fetch_to_op)
+                            .repaired_window_shape(
+                                session.commit_to_op.max(commit_min),
+                                session.fetch_to_op,
+                            )
                             .complete;
                     commit_min >= session.commit_to_op && fetch_complete
                 });

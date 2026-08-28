@@ -4648,12 +4648,21 @@ where
         // that reached the requested frontier closes the session; anything
         // less keeps it armed and the stall retry re-requests the remains
         // (`commit_min + 1..`), converging over rounds.
+        // The residency check starts at the LIVE commit point, not the
+        // session's snapshotted one: delivering the suffix bodies is what
+        // lets the group commit past `commit_to_op`, and the `commit_journal`
+        // above then evicts exactly those headers. Judged from
+        // `commit_to_op`, a fully successful repair would report itself
+        // incomplete forever, pin the session, and block every later re-arm
+        // until a view change. Ops at or below `commit_min` are committed and
+        // applied, a monotone fact the flush cannot erase, so they need no
+        // resident header to count as fetched.
         let fetch_complete = session.fetch_to_op <= session.commit_to_op
             || self
                 .log
                 .journal()
                 .inner
-                .repaired_window_shape(session.commit_to_op, session.fetch_to_op)
+                .repaired_window_shape(session.commit_to_op.max(commit_min), session.fetch_to_op)
                 .complete;
         let done = commit_min >= session.commit_to_op && fetch_complete;
         if done {
@@ -6945,6 +6954,58 @@ mod tests {
         assert!(partition.repair.is_none());
     }
 
+    /// A one-message `SendMessages` prepare for `op`, journaled through the
+    /// replicated-apply path (which stamps offsets and re-checksums), with the
+    /// sequencer advanced the way `on_replicate` does after a real append.
+    pub(super) async fn journal_send_batch(partition: &mut IggyPartition<IggyMessageBus>, op: u64) {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let record = build_segment_record(namespace, 0);
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let total = header_size + record.len();
+        let mut message = Message::<PrepareHeader>::new(total);
+        message.as_mut_slice()[header_size..].copy_from_slice(&record);
+        let message = message.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::SendMessages;
+            header.op = op;
+            header.timestamp = op;
+            header.group = namespace.inner();
+            header.size = u32::try_from(total).expect("prepare size fits u32");
+        });
+        partition
+            .apply_replicated_operation(message)
+            .await
+            .expect("journal send batch");
+        partition.consensus().sequencer().set_sequence(op);
+    }
+
+    #[compio::test]
+    async fn given_committed_suffix_evicted_when_completing_repair_should_close_the_session() {
+        // A successful suffix repair is what lets the group commit past
+        // `commit_to_op`, and the commit walk's flush then evicts exactly the
+        // suffix headers. The completion verdict must survive that eviction:
+        // judged from resident headers alone, the fully successful session
+        // would report itself incomplete forever, stay armed, and block every
+        // later re-arm for this partition until a view change.
+        let mut partition = test_partition();
+        for op in 1..=3 {
+            journal_send_batch(&mut partition, op).await;
+        }
+        partition.consensus().advance_commit_max(3);
+        partition.repair = Some(armed_fetch_session(2, 3, 0, Some(0)));
+        partition.commit_journal(&repair_config()).await;
+        let _ = partition.log.journal().inner.evict_prefix(3).await;
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::Done);
+        assert!(
+            partition.repair.is_none(),
+            "a fully committed suffix fetch must not stay armed after its \
+             headers are flushed out of the resident journal"
+        );
+    }
+
     #[compio::test]
     async fn given_suffix_fetch_when_its_view_is_discarded_should_clear_the_session() {
         let mut partition = test_partition();
@@ -7569,7 +7630,7 @@ mod retention_tests {
 
 #[cfg(test)]
 mod purge_floor_tests {
-    use super::tests::{build_segment_record, repair_config, test_partition};
+    use super::tests::{build_segment_record, journal_send_batch, repair_config, test_partition};
     use super::*;
     use iggy_binary_protocol::{Command, WireConsumer, WireEncode};
 
@@ -7588,31 +7649,6 @@ mod purge_floor_tests {
         let mut partition = test_partition();
         partition.set_partition_dir(dir.to_string_lossy().into_owned());
         (partition, dir)
-    }
-
-    /// A one-message `SendMessages` prepare for `op`, journaled through the
-    /// replicated-apply path (which stamps offsets and re-checksums), with the
-    /// sequencer advanced the way `on_replicate` does after a real append.
-    async fn journal_send_batch(partition: &mut IggyPartition<IggyMessageBus>, op: u64) {
-        let namespace = IggyNamespace::new(1, 1, 0);
-        let record = build_segment_record(namespace, 0);
-        let header_size = std::mem::size_of::<PrepareHeader>();
-        let total = header_size + record.len();
-        let mut message = Message::<PrepareHeader>::new(total);
-        message.as_mut_slice()[header_size..].copy_from_slice(&record);
-        let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command::Prepare;
-            header.operation = Operation::SendMessages;
-            header.op = op;
-            header.timestamp = op;
-            header.group = namespace.inner();
-            header.size = u32::try_from(total).expect("prepare size fits u32");
-        });
-        partition
-            .apply_replicated_operation(message)
-            .await
-            .expect("journal send batch");
-        partition.consensus().sequencer().set_sequence(op);
     }
 
     /// A `StoreConsumerOffset` prepare for `op`, journaled and staged through

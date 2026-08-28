@@ -177,7 +177,13 @@ impl BinaryTransport for QuicClient {
             .await
             {
                 Ok(result) => result,
-                Err(_) => Err(IggyError::TransientNotAccepted),
+                // The frame is on the wire with the reply unread, so the
+                // outcome is unknown: it may be admitted, replicated, and
+                // committed. `TransientNotAccepted` here would license the
+                // walk to re-issue the payload under a fresh session the
+                // server's dedup fence cannot match. `TransientNotCommitted`
+                // states the truth and also ends the hop chain.
+                Err(_) => Err(IggyError::TransientNotCommitted),
             };
             let mut roster_walk: Option<RosterWalk> = None;
             // Once the walk starts it keeps walking: a leader recheck between
@@ -272,7 +278,10 @@ impl BinaryTransport for QuicClient {
                 .await
                 {
                     Ok(result) => result,
-                    Err(_) => Err(IggyError::TransientNotAccepted),
+                    // On the wire, reply unread: unknown outcome. See the
+                    // matching arm above; a fabricated not-admitted would
+                    // re-issue a possibly committed write on the next hop.
+                    Err(_) => Err(IggyError::TransientNotCommitted),
                 };
             }
         }
