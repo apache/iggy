@@ -295,8 +295,11 @@ impl TestHarness {
     /// which is what production does (nothing in the server's bootstrap waits
     /// for peers) and what `start` deliberately does not.
     ///
-    /// Readiness is the login probe alone. The all-nodes mesh gate `start`
-    /// uses cannot apply here by construction, see [`Self::wait_for_login_ready`].
+    /// Readiness is a root login succeeding, not the all-nodes mesh gate
+    /// `start` uses: `mesh_expected_peers` counts every CONFIGURED peer, so a
+    /// deliberately partial cluster never reports a complete mesh however
+    /// healthy its quorum is. A login is a replicated `Register` and cannot
+    /// commit without quorum, which is the stronger signal anyway.
     ///
     /// Dependents (MCP, connectors runtime) and the configured clients are NOT
     /// started: their addresses resolve against nodes this call deliberately

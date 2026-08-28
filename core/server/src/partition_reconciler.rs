@@ -230,7 +230,7 @@ pub struct ReconcilerCtx {
     /// The metadata plane's view, published by shard 0 and shared with every
     /// shard's roster. Read when materialising a partition so its consensus
     /// group starts in the same view the roster's advertised leader comes
-    /// from; [`METADATA_VIEW_UNKNOWN`] until the first publish.
+    /// from; the unknown-view sentinel until the first publish.
     pub metadata_view: Arc<AtomicU64>,
     failure_state: RefCell<AHashMap<(IggyNamespace, FailureCause), FailureRecord>>,
     /// `Streams::revision` observed at the end of the last pass that fully
@@ -270,7 +270,7 @@ impl ReconcilerCtx {
     /// The view a partition group materialised now should start in.
     ///
     /// `None` means this replica has no opinion yet, NOT "start at view 0":
-    /// shard 0 publishes [`METADATA_VIEW_UNKNOWN`] before its first tick and
+    /// shard 0 publishes the unknown-view sentinel before its first tick and
     /// for as long as it has ceded a recovered view's primaryship. Treating
     /// that as 0 is how a single replica of a group ends up view-0 while its
     /// peers are at V, which is the split this seed exists to close. Callers
@@ -461,6 +461,12 @@ struct PassCounters {
     /// has not applied yet. Counted so the pass does not arm the fast-skip
     /// while work is in flight; applying it bumps no revision.
     already_staged: usize,
+    /// Materialisations held back because this replica has no metadata view to
+    /// seed from yet. Counted so the pass does not arm the fast-skip: shard 0
+    /// publishing a view bumps no `Streams::revision` and does not wake the
+    /// reconciler, so an armed skip would strand every deferred group until
+    /// some unrelated commit happened to bump the revision.
+    view_unpublished: usize,
 }
 
 impl PassCounters {
@@ -477,6 +483,7 @@ impl PassCounters {
             + self.deferred
             + self.parked_reclaimed
             + self.already_staged
+            + self.view_unpublished
     }
 }
 
@@ -712,6 +719,10 @@ async fn reconcile_additions(
                 shard = shard_id,
                 "metadata view not published yet; deferring partition materialisation"
             );
+            // Every remaining namespace reads the same view, so none of them
+            // can be seeded either. Counted before breaking so the pass does
+            // not read as converged, which would fast-skip the retry.
+            counters.view_unpublished += 1;
             break;
         }
 
@@ -1725,6 +1736,30 @@ mod tests {
         ))
     }
 
+    /// [`make_ctx`] for a REPLICATED group, sharing `metadata_view` with the
+    /// caller so a test can publish a view mid-run.
+    ///
+    /// Replica count is what decides whether materialisation waits on a
+    /// published view: a solo replica is primary in every view, so there is no
+    /// peer to disagree with and nothing to wait for. Every other test here
+    /// runs solo and takes that short circuit.
+    fn make_cluster_ctx(
+        shard: Rc<TestShard>,
+        total_shards: u16,
+        config: Rc<ServerConfig>,
+        metadata_view: Arc<AtomicU64>,
+    ) -> Rc<ReconcilerCtx> {
+        Rc::new(ReconcilerCtx::new(
+            shard,
+            total_shards,
+            config,
+            CLUSTER_ID,
+            0,
+            3,
+            metadata_view,
+        ))
+    }
+
     /// Tests run reconcile + pump-side apply inline since no real pump exists.
     async fn reconcile_pass(ctx: &ReconcilerCtx) {
         reconcile_once(ctx).await;
@@ -2021,6 +2056,73 @@ mod tests {
     /// `CreatePartitions` on an existing topic adds new namespaces; the
     /// reconciler picks them up on the next pass without touching the
     /// partitions it already materialised.
+    /// A replicated group is NOT materialised while this replica has no
+    /// metadata view to seed from, and IS once one is published.
+    ///
+    /// Seeding is a local read: shard 0 publishes the unknown sentinel before
+    /// its first tick and for as long as it has ceded a recovered view. Taking
+    /// that for view 0 would start the group naming replica 0 underneath peers
+    /// that already elected past it, which is the split the seed exists to
+    /// close, reintroduced one replica at a time. Waiting costs one reconcile
+    /// pass; the publisher reposts every 100ms.
+    #[compio::test]
+    async fn given_no_published_metadata_view_when_reconciling_should_defer_materialisation() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-deferred");
+        seed_topic(&mux, 2, 0, "topic-deferred", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let metadata_view = Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN));
+        let ctx = make_cluster_ctx(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            Arc::clone(&metadata_view),
+        );
+
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.plane.partitions().len(),
+            0,
+            "a replicated group must not materialise before this replica knows the metadata \
+             view: seeded at 0 it names replica 0 whatever the metadata plane elected"
+        );
+
+        // The publisher posts a real view; the deferred pass now converges.
+        metadata_view.store(1, Ordering::Relaxed);
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.plane.partitions().len(),
+            1,
+            "once a view is published the deferred group must materialise on the next pass"
+        );
+    }
+
+    /// A SOLO replica never waits. It is primary in every view, so there is no
+    /// peer for it to disagree with, and blocking on a publisher that a
+    /// single-node deployment may never run would wedge materialisation
+    /// outright.
+    #[compio::test]
+    async fn given_a_solo_replica_when_no_view_is_published_should_still_materialise() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-solo");
+        seed_topic(&mux, 2, 0, "topic-solo", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.plane.partitions().len(),
+            1,
+            "a solo replica must materialise without waiting on a published metadata view"
+        );
+    }
+
     #[compio::test]
     async fn reconcile_picks_up_create_partitions_increments() {
         let tmp = TempDir::new().expect("tempdir for system path");

@@ -3567,6 +3567,7 @@ where
         recovered_state: Option<consensus::VsrState>,
         retained: Option<partitions::RetainedPartitionState>,
         restore_frontier: bool,
+        metadata_view: Option<u32>,
     ) where
         B: MessageBus + Clone,
     {
@@ -3584,26 +3585,42 @@ where
             LocalPipeline::new(),
             self.partition_consensus.clock.clone(),
         );
+        // The SAME decision `build_partition_fresh` makes, not a copy of it.
+        // This path cannot call that builder (it does real filesystem work and
+        // this runs on in-memory storage), and while the two decided
+        // separately the simulator exercised neither the metadata-view seed nor
+        // the plane split it closes. `retained` is populated only by the
+        // restart path, which is this path's evidence of a prior life.
+        let durable_view = recovered_state
+            .as_ref()
+            .map(|state| (state.view, state.log_view));
+        let restarted = retained.is_some() && self.partition_consensus.replica_count > 1;
+        let consensus::FreshGroupStart { join, seed_view } =
+            consensus::fresh_group_start(restarted, durable_view, metadata_view);
+
         // Recorded view first, exactly as the two boot paths order it: restoring
         // after `init` would advertise a view older than the recorded one.
-        if let Some(state) = recovered_state.as_ref() {
-            consensus.set_view(state.view);
-            consensus.set_log_view(state.log_view);
-            consensus.mark_superblock_durable(state.view, state.log_view);
+        if let Some((view, log_view)) = durable_view {
+            consensus.set_view(view);
+            consensus.set_log_view(log_view);
+            consensus.mark_superblock_durable(view, log_view);
+        } else if let Some(view) = seed_view {
+            consensus.set_view(view);
+            consensus.set_log_view(view);
         }
-        // Boot as `load_partition` does. A rebuilt replica cannot know the group's
-        // `(op, commit)`: the partition journal is in-memory and segments carry no
-        // op numbers. So in a cluster it joins quorum-invisible and asks the view's
-        // primary rather than resuming as a primary its peers may have replaced.
-        // Plain `init` would set `Status::Normal` and arm the commit broadcast on
-        // whichever replica is primary-by-index, the split-brain `init_as_backup`
-        // exists to prevent. A first materialisation has no view to rejoin and
-        // keeps the plain init; `retained` is populated only by the restart path.
-        if retained.is_some() && self.partition_consensus.replica_count > 1 {
-            consensus.init_as_backup();
-            consensus.begin_view_probe();
-        } else {
-            consensus.init();
+        // A rebuilt replica cannot know the group's `(op, commit)`: the
+        // partition journal is in-memory and segments carry no op numbers. So
+        // in a cluster it joins quorum-invisible and asks the view's primary
+        // rather than resuming as a primary its peers may have replaced. Plain
+        // `init` would set `Status::Normal` and arm the commit broadcast on
+        // whichever replica is primary-by-index, the split-brain
+        // `init_as_backup` exists to prevent.
+        match join {
+            consensus::JoinMode::ProbeAsBackup { .. } => {
+                consensus.init_as_backup();
+                consensus.begin_view_probe();
+            }
+            consensus::JoinMode::Init => consensus.init(),
         }
 
         let stats = Arc::new(PartitionStats::default());

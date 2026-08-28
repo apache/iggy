@@ -28,7 +28,9 @@ use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets}
 use crate::server_error::ServerError;
 use compio::fs::create_dir_all;
 use configs::server::ServerConfig;
-use consensus::{JoinMode, LocalPipeline, VsrConsensus, VsrRestore, VsrState};
+use consensus::{
+    FreshGroupStart, LocalPipeline, VsrConsensus, VsrRestore, VsrState, fresh_group_start,
+};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
     TopicRuntimeOptions,
@@ -597,22 +599,12 @@ pub async fn build_partition_fresh(
     // peer, byte-identical by the deterministic-roll/replicated-ciphertext
     // design. A truly fresh create keeps the plain init: every group needs
     // its view-0 primary to exist.
-    let join = if restarted {
-        JoinMode::ProbeAsBackup {
-            await_state_transfer: false,
-        }
-    } else {
-        JoinMode::Init
-    };
-    // Only a plain `Init` may be seeded. A probing backup must sit at or below
-    // the group's real view for the primary's `StartView` to move it forward;
-    // seeded above it, the probe reply reads as stale and is dropped, and the
-    // replica never rejoins. The probe exists precisely to learn the view, so
-    // there is nothing for a seed to add there.
-    let seed_view = match join {
-        JoinMode::Init => view_seed,
-        JoinMode::ProbeAsBackup { .. } => None,
-    };
+    let durable_view = recovered_state
+        .as_ref()
+        .map(|state| (state.view, state.log_view));
+    // Shared with the simulator's `init_partition`, which cannot call this
+    // builder; see `fresh_group_start`.
+    let FreshGroupStart { join, seed_view } = fresh_group_start(restarted, durable_view, view_seed);
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
@@ -626,9 +618,7 @@ pub async fn build_partition_fresh(
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
         VsrRestore {
             timers: &timers,
-            durable_view: recovered_state
-                .as_ref()
-                .map(|state| (state.view, state.log_view)),
+            durable_view,
             view_fallback: None,
             // Both planes pick their primary as `view % replica_count` from
             // their OWN view counter. A group left at view 0 while the
