@@ -40,7 +40,7 @@ use consensus::{
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
     ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
     build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
-    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repaired_frontier_update,
     replicate_frozen_to_next_in_chain, replicate_preflight, restamp_prepare_view,
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
@@ -4447,21 +4447,18 @@ where
         // cannot walk. A dropped frame stalls the frontier here; the stall
         // retry refills the hole and the next apply resumes the advance
         // (walking over ops that were journaled out of order meanwhile).
-        let mut frontier = self.consensus().sequencer().current_sequence();
-        while self
-            .log
-            .journal()
-            .inner
-            .header_by_op(frontier + 1)
-            .is_some()
-        {
-            frontier += 1;
-        }
-        let consensus = self.consensus();
-        if frontier > consensus.sequencer().current_sequence() {
+        // The checksum moves only with the frontier and is read from the
+        // journal header at the new head: a lower backfill must not rewind
+        // the parent the next prepare chains onto.
+        let previous_frontier = self.consensus().sequencer().current_sequence();
+        let update = repaired_frontier_update(previous_frontier, |op| {
+            self.log.journal().inner.header_by_op(op)
+        });
+        if let Some((frontier, frontier_checksum)) = update {
+            let consensus = self.consensus();
             consensus.sequencer().set_sequence(frontier);
+            consensus.set_last_prepare_checksum(frontier_checksum);
         }
-        consensus.set_last_prepare_checksum(header.checksum);
     }
 
     /// Conclude a repair stream: settle the commit floor at the serving
@@ -6565,6 +6562,102 @@ mod tests {
             .append(prepare.into_frozen())
             .await
             .expect("journal append");
+    }
+
+    /// A repaired `SendMessages` prepare with an explicit chain identity, as a
+    /// serving peer ships it.
+    fn repaired_send_prepare(op: u64, parent: u128, checksum: u128) -> Message<PrepareHeader> {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let record = build_segment_record(namespace, op);
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let total = header_size + record.len();
+        let mut message = Message::<PrepareHeader>::new(total);
+        message.as_mut_slice()[header_size..].copy_from_slice(&record);
+        message.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::SendMessages;
+            header.op = op;
+            header.parent = parent;
+            header.checksum = checksum;
+            header.group = namespace.inner();
+            header.size = u32::try_from(total).expect("prepare size fits u32");
+        })
+    }
+
+    #[compio::test]
+    async fn given_lower_backfill_when_applying_repaired_prepare_should_not_rewind_parent() {
+        // The call-site regression for the WAL frontier rewind: a repaired op
+        // below the DVC-adopted head must leave BOTH halves of the frontier
+        // alone. The old code left the sequencer at the head and rewound
+        // `last_prepare_checksum` to the backfilled entry, so the next prepare
+        // parented past a committed op and recovery refused the WAL.
+        const CHECKSUM_1: u128 = 0x11;
+        const CHECKSUM_2: u128 = 0x22;
+        const CHECKSUM_3: u128 = 0x33;
+        let mut partition = test_partition();
+        partition.repair = Some(armed_session(3, 0, None));
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, CHECKSUM_1))
+            .await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(3, CHECKSUM_2, CHECKSUM_3))
+            .await;
+        // The hole at op 2 stalls the frontier advance.
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
+
+        // The state a DoViewChange merge leaves: head 3, parented on its
+        // checksum, with the hole at op 2 still unfilled locally.
+        partition.consensus().sequencer().set_sequence(3);
+        partition.consensus().set_last_prepare_checksum(CHECKSUM_3);
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(2, CHECKSUM_1, CHECKSUM_2))
+            .await;
+
+        assert!(
+            partition.log.journal().inner.header_by_op(2).is_some(),
+            "the backfill must be journaled"
+        );
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 3);
+        assert_eq!(
+            partition.consensus().last_prepare_checksum(),
+            CHECKSUM_3,
+            "a lower backfill must not rewind the parent of the next prepare"
+        );
+    }
+
+    #[compio::test]
+    async fn given_gap_closure_when_applying_repaired_prepare_should_adopt_new_head_checksum() {
+        // The frame that closes a gap is not the new head: the frontier walks
+        // to the highest contiguous op and the checksum must come from THAT
+        // journal entry, not from the repair frame that happened to arrive
+        // last.
+        const CHECKSUM_1: u128 = 0x11;
+        const CHECKSUM_2: u128 = 0x22;
+        const CHECKSUM_3: u128 = 0x33;
+        let mut partition = test_partition();
+        partition.repair = Some(armed_session(3, 0, None));
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, CHECKSUM_1))
+            .await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(3, CHECKSUM_2, CHECKSUM_3))
+            .await;
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
+        assert_eq!(partition.consensus().last_prepare_checksum(), CHECKSUM_1);
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(2, CHECKSUM_1, CHECKSUM_2))
+            .await;
+
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 3);
+        assert_eq!(
+            partition.consensus().last_prepare_checksum(),
+            CHECKSUM_3,
+            "a gap closure must adopt the checksum of the new contiguous head"
+        );
     }
 
     #[compio::test]

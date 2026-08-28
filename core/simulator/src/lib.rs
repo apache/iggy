@@ -3530,3 +3530,158 @@ mod view_change_data_loss_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod repair_frontier_tests {
+    //! Journal repair moves durable coverage, not the head of the hash chain.
+    //!
+    //! A replica that rejoins behind the group adopts the primary's head and
+    //! then backfills the ops it missed. Those land BELOW that head, so the
+    //! pair `(sequencer, last_prepare_checksum)` has to keep describing one
+    //! and the same entry: the pair is exactly what the next projected prepare
+    //! stamps as `(op, parent)`. Carrying the repaired frame's own checksum
+    //! instead rewinds the parent, and the next prepare then chains past the
+    //! entry that actually precedes it -- every entry individually well
+    //! sealed, the chain broken, and a WAL that refuses to boot as soon as a
+    //! rewrite (checkpoint drain or uncommitted-suffix truncation) puts the
+    //! two entries side by side.
+
+    use super::*;
+    use consensus::Sequencer;
+    use journal::Journal;
+    use std::collections::BTreeMap;
+
+    /// Replica 0 is primary for view 0, so this one stays a backup for the
+    /// whole run: only the repair ingest is under test, not an election.
+    const LAGGING: u8 = 1;
+
+    /// Committed ops the lagging replica misses and has to repair back.
+    const OPS_MISSED: usize = 20;
+
+    /// Steps allowed for the rejoin, the adoption, and the repair stream.
+    const REPAIR_STEPS: usize = 4000;
+
+    /// Highest op the journal probe walks. The workload stays far below it.
+    const OP_PROBE_CEILING: u64 = 512;
+
+    /// `(sequencer, last_prepare_checksum)` of a replica's metadata consensus:
+    /// the `(op, parent)` its next projected prepare would stamp.
+    fn metadata_chain_head(sim: &Simulator, replica: u8) -> (u64, u128) {
+        let consensus = sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus");
+        (
+            consensus.sequencer().current_sequence(),
+            consensus.last_prepare_checksum(),
+        )
+    }
+
+    /// Every op a replica's metadata journal holds, with its checksum.
+    fn metadata_journal_checksums(sim: &Simulator, replica: u8) -> BTreeMap<u64, u128> {
+        let journal = sim.replicas[replica as usize].shards[0]
+            .plane
+            .metadata()
+            .journal
+            .as_ref()
+            .expect("shard 0 owns the metadata journal");
+        (1..=OP_PROBE_CEILING)
+            .filter_map(|op| {
+                let slot = usize::try_from(op).expect("op fits usize");
+                Journal::header(journal.as_ref(), slot).map(|header| (op, header.checksum))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn given_repair_below_the_head_when_backfilling_should_not_rewind_the_parent() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+
+        sim.register_client_with_primary(&client);
+        for _ in 0..50 {
+            sim.step();
+        }
+
+        sim.replica_crash(LAGGING);
+        for index in 0..OPS_MISSED {
+            let msg = client.create_stream(&format!("gap-{index}"));
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..30 {
+                sim.step();
+            }
+        }
+
+        sim.replica_restart(LAGGING);
+
+        // Everything the restart recovered locally is the baseline; anything
+        // that appears from here arrived over the wire.
+        let mut journaled = metadata_journal_checksums(&sim, LAGGING);
+        let mut backfills_below_head = 0usize;
+        for _ in 0..REPAIR_STEPS {
+            sim.step();
+            let (head, parent) = metadata_chain_head(&sim, LAGGING);
+            let current = metadata_journal_checksums(&sim, LAGGING);
+            for (&op, &checksum) in &current {
+                // A live replicated op IS the head, and the pair moves with it.
+                // Only entries that landed below the head are repair backfill.
+                if journaled.contains_key(&op) || op >= head {
+                    continue;
+                }
+                backfills_below_head += 1;
+                assert_ne!(
+                    parent,
+                    checksum,
+                    "repairing op {op} rewound the parent of the next prepare: the \
+                     sequencer sits at op {head} but last_prepare_checksum now \
+                     describes op {op}, so the next projected prepare would be op \
+                     {} parented past op {head}",
+                    head + 1
+                );
+            }
+            journaled = current;
+        }
+
+        // The contract itself, not just the absence of a rewind: after the
+        // repair stream the pair has to describe one and the same entry, or
+        // the next projected prepare parents on something that is not its
+        // predecessor.
+        let (head, parent) = metadata_chain_head(&sim, LAGGING);
+        let journaled = metadata_journal_checksums(&sim, LAGGING);
+        assert_eq!(
+            journaled.get(&head).copied(),
+            Some(parent),
+            "the sequencer sits at op {head} but last_prepare_checksum describes \
+             op {:?}, so the next projected prepare would parent past op {head}",
+            journaled
+                .iter()
+                .find(|&(_, &checksum)| checksum == parent)
+                .map(|(&op, _)| op)
+        );
+
+        assert!(
+            backfills_below_head > 0,
+            "the rejoined replica never repaired an op below its own head, so \
+             nothing about the repair frontier was exercised"
+        );
+    }
+}
