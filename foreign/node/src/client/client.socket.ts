@@ -24,7 +24,11 @@ import type {
 } from '../client/client.type.js';
 import { ResponseError, responseError } from '../wire/error.utils.js';
 import { debug } from './client.debug.js';
-import { type Endpoint, IggyConnection } from './client.connection.js';
+import {
+  endpointKey,
+  type Endpoint,
+  IggyConnection
+} from './client.connection.js';
 import { LOGIN, LOGIN_WITH_TOKEN, LOGOUT, PING } from '../wire/index.js';
 import { GET_CLUSTER_METADATA } from '../wire/cluster/get-cluster-metadata.command.js';
 import { COMMAND_CODE } from '../wire/command.code.js';
@@ -70,6 +74,17 @@ class LeaderMovedError extends Error {
     super('the node refused the request as not-admitted; re-reading the roster');
   }
 }
+
+/**
+ * How a leader move resolved: onto the metadata leader, onto the next roster
+ * node (for a request the metadata leader itself keeps refusing), or not at
+ * all.
+ */
+type RosterWalkVerdict = {
+  endpoint: Endpoint,
+  moved: boolean
+};
+type LeaderMoveVerdict = 'leader' | RosterWalkVerdict | false;
 
 /**
  * Command codes that can be executed without authentication.
@@ -135,7 +150,13 @@ export class CommandResponseStream extends EventEmitter {
    * The leader re-check a refused request started, shared with every other
    * request refused by the same node so one demotion moves the client once.
    */
-  private leaderMoveInFlight?: Promise<boolean>;
+  private leaderMoveInFlight?: Promise<LeaderMoveVerdict>;
+  /**
+   * Set when a roster walk just redirected this client, so the login that
+   * re-authenticates it stays on the dialed node instead of settling back on
+   * the metadata leader whose partition replica refused the request.
+   */
+  private walkSettleSuppressed = false;
   /**
    * Refusals handed out to callers that have not decided what to do with them
    * yet. The queue holds while any are outstanding: the caller of a refused
@@ -286,6 +307,8 @@ export class CommandResponseStream extends EventEmitter {
       // opening a second one.
       const deadline = options.deadline ?? Date.now() + VSR_RESPONSE_TIMEOUT_MS;
       let response: CommandResponse;
+      let walkingRoster = false;
+      const visitedRosterEndpoints = new Set<string>();
       for (;;) {
         try {
           response = await this._queueCommand(command, payload, handleResponse,
@@ -303,11 +326,22 @@ export class CommandResponseStream extends EventEmitter {
           // refusal the server actually gave: re-issued into what is left, the
           // request would time out instead and the caller would see a timeout
           // where the answer was "not admitted".
-          let moved = false;
+          let moved: LeaderMoveVerdict = false;
           try {
             if (!followsLeaderMoves || !worthAnotherAttempt(deadline))
               throw responseError(command, error.refusal.errorCode);
-            moved = await this._followLeaderMove();
+            // Once this request starts walking the roster it keeps walking: a
+            // leader recheck between hops would put it straight back on the
+            // metadata leader whose partition replica refused it, and the
+            // walk would bounce between two nodes without reaching the rest.
+            moved = await this._followLeaderMove(
+              walkingRoster,
+              visitedRosterEndpoints
+            );
+            if (typeof moved === 'object') {
+              walkingRoster = true;
+              visitedRosterEndpoints.add(endpointKey(moved.endpoint));
+            }
           } finally {
             // Released as soon as the move is decided, before the pace below
             // and before any re-authentication: those go through the queue
@@ -316,7 +350,9 @@ export class CommandResponseStream extends EventEmitter {
             if (followsLeaderMoves)
               this._releaseUndecidedMove();
           }
-          if (!moved) {
+          const connectionMoved = moved === 'leader' ||
+            (typeof moved === 'object' && moved.moved);
+          if (!connectionMoved) {
             // Nowhere else to go yet: the roster still names this node, or it
             // could not be read. Paced, because the in-connection replay
             // window belongs to the request's budget and has already been
@@ -338,6 +374,13 @@ export class CommandResponseStream extends EventEmitter {
       }
       if (!isLoginCommand(command) || this.settlingLeader)
         return response;
+      // A login that re-authenticates a roster walk stays on the dialed node:
+      // settling would put the client back on the metadata leader whose
+      // partition replica refused the walked request. One login only.
+      if (this.walkSettleSuppressed) {
+        this.walkSettleSuppressed = false;
+        return response;
+      }
       this.settlingLeader = true;
       try {
         const settled = await this._settleOnLeader(command, payload);
@@ -392,19 +435,50 @@ export class CommandResponseStream extends EventEmitter {
    *
    * @returns Whether the client moved
    */
-  private _followLeaderMove(): Promise<boolean> {
+  private _followLeaderMove(
+    walkPastLeader = false,
+    visitedRosterEndpoints = new Set<string>()
+  ): Promise<LeaderMoveVerdict> {
     const inFlight = this.leaderMoveInFlight;
     if (inFlight)
       return inFlight;
 
-    const move = (async () => {
+    const move = (async (): Promise<LeaderMoveVerdict> => {
       try {
-        const leader = await this._readLeaderEndpoint();
-        if (!leader || this.connection.isConnectedTo(leader.host, leader.port))
+        if (!walkPastLeader) {
+          const leader = await this._readLeaderEndpoint();
+          if (leader && !this.connection.isConnectedTo(leader.host, leader.port)) {
+            debug(`the leader moved to ${leader.host}:${leader.port}, following it`);
+            await this.connection.redirect(leader.host, leader.port);
+            return 'leader';
+          }
+        }
+        // The roster names this node as the metadata leader (or said nothing
+        // usable), yet it keeps refusing to admit the request: its replica of
+        // the target partition group is not that group's primary, because
+        // metadata and partition consensus groups elect independently. Walk
+        // the roster instead of re-issuing into the same refusal.
+        const next = this.connection.nextRosterEndpoint(visitedRosterEndpoints);
+        if (!next)
           return false;
-        debug(`the leader moved to ${leader.host}:${leader.port}, following it`);
-        await this.connection.redirect(leader.host, leader.port);
-        return true;
+        debug(
+          'the request keeps being refused here, walking the roster to ' +
+          `${next.host}:${next.port}`
+        );
+        // The re-authentication after this redirect runs a login, and a login
+        // normally settles on the metadata leader, which would put the walk
+        // right back on the node that refused. One login only.
+        this.walkSettleSuppressed = true;
+        try {
+          await this.connection.redirect(next.host, next.port);
+        } catch (error) {
+          // The suppression belongs to the redirect above. If that redirect
+          // never lands, a later unrelated login must settle normally.
+          this.walkSettleSuppressed = false;
+          debug('the roster endpoint could not be reached', error);
+          return { endpoint: next, moved: false };
+        }
+        return { endpoint: next, moved: true };
       } catch (error) {
         debug('the leader could not be re-checked, staying on this node', error);
         return false;

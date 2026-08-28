@@ -483,6 +483,35 @@ export class IggyConnection extends EventEmitter {
   }
 
   /**
+   * The roster endpoint after the one this connection is on, for a request
+   * the current node keeps refusing to admit. Metadata and partition
+   * consensus groups elect independently, so the metadata leader can hold a
+   * follower replica of the partition a request targets, and only walking
+   * the roster reaches that group's primary. `undefined` when the roster
+   * names nowhere else to go.
+   */
+  nextRosterEndpoint(visited: Set<string>): Endpoint | undefined {
+    const roster = this.rosterEndpoints;
+    if (roster.length === 0)
+      return undefined;
+    const index = roster.findIndex(
+      (endpoint) => this.isConnectedTo(endpoint.host, endpoint.port)
+    );
+    if (index >= 0)
+      visited.add(endpointKey(roster[index]));
+    const start = index < 0 ? 0 : (index + 1) % roster.length;
+    for (let offset = 0; offset < roster.length; offset += 1) {
+      const candidate = roster[(start + offset) % roster.length];
+      const key = endpointKey(candidate);
+      if (visited.has(key) || this.isConnectedTo(candidate.host, candidate.port))
+        continue;
+      visited.add(key);
+      return candidate;
+    }
+    return undefined;
+  }
+
+  /**
    * Endpoints a redial rotates through, likeliest first: where the client
    * currently is, the endpoint it was configured with, then the roster it
    * learned while connected. After a leader redirect the current endpoint may
@@ -616,3 +645,6 @@ const normalizeHost = (host?: string): string => {
     ? '127.0.0.1'
     : normalized;
 };
+
+export const endpointKey = (endpoint: Endpoint): string =>
+  `${normalizeHost(endpoint.host)}:${endpoint.port}`;

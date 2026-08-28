@@ -101,6 +101,67 @@ func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 		"the remembered credentials signed in again on the survivor")
 }
 
+func TestFailover_WalksPastTwoRefusingReplicasToThePartitionPrimary(t *testing.T) {
+	var metadataLeader *testListener
+
+	partitionPrimary := listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch read.operation() {
+		case vsr.OperationRegister:
+			return registerReplyFrame(7, 384)
+		case vsr.OperationCreateStream:
+			return replyFrame(vsr.OperationCreateStream, resultSection())
+		default:
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		}
+	})
+	follower := listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister {
+			return registerReplyFrame(7, 256)
+		}
+		return statusReplyFrame(vsr.OperationCreateStream,
+			uint32(ierror.TransientNotAcceptedCode), nil)
+	})
+	metadataLeader = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, metadataLeader.address(),
+				follower.address(), partitionPrimary.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 128)
+		default:
+			return statusReplyFrame(vsr.OperationCreateStream,
+				uint32(ierror.TransientNotAcceptedCode), nil)
+		}
+	})
+
+	client := newDialingClient(t, metadataLeader.address())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	require.NoError(t, client.Connect(ctx))
+	_, err := client.LoginUser(ctx, "iggy", "iggy")
+	require.NoError(t, err)
+
+	_, err = client.do(ctx, &command.CreateStream{Name: "orders"})
+	require.NoError(t, err)
+	assert.Equal(t, partitionPrimary.address(), client.currentServerAddress)
+	assert.True(t, len(follower.recorded()) >= 2,
+		"the roster walk skipped the second replica")
+}
+
+func TestFailover_RosterWalkVisitsEachEndpointOnce(t *testing.T) {
+	roster := []string{"iggy-0:8090", "iggy-1:8090", "iggy-2:8090"}
+	visited := make(map[string]struct{})
+
+	second := nextRosterEndpoint(roster[0], roster, visited)
+	third := nextRosterEndpoint(second, roster, visited)
+	exhausted := nextRosterEndpoint(third, roster, visited)
+
+	assert.Equal(t, roster[1], second)
+	assert.Equal(t, roster[2], third)
+	assert.Empty(t, exhausted)
+	assert.Len(t, visited, len(roster))
+}
+
 // Without any credentials there is nothing to sign in with, so a request on a
 // dead node fails instead of reconnecting into an unauthenticated session.
 func TestFailover_FailsFastWhenNothingEverSignedIn(t *testing.T) {

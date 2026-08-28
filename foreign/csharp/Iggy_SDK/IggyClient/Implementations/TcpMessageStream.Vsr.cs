@@ -522,8 +522,10 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         var clearSensitiveReply = HasSensitiveReply(code);
         var overallDeadline = Environment.TickCount64 + VsrRequestTimeoutMs;
         var requestEncoded = false;
-        var redirects = 0;
+        var leaderRedirects = 0;
         var redirectBudgetLogged = false;
+        var walkingRoster = false;
+        HashSet<string> walkedRosterEndpoints = new(StringComparer.OrdinalIgnoreCase);
         VsrConnection? lastConnection = null;
 
         try
@@ -552,12 +554,27 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     && allowRedirect
                     && Environment.TickCount64 < overallDeadline)
                 {
-                    if (redirects < VsrMaxLeaderRedirects && await RedirectAsync(token))
+                    var moved = false;
+                    if (leaderRedirects < VsrMaxLeaderRedirects && !walkingRoster)
                     {
-                        redirects++;
-                        await ConnectAsync(token);
+                        moved = await RedirectAsync(token);
+                        if (moved)
+                        {
+                            leaderRedirects++;
+                        }
                     }
-                    else if (redirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
+
+                    if (!moved)
+                    {
+                        moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
+                        walkingRoster |= moved;
+                    }
+
+                    if (moved)
+                    {
+                        await ConnectAsync(true, !walkingRoster, token);
+                    }
+                    else if (!walkingRoster && leaderRedirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
                     {
                         redirectBudgetLogged = true;
                         _logger.LogWarning("Maximum leader redirections reached, continuing on {Address}",
@@ -599,6 +616,64 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
             throw;
         }
+    }
+
+    /// <summary>
+    ///     Moves to the next unvisited roster endpoint after a never-admitted refusal. Metadata and partition
+    ///     groups elect independently, so the metadata leader is not necessarily the primary for the request's
+    ///     partition. The caller's request deadline and redirect budget bound the walk.
+    /// </summary>
+    private async Task<bool> RedirectToNextRosterNodeAsync(HashSet<string> visited, CancellationToken token)
+    {
+        var roster = _rosterAddresses;
+        if (roster.Length == 0)
+        {
+            return false;
+        }
+
+        var currentIndex = Array.FindIndex(roster, address =>
+            (_connectedAddress.Length > 0 && ServerAddress.IsSame(address, _connectedAddress))
+            || (_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(address, _currentRemoteAddress)));
+        if (currentIndex >= 0)
+        {
+            visited.Add(roster[currentIndex]);
+        }
+
+        string? next = null;
+        for (var offset = 1; offset <= roster.Length; offset++)
+        {
+            var candidate = roster[(Math.Max(currentIndex, -1) + offset) % roster.Length];
+            if (visited.Contains(candidate)
+                || (_connectedAddress.Length > 0 && ServerAddress.IsSame(candidate, _connectedAddress))
+                || (_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(candidate, _currentRemoteAddress)))
+            {
+                continue;
+            }
+
+            next = candidate;
+            break;
+        }
+
+        if (next is null)
+        {
+            return false;
+        }
+        visited.Add(next);
+        _logger.LogInformation("The request was refused on {Address}, walking the roster to {NextAddress}",
+            _connectedAddress, next);
+
+        await _sendingSemaphore.WaitAsync(token);
+        try
+        {
+            _currentAddress = next;
+            DropVsrConnectionLocked(_connection);
+        }
+        finally
+        {
+            _sendingSemaphore.Release();
+        }
+
+        return true;
     }
 
     /// <summary>

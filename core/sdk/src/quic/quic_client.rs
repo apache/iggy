@@ -16,10 +16,12 @@
 // under the License.
 
 use crate::leader_aware::{
-    LeaderRedirectionState, check_and_redirect_to_leader, is_unauthenticated_metadata_probe,
+    ConnectCoordinator, LeaderRedirectionState, RosterWalk, check_and_redirect_to_leader,
+    is_unauthenticated_metadata_probe,
 };
 use crate::prelude::AutoLogin;
 use crate::session::ConsensusSession;
+use crate::vsr::replay_after_session_reset_is_safe;
 use iggy_common::VsrSessionControl as _;
 use iggy_common::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient};
 
@@ -30,7 +32,9 @@ use crate::quic::skip_server_verification::SkipServerVerification;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
-use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
+use iggy_binary_protocol::codes::{
+    GET_CLUSTER_METADATA_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+};
 use iggy_common::{
     ClientState, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
     QuicConnectionStringOptions, TransportProtocol, validate_server_address,
@@ -43,6 +47,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -66,6 +71,12 @@ const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounded overall by `RESPONSE_READ_TIMEOUT`.
 const NOT_READY_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How long a request replays `TransientNotAccepted` on the SAME connection
+/// before it is handed back for a leader recheck or a roster walk. A node
+/// that is not the target group's primary refuses forever, so replaying on it
+/// for the whole request budget would burn the budget against a verdict.
+const TRANSIENT_FAILOVER_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
 /// QUIC client for interacting with the Iggy API.
 #[derive(Debug)]
 pub struct QuicClient {
@@ -81,6 +92,18 @@ pub struct QuicClient {
     // `std::sync::Mutex` rationale (pure-CPU critical section).
     consensus_session: Arc<StdMutex<ConsensusSession>>,
     skip_auto_login_once: Mutex<bool>,
+    /// Every endpoint the cluster roster named on the last leader check, kept
+    /// as walk candidates for a request the current node keeps refusing to
+    /// admit (its replica of the target partition group is not the primary).
+    roster_endpoints: Mutex<Vec<String>>,
+    /// Set when the next connect must stay on the endpoint it dialed instead
+    /// of settling on the metadata leader: the roster walk has to survive its
+    /// own sign-in's leader check. See the TCP client's twin field.
+    settle_off_leader_once: AtomicBool,
+    /// Serializes leader checks and roster walks after refused requests, so
+    /// concurrent QUIC streams cannot tear down each other's new connection.
+    routing_lock: Mutex<()>,
+    connect_coordinator: ConnectCoordinator,
     consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
@@ -129,7 +152,60 @@ impl BinaryTransport for QuicClient {
     }
 
     async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        let result = self.send_raw(code, payload.clone()).await;
+        let mut result = self.send_raw(code, payload.clone()).await;
+
+        // A persistent not-admitted refusal is a verdict about who leads the
+        // TARGET group, which the metadata leader check alone cannot repair:
+        // metadata and partition consensus groups elect independently. Recheck
+        // the leader once, then walk the roster, one visit per endpoint. Only
+        // recoverable with a session to re-establish, hence the auto-login
+        // gate, and a login/register replay stays on its own connection.
+        if matches!(result, Err(IggyError::TransientNotAccepted))
+            && !is_login_register_code(code)
+            && code != GET_CLUSTER_METADATA_CODE
+            && self.config.reconnection.enabled
+            && !matches!(self.config.auto_login, AutoLogin::Disabled)
+        {
+            let _routing_guard = self.routing_lock.lock().await;
+            // A concurrent refused request may have completed the movement
+            // while this request waited for the gate.
+            result = self.send_raw(code, payload.clone()).await;
+            let mut roster_walk: Option<RosterWalk> = None;
+            // Once the walk starts it keeps walking: a leader recheck between
+            // hops would put the request straight back on the node whose
+            // partition replica refused it.
+            let mut checked_metadata_leader = false;
+            while matches!(result, Err(IggyError::TransientNotAccepted)) {
+                let current = self.current_server_address.lock().await.clone();
+                let redirected = if checked_metadata_leader {
+                    false
+                } else {
+                    checked_metadata_leader = true;
+                    let redirected = matches!(self.handle_leader_redirection().await, Ok(true));
+                    let roster = self.roster_endpoints.lock().await.clone();
+                    roster_walk = Some(RosterWalk::new(&current, &roster));
+                    redirected
+                };
+                if !redirected {
+                    let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) else {
+                        break;
+                    };
+                    self.settle_on_endpoint(next).await?;
+                } else {
+                    let target = self.current_server_address.lock().await.clone();
+                    if let Some(walk) = roster_walk.as_mut() {
+                        walk.record_attempt(&target);
+                    }
+                }
+                self.connect().await?;
+                let connected = self.current_server_address.lock().await.clone();
+                if let Some(walk) = roster_walk.as_mut() {
+                    walk.record_attempt(&connected);
+                }
+                result = self.send_raw(code, payload.clone()).await;
+            }
+        }
+
         if result.is_ok() {
             return result;
         }
@@ -152,6 +228,10 @@ impl BinaryTransport for QuicClient {
             return Err(error);
         }
 
+        if code == GET_CLUSTER_METADATA_CODE {
+            return Err(error);
+        }
+
         if !self.config.reconnection.enabled {
             return Err(IggyError::Disconnected);
         }
@@ -166,8 +246,22 @@ impl BinaryTransport for QuicClient {
             return Err(error);
         }
 
-        self.disconnect().await?;
+        let replay_after_reconnect = replay_after_session_reset_is_safe(code, &error);
         let skip_auto_login = is_login_register_code(code);
+        let nested_connect = skip_auto_login && self.connect_coordinator.is_active();
+        let _routing_guard = if nested_connect {
+            None
+        } else {
+            Some(self.routing_lock.lock().await)
+        };
+        if !nested_connect && self.connect_coordinator.is_active() {
+            self.connect().await?;
+            if !replay_after_reconnect {
+                return Err(error);
+            }
+            return self.send_raw(code, payload).await;
+        }
+        self.disconnect().await?;
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
         }
@@ -176,11 +270,22 @@ impl BinaryTransport for QuicClient {
             "Reconnecting to the server: {}, by client: {}",
             server_address, self.config.client_address
         );
-        let reconnect = self.connect().await;
+        let reconnect = if nested_connect {
+            self.connect_inner().await
+        } else {
+            self.connect().await
+        };
         if skip_auto_login && reconnect.is_err() {
             *self.skip_auto_login_once.lock().await = false;
         }
         reconnect?;
+        if !replay_after_reconnect {
+            warn!(
+                "Reconnected, but command: {code} may have committed before its reply was lost; \
+                 replaying it under the new session could apply it twice."
+            );
+            return Err(error);
+        }
         self.send_raw(code, payload).await
     }
 
@@ -299,6 +404,10 @@ impl QuicClient {
             current_server_address: Mutex::new(server_address),
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
+            roster_endpoints: Mutex::new(Vec::new()),
+            settle_off_leader_once: AtomicBool::new(false),
+            routing_lock: Mutex::new(()),
+            connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
         })
     }
@@ -337,6 +446,20 @@ impl QuicClient {
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
+        self.connect_coordinator
+            .run(|abandoned| async move {
+                if abandoned {
+                    self.clear_abandoned_connect().await?;
+                }
+                self.connect_inner().await
+            })
+            .await
+    }
+
+    async fn connect_inner(&self) -> Result<(), IggyError> {
+        // Consume before fallible connection work. A walk target that cannot
+        // connect must not make an unrelated later reconnect skip settlement.
+        let settle_off_leader = self.settle_off_leader_once.swap(false, Ordering::SeqCst);
         loop {
             match self.get_state().await {
                 ClientState::Shutdown => {
@@ -494,12 +617,23 @@ impl QuicClient {
                             }
                         }
 
-                        // The sole leader settlement, and it runs
-                        // authenticated. Any node completes a login now -- a
-                        // backup forwards the register to the primary -- so
-                        // this decides where later ops land, not whether
-                        // sign-in works.
-                        self.handle_leader_redirection().await?
+                        // A roster walk stays on the endpoint it dialed: the
+                        // leader settlement below would put the connection
+                        // straight back on the node whose partition replica
+                        // keeps refusing the request. One connect only.
+                        if settle_off_leader {
+                            info!(
+                                "{NAME} client stays on the dialed node for a partition failover."
+                            );
+                            false
+                        } else {
+                            // The sole leader settlement, and it runs
+                            // authenticated. Any node completes a login now --
+                            // a backup forwards the register to the primary --
+                            // so this decides where later ops land, not
+                            // whether sign-in works.
+                            self.handle_leader_redirection().await?
+                        }
                     }
                 }
             };
@@ -512,19 +646,35 @@ impl QuicClient {
         }
     }
 
+    async fn clear_abandoned_connect(&self) -> Result<(), IggyError> {
+        if let Some(connection) = self.connection.lock().await.take() {
+            connection.close(0u32.into(), b"");
+        }
+        self.endpoint.wait_idle().await;
+        self.reset_vsr_session().await?;
+        self.set_state(ClientState::Disconnected).await;
+        self.publish_event(DiagnosticEvent::Disconnected).await;
+        Ok(())
+    }
+
     /// Checks cluster metadata and handles leader redirection if needed.
     /// Returns true if redirection occurred and reconnection is needed.
     pub(crate) async fn handle_leader_redirection(&self) -> Result<bool, IggyError> {
         let current_address = self.current_server_address.lock().await.clone();
-        // The roster's other endpoints are dropped here: only the TCP client
-        // dials failover candidates so far.
-        let leader_address = check_and_redirect_to_leader(
+        let leader_check = check_and_redirect_to_leader(
             self,
             &current_address,
             iggy_common::TransportProtocol::Quic,
         )
-        .await?
-        .redirect;
+        .await?;
+        // Replaced wholesale rather than merged: the roster is the cluster's
+        // own answer about where its nodes are. Kept for the roster walk a
+        // persistently refused request runs, not for dead-node redial (which
+        // remains TCP-only).
+        if !leader_check.endpoints.is_empty() {
+            *self.roster_endpoints.lock().await = leader_check.endpoints;
+        }
+        let leader_address = leader_check.redirect;
 
         if let Some(new_leader_address) = leader_address {
             let mut redirection_state = self.leader_redirection_state.lock().await;
@@ -550,6 +700,25 @@ impl QuicClient {
             self.leader_redirection_state.lock().await.reset();
             Ok(false)
         }
+    }
+
+    /// Move the connection to the roster endpoint after the current one, for
+    /// a request the current node keeps refusing to admit. See the TCP twin:
+    /// metadata and partition consensus groups elect independently, so the
+    /// metadata leader can hold a follower replica of the target partition,
+    /// and only walking the roster reaches that group's primary.
+    async fn settle_on_endpoint(&self, next: String) -> Result<(), IggyError> {
+        let current = self.current_server_address.lock().await.clone();
+
+        info!(
+            "The request keeps being refused on {current} while the roster names it the \
+             metadata leader; trying the next cluster node at {next}."
+        );
+        self.connected_at.lock().await.take();
+        self.disconnect().await?;
+        *self.current_server_address.lock().await = next;
+        self.settle_off_leader_once.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
@@ -649,6 +818,16 @@ impl QuicClient {
                 // reconnect path in `send_raw_with_response`, same as TCP.
                 let header_bytes = bytemuck::bytes_of(&request_header);
                 let deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
+                // `TransientNotAccepted` gets a short same-connection window
+                // only: past it the refusal is a verdict about who leads, not
+                // load, and the caller runs a leader recheck or roster walk.
+                // Login/register keeps the full budget on this connection: the
+                // connect flow owns its leader settlement.
+                let not_accepted_deadline = if is_login_register_code(code) {
+                    deadline
+                } else {
+                    deadline.min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
+                };
                 loop {
                     let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
                         error!("Failed to open a bidirectional stream: {error}");
@@ -682,14 +861,22 @@ impl QuicClient {
                     {
                         Ok(reply) => return Ok(reply),
                         // `TransientNotCommitted` = the server replied with an
-                        // explicit retry frame because it could not commit yet
-                        // (not-caught-up / in-flight / pipeline-full /
-                        // view-change cancel). Nothing committed, so replaying
-                        // the same request id on a fresh bidi is safe; the
-                        // session stays intact so no reconnect/relogin is
-                        // needed (login replays idempotently too). Anything
-                        // else - including a silent read timeout - is
+                        // explicit retry frame with an outcome that may still
+                        // be resolving (not-caught-up / in-flight /
+                        // pipeline-full / view-change cancel). Replaying the
+                        // same request id on the same session is safe because
+                        // metadata dedup returns the committed reply if needed.
+                        // Anything else, including a silent read timeout, is
                         // terminal here and handled by the caller.
+                        Err(IggyError::TransientNotAccepted)
+                            if tokio::time::Instant::now() >= not_accepted_deadline =>
+                        {
+                            // Never admitted, so re-issuable anywhere: hand it
+                            // back for a leader recheck or a roster walk
+                            // instead of replaying into the same refusal for
+                            // the whole request budget.
+                            return Err(IggyError::TransientNotAccepted);
+                        }
                         Err(IggyError::TransientNotCommitted | IggyError::TransientNotAccepted)
                             if tokio::time::Instant::now() < deadline =>
                         {

@@ -488,10 +488,19 @@ type connectScoped struct{}
 // already-connected gate, and then suppresses somebody else's auto-login.
 type skipAutoLogin struct{}
 
+// skipLeaderSettlement keeps the sign-in owned by one roster-walk Connect on
+// the endpoint it dialed. Context scope prevents a failed or cancelled Connect
+// from suppressing an unrelated later sign-in.
+type skipLeaderSettlement struct{}
+
 // suppressAutoLogin returns ctx marked so the Connect it drives does not sign
 // in by itself.
 func suppressAutoLogin(ctx context.Context) context.Context {
 	return context.WithValue(ctx, skipAutoLogin{}, struct{}{})
+}
+
+func suppressLeaderSettlement(ctx context.Context) context.Context {
+	return context.WithValue(ctx, skipLeaderSettlement{}, struct{}{})
 }
 
 // localPreconditionError marks a request that failed before its frame was
@@ -632,6 +641,12 @@ func (c *IggyTcpClient) sendFrame(ctx context.Context, code uint32, frame []byte
 
 	deadline := time.Now().Add(responseReadTimeout)
 	stamped := false
+	// Once this request starts walking the roster it keeps walking: a leader
+	// recheck between hops would put it straight back on the metadata leader
+	// whose partition replica refused it, and the walk would bounce between
+	// two nodes without ever reaching the rest of the roster.
+	walkingRoster := false
+	visitedRosterEndpoints := make(map[string]struct{})
 	for {
 		// A sign-in owns the whole budget on this connection: any node
 		// completes it (a backup forwards the register to the primary), and
@@ -656,12 +671,38 @@ func (c *IggyTcpClient) sendFrame(ctx context.Context, code uint32, frame []byte
 			// The server never admitted the request, so re-issuing it cannot
 			// double-apply. A same-connection replay keeps the stamped request
 			// id; a redirect registers again, so the frame is stamped afresh.
-			redirect, redirectErr := c.HandleLeaderRedirection(ctx)
-			if redirectErr != nil {
-				return nil, redirectErr
+			redirect := false
+			walked := false
+			if !walkingRoster {
+				var redirectErr error
+				redirect, redirectErr = c.HandleLeaderRedirection(ctx)
+				if redirectErr != nil {
+					return nil, redirectErr
+				}
+			}
+			if !redirect {
+				// The roster names this node as the metadata leader (or said
+				// nothing usable), yet it keeps refusing to admit the
+				// request: its replica of the target partition group is not
+				// that group's primary, because metadata and partition
+				// consensus groups elect independently. Walk the roster
+				// instead of replaying into the same refusal until the whole
+				// request budget burns.
+				var walkErr error
+				walked, walkErr = c.settleOnNextEndpoint(visitedRosterEndpoints)
+				if walkErr != nil {
+					return nil, walkErr
+				}
+				if walked {
+					walkingRoster = true
+					redirect = true
+				}
 			}
 			if redirect {
 				redirectCtx := ctx
+				if walked {
+					redirectCtx = suppressLeaderSettlement(redirectCtx)
+				}
 				if ctx.Value(connectScoped{}) != nil {
 					// Issued from inside the sign-in transaction, which holds
 					// registerMtx: the automatic sign-in on the reconnect path

@@ -21,6 +21,7 @@ mod crash_durability;
 mod crash_offset_reuse;
 mod crash_recovery_corruption;
 mod failover_client_continuity;
+mod fast_primary_rejoin;
 mod metadata_checkpoint_restart;
 mod metadata_state_transfer;
 mod multi_shard_partition_convergence;

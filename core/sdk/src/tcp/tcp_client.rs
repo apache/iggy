@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::leader_aware::{
-    LeaderRedirectionState, check_and_redirect_to_leader, is_same_spelling,
-    is_unauthenticated_metadata_probe, read_transport_endpoints,
+    ConnectCoordinator, LeaderRedirectionState, RosterWalk, check_and_redirect_to_leader,
+    is_same_spelling, is_unauthenticated_metadata_probe, read_transport_endpoints,
 };
 use crate::prelude::Client;
 use crate::prelude::TcpClientConfig;
@@ -25,12 +25,13 @@ use crate::session::ConsensusSession;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
-use crate::vsr::operation_for_code;
+use crate::vsr::replay_after_session_reset_is_safe;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::codes::{LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE};
-use iggy_binary_protocol::consensus::Operation;
+use iggy_binary_protocol::codes::{
+    GET_CLUSTER_METADATA_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+};
 #[cfg(test)]
 use iggy_common::TcpClientReconnectionConfig;
 use iggy_common::VsrSessionControl as _;
@@ -124,6 +125,17 @@ pub struct TcpClient {
     // contention with zero correctness benefit.
     consensus_session: Arc<StdMutex<ConsensusSession>>,
     skip_auto_login_once: Mutex<bool>,
+    /// Set when the next connect must stay on the endpoint it dialed instead
+    /// of settling on the metadata leader. Metadata and partition consensus
+    /// groups elect independently, so the metadata leader can hold a follower
+    /// replica of the partition a request targets; the failover that walks the
+    /// roster past it has to survive its own sign-in's leader check.
+    settle_off_leader_once: AtomicBool,
+    /// Serializes connection movement after a refused request. The stream is
+    /// lockstep, but the refusal releases it before the leader check and
+    /// reconnect, where another request could otherwise run a competing walk.
+    routing_lock: Mutex<()>,
+    connect_coordinator: ConnectCoordinator,
     consumer_group_state: Arc<iggy_common::ConsumerGroupClientState>,
 }
 
@@ -183,7 +195,6 @@ impl Client for TcpClient {
 }
 
 #[async_trait]
-#[async_trait]
 impl BinaryTransport for TcpClient {
     async fn get_state(&self) -> ClientState {
         *self.state.lock().await
@@ -223,6 +234,10 @@ impl BinaryTransport for TcpClient {
             return Err(error);
         }
 
+        if code == GET_CLUSTER_METADATA_CODE {
+            return Err(error);
+        }
+
         if !self.config.reconnection.enabled {
             return Err(IggyError::Disconnected);
         }
@@ -248,11 +263,24 @@ impl BinaryTransport for TcpClient {
         // Login and register are the exception: the server stays deliberately
         // silent on a transient register failure and relies on the client
         // replaying, so that replay is the protocol rather than a retry.
-        let replay_after_reconnect = replay_is_safe(code, &error);
-
-        self.disconnect_transport().await?;
+        let replay_after_reconnect = replay_after_session_reset_is_safe(code, &error);
 
         let skip_auto_login = is_login_register_code(code);
+        let nested_connect = skip_auto_login && self.connect_coordinator.is_active();
+        let _routing_guard = if nested_connect {
+            None
+        } else {
+            Some(self.routing_lock.lock().await)
+        };
+        if !nested_connect && self.connect_coordinator.is_active() {
+            self.connect().await?;
+            if !replay_after_reconnect {
+                return Err(error);
+            }
+            return self.send_raw(code, payload).await;
+        }
+        self.disconnect_transport().await?;
+
         if skip_auto_login {
             *self.skip_auto_login_once.lock().await = true;
         }
@@ -266,7 +294,11 @@ impl BinaryTransport for TcpClient {
             );
         }
 
-        let reconnect = self.connect().await;
+        let reconnect = if nested_connect {
+            self.connect_inner().await
+        } else {
+            self.connect().await
+        };
         if skip_auto_login && reconnect.is_err() {
             *self.skip_auto_login_once.lock().await = false;
         }
@@ -291,38 +323,6 @@ impl BinaryTransport for TcpClient {
     fn consumer_group_state(&self) -> Arc<iggy_common::ConsumerGroupClientState> {
         Arc::clone(&self.consumer_group_state)
     }
-}
-
-/// Whether replaying `code` over a fresh connection cannot apply it twice.
-///
-/// The reconnect registers a new client identity, so the server's dedup fence
-/// no longer covers the original request: only requests that provably never
-/// reached the log may be re-sent.
-///
-/// - the errors raised before the frame was written, and the server's own
-///   refusals, which precede execution. A `StaleClient` eviction is neither:
-///   it arrives out of band and is consumed in place of the pending reply, so
-///   the request it interrupted may already have committed;
-/// - operations that never enter the log: a non-replicated read, and a logout,
-///   which ends whatever session the connection carried -- the reconnect
-///   brought a new one, and refusing the replay would strand
-///   `logout_before_relogin`, whose failure aborts the sign-in that was about
-///   to replace the session;
-/// - login and register, where the replay is the protocol: the server stays
-///   deliberately silent on a transient register failure and relies on the
-///   client resending.
-fn replay_is_safe(code: u32, error: &IggyError) -> bool {
-    is_login_register_code(code)
-        || matches!(
-            error,
-            IggyError::NotConnected
-                | IggyError::CannotEstablishConnection
-                | IggyError::Unauthenticated
-        )
-        || matches!(
-            operation_for_code(code),
-            Operation::NonReplicated | Operation::Logout
-        )
 }
 
 impl iggy_common::VsrSessionSealed for TcpClient {}
@@ -498,11 +498,28 @@ impl TcpClient {
             session_credentials: Mutex::new(None),
             consensus_session: Arc::new(StdMutex::new(ConsensusSession::new())),
             skip_auto_login_once: Mutex::new(false),
+            settle_off_leader_once: AtomicBool::new(false),
+            routing_lock: Mutex::new(()),
+            connect_coordinator: ConnectCoordinator::new(),
             consumer_group_state: Arc::new(iggy_common::ConsumerGroupClientState::new()),
         })
     }
 
     async fn connect(&self) -> Result<(), IggyError> {
+        self.connect_coordinator
+            .run(|abandoned| async move {
+                if abandoned {
+                    self.clear_abandoned_connect().await?;
+                }
+                self.connect_inner().await
+            })
+            .await
+    }
+
+    async fn connect_inner(&self) -> Result<(), IggyError> {
+        // Consume before fallible connection work. A walk target that cannot
+        // connect must not make an unrelated later reconnect skip settlement.
+        let settle_off_leader = self.settle_off_leader_once.swap(false, Ordering::SeqCst);
         loop {
             // Read and claimed under one lock acquisition. Apart, two callers
             // both find `Disconnected` and both sweep: the loser's
@@ -548,7 +565,6 @@ impl TcpClient {
                 let mut guard = self.skip_auto_login_once.lock().await;
                 std::mem::take(&mut *guard)
             };
-
             let mut retry_count = 0;
             let mut candidate = 0;
             // A fault no retry can fix, remembered rather than returned at
@@ -595,7 +611,7 @@ impl TcpClient {
                         self.publish_event(DiagnosticEvent::Connected).await;
 
                         match self
-                            .establish_session(client_address, skip_auto_login)
+                            .establish_session(client_address, skip_auto_login, settle_off_leader)
                             .await
                         {
                             Ok(should_redirect) => break should_redirect,
@@ -684,12 +700,21 @@ impl TcpClient {
         }
     }
 
+    async fn clear_abandoned_connect(&self) -> Result<(), IggyError> {
+        self.stream.lock().await.take();
+        self.reset_vsr_session().await?;
+        self.set_state(ClientState::Disconnected).await;
+        self.publish_event(DiagnosticEvent::Disconnected).await;
+        Ok(())
+    }
+
     /// Re-establish the session on a connection that just came up and settle it
     /// on the leader. Reports whether the leader check asks for a redirect.
     async fn establish_session(
         &self,
         client_address: SocketAddr,
         skip_auto_login: bool,
+        settle_off_leader: bool,
     ) -> Result<bool, SignInFailure> {
         let Some(credentials) = self.sign_in_credentials().await else {
             info!("No credentials to sign in with.");
@@ -720,6 +745,18 @@ impl TcpClient {
         match signed_in {
             Ok(how) => info!("{NAME} client: {client_address} has signed in with {how}."),
             Err(error) => return Err(self.fail_sign_in(error).await),
+        }
+
+        // A failover walking the roster past the metadata leader stays where
+        // it dialed: the leader settlement below would put the connection
+        // straight back on the node whose partition replica keeps refusing
+        // the request. One connect only; the next ordinary connect settles
+        // normally.
+        if settle_off_leader {
+            info!(
+                "{NAME} client: {client_address} stays on the dialed node for a partition failover."
+            );
+            return Ok(false);
         }
 
         // The sole leader settlement, and it runs authenticated. Any node
@@ -826,6 +863,32 @@ impl TcpClient {
             self.leader_redirection_state.lock().await.reset();
             Ok(false)
         }
+    }
+
+    /// Move the connection to the roster endpoint after the current one, for
+    /// a request the current node keeps refusing to admit.
+    ///
+    /// The metadata leader check cannot repair that refusal: metadata and
+    /// partition consensus groups elect independently, so the metadata leader
+    /// can hold a follower replica of the partition the request targets.
+    /// `TransientNotAccepted` marks the request as never admitted and safe to
+    /// re-issue anywhere, so walking the roster is correct, and the caller's
+    /// request budget bounds the walk. Reports whether there was another
+    /// endpoint to move to.
+    async fn settle_on_endpoint(&self, next: String) -> Result<(), IggyError> {
+        let current = self.current_server_address.lock().await.clone();
+
+        info!(
+            "The request keeps being refused on {current} while the roster names it the \
+             metadata leader; trying the next cluster node at {next}."
+        );
+        // No reestablish pacing: the node being left is healthy, the one being
+        // dialed owes no cooldown, and the request is already burning budget.
+        self.connected_at.lock().await.take();
+        self.disconnect_transport().await?;
+        *self.current_server_address.lock().await = next;
+        self.settle_off_leader_once.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Whether an `AutoLogin` is configured on this client, which makes the
@@ -1012,12 +1075,7 @@ impl TcpClient {
 
         let connector = TlsConnector::from(Arc::new(config));
         let tls_domain = if self.config.tls_domain.is_empty() {
-            // Extract hostname/IP from server_address when tls_domain is not specified
-            server_address
-                .split(':')
-                .next()
-                .unwrap_or(server_address)
-                .to_string()
+            tls_server_name(server_address)
         } else {
             self.config.tls_domain.to_owned()
         };
@@ -1172,7 +1230,12 @@ impl TcpClient {
         // sign-in handshake, and reconnecting from underneath it would
         // recurse.
         let overall_deadline = tokio::time::Instant::now() + RESPONSE_READ_TIMEOUT;
-        let mut preencoded = None;
+        // Set once this request starts walking the roster past the metadata
+        // leader, so later rounds keep walking instead of being redirected
+        // back onto the node whose partition replica keeps refusing them.
+        let mut roster_walk: Option<RosterWalk> = None;
+        let mut checked_metadata_leader = false;
+        let mut routing_guard = None;
         loop {
             let transient_deadline = if is_login_register_code(code) {
                 overall_deadline
@@ -1180,11 +1243,11 @@ impl TcpClient {
                 overall_deadline
                     .min(tokio::time::Instant::now() + TRANSIENT_FAILOVER_CHECK_INTERVAL)
             };
-            let (header, result) = self
+            let (_header, result) = self
                 .send_raw_vsr_attempt(
                     code,
                     payload.clone(),
-                    preencoded,
+                    None,
                     transient_deadline,
                     overall_deadline,
                 )
@@ -1194,6 +1257,17 @@ impl TcpClient {
                     if tokio::time::Instant::now() < overall_deadline
                         && !is_login_register_code(code) =>
                 {
+                    if code == GET_CLUSTER_METADATA_CODE {
+                        return Err(IggyError::TransientNotAccepted);
+                    }
+
+                    if routing_guard.is_none() {
+                        routing_guard = Some(self.routing_lock.lock().await);
+                        // A concurrent refused request may have moved the
+                        // shared client while this request waited.
+                        continue;
+                    }
+
                     // The server explicitly did NOT admit the request, so
                     // re-issuing it -- same id on this session, or a fresh
                     // id under a new session after a failover -- cannot
@@ -1204,10 +1278,59 @@ impl TcpClient {
                     // its outcome is unknown, so the attempt loop replays
                     // it same-session for the whole budget and then the
                     // error propagates to the caller.)
-                    preencoded = header;
-                    if let Ok(true) = self.handle_leader_redirection().await {
-                        self.connect().await?;
-                        preencoded = None;
+                    let current = self.current_server_address.lock().await.clone();
+                    let mut redirected = false;
+                    if !checked_metadata_leader {
+                        checked_metadata_leader = true;
+                        redirected = matches!(self.handle_leader_redirection().await, Ok(true));
+                        let roster = self.roster_endpoints.lock().await.clone();
+                        roster_walk = Some(RosterWalk::new(&current, &roster));
+                    }
+                    let (mut target, mut needs_settle) = if redirected {
+                        let target = self.current_server_address.lock().await.clone();
+                        if let Some(walk) = roster_walk.as_mut() {
+                            walk.record_attempt(&target);
+                        }
+                        (target, false)
+                    } else if let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) {
+                        // The roster says this node IS the metadata leader
+                        // (or answered nothing usable), yet it keeps refusing
+                        // to admit the request: its replica of the target
+                        // partition group is not that group's primary, and no
+                        // metadata redirect can fix that. Walk the roster
+                        // instead of replaying into the same refusal until
+                        // the whole request budget burns. Once walking, keep
+                        // walking: rechecking the metadata leader between
+                        // hops would bounce the request between two nodes and
+                        // never reach the rest of the roster.
+                        (next, true)
+                    } else {
+                        return Err(IggyError::TransientNotAccepted);
+                    };
+
+                    loop {
+                        if needs_settle {
+                            self.settle_on_endpoint(target.clone()).await?;
+                        }
+                        match self.connect().await {
+                            Ok(()) => {
+                                let connected = self.current_server_address.lock().await.clone();
+                                let first_visit = roster_walk
+                                    .as_mut()
+                                    .is_some_and(|walk| walk.record_attempt(&connected));
+                                if is_same_spelling(&connected, &target) || first_visit {
+                                    break;
+                                }
+                            }
+                            Err(IggyError::CannotEstablishConnection) => {}
+                            Err(error) => return Err(error),
+                        }
+
+                        let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) else {
+                            return Err(IggyError::TransientNotAccepted);
+                        };
+                        target = next;
+                        needs_settle = true;
                     }
                 }
                 Err(IggyError::Disconnected) => {
@@ -1405,6 +1528,16 @@ const fn is_login_register_code(code: u32) -> bool {
     matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
 }
 
+fn tls_server_name(server_address: &str) -> String {
+    if let Ok(address) = SocketAddr::from_str(server_address) {
+        return address.ip().to_string();
+    }
+    server_address
+        .rsplit_once(':')
+        .map_or(server_address, |(host, _port)| host)
+        .to_owned()
+}
+
 /// Unit tests for TcpClient.
 /// Currently only tests for "from_connection_string()" are implemented.
 /// TODO: Add complete unit tests for TcpClient.
@@ -1416,6 +1549,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SESSION_USER_ID: u32 = 7;
+
+    #[test]
+    fn tls_server_names_support_dns_ipv4_and_ipv6_endpoints() {
+        assert_eq!(tls_server_name("iggy-1:8090"), "iggy-1");
+        assert_eq!(tls_server_name("127.0.0.1:8090"), "127.0.0.1");
+        assert_eq!(tls_server_name("[fd00::1]:8090"), "fd00::1");
+    }
 
     fn client_with(server_address: &str) -> TcpClient {
         TcpClient::create(Arc::new(TcpClientConfig {
@@ -1467,6 +1607,47 @@ mod tests {
 
     async fn endpoint_that_hangs_up() -> String {
         counted_endpoint_that_hangs_up().await.0
+    }
+
+    #[tokio::test]
+    async fn concurrent_connect_waits_for_the_owners_result() {
+        let (_listener, silent) = live_endpoint().await;
+        let client = Arc::new(
+            TcpClient::create(Arc::new(TcpClientConfig {
+                server_address: silent,
+                tls_enabled: true,
+                tls_validate_certificate: false,
+                reconnection: TcpClientReconnectionConfig {
+                    enabled: false,
+                    ..TcpClientReconnectionConfig::default()
+                },
+                ..TcpClientConfig::default()
+            }))
+            .expect("create the client"),
+        );
+        let owner = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { TcpClient::connect(&client).await })
+        };
+        while client.get_state().await != ClientState::Connecting {
+            tokio::task::yield_now().await;
+        }
+        let mut waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { TcpClient::connect(&client).await })
+        };
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err(),
+            "a concurrent caller reported success while the owner was still connecting"
+        );
+        owner.abort();
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(IggyError::Disconnected)
+        ));
     }
 
     // With reconnection off there are no retries, but the endpoints the roster
@@ -1742,8 +1923,11 @@ mod tests {
     #[test]
     fn only_requests_that_cannot_double_apply_are_replayed() {
         // Never written, or refused before execution.
-        assert!(replay_is_safe(SEND_MESSAGES_CODE, &IggyError::NotConnected));
-        assert!(replay_is_safe(
+        assert!(replay_after_session_reset_is_safe(
+            SEND_MESSAGES_CODE,
+            &IggyError::NotConnected
+        ));
+        assert!(replay_after_session_reset_is_safe(
             SEND_MESSAGES_CODE,
             &IggyError::CannotEstablishConnection
         ));
@@ -1751,22 +1935,31 @@ mod tests {
         // re-sent under a session the fence cannot match it against. An
         // eviction is consumed in place of the reply, so it says nothing about
         // whether the write committed.
-        assert!(!replay_is_safe(SEND_MESSAGES_CODE, &IggyError::StaleClient));
-        assert!(!replay_is_safe(
+        assert!(!replay_after_session_reset_is_safe(
+            SEND_MESSAGES_CODE,
+            &IggyError::StaleClient
+        ));
+        assert!(!replay_after_session_reset_is_safe(
             SEND_MESSAGES_CODE,
             &IggyError::Disconnected
         ));
-        assert!(!replay_is_safe(
+        assert!(!replay_after_session_reset_is_safe(
             SEND_MESSAGES_CODE,
             &IggyError::EmptyResponse
         ));
         // A read never enters the log, and a logout ends a session the
         // reconnect already replaced -- `logout_before_relogin` depends on it.
-        assert!(replay_is_safe(GET_ME_CODE, &IggyError::Disconnected));
-        assert!(replay_is_safe(LOGOUT_USER_CODE, &IggyError::Disconnected));
+        assert!(replay_after_session_reset_is_safe(
+            GET_ME_CODE,
+            &IggyError::Disconnected
+        ));
+        assert!(replay_after_session_reset_is_safe(
+            LOGOUT_USER_CODE,
+            &IggyError::Disconnected
+        ));
         // The register replay is the protocol: the server stays silent on a
         // transient failure and waits for the resend.
-        assert!(replay_is_safe(
+        assert!(replay_after_session_reset_is_safe(
             LOGIN_REGISTER_CODE,
             &IggyError::Disconnected
         ));

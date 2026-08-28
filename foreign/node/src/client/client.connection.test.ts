@@ -418,6 +418,33 @@ describe('IggyConnection', () => {
     }
   );
 
+  it('walks each roster endpoint once per request', async () => {
+    const seed = await startServer();
+    const seedPort = (seed.address() as AddressInfo).port;
+    const connection = new IggyConnection(connectionConfig(seed));
+    connection.on('error', () => undefined);
+    try {
+      await connection.connect();
+      connection.rememberRoster([
+        { host: '127.0.0.1', port: seedPort },
+        { host: '127.0.0.1', port: seedPort + 1 },
+        { host: '127.0.0.1', port: seedPort + 2 }
+      ]);
+      const visited = new Set<string>();
+
+      assert.deepEqual(connection.nextRosterEndpoint(visited), {
+        host: '127.0.0.1', port: seedPort + 1
+      });
+      assert.deepEqual(connection.nextRosterEndpoint(visited), {
+        host: '127.0.0.1', port: seedPort + 2
+      });
+      assert.equal(connection.nextRosterEndpoint(visited), undefined);
+      assert.equal(visited.size, 3);
+    } finally {
+      await closeConnection(connection, seed);
+    }
+  });
+
   it('dials the endpoint it is on, then the seed, then the roster',
     async () => {
       const seed = await startServer();

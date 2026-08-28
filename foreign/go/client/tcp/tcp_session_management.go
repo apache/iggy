@@ -162,6 +162,15 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 //
 // Returns nil when the client stays where it is.
 func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+	// A roster walk stays on the endpoint it dialed: the settlement below
+	// would put the connection straight back on the node whose partition
+	// replica keeps refusing the walked request. The marker is scoped to the
+	// Connect that owns this sign-in, so a failed walk cannot leak into another.
+	if ctx.Value(skipLeaderSettlement{}) != nil {
+		c.logger.Info("Staying on the dialed node for a partition failover.")
+		return nil, nil
+	}
+
 	var settled *iggcon.IdentityInfo
 	for {
 		// The roster read runs while register holds the sign-in lock, so it must
@@ -295,4 +304,65 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 	c.mtx.Unlock()
 
 	return true, nil
+}
+
+// settleOnNextEndpoint moves the connection to the roster endpoint after the
+// current one, for a request the current node keeps refusing to admit.
+// Metadata and partition consensus groups elect independently, so the
+// metadata leader can hold a follower replica of the partition a request
+// targets, and only walking the roster reaches that group's primary. The
+// refusal marks the request as never admitted and safe to re-issue anywhere;
+// the caller's request budget bounds the walk.
+func (c *IggyTcpClient) settleOnNextEndpoint(visited map[string]struct{}) (bool, error) {
+	c.mtx.Lock()
+	current := c.currentServerAddress
+	roster := append([]string(nil), c.knownServerAddresses...)
+	c.mtx.Unlock()
+
+	next := nextRosterEndpoint(current, roster, visited)
+	if next == "" {
+		return false, nil
+	}
+
+	c.logger.Info(
+		"The request keeps being refused while the roster names this node the metadata leader; trying the next cluster node.",
+		slog.String("current", current),
+		slog.String("next", next),
+	)
+	if err := c.disconnect(); err != nil {
+		return false, err
+	}
+
+	c.mtx.Lock()
+	c.connectedAt = time.Time{}
+	c.currentServerAddress = next
+	c.mtx.Unlock()
+	return true, nil
+}
+
+func nextRosterEndpoint(current string, roster []string, visited map[string]struct{}) string {
+	currentIndex := -1
+	for index, endpoint := range roster {
+		if endpoint == current {
+			currentIndex = index
+			visited[endpoint] = struct{}{}
+			break
+		}
+	}
+
+	next := ""
+	for offset := 1; offset <= len(roster); offset++ {
+		index := (currentIndex + offset) % len(roster)
+		candidate := roster[index]
+		if _, seen := visited[candidate]; seen || candidate == current {
+			continue
+		}
+		next = candidate
+		break
+	}
+	if next == "" || next == current {
+		return ""
+	}
+	visited[next] = struct{}{}
+	return next
 }

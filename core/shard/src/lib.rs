@@ -4349,7 +4349,17 @@ where
             );
             return;
         }
-        let to_op = header.to_op.min(partition.consensus().commit_max());
+        // The frontier bounds the serve, not `commit_max` alone, mirroring the
+        // metadata twin: a rejoining backup needs the BODIES of the adopted
+        // suffix above the commit point. Its ack for those ops is withheld
+        // until the body is journaled, and the primary's retransmit is dropped
+        // by the backup gap check (adoption already advanced its sequencer to
+        // the head), so repair is the only channel that can deliver them.
+        let to_op = repair_serve_ceiling(
+            header.to_op,
+            partition.consensus().commit_max(),
+            partition.consensus().sequencer().current_sequence(),
+        );
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
         // evicted ring with it, so a freshly installed or freshly restarted
@@ -6508,6 +6518,19 @@ where
                 let commit_min = partition.consensus().commit_min();
                 let cluster = partition.consensus().cluster();
                 let self_id = partition.consensus().replica();
+                if partition
+                    .repair
+                    .is_some_and(|session| commit_min >= session.to_op)
+                {
+                    partition.repair = None;
+                    tracing::info!(
+                        shard = self.id,
+                        namespace_raw = namespace.inner(),
+                        commit_min,
+                        "partition journal repair completed after the commit frontier advanced"
+                    );
+                    continue;
+                }
                 partition.repair.as_mut().and_then(|session| {
                     if !consensus_normal {
                         return None;
@@ -7433,16 +7456,33 @@ where
         B: MessageBus,
     {
         let consensus = partition.consensus();
-        if !consensus.is_normal()
-            || consensus.is_transferring()
-            || consensus.commit_min() >= consensus.commit_max()
-            || partition.repair.is_some()
-        {
+        if !consensus.is_normal() || consensus.is_transferring() || partition.repair.is_some() {
+            return;
+        }
+        // The window ends at the group head when suffix bodies are missing,
+        // not at the commit point. A backup that adopted a StartView holds
+        // suffix HEADERS above `commit_max` whose bodies it may never have
+        // received: its ack for them is withheld until the body is journaled,
+        // and the primary's retransmit is dropped by the backup gap check
+        // because adoption already advanced the sequencer to the head. With a
+        // commit-bounded window nothing ever delivers those bodies, the
+        // primary cannot gather quorum for the suffix, and the group wedges
+        // one op below its head with the client write never confirmed.
+        let head = consensus.sequencer().current_sequence();
+        let commit_lag = consensus.commit_min() < consensus.commit_max();
+        let missing_suffix = consensus.commit_max().checked_add(1).is_some_and(|first| {
+            (first..=head).any(|op| partition.log.journal().inner.header_by_op(op).is_none())
+        });
+        if !commit_lag && !missing_suffix {
             return;
         }
         let nonce = iggy_common::random_id::get_uuid();
         let from_op = consensus.commit_min() + 1;
-        let to_op = consensus.commit_max();
+        let to_op = if missing_suffix {
+            head
+        } else {
+            consensus.commit_max()
+        };
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
         let namespace = consensus.group();

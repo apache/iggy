@@ -1974,6 +1974,30 @@ where
                 message
             };
 
+            // State-dependent admission belongs to the primary. A backup can
+            // lag the committed offset table or message frontier and would
+            // otherwise turn a routing artifact into a terminal 404 or 400.
+            // Reject it first with the only response that proves the request
+            // was never admitted, so the caller may safely retry elsewhere.
+            if consensus.is_follower() || !consensus.is_normal() || consensus.is_transferring() {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "rejecting client request on non-primary partition replica",
+                    )
+                    .with_operation(message.header().operation),
+                );
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "non-primary transient reply send failed",
+                )
+                .await;
+                return;
+            }
+
             // Parse once for both the delete-existence check and AckLevel dispatch.
             let consumer_offset = match message.header().operation {
                 Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
@@ -2062,32 +2086,6 @@ where
                     .await;
                     return;
                 }
-            }
-
-            // A client op landing on a non-primary (or mid-view-change)
-            // replica is a routing artifact -- e.g. the roster still points
-            // here while this group's primaryship moved after a restart.
-            // Answer the typed transient instead of asserting: the SDK
-            // replays and its leader recheck re-routes, whereas a panic
-            // kills the shard and a silent drop wedges the client until its
-            // read timeout.
-            if consensus.is_follower() || !consensus.is_normal() || consensus.is_transferring() {
-                emit_partition_diag(
-                    tracing::Level::WARN,
-                    &PartitionDiagEvent::new(
-                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                        "rejecting client request on non-primary partition replica",
-                    )
-                    .with_operation(message.header().operation),
-                );
-                Self::send_partition_deny_or_log(
-                    consensus,
-                    message.header(),
-                    IggyError::TransientNotAccepted.as_code(),
-                    "non-primary transient reply send failed",
-                )
-                .await;
-                return;
             }
 
             // NoAck -> fast path. Quorum -> VSR pipeline.
@@ -5476,13 +5474,20 @@ mod tests {
     type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
 
     fn recording_partition() -> (IggyPartition<RecordingBus>, SentFrames) {
+        recording_partition_at(0, 1)
+    }
+
+    fn recording_partition_at(
+        replica: u8,
+        replica_count: u8,
+    ) -> (IggyPartition<RecordingBus>, SentFrames) {
         let namespace = IggyNamespace::new(1, 1, 0);
         let bus = RecordingBus::default();
         let sent_to_clients = bus.sent_to_clients.clone();
         let consensus = VsrConsensus::new(
             TEST_CLUSTER,
-            0,
-            1,
+            replica,
+            replica_count,
             namespace.inner(),
             bus,
             LocalPipeline::new(),
@@ -5582,6 +5587,32 @@ mod tests {
             partition.consensus().pipeline_len(),
             1,
             "existing offset delete must replicate"
+        );
+    }
+
+    #[compio::test]
+    async fn on_request_delete_on_stale_backup_replies_transient_before_not_found() {
+        let (mut partition, sent_to_clients) = recording_partition_at(1, 3);
+        let client_id = 42;
+
+        partition
+            .on_request(delete_offset_request(client_id, 7, 5))
+            .await;
+
+        let sent = sent_to_clients.borrow();
+        assert_eq!(sent.len(), 1, "exactly one routing denial");
+        let (reply_client, frame) = &sent[0];
+        assert_eq!(*reply_client, client_id);
+        let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
+            &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
+        )
+        .expect("deny frame starts with a valid reply header");
+        assert_eq!(header.status, IggyError::TransientNotAccepted.as_code());
+        assert_eq!(header.op, 0, "the backup admitted nothing");
+        assert_eq!(
+            partition.consensus().pipeline_len(),
+            0,
+            "a backup must not replicate the delete"
         );
     }
 
