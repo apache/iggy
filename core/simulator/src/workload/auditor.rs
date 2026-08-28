@@ -54,10 +54,27 @@ pub struct AuditorStats {
     pub replies_unknown: u64,
     /// Per-action committed counter, indexed by `Action as usize`.
     pub commits_per_action: [u64; Action::COUNT],
-    /// Metadata replies carrying a nonzero committed result code (a business
-    /// rejection). The shadow does not mutate on these; in a serial run the
-    /// `on_reply` equality oracle asserts the rejection was the targeted outcome.
+    /// Metadata reply with a nonzero committed result code: a business rejection.
+    /// Shadow does not mutate; on a serial run `on_reply` asserts it was targeted.
     pub committed_rejections: u64,
+    /// Denied before commit: `ReplyHeader::status` set, body EMPTY. The op never
+    /// entered the log, so the shadow must not move and there is no result section to
+    /// classify. Shell only; the raw path has no denial site.
+    pub denials: u64,
+    /// Per-action denial count and last status, indexed by `Action as usize`. Splits
+    /// two causes: an op the server refuses for this input (an offset the partition
+    /// cannot accept yet), versus one dispatch cannot decode at all, a workload bug
+    /// showing up as every request for that action denied with the same status.
+    pub denials_per_action: [(u64, u32); Action::COUNT],
+    /// Result section carrying a transport rejection, not a committed outcome.
+    /// `build_result_rejection_reply` frames them under the REQUEST's own operation
+    /// with `status` 0, so only the code distinguishes them from a commit.
+    pub transient_rejections: u64,
+    /// Per-action transient count and last code, indexed by `Action as usize`. Split
+    /// from `denials_per_action` because a denial never passes, while a transient is
+    /// the cluster mid-view-change or backpressured and clears on retry. An action
+    /// that is all transients means the workload outruns the cluster, not a broken op.
+    pub transient_rejections_per_action: [(u64, u32); Action::COUNT],
 }
 
 impl Default for AuditorStats {
@@ -67,6 +84,10 @@ impl Default for AuditorStats {
             replies_unknown: 0,
             commits_per_action: [0u64; Action::COUNT],
             committed_rejections: 0,
+            denials: 0,
+            denials_per_action: [(0, 0); Action::COUNT],
+            transient_rejections: 0,
+            transient_rejections_per_action: [(0, 0); Action::COUNT],
         }
     }
 }
@@ -171,6 +192,25 @@ impl ServerAuditor {
         self.stats.commits_per_action[action as usize] += 1;
     }
 
+    /// Record a pre-commit denial (`ReplyHeader::status` nonzero).
+    pub const fn note_denial(&mut self, action: Action, status: u32) {
+        self.stats.denials += 1;
+        let entry = &mut self.stats.denials_per_action[action as usize];
+        entry.0 += 1;
+        entry.1 = status;
+    }
+
+    /// Record a result-framed transport rejection (see
+    /// [`AuditorStats::transient_rejections`]). Neither a commit nor a denial:
+    /// the shadow does not move, and for `TransientNotCommitted` the request
+    /// stays outstanding so a replay can settle what actually happened.
+    pub const fn note_transient_rejection(&mut self, action: Action, code: u32) {
+        self.stats.transient_rejections += 1;
+        let entry = &mut self.stats.transient_rejections_per_action[action as usize];
+        entry.0 += 1;
+        entry.1 = code;
+    }
+
     /// Record a committed business rejection (nonzero result code). Either
     /// targeted by outcome-first generation (duplicate name, fabricated missing
     /// entity) or produced by a race.
@@ -181,6 +221,26 @@ impl ServerAuditor {
     #[must_use]
     pub const fn stats(&self) -> &AuditorStats {
         &self.stats
+    }
+
+    /// Drop every in-flight expectation for `client`, returning how many went.
+    ///
+    /// For a client the cluster evicted: its session is gone, so nothing it had
+    /// outstanding will ever be answered and an expectation left behind would
+    /// wait forever. The requests themselves were refused before commit, so
+    /// forgetting them loses no committed state.
+    pub fn forget_client(&mut self, client: u128) -> usize {
+        let before = self.in_flight.len();
+        self.in_flight.retain(|&(owner, _), _| owner != client);
+        before - self.in_flight.len()
+    }
+
+    /// The action of an outstanding request, if one is recorded for `key`.
+    /// Diagnostic only: names what a stalled run is waiting on, which the bare
+    /// `(client, request)` pair cannot.
+    #[must_use]
+    pub fn in_flight_action(&self, key: (u128, u64)) -> Option<Action> {
+        self.in_flight.get(&key).map(|entry| entry.action)
     }
 
     #[must_use]
