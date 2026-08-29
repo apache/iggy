@@ -50,7 +50,6 @@ reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
