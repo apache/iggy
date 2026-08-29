@@ -89,7 +89,7 @@ const DEFAULT_CIRCUIT_BREAKER_COOL_DOWN: &str = "30s";
 #[serde(deny_unknown_fields)]
 pub struct TemplateSinkConfig {
     /// TODO(ConnectorDeveloper): document the exact shape this connector expects, e.g.
-    /// "https://api.example.com" or "postgres://user:pass@host:5432/db".
+    /// "<https://api.example.com>" or "postgres://user:pass@host:5432/db".
     /// `SecretString` because DSNs commonly embed credentials — never plain
     /// `String` for this field, see `PostgresSinkConfig::connection_string`
     /// in `sinks/postgres_sink` for the same pattern.
