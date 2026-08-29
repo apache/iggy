@@ -371,9 +371,11 @@ pub enum PartitionRecoveryRefusal {
     /// The sparse index of a topic running under `enforce_fsync` outruns its
     /// log by more than the one entry a crash can legitimately strand there.
     /// Persistence writes exactly one entry per flush chunk, chunks never
-    /// overlap, and it completes before the client reply, so every entry below
-    /// the last one names a chunk whose log bytes were fsync'd before its
-    /// batch was acknowledged. Only the chunk in flight when the process died
+    /// overlap, and flushes are serialized, so every entry below the last one
+    /// names a chunk whose log bytes completed their fdatasync. A flush covers
+    /// the whole committed journal prefix, so every batch in a completed chunk
+    /// was already acknowledged, or is acknowledged by the commit that
+    /// triggered the flush. Only the chunk in flight when the process died
     /// can have an entry the log never backed. A deeper step-back therefore
     /// says the LOG lost acknowledged bytes it had already made durable, and
     /// rebuilding this segment from what the log still holds would let the
@@ -385,6 +387,11 @@ pub enum PartitionRecoveryRefusal {
         /// Position of the highest entry the log still proves; 0 when it
         /// proves none, which `provable_entries` disambiguates.
         provable_position: u64,
+        /// Entries the backward search actually probed, which its own cap
+        /// holds below `entry_count` on a long index: `provable_entries == 0`
+        /// then means nothing proved in the searched window, not that the log
+        /// backs nothing.
+        searched_entries: u64,
     },
     /// A writer reopening over recovered bounds found the on-disk length
     /// diverging from the size recovery just validated and truncated to.
@@ -475,13 +482,15 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 entry_count,
                 provable_entries,
                 provable_position,
+                searched_entries,
             } => write!(
                 f,
                 "segment {start_offset} runs under enforce_fsync with {entry_count} sparse \
-                 index entries, but its log backs only {provable_entries} of them (up to \
-                 byte {provable_position}); every entry below the last was fsync'd with \
-                 the log chunk it describes before that chunk was acknowledged, so the \
-                 log has lost acknowledged data rather than the index having outrun it"
+                 index entries, but its log backs only {provable_entries} of the \
+                 {searched_entries} searched from the top (up to byte {provable_position}); \
+                 every entry below the last was fsync'd together with the acknowledged log \
+                 chunk it describes, so the log has lost acknowledged data rather than the \
+                 index having outrun it"
             ),
             Self::StorageSizeMismatch {
                 start_offset,

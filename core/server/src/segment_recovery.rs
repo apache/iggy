@@ -75,15 +75,24 @@ const REBUILT_INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 const INDEX_SCAN_YIELD_STRIDE: u64 = 1024;
 
 /// Index entries the log may legitimately fail to back under `enforce_fsync`.
-/// Persistence writes exactly one entry per flush chunk, chunks never overlap,
-/// and it completes before the client reply. The two halves fdatasync
-/// concurrently WITHIN one flush, but flushes are serialized, and the log's
-/// fdatasync covers the whole file: an entry existing above entry N therefore
-/// proves the log was synced through chunk N. Only the chunk in flight when
-/// the process died can leave an entry the log never backed. See
-/// [`PartitionRecoveryRefusal::FsyncedLogLoss`] for why a deeper step-back is
-/// evidence about the log rather than about the index.
+/// Persistence writes exactly one entry per flush chunk and chunks never
+/// overlap. The two halves fdatasync concurrently WITHIN one flush, but
+/// flushes are serialized, and the log's fdatasync covers the whole file: an
+/// entry existing above entry N therefore proves the log was synced through
+/// chunk N. Only the chunk in flight when the process died can leave an entry
+/// the log never backed. See [`PartitionRecoveryRefusal::FsyncedLogLoss`] for
+/// why a deeper step-back is evidence about the log rather than about the
+/// index.
 const MAX_FSYNCED_INDEX_STEP_BACK_ENTRIES: u64 = 1;
+
+/// Index entries the backward anchor search probes before giving up, at one
+/// 24-byte pread each. Capping the walk cannot change a verdict: only the
+/// FIRST entry probed can leave the step-back within
+/// [`MAX_FSYNCED_INDEX_STEP_BACK_ENTRIES`], so past that entry the refusal is
+/// already decided and deeper probes only sharpen the byte it names. The
+/// refusal carries the depth actually searched, so a capped search never
+/// reads as "the log backs nothing".
+const MAX_INDEX_ANCHOR_PROBE_ENTRIES: u64 = 4096;
 
 /// Units the damage probes of one partition load may spend per byte of
 /// residue they are asked to classify, at one unit per candidate offset
@@ -1109,7 +1118,7 @@ async fn recover_segment_bounds(
                 // deeper gap is the log missing bytes it already acknowledged.
                 // Refuse and keep every byte for the operator.
                 if enforce_fsync {
-                    let anchor = find_provable_index_anchor(
+                    let search = find_provable_index_anchor(
                         identity,
                         index_path,
                         messages_path,
@@ -1119,15 +1128,14 @@ async fn recover_segment_bounds(
                         messages_size,
                     )
                     .await?;
-                    let (provable_entries, provable_position) =
-                        anchor.map_or((0, 0), |(entries, entry)| (entries, entry.position));
-                    let step_back_entries = entry_count.saturating_sub(provable_entries);
+                    let step_back_entries = entry_count.saturating_sub(search.provable_entries);
                     if step_back_entries > MAX_FSYNCED_INDEX_STEP_BACK_ENTRIES {
                         return Err(identity.refusal(PartitionRecoveryRefusal::FsyncedLogLoss {
                             start_offset,
                             entry_count,
-                            provable_entries,
-                            provable_position,
+                            provable_entries: search.provable_entries,
+                            provable_position: search.provable_position,
+                            searched_entries: search.searched_entries,
                         }));
                     }
                 }
@@ -1456,9 +1464,21 @@ async fn walk_chain_from_anchor(
     })
 }
 
+/// How far the index has outrun the log, in the terms the refusal reports.
+struct IndexAnchorSearch {
+    /// Entries at or below the highest one the log still proves, that entry
+    /// included; 0 when nothing in the searched window proved.
+    provable_entries: u64,
+    /// Position of that entry, or 0 when nothing proved.
+    provable_position: u64,
+    /// Entries actually probed, capped by
+    /// [`MAX_INDEX_ANCHOR_PROBE_ENTRIES`].
+    searched_entries: u64,
+}
+
 /// Highest index entry below the last one that the log can still prove,
-/// returned as the number of entries at or below it plus the entry itself.
-/// `None` when no entry proves out.
+/// reported as the number of entries at or below it plus that entry's
+/// position, alongside how deep the search went.
 ///
 /// Reached only under `enforce_fsync`, and only to measure how far the index
 /// has outrun the log: the index is dropped whole either way, so nothing is
@@ -1471,18 +1491,20 @@ async fn walk_chain_from_anchor(
 /// stamp and the entry's own base offset, and passing its batch checksum.
 /// Entries are read one at a time from the back rather than
 /// slurped: an index can run to megabytes, and the search stops at the first
-/// entry that proves. The dominant shape costs no log read at all -- an
+/// entry that proves. The dominant shape costs no LOG read at all -- an
 /// entry pointing past the log end is rejected on arithmetic alone -- so a
-/// torn tail pays a header read for the one entry it lands on and nothing
-/// more.
+/// torn tail pays one header read for the entry it lands on; the index side
+/// still costs a 24-byte pread per entry stepped over, which is what
+/// [`MAX_INDEX_ANCHOR_PROBE_ENTRIES`] caps.
 ///
-/// Budgeted like the damage probe, because the search reads BACKWARD and
-/// nothing else bounds it: the log span between one probed entry and the
-/// one probed before it is the residue that entry classifies. An honest
-/// index holds one entry per flushed chunk, so a whole batch fits inside
-/// every such span and its verify always fits the residue multiple; entries
-/// packed closer together than the batches they claim exhaust it and refuse,
-/// rather than paying a verify per entry over an index that never proves.
+/// The log reads are budgeted like the damage probe's: the log span between
+/// one probed entry and the one probed before it is the residue that entry
+/// classifies. An honest index holds one entry per flushed chunk, so a whole
+/// batch fits inside every such span and its verify always fits the residue
+/// multiple; entries packed closer together than the batches they claim
+/// exhaust it and refuse, rather than paying a verify per entry over an index
+/// that never proves. That budget bounds hashed BYTES, so the step count is
+/// capped separately.
 /// Yields once per window of disk reads, like the walks, and additionally
 /// every [`INDEX_SCAN_YIELD_STRIDE`] entries: an entry that overshoots the
 /// log reads nothing from it, so there is no refill to key the yield on, and
@@ -1495,10 +1517,14 @@ async fn find_provable_index_anchor(
     start_offset: u64,
     entry_count: u64,
     messages_size: u64,
-) -> Result<Option<(u64, IggyIndex)>, ServerError> {
+) -> Result<IndexAnchorSearch, ServerError> {
     // The last entry is the one that just failed to prove out.
     let Some(mut entry_index) = entry_count.checked_sub(2) else {
-        return Ok(None);
+        return Ok(IndexAnchorSearch {
+            provable_entries: 0,
+            provable_position: 0,
+            searched_entries: 0,
+        });
     };
     let file = fs::File::open(index_path).map_err(|source| {
         error!(
@@ -1515,6 +1541,7 @@ async fn find_provable_index_anchor(
     // Lowest log byte a probed entry has already paid for; the next probed
     // entry is budgeted by the span from its own position up to here.
     let mut budgeted_down_to = messages_size;
+    let mut searched_entries = 0u64;
     loop {
         file.read_exact_at(&mut raw, entry_index * SPARSE_INDEX_ENTRY_SIZE as u64)
             .map_err(|source| {
@@ -1533,6 +1560,7 @@ async fn find_provable_index_anchor(
             read_u64_le(&raw, 8),
             read_u64_le(&raw, 16),
         );
+        searched_entries += 1;
         if entry.position < messages_size {
             scanner
                 .budget
@@ -1559,27 +1587,44 @@ async fn find_provable_index_anchor(
                     entry.position,
                     header.total_size(),
                 )? {
-                    return Ok(Some((entry_index + 1, entry)));
+                    return Ok(IndexAnchorSearch {
+                        provable_entries: entry_index + 1,
+                        provable_position: entry.position,
+                        searched_entries,
+                    });
                 }
             }
         }
         if scanner.take_refilled() || entry_index.is_multiple_of(INDEX_SCAN_YIELD_STRIDE) {
             yield_to_reactor().await;
         }
+        if searched_entries == MAX_INDEX_ANCHOR_PROBE_ENTRIES {
+            break;
+        }
         let Some(next) = entry_index.checked_sub(1) else {
-            return Ok(None);
+            break;
         };
         entry_index = next;
     }
+    Ok(IndexAnchorSearch {
+        provable_entries: 0,
+        provable_position: 0,
+        searched_entries,
+    })
 }
 
-/// Checks every whole index entry: the first must not claim an offset below
-/// the segment's own start, and offsets and positions must strictly ascend
-/// (the writer appends one entry per flushed chunk over a growing log, and
-/// every chunk covers at least one message and one byte). A regression means
-/// the file was written mis-strided or over foreign bytes and describes no
-/// log at all; it is logged here, where the entry is known, and the caller
-/// rebuilds the index from the log.
+/// Checks every whole index entry: the first must name the segment's own
+/// start -- its start offset, at byte 0 -- and offsets and positions must
+/// strictly ascend (the writer appends one entry per flushed chunk over a
+/// growing log, and every chunk covers at least one message and one byte).
+/// Every producer of an index mints its first entry there: the writer at
+/// `file_position == 0` on a fresh segment, [`recover_by_walking_log`]'s
+/// rebuild, and the state-transfer install's own walk. A first entry
+/// elsewhere means the file was written mis-strided or over foreign bytes
+/// and describes no log at all -- and the accepted path reads that entry's
+/// timestamp as the SEGMENT's start timestamp, so a head that belongs to
+/// another segment is not merely unused. Logged here, where the entry is
+/// known, and the caller rebuilds the index from the log.
 ///
 /// Timestamps are deliberately NOT validated: a primary clock rewind across a
 /// restart can legitimately regress persisted `base_timestamp` today, and the
@@ -1647,14 +1692,15 @@ async fn index_is_consistent(
                 );
                 return Ok(false);
             }
-            if previous.is_none() && entry_offset < start_offset {
+            if previous.is_none() && (entry_offset != start_offset || entry_position != 0) {
                 warn!(
                     stream_id = identity.stream_id,
                     topic_id = identity.topic_id,
                     partition_id = identity.partition_id,
                     start_offset,
                     first_entry_offset = entry_offset,
-                    "sparse index claims an offset below the segment start; \
+                    first_entry_position = entry_position,
+                    "sparse index does not start at the segment's own first batch; \
                      discarding the index and rebuilding it from the log"
                 );
                 return Ok(false);
@@ -2784,6 +2830,81 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_index_entry_above_segment_start_when_recovering_should_rebuild_the_index_from_the_log()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let first = encoded_batch(5, 1);
+        let second = encoded_batch(6, 1);
+        let third = encoded_batch(7, 1);
+        let mut log = first.clone();
+        log.extend_from_slice(&second);
+        log.extend_from_slice(&third);
+        // An index that lost its own head: the last entry is valid and
+        // anchors a clean walk, so the segment would be accepted with a start
+        // timestamp taken from a chunk that is not its first.
+        let mut index = index_entry(6, 0);
+        index.extend_from_slice(&index_entry(7, (first.len() + second.len()) as u64));
+        let (messages_path, index_path) = write_segment(&config, 5, &log, &index);
+
+        let recovered = recover(&config)
+            .await
+            .expect("an index starting above the segment start must be rebuilt, not refused");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 7);
+        assert_eq!(
+            bytes_of(&index_path),
+            index_entry(5, 0),
+            "the rebuilt index must start at the segment's own first batch"
+        );
+        assert_eq!(
+            bytes_of(&messages_path),
+            log,
+            "rebuilding the index must not touch a whole log"
+        );
+    }
+
+    #[compio::test]
+    async fn given_index_first_entry_past_byte_zero_when_recovering_should_rebuild_the_index_from_the_log()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let first = encoded_batch(0, 1);
+        let second = encoded_batch(1, 1);
+        let third = encoded_batch(2, 1);
+        let mut log = first.clone();
+        log.extend_from_slice(&second);
+        log.extend_from_slice(&third);
+        // The offset column opens where the segment does and the entries
+        // ascend, so every other check reads this index as healthy. Only the
+        // position is wrong: byte 0 is described by nothing, while the last
+        // entry lands on its batch and would anchor a clean walk.
+        let mut index = index_entry(0, first.len() as u64);
+        index.extend_from_slice(&index_entry(2, (first.len() + second.len()) as u64));
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let recovered = recover(&config)
+            .await
+            .expect("an index whose first entry skips byte 0 must be rebuilt, not refused");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 2);
+        assert_eq!(
+            bytes_of(&index_path),
+            index_entry(0, 0),
+            "the rebuilt index must open at byte 0"
+        );
+        assert_eq!(
+            bytes_of(&messages_path),
+            log,
+            "rebuilding the index must not touch a whole log"
+        );
+    }
+
+    #[compio::test]
     async fn given_index_less_wide_batches_when_recovering_should_rebuild_strided_index() {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
@@ -3576,7 +3697,9 @@ mod tests {
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
         // Every entry points past the log end, so nothing in the index backs
-        // the walk. The log is whole and describes itself, so the index is
+        // the walk -- and the first entry is not even at the segment's first
+        // byte, which the consistency scan catches before the walk runs. The
+        // log is whole and describes itself either way, so the index is
         // dropped and rebuilt from it.
         let log = encoded_batch(0, 2);
         let mut index = index_entry(0, log.len() as u64);
@@ -3810,12 +3933,15 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        // The gap is measured the same way when no entry proves at all: two
-        // entries the log backs nowhere is one more than the in-flight chunk
-        // can explain, so the rebuild never runs.
-        let log = encoded_batch(0, 2);
-        let mut index = index_entry(0, log.len() as u64);
-        index.extend_from_slice(&index_entry(2, log.len() as u64 + 64));
+        // The gap is measured the same way when no entry proves at all. The
+        // index still starts at the segment's own first byte, so it is not
+        // the mis-strided shape the consistency scan drops; the log simply
+        // lost the tail of its FIRST indexed chunk, which two entries the log
+        // backs nowhere is one more than the in-flight chunk can explain.
+        let whole = encoded_batch(0, 2);
+        let log = whole[..COMMAND_HEADER_SIZE + 8].to_vec();
+        let mut index = index_entry(0, 0);
+        index.extend_from_slice(&index_entry(2, whole.len() as u64));
         let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
 
         let error = recover_under_fsync(&config, true)
@@ -3836,6 +3962,51 @@ mod tests {
                 }
             ),
             "expected an fsynced-log-loss refusal over the dropped index, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_an_index_deeper_than_the_probe_cap_under_fsync_when_recovering_should_refuse_with_the_searched_depth()
+     {
+        // Entry 0 is the one entry the log does back, and it sits below the
+        // cap: the search stops before reaching it and proves nothing. The
+        // refusal is still the right verdict -- a step-back this deep is log
+        // loss whatever a deeper probe would find -- which is exactly why it
+        // must name the depth it searched instead of letting zero provable
+        // entries read as "the log backs nothing".
+        const OVERSHOOTING_ENTRIES: u64 = MAX_INDEX_ANCHOR_PROBE_ENTRIES + 1;
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let log = encoded_batch(0, 1);
+        let mut index = index_entry(0, 0);
+        for step in 0..OVERSHOOTING_ENTRIES {
+            index.extend_from_slice(&index_entry(step + 1, log.len() as u64 + step));
+        }
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover_under_fsync(&config, true)
+            .await
+            .err()
+            .expect("an index outrunning the log past the probe cap must refuse");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::FsyncedLogLoss {
+                        entry_count,
+                        provable_entries: 0,
+                        searched_entries,
+                        ..
+                    },
+                    ..
+                } if *entry_count == OVERSHOOTING_ENTRIES + 1
+                    && *searched_entries == MAX_INDEX_ANCHOR_PROBE_ENTRIES
+            ),
+            "expected a capped fsynced-log-loss refusal naming its search depth, got {error:?}"
         );
         assert_eq!(bytes_of(&messages_path), log);
         assert_eq!(bytes_of(&index_path), index);

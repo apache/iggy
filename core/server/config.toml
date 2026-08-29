@@ -443,9 +443,14 @@ path = "partitions"
 validate_checksum = true
 
 # Durability and flush cadence are per topic, set at CreateTopic:
-#   enforce_fsync                     - fsync each write (false when unset)
+#   enforce_fsync                     - fdatasync each flush (false when unset)
 #   messages_required_to_save         - flush after this many messages (1024)
 #   size_of_messages_required_to_save - flush after this many bytes (1 MiB)
+# enforce_fsync decides whether a flush syncs, never whether one happens. A
+# write is acknowledged when it commits, which precedes its flush unless that
+# commit trips a threshold, and the partition journal holding the unflushed
+# remainder is in memory and is not replayed at boot. Acks are therefore
+# durability-gated only at messages_required_to_save = 1.
 
 # Segment configuration
 [system.segment]
@@ -475,8 +480,9 @@ recreate_missing_state = false
 # already held, so an index is never evidence about the log: one the log
 # contradicts is repaired, not believed. It is DROPPED whole and rebuilt from
 # a byte-0 walk when it holds no whole 24-byte entry, when its entries
-# regress in offset or position, when they open below the segment's own start
-# offset, or when the log cannot back its LAST entry. Only an index whose
+# regress in offset or position, when its first entry is not the segment's
+# own start offset at position 0, or when the log cannot back its LAST
+# entry. Only an index whose
 # last entry the log proves anchors a walk, which then runs from that entry
 # to the file end. Under the topic's enforce_fsync = true an index the log
 # cannot back is measured against the log first: a gap of more than ONE entry

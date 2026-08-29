@@ -2929,12 +2929,13 @@ where
         // commit frontier; flushing the uncommitted tail would write
         // per-replica-timing bytes to its segment (cross-replica divergence) and
         // drop the headers those ops need when their own commit later lands
-        // (commit_min wedge). Eviction is deferred until the bytes are durable:
-        // on a persist failure the prefix stays resident so the next commit
-        // re-reads it instead of losing a committed batch (a live-process I/O
-        // fault only; the in-memory journal does not survive a crash). All
-        // segment range / stats / durable-offset accounting below is computed
-        // from the committed entries, not the resident-journal snapshot above.
+        // (commit_min wedge). Eviction is deferred until the bytes are durable,
+        // so a persist failure retains the prefix rather than losing a committed
+        // batch (a live-process I/O fault only; the in-memory journal does not
+        // survive a crash). Only the transfer-offer flush survives to re-read it;
+        // the commit path panics the shard pump instead. All segment range /
+        // stats / durable-offset accounting below is computed from the committed
+        // entries, not the resident-journal snapshot above.
         let commit_max = self.consensus.commit_max();
         let committed_entries = self.log.journal().inner.committed_prefix(commit_max);
         if committed_entries.is_empty() {
@@ -3092,19 +3093,20 @@ where
 
             // Persist BEFORE eviction so a write failure leaves the rest of the
             // committed prefix resident instead of dropping it. Nothing retries
-            // the persist: on the commit path a failure panics
-            // `handle_committed_entries`, the shutdown flush warns and moves to
-            // the next namespace, and the transfer offer turns it into
+            // the persist: on the commit path a failure panics out of
+            // `handle_committed_entries` and takes this shard's message pump with
+            // it, so every partition on the shard stops committing, ticking and
+            // replying until the process is restarted. The shutdown flush warns and
+            // moves to the next namespace, and the transfer offer turns it into
             // `FlushFailed`. Recovery is a restart, which reopens each writer at
             // the on-disk length boot recovery validated.
             //
             // The ordering therefore buys a non-corrupting failure, not an
             // in-process one. Write cursors advance only once both the batch and the
-            // index are durable, so where the error does not panic the partition,
-            // its next flush rewrites the same positions instead of appending a
-            // duplicate. Chunks already durable are evicted before the error
-            // propagates, so it cannot re-read them (and re-write them past a
-            // rotation).
+            // index are durable, so on the paths that survive the error, the next
+            // flush rewrites the same positions instead of appending a duplicate.
+            // Chunks already durable are evicted before the error propagates, so it
+            // cannot re-read them (and re-write them past a rotation).
             if let Err(error) = self
                 .persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
                 .await
