@@ -7238,7 +7238,6 @@ dependencies = [
  "reqwest-middleware",
  "secrecy",
  "serde",
- "serde_json",
  "tokio",
  "tracing",
 ]
