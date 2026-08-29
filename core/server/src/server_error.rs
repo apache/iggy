@@ -77,6 +77,21 @@ pub enum ServerError {
          committed journal tail may not have flushed"
     )]
     ShardPumpDied { shard_id: u16, reason: String },
+    /// A shard's message pump stopped because a partition could not commit
+    /// an op the cluster had already committed. The partition is fenced and
+    /// the server is shutting down; the exit is non-zero so an orchestrator
+    /// does not read a durability fault as a clean stop.
+    #[error(
+        "shard {shard_id} stopped: partition {namespace_raw} could not commit op {op}, \
+         which the cluster had already committed. The replica is divergent and was \
+         fenced; the server shut down so it cannot serve a prefix the cluster has \
+         moved past"
+    )]
+    ShardFatal {
+        shard_id: u16,
+        namespace_raw: u64,
+        op: u64,
+    },
     #[error(
         "shard {shard_id} message pump did not drain within {timeout:?}. \
          Committed journal tail may not have flushed"

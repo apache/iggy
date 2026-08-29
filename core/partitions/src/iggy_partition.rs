@@ -30,7 +30,7 @@ use crate::poll_plan::{
 };
 use crate::segment::Segment;
 use crate::state_transfer::{PartitionTransferSession, PendingTransferRearm};
-use crate::types::{RepairConclusion, RepairSession};
+use crate::types::{FatalCommit, RepairConclusion, RepairSession};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
     PollingConsumer,
@@ -83,7 +83,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
 //
@@ -147,6 +147,11 @@ where
     /// also gates repaired-batch persistence -- overstating THAT field would
     /// silently drop the `(commit_op, commit_max]` replay window.
     pub installed_frontier: Option<u64>,
+    /// Set once a local commit fails for an op the cluster already committed.
+    /// Fences the partition: every path that would advance or serve it turns
+    /// into a no-op, so the shard's tick can observe the fault and shut the
+    /// server down without the partition moving again in the meantime.
+    fatal: Option<FatalCommit>,
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Committed-only mirror of each consumer's persisted offset file: the
     /// last value this replica durably wrote per (kind, consumer id). Fed
@@ -474,6 +479,7 @@ where
             repair: None,
             recovered_durable_offset: None,
             installed_frontier: None,
+            fatal: None,
             pending_consumer_offset_commits: HashMap::new(),
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
@@ -1833,6 +1839,12 @@ where
         IggyNamespace::from_raw(self.consensus.group())
     }
 
+    /// The commit fault that fenced this partition, if one has.
+    #[must_use]
+    pub const fn fatal(&self) -> Option<&FatalCommit> {
+        self.fatal.as_ref()
+    }
+
     fn partition_dir(&self) -> Option<String> {
         if self.partition_dir.is_some() {
             return self.partition_dir.clone();
@@ -2480,6 +2492,9 @@ where
 
     #[allow(clippy::future_not_send)]
     pub async fn on_ack(&mut self, message: Message<PrepareOkHeader>, config: &PartitionsConfig) {
+        if self.fatal.is_some() {
+            return;
+        }
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
         {
@@ -2534,6 +2549,9 @@ where
 
     #[allow(clippy::future_not_send)]
     pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
+        if self.fatal.is_some() {
+            return;
+        }
         self.clear_pending_consumer_offset_commits_if_view_changed();
 
         // The primary commits inline via `on_ack` (it drains its own pipeline).
@@ -3248,12 +3266,32 @@ where
                 // advanced; next advance_commit_min(op+1) would assert
                 // op+1 == commit_min + 1, panics cryptically.
                 //
-                // Fatal: better to suicide than serve stale or panic later.
-                // Operator restarts; recovery+repair re-syncs.
-                panic!(
-                    "partition local commit failed at op={} ({:?}): replica is divergent from cluster commit; restart required",
-                    prepare_header.op, prepare_header.operation
+                // Fatal, but NOT by panicking: this runs on the shard's
+                // message pump, and `compio::runtime::spawn` swallows a panic
+                // there, leaving every partition on the shard unable to
+                // commit, tick or reply while the process still reports
+                // healthy and answers on its other shards. Fence the
+                // partition and stop draining; the shard's tick picks the
+                // fault up and takes the server down through the ordinary
+                // shutdown path, so the remaining partitions flush and the
+                // exit code is non-zero. Operator restarts; recovery+repair
+                // re-syncs.
+                error!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    replica_id,
+                    namespace_raw,
+                    op = prepare_header.op,
+                    operation = ?prepare_header.operation,
+                    "partition local commit failed for a cluster-committed op; \
+                     replica is divergent, fencing the partition and shutting down"
                 );
+                self.fatal = Some(FatalCommit {
+                    namespace_raw,
+                    op: prepare_header.op,
+                    operation: prepare_header.operation,
+                });
+                return;
             }
 
             self.consensus.advance_commit_min(prepare_header.op);
@@ -7605,6 +7643,63 @@ mod tests {
     /// A half that failed never advanced its cursor, so the retry rewrites
     /// the same positions: one copy of the batch, one index entry.
     #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_a_persist_failure_on_a_committed_op_should_fence_the_partition_not_panic() {
+        // The op is cluster-committed and the local write cannot be made, so
+        // the replica is divergent. This used to `panic!`, which the pump
+        // task swallows: the shard stopped serving every partition it owned
+        // while the process reported healthy. The partition must fence itself
+        // instead, so the shard's tick can see the fault and stop the server.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let log_cursor = Rc::new(AtomicU64::new(0));
+        let index_cursor = Rc::new(AtomicU64::new(0));
+        let messages_writer = MessagesWriter::new(
+            log_path.to_str().expect("utf-8 path"),
+            log_cursor,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("open segment log writer");
+        // The index half writes to a device that is always full, so the
+        // persist fails the way a full disk fails.
+        let index_writer = IggyIndexWriter::new(DEV_FULL, index_cursor, true, false)
+            .await
+            .expect("open segment index writer");
+
+        let mut partition = test_partition();
+        partition.log.add_persisted_segment(
+            Segment::new(0, IggyByteSize::from(1024 * 1024_u64)),
+            SegmentStorage::default(),
+            Some(Rc::new(messages_writer)),
+            Some(Rc::new(index_writer)),
+        );
+
+        journal_send_batch(&mut partition, 1).await;
+        partition.consensus().advance_commit_max(1);
+
+        // Would abort the test process before the fence existed.
+        partition.commit_journal(&repair_config()).await;
+
+        let fault = partition
+            .fatal()
+            .expect("a failed commit of a cluster-committed op must fence the partition");
+        assert_eq!(fault.op, 1);
+        assert_eq!(fault.operation, Operation::SendMessages);
+
+        // The fence holds: a fenced partition must not advance again, or the
+        // pump's tail drain walks it into the `advance_commit_min` assert.
+        let commit_min = partition.consensus().commit_min();
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(
+            partition.consensus().commit_min(),
+            commit_min,
+            "a fenced partition must not advance on a later commit"
+        );
+    }
+
     #[compio::test]
     async fn given_failed_persist_when_retried_with_a_healthy_writer_should_overwrite_the_same_positions()
      {
