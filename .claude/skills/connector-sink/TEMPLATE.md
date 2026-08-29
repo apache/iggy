@@ -9,6 +9,12 @@ batch.
 Also read [SKILL.md](SKILL.md) and pre-flight with
 [connector-pr-review](../connector-pr-review/SKILL.md) before `/ready`.
 
+Prefer starting from a compiling crate over copying this prose kit:
+`core/connectors/sinks/sink_template/` implements the same shape as real,
+tested code you can `cargo build`/`cargo test` immediately, with the same
+`TODO(ConnectorDeveloper)` markers. Use this kit instead only when copying
+a whole crate is more scaffolding than you need.
+
 ## Files to create
 
 ```text

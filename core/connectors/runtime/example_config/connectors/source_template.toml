@@ -44,3 +44,4 @@ max_open_retries = 10
 open_retry_max_delay = "60s"
 circuit_breaker_threshold = 5
 circuit_breaker_cool_down = "30s"
+verbose_logging = false

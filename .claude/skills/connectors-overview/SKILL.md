@@ -222,7 +222,7 @@ Each implemented in at least one in-tree plugin or runtime path.
 - Random UUIDs as message IDs / dedup keys.
 - Classifying retryability via `err.to_string()` substring matches.
 - README defaults that disagree with code consts.
-- Invented config knob names (`request_timeout`, `retry_max_delay`) instead of the canon in `connector-pr-review`.
+- Invented config knob names (e.g. `request_timeout` instead of `timeout`) instead of the canon in `connector-pr-review`.
 
 For the full PR review checklist (blockers, delivery-semantics paragraph, pre-flight paste), load [connector-pr-review](../connector-pr-review/SKILL.md).
 

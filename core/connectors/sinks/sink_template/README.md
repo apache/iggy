@@ -27,21 +27,29 @@ blog post for the checklist this template is built against.
   `batch_size` instead of sending everything in one unbounded request.
 - The `sink_connector!` FFI macro invocation and a `Cargo.toml` with the
   right `crate-type`, workspace-pinned dependencies, and license header.
-- Tests for config/identifier validation and the circuit-breaker short-circuit
-  path.
+- `verbose_logging: Option<bool>` upgrading the per-batch log line from
+  `debug!` to `info!`, mirroring the runtime's own `verbose` flag.
+- Tests for config/identifier validation, the circuit-breaker short-circuit
+  path, the `verbose_logging` flag, and `consume()`'s batch loop end to end.
 
 ## What you need to fill in
 
-Search for `TODO(ConnectorDeveloper)` in `src/lib.rs` — there is exactly one spot:
+Search for `TODO(ConnectorDeveloper)` in `src/lib.rs` — there is exactly one
+spot that requires code, plus two more that are conditional/documentation:
 
-**`push_batch()`** — build the request/write that actually sends one chunk
-of messages to your destination, using `self.config.connection_string` (and
-`self.config.target`, already validated by the time this runs) via
-`self.client` (already retry-wrapped). Distinguish permanent failures (bad
-schema, a destination that will reject this payload shape no matter how many
-times you retry) from transient ones (network error, 5xx, timeout) by
-returning `Error::PermanentHttpError` for the former — see the doc comment on
-that variant for why the distinction matters to the circuit breaker.
+**`push_batch()`** (required) — build the request/write that actually sends
+one chunk of messages to your destination, using
+`self.config.connection_string` (and `self.config.target`, already validated
+by the time this runs) via `self.client` (already retry-wrapped). Distinguish
+permanent failures (bad schema, a destination that will reject this payload
+shape no matter how many times you retry) from transient ones (network
+error, 5xx, timeout) by returning `Error::PermanentHttpError` for the
+former — `consume()` drops and counts a permanent failure instead of
+propagating it, so a single bad message can't take the whole connector down;
+any other error stops `consume()` and is returned as-is.
+
+**`connection_string`'s doc comment** (documentation only) — describe the
+exact shape your connector expects instead of the generic example.
 
 If your destination isn't HTTP, also revisit **`build_raw_client()`**: swap
 the `reqwest::Client` for your driver's connection/pool setup (see

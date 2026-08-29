@@ -24,18 +24,20 @@
 //! staged in `poll()` and only committed in `on_batch_result()` on an ACK so
 //! a dropped/nacked batch can be re-polled instead of silently lost.
 //!
-//! There are exactly **two** places you need to touch, each marked
-//! `TODO(ConnectorDeveloper)`:
-//!   1. `TemplateSource::connect()`  — build your actual client/connection
-//!      from `config.connection_string` (and `config.auth_token`, if used).
-//!   2. `TemplateSource::fetch_records()` — fetch up to `batch_size` new
-//!      records from your external system, starting after `cursor`.
+//! There is exactly **one** place you need to write code, marked
+//! `TODO(ConnectorDeveloper)`: `TemplateSource::fetch_records()` — fetch up
+//! to `batch_size` new records from your external system, starting after
+//! `cursor`. `TemplateSource::build_raw_client()` carries a second
+//! `TODO(ConnectorDeveloper)` too, but only applies if your source isn't
+//! HTTP (see below); a third, on the `connection_string` field's doc
+//! comment, just asks you to describe its expected shape — not code.
+//! `grep` for the marker and you'll find all three.
 //!
 //! This template assumes an HTTP-ish source and uses `reqwest` wrapped by
 //! the SDK's retry middleware, because that's what `iggy_connector_sdk::retry`
 //! is built for and it covers the common case. If your source talks to
 //! something else (a database, a queue, a filesystem), swap the client type
-//! in `connect()`/`fetch_records()` for your driver of choice and lean on
+//! in `build_raw_client()`/`fetch_records()` for your driver of choice and lean on
 //! its own retry/pooling behavior — keep the surrounding shape (validation
 //! in `open()`, circuit breaker, cursor staging, batching) unchanged. See
 //! `core/connectors/sources/postgres_source` in this repo for a real
@@ -58,7 +60,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 source_connector!(TemplateSource);
 
@@ -96,7 +98,7 @@ pub struct TemplateSourceConfig {
     /// `Debug`/log output; delete this field if `connection_string` already
     /// carries all required auth. Read it with `.expose_secret()` (from the
     /// `secrecy::ExposeSecret` trait) at the one place you actually need the
-    /// plaintext — e.g. when building an auth header in `connect()`.
+    /// plaintext — e.g. when building an auth header in `build_raw_client()`.
     #[serde(
         default,
         serialize_with = "iggy_common::serde_secret::serialize_optional_secret"
@@ -118,6 +120,11 @@ pub struct TemplateSourceConfig {
     pub open_retry_max_delay: Option<String>,
     pub circuit_breaker_threshold: Option<u32>,
     pub circuit_breaker_cool_down: Option<String>,
+
+    /// Upgrades the per-poll log line from `debug!` to `info!`. Mirrors the
+    /// runtime's own `verbose` flag; keep the field name `verbose_logging`
+    /// (see `postgres_source::PostgresSourceConfig::verbose_logging`).
+    pub verbose_logging: Option<bool>,
 }
 
 // ── Internal state ──────────────────────────────────────────────────────────
@@ -149,6 +156,7 @@ pub struct TemplateSource {
     batch_size: u32,
     poll_interval: Duration,
     retry_delay: Duration,
+    verbose: bool,
     state: Mutex<State>,
     pending_state: Mutex<Option<State>>,
     records_produced: AtomicU64,
@@ -173,6 +181,7 @@ impl TemplateSource {
             ),
         ));
         let batch_size = config.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
+        let verbose = config.verbose_logging.unwrap_or(false);
 
         let restored_state = state
             .and_then(|s| s.deserialize::<State>(CONNECTOR_NAME, id))
@@ -191,6 +200,7 @@ impl TemplateSource {
             batch_size,
             poll_interval,
             retry_delay,
+            verbose,
             state: Mutex::new(restored_state.unwrap_or_default()),
             pending_state: Mutex::new(None),
             records_produced: AtomicU64::new(0),
@@ -371,7 +381,6 @@ impl Source for TemplateSource {
         let mut messages = Vec::with_capacity(records.len());
         let mut new_cursor = cursor;
         for record in records {
-            new_cursor = Some(record.cursor_value);
             let Ok(payload) = serde_json::to_vec(&record.payload) else {
                 error!(
                     "Failed to serialize a record fetched by {CONNECTOR_NAME} connector with ID: {}",
@@ -379,6 +388,11 @@ impl Source for TemplateSource {
                 );
                 continue;
             };
+            // Only advance the candidate cursor once the record actually made it
+            // into `messages` - advancing on a dropped (unserializable) record
+            // would stage a cursor past data that was never produced, and a
+            // later Ack would commit past it permanently.
+            new_cursor = Some(record.cursor_value);
             messages.push(ProducedMessage {
                 id: None,
                 headers: None,
@@ -386,6 +400,17 @@ impl Source for TemplateSource {
                 timestamp: None,
                 origin_timestamp: None,
                 payload,
+            });
+        }
+
+        if messages.is_empty() {
+            // Every fetched record failed to serialize - no progress was
+            // made, so there's nothing to stage and no reason to write
+            // state, same as the `records.is_empty()` case above.
+            return Ok(ProducedMessages {
+                schema: Schema::Json,
+                messages: Vec::new(),
+                state: None,
             });
         }
 
@@ -400,6 +425,20 @@ impl Source for TemplateSource {
 
         self.records_produced
             .fetch_add(messages.len() as u64, Ordering::Relaxed);
+
+        if self.verbose {
+            info!(
+                "{CONNECTOR_NAME} connector with ID: {} produced {} messages",
+                self.id,
+                messages.len()
+            );
+        } else {
+            debug!(
+                "{CONNECTOR_NAME} connector with ID: {} produced {} messages",
+                self.id,
+                messages.len()
+            );
+        }
 
         Ok(ProducedMessages {
             schema: Schema::Json,
@@ -477,7 +516,22 @@ mod tests {
             open_retry_max_delay: Some("100ms".to_string()),
             circuit_breaker_threshold: Some(3),
             circuit_breaker_cool_down: Some("50ms".to_string()),
+            verbose_logging: None,
         }
+    }
+
+    #[test]
+    fn given_verbose_logging_enabled_should_set_verbose_flag() {
+        let mut config = test_config();
+        config.verbose_logging = Some(true);
+        let source = TemplateSource::new(1, config, None);
+        assert!(source.verbose);
+    }
+
+    #[test]
+    fn given_verbose_logging_disabled_should_not_set_verbose_flag() {
+        let source = TemplateSource::new(1, test_config(), None);
+        assert!(!source.verbose);
     }
 
     #[tokio::test]
@@ -568,7 +622,7 @@ mod tests {
         assert!(source.pending_state.lock().await.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn poll_returns_empty_without_error_when_circuit_is_open() {
         let source = TemplateSource::new(1, test_config(), None);
         source.circuit_breaker.record_failure().await;
