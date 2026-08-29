@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::config::PyClientConfig;
+use crate::config::{HttpConfig, PyClientConfig};
 use crate::consumer::{
     AutoCommit, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
     ConsumerGroupDetails as PyConsumerGroupDetails, IggyConsumer,
@@ -141,6 +141,30 @@ impl IggyClient {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(Self {
             inner: Arc::new(client),
+        })
+    }
+
+    /// Constructs a new IggyClient configured for the HTTP transport.
+    ///
+    /// `api_url` is already validated when `config` is built, so this does not
+    /// currently fail; the exception is documented for interface consistency
+    /// with the other transport constructors.
+    ///
+    /// Args:
+    ///     config: HTTP transport configuration. Defaults to `HttpConfig()`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the client cannot be constructed.
+    #[classmethod]
+    #[pyo3(signature = (config=None))]
+    fn http(_cls: &Bound<'_, PyType>, config: Option<HttpConfig>) -> PyResult<Self> {
+        let config = config
+            .map(|config| config.client_config())
+            .unwrap_or_else(|| Arc::new(HttpClientConfig::default()));
+        let http_client = HttpClient::create(config)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(RustIggyClient::new(ClientWrapper::Http(http_client))),
         })
     }
 

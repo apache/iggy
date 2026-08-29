@@ -37,6 +37,7 @@ __all__ = [
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
+    "HttpConfig",
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
@@ -838,6 +839,48 @@ class HeaderValue:
         def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
 
 @typing.final
+class HttpConfig:
+    r"""
+    Configuration for the HTTP transport, accepted by `IggyClient.http(...)`.
+
+    Every field is keyword-only and optional.
+    """
+    @property
+    def api_url(self) -> builtins.str: ...
+    @property
+    def retries(self) -> builtins.int: ...
+    @property
+    def has_jwt(self) -> builtins.bool:
+        r"""
+        Whether a JWT is configured, without exposing the token itself.
+        """
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        api_url: builtins.str | None = None,
+        retries: builtins.int | None = None,
+        jwt: builtins.str | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+    ) -> HttpConfig:
+        r"""
+        Constructs an HTTP configuration.
+
+        Args:
+            api_url: Base URL of the Iggy HTTP API. Defaults to `http://127.0.0.1:3000`.
+            retries: Number of retries to perform on transient errors. Defaults to 3.
+            jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to `None`.
+            heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+
+        Raises:
+            ValueError: If `api_url` is not a valid URL, if `retries` is outside the
+                range of an unsigned 32-bit integer, if a duration is negative, or
+                if `heartbeat_interval` is zero.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -866,6 +909,21 @@ class IggyClient:
         r"""
         Constructs a new IggyClient from a connection string.
         Returns an error if the connection string provided is invalid.
+        """
+    @classmethod
+    def http(cls, config: HttpConfig | None = None) -> IggyClient:
+        r"""
+        Constructs a new IggyClient configured for the HTTP transport.
+
+        `api_url` is already validated when `config` is built, so this does not
+        currently fail; the exception is documented for interface consistency
+        with the other transport constructors.
+
+        Args:
+            config: HTTP transport configuration. Defaults to `HttpConfig()`.
+
+        Raises:
+            RuntimeError: If the client cannot be constructed.
         """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""

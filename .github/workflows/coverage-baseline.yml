@@ -349,6 +349,7 @@ jobs:
           cd foreign/python
           IGGY_SERVER_HOST=127.0.0.1 \
           IGGY_SERVER_TCP_PORT=8090 \
+          IGGY_SERVER_HTTP_PORT=3000 \
           IGGY_SERVER_DOCKER_IMAGE=iggy-server:local \
             uv run --no-sync pytest tests/ -v \
               --junitxml=../../reports/python-junit.xml \
