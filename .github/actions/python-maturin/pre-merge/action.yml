@@ -171,6 +171,7 @@ runs:
         # overwrite the coverage-instrumented .so with a non-instrumented one
         IGGY_SERVER_HOST=127.0.0.1 \
         IGGY_SERVER_TCP_PORT=8090 \
+        IGGY_SERVER_QUIC_PORT=8080 \
         IGGY_SERVER_DOCKER_IMAGE=iggy-server:local \
           uv run --no-sync pytest tests/ -v \
             --junitxml=../../reports/python-junit.xml \

@@ -45,6 +45,8 @@ __all__ = [
     "Partition",
     "Permissions",
     "PollingStrategy",
+    "QuicConfig",
+    "QuicReconnectionConfig",
     "ReceiveMessage",
     "SendMessage",
     "SendMessagesConfirmation",
@@ -866,6 +868,19 @@ class IggyClient:
         r"""
         Constructs a new IggyClient from a connection string.
         Returns an error if the connection string provided is invalid.
+        """
+    @classmethod
+    def quic(cls, config: QuicConfig | None = None) -> IggyClient:
+        r"""
+        Constructs a new IggyClient configured for the QUIC transport.
+
+        Args:
+            config: QUIC transport configuration. Defaults to `QuicConfig()`.
+
+        Raises:
+            RuntimeError: If the client cannot be constructed, e.g. `client_address`
+                is not a valid `host:port` pair or the local UDP socket cannot be
+                bound (for example the port is already in use).
         """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
@@ -1705,6 +1720,144 @@ class PollingStrategy:
         def __new__(cls) -> PollingStrategy.Next: ...
 
     ...
+
+@typing.final
+class QuicConfig:
+    r"""
+    Configuration for the QUIC transport, accepted by `IggyClient.quic(...)`.
+
+    Every field is keyword-only and optional.
+    """
+    @property
+    def server_address(self) -> builtins.str: ...
+    @property
+    def client_address(self) -> builtins.str: ...
+    @property
+    def server_name(self) -> builtins.str: ...
+    @property
+    def auto_login(self) -> AutoLogin: ...
+    @property
+    def reconnection(self) -> QuicReconnectionConfig: ...
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    @property
+    def response_buffer_size(self) -> builtins.int: ...
+    @property
+    def max_concurrent_bidi_streams(self) -> builtins.int: ...
+    @property
+    def datagram_send_buffer_size(self) -> builtins.int: ...
+    @property
+    def initial_mtu(self) -> builtins.int: ...
+    @property
+    def send_window(self) -> builtins.int: ...
+    @property
+    def receive_window(self) -> builtins.int: ...
+    @property
+    def keep_alive_interval(self) -> datetime.timedelta: ...
+    @property
+    def max_idle_timeout(self) -> datetime.timedelta: ...
+    @property
+    def validate_certificate(self) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        server_address: builtins.str | None = None,
+        client_address: builtins.str | None = None,
+        server_name: builtins.str | None = None,
+        auto_login: AutoLogin | None = None,
+        reconnection: QuicReconnectionConfig | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+        response_buffer_size: builtins.int | None = None,
+        max_concurrent_bidi_streams: builtins.int | None = None,
+        datagram_send_buffer_size: builtins.int | None = None,
+        initial_mtu: builtins.int | None = None,
+        send_window: builtins.int | None = None,
+        receive_window: builtins.int | None = None,
+        keep_alive_interval: datetime.timedelta | None = None,
+        max_idle_timeout: datetime.timedelta | None = None,
+        validate_certificate: builtins.bool | None = None,
+    ) -> QuicConfig:
+        r"""
+        Constructs a QUIC configuration.
+
+        Args:
+            server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8080`.
+            client_address: `host:port` to bind the local UDP socket to. Defaults to
+                `127.0.0.1:0`, which binds to any available port.
+            server_name: Server name used for the QUIC/TLS handshake. Defaults to
+                `localhost`.
+            auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            reconnection: Reconnection policy. Defaults to `QuicReconnectionConfig()`.
+            heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+            response_buffer_size: Size of the response buffer in bytes. Defaults to 10 MB.
+            max_concurrent_bidi_streams: Maximum number of concurrent bidirectional
+                streams. Defaults to 10,000.
+            datagram_send_buffer_size: Size of the datagram send buffer in bytes.
+                Defaults to 100,000.
+            initial_mtu: Initial MTU in bytes. Defaults to 1200.
+            send_window: Send window size in bytes. Defaults to 100,000.
+            receive_window: Receive window size in bytes. Defaults to 100,000.
+            keep_alive_interval: Interval between QUIC keep-alive pings, or a zero
+                duration to disable them. Defaults to 5 seconds.
+            max_idle_timeout: How long the connection tolerates silence before it is
+                considered dead, or a zero duration for no limit. Defaults to 10 seconds.
+            validate_certificate: Whether to validate the server certificate. Defaults
+                to disabled, unlike the TCP and WebSocket transports.
+
+        Raises:
+            ValueError: If `server_address` is not a valid `host:port` pair, if a
+                duration is negative, if `heartbeat_interval` is zero, or if a
+                numeric field is outside the range of its underlying wire type.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class QuicReconnectionConfig:
+    r"""
+    How the QUIC client reconnects after the connection to the server is lost.
+    """
+    @property
+    def enabled(self) -> builtins.bool: ...
+    @property
+    def max_retries(self) -> builtins.int | None: ...
+    @property
+    def interval(self) -> datetime.timedelta: ...
+    @property
+    def reestablish_after(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        enabled: builtins.bool | None = None,
+        max_retries: builtins.int | None = None,
+        interval: datetime.timedelta | None = None,
+        reestablish_after: datetime.timedelta | None = None,
+    ) -> QuicReconnectionConfig:
+        r"""
+        Constructs a reconnection policy.
+
+        Args:
+            enabled: Whether to reconnect at all. Defaults to enabled.
+            max_retries: Passes over the known endpoints after the first, or
+                `None` for unlimited; `0` still makes that first pass. One pass
+                tries the endpoint the client is on, the address it was
+                configured with, and every node the roster named, so this counts
+                passes rather than dials. Defaults
+                to unlimited, which means a call awaited while the server is
+                down never returns: `connect()`, `send_messages()` and
+                `poll_messages()` all wait inside the retry loop. Set a finite
+                number for request/reply style usage, so a call fails instead.
+            interval: Delay between passes. Defaults to 1 second. The first pass
+                runs at once when more than one endpoint is known.
+            reestablish_after: Cooldown before redialing the endpoint of the last
+                successful connection, measured from when it was established, so
+                a session that outlived the interval is redialed at once. Owed to
+                that endpoint alone. Defaults to 5 seconds.
+
+        Raises:
+            ValueError: If a duration is negative, if `max_retries` is outside the
+                range of an unsigned 32-bit integer, or if `interval` is zero.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class ReceiveMessage:

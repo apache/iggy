@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::config::PyClientConfig;
+use crate::config::{PyClientConfig, QuicConfig};
 use crate::consumer::{
     AutoCommit, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
     ConsumerGroupDetails as PyConsumerGroupDetails, IggyConsumer,
@@ -137,10 +137,42 @@ impl IggyClient {
         _cls: &Bound<'_, PyType>,
         connection_string: String,
     ) -> PyResult<Self> {
+        // The QUIC transport builds its endpoint eagerly and needs a Tokio runtime context to do
+        // so (see `quic()` below for details); entering it here is a no-op for the other
+        // transports since the protocol isn't known until the connection string is parsed.
+        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
         let client = RustIggyClient::from_connection_string(&connection_string)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(Self {
             inner: Arc::new(client),
+        })
+    }
+
+    /// Constructs a new IggyClient configured for the QUIC transport.
+    ///
+    /// Args:
+    ///     config: QUIC transport configuration. Defaults to `QuicConfig()`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the client cannot be constructed, e.g. `client_address`
+    ///         is not a valid `host:port` pair or the local UDP socket cannot be
+    ///         bound (for example the port is already in use).
+    #[classmethod]
+    #[pyo3(signature = (config=None))]
+    fn quic(_cls: &Bound<'_, PyType>, config: Option<QuicConfig>) -> PyResult<Self> {
+        let config = config
+            .map(|config| config.client_config())
+            .unwrap_or_else(|| Arc::new(QuicClientConfig::default()));
+        // `quinn::Endpoint::client` (invoked eagerly by `QuicClient::create`) looks up the
+        // current Tokio runtime via `Handle::try_current()` and fails with
+        // `CannotCreateEndpoint` if none is active. This method runs synchronously from
+        // Python without one, so enter the runtime pyo3-async-runtimes uses for our own
+        // async methods before building the endpoint.
+        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
+        let quic_client = QuicClient::create(config)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(RustIggyClient::new(ClientWrapper::Quic(quic_client))),
         })
     }
 

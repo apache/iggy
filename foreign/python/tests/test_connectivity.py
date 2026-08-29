@@ -40,6 +40,7 @@ class TestConnectivity:
             "iggy+http://iggy:iggy@127.0.0.1:3000?heartbeat_interval=5s&retries=3",
             "iggy+ws://iggy:iggy@127.0.0.1:8092",
             "iggy+ws://iggy:iggy@127.0.0.1:8092?heartbeat_interval=5s&reconnection_retries=3&reconnection_interval=1s&reestablish_after=5s&read_buffer_size=4096&write_buffer_size=4096&max_write_buffer_size=8192&max_message_size=16384&max_frame_size=16384&accept_unmasked_frames=false&tls_domain=localhost&tls_ca_file=unused.pem&tls_validate_certificate=false&tls=false",
+            "iggy+quic://iggy:iggy@127.0.0.1:8080",
         ],
     )
     @pytest.mark.asyncio
@@ -77,7 +78,6 @@ class TestConnectivity:
                 "iggy+tcp://iggy:iggy@{host}:{port}?invalid_option=value",
                 "Invalid connection string",
             ),
-            ("iggy+quic://iggy:iggy@127.0.0.1:8080", "Cannot create endpoint"),
         ],
     )
     def test_invalid_connection_string(self, invalid_value: str, expected_error: str):
