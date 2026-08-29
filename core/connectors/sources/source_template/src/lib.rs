@@ -45,8 +45,8 @@
 
 use async_trait::async_trait;
 use iggy_connector_sdk::retry::{
-    CircuitBreaker, ConnectivityConfig, build_retry_client, check_connectivity_with_retry,
-    parse_duration,
+    CircuitBreaker, ConnectivityConfig, build_retry_client, 
+    check_connectivity_with_retry, parse_duration,
 };
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
