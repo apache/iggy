@@ -503,7 +503,11 @@ impl HttpConfig {
     }
 
     fn __repr__(&self) -> String {
-        let jwt = if self.inner.jwt.is_some() { "..." } else { "None" };
+        let jwt = if self.inner.jwt.is_some() {
+            "..."
+        } else {
+            "None"
+        };
         format!(
             "HttpConfig(api_url={:?}, retries={}, jwt={jwt}, heartbeat_interval={})",
             self.inner.api_url,
