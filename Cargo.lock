@@ -2742,9 +2742,9 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chacha20"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -6659,7 +6659,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.0-edge.4"
+version = "0.11.0-edge.5"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -6693,7 +6693,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.6.0-edge.4"
+version = "0.6.0-edge.5"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -6750,7 +6750,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.14.0-edge.4"
+version = "0.14.0-edge.5"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6784,7 +6784,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.5.0-edge.4"
+version = "0.5.0-edge.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -6856,7 +6856,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.5.0-edge.3"
+version = "0.5.0-edge.4"
 dependencies = [
  "axum",
  "axum-server",
@@ -6890,7 +6890,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.0-edge.4"
+version = "0.11.0-edge.5"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -6903,7 +6903,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.0-edge.4"
+version = "0.11.0-edge.5"
 dependencies = [
  "aes-gcm",
  "async-broadcast",
@@ -12031,7 +12031,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.0-edge.5"
+version = "0.9.0-edge.6"
 dependencies = [
  "ahash 0.8.12",
  "argon2",

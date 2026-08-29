@@ -1330,6 +1330,20 @@ mod tests {
     }
 
     #[compio::test]
+    async fn repaired_window_shape_rejects_unbounded_sparse_window_before_allocation() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal
+            .append(build_prepare(7, HEADER_SIZE + 16).into_frozen())
+            .await
+            .expect("append");
+
+        let shape = journal.repaired_window_shape(0, u64::MAX);
+
+        assert!(!shape.complete);
+        assert!(!shape.holds_messages);
+    }
+
+    #[compio::test]
     async fn repair_headers_in_serves_the_commit_point_from_the_evicted_ring() {
         // Blank AT the commit point is the one slot a merge can neither adopt nor
         // discard, so a quorum that all flushed there deadlocks. A flushed replica has

@@ -39,6 +39,7 @@ import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.concurrent.FutureListener;
 import io.netty.util.concurrent.ScheduledFuture;
+import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.client.async.tcp.vsr.ConsensusSession;
 import org.apache.iggy.client.async.tcp.vsr.VsrFrameDecoder;
 import org.apache.iggy.client.async.tcp.vsr.VsrRequestEncoder;
@@ -59,8 +60,10 @@ import javax.net.ssl.SSLException;
 import java.io.File;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -342,6 +345,11 @@ public class AsyncTcpConnection {
     }
 
     CompletableFuture<ByteBuf> send(int commandCode, ByteBuf payload, long requestDeadlineNanos) {
+        return send(commandCode, payload, requestDeadlineNanos, new TransientFailoverState());
+    }
+
+    CompletableFuture<ByteBuf> send(
+            int commandCode, ByteBuf payload, long requestDeadlineNanos, TransientFailoverState failoverState) {
         if (isLoginCode(commandCode) && authenticated) {
             return logoutThenLogin(commandCode, payload);
         }
@@ -366,7 +374,8 @@ public class AsyncTcpConnection {
                     failoverPayload,
                     responseFuture,
                     callerFuture,
-                    requestDeadlineNanos);
+                    requestDeadlineNanos,
+                    failoverState);
         });
 
         return callerFuture;
@@ -380,9 +389,17 @@ public class AsyncTcpConnection {
             ByteBuf failoverPayload,
             CompletableFuture<ByteBuf> responseFuture,
             CompletableFuture<ByteBuf> callerFuture,
-            long requestDeadlineNanos) {
+            long requestDeadlineNanos,
+            TransientFailoverState failoverState) {
         Runnable dispatch = () -> dispatchOnChannel(
-                channel, commandCode, payload, failoverPayload, responseFuture, callerFuture, requestDeadlineNanos);
+                channel,
+                commandCode,
+                payload,
+                failoverPayload,
+                responseFuture,
+                callerFuture,
+                requestDeadlineNanos,
+                failoverState);
         if (channel.eventLoop().inEventLoop()) {
             dispatch.run();
             return;
@@ -397,6 +414,7 @@ public class AsyncTcpConnection {
         }
     }
 
+    @SuppressWarnings("checkstyle:ParameterNumber")
     private void dispatchOnChannel(
             Channel channel,
             int commandCode,
@@ -404,7 +422,8 @@ public class AsyncTcpConnection {
             ByteBuf failoverPayload,
             CompletableFuture<ByteBuf> responseFuture,
             CompletableFuture<ByteBuf> callerFuture,
-            long inheritedRequestDeadlineNanos) {
+            long inheritedRequestDeadlineNanos,
+            TransientFailoverState failoverState) {
         boolean isLoginCommand = isLoginCode(commandCode);
         boolean holdLeaseUntilResponse = mutatesSessionState(commandCode);
         long requestDeadlineNanos = inheritedRequestDeadlineNanos == 0
@@ -419,6 +438,7 @@ public class AsyncTcpConnection {
                 requestDeadlineNanos,
                 holdLeaseUntilResponse,
                 callerFuture,
+                failoverState,
                 response,
                 error));
         authenticationStep(channel, commandCode, requestDeadlineNanos)
@@ -483,6 +503,7 @@ public class AsyncTcpConnection {
             long requestDeadlineNanos,
             boolean holdLeaseUntilResponse,
             CompletableFuture<ByteBuf> callerFuture,
+            TransientFailoverState failoverState,
             ByteBuf response,
             Throwable error) {
         try {
@@ -493,6 +514,7 @@ public class AsyncTcpConnection {
                     failoverPayload,
                     requestDeadlineNanos,
                     callerFuture,
+                    failoverState,
                     response,
                     error);
         } finally {
@@ -510,6 +532,7 @@ public class AsyncTcpConnection {
             ByteBuf failoverPayload,
             long requestDeadlineNanos,
             CompletableFuture<ByteBuf> callerFuture,
+            TransientFailoverState failoverState,
             ByteBuf response,
             Throwable error) {
         try {
@@ -522,7 +545,7 @@ public class AsyncTcpConnection {
             completeWithResponse(callerFuture, response);
             return;
         }
-        completeFailedRequest(commandCode, failoverPayload, requestDeadlineNanos, callerFuture, error);
+        completeFailedRequest(commandCode, failoverPayload, requestDeadlineNanos, callerFuture, failoverState, error);
     }
 
     private void completeFailedRequest(
@@ -530,6 +553,7 @@ public class AsyncTcpConnection {
             ByteBuf failoverPayload,
             long requestDeadlineNanos,
             CompletableFuture<ByteBuf> callerFuture,
+            TransientFailoverState failoverState,
             Throwable error) {
         IggyTimeoutException timeout = findResponseTimeout(error);
         if (timeout != null) {
@@ -537,7 +561,8 @@ public class AsyncTcpConnection {
         }
         IggyServerException serverError = findServerError(error);
         if (shouldRecheckLeader(serverError, failoverPayload, requestDeadlineNanos)) {
-            retryAfterLeaderRecheck(commandCode, failoverPayload, requestDeadlineNanos, serverError, callerFuture);
+            retryAfterLeaderRecheck(
+                    commandCode, failoverPayload, requestDeadlineNanos, serverError, callerFuture, failoverState);
             return;
         }
         releaseIfPresent(failoverPayload);
@@ -557,10 +582,12 @@ public class AsyncTcpConnection {
             ByteBuf payload,
             long requestDeadlineNanos,
             IggyServerException rejection,
-            CompletableFuture<ByteBuf> callerFuture) {
+            CompletableFuture<ByteBuf> callerFuture,
+            TransientFailoverState failoverState) {
         CompletableFuture<ByteBuf> retry;
         try {
-            retry = transientFailoverHandler.retry(this, commandCode, payload, requestDeadlineNanos, rejection);
+            retry = transientFailoverHandler.retry(
+                    this, commandCode, payload, requestDeadlineNanos, rejection, failoverState);
         } catch (RuntimeException retryError) {
             payload.release();
             callerFuture.completeExceptionally(retryError);
@@ -953,6 +980,15 @@ public class AsyncTcpConnection {
 
     record AuthenticationSnapshot(int commandCode, ByteBuf payload) {}
 
+    static final class TransientFailoverState {
+
+        private final Set<ConnectionInfo> visitedTargets = new HashSet<>();
+
+        Set<ConnectionInfo> visitedTargets() {
+            return visitedTargets;
+        }
+    }
+
     @FunctionalInterface
     interface TransientFailoverHandler {
         CompletableFuture<ByteBuf> retry(
@@ -960,7 +996,8 @@ public class AsyncTcpConnection {
                 int commandCode,
                 ByteBuf payload,
                 long requestDeadlineNanos,
-                IggyServerException rejection);
+                IggyServerException rejection,
+                TransientFailoverState failoverState);
     }
 
     public static class TcpConnectionPoolConfig {

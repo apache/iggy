@@ -30,10 +30,12 @@ import org.slf4j.LoggerFactory;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
@@ -162,6 +164,37 @@ final class LeaderAwareness {
                 .filter(node -> node.endpoints().tcp() != 0)
                 .map(node -> new ConnectionInfo(node.ip(), node.endpoints().tcp()))
                 .toList();
+    }
+
+    /**
+     * Every roster endpoint after the current one, wrapping once and omitting
+     * aliases of the current endpoint. This is the bounded candidate order for
+     * a request a partition follower has refused as never admitted.
+     */
+    static List<ConnectionInfo> rosterWalkTargets(
+            List<ConnectionInfo> roster, ConnectionInfo currentTarget, Set<ConnectionInfo> visitedTargets) {
+        if (roster.isEmpty()) {
+            return List.of();
+        }
+        int currentIndex = -1;
+        for (int index = 0; index < roster.size(); index++) {
+            if (isSameAddress(roster.get(index), currentTarget)) {
+                currentIndex = index;
+                break;
+            }
+        }
+        int start = currentIndex < 0 ? 0 : (currentIndex + 1) % roster.size();
+        var targets = new ArrayList<ConnectionInfo>(roster.size());
+        for (int offset = 0; offset < roster.size(); offset++) {
+            var candidate = roster.get((start + offset) % roster.size());
+            if (isSameAddress(candidate, currentTarget)
+                    || visitedTargets.stream().anyMatch(visited -> isSameAddress(visited, candidate))
+                    || targets.stream().anyMatch(target -> isSameAddress(target, candidate))) {
+                continue;
+            }
+            targets.add(candidate);
+        }
+        return List.copyOf(targets);
     }
 
     /**

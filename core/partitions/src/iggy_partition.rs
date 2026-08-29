@@ -1974,6 +1974,30 @@ where
                 message
             };
 
+            // State-dependent admission belongs to the primary. A backup can
+            // lag the committed offset table or message frontier and would
+            // otherwise turn a routing artifact into a terminal 404 or 400.
+            // Reject it first with the only response that proves the request
+            // was never admitted, so the caller may safely retry elsewhere.
+            if consensus.is_follower() || !consensus.is_normal() || consensus.is_transferring() {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "rejecting client request on non-primary partition replica",
+                    )
+                    .with_operation(message.header().operation),
+                );
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "non-primary transient reply send failed",
+                )
+                .await;
+                return;
+            }
+
             // Parse once for both the delete-existence check and AckLevel dispatch.
             let consumer_offset = match message.header().operation {
                 Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
@@ -2062,32 +2086,6 @@ where
                     .await;
                     return;
                 }
-            }
-
-            // A client op landing on a non-primary (or mid-view-change)
-            // replica is a routing artifact -- e.g. the roster still points
-            // here while this group's primaryship moved after a restart.
-            // Answer the typed transient instead of asserting: the SDK
-            // replays and its leader recheck re-routes, whereas a panic
-            // kills the shard and a silent drop wedges the client until its
-            // read timeout.
-            if consensus.is_follower() || !consensus.is_normal() || consensus.is_transferring() {
-                emit_partition_diag(
-                    tracing::Level::WARN,
-                    &PartitionDiagEvent::new(
-                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                        "rejecting client request on non-primary partition replica",
-                    )
-                    .with_operation(message.header().operation),
-                );
-                Self::send_partition_deny_or_log(
-                    consensus,
-                    message.header(),
-                    IggyError::TransientNotAccepted.as_code(),
-                    "non-primary transient reply send failed",
-                )
-                .await;
-                return;
             }
 
             // NoAck -> fast path. Quorum -> VSR pipeline.
@@ -4465,10 +4463,29 @@ where
     /// commit walk runs at `RepairDone`, after the floor is known.
     pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
         let header = *message.header();
-        let Some(session) = &self.repair else {
+        let Some(session) = self.repair else {
             return;
         };
-        if header.op <= self.consensus().commit_min() || header.op > session.to_op {
+        let consensus = self.consensus();
+        if !consensus.is_normal() || consensus.view() != session.view {
+            self.repair = None;
+            return;
+        }
+        if header.op <= consensus.commit_min() || header.op > session.fetch_to_op {
+            return;
+        }
+        let canonical_checksum = consensus
+            .with_pending_view_log(|pending| {
+                pending
+                    .headers
+                    .iter()
+                    .find(|expected| expected.op == header.op)
+                    .map(|expected| expected.checksum)
+            })
+            .flatten();
+        if canonical_checksum.is_some_and(|expected| expected != header.checksum)
+            || (header.op > session.commit_to_op && canonical_checksum.is_none())
+        {
             return;
         }
         // Any in-window frame proves the stream is alive; only silence
@@ -4482,7 +4499,9 @@ where
         let applied = if header.operation == Operation::SendMessages {
             match self.append_repaired_send_messages(message).await {
                 Ok(base_offset) => {
-                    if let (Some(base_offset), Some(session)) = (base_offset, self.repair.as_mut())
+                    if header.op <= session.commit_to_op
+                        && let (Some(base_offset), Some(session)) =
+                            (base_offset, self.repair.as_mut())
                     {
                         session.first_batch_offset = Some(
                             session
@@ -4537,6 +4556,10 @@ where
         let Some(session) = self.repair else {
             return RepairConclusion::Done;
         };
+        if !self.consensus().is_normal() || self.consensus().view() != session.view {
+            self.repair = None;
+            return RepairConclusion::Done;
+        }
         if let Some(floor) = session.floor {
             // A peer may have evicted past this replica's commit frontier;
             // an unclamped floor would drive commit_min above commit_max and
@@ -4557,6 +4580,11 @@ where
             let stand_in = durable_end
                 .map(|durable| durable.saturating_add(1))
                 .max(self.installed_frontier);
+            let committed_shape = self
+                .log
+                .journal()
+                .inner
+                .repaired_window_shape(floor, session.commit_to_op);
             let connected = match (session.first_batch_offset, stand_in) {
                 (Some(first), Some(bound)) => first <= bound,
                 (Some(first), None) => first == 0,
@@ -4568,7 +4596,11 @@ where
                 // a fully evicted window -- is indistinguishable from a
                 // message range below the floor that this replica does not
                 // durably own, and accepting it would serve a holed log.
-                (None, _) => self.repaired_window_is_offsets_only(floor, session.to_op),
+                (None, _) => {
+                    floor < session.commit_to_op
+                        && committed_shape.complete
+                        && !committed_shape.holds_messages
+                }
             };
             if !connected {
                 tracing::error!(
@@ -4593,11 +4625,11 @@ where
                 // Both are the state-transfer trigger; the session is
                 // dropped here so the caller's arming funnel starts clean,
                 // and a transfer-unavailable fallback re-arms repair fresh.
-                if self.repaired_window_is_complete(floor, session.to_op) {
+                if committed_shape.complete {
                     self.repair = None;
                     return RepairConclusion::FloorRefused {
                         floor,
-                        to_op: session.to_op,
+                        to_op: session.commit_to_op,
                     };
                 }
                 return RepairConclusion::InProgress;
@@ -4616,7 +4648,23 @@ where
         // that reached the requested frontier closes the session; anything
         // less keeps it armed and the stall retry re-requests the remains
         // (`commit_min + 1..`), converging over rounds.
-        let done = commit_min >= session.to_op;
+        // The residency check starts at the LIVE commit point, not the
+        // session's snapshotted one: delivering the suffix bodies is what
+        // lets the group commit past `commit_to_op`, and the `commit_journal`
+        // above then evicts exactly those headers. Judged from
+        // `commit_to_op`, a fully successful repair would report itself
+        // incomplete forever, pin the session, and block every later re-arm
+        // until a view change. Ops at or below `commit_min` are committed and
+        // applied, a monotone fact the flush cannot erase, so they need no
+        // resident header to count as fetched.
+        let fetch_complete = session.fetch_to_op <= session.commit_to_op
+            || self
+                .log
+                .journal()
+                .inner
+                .repaired_window_shape(session.commit_to_op.max(commit_min), session.fetch_to_op)
+                .complete;
+        let done = commit_min >= session.commit_to_op && fetch_complete;
         if done {
             self.repair = None;
         }
@@ -4627,7 +4675,9 @@ where
             commit_min_before = before,
             commit_min_after = commit_min,
             commit_max = self.consensus().commit_max(),
-            to_op = session.to_op,
+            commit_to_op = session.commit_to_op,
+            fetch_to_op = session.fetch_to_op,
+            fetch_complete,
             done,
             "repair window commit walk finished"
         );
@@ -4636,31 +4686,6 @@ where
         } else {
             RepairConclusion::InProgress
         }
-    }
-
-    /// Whether every op in `(floor, to_op]` is journaled. An empty window
-    /// (`floor >= to_op`) counts as complete: there is nothing left that
-    /// could arrive and change the floor verdict.
-    fn repaired_window_is_complete(&self, floor: u64, to_op: u64) -> bool {
-        self.log
-            .journal()
-            .inner
-            .repaired_window_shape(floor, to_op)
-            .complete
-    }
-
-    /// Whether the served repair window `(floor, to_op]` arrived complete and
-    /// holds no `SendMessages` op. Only then may a commit floor be accepted
-    /// without a batch anchor: the window demonstrably moved no messages, so
-    /// the consumer-offset table on disk stands in below the floor. An empty
-    /// window (`floor >= to_op`) carries no evidence at all and never
-    /// qualifies.
-    fn repaired_window_is_offsets_only(&self, floor: u64, to_op: u64) -> bool {
-        if floor >= to_op {
-            return false;
-        }
-        let shape = self.log.journal().inner.repaired_window_shape(floor, to_op);
-        shape.complete && !shape.holds_messages
     }
 
     /// Journal a repaired `SendMessages` prepare, preserving its embedded
@@ -5476,13 +5501,20 @@ mod tests {
     type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
 
     fn recording_partition() -> (IggyPartition<RecordingBus>, SentFrames) {
+        recording_partition_at(0, 1)
+    }
+
+    fn recording_partition_at(
+        replica: u8,
+        replica_count: u8,
+    ) -> (IggyPartition<RecordingBus>, SentFrames) {
         let namespace = IggyNamespace::new(1, 1, 0);
         let bus = RecordingBus::default();
         let sent_to_clients = bus.sent_to_clients.clone();
         let consensus = VsrConsensus::new(
             TEST_CLUSTER,
-            0,
-            1,
+            replica,
+            replica_count,
             namespace.inner(),
             bus,
             LocalPipeline::new(),
@@ -5582,6 +5614,32 @@ mod tests {
             partition.consensus().pipeline_len(),
             1,
             "existing offset delete must replicate"
+        );
+    }
+
+    #[compio::test]
+    async fn on_request_delete_on_stale_backup_replies_transient_before_not_found() {
+        let (mut partition, sent_to_clients) = recording_partition_at(1, 3);
+        let client_id = 42;
+
+        partition
+            .on_request(delete_offset_request(client_id, 7, 5))
+            .await;
+
+        let sent = sent_to_clients.borrow();
+        assert_eq!(sent.len(), 1, "exactly one routing denial");
+        let (reply_client, frame) = &sent[0];
+        assert_eq!(*reply_client, client_id);
+        let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
+            &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
+        )
+        .expect("deny frame starts with a valid reply header");
+        assert_eq!(header.status, IggyError::TransientNotAccepted.as_code());
+        assert_eq!(header.op, 0, "the backup admitted nothing");
+        assert_eq!(
+            partition.consensus().pipeline_len(),
+            0,
+            "a backup must not replicate the delete"
         );
     }
 
@@ -6599,9 +6657,20 @@ mod tests {
     }
 
     fn armed_session(to_op: u64, floor: u64, first_batch_offset: Option<u64>) -> RepairSession {
+        armed_fetch_session(to_op, to_op, floor, first_batch_offset)
+    }
+
+    fn armed_fetch_session(
+        to_op: u64,
+        fetch_to_op: u64,
+        floor: u64,
+        first_batch_offset: Option<u64>,
+    ) -> RepairSession {
         RepairSession {
             nonce: 1,
-            to_op,
+            view: 0,
+            commit_to_op: to_op,
+            fetch_to_op,
             floor: Some(floor),
             peer: 0,
             first_batch_offset,
@@ -6729,6 +6798,26 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_prior_view_repair_when_a_new_view_started_should_discard_it() {
+        let mut partition = test_partition();
+        partition.repair = Some(armed_fetch_session(0, 1, 0, None));
+        partition.consensus.set_view(1);
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, 0x11))
+            .await;
+
+        assert!(
+            partition.repair.is_none(),
+            "the prior-view session is obsolete"
+        );
+        assert!(
+            partition.log.journal().inner.header_by_op(1).is_none(),
+            "a delayed prior-view body must not enter the new view's journal"
+        );
+    }
+
+    #[compio::test]
     async fn given_session_remint_when_attempts_burned_should_survive_on_partition() {
         let mut partition = test_partition();
         for round in 0..consensus::STATE_TRANSFER_MAX_STALL_RETRIES {
@@ -6847,6 +6936,89 @@ mod tests {
         );
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(partition.repair.is_none());
+    }
+
+    #[compio::test]
+    async fn given_empty_committed_window_with_a_suffix_fetch_should_escape_to_state_transfer() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(5);
+        partition.repair = Some(armed_fetch_session(5, 9, 5, None));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused { floor: 5, to_op: 5 },
+            "the uncommitted fetch ceiling must not postpone a definitive committed-floor refusal"
+        );
+        assert!(partition.repair.is_none());
+    }
+
+    /// A one-message `SendMessages` prepare for `op`, journaled through the
+    /// replicated-apply path (which stamps offsets and re-checksums), with the
+    /// sequencer advanced the way `on_replicate` does after a real append.
+    pub(super) async fn journal_send_batch(partition: &mut IggyPartition<IggyMessageBus>, op: u64) {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let record = build_segment_record(namespace, 0);
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let total = header_size + record.len();
+        let mut message = Message::<PrepareHeader>::new(total);
+        message.as_mut_slice()[header_size..].copy_from_slice(&record);
+        let message = message.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::SendMessages;
+            header.op = op;
+            header.timestamp = op;
+            header.group = namespace.inner();
+            header.size = u32::try_from(total).expect("prepare size fits u32");
+        });
+        partition
+            .apply_replicated_operation(message)
+            .await
+            .expect("journal send batch");
+        partition.consensus().sequencer().set_sequence(op);
+    }
+
+    #[compio::test]
+    async fn given_committed_suffix_evicted_when_completing_repair_should_close_the_session() {
+        // A successful suffix repair is what lets the group commit past
+        // `commit_to_op`, and the commit walk's flush then evicts exactly the
+        // suffix headers. The completion verdict must survive that eviction:
+        // judged from resident headers alone, the fully successful session
+        // would report itself incomplete forever, stay armed, and block every
+        // later re-arm for this partition until a view change.
+        let mut partition = test_partition();
+        for op in 1..=3 {
+            journal_send_batch(&mut partition, op).await;
+        }
+        partition.consensus().advance_commit_max(3);
+        partition.repair = Some(armed_fetch_session(2, 3, 0, Some(0)));
+        partition.commit_journal(&repair_config()).await;
+        let _ = partition.log.journal().inner.evict_prefix(3).await;
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::Done);
+        assert!(
+            partition.repair.is_none(),
+            "a fully committed suffix fetch must not stay armed after its \
+             headers are flushed out of the resident journal"
+        );
+    }
+
+    #[compio::test]
+    async fn given_suffix_fetch_when_its_view_is_discarded_should_clear_the_session() {
+        let mut partition = test_partition();
+        partition.repair = Some(armed_fetch_session(0, 3, 0, None));
+        partition.consensus.set_view(1);
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::Done);
+        assert!(
+            partition.repair.is_none(),
+            "a discarded view must not leave its suffix fetch blocking future repair"
+        );
     }
 
     #[compio::test]
@@ -7458,7 +7630,7 @@ mod retention_tests {
 
 #[cfg(test)]
 mod purge_floor_tests {
-    use super::tests::{build_segment_record, repair_config, test_partition};
+    use super::tests::{build_segment_record, journal_send_batch, repair_config, test_partition};
     use super::*;
     use iggy_binary_protocol::{Command, WireConsumer, WireEncode};
 
@@ -7477,31 +7649,6 @@ mod purge_floor_tests {
         let mut partition = test_partition();
         partition.set_partition_dir(dir.to_string_lossy().into_owned());
         (partition, dir)
-    }
-
-    /// A one-message `SendMessages` prepare for `op`, journaled through the
-    /// replicated-apply path (which stamps offsets and re-checksums), with the
-    /// sequencer advanced the way `on_replicate` does after a real append.
-    async fn journal_send_batch(partition: &mut IggyPartition<IggyMessageBus>, op: u64) {
-        let namespace = IggyNamespace::new(1, 1, 0);
-        let record = build_segment_record(namespace, 0);
-        let header_size = std::mem::size_of::<PrepareHeader>();
-        let total = header_size + record.len();
-        let mut message = Message::<PrepareHeader>::new(total);
-        message.as_mut_slice()[header_size..].copy_from_slice(&record);
-        let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command::Prepare;
-            header.operation = Operation::SendMessages;
-            header.op = op;
-            header.timestamp = op;
-            header.group = namespace.inner();
-            header.size = u32::try_from(total).expect("prepare size fits u32");
-        });
-        partition
-            .apply_replicated_operation(message)
-            .await
-            .expect("journal send batch");
-        partition.consensus().sequencer().set_sequence(op);
     }
 
     /// A `StoreConsumerOffset` prepare for `op`, journaled and staged through

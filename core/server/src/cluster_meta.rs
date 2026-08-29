@@ -83,9 +83,13 @@ impl ClusterRoster {
         }
     }
 
-    /// The current metadata primary's roster index, from the shard-0-published
+    /// The current metadata primary's REPLICA ID, from the shard-0-published
     /// view; `None` until the first publish or with no roster.
-    pub fn current_primary_index(&self) -> Option<u8> {
+    ///
+    /// A replica id, not a position in [`Self::nodes`]: `role_for` compares it
+    /// against each node's configured `replica_id`, and the two coincide only
+    /// while the roster is listed in replica-id order.
+    pub fn current_primary_replica_id(&self) -> Option<u8> {
         if self.nodes.is_empty() {
             return None;
         }

@@ -55,6 +55,7 @@ public sealed class EndpointFailoverTests
     private const byte OperationNonReplicated = 2;
     private const int GetClusterMetadataCode = 12;
     private const int PingCode = 1;
+    private const uint TransientNotAccepted = 58;
 
     [Fact]
     public async Task ResumesOnASurvivorAfterTheSignedInNodeDies()
@@ -101,6 +102,101 @@ public sealed class EndpointFailoverTests
             $"{survivor.Registrations} registrations and {survivor.Pings} pings)");
         Assert.True(survivor.Registrations >= 1, "the remembered credentials signed in again on the survivor");
         Assert.True(survivor.Pings >= 1, "the request landed on the survivor");
+    }
+
+    [Fact]
+    public async Task WalksPastTwoRefusingReplicasToThePartitionPrimary()
+    {
+        const uint commandCode = 60_040;
+        using var metadataLeader = new MockNode();
+        using var follower = new MockNode();
+        using var partitionPrimary = new MockNode();
+
+        metadataLeader.Serve(request => request.Code switch
+        {
+            GetClusterMetadataCode => Reply(OperationNonReplicated,
+                ThreeNodeClusterMetadata(metadataLeader.Port, follower.Port, partitionPrimary.Port)),
+            (int)commandCode => Reply(request.Operation, [], TransientNotAccepted),
+            _ => Answer(request)
+        });
+        follower.Serve(request => request.Code == (int)commandCode
+            ? Reply(request.Operation, [], TransientNotAccepted)
+            : Answer(request));
+        partitionPrimary.Serve(Answer);
+
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{metadataLeader.Port}",
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 1,
+                InitialDelay = TimeSpan.FromMilliseconds(20)
+            }
+        };
+        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+
+        Assert.Empty(await client.SendBinaryRequestAsync(commandCode, [], TestContext.Current.CancellationToken));
+        Assert.True(follower.Connections >= 1, "the roster walk skipped the second replica");
+        Assert.True(partitionPrimary.Connections >= 1, "the roster walk never reached the partition primary");
+    }
+
+    [Fact]
+    public async Task WalksTheWholeRosterBeyondTheMetadataRedirectCap()
+    {
+        const uint commandCode = 60_041;
+        using var metadataLeader = new MockNode();
+        using var second = new MockNode();
+        using var third = new MockNode();
+        using var fourth = new MockNode();
+        using var partitionPrimary = new MockNode();
+        var roster = new[]
+        {
+            metadataLeader.Port,
+            second.Port,
+            third.Port,
+            fourth.Port,
+            partitionPrimary.Port
+        };
+
+        byte[] Refuse(MockRequest request)
+        {
+            return request.Code == (int)commandCode
+                ? Reply(request.Operation, [], TransientNotAccepted)
+                : Answer(request);
+        }
+
+        metadataLeader.Serve(request => request.Code == GetClusterMetadataCode
+            ? Reply(OperationNonReplicated, RosterMetadata(metadataLeader.Port, roster))
+            : Refuse(request));
+        second.Serve(Refuse);
+        third.Serve(Refuse);
+        fourth.Serve(Refuse);
+        partitionPrimary.Serve(Answer);
+
+        var configuration = new IggyClientConfigurator
+        {
+            BaseAddress = $"127.0.0.1:{metadataLeader.Port}",
+            Protocol = Protocol.Tcp,
+            ReconnectionSettings = new ReconnectionSettings
+            {
+                Enabled = true,
+                MaxRetries = 1,
+                InitialDelay = TimeSpan.FromMilliseconds(20)
+            }
+        };
+        using var client = new TcpMessageStream(configuration, NullLoggerFactory.Instance);
+
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.LoginUserAsync("iggy", "iggy", TestContext.Current.CancellationToken);
+
+        Assert.Empty(await client.SendBinaryRequestAsync(commandCode, [], TestContext.Current.CancellationToken));
+        Assert.True(partitionPrimary.Connections >= 1,
+            "the arbitrary metadata redirect cap stopped the bounded roster walk");
     }
 
     /// <summary>
@@ -371,11 +467,16 @@ public sealed class EndpointFailoverTests
 
     private static byte[] Reply(byte operation, byte[] body)
     {
+        return Reply(operation, body, 0);
+    }
+
+    private static byte[] Reply(byte operation, byte[] body, uint status)
+    {
         var frame = new byte[HeaderSize + body.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(SizeOffset, 4), (uint)frame.Length);
         frame[CommandOffset] = CommandReply;
         frame[ReplyOperationOffset] = operation;
-        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(ReplyStatusOffset, 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(ReplyStatusOffset, 4), status);
         body.CopyTo(frame.AsSpan(HeaderSize));
 
         return frame;
@@ -406,6 +507,31 @@ public sealed class EndpointFailoverTests
         body.AddRange(BitConverter.GetBytes(2u));
         WriteNode(body, "primary", primaryPort, primaryPort == leaderPort);
         WriteNode(body, "survivor", survivorPort, survivorPort == leaderPort);
+
+        return body.ToArray();
+    }
+
+    private static byte[] ThreeNodeClusterMetadata(ushort firstPort, ushort secondPort, ushort thirdPort)
+    {
+        var body = new List<byte>();
+        WriteString(body, "test-cluster");
+        body.AddRange(BitConverter.GetBytes(3u));
+        WriteNode(body, "metadata-leader", firstPort, true);
+        WriteNode(body, "follower", secondPort, false);
+        WriteNode(body, "partition-primary", thirdPort, false);
+
+        return body.ToArray();
+    }
+
+    private static byte[] RosterMetadata(ushort leaderPort, IReadOnlyList<ushort> ports)
+    {
+        var body = new List<byte>();
+        WriteString(body, "test-cluster");
+        body.AddRange(BitConverter.GetBytes((uint)ports.Count));
+        for (var index = 0; index < ports.Count; index++)
+        {
+            WriteNode(body, $"node-{index}", ports[index], ports[index] == leaderPort);
+        }
 
         return body.ToArray();
     }

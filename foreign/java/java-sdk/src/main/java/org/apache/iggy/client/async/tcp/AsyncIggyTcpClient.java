@@ -557,7 +557,8 @@ public class AsyncIggyTcpClient {
             int commandCode,
             ByteBuf payload,
             long requestDeadlineNanos,
-            IggyServerException rejection) {
+            IggyServerException rejection,
+            AsyncTcpConnection.TransientFailoverState failoverState) {
         AtomicReference<ByteBuf> requestPayload = new AtomicReference<>(payload);
         Optional<AsyncTcpConnection.AuthenticationSnapshot> authentication = source.authenticationSnapshot();
         AtomicReference<ByteBuf> authenticationPayload = new AtomicReference<>(authentication
@@ -565,7 +566,7 @@ public class AsyncIggyTcpClient {
                 .orElse(null));
 
         CompletableFuture<Void> ready = prepareTransientFailover(
-                source, authentication, authenticationPayload, requestDeadlineNanos, rejection);
+                source, authentication, authenticationPayload, requestDeadlineNanos, rejection, failoverState);
         CompletableFuture<ByteBuf> retried = ready.thenCompose(ignored -> {
             if (requestDeadlineNanos - System.nanoTime() <= 0) {
                 return CompletableFuture.failedFuture(rejection);
@@ -574,7 +575,8 @@ public class AsyncIggyTcpClient {
             if (currentConnection == null) {
                 return CompletableFuture.failedFuture(new IggyNotConnectedException());
             }
-            return currentConnection.send(commandCode, takePayload(requestPayload), requestDeadlineNanos);
+            return currentConnection.send(
+                    commandCode, takePayload(requestPayload), requestDeadlineNanos, failoverState);
         });
         return retried.whenComplete((response, error) -> {
             releasePayload(requestPayload);
@@ -587,10 +589,10 @@ public class AsyncIggyTcpClient {
             Optional<AsyncTcpConnection.AuthenticationSnapshot> authentication,
             AtomicReference<ByteBuf> authenticationPayload,
             long requestDeadlineNanos,
-            IggyServerException rejection) {
+            IggyServerException rejection,
+            AsyncTcpConnection.TransientFailoverState failoverState) {
         CompletableFuture<Void> gate = new CompletableFuture<>();
         CompletableFuture<Void> previous = loginChain.getAndSet(gate);
-        LeaderRedirectionState redirectionState = new LeaderRedirectionState();
         CompletableFuture<Void> transaction = previous.thenCompose(ignored -> {
             if (closed) {
                 return CompletableFuture.failedFuture(new IggyNotConnectedException());
@@ -601,7 +603,7 @@ public class AsyncIggyTcpClient {
             if (connection.get() != source) {
                 return CompletableFuture.completedFuture(null);
             }
-            return redirectToLeader(redirectionState).thenCompose(redirected -> {
+            return walkRoster(requestDeadlineNanos, failoverState).thenCompose(ignoredWalk -> {
                 AsyncTcpConnection currentConnection = connection.get();
                 if (currentConnection == null || currentConnection == source || authentication.isEmpty()) {
                     return CompletableFuture.completedFuture(null);
@@ -883,43 +885,44 @@ public class AsyncIggyTcpClient {
     }
 
     /**
-     * One discovery hop for transient failover. When the roster names a healthy leader elsewhere,
-     * reconnect to it and re-check from the new node, since mid-election
-     * metadata can point at a node that is itself not the leader. Register is
-     * sent only after this bounded process settles. Reading the roster needs a
-     * bound session, so a connection that has none fails the fetch locally and
-     * stays where it is. Login settlement uses {@link #loginAndSettleOnLeader}
-     * so every redirected connection binds before its next roster read.
+     * Walks the known roster once after a never-admitted refusal. Metadata and
+     * partition groups elect independently, so redirecting to the metadata
+     * leader can bounce a partition request away from its primary. Failed
+     * dials are skipped within the same request deadline.
      */
-    private CompletableFuture<Void> redirectToLeader(LeaderRedirectionState redirectionState) {
+    private CompletableFuture<Void> walkRoster(
+            long requestDeadlineNanos, AsyncTcpConnection.TransientFailoverState failoverState) {
         ConnectionInfo currentTarget = connectionInfo;
-        return findLeaderElsewhere(currentTarget).thenCompose(leaderTarget -> {
-            if (leaderTarget.isEmpty()) {
-                return CompletableFuture.completedFuture(null);
-            }
-            if (!redirectionState.canRedirect()) {
-                log.warn(
-                        "Maximum leader redirections ({}) reached, connection will continue on server node {}",
-                        LeaderAwareness.MAX_LEADER_REDIRECTS,
-                        currentTarget.serverAddress());
-                return CompletableFuture.completedFuture(null);
-            }
-            return retarget(leaderTarget.get())
-                    .handle((ignored, error) -> {
-                        if (error != null) {
-                            log.warn(
-                                    "Failed to reconnect to leader at {}: {}, connection will continue"
-                                            + " on server node {}",
-                                    leaderTarget.get().serverAddress(),
-                                    error.getMessage(),
-                                    currentTarget.serverAddress());
-                            return CompletableFuture.<Void>completedFuture(null);
-                        }
-                        redirectionState.recordRedirect();
-                        return redirectToLeader(redirectionState);
-                    })
-                    .thenCompose(Function.identity());
-        });
+        failoverState.visitedTargets().add(currentTarget);
+        List<ConnectionInfo> targets =
+                LeaderAwareness.rosterWalkTargets(rosterTargets, currentTarget, failoverState.visitedTargets());
+        return walkRoster(targets, 0, currentTarget, requestDeadlineNanos, failoverState);
+    }
+
+    private CompletableFuture<Void> walkRoster(
+            List<ConnectionInfo> targets,
+            int index,
+            ConnectionInfo originalTarget,
+            long requestDeadlineNanos,
+            AsyncTcpConnection.TransientFailoverState failoverState) {
+        if (index >= targets.size() || requestDeadlineNanos - System.nanoTime() <= 0) {
+            return CompletableFuture.completedFuture(null);
+        }
+        ConnectionInfo target = targets.get(index);
+        failoverState.visitedTargets().add(target);
+        log.info(
+                "The request was refused on {}, walking the roster to {}",
+                originalTarget.serverAddress(),
+                target.serverAddress());
+        return retarget(target)
+                .handle((ignored, error) -> {
+                    if (error == null) {
+                        return CompletableFuture.<Void>completedFuture(null);
+                    }
+                    log.warn("Roster walk to {} failed: {}", target.serverAddress(), error.getMessage());
+                    return walkRoster(targets, index + 1, originalTarget, requestDeadlineNanos, failoverState);
+                })
+                .thenCompose(Function.identity());
     }
 
     /**

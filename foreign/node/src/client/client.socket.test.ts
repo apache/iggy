@@ -183,6 +183,38 @@ const twoNodeMetadataBody = (
   ]);
 };
 
+const threeNodeMetadataBody = (
+  firstPort: number,
+  secondPort: number,
+  thirdPort: number
+): Buffer => {
+  const node = (name: string, port: number, role: number): Buffer => {
+    const nodeName = Buffer.from(name);
+    const ip = Buffer.from('127.0.0.1');
+    const encoded = Buffer.alloc(4 + nodeName.length + 4 + ip.length + 8 + 2);
+    let offset = 0;
+    encoded.writeUInt32LE(nodeName.length, offset); offset += 4;
+    nodeName.copy(encoded, offset); offset += nodeName.length;
+    encoded.writeUInt32LE(ip.length, offset); offset += 4;
+    ip.copy(encoded, offset); offset += ip.length;
+    encoded.writeUInt16LE(port, offset); offset += 8;
+    encoded.writeUInt8(role, offset); offset += 1;
+    encoded.writeUInt8(0, offset);
+    return encoded;
+  };
+  const name = Buffer.from('iggy-cluster');
+  const header = Buffer.alloc(4 + name.length + 4);
+  header.writeUInt32LE(name.length, 0);
+  name.copy(header, 4);
+  header.writeUInt32LE(3, 4 + name.length);
+  return Buffer.concat([
+    header,
+    node('iggy-node-1', firstPort, 0),
+    node('iggy-node-2', secondPort, 1),
+    node('iggy-node-3', thirdPort, 1)
+  ]);
+};
+
 /** Register, metadata, and echo behavior of a healthy single VSR node. */
 const singleNodeHandler = (port: number): FrameHandler =>
   (frame, socket) => {
@@ -1058,6 +1090,75 @@ describe('VSR client socket', () => {
     }
   );
 
+  it('walks past two refusing replicas to the partition primary',
+    async () => {
+      const third = await startVsrServer((frame, socket) => {
+        singleNodeHandler(third.port)(frame, socket);
+      });
+      const second = await startVsrServer((frame, socket) => {
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        if (operation === Operation.Register) {
+          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          return;
+        }
+        if (frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_040) {
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          return;
+        }
+        socket.write(replyFrame(operation));
+      });
+      const metadataLeader = await startVsrServer((frame, socket) => {
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (operation === Operation.Register) {
+          socket.write(replyFrame(Operation.Register, registerReplyBody()));
+          return;
+        }
+        if (code === COMMAND_CODE.GetClusterMetadata) {
+          socket.write(replyFrame(
+            Operation.NonReplicated,
+            threeNodeMetadataBody(
+              metadataLeader.port,
+              second.port,
+              third.port
+            )
+          ));
+          return;
+        }
+        if (code === 60_040) {
+          socket.write(replyFrame(Operation.NonReplicated, Buffer.alloc(0), 58));
+          return;
+        }
+        socket.write(replyFrame(operation));
+      });
+      const client = new CommandResponseStream(vsrConfig(metadataLeader.port));
+      try {
+        await client.authenticate(vsrConfig(metadataLeader.port).credentials);
+
+        const response = await client.sendCommand(60_040, Buffer.alloc(0), {
+          deadline: Date.now() + 15_000
+        });
+
+        assert.equal(response.status, 0);
+        assert.ok(
+          second.frames.some((frame) =>
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_040),
+          'the roster walk skipped the second replica'
+        );
+        assert.ok(
+          third.frames.some((frame) =>
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) === 60_040),
+          'the roster walk never reached the partition primary'
+        );
+      } finally {
+        client.destroy();
+        await metadataLeader.close();
+        await second.close();
+        await third.close();
+      }
+    }
+  );
+
   it('holds a queued command instead of writing it to the node being left',
     async () => {
       // A refusal sends its caller to re-read the roster, and the drain that
@@ -1206,6 +1307,44 @@ describe('VSR client socket', () => {
         );
       } finally {
         Date.now = realNow;
+        client.destroy();
+        await server.close();
+      }
+    }
+  );
+
+  it('does not suppress leader settlement after a failed roster walk',
+    async () => {
+      const server = await startVsrServer(
+        (frame, socket) => singleNodeHandler(server.port)(frame, socket)
+      );
+      const client = new CommandResponseStream(vsrConfig(server.port));
+      try {
+        await client.authenticate(vsrConfig(server.port).credentials);
+        const routing = client as unknown as {
+          walkSettleSuppressed: boolean,
+          _followLeaderMove: (walkPastLeader: boolean) => Promise<unknown>,
+          connection: {
+            nextRosterEndpoint: () => { host: string, port: number },
+            redirect: (host: string, port: number) => Promise<void>
+          }
+        };
+        routing.connection.nextRosterEndpoint = () => ({
+          host: '127.0.0.1',
+          port: server.port + 1
+        });
+        routing.connection.redirect = async () => {
+          throw new Error('redirect failed');
+        };
+
+        assert.deepEqual(await routing._followLeaderMove(true), {
+          endpoint: { host: '127.0.0.1', port: server.port + 1 },
+          moved: false
+        });
+        assert.equal(routing.walkSettleSuppressed, false,
+          'a failed walk leaked its one-shot suppression into a later login'
+        );
+      } finally {
         client.destroy();
         await server.close();
       }
