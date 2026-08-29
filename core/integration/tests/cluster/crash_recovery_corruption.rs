@@ -68,16 +68,18 @@ const INDEX_ENTRY_POSITION_AT: usize = 2 * size_of::<u64>();
 /// the damaged node's index holds several flush chunks at either role's
 /// cadence (a primary flushes per op, a backup per committed range).
 const INDEX_AHEAD_BATCHES: u32 = 30;
-/// Flush chunks the damaged node's index must hold for the surgery to leave
-/// BOTH a surviving prefix and entries pointing past the truncated log end.
+/// Flush chunks the damaged node's index must hold for the surgery to leave a
+/// real surviving prefix behind the one entry it strands past the log end.
 const MIN_INDEX_ENTRIES: usize = 4;
 /// Infix of the directory the refusal path renames a partition's segment files
 /// into (`partitions::state_transfer::quarantine_segment_files`).
 const FENCED_DIR_MARKER: &str = ".fenced.";
-/// Boot log line recovery emits when it floors an index the log cannot fully
-/// back (`server::segment_recovery::recover_segment_bounds`): the positive
-/// evidence the floor ran, as opposed to a rebuild or a refusal.
-const INDEX_FLOOR_MARKER: &str = "flooring it to the entries the log proves";
+/// Boot log line recovery emits when the log cannot back the last entry of an
+/// index (`server::segment_recovery::recover_segment_bounds`): the positive
+/// evidence that path ran, as opposed to the clean anchored walk or a refusal.
+/// Distinct from the line the self-contradicting-index check emits, which ends
+/// "rebuilding it from the log".
+const INDEX_REBUILD_MARKER: &str = "discarding the index and rebuilding it from a byte-0 walk";
 
 async fn create_stream_and_topic(client: &IggyClient) {
     client
@@ -567,17 +569,22 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
 
 /// A crash can leave a node's segment `.log` shorter than its already durable
 /// `.index` claims: the two files are persisted concurrently, so death between
-/// them lands the index ahead even under `enforce_fsync`, where both were
-/// durable at ack time. The index is a rebuildable local artifact and the log
-/// is the authority, so recovery must floor the index to the last entry the
-/// log still proves and keep serving the batches behind it - not refuse the
-/// chain, which fences every surviving byte aside on a cluster and tombstones
-/// the partition outright on a single replica. The spec pins the whole
-/// outcome: the node boots without a refusal, nothing is fenced, its index no
-/// longer points past its log, catch-up refills the truncated tail, every
-/// acked offset reads back, and the replicas end byte-identical.
+/// them strands the entry of the chunk that was in flight even under
+/// `enforce_fsync`. That one entry is the whole window - every earlier entry
+/// was fsync'd with its log chunk before that chunk's batch was acked - so it
+/// is the shape the surgery reproduces. The index is a rebuildable local
+/// artifact and the log is the authority, so recovery must discard the index,
+/// rebuild it from a byte-0 walk of the log, and keep serving the batches the
+/// walk proves - not refuse the chain, which fences every surviving byte aside
+/// on a cluster and tombstones the partition outright on a single replica. The
+/// walk starts at byte 0 rather than at the highest entry the log still backs
+/// because an anchor above the damage would leave everything below it unread.
+/// The spec pins the whole outcome: the node boots without a refusal, nothing
+/// is fenced, its index no longer points past its log, catch-up refills the
+/// truncated tail, every acked offset reads back, and the replicas end
+/// byte-identical.
 #[iggy_harness(cluster_nodes = 3)]
-async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_should_floor_the_index_and_serve_the_surviving_prefix(
+async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_should_rebuild_the_index_and_serve_the_surviving_prefix(
     harness: &mut TestHarness,
 ) {
     let client = harness.tcp_root_client().await.unwrap();
@@ -613,20 +620,22 @@ async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_sho
     assert!(
         positions.len() >= MIN_INDEX_ENTRIES,
         "the backup's index holds only {} flush chunk(s), fewer than the {MIN_INDEX_ENTRIES} \
-         the surgery needs to leave both a surviving prefix and entries past the log end",
+         the surgery needs to leave a real surviving prefix behind the stranded entry",
         positions.len()
     );
     let log_size = fs::metadata(&log_path)
         .map(|meta| meta.len())
         .unwrap_or_else(|error| panic!("stat {}: {error}", log_path.display()));
-    // Cutting at the midpoint entry's position lands the log end exactly on a
-    // batch boundary, keeps whole batches behind it, and leaves every entry
-    // from the midpoint on pointing at or past the end of the file - what a
-    // crash between the log write and the index write produces.
-    let cut_at = positions[positions.len() / 2];
+    // Cutting at the LAST entry's position lands the log end exactly on a
+    // batch boundary, keeps whole batches behind it, and strands exactly one
+    // entry past the end of the file - the only depth a crash can produce
+    // under `enforce_fsync`, where every earlier entry was fsync'd together
+    // with its log chunk before that chunk's batch was acked. A deeper cut
+    // would fabricate acked-data loss, which recovery refuses by design.
+    let cut_at = positions[positions.len() - 1];
     assert!(
         cut_at > 0 && cut_at < log_size,
-        "the midpoint entry's position {cut_at} must sit inside the {log_size}-byte log"
+        "the last entry's position {cut_at} must sit inside the {log_size}-byte log"
     );
     truncate_to(&log_path, cut_at);
     let truncated =
@@ -643,16 +652,21 @@ async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_sho
     harness.restart_node(backup).unwrap_or_else(|error| {
         panic!(
             "an index ahead of its log is what a crash between the two writes leaves; \
-             boot must floor the index instead of failing: {error}"
+             boot must rebuild the index instead of failing: {error}"
         )
     });
 
-    // Stat the index BEFORE the log, both right after boot: catch-up grows
+    // Read the index BEFORE the log, both right after boot: catch-up grows
     // the two files together, so a log still at the cut proves the index was
-    // read before any append landed, and the floor is then the only shape it
-    // may have. Once the log has grown the refilled tail re-mints the very
-    // entries the floor dropped, and nothing on disk tells the two apart; the
-    // boot log marker below is the evidence that survives that.
+    // read before any append landed, and the rebuild is then the only shape it
+    // may have. Once the log has grown the refilled tail re-mints entries over
+    // the same bytes, and nothing on disk tells the two apart; the boot log
+    // marker below is the evidence that survives that.
+    //
+    // The rebuild's stride is its own, so the entry COUNT is not the spec.
+    // What is: the index describes only bytes the walk proved, which is the
+    // property the stranded entry violated.
+    let recovered_positions = index_positions(&index_path);
     let recovered_index_len = fs::metadata(&index_path)
         .map(|meta| meta.len())
         .unwrap_or_else(|error| panic!("stat {}: {error}", index_path.display()));
@@ -660,22 +674,28 @@ async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_sho
         .map(|meta| meta.len())
         .unwrap_or_else(|error| panic!("stat {}: {error}", log_path.display()));
     if recovered_log_len == cut_at {
-        let floored_entries = positions
-            .iter()
-            .filter(|position| **position < cut_at)
-            .count();
         assert_eq!(
-            recovered_index_len,
-            (floored_entries * INDEX_ENTRY_SIZE) as u64,
-            "recovery must floor the index to exactly the {floored_entries} entries the \
-             {cut_at}-byte log proves"
+            recovered_index_len as usize % INDEX_ENTRY_SIZE,
+            0,
+            "the recovered index must hold whole entries; it is {recovered_index_len} bytes"
+        );
+        assert!(
+            !recovered_positions.is_empty(),
+            "the {cut_at}-byte log holds whole batches, so the rebuilt index must not be empty"
+        );
+        assert!(
+            recovered_positions
+                .iter()
+                .all(|position| *position < cut_at),
+            "every rebuilt entry must open inside the {cut_at}-byte log, got \
+             {recovered_positions:?}"
         );
     }
 
     let fenced = fenced_segment_paths(&backup_data);
     assert!(
         fenced.is_empty(),
-        "recovery must floor the index to the entries the log proves, keeping the {} \
+        "recovery must rebuild the index from the log, keeping the {} \
          surviving batches in service; instead the chain was refused and fenced aside: {fenced:?}",
         surviving.len()
     );
@@ -699,8 +719,9 @@ async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_sho
             "boot must absorb an index that outruns its log, not refuse the chain"
         );
         assert!(
-            harness.node(backup).stdout_contains(INDEX_FLOOR_MARKER),
-            "boot must log the index floor ({INDEX_FLOOR_MARKER:?}); recovery took another path"
+            harness.node(backup).stdout_contains(INDEX_REBUILD_MARKER),
+            "boot must log the byte-0 rebuild ({INDEX_REBUILD_MARKER:?}); recovery took \
+             another path"
         );
     }
 
@@ -718,7 +739,7 @@ async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_sho
     wait_for_acked_readable(&client, &acked, CONVERGE_TIMEOUT)
         .await
         .unwrap_or_else(|state| {
-            panic!("every acked offset must poll back after the floored-index recovery: {state}")
+            panic!("every acked offset must poll back after the rebuilt-index recovery: {state}")
         });
 
     let data_paths: Vec<PathBuf> = harness

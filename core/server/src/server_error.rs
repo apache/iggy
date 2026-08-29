@@ -287,11 +287,16 @@ pub enum ServerError {
 /// appended over), and offsets that do not continue the chain can be minted
 /// into byte-clean files by an upstream crash window as well as by damage.
 ///
-/// An index the log cannot back, or that contradicts itself, is deliberately
-/// NOT here: entries are derived from the log, so recovery floors the index
-/// to the last entry the log proves and rebuilds it from the log when none
-/// does or when the entries are out of order. The index is never evidence
-/// about the log; only the log is.
+/// An index that contradicts itself is deliberately NOT here, and neither is
+/// one the log cannot back UNLESS the topic runs under `enforce_fsync` and the
+/// gap is deeper than the single in-flight entry: entries are derived from the
+/// log, so recovery drops such an index whole and rebuilds it from a byte-0
+/// walk of the log rather than believing any part of it. What `enforce_fsync`
+/// adds is a durability promise -- every entry below the last was made durable
+/// alongside the log chunk it describes, before that chunk's batch was
+/// acknowledged -- which turns a deeper gap into evidence about the LOG.
+/// Absent that promise the index is never evidence about the log; only the
+/// log is.
 #[derive(Debug)]
 pub enum PartitionRecoveryRefusal {
     /// `recoverable_bytes` on the two chain-shape refusals is the sum of
@@ -362,6 +367,24 @@ pub enum PartitionRecoveryRefusal {
         start_offset: u64,
         batch_partition_id: u64,
         position: u64,
+    },
+    /// The sparse index of a topic running under `enforce_fsync` outruns its
+    /// log by more than the one entry a crash can legitimately strand there.
+    /// Persistence writes exactly one entry per flush chunk, chunks never
+    /// overlap, and it completes before the client reply, so every entry below
+    /// the last one names a chunk whose log bytes were fsync'd before its
+    /// batch was acknowledged. Only the chunk in flight when the process died
+    /// can have an entry the log never backed. A deeper step-back therefore
+    /// says the LOG lost acknowledged bytes it had already made durable, and
+    /// rebuilding this segment from what the log still holds would let the
+    /// partition re-mint offsets a client was already promised.
+    FsyncedLogLoss {
+        start_offset: u64,
+        entry_count: u64,
+        provable_entries: u64,
+        /// Position of the highest entry the log still proves; 0 when it
+        /// proves none, which `provable_entries` disambiguates.
+        provable_position: u64,
     },
     /// A writer reopening over recovered bounds found the on-disk length
     /// diverging from the size recovery just validated and truncated to.
@@ -446,6 +469,19 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 "segment {start_offset} holds a verified batch at byte {position} \
                  stamped for partition {batch_partition_id}; a foreign record in \
                  this log is preserved as evidence, not truncated"
+            ),
+            Self::FsyncedLogLoss {
+                start_offset,
+                entry_count,
+                provable_entries,
+                provable_position,
+            } => write!(
+                f,
+                "segment {start_offset} runs under enforce_fsync with {entry_count} sparse \
+                 index entries, but its log backs only {provable_entries} of them (up to \
+                 byte {provable_position}); every entry below the last was fsync'd with \
+                 the log chunk it describes before that chunk was acknowledged, so the \
+                 log has lost acknowledged data rather than the index having outrun it"
             ),
             Self::StorageSizeMismatch {
                 start_offset,

@@ -471,30 +471,54 @@ recreate_missing_state = false
 
 # At boot, segment recovery walks each partition's segments: bytes after the
 # last decodable batch of a genuinely torn tail are physically truncated from
-# the .log/.index files. A LOST index is rebuilt from the batches the walk
-# proves -- lost meaning absent altogether, or holding no whole 24-byte
-# entry. An index that still holds whole entries is NEVER rebuilt, only
-# floored to whole entries, or the partition is refused when its entries
-# contradict the log. Only the walk of a segment whose index was lost
-# re-checksums every batch; with an intact index the walk trusts batch
-# headers, except that a batch contradicting the walk (see below) must pass
-# its batch checksum before the contradiction is believed. Bytes before the
-# last index entry are not re-examined at boot at all -- at-rest damage
-# there surfaces on the read path via validate_checksum.
+# the .log/.index files. Every index entry is derived from a batch the log
+# already held, so an index is never evidence about the log: one the log
+# contradicts is repaired, not believed. It is DROPPED whole and rebuilt from
+# a byte-0 walk when it holds no whole 24-byte entry, when its entries
+# regress in offset or position, when they open below the segment's own start
+# offset, or when the log cannot back its LAST entry. Only an index whose
+# last entry the log proves anchors a walk, which then runs from that entry
+# to the file end. Under the topic's enforce_fsync = true an index the log
+# cannot back is measured against the log first: a gap of more than ONE entry
+# refuses the partition instead of rebuilding, because fsync lets the index
+# outrun the log by at most the chunk in flight at the crash, so a wider gap
+# is acknowledged data the log lost.
 #
-# A restore that dropped every .index therefore boots by re-reading and
-# re-checksumming every byte of every segment and rebuilding each index
-# durably, two fsyncs per segment: budget minutes, not seconds, on a
-# partition holding thousands of segments. A boot that looks hung after such
-# a restore is doing that work. Before, that same shape refused the boot
-# outright.
+# The byte-0 walk is deliberately not narrowed to the entries the log still
+# proves. An anchor picked that way can sit ABOVE damage, and the residue
+# probe only ever looks forward from where a walk stopped, so a hole under
+# the anchor would go unread while end_offset still advertised the offsets
+# over it. Reaching that branch means the index and the log already disagree,
+# so the extra bytes read are bounded by the segments a crash actually tore.
 #
-# Either walk refuses a batch whose base offset does not continue the chain,
-# or whose partition_id stamp is not this partition's. A contradiction whose
-# batch fails its own checksum is damage rather than data: the walk stops
-# there and the residue goes through the damage probe like any other torn
-# tail, so a bit flip in a tail batch's offset truncates instead of refusing
-# the partition, regardless of the flip's direction.
+# Every batch a walk accepts passes its own checksum: the two files are
+# written unordered, so a durable index entry no longer implies a durable
+# chunk beneath it, and one chunk can hold several batches. Bytes below where
+# a walk starts are never read at boot -- on a healthy boot that is
+# everything before the last index entry, where at-rest damage surfaces only
+# on the read path via validate_checksum. Wherever a walk does reach, boot
+# acts on the damage it finds: truncating when nothing decodable follows,
+# refusing when something does.
+#
+# A byte-0 walk therefore re-reads and re-checksums every byte of the
+# segments it covers and rebuilds each index durably, two fsyncs per segment:
+# budget minutes, not seconds, where it covers thousands of them. A restore
+# that dropped every .index hits every segment; an ordinary crash reaches the
+# same walk for the segments whose index no longer matches its log, usually
+# just the tail one. Either way a boot that looks hung is doing that work, and
+# a slow boot with no restore in the change log is not by itself evidence of
+# anything wrong. Before, every one of those shapes refused the boot outright.
+#
+# Either walk refuses a verifying batch whose base offset does not continue
+# the chain, or whose partition_id stamp is not this partition's. The one
+# exception is the first batch at an index-derived anchor: the offset it
+# fails to match is the ENTRY's, not the log's, so a mismatch there breaks
+# the walk as a stale entry, leaving the verdict to the byte-0 rebuild. A
+# batch that fails its own checksum is damage rather than data
+# whatever its fields claim: the walk stops there and the residue goes
+# through the damage probe like any other torn tail, so a bit flip in a tail
+# batch's offset truncates instead of refusing the partition, regardless of
+# the flip's direction.
 #
 # Damage in the middle of a segment is never silently truncated: the
 # partition is refused, as is trailing residue whose verification cost

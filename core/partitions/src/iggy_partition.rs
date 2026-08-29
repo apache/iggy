@@ -3091,12 +3091,20 @@ where
             };
 
             // Persist BEFORE eviction so a write failure leaves the rest of the
-            // committed prefix resident for retry. The persist is idempotent on
-            // failure: it advances its write cursors only once both the batch
-            // and the index are durable, so the retry overwrites the same
-            // positions instead of appending a duplicate. Chunks already durable
-            // are evicted before the error propagates, so the retry cannot
-            // re-read them (and re-write them past a rotation).
+            // committed prefix resident instead of dropping it. Nothing retries
+            // the persist: on the commit path a failure panics
+            // `handle_committed_entries`, the shutdown flush warns and moves to
+            // the next namespace, and the transfer offer turns it into
+            // `FlushFailed`. Recovery is a restart, which reopens each writer at
+            // the on-disk length boot recovery validated.
+            //
+            // The ordering therefore buys a non-corrupting failure, not an
+            // in-process one. Write cursors advance only once both the batch and the
+            // index are durable, so where the error does not panic the partition,
+            // its next flush rewrites the same positions instead of appending a
+            // duplicate. Chunks already durable are evicted before the error
+            // propagates, so it cannot re-read them (and re-write them past a
+            // rotation).
             if let Err(error) = self
                 .persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
                 .await
@@ -3106,9 +3114,9 @@ where
             }
             // Insert the flushed sparse-index entry into the in-mem cache only now
             // that the batch + index are durable. Inserting in the build loop (before
-            // persist) re-inserts a duplicate on a persist-failure retry, which
-            // re-reads the same prefix. The active segment has not rotated yet, so
-            // this targets the segment that received the batches.
+            // persist) re-inserts a duplicate on the next flush after a persist
+            // failure, which re-reads the same prefix. The active segment has not
+            // rotated yet, so this targets the segment that received the batches.
             if let Some(index) = flush_index {
                 self.log.ensure_indexes();
                 let indexes = self.log.active_indexes_mut().expect("indexes must exist");
@@ -3723,6 +3731,22 @@ where
         )
         .await;
 
+        // The match below collapses to the log's error (the durable record, the
+        // index being derived from it). The halves write different files and can
+        // fail for unrelated reasons, so name the index failure here instead of
+        // letting the log's error stand for both.
+        if let (Err(log_error), Err(index_error)) = (&log_result, &index_result) {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                batch_count,
+                %log_error,
+                %index_error,
+                "failed to persist frozen batches: log and index both failed"
+            );
+        }
+
         let (saved, saved_index_bytes) = match (log_result, index_result) {
             (Ok(saved), Ok(saved_index_bytes)) => (saved, saved_index_bytes),
             (Err(error), _) | (Ok(_), Err(error)) => {
@@ -3739,12 +3763,13 @@ where
         };
 
         // Advance both cursors only here, back to back with no await between.
-        // They are the writers' next-write positions: a half whose save failed
-        // must keep its cursor so the retry overwrites the same slot instead of
-        // appending a duplicate index entry or leaving a hole in the segment.
-        // Moving them together keeps the pair describing one durable prefix,
-        // which is what a re-opened writer asserts against the length of the
-        // file it finds.
+        // They are the writers' next-write positions, so a half whose save
+        // failed must keep its cursor: the pair then still describes one durable
+        // prefix, which is what a writer re-opened by boot recovery asserts
+        // against the length of the file it finds
+        // (`SegmentSizeMismatchAtOpen`). In-process it also keeps a later flush
+        // rewriting the same slot rather than appending a duplicate index entry
+        // or leaving a hole in the segment.
         messages_writer.advance(saved.as_bytes_u64());
         index_writer.advance(saved_index_bytes);
 

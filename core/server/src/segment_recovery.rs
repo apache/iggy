@@ -64,13 +64,26 @@ const SCAN_WINDOW_CAPACITY: usize = 4 * 1024 * 1024;
 /// batch always gets one.
 const REBUILT_INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 
-/// Sparse index entries the anchor search steps through between reactor
-/// yields, on top of the per-refill yield it shares with the walks. An entry
-/// whose position is past the log end is rejected on arithmetic alone, so it
-/// never refills the scan window, and an index floored back to a short log is
-/// mostly those: without this the search would hold the shard core -- signal
-/// handling included -- for one pread per entry over the whole file.
-const ANCHOR_SEARCH_YIELD_STRIDE: u64 = 1024;
+/// Sparse index entries either index scan steps through between reactor
+/// yields, on top of the per-refill yield the anchor search shares with the
+/// walks. Neither scan is bounded by disk reads: an entry whose position is
+/// past the log end is rejected on arithmetic alone (an index floored back to
+/// a short log is mostly those), and the consistency scan reads a whole window
+/// of entries per pread and then compares them in memory. Without this a
+/// megabyte-scale index would hold the shard core -- signal handling included
+/// -- for its whole length on every clean boot.
+const INDEX_SCAN_YIELD_STRIDE: u64 = 1024;
+
+/// Index entries the log may legitimately fail to back under `enforce_fsync`.
+/// Persistence writes exactly one entry per flush chunk, chunks never overlap,
+/// and it completes before the client reply. The two halves fdatasync
+/// concurrently WITHIN one flush, but flushes are serialized, and the log's
+/// fdatasync covers the whole file: an entry existing above entry N therefore
+/// proves the log was synced through chunk N. Only the chunk in flight when
+/// the process died can leave an entry the log never backed. See
+/// [`PartitionRecoveryRefusal::FsyncedLogLoss`] for why a deeper step-back is
+/// evidence about the log rather than about the index.
+const MAX_FSYNCED_INDEX_STEP_BACK_ENTRIES: u64 = 1;
 
 /// Units the damage probes of one partition load may spend per byte of
 /// residue they are asked to classify, at one unit per candidate offset
@@ -146,6 +159,11 @@ pub struct RecoveredSegment {
 /// residue the damage probe could not classify within its limits -- return
 /// [`ServerError::PartitionRecoveryRefused`] so the caller can fence this one
 /// partition instead of taking the node down.
+///
+/// `enforce_fsync` is the topic's own effective value, not a hint: it is what
+/// makes a durable index entry evidence about the log (see
+/// [`PartitionRecoveryRefusal::FsyncedLogLoss`]), so passing it wrong either
+/// refuses healthy chains or hides acknowledged data loss.
 #[allow(clippy::too_many_lines)]
 pub async fn load_persisted_segments(
     config: &ServerConfig,
@@ -153,6 +171,7 @@ pub async fn load_persisted_segments(
     topic_id: usize,
     partition_id: usize,
     segment_size: IggyByteSize,
+    enforce_fsync: bool,
     stats: &PartitionStats,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
     let partition_path = config
@@ -200,6 +219,7 @@ pub async fn load_persisted_segments(
             &messages_path,
             start_offset,
             raw_messages_size,
+            enforce_fsync,
             &mut scratch,
         )
         .await?;
@@ -289,14 +309,14 @@ pub async fn load_persisted_segments(
                 plan.segment.start_offset,
             )?;
         }
-        // Log first, index second: a walk only accepts bounds when a whole
-        // batch verifies at the last RETAINED index entry's position, so the
-        // walked log length strictly exceeds that position and every
-        // surviving index entry still points inside the shortened log even if
+        // Log first, index second: an index is kept only when a whole batch
+        // verifies at its LAST entry's position, so the walked log length
+        // strictly exceeds that position and every kept
+        // entry still points inside the shortened log even if
         // a crash lands between the two mutations -- and a crash that lands
         // there anyway leaves an index running ahead of its log, which the
-        // next boot floors instead of refusing. The staged-rebuild install is
-        // reached from a populated index too (one the log backs nowhere), so
+        // next boot discards and rebuilds instead of refusing. The
+        // staged-rebuild install is reached from a populated index too, so
         // a crash between the truncate and the rename leaves that unbacked
         // index over the shortened log; the next boot re-discards it and
         // rebuilds from the log again, and truncation is monotone, so the
@@ -346,10 +366,14 @@ pub async fn load_persisted_segments(
         stats.increment_segments_count(1);
         stats.increment_size_bytes(messages_size);
         if messages_size > 0 {
-            // Offsets in a segment are contiguous (either walk refuses a
-            // discontinuity), so the message count is the inclusive span
-            // between the first (segment start) and last offset. Saturating:
-            // an end offset at u64::MAX must not wrap the counter.
+            // The count is the offset span this segment now advertises, which
+            // is what a consumer can ask for. It is only as verified as the
+            // bounds are: a byte-0 walk proved every offset in the span
+            // contiguous, while the anchored walk proved the span from its
+            // anchor on and inherited the rest from the index -- the same
+            // trust the bounds themselves carry, so counting the whole span
+            // does not widen it. Saturating: an end offset at u64::MAX must
+            // not wrap the counter.
             stats.increment_messages_count(
                 plan.segment
                     .end_offset
@@ -1013,12 +1037,14 @@ async fn load_index_anchors(
 /// concurrently under every config, so there is no ordering barrier between
 /// the message write and the index write, and a tail torn mid-flush would
 /// otherwise pass while `end_offset` claims offsets whose bytes are
-/// incomplete. When the log cannot back that entry, the search steps
-/// down to the highest entry it can and the index is floored to it; when it
-/// backs no entry at all, or the entries contradict each other, the index
-/// is dropped whole. Without one -- dropped or never present -- the log
-/// itself is walked from byte 0 and the index is rebuilt from the batches
-/// found. Either way, bytes left past
+/// incomplete. An index whose last entry the log cannot back, or whose entries
+/// contradict each other, is dropped whole instead: no entry in it anchors a
+/// walk, so the log is walked from byte 0 and the index is rebuilt from the
+/// batches that walk proves. Under `enforce_fsync` the drop is preceded by a
+/// step-back measurement, and a gap deeper than one entry refuses as
+/// acknowledged log loss rather than rebuilding. The byte-0 walk costs a whole
+/// segment of checksums, but only for segments whose index the log already
+/// contradicts, never on a clean boot. Either way, bytes left past
 /// the walked prefix go through the damage probe: a torn tail truncates, but
 /// damage with intact batches after it -- or residue the probe cannot
 /// classify within its limits -- refuses recovery.
@@ -1029,6 +1055,7 @@ async fn recover_segment_bounds(
     messages_path: &str,
     start_offset: u64,
     messages_size: u64,
+    enforce_fsync: bool,
     scratch: &mut ScanScratch,
 ) -> Result<Option<WalkedBounds>, ServerError> {
     let (entry_count, first, last) = load_index_anchors(identity, index_path).await?;
@@ -1036,14 +1063,14 @@ async fn recover_segment_bounds(
     match (first, last) {
         (Some(first), Some(last)) => {
             // A mis-strided or foreign index decodes to garbage entries that
-            // binary searches would trust, and the walk's anchor bounds only
-            // the tail. Ascending positions keep every surviving entry inside
-            // the truncated log once the tail is floored, so an index that
-            // contradicts itself is dropped whole and rebuilt from the log,
-            // exactly like one the log backs nowhere: entries are derived
-            // from the log, so the index can never say more than the log.
+            // binary searches would trust, so an index that contradicts itself
+            // is dropped whole and rebuilt from the log. No `enforce_fsync`
+            // gate here, unlike the step-back below: the writer cannot emit a
+            // non-ascending run, so this file is foreign or mis-strided and is
+            // no witness to what the log once held.
             let consistent =
-                index_is_consistent(identity, index_path, start_offset, entry_count, scratch)?;
+                index_is_consistent(identity, index_path, start_offset, entry_count, scratch)
+                    .await?;
 
             let messages = open_messages_file(identity, messages_path)?;
             let mut scanner = FileScanner::new(&messages, messages_size, scratch);
@@ -1063,7 +1090,7 @@ async fn recover_segment_bounds(
             // flushed as one chunk indexes only its first offset). Walk the
             // batch chain from that position to the file end to recover the
             // true end offset.
-            let mut walk = walk_chain_from_anchor(
+            let walk = walk_chain_from_anchor(
                 identity,
                 &mut scanner,
                 messages_path,
@@ -1072,67 +1099,53 @@ async fn recover_segment_bounds(
                 last,
             )
             .await?;
-            let mut retained_entries = entry_count;
             if !walk.proved_any {
-                // An index entry is not independent evidence about the log:
-                // the writer derives every entry from a batch the log
-                // already held, so an entry the log cannot back is a torn
-                // tail of the INDEX, never proof that the log lost data.
-                // That shape is ordinary: the two files persist concurrently
-                // under every config, so they have no write ordering between
-                // them, and pass C truncates the log before the index, so a
-                // crash between those two mutations leaves exactly this.
-                // Refusing it handed a benign torn tail a permanent tombstone
-                // on a single-replica node. Step down
-                // to the highest entry the log still proves and floor the
-                // index there, so pass C drops the entries nothing backs.
-                let anchor = find_provable_index_anchor(
-                    identity,
-                    index_path,
-                    messages_path,
-                    &mut scanner,
-                    start_offset,
-                    entry_count,
-                    messages_size,
-                )
-                .await?;
-                let Some((provable_entries, anchor)) = anchor else {
-                    // Not one entry is backed by the log, so the index
-                    // describes a file this segment does not hold and every
-                    // entry in it is worthless. The log still describes
-                    // itself, so drop the index whole and walk the log from
-                    // byte 0, which rebuilds the index from what it proves.
-                    // The common shape is the first persist into a fresh
-                    // segment: its one entry and its log chunk fsync
-                    // concurrently, and a crash in between leaves the entry
-                    // durable over an empty or torn log. No ack was ever sent
-                    // for those bytes (persist completes before the reply),
-                    // so recovering from the log alone loses nothing a client
-                    // was promised -- where refusing tombstoned the partition
-                    // on a single-replica node. The walk runs its own residue
-                    // probe from the real break point, so a survivor past
-                    // damage still refuses there.
-                    warn!(
-                        stream_id = identity.stream_id,
-                        topic_id = identity.topic_id,
-                        partition_id = identity.partition_id,
-                        start_offset,
-                        messages_size,
-                        entry_count,
-                        last_entry_offset = last.offset,
-                        last_entry_position = last.position,
-                        "no sparse index entry is backed by the log; \
-                         discarding the index and rebuilding it from the log"
-                    );
-                    return recover_by_walking_log(
+                // Under `enforce_fsync` the DEPTH of the step-back that would
+                // find a usable anchor is evidence about the LOG. Flushes are
+                // serialized and each one fdatasyncs the whole log file before
+                // the next one writes, so an entry existing above entry N
+                // proves the log's fdatasync through chunk N completed. Only
+                // the chunk in flight at the crash can strand an entry; a
+                // deeper gap is the log missing bytes it already acknowledged.
+                // Refuse and keep every byte for the operator.
+                if enforce_fsync {
+                    let anchor = find_provable_index_anchor(
                         identity,
-                        &mut scanner,
+                        index_path,
                         messages_path,
+                        &mut scanner,
                         start_offset,
+                        entry_count,
                         messages_size,
                     )
-                    .await;
-                };
+                    .await?;
+                    let (provable_entries, provable_position) =
+                        anchor.map_or((0, 0), |(entries, entry)| (entries, entry.position));
+                    let step_back_entries = entry_count.saturating_sub(provable_entries);
+                    if step_back_entries > MAX_FSYNCED_INDEX_STEP_BACK_ENTRIES {
+                        return Err(identity.refusal(PartitionRecoveryRefusal::FsyncedLogLoss {
+                            start_offset,
+                            entry_count,
+                            provable_entries,
+                            provable_position,
+                        }));
+                    }
+                }
+                // The log cannot back its own last entry, so this index is no
+                // longer a description of this log and nothing in it is a
+                // trustworthy anchor. Anchoring on the highest entry that
+                // still proves would leave `[0, anchor.position)` unread, and
+                // the damage probe only scans FORWARD from where a walk
+                // stopped: a hole below the anchor would be invisible, while
+                // `end_offset` still advertised the offsets over it. That hole
+                // is exactly what the crash reaching this branch can leave --
+                // without `enforce_fsync` writeback order is arbitrary, so an
+                // unprovable tail entry is equally a torn INDEX tail and
+                // evidence the LOG lost an interior page. Walk from byte 0
+                // instead: it reads the damage, finds the anchor's own batch
+                // as a survivor past it, and refuses with the bytes preserved,
+                // and where the log is whole every rebuilt entry is one the
+                // walk proved rather than one it inherited.
                 warn!(
                     stream_id = identity.stream_id,
                     topic_id = identity.topic_id,
@@ -1140,29 +1153,20 @@ async fn recover_segment_bounds(
                     start_offset,
                     messages_size,
                     entry_count,
-                    provable_entries,
-                    anchor_position = anchor.position,
-                    "sparse index runs ahead of the log it indexes; flooring \
-                     it to the entries the log proves"
+                    last_entry_offset = last.offset,
+                    last_entry_position = last.position,
+                    "the log does not back its last sparse index entry; \
+                     discarding the index and rebuilding it from a byte-0 \
+                     walk of the log"
                 );
-                retained_entries = provable_entries;
-                walk = walk_chain_from_anchor(
+                return recover_by_walking_log(
                     identity,
                     &mut scanner,
                     messages_path,
                     start_offset,
                     messages_size,
-                    anchor,
                 )
-                .await?;
-                // The anchor passed the same checks this walk applies to its
-                // first batch, so it proves at least that one. Pass C relies
-                // on it: the retained entries stop at the anchor, and only a
-                // walk that got past it leaves them inside the truncated log.
-                debug_assert!(
-                    walk.proved_any,
-                    "a provable anchor must prove its own batch to the walk"
-                );
+                .await;
             }
             refuse_if_survivor_past_damage(
                 identity,
@@ -1179,7 +1183,7 @@ async fn recover_segment_bounds(
                 end_timestamp: walk.end_timestamp,
                 end_offset: walk.end_offset,
                 messages_size: walk.position,
-                index_size: retained_entries * SPARSE_INDEX_ENTRY_SIZE as u64,
+                index_size: entry_count * SPARSE_INDEX_ENTRY_SIZE as u64,
                 rebuilt_index: None,
             }))
         }
@@ -1350,9 +1354,9 @@ async fn recover_by_walking_log(
 /// file breaks the walk before any checksum is paid, and the verify covers
 /// one flushed chunk per segment in the ordinary boot (the last entry points
 /// at the last chunk's first batch). When not one whole batch verifies at
-/// the anchor the returned walk is `proved_any == false` and still carries
-/// the anchor's own position and offset, which is what the caller hands to
-/// the step-back and the damage probe.
+/// the anchor the returned walk is `proved_any == false`, which tells the
+/// caller the index does not describe this log; the bounds it carries are
+/// then the anchor's own and must not be used.
 async fn walk_chain_from_anchor(
     identity: PartitionIdentity<'_>,
     scanner: &mut FileScanner<'_>,
@@ -1411,8 +1415,8 @@ async fn walk_chain_from_anchor(
                 // the INDEX ENTRY's, so a verifying batch here contradicts
                 // the entry, not the chain. Calling that a discontinuity
                 // would refuse a healthy log over a stale entry, so break and
-                // leave the verdict to the step-back and the log rebuild,
-                // which read the chain from the filename onward.
+                // leave the verdict to the byte-0 rebuild, which reads the
+                // chain from the filename onward.
                 break;
             }
             // A verified batch that does not continue the chain is durable
@@ -1453,14 +1457,19 @@ async fn walk_chain_from_anchor(
 }
 
 /// Highest index entry below the last one that the log can still prove,
-/// returned as the number of entries to keep plus that entry itself. `None`
-/// when no entry proves out, which drops the index whole.
+/// returned as the number of entries at or below it plus the entry itself.
+/// `None` when no entry proves out.
+///
+/// Reached only under `enforce_fsync`, and only to measure how far the index
+/// has outrun the log: the index is dropped whole either way, so nothing is
+/// anchored on the entry this returns. What the DEPTH decides is whether the
+/// gap is the one chunk a crash can strand or acknowledged data the log lost
+/// (see [`MAX_FSYNCED_INDEX_STEP_BACK_ENTRIES`]).
 ///
 /// An entry proves when the log holds, at its position, the whole batch it
 /// describes: decoding, fitting inside the log, carrying this partition's
-/// stamp and the entry's own base offset, and passing its batch checksum,
-/// so the anchor the whole recovered end offset hangs on is verified before
-/// it is believed. Entries are read one at a time from the back rather than
+/// stamp and the entry's own base offset, and passing its batch checksum.
+/// Entries are read one at a time from the back rather than
 /// slurped: an index can run to megabytes, and the search stops at the first
 /// entry that proves. The dominant shape costs no log read at all -- an
 /// entry pointing past the log end is rejected on arithmetic alone -- so a
@@ -1475,9 +1484,9 @@ async fn walk_chain_from_anchor(
 /// packed closer together than the batches they claim exhaust it and refuse,
 /// rather than paying a verify per entry over an index that never proves.
 /// Yields once per window of disk reads, like the walks, and additionally
-/// every [`ANCHOR_SEARCH_YIELD_STRIDE`] entries: an entry that overshoots the
+/// every [`INDEX_SCAN_YIELD_STRIDE`] entries: an entry that overshoots the
 /// log reads nothing from it, so there is no refill to key the yield on, and
-/// a floored index is full of exactly those.
+/// an index that outran a truncated log is full of exactly those.
 async fn find_provable_index_anchor(
     identity: PartitionIdentity<'_>,
     index_path: &str,
@@ -1554,7 +1563,7 @@ async fn find_provable_index_anchor(
                 }
             }
         }
-        if scanner.take_refilled() || entry_index.is_multiple_of(ANCHOR_SEARCH_YIELD_STRIDE) {
+        if scanner.take_refilled() || entry_index.is_multiple_of(INDEX_SCAN_YIELD_STRIDE) {
             yield_to_reactor().await;
         }
         let Some(next) = entry_index.checked_sub(1) else {
@@ -1576,7 +1585,11 @@ async fn find_provable_index_anchor(
 /// restart can legitimately regress persisted `base_timestamp` today, and the
 /// lower-bound searches degrade gracefully on a non-monotone run, so refusing
 /// would trade availability for nothing.
-fn index_is_consistent(
+///
+/// Runs on EVERY clean boot over the whole index, and a window holds tens of
+/// thousands of entries, so the per-read yield the walks rely on is far too
+/// coarse here: yields every [`INDEX_SCAN_YIELD_STRIDE`] entries instead.
+async fn index_is_consistent(
     identity: PartitionIdentity<'_>,
     index_path: &str,
     start_offset: u64,
@@ -1648,6 +1661,9 @@ fn index_is_consistent(
             }
             previous = Some((entry_offset, entry_position));
             entry_index += 1;
+            if entry_index.is_multiple_of(INDEX_SCAN_YIELD_STRIDE) {
+                yield_to_reactor().await;
+            }
         }
         byte_position += chunk_bytes as u64;
     }
@@ -1730,6 +1746,11 @@ fn scan_read_failure(
 /// decodes, checksums, and plausibly extends the chain is durable data -- it
 /// can only exist because an append completed after the damaged region -- so
 /// discarding it would hide real loss behind a silent boot-time repair.
+///
+/// Scans FORWARD from `damage_position` only, and a walk that consumed the
+/// whole file leaves it nothing to do. Damage BELOW where the caller's walk
+/// began is invisible to it, which is why no caller may start a walk part way
+/// into a log it has reason to distrust.
 ///
 /// The residue is deliberately NOT width-gated: a torn flush chunk is
 /// bounded by the CHUNK, not by one record, and with `enforce_fsync = false`
@@ -2254,12 +2275,20 @@ mod tests {
     }
 
     async fn recover(config: &ServerConfig) -> Result<Vec<RecoveredSegment>, ServerError> {
+        recover_under_fsync(config, false).await
+    }
+
+    async fn recover_under_fsync(
+        config: &ServerConfig,
+        enforce_fsync: bool,
+    ) -> Result<Vec<RecoveredSegment>, ServerError> {
         load_persisted_segments(
             config,
             STREAM_ID,
             TOPIC_ID,
             PARTITION_ID,
             IggyByteSize::from(SEGMENT_MAX_SIZE),
+            enforce_fsync,
             &PartitionStats::default(),
         )
         .await
@@ -3282,7 +3311,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_index_entry_past_the_log_end_when_recovering_should_floor_index_to_last_provable_entry()
+    async fn given_index_entry_past_the_log_end_when_recovering_should_rebuild_the_index_from_the_log()
      {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
@@ -3306,19 +3335,19 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].segment.end_offset, 1);
         assert_eq!(
-            len_of(&index_path),
-            2 * SPARSE_INDEX_ENTRY_SIZE as u64,
-            "the entry nothing in the log backs must be gone from disk"
+            bytes_of(&index_path),
+            index_entry(0, 0),
+            "an index the log contradicts must be rebuilt from the walked batches"
         );
         assert_eq!(
             bytes_of(&messages_path),
             log,
-            "flooring the index must not touch a whole log"
+            "rebuilding the index must not touch a whole log"
         );
     }
 
     #[compio::test]
-    async fn given_index_anchor_on_torn_batch_when_recovering_should_floor_index_and_truncate_log_tail()
+    async fn given_index_anchor_on_torn_batch_when_recovering_should_rebuild_index_and_truncate_log_tail()
      {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
@@ -3349,22 +3378,22 @@ mod tests {
             "the torn batch must be gone from disk"
         );
         assert_eq!(
-            len_of(&index_path),
-            2 * SPARSE_INDEX_ENTRY_SIZE as u64,
-            "the entry pointing at the torn batch must be gone from disk"
+            bytes_of(&index_path),
+            index_entry(0, 0),
+            "the index must describe the batches the walk proved, not the torn one"
         );
         drop(recovered);
 
-        // A floored pair must be a fixpoint: a boot loop that re-refused
+        // A repaired pair must be a fixpoint: a boot loop that re-refused
         // what it just repaired is the failure this replaces.
         let reopened = recover(&config)
             .await
-            .expect("re-recovering a floored segment must not refuse");
+            .expect("re-recovering a repaired segment must not refuse");
 
         assert_eq!(reopened[0].segment.end_offset, 1);
         assert_eq!(
             (len_of(&messages_path), len_of(&index_path)),
-            (torn_position, 2 * SPARSE_INDEX_ENTRY_SIZE as u64),
+            (torn_position, SPARSE_INDEX_ENTRY_SIZE as u64),
             "a second recovery must not move the files"
         );
     }
@@ -3375,9 +3404,9 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        // Stepping back must not weaken the survivor rule: the walk from the
-        // stepped-back anchor still ends at the garbage, and the batch
-        // verifying past it is durable data truncation would erase.
+        // Dropping the index must not weaken the survivor rule: the byte-0
+        // walk still ends at the garbage, and the batch verifying past it is
+        // durable data truncation would erase.
         let batch0 = encoded_batch(0, 1);
         let batch1 = encoded_batch(1, 1);
         let mut log = batch0.clone();
@@ -3408,14 +3437,147 @@ mod tests {
         assert_eq!(bytes_of(&index_path), index);
     }
 
+    /// The `.log` and `.index` fixtures for a segment whose SECOND chunk lost
+    /// its body while its header page survived, and whose last index entry
+    /// points past the log end. Anchoring on the highest entry the log still
+    /// proves lands on the third chunk, ABOVE the damage, and the damage probe
+    /// only ever looks forward from where a walk stopped -- so an anchored
+    /// walk runs clean to EOF and mints an `end_offset` covering an offset
+    /// whose bytes are gone. Returned with the damaged and surviving positions
+    /// so the tests can name them.
+    fn segment_damaged_below_its_last_provable_entry() -> (Vec<u8>, Vec<u8>, u64, u64) {
+        let mut torn = encoded_batch(1, 1);
+        torn[COMMAND_HEADER_SIZE..].fill(0);
+        let batch2 = encoded_batch(2, 1);
+        let mut log = encoded_batch(0, 1);
+        let damage_position = log.len() as u64;
+        log.extend_from_slice(&torn);
+        let survivor_position = log.len() as u64;
+        log.extend_from_slice(&batch2);
+        let mut index = index_entry(0, 0);
+        index.extend_from_slice(&index_entry(1, damage_position));
+        index.extend_from_slice(&index_entry(2, survivor_position));
+        index.extend_from_slice(&index_entry(3, log.len() as u64));
+        (log, index, damage_position, survivor_position)
+    }
+
+    #[compio::test]
+    async fn given_damage_below_the_highest_provable_index_entry_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        let (log, index, damage_position, survivor_position) =
+            segment_damaged_below_its_last_provable_entry();
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("damage below the highest provable entry must refuse, not be walked past");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::InteriorDamage {
+                        damage_position: at,
+                        survivor_position: past,
+                        ..
+                    },
+                    ..
+                } if *at == damage_position && *past == survivor_position
+            ),
+            "expected an interior-damage refusal naming the damaged chunk, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_damage_below_the_highest_provable_index_entry_under_fsync_when_recovering_should_refuse()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The gap between the index and the log is exactly one entry here, so
+        // the `enforce_fsync` guard reads this as the benign in-flight chunk
+        // and lets it through. That verdict is about the INDEX; the log is
+        // still walked from byte 0, which is what catches the damage.
+        let (log, index, damage_position, _) = segment_damaged_below_its_last_provable_entry();
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover_under_fsync(&config, true)
+            .await
+            .err()
+            .expect("a passing step-back depth must not stand in for reading the log");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::InteriorDamage {
+                        damage_position: at,
+                        ..
+                    },
+                    ..
+                } if *at == damage_position
+            ),
+            "expected an interior-damage refusal, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_an_offset_gap_below_the_highest_provable_index_entry_when_recovering_should_refuse()
+     {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // Nothing here is damaged: both batches verify. What is missing is
+        // offsets 1..4, and only a walk that starts at byte 0 can notice.
+        // An anchor on the entry for offset 5 takes that entry's own offset
+        // as the chain expectation, so the gap below it reads as continuous.
+        let mut log = encoded_batch(0, 1);
+        let gap_position = log.len() as u64;
+        log.extend_from_slice(&encoded_batch(5, 1));
+        let mut index = index_entry(0, 0);
+        index.extend_from_slice(&index_entry(5, gap_position));
+        index.extend_from_slice(&index_entry(6, log.len() as u64));
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover(&config)
+            .await
+            .err()
+            .expect("an offset gap below the highest provable entry must refuse");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::OffsetDiscontinuity {
+                        expected_offset: 1,
+                        found_offset: 5,
+                        position,
+                        ..
+                    },
+                    ..
+                } if *position == gap_position
+            ),
+            "expected an offset-discontinuity refusal at the gap, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
     #[compio::test]
     async fn given_no_provable_index_entry_when_recovering_should_rebuild_the_index_from_the_log() {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
-        // Every entry points past the log end, so the step-back exhausts the
-        // index without finding anything the log backs. The log is whole and
-        // describes itself, so the index is dropped and rebuilt from it.
+        // Every entry points past the log end, so nothing in the index backs
+        // the walk. The log is whole and describes itself, so the index is
+        // dropped and rebuilt from it.
         let log = encoded_batch(0, 2);
         let mut index = index_entry(0, log.len() as u64);
         index.extend_from_slice(&index_entry(2, log.len() as u64 + 64));
@@ -3537,15 +3699,15 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_two_unprovable_index_entries_when_recovering_should_floor_to_the_provable_prefix()
+    async fn given_two_unprovable_index_entries_when_recovering_should_rebuild_the_index_from_the_log()
      {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
         prepare_partition_dir(&config);
         // Two unprovable entries for two different reasons: one lands
-        // mid-batch inside the log, the next past its end. The floor must
-        // reach the highest entry the log proves, not stop at the first
-        // step back.
+        // mid-batch inside the log, the next past its end. Neither the depth
+        // of the gap nor the reason for it changes the verdict without
+        // `enforce_fsync`: the whole index goes and the log speaks for itself.
         let batch0 = encoded_batch(0, 1);
         let batch1 = encoded_batch(1, 1);
         let mut log = batch0.clone();
@@ -3558,20 +3720,149 @@ mod tests {
 
         let recovered = recover(&config)
             .await
-            .expect("a multi-entry index overshoot must floor to what the log proves");
+            .expect("a multi-entry index overshoot must rebuild from what the log proves");
 
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].segment.end_offset, 1);
         assert_eq!(
-            len_of(&index_path),
-            2 * SPARSE_INDEX_ENTRY_SIZE as u64,
-            "both unbacked entries must be gone, not just the last one"
+            bytes_of(&index_path),
+            index_entry(0, 0),
+            "every entry must come from the walk, not just the unbacked ones be dropped"
         );
         assert_eq!(bytes_of(&messages_path), log);
     }
 
     #[compio::test]
-    async fn given_index_anchor_on_batch_with_torn_body_when_recovering_should_truncate_it_and_floor_index()
+    async fn given_two_unprovable_index_entries_under_fsync_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The same fixture the lenient rebuild above accepts. Under
+        // `enforce_fsync` the second-from-last entry was durable before its
+        // chunk was acked, so a log that cannot back it lost acked bytes.
+        let batch0 = encoded_batch(0, 1);
+        let batch1 = encoded_batch(1, 1);
+        let mut log = batch0.clone();
+        log.extend_from_slice(&batch1);
+        let mut index = index_entry(0, 0);
+        index.extend_from_slice(&index_entry(1, batch0.len() as u64));
+        index.extend_from_slice(&index_entry(2, batch0.len() as u64 + 8));
+        index.extend_from_slice(&index_entry(3, log.len() as u64));
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover_under_fsync(&config, true)
+            .await
+            .err()
+            .expect("a multi-entry overshoot under enforce_fsync must refuse");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::FsyncedLogLoss {
+                        entry_count: 4,
+                        provable_entries: 2,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected an fsynced-log-loss refusal naming the step-back, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_one_unprovable_index_entry_under_fsync_when_recovering_should_rebuild_the_index()
+    {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The crash window `enforce_fsync` cannot close: the entry for the
+        // chunk still in flight reached disk, its log bytes did not, and no
+        // ack was ever sent for them. Exactly one entry deep, so it recovers.
+        let batch0 = encoded_batch(0, 1);
+        let batch1 = encoded_batch(1, 1);
+        let mut log = batch0.clone();
+        log.extend_from_slice(&batch1);
+        let mut index = index_entry(0, 0);
+        index.extend_from_slice(&index_entry(1, batch0.len() as u64));
+        index.extend_from_slice(&index_entry(2, log.len() as u64));
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let recovered = recover_under_fsync(&config, true)
+            .await
+            .expect("a one-entry overshoot is the crash window, not data loss");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.end_offset, 1);
+        assert_eq!(
+            bytes_of(&index_path),
+            index_entry(0, 0),
+            "the index must be rebuilt from the walk, not floored to the entry below"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+    }
+
+    #[compio::test]
+    async fn given_an_index_the_log_backs_nowhere_under_fsync_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The gap is measured the same way when no entry proves at all: two
+        // entries the log backs nowhere is one more than the in-flight chunk
+        // can explain, so the rebuild never runs.
+        let log = encoded_batch(0, 2);
+        let mut index = index_entry(0, log.len() as u64);
+        index.extend_from_slice(&index_entry(2, log.len() as u64 + 64));
+        let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
+
+        let error = recover_under_fsync(&config, true)
+            .await
+            .err()
+            .expect("an index backed nowhere under enforce_fsync must refuse, not rebuild");
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::FsyncedLogLoss {
+                        entry_count: 2,
+                        provable_entries: 0,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected an fsynced-log-loss refusal over the dropped index, got {error:?}"
+        );
+        assert_eq!(bytes_of(&messages_path), log);
+        assert_eq!(bytes_of(&index_path), index);
+    }
+
+    #[compio::test]
+    async fn given_a_lone_entry_over_an_empty_log_under_fsync_when_recovering_should_not_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // The first persist into a fresh segment, crashed between the two
+        // fsyncs: one entry, no log bytes, no ack ever sent. `enforce_fsync`
+        // must not turn the shape the PR exists for into a tombstone.
+        let index = index_entry(0, 0);
+        let (messages_path, index_path) = write_segment(&config, 0, &[], &index);
+
+        let recovered = recover_under_fsync(&config, true)
+            .await
+            .expect("one entry over an empty log is the crash window, not data loss");
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].segment.size, IggyByteSize::default());
+        assert_eq!((len_of(&messages_path), len_of(&index_path)), (0, 0));
+    }
+
+    #[compio::test]
+    async fn given_index_anchor_on_batch_with_torn_body_when_recovering_should_truncate_it_and_rebuild_index()
      {
         let tmp = tempdir().expect("tempdir");
         let config = test_config(&tmp);
@@ -3610,26 +3901,26 @@ mod tests {
             "the torn batch must be gone from disk"
         );
         assert_eq!(
-            len_of(&index_path),
-            2 * SPARSE_INDEX_ENTRY_SIZE as u64,
+            bytes_of(&index_path),
+            index_entry(0, 0),
             "the entry pointing at the torn batch must be gone from disk"
         );
         drop(recovered);
 
         let reopened = recover(&config)
             .await
-            .expect("re-recovering a floored segment must not refuse");
+            .expect("re-recovering a repaired segment must not refuse");
 
         assert_eq!(reopened[0].segment.end_offset, 1);
         assert_eq!(
             (len_of(&messages_path), len_of(&index_path)),
-            (torn_position, 2 * SPARSE_INDEX_ENTRY_SIZE as u64),
+            (torn_position, SPARSE_INDEX_ENTRY_SIZE as u64),
             "a second recovery must not move the files"
         );
     }
 
     #[compio::test]
-    async fn given_index_entries_packed_closer_than_their_batches_when_stepping_back_should_refuse_on_verify_budget()
+    async fn given_index_entries_packed_closer_than_their_batches_under_fsync_when_measuring_the_gap_should_refuse_on_verify_budget()
      {
         // A mis-strided index over a log of back-to-back headers, each
         // claiming a batch 8 KiB wide: every entry lands on a header that
@@ -3637,7 +3928,9 @@ mod tests {
         // costs a whole-batch verify that never passes. The claims overlap
         // many times over, so an unbudgeted search would hash close to
         // entries x claim bytes; it must give up and refuse instead, leaving
-        // the files byte-identical.
+        // the files byte-identical. Only `enforce_fsync` walks the index
+        // backward at all -- without it the gap is not measured, so there is
+        // nothing here to bound.
         const CLAIMED_BATCH_BYTES: usize = 8 * 1024;
         const ENTRIES: u64 = 64;
         let tmp = tempdir().expect("tempdir");
@@ -3656,10 +3949,10 @@ mod tests {
         log.resize(log.len() + CLAIMED_BATCH_BYTES, 0);
         let (messages_path, index_path) = write_segment(&config, 0, &log, &index);
 
-        let error = recover(&config)
+        let error = recover_under_fsync(&config, true)
             .await
             .err()
-            .expect("exhausting the verify budget while stepping back must refuse");
+            .expect("exhausting the verify budget while measuring the gap must refuse");
 
         assert!(
             matches!(
