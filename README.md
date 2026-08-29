@@ -391,7 +391,7 @@ producer.send(messages).await?;
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
     .auto_commit(AutoCommit::IntervalOrWhen(
-        IggyDuration::from_str("1s")?,
+        NonZeroIggyDuration::from_str("1s")?,
         AutoCommitWhen::ConsumingAllMessages,
     ))
     .create_consumer_group_if_not_exists()

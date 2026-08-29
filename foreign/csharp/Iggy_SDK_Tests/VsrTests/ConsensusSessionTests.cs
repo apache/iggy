@@ -215,4 +215,24 @@ public sealed class ConsensusSessionTests
         Assert.Equal(1UL, session.RequestCounter);
         Assert.NotEqual((UInt128)1, session.ClientId);
     }
+
+    [Fact]
+    public void Generation_AdvancesOnEveryReArmAndNotOnBind()
+    {
+        var session = new ConsensusSession(1);
+        var initialGeneration = session.Generation;
+
+        session.Resolve(VsrOperation.Register);
+        session.Bind(10);
+        Assert.Equal(initialGeneration, session.Generation);
+
+        session.Reset();
+        Assert.Equal(initialGeneration + 1, session.Generation);
+
+        // A register on a previously bound session re-arms the identity, which is a new generation too.
+        session.Resolve(VsrOperation.Register);
+        session.Bind(11);
+        session.Resolve(VsrOperation.Register);
+        Assert.Equal(initialGeneration + 2, session.Generation);
+    }
 }

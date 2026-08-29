@@ -39,7 +39,7 @@ mod stats_vsr;
 mod purge_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server suites below.
-mod http_client;
+pub(crate) mod http_client;
 // Raw-HTTP data-plane contract against the server's shard-0 listener.
 mod http_vsr;
 // Raw-HTTP wire-contract residue against the server (status codes + typed error

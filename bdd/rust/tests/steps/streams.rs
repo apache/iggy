@@ -18,6 +18,11 @@
 use crate::common::global_context::GlobalContext;
 use cucumber::{given, then, when};
 use iggy::prelude::{Identifier, StreamClient, StreamUpdateOptions};
+use std::time::Duration;
+use tokio::time::{Instant, sleep};
+
+const METADATA_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(2);
+const METADATA_CONVERGENCE_POLL: Duration = Duration::from_millis(10);
 
 #[given("I have no streams in the system")]
 pub async fn given_no_streams(world: &mut GlobalContext) {
@@ -123,11 +128,18 @@ pub async fn when_delete_stream_by_numeric_id(world: &mut GlobalContext) {
 
 #[then("getting the stream by its numeric ID should return no stream")]
 pub async fn then_get_stream_returns_no_stream(world: &mut GlobalContext) {
-    get_stream_by_numeric_id(world).await;
-    assert!(
-        world.last_stream_name.is_none(),
-        "Deleted stream should not be returned"
-    );
+    let deadline = Instant::now() + METADATA_CONVERGENCE_TIMEOUT;
+    loop {
+        get_stream_by_numeric_id(world).await;
+        if world.last_stream_name.is_none() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Deleted stream should not be returned after {METADATA_CONVERGENCE_TIMEOUT:?}"
+        );
+        sleep(METADATA_CONVERGENCE_POLL).await;
+    }
 }
 
 async fn create_stream(world: &mut GlobalContext, stream_name: &str) {

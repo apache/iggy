@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM gradle:9.6.1-jdk17
+FROM gradle:9.7.0-jdk17
 
 WORKDIR /workspace
 COPY . .
