@@ -376,8 +376,7 @@ void IggyBlockingClient::StoreConsumerOffset(const Consumer &consumer,
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
-        Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
-                                        std::string(consumer.KindName()), consumer.Id().ToFfi(), offset);
+        Handle()->store_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi(), offset);
     });
 }
 
@@ -392,7 +391,7 @@ ConsumerOffsetInfo IggyBlockingClient::GetConsumerOffset(const Consumer &consume
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
         return ConsumerOffsetInfo::FromFfi(Handle()->get_consumer_offset(
-            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, std::string(consumer.KindName()), consumer.Id().ToFfi()));
+            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi()));
     });
 }
 
@@ -406,8 +405,7 @@ void IggyBlockingClient::DeleteConsumerOffset(const Consumer &consumer,
             throw std::invalid_argument("partition_id cannot be the maximum std::uint32_t value");
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
-        Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id,
-                                         std::string(consumer.KindName()), consumer.Id().ToFfi());
+        Handle()->delete_consumer_offset(stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi());
     });
 }
 
@@ -471,8 +469,8 @@ PolledMessages IggyBlockingClient::PollMessages(const Identifier &stream,
         }
         const auto ffi_partition_id = partition_id.value_or(unspecified_partition_id);
         return PolledMessages::FromFfi(Handle()->poll_messages(
-            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, std::string(consumer.KindName()), consumer.Id().ToFfi(),
-            std::string(strategy.Kind()), strategy.Value(), count, auto_commit));
+            stream.ToFfi(), topic.ToFfi(), ffi_partition_id, consumer.ToFfi(), std::string(strategy.Kind()),
+            strategy.Value(), count, auto_commit));
     });
 }
 

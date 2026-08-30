@@ -1909,7 +1909,9 @@ TEST_F(E2E_Client, ConnectWithoutLoginThenDelete) {
 
 TEST_F(E2E_Client, DeleteWithoutDisconnect) {
     RecordProperty("description", "Allows deleting a connected and authenticated client without disconnecting first.");
-    { auto client = GetLoggedInHighLevelClient(); }
+    {
+        auto client = GetLoggedInHighLevelClient();
+    }
 }
 
 TEST_F(E2E_Client, RepeatedClientMethodCallsHaveStableBehavior) {

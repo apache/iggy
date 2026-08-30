@@ -792,10 +792,6 @@ class Consumer final {
         return consumer;
     }
 
-    [[nodiscard]] std::string_view KindName() const noexcept {
-        return kind_ == Kind::Single ? "consumer" : "consumer_group";
-    }
-
     friend class IggyBlockingClient;
 
     Kind kind_;
