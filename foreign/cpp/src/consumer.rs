@@ -18,6 +18,6 @@
 use iggy::prelude::IggyConsumer as RustIggyConsumer;
 
 #[allow(dead_code)]
-pub struct Consumer {
+pub struct IggyConsumer {
     pub inner: RustIggyConsumer,
 }

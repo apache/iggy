@@ -23,7 +23,7 @@ mod producer;
 mod type_conversion;
 
 use client::{Client, delete_connection as delete_client, from_connection_string, new_connection};
-use consumer::Consumer;
+use consumer::IggyConsumer;
 use messages::make_message;
 use producer::Producer;
 use std::sync::LazyLock;
@@ -430,7 +430,7 @@ mod ffi {
 
     extern "Rust" {
         type Client;
-        type Consumer;
+        type IggyConsumer;
         type Producer;
 
         // Client functions
@@ -657,18 +657,18 @@ mod ffi {
         fn set_string(self: &mut Identifier, id: String) -> Result<()>;
         fn set_numeric(self: &mut Identifier, id: u32) -> Result<()>;
 
-        // Consumer methods
-        // fn name(self: &Consumer) -> Result<String>;
-        // fn topic(self: &Consumer) -> Result<Identifier>;
-        // fn stream(self: &Consumer) -> Result<Identifier>;
-        // fn partition_id(self: &Consumer) -> u32;
-        // fn store_offset(self: &Consumer, offset: u64, partition_id: u32) -> Result<()>;
-        // fn delete_offset(self: &Consumer, partition_id: u32) -> Result<()>;
-        // fn get_last_consumed_offset(self: &Consumer, partition_id: u32) -> Result<u64>;
-        // fn get_last_stored_offset(self: &Consumer, partition_id: u32) -> Result<u64>;
-        // fn init(self: &mut Consumer) -> Result<()>;
-        // fn shutdown(self: &mut Consumer) -> Result<()>;
-        // unsafe fn delete_consumer(consumer: *mut Consumer) -> Result<()>;
+        // IggyConsumer methods
+        // fn name(self: &IggyConsumer) -> Result<String>;
+        // fn topic(self: &IggyConsumer) -> Result<Identifier>;
+        // fn stream(self: &IggyConsumer) -> Result<Identifier>;
+        // fn partition_id(self: &IggyConsumer) -> u32;
+        // fn store_offset(self: &IggyConsumer, offset: u64, partition_id: u32) -> Result<()>;
+        // fn delete_offset(self: &IggyConsumer, partition_id: u32) -> Result<()>;
+        // fn get_last_consumed_offset(self: &IggyConsumer, partition_id: u32) -> Result<u64>;
+        // fn get_last_stored_offset(self: &IggyConsumer, partition_id: u32) -> Result<u64>;
+        // fn init(self: &mut IggyConsumer) -> Result<()>;
+        // fn shutdown(self: &mut IggyConsumer) -> Result<()>;
+        // unsafe fn delete_consumer(consumer: *mut IggyConsumer) -> Result<()>;
 
         // Producer methods
         // fn stream(self: &Producer) -> Result<Identifier>;
