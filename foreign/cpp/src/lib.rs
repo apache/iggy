@@ -545,8 +545,7 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             offset: u64,
         ) -> Result<()>;
         fn get_consumer_offset(
@@ -554,26 +553,27 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
         ) -> Result<ConsumerOffsetInfo>;
         fn delete_consumer_offset(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
         ) -> Result<()>;
 
+        /// Polls messages as `consumer`. A `partition_id` of `u32::MAX` names no
+        /// partition: a consumer group then reads one of the partitions assigned
+        /// to the polling member, taking the next one on every call, and a
+        /// regular consumer reads partition 0.
         #[allow(clippy::too_many_arguments)]
         fn poll_messages(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             partition_id: u32,
-            consumer_kind: String,
-            consumer_id: Identifier,
+            consumer: Consumer,
             polling_strategy_kind: String,
             polling_strategy_value: u64,
             count: u32,
