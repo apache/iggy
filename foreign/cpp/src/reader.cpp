@@ -273,7 +273,7 @@ PolledMessages IggyBlockingClient::PollMessages(const Consumer &consumer,
                                                 const PollOptions &options) {
     return RethrowAsIggyException([&](ffi::ErrorInfo &error_info) {
         return PolledMessages(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id,
-                                                      std::string(consumer.KindName()), consumer.Id().ToFfi(),
+                                                      consumer.ToFfi(),
                                                       ToFfiStrategy(strategy), options.options_, error_info));
     });
 }
@@ -286,7 +286,7 @@ PolledMessages IggyBlockingClient::PollMessages(const Consumer &consumer,
                                                 const PollOptions &options) {
     return RethrowAsIggyException([&](ffi::ErrorInfo &error_info) {
         return PolledMessages(Handle()->poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id,
-                                                      std::string(consumer.KindName()), consumer.Id().ToFfi(),
+                                                      consumer.ToFfi(),
                                                       *continuation.inner_, options.options_, error_info));
     });
 }
@@ -296,8 +296,7 @@ PartitionReader IggyBlockingClient::Reader(const Consumer &consumer,
                                            const Identifier &topic,
                                            const ReaderOptions &options) {
     return RethrowAsIggyException([&](ffi::ErrorInfo &error_info) {
-        return PartitionReader(Handle()->reader(stream.ToFfi(), topic.ToFfi(), std::string(consumer.KindName()),
-                                                consumer.Id().ToFfi(), options.ToFfi(), error_info));
+        return PartitionReader(Handle()->reader(stream.ToFfi(), topic.ToFfi(), consumer.ToFfi(), options.ToFfi(), error_info));
     });
 }
 
@@ -309,7 +308,7 @@ PendingPoll IggyBlockingClient::StartPollMessages(const Consumer &consumer,
                                                   const PollOptions &options) {
     return RethrowAsIggyException([&] {
         return PendingPoll(Handle()->start_poll_messages(stream.ToFfi(), topic.ToFfi(), partition_id,
-                                                         std::string(consumer.KindName()), consumer.Id().ToFfi(),
+                                                         consumer.ToFfi(),
                                                          ToFfiStrategy(strategy), options.options_));
     });
 }
