@@ -35,11 +35,11 @@ const CLOSED: &str = "the consumer is closed";
 ///
 /// C++ can call it from several threads, so the calls run one at a time: a call waits for a
 /// running `next` to end, at most for its timeout.
-pub struct Consumer {
+pub struct IggyConsumer {
     inner: Mutex<Option<RustIggyConsumer>>,
 }
 
-impl Consumer {
+impl IggyConsumer {
     pub(crate) fn new(consumer: RustIggyConsumer) -> Self {
         Self {
             inner: Mutex::new(Some(consumer)),

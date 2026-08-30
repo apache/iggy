@@ -6743,11 +6743,11 @@ class IggyConsumer final {
     void Close();
 
   private:
-    explicit IggyConsumer(rust::Box<ffi::Consumer> consumer) : consumer_(std::move(consumer)) {}
+    explicit IggyConsumer(rust::Box<ffi::IggyConsumer> consumer) : consumer_(std::move(consumer)) {}
 
     friend class IggyBlockingClient;
 
-    rust::Box<ffi::Consumer> consumer_;
+    rust::Box<ffi::IggyConsumer> consumer_;
 };
 
 /**

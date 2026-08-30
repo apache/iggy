@@ -17,7 +17,7 @@
 
 use crate::{
     RUNTIME,
-    consumer::Consumer as ConsumerHandle,
+    consumer::IggyConsumer as ConsumerHandle,
     ffi,
     messages::{Checkpoint, Continuation},
     pending_poll::PendingPoll,
