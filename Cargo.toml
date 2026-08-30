@@ -36,6 +36,7 @@ members = [
     "core/connectors/sinks/clickhouse_sink",
     "core/connectors/sinks/delta_sink",
     "core/connectors/sinks/doris_sink",
+    "core/connectors/sinks/dynamodb_sink",
     "core/connectors/sinks/elasticsearch_sink",
     "core/connectors/sinks/http_sink",
     "core/connectors/sinks/iceberg_sink",
@@ -105,6 +106,8 @@ async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.91"
 async_zip = { version = "0.0.18", features = ["tokio", "lzma", "bzip2", "xz", "deflate", "zstd"] }
+aws-config = { version = "1.9.0", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = "1.117.0"
 axum = { version = "0.8.9", features = ["macros"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.22.1"

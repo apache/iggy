@@ -1,0 +1,732 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use async_trait::async_trait;
+use aws_config::BehaviorVersion;
+use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::config::{Credentials, Region};
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_dynamodb::primitives::Blob;
+use aws_sdk_dynamodb::types::{AttributeValue, PutRequest, WriteRequest};
+use iggy_connector_sdk::{
+    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+};
+use secrecy::{ExposeSecret, SecretString};
+use serde::Deserialize;
+use simd_json::{OwnedValue, StaticNode};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::{debug, error, info, warn};
+
+sink_connector!(DynamoDbSink);
+
+/// `BatchWriteItem` rejects any request carrying more than 25 write requests.
+const MAX_BATCH_WRITE_ITEMS: usize = 25;
+const PAYLOAD_FIELD: &str = "payload";
+const CREDENTIALS_PROVIDER_NAME: &str = "iggy-dynamodb-sink";
+
+#[derive(Debug)]
+pub struct DynamoDbSink {
+    pub id: u32,
+    client: Option<Client>,
+    config: DynamoDbSinkConfig,
+    batch_size: usize,
+    include_metadata: bool,
+    include_checksum: bool,
+    include_origin_timestamp: bool,
+    verbose: bool,
+    items_written: AtomicU64,
+    items_skipped: AtomicU64,
+    write_errors: AtomicU64,
+}
+
+/// Only `Deserialize` - nothing serializes a plugin config back out, and the
+/// missing impl is what keeps the credentials unserializable.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DynamoDbSinkConfig {
+    pub table: String,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub access_key_id: Option<SecretString>,
+    pub secret_access_key: Option<SecretString>,
+    pub session_token: Option<SecretString>,
+    pub batch_size: Option<u32>,
+    pub include_metadata: Option<bool>,
+    pub include_checksum: Option<bool>,
+    pub include_origin_timestamp: Option<bool>,
+    pub verbose_logging: Option<bool>,
+}
+
+impl DynamoDbSink {
+    pub fn new(id: u32, config: DynamoDbSinkConfig) -> Self {
+        let batch_size = config
+            .batch_size
+            .unwrap_or(MAX_BATCH_WRITE_ITEMS as u32)
+            .clamp(1, MAX_BATCH_WRITE_ITEMS as u32) as usize;
+        let include_metadata = config.include_metadata.unwrap_or(true);
+        let include_checksum = config.include_checksum.unwrap_or(true);
+        let include_origin_timestamp = config.include_origin_timestamp.unwrap_or(true);
+        let verbose = config.verbose_logging.unwrap_or(false);
+
+        DynamoDbSink {
+            id,
+            client: None,
+            config,
+            batch_size,
+            include_metadata,
+            include_checksum,
+            include_origin_timestamp,
+            verbose,
+            items_written: AtomicU64::new(0),
+            items_skipped: AtomicU64::new(0),
+            write_errors: AtomicU64::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Sink for DynamoDbSink {
+    async fn open(&mut self) -> Result<(), Error> {
+        info!(
+            "Opening DynamoDB sink connector with ID: {}, table: {}",
+            self.id, self.config.table
+        );
+        let client = self.build_client().await?;
+        client
+            .describe_table()
+            .table_name(&self.config.table)
+            .send()
+            .await
+            .map_err(|error| {
+                Error::InitError(format!(
+                    "DynamoDB table '{}' is not reachable, error: {}",
+                    self.config.table,
+                    describe_sdk_error(&error)
+                ))
+            })?;
+
+        self.client = Some(client);
+        info!(
+            "Opened DynamoDB sink connector with ID: {}, table: {}",
+            self.id, self.config.table
+        );
+        Ok(())
+    }
+
+    async fn consume(
+        &self,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: MessagesMetadata,
+        messages: Vec<ConsumedMessage>,
+    ) -> Result<(), Error> {
+        self.write_messages(topic_metadata, &messages_metadata, messages)
+            .await
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        info!("Closing DynamoDB sink connector with ID: {}", self.id);
+        self.client.take();
+        info!(
+            "Closed DynamoDB sink connector with ID: {}, written: {}, skipped: {}, errors: {}",
+            self.id,
+            self.items_written.load(Ordering::Relaxed),
+            self.items_skipped.load(Ordering::Relaxed),
+            self.write_errors.load(Ordering::Relaxed)
+        );
+        Ok(())
+    }
+}
+
+impl DynamoDbSink {
+    async fn build_client(&self) -> Result<Client, Error> {
+        if self.config.access_key_id.is_some() != self.config.secret_access_key.is_some() {
+            return Err(Error::InvalidConfigValue(
+                "Partially configured credentials. You must provide both access_key_id \
+                 and secret_access_key, or omit both."
+                    .to_owned(),
+            ));
+        }
+
+        let mut loader = aws_config::defaults(BehaviorVersion::latest());
+        if let Some(region) = &self.config.region {
+            loader = loader.region(Region::new(region.clone()));
+        }
+        if let Some(endpoint) = &self.config.endpoint {
+            info!("Using custom DynamoDB endpoint: {endpoint}");
+            loader = loader.endpoint_url(endpoint);
+        }
+        if let (Some(access_key_id), Some(secret_access_key)) =
+            (&self.config.access_key_id, &self.config.secret_access_key)
+        {
+            info!(
+                "Using explicit DynamoDB credentials for sink ID: {}",
+                self.id
+            );
+            loader = loader.credentials_provider(Credentials::new(
+                access_key_id.expose_secret(),
+                secret_access_key.expose_secret(),
+                self.config
+                    .session_token
+                    .as_ref()
+                    .map(|token| token.expose_secret().to_owned()),
+                None,
+                CREDENTIALS_PROVIDER_NAME,
+            ));
+        } else {
+            info!(
+                "No explicit credentials provided, using the default AWS credential chain for sink ID: {}",
+                self.id
+            );
+        }
+
+        Ok(Client::new(&loader.load().await))
+    }
+
+    async fn write_messages(
+        &self,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        mut messages: Vec<ConsumedMessage>,
+    ) -> Result<(), Error> {
+        let client = self.get_client()?;
+        let mut items = Vec::with_capacity(messages.len());
+        let mut skipped = 0u64;
+
+        for message in messages.iter_mut() {
+            match self.build_item(topic_metadata, messages_metadata, message) {
+                Ok(item) => items.push(item),
+                Err(reason) => {
+                    skipped += 1;
+                    warn!(
+                        "DynamoDB sink ID: {} skipped message at offset: {}, reason: {reason}",
+                        self.id, message.offset
+                    );
+                }
+            }
+        }
+
+        if skipped > 0 {
+            self.items_skipped.fetch_add(skipped, Ordering::Relaxed);
+        }
+
+        let mut written = 0u64;
+        let mut last_error: Option<Error> = None;
+        while !items.is_empty() {
+            let chunk_size = self.batch_size.min(items.len());
+            let chunk = items.drain(..chunk_size).collect::<Vec<_>>();
+            match self.write_chunk(client, chunk).await {
+                Ok(count) => written += count,
+                Err(error) => {
+                    self.write_errors
+                        .fetch_add(chunk_size as u64, Ordering::Relaxed);
+                    error!(
+                        "DynamoDB sink ID: {} failed to write {chunk_size} items to table: {}, error: {error}",
+                        self.id, self.config.table
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        self.items_written.fetch_add(written, Ordering::Relaxed);
+
+        let table = &self.config.table;
+        if self.verbose {
+            info!(
+                "DynamoDB sink ID: {} wrote {written} items to table: {table}, current_offset: {}",
+                self.id, messages_metadata.current_offset
+            );
+        } else {
+            debug!(
+                "DynamoDB sink ID: {} wrote {written} items to table: {table}, current_offset: {}",
+                self.id, messages_metadata.current_offset
+            );
+        }
+
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// One `BatchWriteItem` round, retrying both throttled requests and the
+    /// `UnprocessedItems` the API returns inside an otherwise successful
+    /// response.
+    async fn write_chunk(
+        &self,
+        client: &Client,
+        items: Vec<HashMap<String, AttributeValue>>,
+    ) -> Result<u64, Error> {
+        let total = items.len() as u64;
+        let mut pending = Vec::with_capacity(items.len());
+        for item in items {
+            let put_request =
+                PutRequest::builder()
+                    .set_item(Some(item))
+                    .build()
+                    .map_err(|error| {
+                        Error::InvalidRecordValue(format!(
+                            "Cannot build DynamoDB put request: {error}"
+                        ))
+                    })?;
+            pending.push(WriteRequest::builder().put_request(put_request).build());
+        }
+
+        let output = client
+            .batch_write_item()
+            .request_items(&self.config.table, pending)
+            .send()
+            .await
+            .map_err(|error| {
+                Error::CannotStoreData(format!(
+                    "DynamoDB batch write to table '{}' failed, error: {}",
+                    self.config.table,
+                    describe_sdk_error(&error)
+                ))
+            })?;
+
+        let unprocessed = output
+            .unprocessed_items
+            .and_then(|mut tables| tables.remove(&self.config.table))
+            .unwrap_or_default();
+        if !unprocessed.is_empty() {
+            return Err(Error::CannotStoreData(format!(
+                "DynamoDB left {} of {total} items unprocessed in table '{}'",
+                unprocessed.len(),
+                self.config.table
+            )));
+        }
+
+        Ok(total)
+    }
+
+    fn build_item(
+        &self,
+        topic_metadata: &TopicMetadata,
+        messages_metadata: &MessagesMetadata,
+        message: &mut ConsumedMessage,
+    ) -> Result<HashMap<String, AttributeValue>, Error> {
+        // The payload is moved out to build the item without copying it, so
+        // only the message metadata is read afterwards.
+        let payload = std::mem::replace(&mut message.payload, Payload::Raw(Vec::new()));
+        let mut item = payload_into_item(payload)?;
+
+        if self.include_metadata {
+            item.insert(
+                "iggy_stream".to_owned(),
+                AttributeValue::S(topic_metadata.stream.clone()),
+            );
+            item.insert(
+                "iggy_topic".to_owned(),
+                AttributeValue::S(topic_metadata.topic.clone()),
+            );
+            item.insert(
+                "iggy_partition_id".to_owned(),
+                AttributeValue::N(messages_metadata.partition_id.to_string()),
+            );
+            item.insert(
+                "iggy_offset".to_owned(),
+                AttributeValue::N(message.offset.to_string()),
+            );
+            item.insert(
+                "iggy_timestamp".to_owned(),
+                AttributeValue::N(message.timestamp.to_string()),
+            );
+        }
+        if self.include_checksum {
+            item.insert(
+                "iggy_checksum".to_owned(),
+                AttributeValue::N(message.checksum.to_string()),
+            );
+        }
+        if self.include_origin_timestamp {
+            item.insert(
+                "iggy_origin_timestamp".to_owned(),
+                AttributeValue::N(message.origin_timestamp.to_string()),
+            );
+        }
+
+        Ok(item)
+    }
+
+    fn get_client(&self) -> Result<&Client, Error> {
+        self.client
+            .as_ref()
+            .ok_or_else(|| Error::InitError("DynamoDB client is not connected".to_owned()))
+    }
+}
+
+/// DynamoDB items are attribute maps, so anything that is not a JSON object
+/// is nested under a single payload attribute.
+fn payload_into_item(payload: Payload) -> Result<HashMap<String, AttributeValue>, Error> {
+    match payload {
+        Payload::Json(value) => Ok(match json_into_attribute_value(value) {
+            AttributeValue::M(item) => item,
+            other => HashMap::from([(PAYLOAD_FIELD.to_owned(), other)]),
+        }),
+        Payload::Text(text) => Ok(HashMap::from([(
+            PAYLOAD_FIELD.to_owned(),
+            AttributeValue::S(text),
+        )])),
+        Payload::Raw(bytes) => {
+            // simd-json unescapes in place, so a failed parse leaves the
+            // buffer rewritten and only the copy can be thrown away.
+            let mut buffer = bytes.clone();
+            let attribute = match simd_json::to_owned_value(&mut buffer) {
+                Ok(value) => json_into_attribute_value(value),
+                Err(_) => AttributeValue::B(Blob::new(bytes)),
+            };
+            Ok(match attribute {
+                AttributeValue::M(item) => item,
+                other => HashMap::from([(PAYLOAD_FIELD.to_owned(), other)]),
+            })
+        }
+        Payload::Proto(_) | Payload::FlatBuffer(_) | Payload::Avro(_) => {
+            Err(Error::InvalidPayloadType)
+        }
+    }
+}
+
+fn json_into_attribute_value(value: OwnedValue) -> AttributeValue {
+    match value {
+        OwnedValue::Static(StaticNode::Null) => AttributeValue::Null(true),
+        OwnedValue::Static(StaticNode::Bool(value)) => AttributeValue::Bool(value),
+        OwnedValue::Static(StaticNode::I64(value)) => AttributeValue::N(value.to_string()),
+        OwnedValue::Static(StaticNode::U64(value)) => AttributeValue::N(value.to_string()),
+        // DynamoDB numbers have no NaN or infinity, so those become null
+        // instead of a value the API would reject.
+        OwnedValue::Static(StaticNode::F64(value)) => {
+            if value.is_finite() {
+                AttributeValue::N(value.to_string())
+            } else {
+                AttributeValue::Null(true)
+            }
+        }
+        OwnedValue::String(value) => AttributeValue::S(value),
+        OwnedValue::Array(values) => AttributeValue::L(
+            values
+                .into_iter()
+                .map(json_into_attribute_value)
+                .collect::<Vec<_>>(),
+        ),
+        OwnedValue::Object(values) => AttributeValue::M(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, json_into_attribute_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn describe_sdk_error<E, R>(error: &SdkError<E, R>) -> String
+where
+    E: ProvideErrorMetadata,
+{
+    match error.code() {
+        Some(code) => format!("{code}: {}", error.message().unwrap_or("no message")),
+        None => error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_connector_sdk::Schema;
+
+    fn given_default_config() -> DynamoDbSinkConfig {
+        DynamoDbSinkConfig {
+            table: "iggy_messages".to_owned(),
+            region: Some("us-east-1".to_owned()),
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            batch_size: None,
+            include_metadata: None,
+            include_checksum: None,
+            include_origin_timestamp: None,
+            verbose_logging: None,
+        }
+    }
+
+    fn given_topic_metadata() -> TopicMetadata {
+        TopicMetadata {
+            stream: "test_stream".to_owned(),
+            topic: "test_topic".to_owned(),
+        }
+    }
+
+    fn given_messages_metadata() -> MessagesMetadata {
+        MessagesMetadata {
+            partition_id: 1,
+            current_offset: 10,
+            schema: Schema::Json,
+        }
+    }
+
+    fn given_message(payload: Payload) -> ConsumedMessage {
+        ConsumedMessage {
+            id: 42,
+            offset: 7,
+            checksum: 99,
+            timestamp: 1_700_000_000,
+            origin_timestamp: 1_600_000_000,
+            headers: None,
+            payload,
+        }
+    }
+
+    fn given_json_payload(raw: &str) -> Payload {
+        let mut bytes = raw.as_bytes().to_vec();
+        Payload::Json(simd_json::to_owned_value(&mut bytes).expect("parse JSON"))
+    }
+
+    #[test]
+    fn given_no_batch_size_when_created_should_use_dynamodb_limit() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        assert_eq!(sink.batch_size, MAX_BATCH_WRITE_ITEMS);
+    }
+
+    #[test]
+    fn given_oversized_batch_size_when_created_should_clamp_to_dynamodb_limit() {
+        let mut config = given_default_config();
+        config.batch_size = Some(500);
+        let sink = DynamoDbSink::new(1, config);
+        assert_eq!(sink.batch_size, MAX_BATCH_WRITE_ITEMS);
+    }
+
+    #[test]
+    fn given_zero_batch_size_when_created_should_use_single_item_batches() {
+        let mut config = given_default_config();
+        config.batch_size = Some(0);
+        let sink = DynamoDbSink::new(1, config);
+        assert_eq!(sink.batch_size, 1);
+    }
+
+    #[test]
+    fn given_json_object_payload_when_built_should_map_attributes() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(given_json_payload(
+            r#"{"name":"first","count":3,"ratio":1.5,"active":true,"tags":["a","b"],"nested":{"key":"value"},"missing":null}"#,
+        ));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(item["name"], AttributeValue::S("first".to_owned()));
+        assert_eq!(item["count"], AttributeValue::N("3".to_owned()));
+        assert_eq!(item["ratio"], AttributeValue::N("1.5".to_owned()));
+        assert_eq!(item["active"], AttributeValue::Bool(true));
+        assert_eq!(item["missing"], AttributeValue::Null(true));
+        assert_eq!(
+            item["tags"],
+            AttributeValue::L(vec![
+                AttributeValue::S("a".to_owned()),
+                AttributeValue::S("b".to_owned())
+            ])
+        );
+        assert_eq!(
+            item["nested"],
+            AttributeValue::M(HashMap::from([(
+                "key".to_owned(),
+                AttributeValue::S("value".to_owned())
+            )]))
+        );
+    }
+
+    #[test]
+    fn given_json_object_payload_when_built_should_add_metadata_attributes() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(given_json_payload(r#"{"name":"first"}"#));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(
+            item["iggy_stream"],
+            AttributeValue::S("test_stream".to_owned())
+        );
+        assert_eq!(
+            item["iggy_topic"],
+            AttributeValue::S("test_topic".to_owned())
+        );
+        assert_eq!(item["iggy_partition_id"], AttributeValue::N("1".to_owned()));
+        assert_eq!(item["iggy_offset"], AttributeValue::N("7".to_owned()));
+        assert_eq!(item["iggy_checksum"], AttributeValue::N("99".to_owned()));
+        assert_eq!(
+            item["iggy_origin_timestamp"],
+            AttributeValue::N("1600000000".to_owned())
+        );
+    }
+
+    #[test]
+    fn given_disabled_metadata_when_built_should_only_keep_payload_and_key() {
+        let mut config = given_default_config();
+        config.include_metadata = Some(false);
+        config.include_checksum = Some(false);
+        config.include_origin_timestamp = Some(false);
+        let sink = DynamoDbSink::new(1, config);
+        let mut message = given_message(given_json_payload(r#"{"name":"first"}"#));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(item.len(), 1);
+        assert!(item.contains_key("name"));
+    }
+
+    #[test]
+    fn given_unsupported_schema_payload_when_built_should_skip_message() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(Payload::Avro(vec![1, 2, 3]));
+
+        let result = sink.build_item(
+            &given_topic_metadata(),
+            &given_messages_metadata(),
+            &mut message,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_text_payload_when_built_should_store_payload_attribute() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(Payload::Text("hello".to_owned()));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(item[PAYLOAD_FIELD], AttributeValue::S("hello".to_owned()));
+    }
+
+    #[test]
+    fn given_raw_json_payload_when_built_should_map_attributes() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(Payload::Raw(br#"{"name":"first"}"#.to_vec()));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(item["name"], AttributeValue::S("first".to_owned()));
+    }
+
+    #[test]
+    fn given_raw_binary_payload_when_built_should_store_binary_attribute() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(Payload::Raw(vec![0xff, 0xfe, 0xfd]));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(
+            item[PAYLOAD_FIELD],
+            AttributeValue::B(Blob::new(vec![0xff, 0xfe, 0xfd]))
+        );
+    }
+
+    #[test]
+    fn given_json_array_payload_when_built_should_nest_under_payload_attribute() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(given_json_payload(r#"[1,2]"#));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(
+            item[PAYLOAD_FIELD],
+            AttributeValue::L(vec![
+                AttributeValue::N("1".to_owned()),
+                AttributeValue::N("2".to_owned())
+            ])
+        );
+    }
+
+    #[test]
+    fn given_non_finite_json_number_when_converted_should_become_null() {
+        let value = OwnedValue::Static(StaticNode::F64(f64::NAN));
+        assert_eq!(json_into_attribute_value(value), AttributeValue::Null(true));
+    }
+
+    #[tokio::test]
+    async fn given_no_client_when_messages_consumed_should_return_error() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let messages = vec![given_message(given_json_payload(r#"{"name":"first"}"#))];
+
+        let result = sink
+            .write_messages(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                messages,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(sink.items_written.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn given_raw_payload_that_is_not_json_when_built_should_store_the_original_bytes() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let raw = br#"{"a":"x\ny"} trailing"#.to_vec();
+        let mut message = given_message(Payload::Raw(raw.clone()));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(item[PAYLOAD_FIELD], AttributeValue::B(Blob::new(raw)));
+    }
+}
