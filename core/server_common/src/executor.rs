@@ -84,7 +84,7 @@ pub fn create_shard_executor() -> Result<Runtime, std::io::Error> {
     // io_uring targets keep the zero limit: no blocking pool exists on shard
     // threads, which `core/partitions` messages_writer relies on to justify
     // running fallocate inline (`spawn_blocking` would hit that same panic).
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[cfg(not(target_os = "macos"))]
     proactor.thread_pool_limit(0);
 
     compio::runtime::RuntimeBuilder::new()
