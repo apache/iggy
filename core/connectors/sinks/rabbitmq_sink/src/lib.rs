@@ -24,7 +24,7 @@ use iggy_connector_sdk::{
 use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
     options::{ConfirmSelectOptions, ExchangeDeclareOptions},
-    publisher_confirm::Confirmation,
+    publisher_confirm::{Confirmation, PublisherConfirm},
     types::{AMQPValue, ByteArray, FieldTable, ShortString},
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 sink_connector!(RabbitMQSink);
@@ -53,6 +54,7 @@ pub struct RabbitMQSink {
     verbose: bool,
     durable_exchange: bool,
     delivery_mode: u8,
+    timeout: Duration,
     state: Mutex<Option<RabbitMqState>>,
     reconnecting: AtomicBool,
     max_retries: u32,
@@ -89,6 +91,8 @@ pub struct RabbitMQSinkConfig {
     durable_exchange: Option<bool>,
     #[serde(default = "default_delivery_mode")]
     delivery_mode: Option<String>,
+    #[serde(default = "default_timeout_secs")]
+    timeout_secs: Option<u64>,
 }
 
 fn default_exchange_type() -> Option<String> {
@@ -101,6 +105,10 @@ fn default_amqp_url() -> SecretString {
 
 fn default_delivery_mode() -> Option<String> {
     Some("persistent".into())
+}
+
+fn default_timeout_secs() -> Option<u64> {
+    Some(30)
 }
 
 fn default_true() -> Option<bool> {
@@ -140,6 +148,7 @@ impl RabbitMQSink {
             verbose: config.verbose_logging.unwrap_or(false),
             durable_exchange: config.durable_exchange.unwrap_or(true),
             delivery_mode,
+            timeout: Duration::from_secs(config.timeout_secs.unwrap_or(30)),
             state: Mutex::new(None),
             reconnecting: AtomicBool::new(false),
             max_retries: config.max_retries.unwrap_or(3),
@@ -174,23 +183,38 @@ impl RabbitMQSink {
         loop {
             let channel = {
                 let guard = self.state.lock().await;
-                guard
-                    .as_ref()
-                    .map(|s| s.channel.clone())
-                    .ok_or_else(|| Error::Connection("RabbitMQ not connected".into()))?
+                match guard.as_ref() {
+                    Some(state) => state.channel.clone(),
+                    None => {
+                        drop(guard);
+                        self.reconnect().await?;
+                        self.state
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|s| s.channel.clone())
+                            .ok_or_else(|| Error::Connection("RabbitMQ not connected".into()))?
+                    }
+                }
             };
 
             let mut last_error: Option<Error> = None;
+            let mut last_retryable = false;
+            let mut in_flight: Vec<(PublisherConfirm, u64)> =
+                Vec::with_capacity(messages.len() - confirmed);
             for message in &messages[confirmed..] {
                 let body = message.payload.try_to_bytes()?;
-                let mut props = BasicProperties::default().with_delivery_mode(self.delivery_mode);
+                let mut props = BasicProperties::default()
+                    .with_delivery_mode(self.delivery_mode)
+                    .with_message_id(ShortString::from(message.offset.to_string()));
                 let headers = self.build_headers(topic_metadata, messages_metadata, message);
                 if !headers.inner().is_empty() {
                     props = props.with_headers(headers);
                 }
 
-                let confirm = match channel
-                    .basic_publish(
+                let confirm = match timeout(
+                    self.timeout,
+                    channel.basic_publish(
                         &self.exchange,
                         &self.routing_key,
                         lapin::options::BasicPublishOptions {
@@ -199,31 +223,64 @@ impl RabbitMQSink {
                         },
                         &body,
                         props,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
-                    Ok(confirm) => confirm,
-                    Err(e) => {
+                    Ok(Ok(confirm)) => confirm,
+                    Ok(Err(e)) => {
                         last_error = Some(Error::CannotStoreData(e.to_string()));
+                        last_retryable = is_lapin_error_retryable(&e);
+                        self.clear_state().await;
+                        break;
+                    }
+                    Err(_) => {
+                        last_error = Some(Error::CannotStoreData("publish timed out".into()));
+                        last_retryable = true;
                         break;
                     }
                 };
-                match confirm.await {
-                    Ok(Confirmation::Ack(None)) => confirmed += 1,
-                    Ok(Confirmation::Ack(Some(_))) | Ok(Confirmation::Nack(_)) => {
-                        last_error = Some(Error::InvalidRecordValue(
-                            "message returned as unroutable by RabbitMQ".into(),
-                        ));
+                in_flight.push((confirm, message.offset));
+            }
+
+            // Confirms resolve in publish order over already-overlapped RTTs; returns are
+            // matched by message_id (lapin's Return-to-confirm FIFO has no delivery tag), so a
+            // post-publish failure re-publishes the already-delivered tail (at-least-once in batch).
+            for (confirm, offset) in in_flight {
+                match timeout(self.timeout, confirm).await {
+                    Ok(Ok(Confirmation::Ack(None))) => confirmed += 1,
+                    Ok(Ok(Confirmation::Ack(Some(returned)))) => {
+                        let returned_id = returned.delivery.properties.message_id();
+                        last_error = Some(Error::InvalidRecordValue(format!(
+                            "message offset {offset} (id {returned_id:?}) returned as unroutable by RabbitMQ"
+                        )));
+                        last_retryable = false;
                         break;
                     }
-                    Ok(Confirmation::NotRequested) => {
+                    Ok(Ok(Confirmation::Nack(_))) => {
+                        last_error =
+                            Some(Error::CannotStoreData("message nack'd by RabbitMQ".into()));
+                        last_retryable = true;
+                        break;
+                    }
+                    Ok(Ok(Confirmation::NotRequested)) => {
                         last_error = Some(Error::CannotStoreData(
                             "publisher confirms not enabled".into(),
                         ));
+                        last_retryable = false;
                         break;
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         last_error = Some(Error::CannotStoreData(format!("publish rejected: {e}")));
+                        last_retryable = is_lapin_error_retryable(&e);
+                        self.clear_state().await;
+                        break;
+                    }
+                    Err(_) => {
+                        last_error = Some(Error::CannotStoreData(
+                            "publisher confirmation timed out".into(),
+                        ));
+                        last_retryable = true;
                         break;
                     }
                 }
@@ -236,7 +293,7 @@ impl RabbitMQSink {
             let error = last_error.unwrap();
             attempts += 1;
 
-            if !is_publish_retryable(&error) || attempts >= self.max_retries {
+            if !last_retryable || attempts >= self.max_retries {
                 self.publish_errors
                     .fetch_add((messages.len() - confirmed) as u64, Ordering::Relaxed);
                 return Err(Error::CannotStoreData(format!(
@@ -266,6 +323,10 @@ impl RabbitMQSink {
             );
             tokio::time::sleep(delay).await;
         }
+    }
+
+    async fn clear_state(&self) {
+        *self.state.lock().await = None;
     }
 
     fn build_headers(
@@ -320,11 +381,15 @@ impl RabbitMQSink {
 
         warn!("Reconnecting RabbitMQ sink ID: {}", self.id);
         let result = async {
-            let conn = Connection::connect(
-                self.amqp_url.expose_secret(),
-                ConnectionProperties::default(),
+            let conn = timeout(
+                self.timeout,
+                Connection::connect(
+                    self.amqp_url.expose_secret(),
+                    ConnectionProperties::default(),
+                ),
             )
             .await
+            .map_err(|_| Error::Connection("connection timed out".into()))?
             .map_err(|e| Error::Connection(e.to_string()))?;
             let channel = conn
                 .create_channel()
@@ -363,11 +428,15 @@ impl RabbitMQSink {
 impl Sink for RabbitMQSink {
     async fn open(&mut self) -> Result<(), Error> {
         let exchange_kind = self.exchange_kind()?;
-        let conn = Connection::connect(
-            self.amqp_url.expose_secret(),
-            ConnectionProperties::default(),
+        let conn = timeout(
+            self.timeout,
+            Connection::connect(
+                self.amqp_url.expose_secret(),
+                ConnectionProperties::default(),
+            ),
         )
         .await
+        .map_err(|_| Error::Connection("connection timed out".into()))?
         .map_err(|e| Error::Connection(e.to_string()))?;
         let channel = conn
             .create_channel()
@@ -451,14 +520,16 @@ impl Sink for RabbitMQSink {
     }
 }
 
-fn is_publish_retryable(error: &Error) -> bool {
-    let msg = error.to_string().to_lowercase();
-    msg.contains("connection")
-        || msg.contains("timeout")
-        || msg.contains("broken pipe")
-        || msg.contains("reset by peer")
-        || msg.contains("resource locked")
-        || msg.contains("channel closed")
+fn is_lapin_error_retryable(error: &lapin::Error) -> bool {
+    match error {
+        lapin::Error::InvalidChannelState(_)
+        | lapin::Error::InvalidConnectionState(_)
+        | lapin::Error::IOError(_)
+        | lapin::Error::MissingHeartbeatError => true,
+        // AMQP soft channel errors: 405 RESOURCE_LOCKED, 320 CONNECTION_FORCED.
+        lapin::Error::ProtocolError(amqp_error) => matches!(amqp_error.get_id(), 320 | 405),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +552,7 @@ mod tests {
             max_retry_delay_secs: Some(5),
             durable_exchange: None,
             delivery_mode: None,
+            timeout_secs: None,
         }
     }
 
@@ -593,29 +665,82 @@ mod tests {
     }
 
     #[test]
-    fn given_transient_error_when_is_publish_retryable_should_return_true() {
-        for message in [
-            "connection refused",
-            "operation timeout",
-            "broken pipe",
-            "connection reset by peer",
-            "resource locked",
-            "channel closed",
-        ] {
+    fn given_transient_lapin_error_when_is_lapin_error_retryable_should_return_true() {
+        let errors = [
+            lapin::Error::InvalidChannelState(lapin::ChannelState::Closed),
+            lapin::Error::InvalidConnectionState(lapin::ConnectionState::Error),
+            lapin::Error::IOError(std::sync::Arc::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset by peer",
+            ))),
+            lapin::Error::MissingHeartbeatError,
+            lapin::Error::ProtocolError(lapin::protocol::AMQPError::new(
+                lapin::protocol::AMQPErrorKind::Soft(
+                    lapin::protocol::AMQPSoftError::RESOURCELOCKED,
+                ),
+                "RESOURCE_LOCKED".into(),
+            )),
+        ];
+        for error in errors {
             assert!(
-                is_publish_retryable(&Error::CannotStoreData(message.into())),
-                "expected {message:?} to be retryable"
+                is_lapin_error_retryable(&error),
+                "expected {error:?} to be retryable"
             );
         }
     }
 
     #[test]
-    fn given_permanent_error_when_is_publish_retryable_should_return_false() {
-        assert!(!is_publish_retryable(&Error::CannotStoreData(
-            "PRECONDITION_FAILED".into()
-        )));
-        assert!(!is_publish_retryable(&Error::InvalidRecordValue(
-            "message returned as unroutable by RabbitMQ".into()
-        )));
+    fn given_permanent_lapin_error_when_is_lapin_error_retryable_should_return_false() {
+        let errors = [
+            lapin::Error::ProtocolError(lapin::protocol::AMQPError::new(
+                lapin::protocol::AMQPErrorKind::Soft(
+                    lapin::protocol::AMQPSoftError::PRECONDITIONFAILED,
+                ),
+                "PRECONDITION_FAILED".into(),
+            )),
+            lapin::Error::InvalidChannel(0),
+        ];
+        for error in errors {
+            assert!(
+                !is_lapin_error_retryable(&error),
+                "expected {error:?} to be permanent"
+            );
+        }
+    }
+
+    #[test]
+    fn given_timeout_secs_when_new_should_set_timeout() {
+        let mut config = test_config();
+        config.timeout_secs = Some(7);
+        let sink = test_sink(config);
+        assert_eq!(sink.timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn given_minimal_config_when_deserialized_should_apply_defaults() {
+        let config: RabbitMQSinkConfig = serde_json::from_str("{}").unwrap();
+        let sink = RabbitMQSink::new(1, config);
+        assert_eq!(
+            sink.amqp_url.expose_secret(),
+            "amqp://guest:guest@localhost:5672"
+        );
+        assert_eq!(sink.exchange, "iggy_events");
+        assert_eq!(sink.exchange_type, "topic");
+        assert_eq!(sink.routing_key, "iggy.messages");
+        assert!(sink.include_metadata);
+        assert!(sink.durable_exchange);
+        assert_eq!(sink.delivery_mode, 2);
+        assert_eq!(sink.max_retries, 3);
+        assert_eq!(sink.retry_delay, Duration::from_secs(1));
+        assert_eq!(sink.max_retry_delay, Duration::from_secs(5));
+        assert_eq!(sink.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn given_unknown_delivery_mode_when_new_should_default_to_persistent() {
+        let mut config = test_config();
+        config.delivery_mode = Some("fancy".into());
+        let sink = test_sink(config);
+        assert_eq!(sink.delivery_mode, 2);
     }
 }

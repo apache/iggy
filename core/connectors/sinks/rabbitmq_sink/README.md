@@ -17,10 +17,19 @@ The RabbitMQ sink connector publishes messages from Iggy streams to RabbitMQ exc
 | `max_retries` | u32 | `3` | Maximum transient publish retries before failing the batch. |
 | `retry_delay_secs` | u64 | `1` | Base retry delay in seconds. |
 | `max_retry_delay_secs` | u64 | `5` | Upper bound for exponential backoff. |
+| `timeout_secs` | u64 | `30` | Timeout for connection, publish, and publisher-confirmation operations. |
 
 User headers on consumed Iggy messages are forwarded as AMQP headers: string values become AMQP `LongString`, raw binary values become `ByteArray`. This allows routing through a `headers` exchange on original user headers.
 
-Publishes are confirmed via `ConfirmSelect`. With `mandatory = true`, a message with a routing key that matches no binding is returned by RabbitMQ and the batch fails with a permanent error (delivery is at-least-once: if the connection drops mid-batch, the sink resumes from the first unconfirmed message, so a broker-side outcome may be unknowable and could be delivered more than once).
+Publishes are confirmed via `ConfirmSelect`. With `mandatory = true`, a message with a routing key that matches no binding is returned by RabbitMQ and the batch fails with a permanent error.
+
+**Delivery guarantee:** in-request retry only. Transient failures (connection loss, `Nack`, channel exceptions,
+timeouts) are retried within a single `consume()` call up to `max_retries`, resuming at the first unconfirmed
+message. Publishes are pipelined (all messages sent, then confirmed in order), so a failure mid-batch can already
+have delivered the in-flight tail; resuming re-publishes those, so delivery is **at-least-once within a batch**.
+However, the connectors runtime commits the consumer offset at poll time and discards `consume()`'s return value,
+so there is no cross-poll redrive or DLQ: a failure that outlives the retry budget, or a crash mid-batch, is
+**at-most-once** across polls.
 
 ```toml
 [plugin_config]
@@ -35,4 +44,5 @@ verbose_logging = false
 max_retries = 3
 retry_delay_secs = 1
 max_retry_delay_secs = 5
+timeout_secs = 30
 ```

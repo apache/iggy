@@ -43,3 +43,4 @@ verbose_logging = false
 max_retries = 3
 retry_delay_secs = 1
 max_retry_delay_secs = 5
+timeout_secs = 30
