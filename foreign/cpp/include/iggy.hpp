@@ -211,6 +211,7 @@ class Identifier final {
 
     [[nodiscard]] ffi::Identifier ToFfi() const;
 
+    friend class Consumer;
     friend class IggyBlockingClient;
 
     Kind kind_;
@@ -725,11 +726,45 @@ class Consumer final {
     static Consumer Single(Identifier id) { return Consumer(Kind::Single, std::move(id)); }
 
     /**
+     * @brief Creates a named consumer for the low-level client.
+     * @param id Consumer name.
+     * @return Consumer accepted by the low-level client.
+     * @throws IggyException if @p id is empty or longer than 255 bytes.
+     */
+    static ffi::Consumer Single(std::string id) {
+        return ToFfi(Kind::Single, Identifier::String(std::move(id)));
+    }
+
+    /**
+     * @brief Creates a numbered consumer for the low-level client.
+     * @param id Consumer number.
+     * @return Consumer accepted by the low-level client.
+     */
+    static ffi::Consumer Single(std::uint32_t id) { return ToFfi(Kind::Single, Identifier::Numeric(id)); }
+
+    /**
      * @brief Identifies a consumer group.
      * @param id Consumer group ID or name.
      * @return Consumer group identity.
      */
     static Consumer Group(Identifier id) { return Consumer(Kind::Group, std::move(id)); }
+
+    /**
+     * @brief Creates a named consumer group for the low-level client.
+     * @param id Consumer group name.
+     * @return Consumer group accepted by the low-level client.
+     * @throws IggyException if @p id is empty or longer than 255 bytes.
+     */
+    static ffi::Consumer Group(std::string id) {
+        return ToFfi(Kind::Group, Identifier::String(std::move(id)));
+    }
+
+    /**
+     * @brief Creates a numbered consumer group for the low-level client.
+     * @param id Consumer group number.
+     * @return Consumer group accepted by the low-level client.
+     */
+    static ffi::Consumer Group(std::uint32_t id) { return ToFfi(Kind::Group, Identifier::Numeric(id)); }
 
     /**
      * @brief Returns the kind of consumer represented by this value.
@@ -747,6 +782,15 @@ class Consumer final {
 
   private:
     Consumer(Kind kind, Identifier id) : kind_(kind), id_(std::move(id)) {}
+
+    [[nodiscard]] ffi::Consumer ToFfi() const { return ToFfi(kind_, id_); }
+
+    [[nodiscard]] static ffi::Consumer ToFfi(Kind kind, const Identifier &id) {
+        ffi::Consumer consumer{};
+        consumer.kind = kind == Kind::Single ? ffi::ConsumerKind::Consumer : ffi::ConsumerKind::ConsumerGroup;
+        consumer.id   = id.ToFfi();
+        return consumer;
+    }
 
     [[nodiscard]] std::string_view KindName() const noexcept {
         return kind_ == Kind::Single ? "consumer" : "consumer_group";
@@ -3239,6 +3283,17 @@ class PollingStrategy final {
     std::string polling_strategy_kind_;
     std::uint64_t polling_strategy_value_;
 };
+
+/**
+ * @brief Partition value that names no partition.
+ *
+ * Polling a consumer group with it reads one of the partitions assigned to the
+ * polling member, taking the next one on every call. Polling a regular consumer
+ * with it reads partition 0, and so does `get_consumer_offset(...)`.
+ * `store_consumer_offset(...)` and `delete_consumer_offset(...)` reject it and
+ * need an explicit partition.
+ */
+inline constexpr std::uint32_t kAnyPartitionId{std::numeric_limits<std::uint32_t>::max()};
 
 /**
  * @brief Selects the destination partition for a batch of messages.
