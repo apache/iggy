@@ -7428,6 +7428,7 @@ dependencies = [
  "lapin",
  "secrecy",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
