@@ -486,6 +486,109 @@ class IggyException : public std::runtime_error {
 };
 
 /**
+ * @brief Partition value that names no partition.
+ *
+ * Polling a consumer group with it reads one of the partitions assigned to the
+ * polling member, taking the next one on every call. Polling a regular consumer
+ * with it reads partition 0, and so does `get_consumer_offset(...)`.
+ * `store_consumer_offset(...)` and `delete_consumer_offset(...)` reject it and
+ * need an explicit partition.
+ */
+inline constexpr std::uint32_t kAnyPartitionId{std::numeric_limits<std::uint32_t>::max()};
+
+namespace detail {
+
+inline iggy::ffi::Identifier to_string_identifier(const std::string &id) {
+    iggy::ffi::Identifier identifier{};
+    try {
+        identifier.set_string(id);
+    } catch (const std::exception &error) {
+        throw IggyException(error.what());
+    }
+
+    return identifier;
+}
+
+inline iggy::ffi::Identifier to_numeric_identifier(const std::uint32_t id) {
+    iggy::ffi::Identifier identifier{};
+    try {
+        identifier.set_numeric(id);
+    } catch (const std::exception &error) {
+        throw IggyException(error.what());
+    }
+
+    return identifier;
+}
+
+inline iggy::ffi::Consumer to_consumer(const iggy::ffi::ConsumerKind kind, iggy::ffi::Identifier id) {
+    iggy::ffi::Consumer consumer{};
+    consumer.kind = kind;
+    consumer.id   = std::move(id);
+
+    return consumer;
+}
+
+}  // namespace detail
+
+/**
+ * @brief Creates the consumer that polling and consumer-offset calls take.
+ *
+ * The consumer carries the kind and the identifier the server keys the stored
+ * offset on. Two callers naming the same identifier share one offset, so under
+ * `PollingStrategy::Next()` with auto-commit each of them sees only the messages
+ * the other has not read yet. Give every independent consumer its own name.
+ */
+class Consumer final {
+  public:
+    /**
+     * @brief Creates a named consumer owning its offset on the polled partition.
+     * @param id Consumer name.
+     * @return Consumer accepted by the client.
+     * @throws IggyException if @p id is empty or longer than 255 bytes.
+     */
+    static iggy::ffi::Consumer Single(const std::string &id) {
+        return detail::to_consumer(iggy::ffi::ConsumerKind::Consumer, detail::to_string_identifier(id));
+    }
+
+    /**
+     * @brief Creates a numbered consumer owning its offset on the polled partition.
+     * @param id Consumer number.
+     * @return Consumer accepted by the client.
+     */
+    static iggy::ffi::Consumer Single(const std::uint32_t id) {
+        return detail::to_consumer(iggy::ffi::ConsumerKind::Consumer, detail::to_numeric_identifier(id));
+    }
+
+    /**
+     * @brief Creates a member of the named consumer group, sharing the group's offset.
+     *
+     * Join the group with `join_consumer_group(...)` before polling, and pass
+     * `kAnyPartitionId` to read the partitions assigned to this member, one per
+     * call.
+     *
+     * @param id Consumer group name.
+     * @return Consumer accepted by the client.
+     * @throws IggyException if @p id is empty or longer than 255 bytes.
+     */
+    static iggy::ffi::Consumer Group(const std::string &id) {
+        return detail::to_consumer(iggy::ffi::ConsumerKind::ConsumerGroup, detail::to_string_identifier(id));
+    }
+
+    /**
+     * @brief Creates a member of the numbered consumer group, sharing the group's offset.
+     * @param id Consumer group number.
+     * @return Consumer accepted by the client.
+     * @see Group(const std::string &)
+     */
+    static iggy::ffi::Consumer Group(const std::uint32_t id) {
+        return detail::to_consumer(iggy::ffi::ConsumerKind::ConsumerGroup, detail::to_numeric_identifier(id));
+    }
+
+  private:
+    Consumer() = delete;
+};
+
+/**
  * @brief Owning client connection to an Apache Iggy server.
  *
  * Create instances with Builder or FromConnectionString(). The client owns a
