@@ -45,4 +45,7 @@ include_metadata = true
 include_checksum = true
 include_origin_timestamp = true
 max_item_size = 409600
+max_retries = 3
+retry_delay = "500ms"
+max_retry_delay = "5s"
 verbose_logging = false

@@ -22,6 +22,8 @@ use aws_sdk_dynamodb::config::{Credentials, Region};
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{AttributeValue, PutRequest, WriteRequest};
+use humantime::Duration as HumanDuration;
+use iggy_connector_sdk::retry::{exponential_backoff, jitter};
 use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
 };
@@ -30,7 +32,9 @@ use serde::Deserialize;
 use simd_json::{OwnedValue, StaticNode};
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 sink_connector!(DynamoDbSink);
@@ -40,6 +44,9 @@ const MAX_BATCH_WRITE_ITEMS: usize = 25;
 /// DynamoDB rejects items larger than 400 KB.
 const MAX_ITEM_SIZE: usize = 400 * 1024;
 const DEFAULT_PARTITION_KEY_FIELD: &str = "iggy_id";
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_RETRY_DELAY: &str = "500ms";
+const DEFAULT_MAX_RETRY_DELAY: &str = "5s";
 const PAYLOAD_FIELD: &str = "payload";
 const CREDENTIALS_PROVIDER_NAME: &str = "iggy-dynamodb-sink";
 
@@ -55,6 +62,9 @@ pub struct DynamoDbSink {
     include_checksum: bool,
     include_origin_timestamp: bool,
     max_item_size: usize,
+    max_retries: u32,
+    retry_delay: Duration,
+    max_retry_delay: Duration,
     verbose: bool,
     items_written: AtomicU64,
     items_skipped: AtomicU64,
@@ -79,6 +89,9 @@ pub struct DynamoDbSinkConfig {
     pub include_checksum: Option<bool>,
     pub include_origin_timestamp: Option<bool>,
     pub max_item_size: Option<usize>,
+    pub max_retries: Option<u32>,
+    pub retry_delay: Option<String>,
+    pub max_retry_delay: Option<String>,
     pub verbose_logging: Option<bool>,
 }
 
@@ -100,6 +113,16 @@ impl DynamoDbSink {
             .max_item_size
             .unwrap_or(MAX_ITEM_SIZE)
             .min(MAX_ITEM_SIZE);
+        let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
+        let retry_delay = parse_duration(config.retry_delay.as_deref(), DEFAULT_RETRY_DELAY);
+        let mut max_retry_delay =
+            parse_duration(config.max_retry_delay.as_deref(), DEFAULT_MAX_RETRY_DELAY);
+        if max_retry_delay < retry_delay {
+            warn!(
+                "DynamoDB sink ID: {id} has max_retry_delay below retry_delay, raising it to the retry delay"
+            );
+            max_retry_delay = retry_delay;
+        }
         let verbose = config.verbose_logging.unwrap_or(false);
 
         DynamoDbSink {
@@ -113,6 +136,9 @@ impl DynamoDbSink {
             include_checksum,
             include_origin_timestamp,
             max_item_size,
+            max_retries,
+            retry_delay,
+            max_retry_delay,
             verbose,
             items_written: AtomicU64::new(0),
             items_skipped: AtomicU64::new(0),
@@ -359,32 +385,78 @@ impl DynamoDbSink {
             pending.push(WriteRequest::builder().put_request(put_request).build());
         }
 
-        let output = client
-            .batch_write_item()
-            .request_items(&self.config.table, pending)
-            .send()
-            .await
-            .map_err(|error| {
-                Error::CannotStoreData(format!(
-                    "DynamoDB batch write to table '{}' failed, error: {}",
-                    self.config.table,
-                    describe_sdk_error(&error)
-                ))
-            })?;
+        let mut attempt = 0u32;
+        loop {
+            // `request_items` consumes the batch, and a failed send does not
+            // hand it back, so the retry loop keeps its own copy.
+            let result = client
+                .batch_write_item()
+                .request_items(&self.config.table, pending.clone())
+                .send()
+                .await;
 
-        let unprocessed = output
-            .unprocessed_items
-            .and_then(|mut tables| tables.remove(&self.config.table))
-            .unwrap_or_default();
-        if !unprocessed.is_empty() {
-            return Err(Error::CannotStoreData(format!(
-                "DynamoDB left {} of {total} items unprocessed in table '{}'",
+            let unprocessed = match result {
+                Ok(output) => output
+                    .unprocessed_items
+                    .and_then(|mut tables| tables.remove(&self.config.table))
+                    .unwrap_or_default(),
+                Err(error) => {
+                    if !is_transient_error(&error) {
+                        return Err(Error::PermanentHttpError(format!(
+                            "DynamoDB batch write to table '{}' failed, error: {}",
+                            self.config.table,
+                            describe_sdk_error(&error)
+                        )));
+                    }
+                    attempt += 1;
+                    if attempt > self.max_retries {
+                        return Err(Error::CannotStoreData(format!(
+                            "DynamoDB batch write to table '{}' failed after {attempt} attempts, error: {}",
+                            self.config.table,
+                            describe_sdk_error(&error)
+                        )));
+                    }
+                    warn!(
+                        "Transient DynamoDB error on attempt {attempt}/{} for sink ID: {}, error: {}",
+                        self.max_retries,
+                        self.id,
+                        describe_sdk_error(&error)
+                    );
+                    self.backoff(attempt).await;
+                    continue;
+                }
+            };
+
+            if unprocessed.is_empty() {
+                return Ok(total);
+            }
+
+            attempt += 1;
+            if attempt > self.max_retries {
+                return Err(Error::CannotStoreData(format!(
+                    "DynamoDB left {} of {total} items unprocessed in table '{}' after {attempt} attempts",
+                    unprocessed.len(),
+                    self.config.table
+                )));
+            }
+            warn!(
+                "DynamoDB returned {} unprocessed items on attempt {attempt}/{} for sink ID: {}",
                 unprocessed.len(),
-                self.config.table
-            )));
+                self.max_retries,
+                self.id
+            );
+            self.backoff(attempt).await;
+            pending = unprocessed;
         }
+    }
 
-        Ok(total)
+    async fn backoff(&self, attempt: u32) {
+        let delay = jitter(exponential_backoff(
+            self.retry_delay,
+            attempt - 1,
+            self.max_retry_delay,
+        ));
+        tokio::time::sleep(delay).await;
     }
 
     fn build_item(
@@ -467,6 +539,18 @@ impl DynamoDbSink {
             .as_ref()
             .ok_or_else(|| Error::InitError("DynamoDB client is not connected".to_owned()))
     }
+}
+
+fn parse_duration(raw: Option<&str>, default: &str) -> Duration {
+    let value = raw.unwrap_or(default);
+    HumanDuration::from_str(value)
+        .map(Duration::from)
+        .unwrap_or_else(|_| {
+            warn!("Invalid DynamoDB sink duration '{value}', falling back to '{default}'");
+            HumanDuration::from_str(default)
+                .map(Duration::from)
+                .unwrap_or(Duration::from_millis(500))
+        })
 }
 
 /// DynamoDB items are attribute maps, so anything that is not a JSON object
@@ -603,6 +687,32 @@ fn attribute_value_size(value: &AttributeValue) -> usize {
     }
 }
 
+fn is_transient_error<E, R>(error: &SdkError<E, R>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    match error {
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => true,
+        SdkError::ResponseError(_) => true,
+        SdkError::ServiceError(service_error) => {
+            is_transient_code(service_error.err().code().unwrap_or_default())
+        }
+        _ => false,
+    }
+}
+
+fn is_transient_code(code: &str) -> bool {
+    matches!(
+        code,
+        "ProvisionedThroughputExceededException"
+            | "RequestLimitExceeded"
+            | "ThrottlingException"
+            | "InternalServerError"
+            | "ServiceUnavailable"
+            | "TransactionInProgressException"
+    )
+}
+
 fn describe_sdk_error<E, R>(error: &SdkError<E, R>) -> String
 where
     E: ProvideErrorMetadata,
@@ -633,6 +743,9 @@ mod tests {
             include_checksum: None,
             include_origin_timestamp: None,
             max_item_size: None,
+            max_retries: None,
+            retry_delay: None,
+            max_retry_delay: None,
             verbose_logging: None,
         }
     }
@@ -689,6 +802,24 @@ mod tests {
         config.batch_size = Some(0);
         let sink = DynamoDbSink::new(1, config);
         assert_eq!(sink.batch_size, 1);
+    }
+
+    #[test]
+    fn given_reversed_retry_delays_when_created_should_raise_max_retry_delay() {
+        let mut config = given_default_config();
+        config.retry_delay = Some("5s".to_owned());
+        config.max_retry_delay = Some("1s".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        assert_eq!(sink.retry_delay, Duration::from_secs(5));
+        assert_eq!(sink.max_retry_delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn given_invalid_duration_when_created_should_use_default() {
+        let mut config = given_default_config();
+        config.retry_delay = Some("not-a-duration".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        assert_eq!(sink.retry_delay, Duration::from_millis(500));
     }
 
     #[test]
@@ -1074,6 +1205,16 @@ mod tests {
             .expect("build item");
 
         assert_eq!(item[PAYLOAD_FIELD], AttributeValue::B(Blob::new(raw)));
+    }
+
+    #[test]
+    fn given_service_error_codes_when_checked_should_only_retry_the_transient_ones() {
+        assert!(is_transient_code("ThrottlingException"));
+        assert!(is_transient_code("ProvisionedThroughputExceededException"));
+        assert!(is_transient_code("InternalServerError"));
+        assert!(!is_transient_code("ValidationException"));
+        assert!(!is_transient_code("ResourceNotFoundException"));
+        assert!(!is_transient_code(""));
     }
 
     #[test]

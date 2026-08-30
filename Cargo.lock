@@ -7043,6 +7043,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-dynamodb",
+ "humantime",
  "iggy_connector_sdk",
  "secrecy",
  "serde",

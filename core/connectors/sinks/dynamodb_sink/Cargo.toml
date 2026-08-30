@@ -36,14 +36,13 @@ crate-type = ["cdylib", "lib"]
 async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-dynamodb = { workspace = true }
+humantime = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 simd-json = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
