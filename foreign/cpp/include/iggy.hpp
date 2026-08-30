@@ -537,6 +537,14 @@ inline iggy::ffi::Consumer to_consumer(const iggy::ffi::ConsumerKind kind, iggy:
  * offset on. Two callers naming the same identifier share one offset, so under
  * `PollingStrategy::Next()` with auto-commit each of them sees only the messages
  * the other has not read yet. Give every independent consumer its own name.
+ *
+ * @code{.cpp}
+ * const auto strategy{iggy::PollingStrategy::Next()};
+ * const auto polled{client->poll_messages(stream, topic, iggy::kAnyPartitionId,
+ *                                         iggy::Consumer::Group("my-group"),
+ *                                         std::string(strategy.PollingStrategyKind()),
+ *                                         strategy.PollingStrategyValue(), 10, true)};
+ * @endcode
  */
 class Consumer final {
   public:
