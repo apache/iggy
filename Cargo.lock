@@ -7587,6 +7587,8 @@ dependencies = [
  "arrow 57.3.1",
  "assert_cmd",
  "async-trait",
+ "aws-config",
+ "aws-sdk-dynamodb",
  "base64",
  "bon",
  "bytemuck",
