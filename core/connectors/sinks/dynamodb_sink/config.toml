@@ -44,4 +44,5 @@ batch_size = 25
 include_metadata = true
 include_checksum = true
 include_origin_timestamp = true
+max_item_size = 409600
 verbose_logging = false

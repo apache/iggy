@@ -37,6 +37,8 @@ sink_connector!(DynamoDbSink);
 
 /// `BatchWriteItem` rejects any request carrying more than 25 write requests.
 const MAX_BATCH_WRITE_ITEMS: usize = 25;
+/// DynamoDB rejects items larger than 400 KB.
+const MAX_ITEM_SIZE: usize = 400 * 1024;
 const DEFAULT_PARTITION_KEY_FIELD: &str = "iggy_id";
 const PAYLOAD_FIELD: &str = "payload";
 const CREDENTIALS_PROVIDER_NAME: &str = "iggy-dynamodb-sink";
@@ -52,6 +54,7 @@ pub struct DynamoDbSink {
     include_metadata: bool,
     include_checksum: bool,
     include_origin_timestamp: bool,
+    max_item_size: usize,
     verbose: bool,
     items_written: AtomicU64,
     items_skipped: AtomicU64,
@@ -75,6 +78,7 @@ pub struct DynamoDbSinkConfig {
     pub include_metadata: Option<bool>,
     pub include_checksum: Option<bool>,
     pub include_origin_timestamp: Option<bool>,
+    pub max_item_size: Option<usize>,
     pub verbose_logging: Option<bool>,
 }
 
@@ -92,6 +96,10 @@ impl DynamoDbSink {
         let include_metadata = config.include_metadata.unwrap_or(true);
         let include_checksum = config.include_checksum.unwrap_or(true);
         let include_origin_timestamp = config.include_origin_timestamp.unwrap_or(true);
+        let max_item_size = config
+            .max_item_size
+            .unwrap_or(MAX_ITEM_SIZE)
+            .min(MAX_ITEM_SIZE);
         let verbose = config.verbose_logging.unwrap_or(false);
 
         DynamoDbSink {
@@ -104,6 +112,7 @@ impl DynamoDbSink {
             include_metadata,
             include_checksum,
             include_origin_timestamp,
+            max_item_size,
             verbose,
             items_written: AtomicU64::new(0),
             items_skipped: AtomicU64::new(0),
@@ -437,6 +446,19 @@ impl DynamoDbSink {
                 .or_insert_with(|| AttributeValue::N(message.offset.to_string()));
         }
 
+        validate_key_attribute(&item, &self.partition_key_field)?;
+        if let Some(sort_key_field) = &self.sort_key_field {
+            validate_key_attribute(&item, sort_key_field)?;
+        }
+
+        let size = estimate_item_size(&item);
+        if size > self.max_item_size {
+            return Err(Error::InvalidRecordValue(format!(
+                "item size of {size} bytes exceeds the limit of {} bytes",
+                self.max_item_size
+            )));
+        }
+
         Ok(item)
     }
 
@@ -535,6 +557,52 @@ fn build_message_key(
     )
 }
 
+/// DynamoDB key attributes must be a non-empty string, number, or binary
+/// value. Anything else fails the whole batch with a validation error, so the
+/// offending message is dropped before it is sent.
+fn validate_key_attribute(
+    item: &HashMap<String, AttributeValue>,
+    field: &str,
+) -> Result<(), Error> {
+    let value = item
+        .get(field)
+        .ok_or_else(|| Error::InvalidRecordValue(format!("key field '{field}' is missing")))?;
+    let valid = match value {
+        AttributeValue::S(text) => !text.is_empty(),
+        AttributeValue::N(number) => !number.is_empty(),
+        AttributeValue::B(blob) => !blob.as_ref().is_empty(),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidRecordValue(format!(
+            "key field '{field}' must be a non-empty string, number, or binary value"
+        )))
+    }
+}
+
+fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> usize {
+    item.iter()
+        .map(|(name, value)| name.len() + attribute_value_size(value))
+        .sum()
+}
+
+fn attribute_value_size(value: &AttributeValue) -> usize {
+    match value {
+        AttributeValue::S(text) => text.len(),
+        AttributeValue::N(number) => number.len(),
+        AttributeValue::B(blob) => blob.as_ref().len(),
+        AttributeValue::Bool(_) | AttributeValue::Null(_) => 1,
+        AttributeValue::Ss(values) => values.iter().map(String::len).sum(),
+        AttributeValue::Ns(values) => values.iter().map(String::len).sum(),
+        AttributeValue::Bs(values) => values.iter().map(|blob| blob.as_ref().len()).sum(),
+        AttributeValue::L(values) => values.iter().map(attribute_value_size).sum(),
+        AttributeValue::M(values) => estimate_item_size(values),
+        _ => 0,
+    }
+}
+
 fn describe_sdk_error<E, R>(error: &SdkError<E, R>) -> String
 where
     E: ProvideErrorMetadata,
@@ -564,6 +632,7 @@ mod tests {
             include_metadata: None,
             include_checksum: None,
             include_origin_timestamp: None,
+            max_item_size: None,
             verbose_logging: None,
         }
     }
@@ -620,6 +689,14 @@ mod tests {
         config.batch_size = Some(0);
         let sink = DynamoDbSink::new(1, config);
         assert_eq!(sink.batch_size, 1);
+    }
+
+    #[test]
+    fn given_oversized_max_item_size_when_created_should_clamp_to_dynamodb_limit() {
+        let mut config = given_default_config();
+        config.max_item_size = Some(MAX_ITEM_SIZE * 2);
+        let sink = DynamoDbSink::new(1, config);
+        assert_eq!(sink.max_item_size, MAX_ITEM_SIZE);
     }
 
     #[test]
@@ -748,6 +825,38 @@ mod tests {
             .expect("build item");
 
         assert_eq!(item["event_offset"], AttributeValue::N("7".to_owned()));
+    }
+
+    #[test]
+    fn given_invalid_key_type_when_built_should_skip_message() {
+        let mut config = given_default_config();
+        config.partition_key_field = Some("user_id".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        let mut message = given_message(given_json_payload(r#"{"user_id":true}"#));
+
+        let result = sink.build_item(
+            &given_topic_metadata(),
+            &given_messages_metadata(),
+            &mut message,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_oversized_payload_when_built_should_skip_message() {
+        let mut config = given_default_config();
+        config.max_item_size = Some(64);
+        let sink = DynamoDbSink::new(1, config);
+        let mut message = given_message(Payload::Text("x".repeat(1024)));
+
+        let result = sink.build_item(
+            &given_topic_metadata(),
+            &given_messages_metadata(),
+            &mut message,
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
