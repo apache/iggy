@@ -81,6 +81,7 @@ Each sink should have its own, custom configuration, which is passed along with 
 ### Available Sinks
 
 - **Doris Sink** - loads JSON messages into Apache Doris tables via the Stream Load HTTP API
+- **DynamoDB Sink** - writes messages to Amazon DynamoDB tables
 - **Elasticsearch Sink** - sends messages to Elasticsearch indices
 - **Iceberg Sink** - writes data to Apache Iceberg tables via REST catalog
 - **Meilisearch Sink** - indexes messages in Meilisearch
