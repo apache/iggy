@@ -712,6 +712,18 @@ class Permissions final {
  * A consumer offset belongs either to an individual consumer or to a consumer
  * group. Create a value with Single() or Group(), then pass it to the consumer
  * offset operations on IggyBlockingClient.
+ *
+ * Two callers naming the same identifier share one offset, so under
+ * PollingStrategy::Next() with auto-commit each sees only the messages the
+ * other has not read yet. Give every independent consumer its own name.
+ *
+ * @code{.cpp}
+ * const auto strategy{iggy::PollingStrategy::Next()};
+ * const auto polled{client->poll_messages(stream, topic, iggy::kAnyPartitionId,
+ *                                         iggy::Consumer::Group("my-group"),
+ *                                         std::string(strategy.Kind()),
+ *                                         strategy.Value(), 10, true)};
+ * @endcode
  */
 class Consumer final {
   public:
