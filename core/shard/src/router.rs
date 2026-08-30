@@ -30,6 +30,8 @@ use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
 use partitions::FatalCommit;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How often the shard pump drives `VsrConsensus::tick`.
 ///
@@ -261,8 +263,19 @@ where
     /// holding a divergent partition, and answering them means re-entering
     /// the commit path that just failed. The final flush still runs, so
     /// every partition that CAN still reach disk does.
+    ///
+    /// `shutdown_flag` is the cross-thread server shutdown signal. The pump
+    /// flips it as soon as a commit fault is resolved, BEFORE the final
+    /// flush: the flush writes to the device whose failure raised the fault,
+    /// so it can stall indefinitely, and only the flag arms the watchdog and
+    /// the bounded pump drain that turn a stalled flush into a timed-out
+    /// non-zero exit instead of a process that reports healthy forever.
     #[allow(clippy::future_not_send)]
-    pub async fn run_message_pump(&self, stop: Receiver<()>) -> Option<FatalCommit>
+    pub async fn run_message_pump(
+        &self,
+        stop: Receiver<()>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Option<FatalCommit>
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
@@ -377,6 +390,13 @@ where
             }
         }
 
+        // A stop can win the select immediately after a frame fenced a
+        // partition, before the next tick observes it. Preserve that fault so
+        // shutdown cannot turn a durability failure into a clean pump exit.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
         // Drain remaining frames so in-flight requests get a response, and
         // the reply lane so already-forwarded replies still reach their
         // clients before the bus tears down. Skipped on a commit fault: a
@@ -392,13 +412,32 @@ where
                     self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
                         .await;
                     self.apply_reconcile_ops();
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        fatal = Some(fault);
+                        break;
+                    }
                 }
             }
+        }
+        if fatal.is_none() {
             while let Ok(frame) = self.reply_inbox.try_recv() {
                 if self.accept_frame_for_self(&frame) {
                     self.process_frame(frame).await;
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        fatal = Some(fault);
+                        break;
+                    }
                 }
             }
+        }
+
+        if fatal.is_some() {
+            // Flipped BEFORE the final flush, not after the pump returns: the
+            // flush writes to the device whose failure raised the fault and
+            // can stall there indefinitely, and the flag is what arms the
+            // watchdog and the bounded pump drain. Siblings give up at most
+            // the flush window of extra serving.
+            shutdown_flag.store(true, Ordering::Relaxed);
         }
 
         // Final flush: committed messages still resident in the in-memory
@@ -406,11 +445,32 @@ where
         // graceful restart recovers consumer offsets ahead of the data. Runs
         // on a fault too, the fenced partition included: its resident prefix
         // is cluster-committed data, so writing what still reaches disk is
-        // strictly better than dropping it, and a second failure is warned
-        // per partition rather than propagated.
+        // strictly better than dropping it, and a second failure of an
+        // already-fenced partition is warned rather than propagated.
         self.flush_partitions().await;
 
+        // A failed flush fences its partition: the data it could not write is
+        // cluster-committed and now lives only in this process's memory, so a
+        // clean exit here would report a durability loss as a good shutdown.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
         fatal
+    }
+
+    /// First partition commit fault currently fenced on this shard.
+    ///
+    /// The regular path observes faults in `tick_partitions`. This scan covers
+    /// the pump-exit edges where a stop signal wins before that tick, or a
+    /// queued frame fails while the pump is draining during shutdown.
+    fn first_partition_commit_fault(&self) -> Option<FatalCommit> {
+        let partitions = self.plane.partitions();
+        partitions.namespaces().find_map(|namespace| {
+            partitions
+                .get_by_ns(namespace)
+                .and_then(|partition| partition.fatal().cloned())
+        })
     }
 
     /// Sanity check at pump entry: every Consensus frame routed through

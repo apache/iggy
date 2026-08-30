@@ -480,15 +480,16 @@ recreate_missing_state = false
 # already held, so an index is never evidence about the log: one the log
 # contradicts is repaired, not believed. It is DROPPED whole and rebuilt from
 # a byte-0 walk when it holds no whole 24-byte entry, when its entries
-# regress in offset or position, when its first entry is not the segment's
-# own start offset at position 0, or when the log cannot back its LAST
-# entry. Only an index whose
+# regress in offset or position, when an entry does not match the log batch's
+# offset, timestamp, partition and position, when its first entry is not the
+# segment's own start offset at position 0, or when the log cannot back its
+# LAST entry. Only an index whose
 # last entry the log proves anchors a walk, which then runs from that entry
 # to the file end. Under the topic's enforce_fsync = true an index the log
 # cannot back is measured against the log first: a gap of more than ONE entry
 # refuses the partition instead of rebuilding, because fsync lets the index
 # outrun the log by at most the chunk in flight at the crash, so a wider gap
-# is acknowledged data the log lost.
+# is previously durable data the log lost.
 #
 # The byte-0 walk is deliberately not narrowed to the entries the log still
 # proves. An anchor picked that way can sit ABOVE damage, and the residue
@@ -497,23 +498,23 @@ recreate_missing_state = false
 # over it. Reaching that branch means the index and the log already disagree,
 # so the extra bytes read are bounded by the segments a crash actually tore.
 #
-# Every batch a walk accepts passes its own checksum: the two files are
-# written unordered, so a durable index entry no longer implies a durable
-# chunk beneath it, and one chunk can hold several batches. Bytes below where
-# a walk starts are never read at boot -- on a healthy boot that is
-# everything before the last index entry, where at-rest damage surfaces only
-# on the read path via validate_checksum. Wherever a walk does reach, boot
-# acts on the damage it finds: truncating when nothing decodable follows,
-# refusing when something does.
+# Every batch a walk accepts passes its own checksum. With enforce_fsync =
+# false, the index only locates data because page-cache writeback can preserve
+# a later log page while losing an earlier one, so recovery walks every segment
+# from byte 0. A clean walk preserves the existing index and performs no disk
+# mutation. With enforce_fsync = true, completed serialized log fdatasyncs
+# prove the prefix before the last index entry, so a healthy boot starts at
+# that last entry and leaves earlier at-rest damage to the read path's
+# validate_checksum. Wherever a recovery walk finds damage, it truncates only
+# when nothing decodable follows and refuses when something does.
 #
-# A byte-0 walk therefore re-reads and re-checksums every byte of the
-# segments it covers and rebuilds each index durably, two fsyncs per segment:
-# budget minutes, not seconds, where it covers thousands of them. A restore
-# that dropped every .index hits every segment; an ordinary crash reaches the
-# same walk for the segments whose index no longer matches its log, usually
-# just the tail one. Either way a boot that looks hung is doing that work, and
-# a slow boot with no restore in the change log is not by itself evidence of
-# anything wrong. Before, every one of those shapes refused the boot outright.
+# The non-fsync verification pass therefore reads and checksums every log byte
+# at boot, although it keeps a clean index in place. A byte-0 repair walk also
+# rebuilds a missing or contradicted index durably, adding two fsyncs per
+# repaired segment. Either path can take minutes over thousands of segments.
+# A restore that dropped every .index repairs every segment; an ordinary
+# fsynced crash usually repairs only its tail segment. A slow boot is therefore
+# not by itself evidence of a stall. Before, the repair shapes refused boot.
 #
 # Either walk refuses a verifying batch whose base offset does not continue
 # the chain, or whose partition_id stamp is not this partition's. The one

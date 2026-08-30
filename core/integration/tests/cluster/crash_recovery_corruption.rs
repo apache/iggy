@@ -570,9 +570,9 @@ async fn given_a_torn_index_tail_when_a_node_recovers_should_not_misalign_subseq
 /// A crash can leave a node's segment `.log` shorter than its already durable
 /// `.index` claims: the two files are persisted concurrently, so death between
 /// them strands the entry of the chunk that was in flight even under
-/// `enforce_fsync`. That one entry is the whole window - every earlier entry
-/// was fsync'd with its log chunk before that chunk's batch was acked - so it
-/// is the shape the surgery reproduces. The index is a rebuildable local
+/// `enforce_fsync`. That one entry is the whole window: every earlier entry
+/// belongs to a completed serialized flush whose log fdatasync finished before
+/// the later flush began, so it is the shape the surgery reproduces. The index is a rebuildable local
 /// artifact and the log is the authority, so recovery must discard the index,
 /// rebuild it from a byte-0 walk of the log, and keep serving the batches the
 /// walk proves - not refuse the chain, which fences every surviving byte aside
@@ -629,9 +629,10 @@ async fn given_a_durable_index_ahead_of_a_truncated_log_when_a_node_recovers_sho
     // Cutting at the LAST entry's position lands the log end exactly on a
     // batch boundary, keeps whole batches behind it, and strands exactly one
     // entry past the end of the file - the only depth a crash can produce
-    // under `enforce_fsync`, where every earlier entry was fsync'd together
-    // with its log chunk before that chunk's batch was acked. A deeper cut
-    // would fabricate acked-data loss, which recovery refuses by design.
+    // under `enforce_fsync`, where each serialized flush fdatasyncs the whole
+    // log before the next chunk's entry can exist. A deeper cut would
+    // fabricate previously durable data loss, which recovery refuses by
+    // design.
     let cut_at = positions[positions.len() - 1];
     assert!(
         cut_at > 0 && cut_at < log_size,

@@ -1273,14 +1273,18 @@ async fn shard_main(
     // tail that had not hit a flush threshold yet.
     let pump_shutdown_flag = Arc::clone(&shutdown_flag_for_handoff);
     let mut pump_handle = Some(compio::runtime::spawn(async move {
-        let fatal = pump_shard.run_message_pump(stop_rx).await;
+        // The pump itself flips the shared flag when a commit fault stops it,
+        // BEFORE its final flush, so a flush stalling on the failed device
+        // still reaches the watchdog and the bounded drain. Every sibling
+        // shard's watchdog drives its own graceful stop off the same flag;
+        // this shard's watchdog is what fires the token `shard_main` is
+        // parked on. The store below backstops the one fault the pump can
+        // only observe after that flip: a partition fenced by the final
+        // flush itself.
+        let fatal = pump_shard
+            .run_message_pump(stop_rx, Arc::clone(&pump_shutdown_flag))
+            .await;
         if fatal.is_some() {
-            // A commit fault fenced a partition on this shard. Flip the
-            // shared flag so every sibling shard's watchdog drives its own
-            // graceful stop; this shard's watchdog sees it too, which is what
-            // fires the token `shard_main` is parked on. Set after the pump
-            // returns rather than at the fault, so the siblings keep serving
-            // healthy partitions until this shard has finished flushing.
             pump_shutdown_flag.store(true, Ordering::Relaxed);
         }
         fatal
@@ -2582,7 +2586,7 @@ fn restore_metadata_consensus(
 ///
 /// The topic's effective `enforce_fsync` goes in for the same reason: it is
 /// what tells recovery whether a durable index entry the log cannot back is a
-/// benign torn index or acknowledged data the log lost.
+/// benign torn index or previously durable data the log lost.
 async fn recover_partition_segments(
     config: &ServerConfig,
     namespace: IggyNamespace,

@@ -6752,11 +6752,16 @@ where
                 .flush_committed_messages(partitions.config())
                 .await
             {
-                tracing::warn!(
+                tracing::error!(
                     namespace_raw = namespace.inner(),
                     %error,
                     "failed to flush partition journal on shutdown"
                 );
+                // The bytes left behind are cluster-committed, so the pump
+                // must not let this exit report clean (it re-scans for faults
+                // after this flush). A partition already fenced by the commit
+                // path keeps its original fault.
+                partition.fence_flush_failure();
             }
         }
     }

@@ -307,11 +307,11 @@ pub enum ServerError {
 /// gap is deeper than the single in-flight entry: entries are derived from the
 /// log, so recovery drops such an index whole and rebuilds it from a byte-0
 /// walk of the log rather than believing any part of it. What `enforce_fsync`
-/// adds is a durability promise -- every entry below the last was made durable
-/// alongside the log chunk it describes, before that chunk's batch was
-/// acknowledged -- which turns a deeper gap into evidence about the LOG.
-/// Absent that promise the index is never evidence about the log; only the
-/// log is.
+/// adds is evidence from serialized completed flushes: an entry above chunk N
+/// means the log fdatasync covering chunk N completed before the later flush
+/// began. This is independent of reply timing and turns a deeper gap into
+/// evidence about the LOG. Absent that evidence the index only locates data;
+/// recovery verifies the log from byte 0.
 #[derive(Debug)]
 pub enum PartitionRecoveryRefusal {
     /// `recoverable_bytes` on the two chain-shape refusals is the sum of
@@ -387,14 +387,13 @@ pub enum PartitionRecoveryRefusal {
     /// log by more than the one entry a crash can legitimately strand there.
     /// Persistence writes exactly one entry per flush chunk, chunks never
     /// overlap, and flushes are serialized, so every entry below the last one
-    /// names a chunk whose log bytes completed their fdatasync. A flush covers
-    /// the whole committed journal prefix, so every batch in a completed chunk
-    /// was already acknowledged, or is acknowledged by the commit that
-    /// triggered the flush. Only the chunk in flight when the process died
-    /// can have an entry the log never backed. A deeper step-back therefore
-    /// says the LOG lost acknowledged bytes it had already made durable, and
-    /// rebuilding this segment from what the log still holds would let the
-    /// partition re-mint offsets a client was already promised.
+    /// names a chunk whose log bytes completed their fdatasync. A completed
+    /// chunk can contain batches acknowledged before the flush threshold was
+    /// reached, while the in-flight chunk can do so too. Reply timing is not
+    /// the proof. Only the chunk in flight when the process died can have an
+    /// entry the log never backed. A deeper step-back therefore says the LOG
+    /// lost bytes it had already made durable, and rebuilding from what remains
+    /// could re-mint offsets, including offsets already returned to clients.
     FsyncedLogLoss {
         start_offset: u64,
         entry_count: u64,
@@ -407,6 +406,20 @@ pub enum PartitionRecoveryRefusal {
         /// then means nothing proved in the searched window, not that the log
         /// backs nothing.
         searched_entries: u64,
+    },
+    /// Under `enforce_fsync`, the byte-0 rebuild after a dropped index proved
+    /// the log only through `walked_position`, short of `durable_position`,
+    /// the byte the index's own last entry proves the log had already
+    /// fdatasynced through (the flush that wrote the entry began only after
+    /// the previous chunk's log sync completed). The step-back gate measures
+    /// loss at entry granularity; this catches the sub-chunk shape it cannot:
+    /// bytes a completed flush made durable are gone mid-chunk, so truncating
+    /// to the walked prefix would re-mint their offsets.
+    FsyncedRebuildShortfall {
+        start_offset: u64,
+        entry_count: u64,
+        walked_position: u64,
+        durable_position: u64,
     },
     /// A writer reopening over recovered bounds found the on-disk length
     /// diverging from the size recovery just validated and truncated to.
@@ -503,9 +516,23 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 "segment {start_offset} runs under enforce_fsync with {entry_count} sparse \
                  index entries, but its log backs only {provable_entries} of the \
                  {searched_entries} searched from the top (up to byte {provable_position}); \
-                 every entry below the last was fsync'd together with the acknowledged log \
-                 chunk it describes, so the log has lost acknowledged data rather than the \
+                 every entry below the last describes a log chunk whose fdatasync had \
+                 completed, so the log has lost previously durable data rather than the \
                  index having outrun it"
+            ),
+            Self::FsyncedRebuildShortfall {
+                start_offset,
+                entry_count,
+                walked_position,
+                durable_position,
+            } => write!(
+                f,
+                "segment {start_offset} runs under enforce_fsync with {entry_count} sparse \
+                 index entries, and the byte-0 rebuild proved its log only through byte \
+                 {walked_position}, short of byte {durable_position} which the last \
+                 entry's own fdatasync ordering proves the log had already made durable; \
+                 the log has lost previously durable bytes mid-chunk, so rebuilding \
+                 would re-mint their offsets"
             ),
             Self::StorageSizeMismatch {
                 start_offset,

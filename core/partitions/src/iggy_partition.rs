@@ -1845,6 +1845,22 @@ where
         self.fatal.as_ref()
     }
 
+    /// Fence this partition after the shutdown flush failed to persist its
+    /// committed journal prefix: that data is cluster-committed and now lives
+    /// only in this process's memory, so the shard must not report a clean
+    /// exit over it. A fault the commit path already recorded is kept, since
+    /// it names the op that first diverged; `commit_min` here only bounds
+    /// where the unpersisted prefix ends.
+    pub fn fence_flush_failure(&mut self) {
+        if self.fatal.is_none() {
+            self.fatal = Some(FatalCommit {
+                namespace_raw: self.namespace().inner(),
+                op: self.consensus.commit_min(),
+                operation: Operation::SendMessages,
+            });
+        }
+    }
+
     fn partition_dir(&self) -> Option<String> {
         if self.partition_dir.is_some() {
             return self.partition_dir.clone();
@@ -2986,8 +3002,8 @@ where
         // re-appends the whole retained tail, so a per-chunk call would
         // re-walk that tail once per segment crossed, quadratic in the flush
         // span -- all under the partition write lock. On an error mid-flush
-        // the accumulated prefix is evicted before propagating, so the retry
-        // re-reads only what did not land.
+        // the accumulated prefix is evicted before propagating, so any later
+        // flush attempt re-reads only what did not land.
         let mut evictable = 0usize;
         while entries.peek().is_some() {
             // A recovered active segment can already sit at or past the cap
@@ -3110,21 +3126,21 @@ where
             };
 
             // Persist BEFORE eviction so a write failure leaves the rest of the
-            // committed prefix resident instead of dropping it. Nothing retries
-            // the persist: on the commit path a failure panics out of
-            // `handle_committed_entries` and takes this shard's message pump with
-            // it, so every partition on the shard stops committing, ticking and
-            // replying until the process is restarted. The shutdown flush warns and
-            // moves to the next namespace, and the transfer offer turns it into
-            // `FlushFailed`. Recovery is a restart, which reopens each writer at
-            // the on-disk length boot recovery validated.
+            // committed prefix resident instead of dropping it. On the commit
+            // path a failure fences the partition and stops the shard pump; the
+            // server then shuts down non-zero after one final best-effort flush
+            // of every partition. A shutdown-flush failure warns and moves to
+            // the next namespace, while the transfer offer turns it into
+            // `FlushFailed`. Recovery reopens each writer at the on-disk length
+            // boot recovery validated.
             //
             // The ordering therefore buys a non-corrupting failure, not an
             // in-process one. Write cursors advance only once both the batch and the
-            // index are durable, so on the paths that survive the error, the next
-            // flush rewrites the same positions instead of appending a duplicate.
-            // Chunks already durable are evicted before the error propagates, so it
-            // cannot re-read them (and re-write them past a rotation).
+            // index are durable, so a later attempt, including the final
+            // shutdown flush, rewrites the same positions instead of appending
+            // a duplicate. Chunks already durable are evicted before the error
+            // propagates, so it cannot re-read them and write them past a
+            // rotation.
             if let Err(error) = self
                 .persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
                 .await
@@ -7698,6 +7714,34 @@ mod tests {
             commit_min,
             "a fenced partition must not advance on a later commit"
         );
+    }
+
+    #[compio::test]
+    async fn given_a_shutdown_flush_failure_when_fencing_should_keep_an_earlier_commit_fault() {
+        let mut partition = test_partition();
+
+        // A flush failure on a healthy partition fences it, so the pump's
+        // post-flush scan turns the exit non-zero instead of reporting a
+        // clean shutdown over unpersisted cluster-committed data.
+        partition.fence_flush_failure();
+        let fault = partition
+            .fatal()
+            .expect("a failed shutdown flush must fence the partition");
+        assert_eq!(fault.op, partition.consensus().commit_min());
+        assert_eq!(fault.operation, Operation::SendMessages);
+
+        // A partition the commit path already fenced keeps that fault: it
+        // names the op that first diverged.
+        let commit_fault = FatalCommit {
+            namespace_raw: fault.namespace_raw,
+            op: 42,
+            operation: Operation::StoreConsumerOffset,
+        };
+        partition.fatal = Some(commit_fault);
+        partition.fence_flush_failure();
+        let kept = partition.fatal().expect("the fence must hold");
+        assert_eq!(kept.op, 42);
+        assert_eq!(kept.operation, Operation::StoreConsumerOffset);
     }
 
     #[compio::test]
