@@ -244,6 +244,22 @@ mod ffi {
         stored_offset: u64,
     }
 
+    /// Kind of the consumer a poll or a consumer-offset call names.
+    #[repr(u8)]
+    enum ConsumerKind {
+        Consumer = 1,
+        ConsumerGroup = 2,
+    }
+
+    /// The consumer a poll or a consumer-offset call names. It carries both the
+    /// kind and the identifier the server keys the stored offset on. Two callers
+    /// sharing one identifier share one offset, so under the `next` strategy with
+    /// auto-commit each of them reads only what the other has not read yet.
+    struct Consumer {
+        kind: ConsumerKind,
+        id: Identifier,
+    }
+
     struct ClientInfo {
         client_id: u32,
         has_user_id: bool,
