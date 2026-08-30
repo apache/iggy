@@ -21,7 +21,9 @@ use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::config::{Credentials, Region};
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::{AttributeValue, PutRequest, WriteRequest};
+use aws_sdk_dynamodb::types::{
+    AttributeValue, KeySchemaElement, KeyType, PutRequest, WriteRequest,
+};
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::retry::{exponential_backoff, jitter};
 use iggy_connector_sdk::{
@@ -156,7 +158,7 @@ impl Sink for DynamoDbSink {
             self.id, self.config.table
         );
         let client = self.build_client().await?;
-        client
+        let description = client
             .describe_table()
             .table_name(&self.config.table)
             .send()
@@ -168,6 +170,12 @@ impl Sink for DynamoDbSink {
                     describe_sdk_error(&error)
                 ))
             })?;
+        self.validate_key_schema(
+            description
+                .table
+                .and_then(|table| table.key_schema)
+                .unwrap_or_default(),
+        )?;
 
         self.client = Some(client);
         info!(
@@ -245,6 +253,46 @@ impl DynamoDbSink {
         }
 
         Ok(Client::new(&loader.load().await))
+    }
+
+    /// A key field that does not match the table makes DynamoDB reject every
+    /// write, and the runtime stops the connector on the first error, so the
+    /// mismatch is reported while the sink is still opening.
+    fn validate_key_schema(&self, key_schema: Vec<KeySchemaElement>) -> Result<(), Error> {
+        let table_key = |key_type: KeyType| {
+            key_schema
+                .iter()
+                .find(|element| element.key_type == key_type)
+                .map(|element| element.attribute_name.clone())
+        };
+
+        let partition_key = table_key(KeyType::Hash);
+        if let Some(partition_key) = &partition_key
+            && partition_key != &self.partition_key_field
+        {
+            return Err(Error::InvalidConfigValue(format!(
+                "Table '{}' uses '{partition_key}' as its partition key, but partition_key_field is '{}'",
+                self.config.table, self.partition_key_field
+            )));
+        }
+
+        match (table_key(KeyType::Range), &self.sort_key_field) {
+            (Some(sort_key), Some(sort_key_field)) if &sort_key != sort_key_field => {
+                Err(Error::InvalidConfigValue(format!(
+                    "Table '{}' uses '{sort_key}' as its sort key, but sort_key_field is '{sort_key_field}'",
+                    self.config.table
+                )))
+            }
+            (Some(sort_key), None) => Err(Error::InvalidConfigValue(format!(
+                "Table '{}' has a sort key '{sort_key}', so sort_key_field must be set",
+                self.config.table
+            ))),
+            (None, Some(sort_key_field)) => Err(Error::InvalidConfigValue(format!(
+                "Table '{}' has no sort key, so sort_key_field '{sort_key_field}' must be removed",
+                self.config.table
+            ))),
+            _ => Ok(()),
+        }
     }
 
     async fn write_messages(
@@ -1188,6 +1236,72 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(sink.items_written.load(Ordering::Relaxed), 0);
+    }
+
+    fn given_key_schema(partition_key: &str, sort_key: Option<&str>) -> Vec<KeySchemaElement> {
+        let mut key_schema = vec![
+            KeySchemaElement::builder()
+                .attribute_name(partition_key)
+                .key_type(KeyType::Hash)
+                .build()
+                .expect("build key schema"),
+        ];
+        if let Some(sort_key) = sort_key {
+            key_schema.push(
+                KeySchemaElement::builder()
+                    .attribute_name(sort_key)
+                    .key_type(KeyType::Range)
+                    .build()
+                    .expect("build key schema"),
+            );
+        }
+        key_schema
+    }
+
+    #[test]
+    fn given_matching_key_schema_when_validated_should_accept_the_table() {
+        let mut config = given_default_config();
+        config.sort_key_field = Some("iggy_offset".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+
+        let result = sink.validate_key_schema(given_key_schema(
+            DEFAULT_PARTITION_KEY_FIELD,
+            Some("iggy_offset"),
+        ));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn given_another_partition_key_when_validated_should_reject_the_table() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+
+        let result = sink.validate_key_schema(given_key_schema("user_id", None));
+
+        assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+    }
+
+    #[test]
+    fn given_table_sort_key_without_configured_field_when_validated_should_reject_the_table() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+
+        let result = sink.validate_key_schema(given_key_schema(
+            DEFAULT_PARTITION_KEY_FIELD,
+            Some("iggy_offset"),
+        ));
+
+        assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+    }
+
+    #[test]
+    fn given_configured_sort_key_without_table_sort_key_when_validated_should_reject_the_table() {
+        let mut config = given_default_config();
+        config.sort_key_field = Some("iggy_offset".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+
+        let result = sink.validate_key_schema(given_key_schema(DEFAULT_PARTITION_KEY_FIELD, None));
+
+        assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
     }
 
     #[test]
