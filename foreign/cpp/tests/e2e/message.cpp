@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 
 #include <gtest/gtest.h>
@@ -1549,4 +1550,120 @@ TEST_F(LowLevelE2E_Message, ConsumerGroupCreateJoinAndPollMessages) {
     auto group_after_leave = client->get_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
                                                         make_numeric_identifier(group.id));
     ASSERT_EQ(group_after_leave.members_count, 0u);
+}
+
+TEST_F(LowLevelE2E_Message, PollMessagesWithDistinctConsumersKeepsOffsetsIndependent) {
+    RecordProperty("description", "Each named consumer owns its offset, so both read the whole partition.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t i = 0; i < 3; i++) {
+        auto msg =
+            iggy::ffi::make_message(to_payload("isolated-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
+        messages.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages));
+
+    for (const std::string &consumer_name :
+         {std::string("isolation-consumer-a"), std::string("isolation-consumer-b")}) {
+        auto polled = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
+                                            iggy::Consumer::Single(consumer_name), "next", 0, 10, true);
+
+        ASSERT_EQ(polled.count, 3u) << "Consumer " << consumer_name << " did not read the whole partition";
+        for (std::uint32_t i = 0; i < 3; i++) {
+            std::string expected = "isolated-" + std::to_string(i);
+            std::string actual(polled.messages[i].payload.begin(), polled.messages[i].payload.end());
+            EXPECT_EQ(actual, expected) << "Payload mismatch at offset " << i;
+        }
+    }
+}
+
+TEST_F(LowLevelE2E_Message, PollMessagesWithSharedConsumerSplitsThePartition) {
+    RecordProperty("description", "Two polls under one consumer name share a stored offset, so the second reads none.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 1, "none", "never_expire", 0, "server_default",
+                         {});
+
+    rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+    for (std::uint32_t i = 0; i < 3; i++) {
+        auto msg =
+            iggy::ffi::make_message(to_payload("shared-" + std::to_string(i)), rust::Vec<iggy::ffi::HeaderEntry>());
+        messages.push_back(std::move(msg));
+    }
+    client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                          partition_id_bytes(0), std::move(messages));
+
+    auto first_poll = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
+                                            iggy::Consumer::Single("shared-consumer"), "next", 0, 10, true);
+    ASSERT_EQ(first_poll.count, 3u);
+
+    auto second_poll = client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), 0,
+                                             iggy::Consumer::Single("shared-consumer"), "next", 0, 10, true);
+    ASSERT_EQ(second_poll.count, 0u);
+}
+
+TEST_F(LowLevelE2E_Message, PollMessagesWithConsumerGroupReadsAssignedPartitions) {
+    RecordProperty("description",
+                   "A group member polling kAnyPartitionId reads its assigned partitions, one per call, rather than "
+                   "falling back to partition 0.");
+    const std::string stream_name = GetRandomName();
+    iggy::ffi::Client *client     = GetLoggedInClient();
+
+    client->create_stream(stream_name);
+    auto stream = client->get_stream(make_string_identifier(stream_name));
+    TrackStream(stream.id);
+    const std::string topic_name = GetRandomName();
+    client->create_topic(make_numeric_identifier(stream.id), topic_name, 2, "none", "never_expire", 0, "server_default",
+                         {});
+
+    const std::string group_name = GetRandomName();
+    client->create_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0), group_name);
+    TrackConsumerGroup(stream_name, topic_name, group_name);
+    client->join_consumer_group(make_numeric_identifier(stream.id), make_numeric_identifier(0),
+                                make_string_identifier(group_name));
+
+    for (std::uint32_t partition_id = 0; partition_id < 2; partition_id++) {
+        rust::Vec<iggy::ffi::IggyMessageToSend> messages;
+        for (std::uint32_t i = 0; i < 2; i++) {
+            auto msg = iggy::ffi::make_message(to_payload("p" + std::to_string(partition_id) + "-" + std::to_string(i)),
+                                               rust::Vec<iggy::ffi::HeaderEntry>());
+            messages.push_back(std::move(msg));
+        }
+        client->send_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), "partition_id",
+                              partition_id_bytes(partition_id), std::move(messages));
+    }
+
+    // Each poll takes the next partition the member owns, so two polls cover
+    // both. A client falling back to partition 0 would read it twice instead.
+    std::unordered_set<std::uint32_t> polled_partitions;
+    std::unordered_set<std::string> polled_payloads;
+    for (std::uint32_t poll = 0; poll < 2; poll++) {
+        auto polled =
+            client->poll_messages(make_numeric_identifier(stream.id), make_numeric_identifier(0), iggy::kAnyPartitionId,
+                                  iggy::Consumer::Group(group_name), "next", 0, 10, true);
+
+        ASSERT_EQ(polled.count, 2u) << "Poll " << poll << " did not read a whole partition";
+        polled_partitions.insert(polled.partition_id);
+        for (const auto &message : polled.messages) {
+            polled_payloads.insert(std::string(message.payload.begin(), message.payload.end()));
+        }
+    }
+
+    EXPECT_EQ(polled_partitions, (std::unordered_set<std::uint32_t>{0, 1}));
+    EXPECT_EQ(polled_payloads, (std::unordered_set<std::string>{"p0-0", "p0-1", "p1-0", "p1-1"}));
 }
