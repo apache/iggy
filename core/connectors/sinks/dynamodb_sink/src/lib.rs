@@ -29,6 +29,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use simd_json::{OwnedValue, StaticNode};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
 
@@ -36,6 +37,7 @@ sink_connector!(DynamoDbSink);
 
 /// `BatchWriteItem` rejects any request carrying more than 25 write requests.
 const MAX_BATCH_WRITE_ITEMS: usize = 25;
+const DEFAULT_PARTITION_KEY_FIELD: &str = "iggy_id";
 const PAYLOAD_FIELD: &str = "payload";
 const CREDENTIALS_PROVIDER_NAME: &str = "iggy-dynamodb-sink";
 
@@ -44,6 +46,8 @@ pub struct DynamoDbSink {
     pub id: u32,
     client: Option<Client>,
     config: DynamoDbSinkConfig,
+    partition_key_field: String,
+    sort_key_field: Option<String>,
     batch_size: usize,
     include_metadata: bool,
     include_checksum: bool,
@@ -51,6 +55,7 @@ pub struct DynamoDbSink {
     verbose: bool,
     items_written: AtomicU64,
     items_skipped: AtomicU64,
+    items_deduplicated: AtomicU64,
     write_errors: AtomicU64,
 }
 
@@ -64,6 +69,8 @@ pub struct DynamoDbSinkConfig {
     pub access_key_id: Option<SecretString>,
     pub secret_access_key: Option<SecretString>,
     pub session_token: Option<SecretString>,
+    pub partition_key_field: Option<String>,
+    pub sort_key_field: Option<String>,
     pub batch_size: Option<u32>,
     pub include_metadata: Option<bool>,
     pub include_checksum: Option<bool>,
@@ -73,6 +80,11 @@ pub struct DynamoDbSinkConfig {
 
 impl DynamoDbSink {
     pub fn new(id: u32, config: DynamoDbSinkConfig) -> Self {
+        let partition_key_field = config
+            .partition_key_field
+            .clone()
+            .unwrap_or_else(|| DEFAULT_PARTITION_KEY_FIELD.to_owned());
+        let sort_key_field = config.sort_key_field.clone();
         let batch_size = config
             .batch_size
             .unwrap_or(MAX_BATCH_WRITE_ITEMS as u32)
@@ -86,6 +98,8 @@ impl DynamoDbSink {
             id,
             client: None,
             config,
+            partition_key_field,
+            sort_key_field,
             batch_size,
             include_metadata,
             include_checksum,
@@ -93,6 +107,7 @@ impl DynamoDbSink {
             verbose,
             items_written: AtomicU64::new(0),
             items_skipped: AtomicU64::new(0),
+            items_deduplicated: AtomicU64::new(0),
             write_errors: AtomicU64::new(0),
         }
     }
@@ -141,10 +156,11 @@ impl Sink for DynamoDbSink {
         info!("Closing DynamoDB sink connector with ID: {}", self.id);
         self.client.take();
         info!(
-            "Closed DynamoDB sink connector with ID: {}, written: {}, skipped: {}, errors: {}",
+            "Closed DynamoDB sink connector with ID: {}, written: {}, skipped: {}, deduplicated: {}, errors: {}",
             self.id,
             self.items_written.load(Ordering::Relaxed),
             self.items_skipped.load(Ordering::Relaxed),
+            self.items_deduplicated.load(Ordering::Relaxed),
             self.write_errors.load(Ordering::Relaxed)
         );
         Ok(())
@@ -219,6 +235,15 @@ impl DynamoDbSink {
             }
         }
 
+        let (mut items, duplicates) = self.deduplicate_items(items);
+        if duplicates > 0 {
+            debug!(
+                "DynamoDB sink ID: {} dropped {duplicates} items sharing a primary key",
+                self.id
+            );
+            self.items_deduplicated
+                .fetch_add(duplicates, Ordering::Relaxed);
+        }
         if skipped > 0 {
             self.items_skipped.fetch_add(skipped, Ordering::Relaxed);
         }
@@ -260,6 +285,46 @@ impl DynamoDbSink {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// `BatchWriteItem` rejects a request that carries two writes for the same
+    /// primary key, so only the newest item per key survives. DynamoDB would
+    /// overwrite the older ones anyway.
+    fn deduplicate_items(
+        &self,
+        items: Vec<HashMap<String, AttributeValue>>,
+    ) -> (Vec<HashMap<String, AttributeValue>>, u64) {
+        let mut positions: HashMap<String, usize> = HashMap::with_capacity(items.len());
+        let mut deduplicated: Vec<HashMap<String, AttributeValue>> =
+            Vec::with_capacity(items.len());
+        let mut duplicates = 0u64;
+
+        for item in items {
+            let key = self.key_signature(&item);
+            match positions.get(&key) {
+                Some(&position) => {
+                    deduplicated[position] = item;
+                    duplicates += 1;
+                }
+                None => {
+                    positions.insert(key, deduplicated.len());
+                    deduplicated.push(item);
+                }
+            }
+        }
+
+        (deduplicated, duplicates)
+    }
+
+    /// `AttributeValue` is not hashable, so the key attributes are rendered
+    /// into a string that only lives for the deduplication pass.
+    fn key_signature(&self, item: &HashMap<String, AttributeValue>) -> String {
+        let mut signature = key_attribute_signature(item.get(&self.partition_key_field));
+        if let Some(sort_key_field) = &self.sort_key_field {
+            signature.push('|');
+            signature.push_str(&key_attribute_signature(item.get(sort_key_field)));
+        }
+        signature
     }
 
     /// One `BatchWriteItem` round, retrying both throttled requests and the
@@ -359,6 +424,19 @@ impl DynamoDbSink {
             );
         }
 
+        item.entry(self.partition_key_field.clone())
+            .or_insert_with(|| {
+                AttributeValue::S(build_message_key(
+                    topic_metadata,
+                    messages_metadata,
+                    message.id,
+                ))
+            });
+        if let Some(sort_key_field) = &self.sort_key_field {
+            item.entry(sort_key_field.clone())
+                .or_insert_with(|| AttributeValue::N(message.offset.to_string()));
+        }
+
         Ok(item)
     }
 
@@ -431,6 +509,32 @@ fn json_into_attribute_value(value: OwnedValue) -> AttributeValue {
     }
 }
 
+fn key_attribute_signature(value: Option<&AttributeValue>) -> String {
+    match value {
+        Some(AttributeValue::S(text)) => format!("S:{text}"),
+        Some(AttributeValue::N(number)) => format!("N:{number}"),
+        Some(AttributeValue::B(blob)) => {
+            let mut signature = String::from("B:");
+            for byte in blob.as_ref() {
+                let _ = write!(signature, "{byte:02x}");
+            }
+            signature
+        }
+        _ => String::new(),
+    }
+}
+
+fn build_message_key(
+    topic_metadata: &TopicMetadata,
+    messages_metadata: &MessagesMetadata,
+    message_id: u128,
+) -> String {
+    format!(
+        "{}:{}:{}:{message_id}",
+        topic_metadata.stream, topic_metadata.topic, messages_metadata.partition_id
+    )
+}
+
 fn describe_sdk_error<E, R>(error: &SdkError<E, R>) -> String
 where
     E: ProvideErrorMetadata,
@@ -454,6 +558,8 @@ mod tests {
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
+            partition_key_field: None,
+            sort_key_field: None,
             batch_size: None,
             include_metadata: None,
             include_checksum: None,
@@ -580,6 +686,10 @@ mod tests {
             item["iggy_origin_timestamp"],
             AttributeValue::N("1600000000".to_owned())
         );
+        assert_eq!(
+            item[DEFAULT_PARTITION_KEY_FIELD],
+            AttributeValue::S("test_stream:test_topic:1:42".to_owned())
+        );
     }
 
     #[test]
@@ -599,8 +709,45 @@ mod tests {
             )
             .expect("build item");
 
-        assert_eq!(item.len(), 1);
+        assert_eq!(item.len(), 2);
         assert!(item.contains_key("name"));
+        assert!(item.contains_key(DEFAULT_PARTITION_KEY_FIELD));
+    }
+
+    #[test]
+    fn given_payload_with_partition_key_when_built_should_keep_payload_value() {
+        let mut config = given_default_config();
+        config.partition_key_field = Some("user_id".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        let mut message = given_message(given_json_payload(r#"{"user_id":"u-1"}"#));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(item["user_id"], AttributeValue::S("u-1".to_owned()));
+    }
+
+    #[test]
+    fn given_missing_sort_key_when_built_should_inject_offset() {
+        let mut config = given_default_config();
+        config.sort_key_field = Some("event_offset".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        let mut message = given_message(given_json_payload(r#"{"name":"first"}"#));
+
+        let item = sink
+            .build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut message,
+            )
+            .expect("build item");
+
+        assert_eq!(item["event_offset"], AttributeValue::N("7".to_owned()));
     }
 
     #[test]
@@ -696,6 +843,96 @@ mod tests {
         assert_eq!(json_into_attribute_value(value), AttributeValue::Null(true));
     }
 
+    #[test]
+    fn given_same_message_when_built_twice_should_produce_the_same_key() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let topic_metadata = given_topic_metadata();
+        let messages_metadata = given_messages_metadata();
+        let mut first = given_message(given_json_payload(r#"{"name":"first"}"#));
+        let mut second = given_message(given_json_payload(r#"{"name":"first"}"#));
+
+        let first_item = sink
+            .build_item(&topic_metadata, &messages_metadata, &mut first)
+            .expect("build item");
+        let second_item = sink
+            .build_item(&topic_metadata, &messages_metadata, &mut second)
+            .expect("build item");
+
+        assert_eq!(
+            first_item[DEFAULT_PARTITION_KEY_FIELD],
+            second_item[DEFAULT_PARTITION_KEY_FIELD]
+        );
+    }
+
+    #[test]
+    fn given_different_topics_when_built_should_produce_different_keys() {
+        let messages_metadata = given_messages_metadata();
+        let first_topic = given_topic_metadata();
+        let second_topic = TopicMetadata {
+            stream: "test_stream".to_owned(),
+            topic: "other_topic".to_owned(),
+        };
+
+        assert_ne!(
+            build_message_key(&first_topic, &messages_metadata, 42),
+            build_message_key(&second_topic, &messages_metadata, 42)
+        );
+    }
+
+    #[test]
+    fn given_items_sharing_a_key_when_deduplicated_should_keep_the_newest() {
+        let mut config = given_default_config();
+        config.partition_key_field = Some("user_id".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        let items = vec![
+            HashMap::from([
+                ("user_id".to_owned(), AttributeValue::S("u-1".to_owned())),
+                ("name".to_owned(), AttributeValue::S("old".to_owned())),
+            ]),
+            HashMap::from([
+                ("user_id".to_owned(), AttributeValue::S("u-2".to_owned())),
+                ("name".to_owned(), AttributeValue::S("other".to_owned())),
+            ]),
+            HashMap::from([
+                ("user_id".to_owned(), AttributeValue::S("u-1".to_owned())),
+                ("name".to_owned(), AttributeValue::S("new".to_owned())),
+            ]),
+        ];
+
+        let (deduplicated, duplicates) = sink.deduplicate_items(items);
+
+        assert_eq!(duplicates, 1);
+        assert_eq!(deduplicated.len(), 2);
+        assert_eq!(deduplicated[0]["name"], AttributeValue::S("new".to_owned()));
+        assert_eq!(
+            deduplicated[1]["name"],
+            AttributeValue::S("other".to_owned())
+        );
+    }
+
+    #[test]
+    fn given_items_sharing_a_partition_key_when_sort_key_differs_should_keep_both() {
+        let mut config = given_default_config();
+        config.partition_key_field = Some("user_id".to_owned());
+        config.sort_key_field = Some("event_offset".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        let items = vec![
+            HashMap::from([
+                ("user_id".to_owned(), AttributeValue::S("u-1".to_owned())),
+                ("event_offset".to_owned(), AttributeValue::N("1".to_owned())),
+            ]),
+            HashMap::from([
+                ("user_id".to_owned(), AttributeValue::S("u-1".to_owned())),
+                ("event_offset".to_owned(), AttributeValue::N("2".to_owned())),
+            ]),
+        ];
+
+        let (deduplicated, duplicates) = sink.deduplicate_items(items);
+
+        assert_eq!(duplicates, 0);
+        assert_eq!(deduplicated.len(), 2);
+    }
+
     #[tokio::test]
     async fn given_no_client_when_messages_consumed_should_return_error() {
         let sink = DynamoDbSink::new(1, given_default_config());
@@ -728,5 +965,20 @@ mod tests {
             .expect("build item");
 
         assert_eq!(item[PAYLOAD_FIELD], AttributeValue::B(Blob::new(raw)));
+    }
+
+    #[test]
+    fn given_binary_keys_when_signed_should_not_collide() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let first = HashMap::from([(
+            DEFAULT_PARTITION_KEY_FIELD.to_owned(),
+            AttributeValue::B(Blob::new(vec![0x01, 0x02])),
+        )]);
+        let second = HashMap::from([(
+            DEFAULT_PARTITION_KEY_FIELD.to_owned(),
+            AttributeValue::B(Blob::new(vec![0x01, 0x03])),
+        )]);
+
+        assert_ne!(sink.key_signature(&first), sink.key_signature(&second));
     }
 }
