@@ -66,14 +66,15 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///
 /// The [`ClientWrapper`] lives behind an [`IggyRwLock`] so that the connection
 /// can be shared safely. You create a single client and use it from many tasks
-/// at once (producers, consumers, the background heartbeat). Many operations can read
+/// at once (e.g. producers, consumers). Many operations can read
 /// from the connection concurrently, while actions that reshape it, like
 /// connecting, reconnecting, or logging in, briefly take exclusive access.
 ///
 /// A [`Partitioner`] and a client-side [`EncryptorKind`] are optional, and both
 /// default to disabled. The [`Partitioner`] computes on the client-side the target
-/// partition for messages published without an explicit partition. Hence, routing
-/// can depend on the stream, topic, and/ or message contents.
+/// partition for messages published without an explicit partition. Hence, you can
+/// configure routing to partitions within a topic yourself dependent on the stream,
+/// topic, and/ or message contents.
 ///
 /// The [`EncryptorKind`] encrypts each message payload before it leaves the client and decrypts it on
 /// the way back, keeping payloads opaque to the server. Attach either through
