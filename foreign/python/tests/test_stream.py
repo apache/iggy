@@ -254,6 +254,10 @@ class TestGetStreams:
         assert listed is not None
         assert listed.topics_count == 1
 
+        stream = await iggy_client.get_stream(stream_name)
+        assert stream is not None
+        assert [topic.name for topic in stream.topics] == [topic_name]
+
     @pytest.mark.asyncio
     async def test_get_streams_returns_same_result_when_called_repeatedly(
         self, iggy_client: IggyClient, unique_name
@@ -325,6 +329,21 @@ class TestUpdateStream:
         assert renamed.name == new_name
 
     @pytest.mark.asyncio
+    async def test_update_stream_forwards_options(
+        self, iggy_client: IggyClient, unique_name
+    ):
+        """Test update_stream forwards option keys to the server."""
+        stream_name = unique_name()
+        await iggy_client.create_stream(stream_name)
+
+        with pytest.raises(RuntimeError):
+            await iggy_client.update_stream(
+                stream_id=stream_name,
+                name=stream_name,
+                options={"unknown": "value"},
+            )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "new_name",
         [
@@ -341,12 +360,9 @@ class TestUpdateStream:
         await iggy_client.create_stream(stream_name)
 
         await iggy_client.update_stream(stream_id=stream_name, name=new_name)
-        try:
-            renamed = await iggy_client.get_stream(new_name)
-            assert renamed is not None
-            assert renamed.name == new_name
-        finally:
-            await iggy_client.delete_stream(new_name)
+        renamed = await iggy_client.get_stream(new_name)
+        assert renamed is not None
+        assert renamed.name == new_name
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -400,10 +416,10 @@ class TestUpdateStream:
             await iggy_client.update_stream(stream_id=unique_name(), name=unique_name())
 
     @pytest.mark.asyncio
-    async def test_update_stream_to_existing_name_fails(
+    async def test_update_stream_to_existing_name_fails_and_current_name_is_a_noop(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test update_stream rejects renaming a stream to a name already in use."""
+        """Test update_stream rejects conflicts and preserves a self-rename."""
         first_stream = unique_name()
         second_stream = unique_name()
 
@@ -422,6 +438,8 @@ class TestUpdateStream:
 
         with pytest.raises(RuntimeError):
             await iggy_client.update_stream(stream_id=second_stream, name=first_stream)
+
+        await iggy_client.update_stream(stream_id=second_stream, name=second_stream)
 
         streams = await iggy_client.get_streams()
         after = next(stream for stream in streams if stream.id == before.id)

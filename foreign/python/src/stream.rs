@@ -19,6 +19,8 @@ use iggy::prelude::{Stream as RustStream, StreamDetails as RustStreamDetails};
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
+use crate::topic::Topic;
+
 #[pyclass]
 #[gen_stub_pyclass]
 pub struct StreamDetails {
@@ -66,6 +68,12 @@ impl StreamDetails {
     #[getter]
     pub fn topics_count(&self) -> u32 {
         self.inner.topics_count
+    }
+
+    /// Returns the topics in the stream.
+    #[getter]
+    pub fn topics(&self) -> Vec<Topic> {
+        self.inner.topics.iter().map(Topic::from).collect()
     }
 }
 

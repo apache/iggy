@@ -117,12 +117,14 @@ async def cleanup_streams(
         return
 
     client: IggyClient = request.getfixturevalue("iggy_client")
-    existing_stream_ids = {stream.id for stream in await client.get_streams()}
+    existing_streams = {
+        (stream.id, stream.created_at) for stream in await client.get_streams()
+    }
 
     yield
 
     for stream in await client.get_streams():
-        if stream.id not in existing_stream_ids:
+        if (stream.id, stream.created_at) not in existing_streams:
             with contextlib.suppress(RuntimeError):
                 await client.delete_stream(stream.id)
 

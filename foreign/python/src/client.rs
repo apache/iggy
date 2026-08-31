@@ -500,9 +500,7 @@ impl IggyClient {
         })
     }
 
-    /// Return all streams visible to the authenticated user.
-    ///
-    /// The result is ordered by ascending numeric stream ID.
+    /// Return all streams.
     ///
     /// Returns:
     ///     A list of `Stream` summaries.
@@ -529,30 +527,42 @@ impl IggyClient {
     /// and contain between 1 and 255 UTF-8 bytes. Renaming a stream to its current
     /// name succeeds without changing it.
     ///
+    /// Args:
+    ///     stream_id: Stream identifier as `str | int`.
+    ///     name: New stream name as `str`.
+    ///     options: Additional option keys as `dict[str, str] | None`, forwarded
+    ///         to the server. Current server versions reject all stream update
+    ///         option keys.
+    ///
     /// Returns:
     ///     None.
     ///
     /// Raises:
-    ///     TypeError: If `stream_id` is neither `str` nor `int`, or `name` is not
-    ///         `str`.
-    ///     OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+    ///     TypeError: If `stream_id` is not `str` or an integer in
+    ///         `0..=2**32 - 1`, or `name` is not `str`.
     ///     ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
     ///     RuntimeError: If the client is not authenticated, the user lacks global
     ///         `manage_streams` or per-stream `manage_stream` permission, the
     ///         stream does not exist, the new name is invalid or already used, or
     ///         the request fails.
+    #[pyo3(signature = (stream_id, name, options = None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn update_stream<'a>(
         &self,
         py: Python<'a>,
         stream_id: PyIdentifier,
         name: String,
+        #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
+        options: Option<BTreeMap<String, String>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let stream_id = Identifier::try_from(stream_id)?;
+        let update_options = StreamUpdateOptions {
+            raw: options.unwrap_or_default(),
+        };
         let inner = self.inner.clone();
         future_into_py(py, async move {
             inner
-                .update_stream(&stream_id, &name, &StreamUpdateOptions::default())
+                .update_stream(&stream_id, &name, &update_options)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
@@ -569,8 +579,8 @@ impl IggyClient {
     ///     None.
     ///
     /// Raises:
-    ///     TypeError: If `stream_id` is neither `str` nor `int`.
-    ///     OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+    ///     TypeError: If `stream_id` is not `str` or an integer in
+    ///         `0..=2**32 - 1`.
     ///     ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
     ///     RuntimeError: If the client is not authenticated, the user lacks global
     ///         `manage_streams` or per-stream `manage_stream` permission, the
@@ -603,8 +613,8 @@ impl IggyClient {
     ///     None.
     ///
     /// Raises:
-    ///     TypeError: If `stream_id` is neither `str` nor `int`.
-    ///     OverflowError: If an integer identifier is outside `0..=2**32 - 1`.
+    ///     TypeError: If `stream_id` is not `str` or an integer in
+    ///         `0..=2**32 - 1`.
     ///     ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
     ///     RuntimeError: If the client is not authenticated, the user lacks global
     ///         `manage_streams` or per-stream `manage_stream` permission, the
