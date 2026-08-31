@@ -94,15 +94,15 @@ public class IggyPublisherConfig
 
     /// <summary>
     ///     Gets or sets the size of the receive buffer in bytes.
-    ///     Default is 4096 bytes (4 KB).
+    ///     Default is null (OS default).
     /// </summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public int? ReceiveBufferSize { get; set; } = null;
 
     /// <summary>
     ///     Gets or sets the size of the send buffer in bytes.
-    ///     Default is 4096 bytes (4 KB).
+    ///     Default is null (OS default).
     /// </summary>
-    public int SendBufferSize { get; set; } = 4096;
+    public int? SendBufferSize { get; set; } = null;
 
     /// <summary>
     ///     Gets or sets the partitioning strategy for messages.

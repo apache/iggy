@@ -80,9 +80,9 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
     BaseAddress = "127.0.0.1:8090",
     Protocol = Protocol.Tcp,
 
-    // Buffer sizes (optional, default: 4096)
-    ReceiveBufferSize = 4096,
-    SendBufferSize = 4096,
+    // Buffer sizes (optional, in bytes, default: null (for OS automatic))
+    ReceiveBufferSize = null,
+    SendBufferSize = null,
 
     // TLS/SSL configuration
     TlsSettings = new TlsSettings

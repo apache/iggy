@@ -44,14 +44,14 @@ public sealed class IggyClientConfigurator
     public int MaxResponseFrameSize { get; set; } = 64 * 1024 * 1024;
 
     /// <summary>
-    ///     The size of the receive buffer in bytes. Default is 4096.
+    ///     The size of the receive buffer in bytes. Default is null.
     /// </summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public int? ReceiveBufferSize { get; set; } = null;
 
     /// <summary>
-    ///     The size of the send buffer in bytes. Default is 4096.
+    ///     The size of the send buffer in bytes. Default is null.
     /// </summary>
-    public int SendBufferSize { get; set; } = 4096;
+    public int? SendBufferSize { get; set; } = null;
 
     /// <summary>
     ///     Interval between the pings the <see cref="Enums.Protocol.Tcp" /> client sends on its own while

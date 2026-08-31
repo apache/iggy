@@ -109,12 +109,12 @@ public class IggyPublisherBuilder
     /// <param name="address">The server address to connect to (format depends on protocol).</param>
     /// <param name="login">The login username for authentication.</param>
     /// <param name="password">The password for authentication.</param>
-    /// <param name="receiveBufferSize">The size of the receive buffer in bytes. Default is 4096.</param>
-    /// <param name="sendBufferSize">The size of the send buffer in bytes. Default is 4096.</param>
+    /// <param name="receiveBufferSize">The size of the receive buffer in bytes. Default is null.</param>
+    /// <param name="sendBufferSize">The size of the send buffer in bytes. Default is null.</param>
     /// <param name="reconnectionSettings">Reconnection settings for the client.</param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithConnection(Protocol protocol, string address, string login, string password,
-        int receiveBufferSize = 4096, int sendBufferSize = 4096, ReconnectionSettings? reconnectionSettings = null)
+        int? receiveBufferSize = null, int? sendBufferSize = null, ReconnectionSettings? reconnectionSettings = null)
     {
         Config.Protocol = protocol;
         Config.Address = address;
@@ -138,7 +138,7 @@ public class IggyPublisherBuilder
     /// <param name="reconnectionSettings">Reconnection settings for the client.</param>
     /// <returns>The current instance of <see cref="IggyPublisherBuilder" /> to allow method chaining.</returns>
     public IggyPublisherBuilder WithConnection(Protocol protocol, string address, string personalAccessToken,
-        int receiveBufferSize = 4096, int sendBufferSize = 4096, ReconnectionSettings? reconnectionSettings = null)
+        int? receiveBufferSize = null, int? sendBufferSize = null, ReconnectionSettings? reconnectionSettings = null)
     {
         Config.Protocol = protocol;
         Config.Address = address;
@@ -422,14 +422,14 @@ public class IggyPublisherBuilder
             }
         }
 
-        if (Config.ReceiveBufferSize <= 0)
+        if (Config.ReceiveBufferSize is <= 0)
         {
-            throw new InvalidOperationException("ReceiveBufferSize must be greater than 0.");
+            throw new InvalidOperationException("ReceiveBufferSize must be greater than 0 when set.");
         }
 
-        if (Config.SendBufferSize <= 0)
+        if (Config.SendBufferSize is <= 0)
         {
-            throw new InvalidOperationException("SendBufferSize must be greater than 0.");
+            throw new InvalidOperationException("SendBufferSize must be greater than 0 when set.");
         }
 
         if (Config.EnableBackgroundSending)
