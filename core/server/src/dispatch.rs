@@ -3854,6 +3854,7 @@ mod tests {
     use std::future::Future;
     use std::mem::size_of;
     use std::rc::Rc;
+    use std::sync::atomic::AtomicBool;
 
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
     type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
@@ -4514,7 +4515,9 @@ mod tests {
         let (stop_tx, stop_rx) = shard::channel::<()>(1);
         let pump_shard = Rc::clone(&shard);
         let pump = compio::runtime::spawn(async move {
-            pump_shard.run_message_pump(stop_rx).await;
+            pump_shard
+                .run_message_pump(stop_rx, Arc::new(AtomicBool::new(false)))
+                .await;
         });
 
         lane_sender
@@ -4560,7 +4563,9 @@ mod tests {
         // post-loop drain must still deliver the reply-lane frame.
         let (stop_tx, stop_rx) = shard::channel::<()>(1);
         stop_tx.try_send(()).expect("stop channel has capacity");
-        shard.run_message_pump(stop_rx).await;
+        shard
+            .run_message_pump(stop_rx, Arc::new(AtomicBool::new(false)))
+            .await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(

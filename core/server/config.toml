@@ -443,9 +443,14 @@ path = "partitions"
 validate_checksum = true
 
 # Durability and flush cadence are per topic, set at CreateTopic:
-#   enforce_fsync                     - fsync each write (false when unset)
+#   enforce_fsync                     - fdatasync each flush (false when unset)
 #   messages_required_to_save         - flush after this many messages (1024)
 #   size_of_messages_required_to_save - flush after this many bytes (1 MiB)
+# enforce_fsync decides whether a flush syncs, never whether one happens. A
+# write is acknowledged when it commits, which precedes its flush unless that
+# commit trips a threshold, and the partition journal holding the unflushed
+# remainder is in memory and is not replayed at boot. Acks are therefore
+# durability-gated only at messages_required_to_save = 1.
 
 # Segment configuration
 [system.segment]
@@ -471,30 +476,56 @@ recreate_missing_state = false
 
 # At boot, segment recovery walks each partition's segments: bytes after the
 # last decodable batch of a genuinely torn tail are physically truncated from
-# the .log/.index files. A LOST index is rebuilt from the batches the walk
-# proves -- lost meaning absent altogether, or holding no whole 24-byte
-# entry. An index that still holds whole entries is NEVER rebuilt, only
-# floored to whole entries, or the partition is refused when its entries
-# contradict the log. Only the walk of a segment whose index was lost
-# re-checksums every batch; with an intact index the walk trusts batch
-# headers, except that a batch contradicting the walk (see below) must pass
-# its batch checksum before the contradiction is believed. Bytes before the
-# last index entry are not re-examined at boot at all -- at-rest damage
-# there surfaces on the read path via validate_checksum.
+# the .log/.index files. Every index entry is derived from a batch the log
+# already held, so an index is never evidence about the log: one the log
+# contradicts is repaired, not believed. It is DROPPED whole and rebuilt from
+# a byte-0 walk when it holds no whole 24-byte entry, when its entries
+# regress in offset or position, when an entry does not match the log batch's
+# offset, timestamp, partition and position, when its first entry is not the
+# segment's own start offset at position 0, or when the log cannot back its
+# LAST entry. Only an index whose
+# last entry the log proves anchors a walk, which then runs from that entry
+# to the file end. Under the topic's enforce_fsync = true an index the log
+# cannot back is measured against the log first: a gap of more than ONE entry
+# refuses the partition instead of rebuilding, because fsync lets the index
+# outrun the log by at most the chunk in flight at the crash, so a wider gap
+# is previously durable data the log lost.
 #
-# A restore that dropped every .index therefore boots by re-reading and
-# re-checksumming every byte of every segment and rebuilding each index
-# durably, two fsyncs per segment: budget minutes, not seconds, on a
-# partition holding thousands of segments. A boot that looks hung after such
-# a restore is doing that work. Before, that same shape refused the boot
-# outright.
+# The byte-0 walk is deliberately not narrowed to the entries the log still
+# proves. An anchor picked that way can sit ABOVE damage, and the residue
+# probe only ever looks forward from where a walk stopped, so a hole under
+# the anchor would go unread while end_offset still advertised the offsets
+# over it. Reaching that branch means the index and the log already disagree,
+# so the extra bytes read are bounded by the segments a crash actually tore.
 #
-# Either walk refuses a batch whose base offset does not continue the chain,
-# or whose partition_id stamp is not this partition's. A contradiction whose
-# batch fails its own checksum is damage rather than data: the walk stops
-# there and the residue goes through the damage probe like any other torn
-# tail, so a bit flip in a tail batch's offset truncates instead of refusing
-# the partition, regardless of the flip's direction.
+# Every batch a walk accepts passes its own checksum. With enforce_fsync =
+# false, the index only locates data because page-cache writeback can preserve
+# a later log page while losing an earlier one, so recovery walks every segment
+# from byte 0. A clean walk preserves the existing index and performs no disk
+# mutation. With enforce_fsync = true, completed serialized log fdatasyncs
+# prove the prefix before the last index entry, so a healthy boot starts at
+# that last entry and leaves earlier at-rest damage to the read path's
+# validate_checksum. Wherever a recovery walk finds damage, it truncates only
+# when nothing decodable follows and refuses when something does.
+#
+# The non-fsync verification pass therefore reads and checksums every log byte
+# at boot, although it keeps a clean index in place. A byte-0 repair walk also
+# rebuilds a missing or contradicted index durably, adding two fsyncs per
+# repaired segment. Either path can take minutes over thousands of segments.
+# A restore that dropped every .index repairs every segment; an ordinary
+# fsynced crash usually repairs only its tail segment. A slow boot is therefore
+# not by itself evidence of a stall. Before, the repair shapes refused boot.
+#
+# Either walk refuses a verifying batch whose base offset does not continue
+# the chain, or whose partition_id stamp is not this partition's. The one
+# exception is the first batch at an index-derived anchor: the offset it
+# fails to match is the ENTRY's, not the log's, so a mismatch there breaks
+# the walk as a stale entry, leaving the verdict to the byte-0 rebuild. A
+# batch that fails its own checksum is damage rather than data
+# whatever its fields claim: the walk stops there and the residue goes
+# through the damage probe like any other torn tail, so a bit flip in a tail
+# batch's offset truncates instead of refusing the partition, regardless of
+# the flip's direction.
 #
 # Damage in the middle of a segment is never silently truncated: the
 # partition is refused, as is trailing residue whose verification cost

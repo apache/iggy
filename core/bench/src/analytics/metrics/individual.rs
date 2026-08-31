@@ -28,7 +28,7 @@ use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::individual_metrics_summary::BenchmarkIndividualMetricsSummary;
 use bench_report::time_series::TimeSeries;
-use bench_report::utils::{max, min, std_dev};
+use bench_report::utils::std_dev_values;
 use iggy::prelude::IggyDuration;
 
 pub fn from_records(
@@ -68,7 +68,7 @@ pub fn from_records(
         .collect();
     raw_latencies_ms.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
 
-    let latency_metrics = calculate_latency_metrics(&raw_latencies_ms, &latency_ts);
+    let latency_metrics = calculate_latency_metrics(&raw_latencies_ms);
 
     BenchmarkIndividualMetrics {
         summary: BenchmarkIndividualMetricsSummary {
@@ -219,10 +219,7 @@ struct LatencyMetrics {
     std_dev: f64,
 }
 
-fn calculate_latency_metrics(
-    sorted_latencies_ms: &[f64],
-    latency_ts: &TimeSeries,
-) -> LatencyMetrics {
+fn calculate_latency_metrics(sorted_latencies_ms: &[f64]) -> LatencyMetrics {
     let p50 = calculate_percentile(sorted_latencies_ms, 50.0);
     let p90 = calculate_percentile(sorted_latencies_ms, 90.0);
     let p95 = calculate_percentile(sorted_latencies_ms, 95.0);
@@ -238,9 +235,11 @@ fn calculate_latency_metrics(
         sorted_latencies_ms[len]
     };
 
-    let min = min(latency_ts).unwrap_or(0.0);
-    let max = max(latency_ts).unwrap_or(0.0);
-    let std_dev = std_dev(latency_ts).unwrap_or(0.0);
+    // Taken from raw samples, not from `latency_ts`: that series is averaged
+    // per sampling bucket, which pulls the extremes inside the percentiles.
+    let min = sorted_latencies_ms[0];
+    let max = sorted_latencies_ms[sorted_latencies_ms.len() - 1];
+    let std_dev = std_dev_values(sorted_latencies_ms).unwrap_or(0.0);
 
     LatencyMetrics {
         p50,
@@ -272,4 +271,52 @@ pub fn calculate_percentile(sorted_data: &[f64], percentile: f64) -> f64 {
 
     let weight = rank - lower as f64;
     sorted_data[lower].mul_add(1.0 - weight, sorted_data[upper] * weight)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn record(elapsed_time_us: u64, latency_us: u64) -> BenchmarkRecord {
+        BenchmarkRecord {
+            elapsed_time_us,
+            latency_us,
+            messages: 1,
+            message_batches: 1,
+            user_data_bytes: 1_000,
+            total_bytes: 1_000,
+        }
+    }
+
+    #[test]
+    fn given_latencies_averaged_into_one_bucket_when_building_metrics_should_report_raw_extremes() {
+        let records = [
+            record(1_000, 1_000),
+            record(2_000, 2_000),
+            record(3_000, 10_000),
+        ];
+
+        let metrics = from_records(
+            &records,
+            BenchmarkKind::PinnedProducer,
+            ActorKind::Producer,
+            0,
+            IggyDuration::from_str("1s").unwrap(),
+            20,
+        );
+
+        // A single sampling bucket holds every record, so the series carries
+        // only their average and hides both the 1 ms and the 10 ms sample.
+        assert_eq!(metrics.latency_ts.points.len(), 1);
+        assert!((metrics.latency_ts.points[0].value - 4.333).abs() < 1e-9);
+
+        let summary = &metrics.summary;
+        assert!((summary.min_latency_ms - 1.0).abs() < f64::EPSILON);
+        assert!((summary.max_latency_ms - 10.0).abs() < f64::EPSILON);
+        // Population std dev of [1, 2, 10]; the one-point series would give 0.
+        assert!((summary.std_dev_latency_ms - 4.027_682).abs() < 1e-6);
+        assert!(summary.min_latency_ms <= summary.p50_latency_ms);
+        assert!(summary.max_latency_ms >= summary.p9999_latency_ms);
+    }
 }
