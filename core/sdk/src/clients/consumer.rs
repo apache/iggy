@@ -500,7 +500,6 @@ unsafe impl Sync for IggyConsumer {}
 ///   [`allow_replay()`], which turns that filter off.
 /// - **Delivering at-least-once.** If you cannot tolerate missing any messages, use [`AutoCommit::Disabled`]
 ///   and store the offset using [`Self::store_offset()`] after handling a message.
-///   Alternatively, you can use [`IggyConsumerMessageExt::consumer_messages()`] with [`AutoCommitAfter`].
 ///   All other settings risk missing a number of messages dependent on [`AutoCommit`] when the handler
 ///   crashes.
 ///
@@ -893,7 +892,7 @@ impl IggyConsumer {
 
             // Absent streams or topics are not necessarily permanent failures.
             // It may happen that get_stream/ get_topic races the initial setup of the stream/ topic.
-            // Retry for init_retires times, while waiting interval between retries.
+            // Retry for init_retries times, while waiting interval between retries.
             loop {
                 if stream_exists && topic_exists {
                     info!(
