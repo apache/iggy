@@ -92,12 +92,11 @@ Every installation below compiles the Rust extension, so you'll need:
    pytest tests/ -v # make sure iggy-server is running and the venv is activated
    ```
 
-4. To update the stubs, only after changing the pyo3 API surface (nothing in CI checks stub freshness, so unconditional regen just invites `.pyi` churn), use
+4. To update the stubs, after changing the pyo3 API surface, use
 
    ```bash
    # run from foreign/python
    cargo run --bin stub_gen
-   # TODO: Known bug: running this from a subdirectory of `foreign/python` corrupts the tracked stub, see https://github.com/apache/iggy/pull/3825/changes/BASE..773a27971b4ddb7b44773ded395ed23afb1de4c9#r3727691619
    ```
 
 5. Before committing, test the pre-commit and pre-push hooks. `prek` only inspects staged content, so stage your work first:

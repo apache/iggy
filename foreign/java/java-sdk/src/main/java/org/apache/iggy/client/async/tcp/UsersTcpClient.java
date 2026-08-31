@@ -190,6 +190,7 @@ public class UsersTcpClient implements UsersClient {
 
         return connection().send(CommandCode.User.LOGOUT.getValue(), payload).thenAccept(response -> {
             response.release();
+            routingHook.forgetLogin();
             log.debug("Logged out successfully");
         });
     }

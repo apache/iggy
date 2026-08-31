@@ -115,7 +115,7 @@ func TestEncodeRequest_SendsNonReplicatedCommandsBeforeRegister(t *testing.T) {
 	assert.Equal(t, uint64(1), binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 }
 
-func TestEncodeRequest_DoesNotAdvanceTheWatermarkOffTheMetadataPlane(t *testing.T) {
+func TestEncodeRequest_DoesNotAdvanceTheWatermarkForNonReplicated(t *testing.T) {
 	session := boundSession(t)
 
 	for range 3 {
@@ -123,12 +123,21 @@ func TestEncodeRequest_DoesNotAdvanceTheWatermarkOffTheMetadataPlane(t *testing.
 		require.NoError(t, err)
 	}
 	assert.Equal(t, uint64(1), session.CurrentRequestID())
+}
 
-	for range 3 {
-		_, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
+func TestEncodeRequest_PartitionCommandConsumesTheWatermark(t *testing.T) {
+	// Dedup identity requires each send to carry a distinct id, so partition
+	// commands advance the counter exactly like metadata commands and the two
+	// planes interleave on one sequence.
+	session := boundSession(t)
+
+	for expected := uint64(1); expected <= 3; expected++ {
+		frame, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
 		require.NoError(t, err)
+		header := frameHeader(t, frame)
+		assert.Equal(t, expected, binary.LittleEndian.Uint64(header[requestOffsetRequest:]))
 	}
-	assert.Equal(t, uint64(1), session.CurrentRequestID())
+	assert.Equal(t, uint64(4), session.CurrentRequestID())
 }
 
 func TestEncodeRequest_AdvancesTheWatermarkPerMetadataCommand(t *testing.T) {
@@ -157,6 +166,7 @@ func TestEncodeRequest_RejectsAPartitionCommandOnAnUnboundSession(t *testing.T) 
 
 	_, err := EncodeRequest(session, uint32(command.SendMessagesCode), []byte{1})
 	assert.ErrorIs(t, err, ierror.ErrUnauthenticated)
+	assert.Equal(t, uint64(1), session.CurrentRequestID(), "the rejection burns no id")
 }
 
 func TestEncodeRequest_EncodesASendMessagesFrame(t *testing.T) {

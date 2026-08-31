@@ -20,10 +20,10 @@ package tcp_test
 import (
 	"context"
 	"math/rand"
-	"os"
 	"strings"
 	"time"
 
+	"github.com/apache/iggy/bdd/go/tests/env"
 	"github.com/apache/iggy/foreign/go/client"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 
@@ -32,7 +32,8 @@ import (
 
 func createAuthorizedConnection() iggcon.Client {
 	cli := createClient()
-	_, err := cli.LoginUser(context.Background(), "iggy", "iggy")
+	username, password := env.RootCredentials()
+	_, err := cli.LoginUser(context.Background(), username, password)
 	if err != nil {
 		panic(err)
 	}
@@ -40,13 +41,9 @@ func createAuthorizedConnection() iggcon.Client {
 }
 
 func createClient() iggcon.Client {
-	addr := os.Getenv("IGGY_TCP_ADDRESS")
-	if addr == "" {
-		addr = "127.0.0.1:8090"
-	}
 	cli, err := client.NewIggyClient(
 		client.WithTcp(
-			tcp.WithServerAddress(addr),
+			tcp.WithServerAddress(env.ServerAddress()),
 		),
 	)
 	if err != nil {

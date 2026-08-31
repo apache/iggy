@@ -65,7 +65,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
 use crate::bootstrap::ServerShard;
-use crate::cluster_meta::ClusterRoster;
+use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes};
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
@@ -103,6 +103,7 @@ pub async fn start(
     max_tokens_per_user: u32,
     cluster: &ClusterConfig,
     system_config: Arc<ServerSystemConfig>,
+    self_advertised: &str,
     self_ports: TransportPorts,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
@@ -149,8 +150,8 @@ pub async fn start(
         roster: ClusterRoster {
             enabled: cluster.enabled,
             name: cluster.name.clone(),
-            nodes: cluster.nodes.iter().cloned().map(Into::into).collect(),
-            self_ip: bound_addr.ip().to_string(),
+            nodes: resolved_roster_nodes(cluster).map_err(ServerError::Config)?,
+            self_advertised: self_advertised.to_owned(),
             // The self node reports the live bound HTTP port; the other client
             // ports arrive resolved from the caller.
             self_ports: TransportPorts {
@@ -275,13 +276,7 @@ fn router(
         .is_some()
         .then(|| state.metrics.request_counter());
     let forwardable = forwardable_routes(state.clone());
-    // The partition-plane routes (produce, consumer-offset writes) stay local:
-    // each partition is its own consensus group whose primary can diverge from
-    // the metadata primary, so forwarding them to the metadata primary would
-    // livelock whenever the two disagree.
-    // TODO: forward partition-plane writes to their own partition group's
-    // primary (requires resolving the target partition from the request before
-    // dispatch, and rewriting balanced partitioning to an explicit partition).
+    let partition_writes = partition_write_routes(state.clone());
     let local = Router::new()
         .route(PING_PATH, get(ping))
         .route("/users/login", post(login_user))
@@ -292,15 +287,11 @@ fn router(
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
-            get(poll_messages).post(send_messages),
+            get(poll_messages),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
-            get(get_consumer_offset).put(store_consumer_offset),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
-            delete(delete_consumer_offset),
+            get(get_consumer_offset),
         )
         .route("/stats", get(get_stats))
         .route("/options/{scope}", get(describe_options))
@@ -314,6 +305,7 @@ fn router(
     };
     let router = Router::new()
         .merge(forwardable)
+        .merge(partition_writes)
         .merge(local)
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_request_size))
@@ -356,6 +348,26 @@ fn router(
     // axum rebuilds per request. Identity on already-finalized routes, so
     // both the plain and the TLS serve paths share the finalized form.
     merge_web_ui(router, web_ui).with_state(())
+}
+
+/// Acknowledged partition writes use a bounded HTTP roster fallback. This is
+/// a correctness path for the existing stateless HTTP transport. Direct
+/// partition-primary routing remains the scalable long-term design.
+fn partition_write_routes(state: HttpState) -> Router<HttpState> {
+    Router::new()
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/messages",
+            post(send_messages),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
+            put(store_consumer_offset),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
+            delete(delete_consumer_offset),
+        )
+        .route_layer(from_fn_with_state(state, forward::forward_partition_write))
 }
 
 /// The control-plane route table: every write here commits through the

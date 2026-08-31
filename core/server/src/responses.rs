@@ -682,7 +682,7 @@ where
             (!(consensus.has_ceded_primaryship() && primary_index == consensus.replica()))
                 .then_some(primary_index)
         })
-        .or_else(|| roster.current_primary_index());
+        .or_else(|| roster.current_primary_replica_id());
     let metadata = roster.cluster_metadata(primary_index, client_ip);
     ClusterMetadataResponse {
         name: metadata.name,

@@ -71,6 +71,13 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     private const int VsrMaxLeaderRedirects = 3;
 
     /// <summary>
+    ///     Bound on one endpoint's dial while other endpoints are queued behind it. Neither the connect nor the
+    ///     TLS handshake has a deadline of its own, so a node whose syns are dropped would hold the sweep for
+    ///     the whole kernel connect timeout - minutes - while a survivor goes untried. Matches the Rust SDK.
+    /// </summary>
+    private const int FailoverDialTimeout = 2_000;
+
+    /// <summary>
     ///     Attempts a consumer-group poll gets before it gives up and reports an empty poll: one re-sync after
     ///     the coordinator fences a stale assignment, then one retry.
     /// </summary>
@@ -401,6 +408,25 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         return true;
     }
 
+    /// <summary>
+    ///     Keeps every node the roster names as a dial candidate. Replaced wholesale rather than merged: the
+    ///     roster is the cluster's own answer about where its nodes are, so a node it dropped stops being dialed.
+    ///     The configured address is kept separately and outlives it. A node that does not expose the tcp
+    ///     transport reports port 0 and is skipped, since dialing it would burn an attempt on an endpoint that
+    ///     cannot answer.
+    /// </summary>
+    private void RememberRoster(ClusterMetadata clusterMetadata)
+    {
+        var endpoints = clusterMetadata.Nodes
+            .Where(node => node.Endpoints.Tcp != 0)
+            .Select(node => ServerAddress.HostPort(node.Ip, node.Endpoints.Tcp))
+            .ToArray();
+        if (endpoints.Length > 0)
+        {
+            _rosterAddresses = endpoints;
+        }
+    }
+
     private async Task<ClusterNode?> GetCurrentLeaderNodeAsync(CancellationToken token)
     {
         var leaderlessDeadline = Environment.TickCount64 + VsrLeaderlessWaitMs;
@@ -413,6 +439,8 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 {
                     return null;
                 }
+
+                RememberRoster(clusterMetadata);
 
                 if (clusterMetadata.Nodes.Count() == 1)
                 {
@@ -494,8 +522,10 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
         var clearSensitiveReply = HasSensitiveReply(code);
         var overallDeadline = Environment.TickCount64 + VsrRequestTimeoutMs;
         var requestEncoded = false;
-        var redirects = 0;
+        var leaderRedirects = 0;
         var redirectBudgetLogged = false;
+        var walkingRoster = false;
+        HashSet<string> walkedRosterEndpoints = new(StringComparer.OrdinalIgnoreCase);
         VsrConnection? lastConnection = null;
 
         try
@@ -524,12 +554,27 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                     && allowRedirect
                     && Environment.TickCount64 < overallDeadline)
                 {
-                    if (redirects < VsrMaxLeaderRedirects && await RedirectAsync(token))
+                    var moved = false;
+                    if (leaderRedirects < VsrMaxLeaderRedirects && !walkingRoster)
                     {
-                        redirects++;
-                        await ConnectAsync(token);
+                        moved = await RedirectAsync(token);
+                        if (moved)
+                        {
+                            leaderRedirects++;
+                        }
                     }
-                    else if (redirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
+
+                    if (!moved)
+                    {
+                        moved = await RedirectToNextRosterNodeAsync(walkedRosterEndpoints, token);
+                        walkingRoster |= moved;
+                    }
+
+                    if (moved)
+                    {
+                        await ConnectAsync(true, !walkingRoster, token);
+                    }
+                    else if (!walkingRoster && leaderRedirects >= VsrMaxLeaderRedirects && !redirectBudgetLogged)
                     {
                         redirectBudgetLogged = true;
                         _logger.LogWarning("Maximum leader redirections reached, continuing on {Address}",
@@ -541,6 +586,9 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
                 if (attempt.Error is VsrSessionEvictedException evicted)
                 {
+                    // The session is gone, but the sign-in that established it is not: a stale-client
+                    // eviction comes off the server's heartbeat timer, so the reconnect re-establishes it.
+                    // Only an explicit sign-out or Dispose ends it.
                     if (attempt.RequestStarted && !VsrOperations.IsReplaySafeRead(code, isLoginRegister, body.Span))
                     {
                         throw new VsrRequestOutcomeUnknownException(evicted);
@@ -568,6 +616,64 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
 
             throw;
         }
+    }
+
+    /// <summary>
+    ///     Moves to the next unvisited roster endpoint after a never-admitted refusal. Metadata and partition
+    ///     groups elect independently, so the metadata leader is not necessarily the primary for the request's
+    ///     partition. The caller's request deadline and redirect budget bound the walk.
+    /// </summary>
+    private async Task<bool> RedirectToNextRosterNodeAsync(HashSet<string> visited, CancellationToken token)
+    {
+        var roster = _rosterAddresses;
+        if (roster.Length == 0)
+        {
+            return false;
+        }
+
+        var currentIndex = Array.FindIndex(roster, address =>
+            (_connectedAddress.Length > 0 && ServerAddress.IsSame(address, _connectedAddress))
+            || (_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(address, _currentRemoteAddress)));
+        if (currentIndex >= 0)
+        {
+            visited.Add(roster[currentIndex]);
+        }
+
+        string? next = null;
+        for (var offset = 1; offset <= roster.Length; offset++)
+        {
+            var candidate = roster[(Math.Max(currentIndex, -1) + offset) % roster.Length];
+            if (visited.Contains(candidate)
+                || (_connectedAddress.Length > 0 && ServerAddress.IsSame(candidate, _connectedAddress))
+                || (_currentRemoteAddress.Length > 0 && ServerAddress.IsSame(candidate, _currentRemoteAddress)))
+            {
+                continue;
+            }
+
+            next = candidate;
+            break;
+        }
+
+        if (next is null)
+        {
+            return false;
+        }
+        visited.Add(next);
+        _logger.LogInformation("The request was refused on {Address}, walking the roster to {NextAddress}",
+            _connectedAddress, next);
+
+        await _sendingSemaphore.WaitAsync(token);
+        try
+        {
+            _currentAddress = next;
+            DropVsrConnectionLocked(_connection);
+        }
+        finally
+        {
+            _sendingSemaphore.Release();
+        }
+
+        return true;
     }
 
     /// <summary>
