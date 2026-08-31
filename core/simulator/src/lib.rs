@@ -1982,9 +1982,11 @@ mod tests {
         // `WireConsumer` discriminant so every such request was dropped unparsed (see
         // `ops::sample_consumer_kind`); and per-stream seeds moving from XOR salts to
         // [`SimSeeds`] alongside `Xoshiro256Plus` becoming `Xoshiro256PlusPlus`, which
-        // together remap every stream.
+        // together remap every stream; and partition ops drawing from the one shared
+        // request counter instead of a separate sequence based at `1<<63`, which
+        // renumbers every partition request id and so every reply header in the trace.
         assert_eq!(
-            h1, 0x1376_D480_4A3F_E6A9,
+            h1, 0x5C2B_6057_2DA9_908B,
             "workload reply hash drifted from locked baseline"
         );
     }

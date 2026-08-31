@@ -84,13 +84,19 @@ public final class ConsensusSession {
      * counter. The wire field is a u64 but Java has no unsigned long, so the
      * counter is refused at {@link Long#MAX_VALUE} rather than wrapping
      * negative and sending an id below the server's watermark.
+     *
+     * <p>Exhaustion is terminal for this instance. {@link #beginRegister()}
+     * deliberately carries the counter across a re-login to keep pending-reply
+     * correlation keys unique, so reconnecting cannot rewind it; only a new
+     * client instance starts a fresh sequence.
      */
     synchronized long nextRequestId() {
         if (session == null) {
             throw new IggyNotConnectedException("Not authenticated, call login first");
         }
         if (requestCounter == Long.MAX_VALUE) {
-            throw new IllegalStateException("VSR request counter exhausted, reconnect to register a fresh session");
+            throw new IllegalStateException(
+                    "VSR request counter exhausted, create a fresh client instance (reconnecting preserves the counter)");
         }
         return requestCounter++;
     }
