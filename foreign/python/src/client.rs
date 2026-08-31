@@ -1201,8 +1201,16 @@ impl IggyClient {
                 .init()
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let state = consumer.state();
+            let name = consumer.name().to_string();
+            let stream = PyIdentifier::try_from(consumer.stream())?;
+            let topic = PyIdentifier::try_from(consumer.topic())?;
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
+                state,
+                name,
+                stream,
+                topic,
             })
         })
     }

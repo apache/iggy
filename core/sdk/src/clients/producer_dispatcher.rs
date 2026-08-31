@@ -20,7 +20,7 @@ use crate::clients::producer_config::{BackgroundConfig, BackpressureMode};
 use crate::clients::producer_error_callback::ErrorCtx;
 use crate::clients::producer_sharding::{Shard, ShardMessage, ShardMessageWithPermit};
 use futures::FutureExt;
-use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning, Sizeable};
+use iggy_common::{Identifier, IggyByteSize, IggyError, IggyMessage, Partitioning, Sizeable};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Semaphore, broadcast};
@@ -61,13 +61,16 @@ impl ProducerDispatcher {
             tracing::debug!("error-callback worker finished");
         });
 
-        let bytes_permit = {
-            let bytes = config.max_buffer_size.as_bytes_usize();
-            if bytes == 0 { usize::MAX } else { bytes }
-        };
+        let max_buffer_size = config.max_buffer_size.as_bytes_u64();
+        assert!(
+            max_buffer_size == 0 || max_buffer_size <= Semaphore::MAX_PERMITS as u64,
+            "max_buffer_size cannot exceed {} bytes on this platform",
+            Semaphore::MAX_PERMITS
+        );
+        let bytes_permit = Arc::new(Semaphore::new(max_buffer_size as usize));
 
         let slots_permit = Arc::new(Semaphore::new(if config.max_in_flight == 0 {
-            usize::MAX
+            Semaphore::MAX_PERMITS
         } else {
             config.max_in_flight
         }));
@@ -87,7 +90,7 @@ impl ProducerDispatcher {
             shards,
             config,
             closed: AtomicBool::new(false),
-            bytes_permit: Arc::new(Semaphore::new(bytes_permit)),
+            bytes_permit,
             stop_tx,
             join_handle: handle,
         }
@@ -112,41 +115,45 @@ impl ProducerDispatcher {
         };
         let batch_bytes = shard_message.get_size_bytes();
 
-        if batch_bytes > self.config.max_buffer_size {
+        if self.config.max_buffer_size != 0 && batch_bytes > self.config.max_buffer_size {
             return Err(IggyError::BackgroundSendBufferOverflow);
         }
 
-        let permit_bytes = match self
-            .bytes_permit
-            .clone()
-            .try_acquire_many_owned(batch_bytes.as_bytes_u32())
-        {
-            Ok(perm) => perm,
-            Err(_) => match self.config.failure_mode {
-                BackpressureMode::FailImmediately => {
-                    return Err(IggyError::BackgroundSendBufferOverflow);
-                }
-                BackpressureMode::Block => self
-                    .bytes_permit
-                    .clone()
-                    .acquire_many_owned(batch_bytes.as_bytes_u32())
-                    .await
-                    .map_err(|_| IggyError::BackgroundSendError)?,
-                BackpressureMode::BlockWithTimeout(timeout_dur) => {
-                    match tokio::time::timeout(
-                        timeout_dur.get_duration(),
-                        self.bytes_permit
-                            .clone()
-                            .acquire_many_owned(batch_bytes.as_bytes_u32()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(perm)) => perm,
-                        Ok(Err(_)) => return Err(IggyError::BackgroundSendError),
-                        Err(_) => return Err(IggyError::BackgroundSendTimeout),
+        let permit_count = Self::permit_count(batch_bytes)?;
+        let bytes_permit = if self.config.max_buffer_size == 0 {
+            None
+        } else {
+            let permit = match self
+                .bytes_permit
+                .clone()
+                .try_acquire_many_owned(permit_count)
+            {
+                Ok(permit) => permit,
+                Err(_) => match &self.config.failure_mode {
+                    BackpressureMode::FailImmediately => {
+                        return Err(IggyError::BackgroundSendBufferOverflow);
                     }
-                }
-            },
+                    BackpressureMode::Block => self
+                        .bytes_permit
+                        .clone()
+                        .acquire_many_owned(permit_count)
+                        .await
+                        .map_err(|_| IggyError::BackgroundSendError)?,
+                    BackpressureMode::BlockWithTimeout(timeout_duration) => {
+                        match tokio::time::timeout(
+                            timeout_duration.get_duration(),
+                            self.bytes_permit.clone().acquire_many_owned(permit_count),
+                        )
+                        .await
+                        {
+                            Ok(Ok(permit)) => permit,
+                            Ok(Err(_)) => return Err(IggyError::BackgroundSendError),
+                            Err(_) => return Err(IggyError::BackgroundSendTimeout),
+                        }
+                    }
+                },
+            };
+            Some(permit)
         };
 
         let shard_ix = self.config.sharding.pick_shard(
@@ -159,8 +166,13 @@ impl ProducerDispatcher {
         let shard = &self.shards[shard_ix];
 
         shard
-            .send(ShardMessageWithPermit::new(shard_message, permit_bytes))
+            .send(ShardMessageWithPermit::new(shard_message, bytes_permit))
             .await
+    }
+
+    fn permit_count(batch_size: IggyByteSize) -> Result<u32, IggyError> {
+        u32::try_from(batch_size.as_bytes_u64())
+            .map_err(|_| IggyError::BackgroundSendBufferOverflow)
     }
 
     /// Flushes each shard's buffer and stops its worker. Dropping the
@@ -174,7 +186,7 @@ impl ProducerDispatcher {
         let _ = self.stop_tx.send(());
 
         for shard in self.shards.drain(..) {
-            if let Err(e) = shard._handle.await {
+            if let Err(e) = shard.handle.await {
                 tracing::error!("shard panicked: {e:?}");
             }
         }
@@ -235,6 +247,60 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_succeeds_with_unlimited_buffer_and_in_flight_requests() {
+        let mut mock = MockProducerCoreBackend::new();
+        mock.expect_send_internal()
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(no_confirmations()) }));
+
+        let config = BackgroundConfig::builder()
+            .max_buffer_size(0.into())
+            .max_in_flight(0)
+            .batch_length(1)
+            .build();
+        let dispatcher = ProducerDispatcher::new(Arc::new(mock), config);
+
+        assert_eq!(dispatcher.bytes_permit.available_permits(), 0);
+        dispatcher
+            .dispatch(
+                vec![dummy_message(5)],
+                dummy_identifier(),
+                dummy_identifier(),
+                None,
+            )
+            .await
+            .unwrap();
+        dispatcher.shutdown().await;
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[tokio::test]
+    async fn test_dispatcher_supports_buffer_budget_above_u32_max() {
+        let mock = MockProducerCoreBackend::new();
+        let budget_size = u32::MAX as u64 + 1;
+        let config = BackgroundConfig::builder()
+            .max_buffer_size(budget_size.into())
+            .build();
+        let dispatcher = ProducerDispatcher::new(Arc::new(mock), config);
+
+        assert_eq!(
+            dispatcher.bytes_permit.available_permits(),
+            budget_size as usize
+        );
+        dispatcher.shutdown().await;
+    }
+
+    #[test]
+    fn test_permit_count_rejects_batch_above_u32_max() {
+        let result = ProducerDispatcher::permit_count(IggyByteSize::from(u32::MAX as u64 + 1));
+
+        assert!(matches!(
+            result,
+            Err(IggyError::BackgroundSendBufferOverflow)
+        ));
     }
 
     #[tokio::test]

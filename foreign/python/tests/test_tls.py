@@ -66,6 +66,7 @@ def tls_container():
         .with_env("IGGY_TCP_TLS_CERT_FILE", "/app/certs/iggy_cert.pem")
         .with_env("IGGY_TCP_TLS_KEY_FILE", "/app/certs/iggy_key.pem")
         .with_env("IGGY_TCP_ADDRESS", f"0.0.0.0:{CONTAINER_TCP_PORT}")
+        .with_env("IGGY_NODE_ADVERTISED_ADDRESS", "127.0.0.1")
         .with_volume_mapping(CERTS_DIR, "/app/certs", "ro")
         .with_kwargs(privileged=True)
     )

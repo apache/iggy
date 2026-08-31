@@ -57,6 +57,12 @@ pub struct IggyTestAttrs {
     pub seed_fn: Option<syn::Path>,
     pub cluster_nodes: ClusterNodesValue,
     pub jwks_server: Option<JwksAttrs>,
+    /// Skip the generated `start()` call so the test brings nodes up itself.
+    /// For boot-ordering tests, which need a cluster that begins serving
+    /// before every configured node has arrived; `start` waits for all of
+    /// them. Pairs with `TestHarness::start_nodes` / `start_node`. A `seed`
+    /// cannot run under it, since no node is up when it would fire.
+    pub manual_start: bool,
 }
 
 /// JWKS server attributes.
@@ -90,6 +96,7 @@ impl IggyTestAttrs {
             seed_fn: None,
             cluster_nodes: ClusterNodesValue::None,
             jwks_server: None,
+            manual_start: false,
         }
     }
 }
@@ -265,6 +272,9 @@ impl Parse for IggyTestAttrs {
                 AttrItem::JwksServer(jwks) => {
                     attrs.jwks_server = Some(jwks);
                 }
+                AttrItem::ManualStart => {
+                    attrs.manual_start = true;
+                }
             }
         }
 
@@ -282,6 +292,7 @@ enum AttrItem {
     Seed(syn::Path),
     ClusterNodes(ClusterNodesValue),
     JwksServer(JwksAttrs),
+    ManualStart,
 }
 
 impl Parse for AttrItem {
@@ -317,6 +328,7 @@ impl Parse for AttrItem {
                 let jwks = parse_jwks_attrs(&content)?;
                 Ok(AttrItem::JwksServer(jwks))
             }
+            "manual_start" => Ok(AttrItem::ManualStart),
             _ => Err(syn::Error::new(
                 ident.span(),
                 format!("unknown attribute: {ident_str}"),
