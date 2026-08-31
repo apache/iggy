@@ -468,7 +468,7 @@ pub async fn send_eviction_to_client<B, P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_table::REGISTER_REQUEST_ID;
+    use crate::client_table::{REGISTER_REQUEST_ID, REPLY_RING_RETENTION_BYTES};
     use crate::{CLIENTS_TABLE_MAX, LocalPipeline};
     use iggy_binary_protocol::{Command, Operation, ReplyHeader};
     use message_bus::SendError;
@@ -740,8 +740,10 @@ mod tests {
         client_table
             .borrow_mut()
             .commit_register(client_id, ACTING_USER_ID, initial_reply);
-        // Ring capacity is 5, so request 1's reply is displaced once 6 commits.
-        for request in 1..=6u64 {
+        // Enough replies to exhaust the retention budget, so request 1's is
+        // certain to have been dropped.
+        let requests = (REPLY_RING_RETENTION_BYTES / size_of::<ReplyHeader>() + 8) as u64;
+        for request in 1..=requests {
             let reply =
                 synthesize_send_messages_reply(&consensus, client_id, request, 100 + request);
             client_table

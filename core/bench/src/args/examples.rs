@@ -37,6 +37,12 @@ const EXAMPLES: &str = r#"EXAMPLES:
     $ cargo r -r --bin iggy-bench -- balanced-producer-and-consumer-group --partitions 24 --producers 6 --consumers 6 tcp
     $ cargo r -r --bin iggy-bench -- -T 10GB bpc tcp
 
+    Durability-matched run, where every produce ack waits for an fsync
+    (--partitions 1 routes every producer straight to that partition):
+
+    $ cargo r -r --bin iggy-bench -- --enforce-fsync --messages-required-to-save 1 \
+        balanced-producer --partitions 1 --producers 8 tcp
+
 3) End-to-End Benchmarking:
 
     Run end-to-end benchmarks that measure performance for a producer that is also a consumer:

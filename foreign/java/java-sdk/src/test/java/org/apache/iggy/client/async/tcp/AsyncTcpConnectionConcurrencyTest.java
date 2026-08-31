@@ -111,7 +111,7 @@ class AsyncTcpConnectionConcurrencyTest {
                     Duration.ofHours(1),
                     1024 * 1024,
                     null,
-                    () -> {},
+                    errorCode -> {},
                     ignored -> {});
             try {
                 connection.connect().get(5, TimeUnit.SECONDS);
@@ -308,7 +308,7 @@ class AsyncTcpConnectionConcurrencyTest {
                 heartbeatInterval,
                 1024 * 1024,
                 null,
-                () -> {},
+                errorCode -> {},
                 ignored -> {});
     }
 
