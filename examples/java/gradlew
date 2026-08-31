@@ -102,6 +102,55 @@ die () {
     exit 1
 } >&2
 
+##############################################################################
+#
+#   Gradle Wrapper JAR Auto-Fetch
+#
+#   Since the Apache Software Foundation prohibits binary files in source
+#   repositories, we download the gradle-wrapper.jar from the official
+#   Gradle repository if it's missing.
+#
+##############################################################################
+
+GRADLE_WRAPPER_VERSION=9.7.1
+REQUIRED_WRAPPER_JAR_CHECKSUM="7a9ce74cff467ca1bf60a4fcd9f05185acceda4d0f382434d393e17864262c5d"
+
+for _ in 1 2 3; do
+    if [ ! -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then
+        if ! curl -s -S --retry 3 -L -o "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" "https://raw.githubusercontent.com/gradle/gradle/v$GRADLE_WRAPPER_VERSION/gradle/wrapper/gradle-wrapper.jar"; then
+            rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+            sleep 5
+            continue
+        fi
+    fi
+
+    if [ -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            LOCAL_WRAPPER_JAR_CHECKSUM=$(sha256sum "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" | awk '{print $1}')
+        elif command -v shasum >/dev/null 2>&1; then
+            LOCAL_WRAPPER_JAR_CHECKSUM=$(shasum -a 256 "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" | awk '{print $1}')
+        else
+            warn "Cannot find sha256sum or shasum to verify wrapper JAR."
+            break
+        fi
+
+        if [ "$LOCAL_WRAPPER_JAR_CHECKSUM" != "$REQUIRED_WRAPPER_JAR_CHECKSUM" ]; then
+            rm -f "$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+        else
+            break
+        fi
+    fi
+done
+
+if [ ! -e "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" ]; then
+    die "ERROR: Failed to download gradle-wrapper.jar after multiple attempts.
+
+Please check your network connection or manually download the file from:
+https://raw.githubusercontent.com/gradle/gradle/v$GRADLE_WRAPPER_VERSION/gradle/wrapper/gradle-wrapper.jar
+
+and place it in $APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+fi
+
 # OS specific support (must be 'true' or 'false').
 cygwin=false
 msys=false
