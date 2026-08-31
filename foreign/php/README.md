@@ -81,7 +81,7 @@ The tests assume:
 - username: `iggy`
 - password: `iggy`
 
-Override them with `IGGY_HOST`, `IGGY_PORT`, `IGGY_USERNAME`, and `IGGY_PASSWORD`.
+Override them with `IGGY_TCP_ADDRESS`, `IGGY_ROOT_USERNAME`, and `IGGY_ROOT_PASSWORD`.
 
 ## Usage
 

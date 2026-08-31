@@ -80,6 +80,9 @@ services:
   python-bdd:
     <<: *server-bdd-deps
 
+  php-bdd:
+    <<: *server-bdd-deps
+
   go-bdd:
     <<: *server-bdd-deps
 
