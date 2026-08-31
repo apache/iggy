@@ -6495,6 +6495,9 @@ where
         // mid-sweep is seen on the next tick, the same latency a capped arm
         // already accepts.
         let mut transfers_inflight: Option<usize> = None;
+        // Repair sessions this sweep has opened, against
+        // `PARTITION_REPAIR_ARMS_PER_TICK_MAX`.
+        let mut repair_arms = 0usize;
 
         let mut fatal: Option<FatalCommit> = None;
         for namespace in namespace_scratch.drain(..) {
@@ -6623,6 +6626,72 @@ where
                     namespace.inner(),
                 )
                 .await;
+            }
+
+            // Level-triggered gap detector. Every other partition arming site
+            // is edge-triggered and the edges are starvable: the commit-heartbeat
+            // backstop needs `CommitOutcome::Advanced`, and a follower has
+            // already advanced `commit_max` from each prepare header in
+            // `replicate_preflight` before the gap check dropped the prepare, so
+            // under produce load the heartbeat lands as `Accepted` and the gap
+            // wedges until an unrelated view change. Those edges stay the fast
+            // path; this is the ~1s floor under them.
+            let (gap_arm, walk_stalled) = {
+                let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                    continue;
+                };
+                let gap_drops = partition.take_prepare_gap_drops();
+                if gap_drops > 0 {
+                    self.metrics.record_partition_prepare_gap_drops(gap_drops);
+                }
+                let probe = partition_gap_probe(partition);
+                let gap_arm = drive_partition_gap_debounce(
+                    &probe,
+                    &mut partition.gap_ticks,
+                    repair_retry_ticks,
+                    repair_arms,
+                );
+                (gap_arm, partition_is_walk_stalled(&probe))
+            };
+            if gap_arm {
+                let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                    continue;
+                };
+                let consensus = partition.consensus();
+                let peer = consensus.primary_index(consensus.view());
+                let commit_min = consensus.commit_min();
+                let commit_max = consensus.commit_max();
+                tracing::info!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    commit_min,
+                    commit_max,
+                    peer,
+                    "partition gap-stopped past the debounce; arming repair from the primary"
+                );
+                self.maybe_request_partition_repair(partition, peer).await;
+                repair_arms += 1;
+            }
+
+            // Undebounced and uncapped, unlike the repair arm: the predicate
+            // guarantees the walk finds at least the next op (it and
+            // `collect_committable_from_journal` read the same `header_by_op`),
+            // so it cannot spin, and the apply is the same local, already-owed
+            // work the prepare arm runs inline uncapped.
+            if walk_stalled {
+                let config = partitions.config();
+                let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                    continue;
+                };
+                let consensus = partition.consensus();
+                tracing::info!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    commit_min = consensus.commit_min(),
+                    commit_max = consensus.commit_max(),
+                    "partition commit walk parked over resident committed ops; resuming"
+                );
+                partition.commit_journal(config).await;
             }
 
             // Transfer stall retry: descriptor and chunk frames are
@@ -8831,6 +8900,124 @@ fn repair_serve_ceiling(requested_to_op: u64, commit_max: u64, head: u64) -> u64
     requested_to_op.min(commit_max.max(head))
 }
 
+/// Repair sessions the partition tick sweep will OPEN per pass. Sibling of
+/// `IggyShard::PARTITION_TRANSFERS_INFLIGHT_MAX`: one arm is a `RequestPrepares`
+/// plus a repair stream the serving peer walks synchronously, and a node-wide
+/// gap (a rejoin, a lossy link) makes every group on this shard due in the same
+/// tick. Over-cap groups stay due and arm on a later pass.
+const PARTITION_REPAIR_ARMS_PER_TICK_MAX: usize = 3;
+
+/// What already owns a partition's recovery, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryOwner {
+    /// Nothing owns it: the sweep may arm repair.
+    Nobody,
+    Repair,
+    Transfer,
+    /// A scheduled transfer re-arm counting down. Arming repair over it would
+    /// defeat its backoff, as `arm_partition_transfer` documents.
+    TransferRearm,
+}
+
+/// What the tick sweep reads off one partition to decide whether it is
+/// gap-stopped. Split out so the guards, the debounce and the per-tick cap are
+/// testable without a shard, a bus, or a journal.
+#[derive(Debug, Clone, Copy)]
+struct GapProbe {
+    normal: bool,
+    transferring: bool,
+    recovery: RecoveryOwner,
+    commit_min: u64,
+    commit_max: u64,
+    /// Whether `commit_min + 1` is resident in the local journal.
+    next_op_resident: bool,
+}
+
+/// Whether this replica holds committed ops it cannot walk to, because the op
+/// one past its commit frontier is missing from its journal.
+///
+/// The journal-hole half is not redundant: a follower advances `commit_max`
+/// from every prepare header in `replicate_preflight`, so `commit_min <
+/// commit_max` is transiently true on every healthy pipelined tick and a bare
+/// lag test would arm repair against ordinary produce.
+const fn partition_is_gap_stopped(probe: &GapProbe) -> bool {
+    probe.normal
+        && !probe.transferring
+        && matches!(probe.recovery, RecoveryOwner::Nobody)
+        && probe.commit_min < probe.commit_max
+        && !probe.next_op_resident
+}
+
+/// The gap predicate's complement: everything the walk needs is resident, it
+/// just never ran (a heartbeat carrying a known commit is `Accepted`, and an
+/// idle group offers no other edge). Not gated on `RecoveryOwner`: repair
+/// fetches bodies without walking them, so gating parks the walk all session.
+const fn partition_is_walk_stalled(probe: &GapProbe) -> bool {
+    probe.normal
+        && !probe.transferring
+        && probe.commit_min < probe.commit_max
+        && probe.next_op_resident
+}
+
+/// Count one sweep tick against `gap_ticks` and answer whether this partition
+/// may arm repair now.
+///
+/// Level-triggered, because every edge-triggered arming site is starvable: the
+/// commit-heartbeat backstop fires only on `CommitOutcome::Advanced`, and under
+/// sustained produce the prepares consume the advance in preflight before the
+/// gap check drops them, so the heartbeat lands as `Accepted` and the gap wedges
+/// until an unrelated view change.
+///
+/// A capped-out arm keeps its debounce satisfied rather than starting over, so
+/// the group arms on the next pass with a slot free.
+const fn drive_partition_gap_debounce(
+    probe: &GapProbe,
+    gap_ticks: &mut u32,
+    debounce_ticks: u32,
+    arms_this_tick: usize,
+) -> bool {
+    if !partition_is_gap_stopped(probe) {
+        *gap_ticks = 0;
+        return false;
+    }
+    *gap_ticks = gap_ticks.saturating_add(1);
+    *gap_ticks >= debounce_ticks && arms_this_tick < PARTITION_REPAIR_ARMS_PER_TICK_MAX
+}
+
+/// Read the gap probe off a live partition.
+fn partition_gap_probe<B, SB>(partition: &IggyPartition<B, SB>) -> GapProbe
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    let consensus = partition.consensus();
+    let commit_min = consensus.commit_min();
+    // Transfer first: it supersedes repair, so naming it is the truthful
+    // diagnostic when both happen to be set.
+    let recovery = if partition.transfer.is_some() {
+        RecoveryOwner::Transfer
+    } else if partition.transfer_rearm.is_some() {
+        RecoveryOwner::TransferRearm
+    } else if partition.repair.is_some() {
+        RecoveryOwner::Repair
+    } else {
+        RecoveryOwner::Nobody
+    };
+    GapProbe {
+        normal: consensus.is_normal(),
+        transferring: consensus.is_transferring(),
+        recovery,
+        commit_min,
+        commit_max: consensus.commit_max(),
+        next_op_resident: partition
+            .log
+            .journal()
+            .inner
+            .header_by_op(commit_min.saturating_add(1))
+            .is_some(),
+    }
+}
+
 /// Whether the parked `StartView` log names every op in the uncommitted
 /// suffix `(commit_max, head]`, in descending order. Only this canonical list
 /// makes fetching bodies above the commit point safe.
@@ -10062,5 +10249,266 @@ mod superblock_fail_stop_tests {
         assert!(!superblock_wedged(119, 120));
         assert!(superblock_wedged(120, 120));
         assert!(superblock_wedged(121, 120));
+    }
+}
+
+#[cfg(test)]
+mod gap_detector_tests {
+    //! The level-triggered repair arm the partition tick sweep runs.
+    //!
+    //! Its whole reason to exist is that the edge-triggered arming sites are
+    //! starvable, so the guards it shares with them and the debounce that keeps
+    //! it off healthy traffic are the parts worth pinning.
+
+    use super::{
+        GapProbe, PARTITION_REPAIR_ARMS_PER_TICK_MAX, RecoveryOwner, drive_partition_gap_debounce,
+        partition_is_gap_stopped, partition_is_walk_stalled,
+    };
+
+    const DEBOUNCE: u32 = 100;
+
+    /// A gap-stopped follower: committed through op 10, walkable only to 5,
+    /// because op 6 is not in its journal.
+    const fn gap_stopped() -> GapProbe {
+        GapProbe {
+            normal: true,
+            transferring: false,
+            recovery: RecoveryOwner::Nobody,
+            commit_min: 5,
+            commit_max: 10,
+            next_op_resident: false,
+        }
+    }
+
+    /// A walk-stalled follower: the same lag, but op 6 IS in its journal, so
+    /// nothing needs fetching and the walk just has to run.
+    fn walk_stalled() -> GapProbe {
+        GapProbe {
+            next_op_resident: true,
+            ..gap_stopped()
+        }
+    }
+
+    #[test]
+    fn given_a_lagging_follower_with_the_next_op_resident_when_probed_should_not_be_gap_stopped() {
+        // The half that keeps the predicate honest. A follower advances
+        // commit_max from every prepare header in preflight, so commit_min <
+        // commit_max is transiently true on any pipelined tick; without the
+        // journal-hole test the driver would request repair against ordinary
+        // produce, on every partition, forever.
+        let healthy = GapProbe {
+            next_op_resident: true,
+            ..gap_stopped()
+        };
+        assert!(!partition_is_gap_stopped(&healthy));
+        assert!(partition_is_gap_stopped(&gap_stopped()));
+    }
+
+    #[test]
+    fn given_a_caught_up_follower_when_probed_should_not_be_gap_stopped() {
+        let caught_up = GapProbe {
+            commit_min: 10,
+            ..gap_stopped()
+        };
+        assert!(!partition_is_gap_stopped(&caught_up));
+    }
+
+    #[test]
+    fn given_a_replica_outside_normal_status_when_probed_should_not_be_gap_stopped() {
+        // A view change owns the log while it runs, and `maybe_request_partition_repair`
+        // refuses outside Normal anyway; arming here would only burn a nonce.
+        let electing = GapProbe {
+            normal: false,
+            ..gap_stopped()
+        };
+        assert!(!partition_is_gap_stopped(&electing));
+
+        let installing = GapProbe {
+            transferring: true,
+            ..gap_stopped()
+        };
+        assert!(!partition_is_gap_stopped(&installing));
+    }
+
+    #[test]
+    fn given_recovery_already_owned_when_probed_should_not_be_gap_stopped() {
+        for owner in [
+            RecoveryOwner::Repair,
+            RecoveryOwner::Transfer,
+            RecoveryOwner::TransferRearm,
+        ] {
+            let owned = GapProbe {
+                recovery: owner,
+                ..gap_stopped()
+            };
+            assert!(
+                !partition_is_gap_stopped(&owned),
+                "{owner:?} owns the recovery; a second session would race it"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_gap_stopped_follower_when_debouncing_should_arm_only_at_the_threshold() {
+        let probe = gap_stopped();
+        let mut gap_ticks = 0;
+        for tick in 1..DEBOUNCE {
+            assert!(
+                !drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, 0),
+                "armed at tick {tick}, before the debounce elapsed"
+            );
+        }
+        assert!(drive_partition_gap_debounce(
+            &probe,
+            &mut gap_ticks,
+            DEBOUNCE,
+            0
+        ));
+    }
+
+    #[test]
+    fn given_a_debounce_in_progress_when_the_gap_closes_should_reset_the_counter() {
+        let stopped = gap_stopped();
+        let walkable = GapProbe {
+            next_op_resident: true,
+            ..stopped
+        };
+        let mut gap_ticks = 0;
+        for _ in 0..DEBOUNCE - 1 {
+            drive_partition_gap_debounce(&stopped, &mut gap_ticks, DEBOUNCE, 0);
+        }
+        assert_eq!(gap_ticks, DEBOUNCE - 1);
+
+        assert!(!drive_partition_gap_debounce(
+            &walkable,
+            &mut gap_ticks,
+            DEBOUNCE,
+            0
+        ));
+        assert_eq!(gap_ticks, 0, "progress must restart the debounce");
+        assert!(
+            !drive_partition_gap_debounce(&stopped, &mut gap_ticks, DEBOUNCE, 0),
+            "a fresh gap must serve its own debounce, not inherit the old count"
+        );
+    }
+
+    #[test]
+    fn given_a_follower_with_resident_committed_ops_when_probed_should_be_walk_stalled() {
+        assert!(partition_is_walk_stalled(&walk_stalled()));
+        assert!(
+            !partition_is_walk_stalled(&gap_stopped()),
+            "a missing next op is repair's job; a walk over it would stop dead"
+        );
+    }
+
+    #[test]
+    fn given_a_caught_up_follower_when_probed_should_not_be_walk_stalled() {
+        let caught_up = GapProbe {
+            commit_min: 10,
+            ..walk_stalled()
+        };
+        assert!(!partition_is_walk_stalled(&caught_up));
+    }
+
+    #[test]
+    fn given_a_replica_outside_normal_status_when_probed_should_not_be_walk_stalled() {
+        let electing = GapProbe {
+            normal: false,
+            ..walk_stalled()
+        };
+        assert!(!partition_is_walk_stalled(&electing));
+
+        // Same gate as the on-commit arm: a walk during a transfer can advance
+        // commit_min past the incoming frontier.
+        let installing = GapProbe {
+            transferring: true,
+            ..walk_stalled()
+        };
+        assert!(!partition_is_walk_stalled(&installing));
+    }
+
+    #[test]
+    fn given_recovery_already_owned_when_the_next_op_is_resident_should_still_be_walk_stalled() {
+        // Deliberate: `apply_repaired_prepare` journals without walking, so a
+        // gated walk would sit parked for the whole session while the resident
+        // prefix is already applicable.
+        for owner in [
+            RecoveryOwner::Repair,
+            RecoveryOwner::Transfer,
+            RecoveryOwner::TransferRearm,
+        ] {
+            let owned = GapProbe {
+                recovery: owner,
+                ..walk_stalled()
+            };
+            assert!(
+                partition_is_walk_stalled(&owned),
+                "{owner:?} owns the fetch, not the resident prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn given_any_probe_when_evaluated_should_never_be_both_gap_stopped_and_walk_stalled() {
+        // The two halves split on `next_op_resident`; if they ever overlap, one
+        // tick both arms repair and walks the window it is fetching.
+        let owners = [
+            RecoveryOwner::Nobody,
+            RecoveryOwner::Repair,
+            RecoveryOwner::Transfer,
+            RecoveryOwner::TransferRearm,
+        ];
+        for normal in [false, true] {
+            for transferring in [false, true] {
+                for recovery in owners {
+                    for (commit_min, commit_max) in [(5, 10), (10, 10)] {
+                        for next_op_resident in [false, true] {
+                            let probe = GapProbe {
+                                normal,
+                                transferring,
+                                recovery,
+                                commit_min,
+                                commit_max,
+                                next_op_resident,
+                            };
+                            assert!(
+                                !(partition_is_gap_stopped(&probe)
+                                    && partition_is_walk_stalled(&probe)),
+                                "both predicates claim {probe:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn given_the_per_tick_cap_reached_when_debouncing_should_defer_without_losing_the_debounce() {
+        let probe = gap_stopped();
+        let mut gap_ticks = DEBOUNCE;
+        assert!(
+            !drive_partition_gap_debounce(
+                &probe,
+                &mut gap_ticks,
+                DEBOUNCE,
+                PARTITION_REPAIR_ARMS_PER_TICK_MAX
+            ),
+            "the cap must refuse the arm"
+        );
+        assert!(
+            gap_ticks > DEBOUNCE,
+            "a capped-out group stays due; restarting its debounce would push the \
+             arm a whole interval out per contended tick"
+        );
+        assert!(
+            drive_partition_gap_debounce(
+                &probe,
+                &mut gap_ticks,
+                DEBOUNCE,
+                PARTITION_REPAIR_ARMS_PER_TICK_MAX - 1
+            ),
+            "the same group arms on the next pass with a slot free"
+        );
     }
 }

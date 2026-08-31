@@ -108,20 +108,22 @@
 //! `park_dropped` when it parked and then lost its namespace. A prepare has
 //! nobody to answer, so the counter is the only record it existed.
 //!
+//! A shed or discarded *prepare* is not recovered by retransmit once its op has
+//! reached quorum (`consensus::retransmit_targets` skips entries with
+//! `ok_quorum_received`), so the backup gap-stops. `tick_partitions` opens a
+//! repair session for it: its level-triggered detector arms once a partition has
+//! been gap-stopped for the repair retry interval, independently of the
+//! edge-triggered arming sites (`StartView` adoption, the commit heartbeat, the
+//! post-transfer tail), whose edges a produce stream can starve. The park policy
+//! above still shrinks the exposure to a genuinely exhausted byte budget and a
+//! namespace this shard cannot serve; the driver bounds how long either costs,
+//! and `partition_prepare_gap_drops_total` counts what reached the gap check.
+//!
 //! # Known gaps
 //!
-//! Recorded here because both were previously carried as a TODO on the
+//! Recorded here because they were previously carried as a TODO on the
 //! materialization barrier this module used to promise, and the barrier is gone
 //! (see above) while these are not:
-//!
-//! TODO(krishna): a shed or discarded *prepare* has no recovery once its op has
-//! reached quorum. `consensus::retransmit_targets` skips entries with
-//! `ok_quorum_received`, and the partition plane creates a repair session only
-//! in `on_start_view` -- `tick_partitions` re-drives an existing session but
-//! cannot open one -- so the backup stays behind `commit_max` until an unrelated
-//! view change. It needs a normal-status repair driver. The park policy above
-//! shrinks the exposure to two cases, a genuinely exhausted byte budget and a
-//! namespace this shard cannot serve, but only the repair driver removes it.
 //!
 //! TODO(krishna): `serves_committed_incarnation` and the park stamp both call
 //! `Streams::created_revision_for_namespace`, now on the per-request fence path.

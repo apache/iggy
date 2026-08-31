@@ -97,8 +97,10 @@ const DEGRADED_MARKERS: [&str; 3] = [
 ];
 
 /// `IggyPartition::on_replicate`'s backup gap check. A re-dispatch that appends
-/// behind an op already queued on the inbox surfaces here, and the dropped op
-/// is gone: nothing refetches it while the replica's status is normal.
+/// behind an op already queued on the inbox surfaces here. The dropped op is
+/// refetched by `tick_partitions`' level-triggered repair driver, but only after
+/// its debounce interval, so a re-dispatch that trips this has already stalled
+/// the replica for ~1s and the marker still means the ordering broke.
 const GAP_MARKER: &str = "dropping out-of-order prepare (gap)";
 
 fn topic_name(index: u32) -> String {
