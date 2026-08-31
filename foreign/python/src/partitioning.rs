@@ -45,6 +45,11 @@ impl Partitioning {
     ///
     /// `partition_id` must be between 0 and `2**32 - 1`. The topic must contain
     /// that partition when the batch is sent.
+    ///
+    /// Raises:
+    ///     TypeError: If `partition_id` is not an integer.
+    ///     OverflowError: If `partition_id` is outside the supported unsigned
+    ///         32-bit range.
     #[staticmethod]
     pub fn partition_id(partition_id: u32) -> Self {
         Self {

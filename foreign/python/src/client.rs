@@ -1070,7 +1070,7 @@ impl IggyClient {
         polling_strategy: &PollingStrategy,
         count: u32,
         auto_commit: bool,
-        partition_id: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let consumer = RustConsumer::try_from(consumer)?;
         let stream = Identifier::try_from(stream)?;
