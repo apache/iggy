@@ -23,12 +23,15 @@ use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFra
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
-use iggy_binary_protocol::{GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
+use partitions::FatalCommit;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How often the shard pump drives `VsrConsensus::tick`.
 ///
@@ -60,19 +63,48 @@ where
     /// made every frame pay `bytemuck::checked::try_from_bytes` plus the
     /// header's `validate()` twice.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
+        let command = message.header().command;
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
+            Err(ConsensusError::UnsupportedOperation { operation }) => {
+                // For a replication frame this is terminal for its consensus
+                // group, not a per-frame hiccup: the op is never journaled,
+                // never acked, and every later prepare dies on the resulting
+                // gap while quorum hides the outage. Repair wraps the same
+                // typed header, so it cannot rescue this node either -- only
+                // upgrading it can. A routed request, by contrast, is dropped
+                // before journaling and stalls nothing; the consequence in the
+                // log follows the frame. Nothing fences the sending peer, so
+                // the log and the counter are the whole signal an operator
+                // gets.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNSUPPORTED_OPERATION,
+                );
+                let consequence = match command {
+                    Command::Prepare | Command::RepairPrepare | Command::PrepareOk => {
+                        "this node cannot journal or ack it, so its consensus group stops \
+                         making progress until this node is upgraded"
+                    }
+                    _ => "the frame is dropped before journaling, with no reply to the sender",
+                };
+                tracing::error!(
+                    shard = self.id,
+                    operation = format_args!("{operation:#04x}"),
+                    command = ?command,
+                    build_release = %iggy_binary_protocol::ProtocolVersion(
+                        iggy_binary_protocol::IGGY_PROTOCOL_VERSION
+                    ),
+                    "frame carries an operation this build does not know; a newer release \
+                     likely added it. {consequence}"
+                );
+                return;
+            }
             Err(e) => {
-                // TODO(hubcio): this drop is the whole story for a consensus
-                // frame carrying an Operation this build does not know: no
-                // metric, no peer error, no eviction. An old node in a mixed
-                // cluster silently gap-stops the group here (never journals
-                // the op, never PrepareOks, every later prepare dies on the
-                // gap check) while quorum hides it, and repair wraps the same
-                // typed header so it cannot rescue. Rolling upgrades across
-                // consensus-op additions need a version fence (release_min /
-                // release_max bounds on the replica plane) before this arm is
-                // safe to hit.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNPARSABLE,
+                );
                 tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
                 return;
             }
@@ -225,8 +257,25 @@ where
     /// Drain this shard's inbox and process each frame locally until the
     /// `stop` signal fires or the inbox disconnects, then drain any frames
     /// still queued so in-flight requests still get a response.
+    ///
+    /// Returns the commit fault that ended the pump, if one did. A fault
+    /// skips that queued drain: the frames in it are requests for a shard
+    /// holding a divergent partition, and answering them means re-entering
+    /// the commit path that just failed. The final flush still runs, so
+    /// every partition that CAN still reach disk does.
+    ///
+    /// `shutdown_flag` is the cross-thread server shutdown signal. The pump
+    /// flips it as soon as a commit fault is resolved, BEFORE the final
+    /// flush: the flush writes to the device whose failure raised the fault,
+    /// so it can stall indefinitely, and only the flag arms the watchdog and
+    /// the bounded pump drain that turn a stalled flush into a timed-out
+    /// non-zero exit instead of a process that reports healthy forever.
     #[allow(clippy::future_not_send)]
-    pub async fn run_message_pump(&self, stop: Receiver<()>)
+    pub async fn run_message_pump(
+        &self,
+        stop: Receiver<()>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Option<FatalCommit>
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
@@ -252,6 +301,7 @@ where
         // simulator (see `MessageBus::sleep`).
         let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
+        let mut fatal: Option<FatalCommit> = None;
         loop {
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
@@ -270,7 +320,10 @@ where
                     // decoupled from the pump again without reintroducing the
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
-                    self.tick_partitions(&mut namespace_scratch).await;
+                    if let Some(fault) = self.tick_partitions(&mut namespace_scratch).await {
+                        fatal = Some(fault);
+                        break;
+                    }
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -337,27 +390,87 @@ where
             }
         }
 
+        // A stop can win the select immediately after a frame fenced a
+        // partition, before the next tick observes it. Preserve that fault so
+        // shutdown cannot turn a durability failure into a clean pump exit.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
         // Drain remaining frames so in-flight requests get a response, and
         // the reply lane so already-forwarded replies still reach their
-        // clients before the bus tears down.
-        while let Ok(frame) = self.inbox.try_recv() {
-            if self.accept_frame_for_self(&frame) {
-                self.process_frame(frame).await;
-                self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
-                    .await;
-                self.apply_reconcile_ops();
+        // clients before the bus tears down. Skipped on a commit fault: a
+        // queued Ack or Commit frame for the fenced partition would re-enter
+        // the commit path that just failed, and `advance_commit_min` asserts
+        // on the gap the fault left. Those requests go unanswered and their
+        // clients time out, which is what a node stopping on a durability
+        // fault owes them.
+        if fatal.is_none() {
+            while let Ok(frame) = self.inbox.try_recv() {
+                if self.accept_frame_for_self(&frame) {
+                    self.process_frame(frame).await;
+                    self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
+                        .await;
+                    self.apply_reconcile_ops();
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        fatal = Some(fault);
+                        break;
+                    }
+                }
             }
         }
-        while let Ok(frame) = self.reply_inbox.try_recv() {
-            if self.accept_frame_for_self(&frame) {
-                self.process_frame(frame).await;
+        if fatal.is_none() {
+            while let Ok(frame) = self.reply_inbox.try_recv() {
+                if self.accept_frame_for_self(&frame) {
+                    self.process_frame(frame).await;
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        fatal = Some(fault);
+                        break;
+                    }
+                }
             }
+        }
+
+        if fatal.is_some() {
+            // Flipped BEFORE the final flush, not after the pump returns: the
+            // flush writes to the device whose failure raised the fault and
+            // can stall there indefinitely, and the flag is what arms the
+            // watchdog and the bounded pump drain. Siblings give up at most
+            // the flush window of extra serving.
+            shutdown_flag.store(true, Ordering::Relaxed);
         }
 
         // Final flush: committed messages still resident in the in-memory
         // journal must reach segment storage before the process exits, or a
-        // graceful restart recovers consumer offsets ahead of the data.
+        // graceful restart recovers consumer offsets ahead of the data. Runs
+        // on a fault too, the fenced partition included: its resident prefix
+        // is cluster-committed data, so writing what still reaches disk is
+        // strictly better than dropping it, and a second failure of an
+        // already-fenced partition is warned rather than propagated.
         self.flush_partitions().await;
+
+        // A failed flush fences its partition: the data it could not write is
+        // cluster-committed and now lives only in this process's memory, so a
+        // clean exit here would report a durability loss as a good shutdown.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
+        fatal
+    }
+
+    /// First partition commit fault currently fenced on this shard.
+    ///
+    /// The regular path observes faults in `tick_partitions`. This scan covers
+    /// the pump-exit edges where a stop signal wins before that tick, or a
+    /// queued frame fails while the pump is draining during shutdown.
+    fn first_partition_commit_fault(&self) -> Option<FatalCommit> {
+        let partitions = self.plane.partitions();
+        partitions.namespaces().find_map(|namespace| {
+            partitions
+                .get_by_ns(namespace)
+                .and_then(|partition| partition.fatal().cloned())
+        })
     }
 
     /// Sanity check at pump entry: every Consensus frame routed through
@@ -798,34 +911,30 @@ enum ReplicaHandshakeOutcome {
 #[cfg(test)]
 mod tests {
     use iggy_binary_protocol::{
-        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader, frame_checksum_bytes,
+        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
+        prepare_identity_checksum_bytes,
     };
     use server_common::iobuf::Owned;
     use server_common::{MESSAGE_ALIGN, Message, MessageBag};
     use std::mem::offset_of;
 
-    /// RED SPEC, expected to FAIL: pins the mixed-cluster upgrade hole in
-    /// `dispatch`'s decode seam.
-    ///
     /// An `Operation` discriminant this build does not know, arriving on an
     /// otherwise wire-valid consensus frame (correct command, size, checksum:
-    /// exactly what a newer release sends after an op addition), decodes to
-    /// the same undifferentiated `ConsensusError::InvalidBitPattern` as random
-    /// memory corruption. `dispatch` answers both identically: a warn log and
-    /// a dropped frame. No metric, no peer error, no eviction, no version
-    /// fence. An old node in a mixed cluster therefore gap-stops its consensus
-    /// group silently (never journals the op, never sends a `PrepareOk`, every
-    /// later prepare dies on the gap check) while quorum hides the outage.
+    /// exactly what a newer release sends after an op addition), must decode to
+    /// its own error rather than the `InvalidBitPattern` that random memory
+    /// corruption produces.
     ///
-    /// Passes once the decode surfaces a dedicated unsupported-operation
-    /// signal the router can fence and account, instead of collapsing it into
-    /// the corruption error.
+    /// The two need different operator actions: version skew is fixed by
+    /// upgrading this node, and until it is, the frame's consensus group makes
+    /// no progress (the op is never journaled, never acked, and every later
+    /// prepare dies on the gap). `dispatch` splits its drop arms on this
+    /// distinction; the accounting half is pinned in the server crate by
+    /// `given_an_unknown_operation_when_dispatched_should_account_an_upgrade_fence_drop`.
     #[test]
-    // TODO(hubcio): fix this test
-    #[ignore = "unknown operation collapses into InvalidBitPattern; no upgrade fence"]
     fn given_an_unknown_operation_when_a_consensus_frame_decodes_should_surface_an_upgrade_fence_signal()
      {
-        // Far past every defined Operation discriminant (the highest is 165).
+        // Far past every defined Operation discriminant (the highest is 162,
+        // `DeleteConsumerOffset`).
         const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
 
         let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
@@ -838,13 +947,15 @@ mod tests {
             let client_offset = offset_of!(PrepareHeader, client);
             frame[client_offset..client_offset + 16].copy_from_slice(&0xCAFE_u128.to_le_bytes());
             frame[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
-            // Seal the checksum the way a real sender does, so the frame's
-            // only anomaly is the operation byte itself.
+            // A prepare's `checksum` carries the identity checksum, computed
+            // over the operation byte among others; stamping it the way a real
+            // sender does leaves the unknown byte as the frame's only anomaly
+            // and is what lets the classifier trust that byte.
             let header: &[u8; HEADER_SIZE] = frame[..HEADER_SIZE]
                 .try_into()
                 .expect("frame spans a full header");
-            let checksum = frame_checksum_bytes(header);
-            frame[..size_of::<u128>()].copy_from_slice(&checksum.to_le_bytes());
+            let identity = prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
         }
 
         // The generic view carries no operation field, so the receive path
@@ -858,7 +969,12 @@ mod tests {
         };
 
         assert!(
-            !matches!(error, ConsensusError::InvalidBitPattern),
+            matches!(
+                error,
+                ConsensusError::UnsupportedOperation {
+                    operation: OPERATION_FROM_A_NEWER_RELEASE
+                }
+            ),
             "unknown operation {OPERATION_FROM_A_NEWER_RELEASE:#x} is silently dropped: the \
              typed decode collapses a wire-valid frame from a newer release into the same \
              InvalidBitPattern as corruption, and dispatch drops both with only a warn log, \

@@ -288,10 +288,16 @@ async fn then_both_use_same_server(world: &mut LeaderContext) {
     let conn_info_a = client_a.get_connection_info().await;
     let conn_info_b = client_b.get_connection_info().await;
 
-    // Verify both clients are connected to the same server
-    assert_eq!(
-        conn_info_a.server_address, conn_info_b.server_address,
-        "Both clients should be connected to the same server"
+    // Verify both clients are connected to the same server. Client A holds
+    // the address it was configured with and client B the one the roster
+    // published for the leader, so the spellings differ even when the node
+    // is the same.
+    assert!(
+        cluster::is_same_endpoint(&conn_info_a.server_address, &conn_info_b.server_address)
+            .expect("Server addresses should resolve"),
+        "Both clients should be connected to the same server, got {} and {}",
+        conn_info_a.server_address,
+        conn_info_b.server_address
     );
 
     // Verify both can communicate

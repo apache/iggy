@@ -20,3 +20,8 @@ pub mod recovery;
 
 /// Subdirectory under the data root where metadata state is stored.
 pub const METADATA_DIR: &str = "metadata";
+
+/// File under [`METADATA_DIR`] holding the persisted snapshot, and the artifact
+/// state transfer serves. Public so a reader outside this crate (the simulator
+/// asserting a checkpoint landed) can name it.
+pub const SNAPSHOT_FILE_NAME: &str = "snapshot.bin";

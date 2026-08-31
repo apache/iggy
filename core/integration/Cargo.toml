@@ -28,14 +28,12 @@ publish = false
 [package.metadata.cargo-machete]
 ignored = ["cfg_aliases", "rust-s3"]
 
-# Some tests are failing in CI due to lack of IPv6 interfaces
-# inside the docker containers. This is a temporary workaround (hopefully).
 [features]
-ci-qemu = []
 default = ["login-session"]
 login-session = ["dep:zbus-secret-service-keyring-store"]
 
 [dependencies]
+arrow = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
@@ -54,6 +52,7 @@ dtor = { workspace = true }
 figment = { workspace = true }
 futures = { workspace = true }
 harness_derive = { workspace = true }
+hex = { workspace = true }
 humantime = { workspace = true }
 iggy = { workspace = true }
 iggy-cli = { workspace = true }
@@ -71,6 +70,8 @@ keyring-core = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 mongodb = { workspace = true }
+parquet = { workspace = true }
+pgwire = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
@@ -88,6 +89,7 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
+sqlparser = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
@@ -95,6 +97,7 @@ test-case = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-postgres = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -109,3 +112,6 @@ zbus-secret-service-keyring-store = { workspace = true, optional = true }
 
 [build-dependencies]
 cfg_aliases = { workspace = true }
+
+[lints]
+workspace = true

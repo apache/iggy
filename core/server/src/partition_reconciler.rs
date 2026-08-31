@@ -61,7 +61,7 @@
 //!   frame's provenance, which is why the park stamp above is separate.
 //! - Nothing is left unanswered: a tombstoned namespace, an overflowing park
 //!   buffer, and a namespace this shard has given up materialising
-//!   ([`reconcile_parked_frames`]) all reply with a retriable status, so a
+//!   (`reconcile_parked_frames`) all reply with a retriable status, so a
 //!   lockstep transport never waits out its read timeout on silence.
 //!
 //! `shards_table` is therefore a **cache of a deterministic hash**, never a
@@ -170,6 +170,7 @@
 //! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
 use crate::bootstrap::ServerShard;
+use crate::cluster_meta::METADATA_VIEW_UNKNOWN;
 use crate::partition_helpers::{build_partition_fresh, delete_partitions_from_disk};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -187,6 +188,7 @@ use shard::{Receiver, Sender};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
 
@@ -225,6 +227,11 @@ pub struct ReconcilerCtx {
     pub cluster_id: u128,
     pub self_replica_id: u8,
     pub replica_count: u8,
+    /// The metadata plane's view, published by shard 0 and shared with every
+    /// shard's roster. Read when materialising a partition so its consensus
+    /// group starts in the same view the roster's advertised leader comes
+    /// from; the unknown-view sentinel until the first publish.
+    pub metadata_view: Arc<AtomicU64>,
     failure_state: RefCell<AHashMap<(IggyNamespace, FailureCause), FailureRecord>>,
     /// `Streams::revision` observed at the end of the last pass that fully
     /// converged. Paired with `last_pass_noop` for the fast-skip in
@@ -244,6 +251,7 @@ impl ReconcilerCtx {
         cluster_id: u128,
         self_replica_id: u8,
         replica_count: u8,
+        metadata_view: Arc<AtomicU64>,
     ) -> Self {
         Self {
             shard,
@@ -252,10 +260,46 @@ impl ReconcilerCtx {
             cluster_id,
             self_replica_id,
             replica_count,
+            metadata_view,
             failure_state: RefCell::new(AHashMap::new()),
             last_revision: Cell::new(None),
             last_pass_noop: Cell::new(false),
         }
+    }
+
+    /// The view a partition group materialised now should start in.
+    ///
+    /// `None` means this replica has no opinion yet, NOT "start at view 0":
+    /// shard 0 publishes the unknown-view sentinel before its first tick and
+    /// for as long as it has ceded a recovered view's primaryship. Treating
+    /// that as 0 is how a single replica of a group ends up view-0 while its
+    /// peers are at V, which is the split this seed exists to close. Callers
+    /// on a replicated group defer materialising instead; see
+    /// [`Self::partition_view_seed_ready`].
+    ///
+    /// # Panics
+    /// If the published view does not fit a `u32`. The publisher writes
+    /// `u64::from(consensus.view())` or the sentinel handled above, so a value
+    /// past `u32::MAX` is memory corruption, not a state a retry can clear.
+    /// Silently falling back to `None` here would restore the view-0 start
+    /// this change exists to remove, on the one path nobody would look at.
+    fn partition_view_seed(&self) -> Option<u32> {
+        let view = self.metadata_view.load(Ordering::Relaxed);
+        if view == METADATA_VIEW_UNKNOWN {
+            return None;
+        }
+        Some(u32::try_from(view).expect("published metadata view must fit a u32"))
+    }
+
+    /// Whether a group may be materialised now.
+    ///
+    /// A solo replica is always ready: with one replica every view names it
+    /// primary, so there is no peer to disagree with and no split to cause.
+    /// A replicated group waits until this replica knows the metadata view,
+    /// so it cannot seed a view-0 group underneath peers that already moved.
+    /// The wait is one reconcile pass; shard 0 republishes every 100ms.
+    fn partition_view_seed_ready(&self) -> bool {
+        self.replica_count <= 1 || self.partition_view_seed().is_some()
     }
 
     fn is_backed_off(&self, ns: IggyNamespace, cause: FailureCause, now: Instant) -> bool {
@@ -417,6 +461,12 @@ struct PassCounters {
     /// has not applied yet. Counted so the pass does not arm the fast-skip
     /// while work is in flight; applying it bumps no revision.
     already_staged: usize,
+    /// Materialisations held back because this replica has no metadata view to
+    /// seed from yet. Counted so the pass does not arm the fast-skip: shard 0
+    /// publishing a view bumps no `Streams::revision` and does not wake the
+    /// reconciler, so an armed skip would strand every deferred group until
+    /// some unrelated commit happened to bump the revision.
+    view_unpublished: usize,
 }
 
 impl PassCounters {
@@ -433,6 +483,7 @@ impl PassCounters {
             + self.deferred
             + self.parked_reclaimed
             + self.already_staged
+            + self.view_unpublished
     }
 }
 
@@ -527,6 +578,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     true
 }
 
+#[allow(clippy::too_many_lines)]
 async fn reconcile_additions(
     ctx: &ReconcilerCtx,
     target: Vec<(IggyNamespace, u64)>,
@@ -598,6 +650,27 @@ async fn reconcile_additions(
             continue;
         }
 
+        // Tombstoned without ever being materialised: a boot-time damage
+        // verdict (a refused segment chain, an untrusted superblock) fenced
+        // the namespace before any partition existed, so no teardown ran and
+        // no `ConfirmRemove` is coming to lift the tombstone. Building fresh
+        // would plant segment 0 over the refused files, truncating the
+        // oldest one, and the partition would then serve empty, hiding
+        // exactly the loss the tombstone surfaces. Deliberately uncounted:
+        // while the namespace stays committed nothing lifts this state (the
+        // exit is `reconcile_removals`' fenced-ghost sweep, which fires only
+        // once an operator delete removes it from the target), and a commit
+        // bumps `Streams::revision`, which forces the next pass past the
+        // fast-skip.
+        if partitions.is_tombstoned(&ns) {
+            trace!(
+                shard = shard_id,
+                ns_raw = ns.inner(),
+                "additions: ns tombstoned before materialisation; refusing to rebuild over fenced files"
+            );
+            continue;
+        }
+
         let owning_shard = calculate_shard_assignment(&ns, total_shards);
         if owning_shard != shard_id {
             // Compare the epoch, not just presence: a delete + recreate
@@ -637,6 +710,22 @@ async fn reconcile_additions(
             continue;
         }
 
+        // Materialising before this replica knows the metadata view would seed
+        // the group at view 0 under peers that already elected past it. Defer
+        // the whole pass rather than the namespace: every group on this shard
+        // reads the same view, so none of them can be seeded correctly yet.
+        if !ctx.partition_view_seed_ready() {
+            debug!(
+                shard = shard_id,
+                "metadata view not published yet; deferring partition materialisation"
+            );
+            // Every remaining namespace reads the same view, so none of them
+            // can be seeded either. Counted before breaking so the pass does
+            // not read as converged, which would fast-skip the retry.
+            counters.view_unpublished += 1;
+            break;
+        }
+
         // Resolve the shared stats `Arc` only for namespaces actually
         // built, not once per committed partition every pass. A topic that
         // vanished between the target snapshot and this read defers to the
@@ -654,6 +743,7 @@ async fn reconcile_additions(
             ctx.cluster_id,
             ctx.self_replica_id,
             ctx.replica_count,
+            ctx.partition_view_seed(),
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -780,6 +870,29 @@ async fn reconcile_removals(
         .filter(|ns| !target_set.contains(ns))
         .collect();
     for ns in owned_ghosts {
+        tear_down_owned_partition(ctx, ns, counters).await;
+    }
+
+    // Boot-time damage verdicts tombstone a namespace BEFORE it is ever
+    // materialised, so it sits in neither `partitions.namespaces()` nor the
+    // shards table: the loop above can never reach it, and `ConfirmRemove`
+    // (the only untombstone) is never enqueued for it -- without this, a
+    // boot fence has no exit and a recreate of the recycled ids inherits it
+    // forever. Once committed metadata no longer names the namespace (the
+    // operator deleted it), route it through the same teardown: the disk
+    // delete removes the refused files the verdict left at their real paths
+    // FIRST, and only its success enqueues the `ConfirmRemove` that lifts
+    // the fence -- a bare untombstone would leave the cause in place for
+    // the next boot to re-derive, with a window where a fresh build
+    // truncates the refused files. While the namespace is still in the
+    // committed target the fence stands: only an operator delete authorises
+    // destroying the bytes it guards.
+    let fenced_ghosts: Vec<IggyNamespace> = partitions
+        .tombstoned_namespaces()
+        .into_iter()
+        .filter(|ns| !target_set.contains(ns) && !partitions.contains(ns))
+        .collect();
+    for ns in fenced_ghosts {
         tear_down_owned_partition(ctx, ns, counters).await;
     }
 
@@ -1166,8 +1279,8 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureCause, FailureRecord, ReconcilerCtx, build_partition_fresh,
-        delete_partitions_from_disk, fetch_partition_stats, reconcile_once,
+        AtomicU64, FailureCause, FailureRecord, METADATA_VIEW_UNKNOWN, ReconcilerCtx,
+        build_partition_fresh, delete_partitions_from_disk, fetch_partition_stats, reconcile_once,
     };
     use configs::server::{ServerConfig, ServerSystemConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
@@ -1619,6 +1732,31 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
+        ))
+    }
+
+    /// [`make_ctx`] for a REPLICATED group, sharing `metadata_view` with the
+    /// caller so a test can publish a view mid-run.
+    ///
+    /// Replica count is what decides whether materialisation waits on a
+    /// published view: a solo replica is primary in every view, so there is no
+    /// peer to disagree with and nothing to wait for. Every other test here
+    /// runs solo and takes that short circuit.
+    fn make_cluster_ctx(
+        shard: Rc<TestShard>,
+        total_shards: u16,
+        config: Rc<ServerConfig>,
+        metadata_view: Arc<AtomicU64>,
+    ) -> Rc<ReconcilerCtx> {
+        Rc::new(ReconcilerCtx::new(
+            shard,
+            total_shards,
+            config,
+            CLUSTER_ID,
+            0,
+            3,
+            metadata_view,
         ))
     }
 
@@ -1764,6 +1902,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            None,
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -1793,6 +1932,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            None,
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -1916,6 +2056,73 @@ mod tests {
     /// `CreatePartitions` on an existing topic adds new namespaces; the
     /// reconciler picks them up on the next pass without touching the
     /// partitions it already materialised.
+    /// A replicated group is NOT materialised while this replica has no
+    /// metadata view to seed from, and IS once one is published.
+    ///
+    /// Seeding is a local read: shard 0 publishes the unknown sentinel before
+    /// its first tick and for as long as it has ceded a recovered view. Taking
+    /// that for view 0 would start the group naming replica 0 underneath peers
+    /// that already elected past it, which is the split the seed exists to
+    /// close, reintroduced one replica at a time. Waiting costs one reconcile
+    /// pass; the publisher reposts every 100ms.
+    #[compio::test]
+    async fn given_no_published_metadata_view_when_reconciling_should_defer_materialisation() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-deferred");
+        seed_topic(&mux, 2, 0, "topic-deferred", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let metadata_view = Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN));
+        let ctx = make_cluster_ctx(
+            Rc::clone(&shard),
+            1,
+            Rc::new(config),
+            Arc::clone(&metadata_view),
+        );
+
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.plane.partitions().len(),
+            0,
+            "a replicated group must not materialise before this replica knows the metadata \
+             view: seeded at 0 it names replica 0 whatever the metadata plane elected"
+        );
+
+        // The publisher posts a real view; the deferred pass now converges.
+        metadata_view.store(1, Ordering::Relaxed);
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.plane.partitions().len(),
+            1,
+            "once a view is published the deferred group must materialise on the next pass"
+        );
+    }
+
+    /// A SOLO replica never waits. It is primary in every view, so there is no
+    /// peer for it to disagree with, and blocking on a publisher that a
+    /// single-node deployment may never run would wedge materialisation
+    /// outright.
+    #[compio::test]
+    async fn given_a_solo_replica_when_no_view_is_published_should_still_materialise() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-solo");
+        seed_topic(&mux, 2, 0, "topic-solo", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.plane.partitions().len(),
+            1,
+            "a solo replica must materialise without waiting on a published metadata view"
+        );
+    }
+
     #[compio::test]
     async fn reconcile_picks_up_create_partitions_increments() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -2350,6 +2557,130 @@ mod tests {
         );
     }
 
+    /// The mixed-version upgrade hole from IGGY-250, at the router seam this
+    /// time: a wire-valid consensus frame carrying an operation only a newer
+    /// release defines must leave an accounted, operator-visible trace instead
+    /// of a bare warn log, because the frame's group stops making progress
+    /// until this node is upgraded.
+    #[compio::test]
+    async fn given_an_unknown_operation_when_dispatched_should_account_an_upgrade_fence_drop() {
+        // Far past every discriminant this build defines.
+        const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let shard = build_test_shard(0, &config, TestMux::default());
+
+        let mut owned = server_common::iobuf::Owned::<{ server_common::MESSAGE_ALIGN }>::zeroed(
+            iggy_binary_protocol::HEADER_SIZE,
+        );
+        {
+            let frame = owned.as_mut_slice();
+            let size_offset = std::mem::offset_of!(PrepareHeader, size);
+            let frame_size =
+                u32::try_from(iggy_binary_protocol::HEADER_SIZE).expect("header size fits in u32");
+            frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
+            frame[std::mem::offset_of!(PrepareHeader, command)] = Command::Prepare as u8;
+            frame[std::mem::offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+            // A prepare's `checksum` carries the identity checksum, computed
+            // over the operation byte among others; stamping it the way a real
+            // sender does is what lets the classifier trust that byte.
+            let header: &[u8; iggy_binary_protocol::HEADER_SIZE] = frame
+                [..iggy_binary_protocol::HEADER_SIZE]
+                .try_into()
+                .expect("frame spans a full header");
+            let identity = iggy_binary_protocol::prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
+        }
+        let message = Message::<iggy_binary_protocol::GenericHeader>::try_from(owned)
+            .expect("an identity-stamped Prepare frame is wire-valid in the generic view");
+
+        let before = shard.metrics().frame_drop_count(
+            shard::metrics::frame_drop_variant::CONSENSUS,
+            shard::metrics::frame_drop_reason::UNSUPPORTED_OPERATION,
+        );
+        shard.dispatch(message);
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::CONSENSUS,
+                shard::metrics::frame_drop_reason::UNSUPPORTED_OPERATION,
+            ),
+            before + 1,
+            "an operation from a newer release must be accounted under its own reason, not \
+             folded into the generic unparsable drop"
+        );
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::CONSENSUS,
+                shard::metrics::frame_drop_reason::UNPARSABLE,
+            ),
+            0,
+            "version skew must not read as header corruption"
+        );
+    }
+
+    /// The complement of the upgrade-fence accounting: an operation byte that
+    /// landed in undefined space by CORRUPTION (the prepare identity no longer
+    /// matches) must count as `unparsable`, never as version skew -- the two
+    /// counters send an operator to opposite remedies.
+    #[compio::test]
+    async fn given_a_corrupt_operation_byte_when_dispatched_should_account_an_unparsable_drop() {
+        const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let shard = build_test_shard(0, &config, TestMux::default());
+
+        let mut owned = server_common::iobuf::Owned::<{ server_common::MESSAGE_ALIGN }>::zeroed(
+            iggy_binary_protocol::HEADER_SIZE,
+        );
+        {
+            let frame = owned.as_mut_slice();
+            let size_offset = std::mem::offset_of!(PrepareHeader, size);
+            let frame_size =
+                u32::try_from(iggy_binary_protocol::HEADER_SIZE).expect("header size fits in u32");
+            frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
+            frame[std::mem::offset_of!(PrepareHeader, command)] = Command::Prepare as u8;
+            // Identity stamped over operation 0, then the byte flipped in
+            // flight: the checksum mismatch is what proves corruption.
+            let header: &[u8; iggy_binary_protocol::HEADER_SIZE] = frame
+                [..iggy_binary_protocol::HEADER_SIZE]
+                .try_into()
+                .expect("frame spans a full header");
+            let identity = iggy_binary_protocol::prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
+            frame[std::mem::offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+        }
+        let message = Message::<iggy_binary_protocol::GenericHeader>::try_from(owned)
+            .expect("the frame is wire-valid in the generic view");
+
+        let unparsable_before = shard.metrics().frame_drop_count(
+            shard::metrics::frame_drop_variant::CONSENSUS,
+            shard::metrics::frame_drop_reason::UNPARSABLE,
+        );
+        let skew_before = shard.metrics().frame_drop_count(
+            shard::metrics::frame_drop_variant::CONSENSUS,
+            shard::metrics::frame_drop_reason::UNSUPPORTED_OPERATION,
+        );
+        shard.dispatch(message);
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::CONSENSUS,
+                shard::metrics::frame_drop_reason::UNPARSABLE,
+            ),
+            unparsable_before + 1,
+            "a corrupt operation byte is header damage and must be accounted as such"
+        );
+        assert_eq!(
+            shard.metrics().frame_drop_count(
+                shard::metrics::frame_drop_variant::CONSENSUS,
+                shard::metrics::frame_drop_reason::UNSUPPORTED_OPERATION,
+            ),
+            skew_before,
+            "corruption must not tell an operator to upgrade the node"
+        );
+    }
+
     /// Receive half of the purge gate in `on_repair_range_reply`: while a
     /// committed purge has not applied locally, a repair verdict must be
     /// deferred wholesale -- installing the peer's floor against pre-purge
@@ -2376,7 +2707,9 @@ mod tests {
             .expect("partition is materialised")
             .repair = Some(RepairSession {
             nonce: NONCE,
-            to_op: 5,
+            view: 0,
+            commit_to_op: 5,
+            fetch_to_op: 5,
             floor: None,
             peer: 1,
             first_batch_offset: None,
@@ -2656,6 +2989,193 @@ mod tests {
         assert!(
             std::path::Path::new(&partition_root).exists(),
             "defer must not re-drive teardown: the directory must remain"
+        );
+    }
+
+    /// A namespace tombstoned before it was ever materialised is a boot-time
+    /// damage verdict (a refused segment chain, an untrusted superblock): its
+    /// files are still on disk and no `ConfirmRemove` is coming. The
+    /// additions pass must not rebuild it -- `build_partition_fresh` would
+    /// plant segment 0 over the refused files and the partition would serve
+    /// empty -- and it must stay unrouted so the loss stays visible.
+    #[compio::test]
+    async fn reconcile_never_rebuilds_tombstoned_unmaterialised_namespace() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-fence");
+        seed_topic(&mux, 2, 0, "topic-fence", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        // Boot-fence shape: the verdict lands during partition load, before
+        // anything is inserted, so the namespace is tombstoned but absent
+        // from the map while still in the committed target.
+        partitions.tombstone(ns);
+
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            !partitions.contains(&ns),
+            "tombstoned namespace must not be rebuilt"
+        );
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the boot fence must survive the pass"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            None,
+            "tombstoned namespace must stay unrouted"
+        );
+        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        assert!(
+            !std::path::Path::new(&partition_root).exists(),
+            "no fresh build may touch the refused files' directory"
+        );
+    }
+
+    /// Boot-fence exit: once an operator DELETES the fenced namespace it
+    /// leaves the committed target, but it sits in neither `partitions` nor
+    /// `shards_table`, so neither ghost sweep used to reach it -- the fence
+    /// had no exit, and slab-key recycling made a recreate of the same ids
+    /// inherit it for bytes it never had. The removals pass must route it
+    /// through teardown: the refused files are deleted first (metadata says
+    /// the partition is gone, so nothing an operator kept is destroyed) and
+    /// only the delete's success enqueues the `ConfirmRemove` that lifts
+    /// the tombstone.
+    #[compio::test]
+    async fn reconcile_lifts_boot_fence_once_namespace_leaves_target() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-fence-exit");
+        seed_topic(&mux, 2, 0, "topic-fence-exit", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        // Boot-fence shape with the refused files still at their real paths.
+        partitions.tombstone(ns);
+        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        std::fs::create_dir_all(&partition_root).expect("plant partition dir");
+        let refused_log = format!("{partition_root}/00000000000000000000.log");
+        std::fs::write(&refused_log, b"refused bytes").expect("plant refused log");
+
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            !partitions.is_tombstoned(&ns),
+            "the fence must lift once the namespace leaves the committed target"
+        );
+        assert!(!partitions.contains(&ns));
+        assert!(
+            !std::path::Path::new(&partition_root).exists(),
+            "teardown must delete the refused files before lifting the fence"
+        );
+
+        // Recreate the same ids: slab keys recycle, so the fresh topic gets
+        // an identical namespace and must materialise cleanly.
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-fence-reborn",
+            vec![assignment(0, 1)],
+        );
+        reconcile_pass(&ctx).await;
+        assert!(
+            partitions.contains(&ns),
+            "a recreate of the recycled ids must not inherit the lifted fence"
+        );
+        assert!(!partitions.is_tombstoned(&ns));
+    }
+
+    /// The sibling guard: while the namespace is STILL in the committed
+    /// target, the fenced-ghost sweep must not touch it -- only an operator
+    /// delete authorises destroying the bytes the fence guards. (The
+    /// additions-pass half of this is covered by
+    /// `reconcile_never_rebuilds_tombstoned_unmaterialised_namespace`.)
+    #[compio::test]
+    async fn reconcile_keeps_boot_fence_while_namespace_in_target() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-fence-hold");
+        seed_topic(&mux, 2, 0, "topic-fence-hold", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+        partitions.tombstone(ns);
+        let partition_root = ctx.config.system.get_partition_path(0, 0, 0);
+        std::fs::create_dir_all(&partition_root).expect("plant partition dir");
+        let refused_log = format!("{partition_root}/00000000000000000000.log");
+        std::fs::write(&refused_log, b"refused bytes").expect("plant refused log");
+
+        reconcile_pass(&ctx).await;
+
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the fence must hold while the namespace is committed"
+        );
+        assert!(
+            std::path::Path::new(&refused_log).exists(),
+            "the refused files must stay untouched while the fence holds"
+        );
+    }
+
+    /// Backstop at the pump: an `InsertOwned` staged before a tombstone
+    /// landed must be discarded at apply, not routed. Applying it would put
+    /// the namespace in `partitions` + `shards_table` while the tombstone
+    /// stands, and the plane drops requests for tombstoned namespaces
+    /// without replying, so every client would hang to its read timeout.
+    #[compio::test]
+    async fn apply_discards_insert_owned_for_tombstoned_namespace() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-race");
+        seed_topic(&mux, 2, 0, "topic-race", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partitions = shard.plane.partitions();
+
+        // Stage the build without applying it, then fence: models a
+        // tombstone landing between the reconciler pass and the pump drain.
+        reconcile_once(&ctx).await;
+        assert!(shard.has_staged_insert_owned(ns));
+        partitions.tombstone(ns);
+        shard.apply_reconcile_ops();
+
+        assert!(
+            !partitions.contains(&ns),
+            "InsertOwned for a tombstoned namespace must be discarded"
+        );
+        assert!(
+            partitions.is_tombstoned(&ns),
+            "the discard must not clear the tombstone"
+        );
+        assert_eq!(
+            shard.shards_table().shard_for(ns),
+            None,
+            "the discarded build must not route the namespace"
+        );
+
+        // The follow-up pass sees the same tombstone before building, so the
+        // namespace stays dark instead of looping build-and-discard.
+        reconcile_pass(&ctx).await;
+        assert!(!partitions.contains(&ns));
+        assert!(
+            !shard.has_staged_insert_owned(ns),
+            "no second build may be staged while the tombstone stands"
         );
     }
 

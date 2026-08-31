@@ -143,22 +143,23 @@ class TestTcpReconnectionConfig:
 
         assert reconnection.reestablish_after == timedelta(0)
 
-    def test_zero_interval_is_allowed_with_bounded_retries(self):
-        """Test that a zero interval is legal as a bounded fast-retry policy."""
-        reconnection = TcpReconnectionConfig(interval=timedelta(0), max_retries=5)
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"max_retries": 5},
+            {"enabled": False},
+        ],
+        ids=["unlimited_retries", "bounded_retries", "reconnection_disabled"],
+    )
+    def test_zero_interval_is_rejected(self, kwargs: dict):
+        """Test that a zero interval fails whatever the retry policy is.
 
-        assert reconnection.interval == timedelta(0)
-
-    def test_zero_interval_is_allowed_when_reconnection_is_disabled(self):
-        """Test that a zero interval is legal when nothing ever reads it."""
-        reconnection = TcpReconnectionConfig(enabled=False, interval=timedelta(0))
-
-        assert reconnection.interval == timedelta(0)
-
-    def test_zero_interval_with_unlimited_retries_is_rejected(self):
-        """Test that the combination that reconnects in a continuous loop fails."""
+        The interval is a delay between attempts, so zero reconnects in a
+        continuous loop.
+        """
         with pytest.raises(ValueError, match="zero"):
-            TcpReconnectionConfig(interval=timedelta(0))
+            TcpReconnectionConfig(interval=timedelta(0), **kwargs)
 
     def test_very_long_interval_round_trips(self):
         """Test that an interval beyond 68 years survives the i32 boundary."""
@@ -316,32 +317,17 @@ class TestClientConstruction:
         [
             {"polling_retry_interval": timedelta(0)},
             {"init_retries": 3, "init_retry_interval": timedelta(0)},
-            {"auto_commit": AutoCommit.Interval(timedelta(0))},
-            {
-                "auto_commit": AutoCommit.IntervalOrWhen(
-                    timedelta(0), AutoCommitWhen.PollingMessages()
-                )
-            },
-            {
-                "auto_commit": AutoCommit.IntervalOrAfter(
-                    timedelta(0), AutoCommitAfter.ConsumingEachMessage()
-                )
-            },
         ],
         ids=[
             "polling_retry_interval",
             "init_retry_interval",
-            "auto_commit_interval",
-            "auto_commit_interval_or_when",
-            "auto_commit_interval_or_after",
         ],
     )
     def test_zero_consumer_interval_is_rejected(self, interval_kwargs: dict):
-        """Test that a zero consumer interval fails at the call.
+        """Test that a zero retry interval fails at the call.
 
-        Zero spins the retry loop, floods the server with offset stores, or
-        panics inside the runtime timer, and none of those name the argument
-        that caused it.
+        Zero spins the retry loop or panics inside the runtime timer, and
+        neither names the argument that caused it.
         """
         client = IggyClient()
 
@@ -351,6 +337,33 @@ class TestClientConstruction:
                 stream="stream",
                 topic="topic",
                 **interval_kwargs,
+            )
+
+    @pytest.mark.parametrize(
+        "auto_commit",
+        [
+            AutoCommit.Interval(timedelta(0)),
+            AutoCommit.IntervalOrWhen(timedelta(0), AutoCommitWhen.PollingMessages()),
+            AutoCommit.IntervalOrAfter(
+                timedelta(0), AutoCommitAfter.ConsumingEachMessage()
+            ),
+        ],
+        ids=["interval", "interval_or_when", "interval_or_after"],
+    )
+    def test_zero_auto_commit_interval_is_rejected(self, auto_commit: AutoCommit):
+        """Test that a zero auto-commit interval fails at the call.
+
+        Zero there stores the offsets in a busy loop. Committing on every poll
+        is spelled AutoCommit.When or AutoCommit.After instead.
+        """
+        client = IggyClient()
+
+        with pytest.raises(ValueError, match="zero"):
+            client.consumer_group(
+                name="group",
+                stream="stream",
+                topic="topic",
+                auto_commit=auto_commit,
             )
 
     def test_zero_poll_interval_is_allowed(self):

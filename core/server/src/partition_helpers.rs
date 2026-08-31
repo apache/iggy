@@ -28,7 +28,9 @@ use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets}
 use crate::server_error::ServerError;
 use compio::fs::create_dir_all;
 use configs::server::ServerConfig;
-use consensus::{JoinMode, LocalPipeline, VsrConsensus, VsrRestore, VsrState};
+use consensus::{
+    FreshGroupStart, LocalPipeline, VsrConsensus, VsrRestore, VsrState, fresh_group_start,
+};
 use iggy_common::{
     ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
     TopicRuntimeOptions,
@@ -353,8 +355,9 @@ pub async fn ensure_initial_segment(
             );
             source
         })?;
-    // Share the storage's size counters so reads observe persisted bytes;
-    // a writer with a private counter grows the file invisibly to readers.
+    // Share the storage's size counters: they are the write cursors. A private
+    // counter would let the append position diverge from the segment
+    // bookkeeping that index entries and poll bounds rely on.
     let messages_size_counter = storage
         .messages_writer
         .as_ref()
@@ -515,6 +518,12 @@ pub(crate) async fn open_partition_superblock(
 /// The namespace arrives packed, so its components are in range by
 /// construction. Metadata admission is what bounds them.
 ///
+/// `view_seed` is the view a group with no durable record of its own starts
+/// in, and it is the metadata plane's current view: see the `seed_view`
+/// comment below for why a group left at view 0 is unreachable. `None` keeps
+/// the historical view-0 start, and is also what a restart materialization
+/// gets, since it probes for the live view instead.
+///
 /// The returned partition's `offset` / `dirty_offset` are `0` and
 /// `should_increment_offset` is `false`, mirroring a clean append starting
 /// at the empty segment.
@@ -533,6 +542,7 @@ pub async fn build_partition_fresh(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
+    view_seed: Option<u32>,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
     let stream_id = namespace.stream_id();
@@ -589,13 +599,12 @@ pub async fn build_partition_fresh(
     // peer, byte-identical by the deterministic-roll/replicated-ciphertext
     // design. A truly fresh create keeps the plain init: every group needs
     // its view-0 primary to exist.
-    let join = if restarted {
-        JoinMode::ProbeAsBackup {
-            await_state_transfer: false,
-        }
-    } else {
-        JoinMode::Init
-    };
+    let durable_view = recovered_state
+        .as_ref()
+        .map(|state| (state.view, state.log_view));
+    // Shared with the simulator's `init_partition`, which cannot call this
+    // builder; see `fresh_group_start`.
+    let FreshGroupStart { join, seed_view } = fresh_group_start(restarted, durable_view, view_seed);
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
@@ -609,10 +618,25 @@ pub async fn build_partition_fresh(
         LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
         VsrRestore {
             timers: &timers,
-            durable_view: recovered_state
-                .as_ref()
-                .map(|state| (state.view, state.log_view)),
+            durable_view,
             view_fallback: None,
+            // Both planes pick their primary as `view % replica_count` from
+            // their OWN view counter. A group left at view 0 while the
+            // metadata plane sits elsewhere therefore names a different node
+            // than the roster advertises as leader, and nothing routes a
+            // partition write across that gap: the client is sent to the
+            // metadata leader and refused there for the whole budget. Seeding
+            // from the metadata view keeps the two congruent for a group born
+            // after a metadata election.
+            //
+            // Replicas can still disagree on the seed: each publishes its own
+            // metadata view on a 100ms poll, so one may read V while another
+            // has yet to see the election. That resolves the way any view
+            // disagreement does, the higher view winning through `StartView` -
+            // but only because the seed sets `log_view` too. The caller is
+            // what keeps a replica from seeding a view it has no opinion on;
+            // see `ReconcilerCtx::partition_view_seed`.
+            seed_view,
             incarnation: None,
             join,
         },

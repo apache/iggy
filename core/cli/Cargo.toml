@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-cli"
-version = "0.14.0-edge.4"
+version = "0.14.0-edge.5"
 edition = "2024"
 rust-version.workspace = true
 authors = ["bartosz.ciesla@gmail.com"]
@@ -94,3 +94,6 @@ cfg_aliases = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

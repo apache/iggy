@@ -157,7 +157,7 @@ async fn create_consumer(client: &IggyClient, consumer_group_name: &str) -> Iggy
         .polling_strategy(PollingStrategy::next())
         .auto_join_consumer_group()
         .auto_commit(AutoCommit::IntervalOrAfter(
-            IggyDuration::from_str("100ms").unwrap(),
+            NonZeroIggyDuration::from_str("100ms").unwrap(),
             AutoCommitAfter::ConsumingEachMessage,
         ))
         .build();

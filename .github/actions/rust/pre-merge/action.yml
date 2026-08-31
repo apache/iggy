@@ -180,6 +180,8 @@ runs:
 
     - name: Doc test
       if: inputs.task == 'doctest'
+      env:
+        RUSTDOCFLAGS: -D warnings
       run: |
         cargo test --locked --doc
         cargo doc --no-deps --all-features --quiet
@@ -279,6 +281,44 @@ runs:
         compile_duration=$((compile_end - compile_start))
         echo "::notice::Tests compiled in ${compile_duration}s ($(date -ud @${compile_duration} +'%M:%S'))"
 
+        # api_handler_tests, version_firewall_tests, and server_e2e_tests need gitignored
+        # wire fixtures. Generate when iggy-gateway-kafka is in the DAG test scope, or (on
+        # a full-workspace run) when gateways/** changed vs origin/master — avoid building
+        # kafka-message-gen / kafka-protocol when the gateway was not touched.
+        NEEDS_KAFKA_FIXTURES=false
+        if grep -q 'package(iggy-gateway-kafka)' <<< "$NEXTEST_FILTER"; then
+          NEEDS_KAFKA_FIXTURES=true
+        elif [[ -z "$NEXTEST_FILTER" ]]; then
+          # `2>&1` into a variable, not `2>/dev/null` piped straight to grep: the old form
+          # silenced *any* git failure (e.g. a shallow checkout with no merge-base history for
+          # origin/master) into empty output, which `grep -q` then reads identically to "diff
+          # succeeded, no gateways/ changes" - so a broken diff and a clean diff produced the
+          # same "skip fixtures" outcome. Confirmed in CI run 32256598833: gateways/-only PR,
+          # full-workspace lane, fixtures silently skipped, KAFKA_FIXTURES_REQUIRED never set -
+          # every fixture-backed test quietly passed by skipping all its assertions instead of
+          # running them (0.005s for a test meant to decode 9 real fixtures).
+          if DIFF_OUTPUT=$(git diff --name-only origin/master...HEAD 2>&1); then
+            if grep -qE '^gateways/' <<< "$DIFF_OUTPUT"; then
+              NEEDS_KAFKA_FIXTURES=true
+            else
+              echo "::notice::Skipping Kafka wire fixtures (full suite, gateways/** unchanged)"
+            fi
+          else
+            # Diff itself failed - NOT the same as "no gateways/ changes". Generate
+            # unconditionally as the fail-safe default; this is the case the bug above collapsed
+            # into a silent skip.
+            NEEDS_KAFKA_FIXTURES=true
+            echo "::warning::git diff origin/master...HEAD failed (${DIFF_OUTPUT}); generating Kafka fixtures unconditionally as a fail-safe"
+          fi
+        fi
+        if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then
+          ./gateways/kafka/scripts/ci-wire-fixtures.sh generate
+          trap './gateways/kafka/scripts/ci-wire-fixtures.sh cleanup' EXIT
+          # Fixtures are expected to exist from here on; a missing one now means
+          # generation silently failed, not a legitimate local-dev skip.
+          export KAFKA_FIXTURES_REQUIRED=1
+        fi
+
         # Start D-Bus and unlock keyring right before test execution to avoid
         # gnome-keyring auto-locking the collection during the build phase.
         # Previously this ran before `cargo build`, leaving a 7+ minute idle
@@ -293,7 +333,12 @@ runs:
         test_start=$(date +%s)
         if command -v cargo-nextest &> /dev/null; then
           if [[ -n "$NEXTEST_FILTER" ]]; then
-            cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
+            # Every test target in the `bdd` crate is `required-features =
+            # ["bdd"]`, so the `cargo test --no-run` above builds no binaries
+            # for it. A PR touching only that crate then produces a valid
+            # filter that matches zero tests, and nextest's default
+            # `--no-tests=fail` turns that into exit 4 on a green PR.
+            cargo nextest run --locked --no-fail-fast --no-tests=warn --profile ci $PARTITION_FLAG $PACKAGE_FLAGS -E "$NEXTEST_FILTER"
           else
             cargo nextest run --locked --no-fail-fast --profile ci $PARTITION_FLAG
           fi

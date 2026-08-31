@@ -629,7 +629,7 @@ impl PrepareJournal {
     }
 
     /// How many entries the opening scan replayed unverified
-    /// ([`CHECKSUM_BODY_UNSEALED`]). `0` once every producer seals; the boot path
+    /// (`CHECKSUM_BODY_UNSEALED`). `0` once every producer seals; the boot path
     /// warns while it is not, so the fail-open stretch is visible to an operator.
     pub const fn unsealed_entry_count(&self) -> u64 {
         self.unsealed_entries
@@ -1441,6 +1441,46 @@ mod tests {
             journal.last_op(),
             Some(1),
             "op 2 does not chain to op 1 and must be truncated as a torn tail"
+        );
+    }
+
+    #[compio::test]
+    async fn scan_refuses_boot_on_interior_parent_chain_break() {
+        // The shape a repair frontier rewind leaves behind: every entry is
+        // complete and individually well sealed, op 3 parents to op 1 instead
+        // of op 2, and a valid chain continues from op 3. Complete entries
+        // after the break can be quorum committed, so boot must refuse rather
+        // than truncate them away as a torn tail.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let op_1 = make_identity_sealed_prepare(1, BODY, 0);
+            let checksum_1 = op_1.header().checksum;
+            journal.append(op_1.deep_copy()).await.unwrap();
+            let op_2 = make_identity_sealed_prepare(2, BODY, checksum_1);
+            journal.append(op_2.deep_copy()).await.unwrap();
+            let op_3 = make_identity_sealed_prepare(3, BODY, checksum_1);
+            let checksum_3 = op_3.header().checksum;
+            journal.append(op_3.deep_copy()).await.unwrap();
+            let op_4 = make_identity_sealed_prepare(4, BODY, checksum_3);
+            journal.append(op_4.deep_copy()).await.unwrap();
+        }
+        let bytes_before = std::fs::metadata(&path).unwrap().len();
+
+        let error = PrepareJournal::open(&path, 0).await.unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("interior WAL corruption") && message.contains("does not chain"),
+            "a rewound parent with a complete suffix following must refuse \
+             boot rather than truncate, got: {message}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            bytes_before,
+            "the refusal must leave the WAL bytes untouched"
         );
     }
 

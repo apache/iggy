@@ -67,6 +67,8 @@ new session.
 
 The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
+`heartbeatInterval` also accepts a duration expression such as `"10s"` or
+`"1h 30m"`, like the Rust SDK.
 The server evicts a connection silent for 36 s, which is 1.2 x its 30 s
 heartbeat interval. Raising the client interval past that window, or setting it
 to 0 to disable client heartbeats, exposes an idle consumer-group member to
@@ -104,6 +106,43 @@ const client = new Client({
 
 const stats = await client.system.getStats();
 ```
+
+### Connection strings
+
+Every client constructor (except `SimpleClient` see note) also accepts a
+connection string instead of a config object:
+
+```ts
+import { Client } from "apache-iggy";
+
+const client = new Client("iggy://iggy:iggy@127.0.0.1:8090");
+const stats = await client.system.getStats();
+```
+
+Supported schemes are `iggy://` (TCP, default) and `iggy+tcp://`. Credentials
+are `username:password` or a single personal access token. Options mirror the
+other SDKs: `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries`,
+`reconnection_interval`, `heartbeat_interval` and `nodelay`. `reestablish_after`
+is accepted for format compatibility but has no Node equivalent.
+
+note: `SimpleClient` does not accept a connection string: it wraps an existing
+`RawClient` instance rather than building one from configuration. Pass the
+connection string to `Client`, `SingleClient` or `getRawClient` and hand the
+resulting raw client to `SimpleClient` if needed.
+
+### option limits
+
+| option | limit |
+| --- | --- |
+| `reconnection_retries` | integer up to `4294967295` (u32 max); larger values are rejected like Rust's u32 overflow, and `unlimited` maps to this ceiling. Defaults to unlimited |
+| `heartbeat_interval` | duration up to `2147483647ms` (Node's largest timer delay); `0` disables heartbeats |
+| `reconnection_interval` | positive duration (`ms`, `s`, `m`, `h`) up to `2147483647ms` (Node's largest timer delay); zero spellings are rejected. Defaults to `1s` |
+| port in the authority | decimal up to `65535` |
+
+Durations accept the same expressions as the Rust SDK, for example `500ms`,
+`10s`, `1h 30m`, `5d`, `2w`, `1y`; matching is case-insensitive and
+`0`, `unlimited`, `disabled` and `none` map to zero. Unit-less numbers such as
+`5` are rejected.
 
 ## use sources
 

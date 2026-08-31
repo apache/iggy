@@ -407,6 +407,13 @@ where
         self.tombstoned.borrow().contains(namespace)
     }
 
+    /// Snapshot every tombstoned namespace, including ones never
+    /// materialised: a boot-time damage verdict fences a namespace before
+    /// any partition exists, so it appears in no other view of this map.
+    pub fn tombstoned_namespaces(&self) -> Vec<IggyNamespace> {
+        self.tombstoned.borrow().iter().copied().collect()
+    }
+
     /// Mark a namespace as tombstoned. Callable from any task on the
     /// shard's runtime (reconciler sets the fence synchronously before
     /// awaiting disk delete).

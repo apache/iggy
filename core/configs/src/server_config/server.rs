@@ -19,6 +19,7 @@ use super::COMPONENT;
 use super::cluster::ClusterConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::node::NodeConfig;
 use super::partition::PartitionConfig;
 use super::quic::QuicConfig;
 use super::tcp::TcpConfig;
@@ -102,14 +103,16 @@ pub type ServerSystemConfig = SystemConfig<super::sharding::ShardingConfig>;
 
 /// Top-level on-disk config schema for the `iggy-server` binary.
 ///
-/// Composes the shared section types from [`crate::common`] with the
+/// Composes the shared section types from `crate::common` with the
 /// transport, cluster, metadata and [`MessageBusConfig`] sections owned
-/// by [`super`].
+/// by `super`.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 #[config_env(prefix = "IGGY_", name = "iggy-server-config")]
 pub struct ServerConfig {
     pub consumer_group: ConsumerGroupConfig,
     pub data_maintenance: DataMaintenanceConfig,
+    #[serde(default)]
+    pub node: NodeConfig,
     #[serde(default)]
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
@@ -125,7 +128,58 @@ pub struct ServerConfig {
     pub message_bus: MessageBusConfig,
 }
 
+/// One client-facing listener, as the client-facing address derivation and
+/// boot validation see it: the config key naming its bind address, that
+/// address as written, and whether the listener is switched on.
+pub struct ClientListener<'a> {
+    pub key: &'static str,
+    pub address: &'a str,
+    pub enabled: bool,
+}
+
 impl ServerConfig {
+    /// The client-facing listeners, in the order the derived client-facing
+    /// address prefers them. TCP leads: it is the binary protocol every SDK
+    /// speaks, so it is the listener an address derived for clients should
+    /// describe whenever it is running.
+    #[must_use]
+    pub fn client_listeners(&self) -> [ClientListener<'_>; 4] {
+        [
+            ClientListener {
+                key: "tcp.address",
+                address: &self.tcp.address,
+                enabled: self.tcp.enabled,
+            },
+            ClientListener {
+                key: "websocket.address",
+                address: &self.websocket.address,
+                enabled: self.websocket.enabled,
+            },
+            ClientListener {
+                key: "quic.address",
+                address: &self.quic.address,
+                enabled: self.quic.enabled,
+            },
+            ClientListener {
+                key: "http.address",
+                address: &self.http.address,
+                enabled: self.http.enabled,
+            },
+        ]
+    }
+
+    /// The listener whose bind address cluster metadata derives this node's
+    /// client-facing address from when `node.advertised_address` is unset:
+    /// the first enabled one. `None` when every client-facing listener is
+    /// off, which leaves no address for a client to dial and nothing to
+    /// publish.
+    #[must_use]
+    pub fn derived_address_listener(&self) -> Option<ClientListener<'_>> {
+        self.client_listeners()
+            .into_iter()
+            .find(|listener| listener.enabled)
+    }
+
     /// Load server configuration from file and environment variables.
     ///
     /// The path comes from `IGGY_CONFIG_PATH` or defaults to

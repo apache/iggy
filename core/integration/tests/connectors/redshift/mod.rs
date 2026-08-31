@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Apache.Iggy.Utils;
+mod redshift_sink;
 
-internal static class BufferSizes
-{
-    internal const int INITIAL_BYTES_LENGTH = 4;
-}
+const TEST_MESSAGE_COUNT: usize = 3;

@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionString, ConnectionStringOptions, HttpConnectionStringOptions};
+use crate::{
+    ConnectionString, ConnectionStringOptions, HttpConnectionStringOptions, NonZeroIggyDuration,
+};
+use std::str::FromStr;
 
 /// Configuration for the HTTP client.
 #[derive(Debug, Clone)]
@@ -26,6 +29,8 @@ pub struct HttpClientConfig {
     pub retries: u32,
     /// The JWT for A2A authentication.
     pub jwt: Option<String>,
+    /// The interval between the heartbeats sent to the server.
+    pub heartbeat_interval: NonZeroIggyDuration,
 }
 
 impl Default for HttpClientConfig {
@@ -34,6 +39,7 @@ impl Default for HttpClientConfig {
             api_url: "http://127.0.0.1:3000".to_string(),
             retries: 3,
             jwt: None,
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
         }
     }
 }
@@ -44,6 +50,7 @@ impl From<ConnectionString<HttpConnectionStringOptions>> for HttpClientConfig {
             api_url: format!("http://{}", connection_string.server_address()),
             retries: connection_string.options().retries().unwrap(),
             jwt: None,
+            heartbeat_interval: connection_string.options().heartbeat_interval(),
         }
     }
 }

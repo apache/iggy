@@ -54,8 +54,9 @@ use crate::wire::{request_body, usize_to_u32, verify_request_checksum};
 use bytes::Bytes;
 use configs::server::ServerSystemConfig;
 use consensus::{
-    Consensus, EvictionContext, MetadataHandle, PartitionsHandle, build_eviction_message,
-    build_incompatible_protocol_eviction_message, build_result_rejection_reply,
+    Consensus, DISCONNECT_LOGOUT_REQUEST_ID, EvictionContext, MetadataHandle, PartitionsHandle,
+    build_eviction_message, build_incompatible_protocol_eviction_message,
+    build_result_rejection_reply,
 };
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
@@ -3105,7 +3106,7 @@ where
     // dropped channel, where nothing came back to classify.
     rx.recv()
         .await
-        .map_or(Err(MetadataSubmitError::Canceled), |outcome| outcome)
+        .unwrap_or(Err(MetadataSubmitError::Canceled))
 }
 
 /// Logout counterpart of [`submit_register_on_owner`].
@@ -3135,7 +3136,7 @@ where
     });
     rx.recv()
         .await
-        .map_or(Err(MetadataSubmitError::Canceled), |outcome| outcome)
+        .unwrap_or(Err(MetadataSubmitError::Canceled))
 }
 
 /// Handle a client `DeleteSegments`: resolve the requested count to an offset
@@ -3415,12 +3416,9 @@ fn submit_disconnect_logout<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // Synthetic request id: header validation rejects `request == 0` for
-    // non-register ops, and a disconnect has no client-issued request id.
-    // The logout apply keys on (client, session) only, so any non-zero id
-    // is valid here.
-    const DISCONNECT_LOGOUT_REQUEST_ID: u64 = u64::MAX;
-
+    // The sentinel request id is what the apply path reads to keep, rather
+    // than drop, the session's dedup fence: the client may be reconnecting
+    // under the same key, and its retry must still be answered.
     let bus = shard.bus.clone();
     bus.spawn(async move {
         if let Err(error) =
@@ -3856,6 +3854,7 @@ mod tests {
     use std::future::Future;
     use std::mem::size_of;
     use std::rc::Rc;
+    use std::sync::atomic::AtomicBool;
 
     type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
     type TestShard = IggyShard<SpyBus, PrepareJournal, IggySnapshot, TestMux, PapayaShardsTable>;
@@ -4516,7 +4515,9 @@ mod tests {
         let (stop_tx, stop_rx) = shard::channel::<()>(1);
         let pump_shard = Rc::clone(&shard);
         let pump = compio::runtime::spawn(async move {
-            pump_shard.run_message_pump(stop_rx).await;
+            pump_shard
+                .run_message_pump(stop_rx, Arc::new(AtomicBool::new(false)))
+                .await;
         });
 
         lane_sender
@@ -4562,7 +4563,9 @@ mod tests {
         // post-loop drain must still deliver the reply-lane frame.
         let (stop_tx, stop_rx) = shard::channel::<()>(1);
         stop_tx.try_send(()).expect("stop channel has capacity");
-        shard.run_message_pump(stop_rx).await;
+        shard
+            .run_message_pump(stop_rx, Arc::new(AtomicBool::new(false)))
+            .await;
 
         let replies = bus.client_replies.borrow();
         assert_eq!(
@@ -5103,8 +5106,13 @@ mod tests {
         let multi_node = Rc::new(ClusterRoster {
             enabled: true,
             name: "test-cluster".to_owned(),
-            nodes: vec![roster_node("node-0").into(), roster_node("node-1").into()],
-            self_ip: "127.0.0.1".to_owned(),
+            nodes: ["node-0", "node-1"]
+                .map(|name| {
+                    configs::cluster::ResolvedClusterNode::try_from(roster_node(name))
+                        .expect("valid roster node")
+                })
+                .to_vec(),
+            self_advertised: "127.0.0.1".to_owned(),
             self_ports: TransportPorts::default(),
             metadata_view: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,

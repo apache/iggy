@@ -24,7 +24,7 @@ use tracing::trace;
 
 /// Reader for the sparse index file written by [`crate::IggyIndexWriter`].
 ///
-/// The on-disk stride is [`IGGY_INDEX_SIZE`] (24 bytes: `offset` u64,
+/// The on-disk stride is `IGGY_INDEX_SIZE` (24 bytes: `offset` u64,
 /// `timestamp` u64, `position` u64, little-endian) — distinct from the legacy
 /// 16-byte dense per-message index that `server_common::IndexReader` parses.
 /// Recovery reaches for this reader so the reader matches the writer.
@@ -119,10 +119,11 @@ impl IggyIndexReader {
         ))
     }
 
-    /// Load every whole entry into an [`IggyIndexCache`] for offset / timestamp
+    /// Load every whole entry into an `IggyIndexCache` for offset / timestamp
     /// lower-bound lookups in one read. Density is one sparse entry per flushed
     /// chunk, so an aggressive flush cadence (`messages_required_to_save = 1`)
-    /// makes the file track every message: callers that cannot afford an
+    /// makes the file track every produced batch - every message only when
+    /// producers send one message per batch: callers that cannot afford an
     /// unbounded read must gate on [`Self::entry_count`] and fall back to the
     /// on-file lower-bound lookups. A trailing partial entry (torn write) is
     /// ignored (see [`Self::entry_count`]).
@@ -158,7 +159,7 @@ impl IggyIndexReader {
     /// Last entry with `offset` at or below the target, binary-searching the
     /// file with single-entry preads instead of materializing it, for indexes
     /// too large to load whole. `None` when every entry sits above the target;
-    /// semantics match [`IggyIndexCache::offset_lower_bound`]. `entry_count`
+    /// semantics match `IggyIndexCache::offset_lower_bound`. `entry_count`
     /// comes from [`Self::entry_count`]; entries are written in ascending
     /// offset and timestamp order.
     ///
