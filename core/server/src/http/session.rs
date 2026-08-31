@@ -99,7 +99,10 @@ pub(in crate::http) struct HttpSession {
     /// Serializes this session's writes: the guarded value is the NEXT request
     /// id. A `tokio::sync::Mutex` because the write path holds it across the
     /// submit `.await` so each session's request numbers reach the primary in
-    /// order and stay gap-free for the depth-1 consensus dedup.
+    /// order. Ordering is what matters, not contiguity: the client table dedups
+    /// on a watermark (see `submit.rs`), so gaps are free but an id overtaken by
+    /// a larger one would arrive at or below the watermark and be refused as a
+    /// duplicate.
     pub(in crate::http) gate: Mutex<u64>,
     /// Next data-plane request id. A separate, gate-free counter: partition ops
     /// are at-least-once with no consensus dedup, so the id only correlates the
