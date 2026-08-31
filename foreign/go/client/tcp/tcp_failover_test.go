@@ -748,6 +748,41 @@ func TestConnect_ConcurrentReconnectsThroughExchangeShareOneAttempt(t *testing.T
 		"the two failing requests reconnected separately")
 }
 
+// The teardown that follows a failure belongs to the connection the request
+// ran on. Connect marks the client connected before it signs in, so a caller
+// parked on c.mtx for that sign-in wakes to a healthy-looking state that says
+// nothing about which connection is installed.
+func TestDisconnect_DoesNotCloseAConnectionItDidNotFailOn(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
+
+	client := newDialingClient(t, server.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	require.NoError(t, client.Connect(context.Background()))
+
+	// What a request that fails on this connection carries with it.
+	failed := client.connGeneration
+
+	require.NoError(t, client.disconnect())
+	require.NoError(t, client.Connect(context.Background()))
+	require.NotEqual(t, failed, client.connGeneration,
+		"a reconnect installs a connection of its own")
+
+	torn, err := client.disconnectGeneration(failed)
+	require.NoError(t, err)
+	assert.False(t, torn, "the stale generation reported a teardown it did not make")
+	assert.Equal(t, iggcon.TransportStateConnected, client.transportState)
+	require.NoError(t, client.Ping(context.Background()),
+		"the reconnected client was torn down by a stale failure")
+	assert.Equal(t, 2, server.connections(), "the stale teardown forced a third connection")
+
+	// The connection the caller did fail on is still torn down.
+	torn, err = client.disconnectGeneration(client.connGeneration)
+	require.NoError(t, err)
+	assert.True(t, torn)
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
+}
+
 // The sign-in transaction holds registerMtx across its reconnect, and an
 // attempt started by a plain request ends in a sign-in that needs that same
 // lock. Waiting for that attempt closes a cycle -- the owner blocked on

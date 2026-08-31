@@ -56,6 +56,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Poll budget per [`DetExecutor::run_until_stalled`]. Pumps are event-driven, so
 /// hitting it means a task is spin-waking: a bug, panicked with the seed.
@@ -433,8 +435,13 @@ impl Simulator {
                 // the held stop channel or a crash abort.
                 let (stop_tx, stop_rx) = shard::channel::<()>(1);
                 let pump_shard = Rc::clone(&shard);
+                // The simulator crashes replicas explicitly, so nothing reads
+                // the shutdown flag a commit fault would flip.
+                let pump_shutdown_flag = Arc::new(AtomicBool::new(false));
                 pump_tasks.push(executor.spawn(async move {
-                    pump_shard.run_message_pump(stop_rx).await;
+                    pump_shard
+                        .run_message_pump(stop_rx, pump_shutdown_flag)
+                        .await;
                 }));
                 stop_txs.push(stop_tx);
                 shards.push(shard);
@@ -1117,8 +1124,11 @@ impl Simulator {
             }
             let (stop_tx, stop_rx) = shard::channel::<()>(1);
             let pump_shard = Rc::clone(&shard);
+            let pump_shutdown_flag = Arc::new(AtomicBool::new(false));
             pump_tasks.push(self.executor.spawn(async move {
-                pump_shard.run_message_pump(stop_rx).await;
+                pump_shard
+                    .run_message_pump(stop_rx, pump_shutdown_flag)
+                    .await;
             }));
             stop_txs.push(stop_tx);
             shards.push(shard);

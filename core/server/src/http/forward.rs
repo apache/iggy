@@ -602,8 +602,8 @@ fn primary_socket(state: &HttpInner) -> Option<SocketAddr> {
 }
 
 /// Private HTTP sockets for every other configured replica, in stable roster
-/// order. The caller tries each once. Invalid or HTTP-disabled entries are
-/// skipped because they cannot accept the forwarded request.
+/// order. The caller tries each once. HTTP-disabled entries are skipped
+/// because they cannot accept the forwarded request.
 fn partition_http_sockets(
     roster: &crate::cluster_meta::ClusterRoster,
     self_id: Option<u8>,
@@ -614,7 +614,7 @@ fn partition_http_sockets(
         .filter(|node| Some(node.config().replica_id) != self_id)
         .filter_map(|node| {
             Some(SocketAddr::new(
-                node.replica_ip()?,
+                node.replica_ip(),
                 node.config().ports.http?,
             ))
         })
@@ -715,7 +715,7 @@ impl ServerCertVerifier for PinnedCertVerifier {
 mod tests {
     use super::*;
 
-    use configs::cluster::{ClusterNodeConfig, TransportPorts};
+    use configs::cluster::{ClusterNodeConfig, ResolvedClusterNode, TransportPorts};
 
     fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
         ClusterNodeConfig {
@@ -738,8 +738,11 @@ mod tests {
         crate::cluster_meta::ClusterRoster {
             enabled: true,
             name: "test-cluster".to_owned(),
-            nodes: nodes.into_iter().map(Into::into).collect(),
-            self_ip: "127.0.0.1".to_owned(),
+            nodes: nodes
+                .into_iter()
+                .map(|node| ResolvedClusterNode::try_from(node).expect("valid roster node"))
+                .collect(),
+            self_advertised: "127.0.0.1".to_owned(),
             self_ports: TransportPorts::default(),
             metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
@@ -789,8 +792,7 @@ mod tests {
         let roster = roster(vec![
             node(0, "10.0.0.1", Some(8080)),
             node(1, "10.0.0.2", Some(8081)),
-            node(2, "not-an-ip", Some(8082)),
-            node(3, "10.0.0.4", None),
+            node(2, "10.0.0.3", None),
         ]);
 
         assert_eq!(

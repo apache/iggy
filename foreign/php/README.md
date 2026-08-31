@@ -64,6 +64,7 @@ php -r 'var_dump(extension_loaded("iggy-php"));'
 docker run --rm --name iggy-php-test \
   -p 8090:8090 \
   -p 3000:3000 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
   apache/iggy:latest
 ```
 
