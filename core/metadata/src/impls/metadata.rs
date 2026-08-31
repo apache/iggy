@@ -769,6 +769,11 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// whole snapshot on shard 0's pump, and hands each requester its own
     /// multi-MB copy.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
+    /// Prepares the backup gap check destroyed since the shard last drained
+    /// the count. Replicated traffic has no client to answer and retransmit
+    /// skips ops that already reached quorum, so nothing else records that the
+    /// frame existed. The partition twin is `IggyPartition::prepare_gap_drops`.
+    prepare_gap_drops: Cell<u64>,
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB>
@@ -808,11 +813,27 @@ where
             commit_notifier: RefCell::new(None),
             client_table_frontier: Cell::new(0),
             transfer_offer_cache: RefCell::new(None),
+            prepare_gap_drops: Cell::new(0),
         }
     }
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
+    /// Record one prepare destroyed by the backup gap check. Drained by
+    /// `tick_metadata` into `metadata_prepare_gap_drops_total`; the counter is
+    /// the only production signal that the level-triggered repair driver has
+    /// work to do, since the drop itself answers nobody.
+    pub fn note_prepare_gap_drop(&self) {
+        self.prepare_gap_drops
+            .set(self.prepare_gap_drops.get().saturating_add(1));
+    }
+
+    /// Take and clear the gap-drop count.
+    #[must_use = "dropping the count loses the only record those prepares existed"]
+    pub const fn take_prepare_gap_drops(&self) -> u64 {
+        self.prepare_gap_drops.replace(0)
+    }
+
     /// Slot capacity of the LIVE client table, i.e. the largest transferred
     /// table this replica can absorb.
     ///
@@ -1219,6 +1240,7 @@ where
                     sequencer_op = current_op,
                     "on_replicate: dropping out-of-order prepare (gap)"
                 );
+                self.note_prepare_gap_drop();
                 return;
             }
         } else {
@@ -3535,10 +3557,10 @@ where
 
             let Some(header) = journal.handle().header(op as usize) else {
                 // Gap-stop: the walk halts at the first missing prepare and
-                // resumes once it is refilled. Live drops refill via the
-                // primary's prepare retransmit; a replica behind at recovery
-                // or after StartView adoption arms a `MetadataRepairSession`
-                // (shard) that re-requests the missing window.
+                // resumes once it is refilled -- by the primary's retransmit
+                // while the op lacks quorum, else by a `MetadataRepairSession`
+                // (armed at StartView adoption or by `tick_metadata`'s gap
+                // detector, since retransmit skips quorum-acked ops).
                 break;
             };
             let header = *header;
@@ -4170,6 +4192,21 @@ mod tests {
     /// touches their methods.
     fn peer_metadata() -> IggyMetadata<(), (), (), TestMux> {
         IggyMetadata::new(None, None, None, None, TestMux::default(), None)
+    }
+
+    #[test]
+    fn take_prepare_gap_drops_drains_the_count() {
+        let md = peer_metadata();
+        assert_eq!(md.take_prepare_gap_drops(), 0);
+
+        md.note_prepare_gap_drop();
+        md.note_prepare_gap_drop();
+        assert_eq!(md.take_prepare_gap_drops(), 2);
+        assert_eq!(
+            md.take_prepare_gap_drops(),
+            0,
+            "a second drain must not re-report drops the metrics already counted"
+        );
     }
 
     #[test]

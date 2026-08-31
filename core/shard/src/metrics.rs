@@ -200,6 +200,7 @@ pub struct ShardMetrics {
     partition_requests_denied_transient_total: Counter,
     partition_repair_serves_deferred_purge_total: Counter,
     partition_prepare_gap_drops_total: Counter,
+    metadata_prepare_gap_drops_total: Counter,
 }
 
 impl ShardMetrics {
@@ -225,6 +226,7 @@ impl ShardMetrics {
             partition_requests_denied_transient_total: Counter::default(),
             partition_repair_serves_deferred_purge_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
+            metadata_prepare_gap_drops_total: Counter::default(),
         }
     }
 
@@ -417,6 +419,23 @@ impl ShardMetrics {
         self.partition_prepare_gap_drops_total.get()
     }
 
+    /// Add the prepares the metadata backup gap check destroyed since the last
+    /// tick, drained from `IggyMetadata::take_prepare_gap_drops`. A sibling of
+    /// `partition_prepare_gap_drops_total`, and NOT a `frame_drops_total`
+    /// reason for the same cause: gap drops are protocol-ordering drops that
+    /// the tick driver repairs, not routing faults, and the simulator asserts
+    /// `frame_drops_total` stays at zero on runs with no injected loss.
+    pub fn record_metadata_prepare_gap_drops(&self, drops: u64) {
+        self.metadata_prepare_gap_drops_total.inc_by(drops);
+    }
+
+    /// Snapshot of `metadata_prepare_gap_drops_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn metadata_prepare_gap_drops_value(&self) -> u64 {
+        self.metadata_prepare_gap_drops_total.get()
+    }
+
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
     /// accessor, readable from any crate under those cfgs so the crates that
     /// drive the reconciler can assert a reject did not happen.
@@ -512,6 +531,11 @@ impl ShardMetrics {
             "partition_prepare_gap_drops",
             "replicated prepares dropped out of order by a backup's gap check",
             self.partition_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "metadata_prepare_gap_drops",
+            "replicated metadata prepares dropped out of order by a backup's gap check",
+            self.metadata_prepare_gap_drops_total.clone(),
         );
     }
 }
