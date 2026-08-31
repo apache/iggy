@@ -36,6 +36,12 @@ impl From<RustStreamDetails> for StreamDetails {
 #[gen_stub_pymethods]
 #[pymethods]
 impl StreamDetails {
+    /// Stream creation time as Unix time in microseconds.
+    #[getter]
+    pub fn created_at(&self) -> u64 {
+        self.inner.created_at.as_micros()
+    }
+
     #[getter]
     pub fn id(&self) -> u32 {
         self.inner.id
@@ -44,6 +50,12 @@ impl StreamDetails {
     #[getter]
     pub fn name(&self) -> String {
         self.inner.name.to_string()
+    }
+
+    /// Current stored stream size in bytes.
+    #[getter]
+    pub fn size(&self) -> u64 {
+        self.inner.size.as_bytes_u64()
     }
 
     #[getter]
@@ -59,8 +71,8 @@ impl StreamDetails {
 
 /// Summary information returned by `IggyClient.get_streams()`.
 ///
-/// `created_at` is Unix time in microseconds. `size_bytes` is the stream's
-/// current stored size in bytes.
+/// `created_at` is Unix time in microseconds. `size` is the stream's current
+/// stored size in bytes.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct Stream {
@@ -96,7 +108,7 @@ impl Stream {
 
     /// Current stored stream size in bytes.
     #[getter]
-    pub fn size_bytes(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         self.inner.size.as_bytes_u64()
     }
 

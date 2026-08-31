@@ -1949,8 +1949,8 @@ class Stream:
     r"""
     Summary information returned by `IggyClient.get_streams()`.
 
-    `created_at` is Unix time in microseconds. `size_bytes` is the stream's
-    current stored size in bytes.
+    `created_at` is Unix time in microseconds. `size` is the stream's current
+    stored size in bytes.
     """
     @property
     def id(self) -> builtins.int:
@@ -1968,7 +1968,7 @@ class Stream:
         Unique stream name.
         """
     @property
-    def size_bytes(self) -> builtins.int:
+    def size(self) -> builtins.int:
         r"""
         Current stored stream size in bytes.
         """
@@ -1986,9 +1986,19 @@ class Stream:
 @typing.final
 class StreamDetails:
     @property
+    def created_at(self) -> builtins.int:
+        r"""
+        Stream creation time as Unix time in microseconds.
+        """
+    @property
     def id(self) -> builtins.int: ...
     @property
     def name(self) -> builtins.str: ...
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        Current stored stream size in bytes.
+        """
     @property
     def messages_count(self) -> builtins.int: ...
     @property

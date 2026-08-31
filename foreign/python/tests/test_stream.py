@@ -62,7 +62,9 @@ class TestStreamOperations:
 
         stream = await iggy_client.get_stream(stream_name)
         assert stream is not None
+        assert stream.created_at > 0
         assert stream.name == stream_name
+        assert stream.size == 0
         assert stream.topics_count == 0
 
     @pytest.mark.asyncio
@@ -228,7 +230,7 @@ class TestGetStreams:
         assert {stream.name for stream in mine} == created_names
         assert [stream.id for stream in mine] == sorted(stream.id for stream in mine)
         assert all(stream.created_at > 0 for stream in mine)
-        assert all(stream.size_bytes == 0 for stream in mine)
+        assert all(stream.size == 0 for stream in mine)
         assert all(stream.messages_count == 0 for stream in mine)
         assert all(stream.topics_count == 0 for stream in mine)
 
@@ -413,7 +415,7 @@ class TestUpdateStream:
             before.id,
             before.created_at,
             before.name,
-            before.size_bytes,
+            before.size,
             before.messages_count,
             before.topics_count,
         )
@@ -427,7 +429,7 @@ class TestUpdateStream:
             after.id,
             after.created_at,
             after.name,
-            after.size_bytes,
+            after.size,
             after.messages_count,
             after.topics_count,
         ) == before_metadata
