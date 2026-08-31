@@ -578,8 +578,10 @@ pub struct ClientTable {
 
 /// Whether two integrity stamps for the same request number disagree.
 ///
-/// Zero means unstamped (the wire integrity fields are zeroed today), and an
-/// unstamped side carries no evidence either way, so it never conflicts.
+/// Zero means unstamped, and an unstamped side carries no evidence either way,
+/// so it never conflicts. The Rust SDK stamps the ops this table dedups;
+/// partition ops and the other SDKs still send zero, so a conflict is only ever
+/// detectable between two stamped frames.
 const fn checksums_conflict(stored: u128, received: u128) -> bool {
     stored != 0 && received != 0 && stored != received
 }
