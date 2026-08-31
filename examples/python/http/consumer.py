@@ -98,8 +98,8 @@ async def main():
         logger.info("Connecting to IggyClient...")
         await client.connect()
         logger.info("Connected.")
-        # HTTP is a stateless transport: log in explicitly rather than relying
-        # on auto-login, which HttpConfig does not expose.
+        # Log in explicitly rather than relying on auto-login, which
+        # HttpConfig does not expose.
         await client.login_user("iggy", "iggy")
         await consume_messages(client)
     except Exception as error:

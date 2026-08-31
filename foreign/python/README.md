@@ -170,7 +170,8 @@ asyncio.run(main())
 
 `IggyClient.http(...)` takes an `HttpConfig` the same way, built from `IggyClient.http()`'s own
 config type rather than passed to `IggyClient(...)`. HTTP is a stateless per-request transport,
-so there is no `AutoLogin` or reconnection policy to configure:
+so there is no reconnection policy to configure. There is also no `AutoLogin`: call
+`login_user(...)` explicitly after connecting.
 
 ```python
 import asyncio
