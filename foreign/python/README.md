@@ -203,6 +203,49 @@ async def main():
 asyncio.run(main())
 ```
 
+`WebSocketConfig` is the fourth arm of the same constructor:
+
+```python
+import asyncio
+from datetime import timedelta
+
+from apache_iggy import (
+    AutoLogin,
+    IggyClient,
+    WebSocketConfig,
+    WebSocketFramingConfig,
+    WebSocketReconnectionConfig,
+)
+
+
+async def main():
+    client = IggyClient(
+        WebSocketConfig(
+            server_address="127.0.0.1:8092",
+            auto_login=AutoLogin.username_password("iggy", "iggy"),
+            reconnection=WebSocketReconnectionConfig(
+                enabled=True,
+                max_retries=10,
+                interval=timedelta(seconds=2),
+                reestablish_after=timedelta(seconds=30),
+            ),
+            heartbeat_interval=timedelta(seconds=5),
+            framing=WebSocketFramingConfig(
+                max_message_size=64 * 1024 * 1024,
+                max_frame_size=16 * 1024 * 1024,
+            ),
+            # tls_enabled=True,
+            # tls_domain="localhost",
+            # tls_ca_file="../../core/certs/iggy_ca_cert.pem",
+            # tls_validate_certificate=True,
+        )
+    )
+    await client.connect()
+
+
+asyncio.run(main())
+```
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.
