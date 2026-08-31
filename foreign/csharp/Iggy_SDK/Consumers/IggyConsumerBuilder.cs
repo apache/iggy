@@ -95,7 +95,7 @@ public class IggyConsumerBuilder
     /// <param name="reconnectionSettings">Reconnection settings for the client.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithConnection(Protocol protocol, string address, string login, string password,
-        int? receiveBufferSize = null, int sendBufferSize? = null, ReconnectionSettings? reconnectionSettings = null)
+        int? receiveBufferSize = null, int? sendBufferSize = null, ReconnectionSettings? reconnectionSettings = null)
     {
         Config.Protocol = protocol;
         Config.Address = address;
