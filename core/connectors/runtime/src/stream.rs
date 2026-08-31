@@ -142,10 +142,10 @@ fn connection_string_with_token(
             .filter(|domain| !domain.is_empty())
             .map(|domain| format!("&tls_domain={domain}"))
             .unwrap_or_default();
-        append_query_parameters(
+        Ok(append_query_parameters(
             &connection_string,
             &format!("tls=true&tls_ca_file={ca_file}{domain}"),
-        )
+        ))
     } else {
         Ok(connection_string)
     }
