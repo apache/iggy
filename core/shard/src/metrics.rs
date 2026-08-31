@@ -79,17 +79,12 @@ pub struct FrameDropLabel {
 /// had not materialised and its park buffer was at capacity
 /// (`reason=park_overflow`), a parked frame retired with no client to answer
 /// (`reason=park_dropped`), or a routing send the target inbox refused. A shed
-/// client request is answered with
-/// a retriable status, so the client recovers -- but a shed *prepare* is not
-/// covered by retransmit once its op has reached quorum
-/// (`consensus::retransmit_targets` skips `ok_quorum_received`, and the
-/// partition plane creates a repair session only in `on_start_view`), so it
-/// leaves that backup behind until an unrelated view change.
-//
-// TODO(krishna): give the partition plane a normal-status repair driver so a
-// shed or refused prepare is repaired without waiting for a view change. Until
-// then `variant=partition` is the only signal that a backup may be stranded
-// behind `commit_max`.
+/// client request is answered with a retriable status, so the client recovers.
+/// A shed *prepare* has nobody to answer and is not covered by retransmit once
+/// its op has reached quorum (`consensus::retransmit_targets` skips
+/// `ok_quorum_received`), so the backup gap-stops; `tick_partitions`' sweep is
+/// what repairs it, and `partition_prepare_gap_drops_total` is what counts the
+/// prepares that reached the gap check.
 pub mod frame_drop_variant {
     pub const CONSENSUS: &str = "consensus";
     pub const FD_TRANSFER: &str = "fd_transfer";
@@ -204,6 +199,7 @@ pub struct ShardMetrics {
     partition_frames_rejected_ahead_total: Counter,
     partition_requests_denied_transient_total: Counter,
     partition_repair_serves_deferred_purge_total: Counter,
+    partition_prepare_gap_drops_total: Counter,
 }
 
 impl ShardMetrics {
@@ -228,6 +224,7 @@ impl ShardMetrics {
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_requests_denied_transient_total: Counter::default(),
             partition_repair_serves_deferred_purge_total: Counter::default(),
+            partition_prepare_gap_drops_total: Counter::default(),
         }
     }
 
@@ -401,6 +398,25 @@ impl ShardMetrics {
         self.partition_repair_serves_deferred_purge_total.get()
     }
 
+    /// Add the prepares a partition's backup gap check destroyed since the last
+    /// sweep, drained per tick from `IggyPartition::take_prepare_gap_drops`.
+    ///
+    /// Deliberately NOT a `frame_drops_total{variant=partition}` reason: that
+    /// family means the bus or the router shed a frame, and the simulator
+    /// asserts it stays at zero on runs with no injected loss. A gap drop is a
+    /// protocol-ordering drop that any real loss produces, and the sweep repairs
+    /// it, so folding the two would turn a routing-fault alert into noise.
+    pub fn record_partition_prepare_gap_drops(&self, drops: u64) {
+        self.partition_prepare_gap_drops_total.inc_by(drops);
+    }
+
+    /// Snapshot of `partition_prepare_gap_drops_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_prepare_gap_drops_value(&self) -> u64 {
+        self.partition_prepare_gap_drops_total.get()
+    }
+
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
     /// accessor, readable from any crate under those cfgs so the crates that
     /// drive the reconciler can assert a reject did not happen.
@@ -491,6 +507,11 @@ impl ShardMetrics {
             "partition_repair_serves_deferred_purge",
             "partition repair serves or completions deferred until a committed purge applies",
             self.partition_repair_serves_deferred_purge_total.clone(),
+        );
+        registry.register(
+            "partition_prepare_gap_drops",
+            "replicated prepares dropped out of order by a backup's gap check",
+            self.partition_prepare_gap_drops_total.clone(),
         );
     }
 }

@@ -132,6 +132,16 @@ where
     /// set when the recovery handshake finds this replica behind the group's
     /// commit frontier, cleared when `RepairDone` completes the walk.
     pub repair: Option<RepairSession>,
+    /// Consecutive shard-sweep ticks this partition has been seen gap-stopped
+    /// (committed ops it cannot walk to, because the op at its commit frontier
+    /// plus one is missing). Debounces the sweep's level-triggered repair arm.
+    /// Owned by the sweep, like [`Self::transfer_rearm`].
+    pub gap_ticks: u32,
+    /// Prepares the backup gap check destroyed since the shard last drained
+    /// the count. Replicated traffic has no client to answer and retransmit
+    /// skips ops that already reached quorum, so nothing else records that the
+    /// frame existed.
+    prepare_gap_drops: u64,
     /// Highest message offset recovered from segments at boot (`None` when
     /// the partition booted empty). Repaired batches at or below this line
     /// are already persisted and counted; the flush and commit paths skip
@@ -477,6 +487,8 @@ where
             consumer_offset_enforce_fsync: false,
             runtime_options: TopicRuntimeOptions::default(),
             repair: None,
+            gap_ticks: 0,
+            prepare_gap_drops: 0,
             recovered_durable_offset: None,
             installed_frontier: None,
             fatal: None,
@@ -996,6 +1008,22 @@ where
         }
         let _superblock_guard = self.superblock_lock.acquire().await;
         self.write_superblock(superblock.as_ref(), frontier).await
+    }
+
+    /// Record one prepare destroyed by the backup gap check. Drained by the
+    /// shard sweep into `partition_prepare_gap_drops_total`; the counter is the
+    /// only production signal that the level-triggered repair driver has work
+    /// to do, since the drop itself answers nobody.
+    pub const fn note_prepare_gap_drop(&mut self) {
+        self.prepare_gap_drops = self.prepare_gap_drops.saturating_add(1);
+    }
+
+    /// Take and clear the gap-drop count.
+    #[must_use = "dropping the count loses the only record those prepares existed"]
+    pub const fn take_prepare_gap_drops(&mut self) -> u64 {
+        let drops = self.prepare_gap_drops;
+        self.prepare_gap_drops = 0;
+        drops
     }
 
     /// Burn one transfer stall round; `true` once the budget is exhausted.
@@ -2378,6 +2406,7 @@ where
                     .with_operation(header.operation)
                     .with_op(header.op),
                 );
+                self.note_prepare_gap_drop();
                 return;
             }
         } else {
