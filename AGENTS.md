@@ -6,11 +6,11 @@ Transports: QUIC, WebSocket, TCP (custom binary), HTTP (REST). SDKs:
 Rust, .NET, Java, Python, Go, C++, Node.js. A connectors subsystem
 ingests from / egresses to external systems via dlopened plugins.
 
-> Skills under `.claude/skills/` are currently scoped to the
-> **connectors** subsystem (`core/connectors/`). Load
+> Skills live under `.claude/skills/`. Load
 > [connectors-overview](.claude/skills/connectors-overview/SKILL.md)
-> first for any change there. Other subsystems follow the repo-wide
-> principles in this file.
+> first for any change under `core/connectors/`;
+> [team-review](.claude/skills/team-review/SKILL.md) is repo-wide.
+> Other subsystems follow the repo-wide principles in this file.
 
 ## Contents
 
@@ -121,8 +121,8 @@ iggy/
 
 ## Skills
 
-Connectors-scoped. Each `SKILL.md` has YAML frontmatter (name,
-description). Load `connectors-overview` first as router.
+Each `SKILL.md` has YAML frontmatter (name, description). For
+connectors work, load `connectors-overview` first as router.
 
 - [connectors-overview](.claude/skills/connectors-overview/SKILL.md) - router + universal connector rules
 - [connector-runtime](.claude/skills/connector-runtime/SKILL.md) - FFI host, lifecycle, state, metrics
@@ -131,6 +131,10 @@ description). Load `connectors-overview` first as router.
 - [connector-source](.claude/skills/connector-source/SKILL.md) - source plugin authoring
 - [connector-transform](.claude/skills/connector-transform/SKILL.md) - transform authoring
 - [connector-testing](.claude/skills/connector-testing/SKILL.md) - unit + integration test patterns
+
+Repo-wide:
+
+- [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, user-invoked only
 
 ## Repo-wide principles
 
