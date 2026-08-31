@@ -518,11 +518,11 @@ pub(crate) async fn open_partition_superblock(
 /// The namespace arrives packed, so its components are in range by
 /// construction. Metadata admission is what bounds them.
 ///
-/// `view_seed` is the view a group with no durable record of its own starts
-/// in, and it is the metadata plane's current view: see the `seed_view`
-/// comment below for why a group left at view 0 is unreachable. `None` keeps
-/// the historical view-0 start, and is also what a restart materialization
-/// gets, since it probes for the live view instead.
+/// `created_view` is the view a group with no durable record of its own starts
+/// in: the metadata plane's view when it committed the create, recorded on
+/// the committed partition so every replica seeds the same value. See the
+/// `seed_view` comment below for why a group left at view 0 is unreachable. A
+/// restart materialization ignores it and probes for the live view instead.
 ///
 /// The returned partition's `offset` / `dirty_offset` are `0` and
 /// `should_increment_offset` is `false`, mirroring a clean append starting
@@ -542,7 +542,7 @@ pub async fn build_partition_fresh(
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
-    view_seed: Option<u32>,
+    created_view: u32,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
     let stream_id = namespace.stream_id();
@@ -604,7 +604,8 @@ pub async fn build_partition_fresh(
         .map(|state| (state.view, state.log_view));
     // Shared with the simulator's `init_partition`, which cannot call this
     // builder; see `fresh_group_start`.
-    let FreshGroupStart { join, seed_view } = fresh_group_start(restarted, durable_view, view_seed);
+    let FreshGroupStart { join, seed_view } =
+        fresh_group_start(restarted, durable_view, created_view);
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
@@ -626,16 +627,16 @@ pub async fn build_partition_fresh(
             // than the roster advertises as leader, and nothing routes a
             // partition write across that gap: the client is sent to the
             // metadata leader and refused there for the whole budget. Seeding
-            // from the metadata view keeps the two congruent for a group born
-            // after a metadata election.
+            // from the view the create was admitted in keeps the two congruent
+            // for a group born after a metadata election.
             //
-            // Replicas can still disagree on the seed: each publishes its own
-            // metadata view on a 100ms poll, so one may read V while another
-            // has yet to see the election. That resolves the way any view
-            // disagreement does, the higher view winning through `StartView` -
-            // but only because the seed sets `log_view` too. The caller is
-            // what keeps a replica from seeding a view it has no opinion on;
-            // see `ReconcilerCtx::partition_view_seed`.
+            // The seed comes off the committed partition, not this replica's
+            // live metadata view: the two differ once the metadata plane
+            // elects again, and a seed above the group's real view is an
+            // empty log that outranks committed history in the next DVC
+            // merge. The value rides the create's request body (a header view
+            // is restamped per delivery), so every replica commits the same
+            // one and a late materialiser lands at or below its peers.
             seed_view,
             incarnation: None,
             join,
