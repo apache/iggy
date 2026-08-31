@@ -516,6 +516,10 @@ jobs:
           go test -v -race -coverprofile=../../reports/go-coverage-unit.out ./...
 
       - name: Run BDD tests with coverage
+        env:
+          IGGY_TCP_ADDRESS: 127.0.0.1:8090
+          IGGY_ROOT_USERNAME: iggy
+          IGGY_ROOT_PASSWORD: iggy
         run: |
           cd bdd/go
           mkdir -p ../../reports
