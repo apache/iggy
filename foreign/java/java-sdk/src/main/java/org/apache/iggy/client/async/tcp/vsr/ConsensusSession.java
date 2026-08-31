@@ -52,12 +52,20 @@ public final class ConsensusSession {
      * the whole identity re-arms with a fresh client id so the server sees a
      * brand-new registration. Returns the request id a Register carries,
      * which is always zero.
+     *
+     * <p>The request counter is deliberately not rewound. This SDK multiplexes
+     * a single pinned channel and correlates replies by (operation, request
+     * id), so a send still in flight when a re-login re-arms would share its
+     * key with the first send of the new session: the correlation map would
+     * refuse the second one and a late reply for the first could be handed to
+     * it. A re-arm registers a fresh client id, which the server admits at
+     * watermark zero and which accepts any id above it, so carrying the
+     * counter forward costs nothing on the wire.
      */
     synchronized long beginRegister() {
         if (registerConsumed || session != null) {
             regenerateClientId();
             session = null;
-            requestCounter = 1;
         }
         registerConsumed = true;
         return 0;
