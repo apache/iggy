@@ -30,7 +30,10 @@ mod user;
 mod user_headers;
 
 use client::IggyClient;
-use config::{AutoLogin, TcpConfig, TcpReconnectionConfig};
+use config::{
+    AutoLogin, TcpConfig, TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig,
+    WebSocketReconnectionConfig,
+};
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerGroupMember, IggyConsumer, ReceiveMessageIterator,
@@ -56,6 +59,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AutoLogin>()?;
     m.add_class::<TcpConfig>()?;
     m.add_class::<TcpReconnectionConfig>()?;
+    m.add_class::<WebSocketConfig>()?;
+    m.add_class::<WebSocketReconnectionConfig>()?;
+    m.add_class::<WebSocketFramingConfig>()?;
     m.add_class::<StreamDetails>()?;
     m.add_class::<Topic>()?;
     m.add_class::<TopicDetails>()?;
