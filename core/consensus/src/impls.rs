@@ -1127,7 +1127,7 @@ pub struct ConsensusTimers {
 }
 
 /// How a restored replica joins its group.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinMode {
     /// Fresh group or solo replica: plain init; the group needs its view-0
     /// primary to exist.
@@ -1151,9 +1151,70 @@ pub struct VsrRestore<'a> {
     /// View inferred from the last journaled prepare, consulted only when no
     /// durable record exists; `log_view` cannot be inferred and stays 0.
     pub view_fallback: Option<u32>,
+    /// Starting `(view, log_view)` for a group with NO history of its own,
+    /// consulted only when neither of the two above applies.
+    ///
+    /// Sets `log_view` as well as `view`, unlike `view_fallback`: the log is
+    /// empty, so there is no history to misattribute to the view, and a
+    /// primary whose `log_view` lags its `view` is treated as mid-transition
+    /// and answers no `RequestStartView` probe (see
+    /// [`VsrConsensus::handle_request_start_view`]) - it would hold its own group's
+    /// probes open forever.
+    ///
+    /// Deliberately NOT marked superblock-durable: nothing has been written
+    /// yet, and claiming otherwise would let a restart resume a view no record
+    /// holds. The group persists on its first tick instead.
+    pub seed_view: Option<u32>,
     /// Non-zero boot incarnation; `None` keeps the default.
     pub incarnation: Option<u128>,
     pub join: JoinMode,
+}
+
+/// How a group with no consensus state in memory should come up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreshGroupStart {
+    pub join: JoinMode,
+    /// Starting view for a group with no durable record; see
+    /// [`VsrRestore::seed_view`]. Always `None` when a durable record exists,
+    /// so a caller can apply the two in either order.
+    pub seed_view: Option<u32>,
+}
+
+/// Decide how a group being materialised should join, and what view it starts
+/// in when it has no record of its own.
+///
+/// One function because there are two materialisation paths and they must not
+/// drift: `build_partition_fresh` on the server, and the simulator's
+/// `init_partition`, which cannot call it (that builder does real filesystem
+/// work, and the simulator runs on in-memory storage). Both previously decided
+/// this for themselves, which is how the simulator came to exercise neither
+/// the seed nor the split it closes.
+///
+/// `restarted` is the caller's own evidence of a prior life, since the two
+/// paths read it differently: a partition directory already on disk for the
+/// server, a retained in-memory log for the simulator.
+#[must_use]
+pub const fn fresh_group_start(
+    restarted: bool,
+    durable_view: Option<(u32, u32)>,
+    metadata_view: Option<u32>,
+) -> FreshGroupStart {
+    let join = if restarted {
+        JoinMode::ProbeAsBackup {
+            await_state_transfer: false,
+        }
+    } else {
+        JoinMode::Init
+    };
+    // A durable record outranks the seed, and a probing backup takes neither:
+    // it must sit at or below the group's real view for the primary's
+    // `StartView` to move it forward, and seeded above that the reply reads as
+    // stale and is dropped.
+    let seed_view = match (durable_view, join) {
+        (None, JoinMode::Init) => metadata_view,
+        _ => None,
+    };
+    FreshGroupStart { join, seed_view }
 }
 
 impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
@@ -1230,6 +1291,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             consensus.mark_superblock_durable(view, log_view);
         } else if let Some(view) = restore.view_fallback {
             consensus.set_view(view);
+        } else if let Some(view) = restore.seed_view {
+            tracing::info!(
+                group,
+                view,
+                "seeded a group with no history of its own into the current view"
+            );
+            consensus.set_view(view);
+            consensus.set_log_view(view);
         }
         match restore.join {
             JoinMode::Init => consensus.init(),
@@ -3985,6 +4054,51 @@ where
 
     fn is_transferring(&self) -> bool {
         self.state_transfer_stage.get() != StateTransferStage::Idle
+    }
+}
+
+#[cfg(test)]
+mod fresh_group_start_tests {
+    use super::{JoinMode, fresh_group_start};
+
+    const METADATA_VIEW: u32 = 4;
+
+    /// The case the seed exists for: a group created after the metadata plane
+    /// elected must not start at view 0, or it names a replica the roster does
+    /// not advertise and no client can be routed to it.
+    #[test]
+    fn given_a_fresh_group_when_the_metadata_view_moved_should_seed_that_view() {
+        let start = fresh_group_start(false, None, Some(METADATA_VIEW));
+        assert_eq!(start.join, JoinMode::Init);
+        assert_eq!(start.seed_view, Some(METADATA_VIEW));
+    }
+
+    /// No published view is "no opinion", not "view 0". The caller defers
+    /// materialising rather than seeding; this only asserts nothing is
+    /// invented here.
+    #[test]
+    fn given_a_fresh_group_when_no_metadata_view_is_known_should_not_seed() {
+        let start = fresh_group_start(false, None, None);
+        assert_eq!(start.join, JoinMode::Init);
+        assert_eq!(start.seed_view, None);
+    }
+
+    /// A durable record outranks the seed: it is what this replica actually
+    /// promised, and the seed is a guess about someone else's plane.
+    #[test]
+    fn given_a_durable_record_when_seeding_should_prefer_the_record() {
+        let start = fresh_group_start(false, Some((7, 7)), Some(METADATA_VIEW));
+        assert_eq!(start.seed_view, None);
+    }
+
+    /// A probing backup must sit at or below the group's real view for the
+    /// primary's `StartView` to move it forward. Seeded above it, the reply
+    /// reads as stale and the replica never rejoins.
+    #[test]
+    fn given_a_prior_life_when_seeding_should_probe_without_a_seed() {
+        let start = fresh_group_start(true, None, Some(METADATA_VIEW));
+        assert!(matches!(start.join, JoinMode::ProbeAsBackup { .. }));
+        assert_eq!(start.seed_view, None);
     }
 }
 

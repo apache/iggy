@@ -105,7 +105,8 @@ pub struct BackgroundConfig {
     /// Action to apply when back-pressure limits are reached
     #[builder(default = BackpressureMode::Block)]
     pub failure_mode: BackpressureMode,
-    /// Upper bound for the **bytes held in memory** across *all* shards.
+    /// Upper bound for the **bytes buffered or in flight** across *all* shards.
+    /// Bytes remain charged until the corresponding write completes.
     /// `IggyByteSize::from(0)` ⇒ unlimited.
     #[builder(default = IggyByteSize::from(32 * MIB as u64))]
     pub max_buffer_size: IggyByteSize,

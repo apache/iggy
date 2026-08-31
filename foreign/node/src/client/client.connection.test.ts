@@ -17,19 +17,44 @@
 
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 import {
   createServer,
   type AddressInfo,
   type Server,
-  type Socket,
+  type Socket
 } from 'node:net';
-import { describe, it } from 'node:test';
+import {
+  createServer as createTlsServer,
+  type TLSSocket
+} from 'node:tls';
+import { describe, it, before, after } from 'node:test';
 import { ProtocolFrameError } from './client.frame.js';
 import { IggyConnection } from './client.connection.js';
 import type { ClientConfig } from './client.type.js';
 import { Command, HEADER_SIZE, REPLY_OFFSET } from '../wire/vsr/header.js';
 
 const FRAME_LIMIT = 2 * HEADER_SIZE;
+
+const TLS_CERTIFICATE = readFileSync(
+  new URL('../../../../core/certs/iggy_cert.pem', import.meta.url)
+);
+const TLS_KEY = readFileSync(
+  new URL('../../../../core/certs/iggy_key.pem', import.meta.url)
+);
+const TLS_CA_CERTIFICATE = readFileSync(
+  new URL('../../../../core/certs/iggy_ca_cert.pem', import.meta.url)
+);
+
+const startTlsServer = async (): Promise<Server> => {
+  const server = createTlsServer({
+    cert: TLS_CERTIFICATE,
+    key: TLS_KEY
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  return server;
+};
 
 const startServer = async (): Promise<Server> => {
   const server = createServer();
@@ -67,7 +92,16 @@ const closeConnection = async (
   await new Promise<void>((resolve) => server.close(() => resolve()));
 };
 
+let keepAlive: NodeJS.Timeout;
+
 describe('IggyConnection', () => {
+
+  // Note:
+  // before node v24 Timeout.unref() would let eventloop exit before test end
+  // (tested against 22.x 23.x -> fail vs 24.x 26.x -> pass)
+  // this timeout prevent eventloop exit before this test end
+  before(() => { keepAlive = setInterval(() => {}, 10000) });
+
   it('recognizes a connection established before connect is called',
     async () => {
       const server = await startServer();
@@ -342,8 +376,15 @@ describe('IggyConnection', () => {
           (resolve) => server.close(() => resolve())
         );
         serverSocket?.destroy();
+        const retryStartedAt = Date.now();
         await closed;
         const error = await exhausted;
+        // Three retries at a 10 ms interval must spend at least 30 ms in
+        // backoff; a broken wait would redial back to back.
+        assert.ok(
+          Date.now() - retryStartedAt >= 30,
+          'reconnect backoff did not elapse between retries'
+        );
         assert.match(error.message, /reconnect maxRetries exceeded/);
         await new Promise<void>((resolve) => setTimeout(resolve, 20));
         assert.deepEqual(rejections, []);
@@ -417,6 +458,33 @@ describe('IggyConnection', () => {
       }
     }
   );
+
+  it('walks each roster endpoint once per request', async () => {
+    const seed = await startServer();
+    const seedPort = (seed.address() as AddressInfo).port;
+    const connection = new IggyConnection(connectionConfig(seed));
+    connection.on('error', () => undefined);
+    try {
+      await connection.connect();
+      connection.rememberRoster([
+        { host: '127.0.0.1', port: seedPort },
+        { host: '127.0.0.1', port: seedPort + 1 },
+        { host: '127.0.0.1', port: seedPort + 2 }
+      ]);
+      const visited = new Set<string>();
+
+      assert.deepEqual(connection.nextRosterEndpoint(visited), {
+        host: '127.0.0.1', port: seedPort + 1
+      });
+      assert.deepEqual(connection.nextRosterEndpoint(visited), {
+        host: '127.0.0.1', port: seedPort + 2
+      });
+      assert.equal(connection.nextRosterEndpoint(visited), undefined);
+      assert.equal(visited.size, 3);
+    } finally {
+      await closeConnection(connection, seed);
+    }
+  });
 
   it('dials the endpoint it is on, then the seed, then the roster',
     async () => {
@@ -813,4 +881,76 @@ describe('IggyConnection', () => {
       }
     }
   );
+
+  it('rejects an unreadable tls_ca_file with a TypeError at socket creation',
+    () => {
+      assert.throws(
+        () =>
+          new IggyConnection({
+            transport: 'TLS',
+            options: {
+              host: '127.0.0.1',
+              port: 8090,
+              caFile: '/does/not/exist.pem'
+            },
+            credentials: { username: 'iggy', password: 'iggy' },
+            reconnect: { enabled: false, interval: 0, maxRetries: 0 }
+          }),
+        /cannot read tls_ca_file/
+      );
+    }
+  );
+
+  it('sends a DNS host as the SNI server name when none is set',
+    async () => {
+      const server = await startTlsServer();
+      const secureConnection =
+        once(server, 'secureConnection') as Promise<[TLSSocket]>;
+      const connection = new IggyConnection({
+        transport: 'TLS',
+        options: {
+          host: 'localhost',
+          port: (server.address() as AddressInfo).port,
+          ca: TLS_CA_CERTIFICATE
+        },
+        credentials: { username: 'iggy', password: 'iggy' },
+        reconnect: { enabled: false, interval: 0, maxRetries: 0 }
+      });
+      try {
+        await connection.connect();
+        assert.equal(connection.connected, true);
+        const [tlsSocket] = await secureConnection;
+        assert.equal(tlsSocket.servername, 'localhost');
+      } finally {
+        await closeConnection(connection, server);
+      }
+    }
+  );
+
+  it('omits SNI for IP literal hosts', async () => {
+    const server = await startTlsServer();
+    const secureConnection =
+      once(server, 'secureConnection') as Promise<[TLSSocket]>;
+    const connection = new IggyConnection({
+      transport: 'TLS',
+      options: {
+        host: '127.0.0.1',
+        port: (server.address() as AddressInfo).port,
+        rejectUnauthorized: false
+      },
+      credentials: { username: 'iggy', password: 'iggy' },
+      reconnect: { enabled: false, interval: 0, maxRetries: 0 }
+    });
+    try {
+      await connection.connect();
+      assert.equal(connection.connected, true);
+      const [tlsSocket] = await secureConnection;
+      // Node reports a missing SNI name as false on the server side.
+      assert.ok(!tlsSocket.servername);
+    } finally {
+      await closeConnection(connection, server);
+    }
+  });
+
+  after(() => clearInterval(keepAlive));
 });

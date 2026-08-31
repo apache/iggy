@@ -608,7 +608,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 "Reconnection is enabled without auto login: a lost session can only be restored once the client has signed in at least once");
         }
 
-        return ConnectAsync(true, token);
+        return ConnectAsync(true, true, token);
     }
 
     /// <inheritdoc />
@@ -817,6 +817,15 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// </summary>
     private async Task ConnectAsync(bool autoLogin, CancellationToken token)
     {
+        await ConnectAsync(autoLogin, true, token);
+    }
+
+    /// <summary>
+    ///     Connects and optionally leaves an authenticated roster walk on the endpoint it reached instead of
+    ///     settling it back onto the metadata leader.
+    /// </summary>
+    private async Task ConnectAsync(bool autoLogin, bool settleOnLeader, CancellationToken token)
+    {
         if (State is ConnectionState.Connected
             or ConnectionState.Authenticating
             or ConnectionState.Authenticated)
@@ -847,7 +856,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             }
 
             SetConnectionState(ConnectionState.Connecting);
-            await TryEstablishConnectionAsync(autoLogin, token);
+            await TryEstablishConnectionAsync(autoLogin, settleOnLeader, token);
 
             // Dispose is synchronous and cannot take the sending semaphore, so a Dispose that ran while this
             // connect was dialing already read a connection that did not exist yet. Reading the flag after the
@@ -1029,7 +1038,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         };
     }
 
-    private async Task TryEstablishConnectionAsync(bool autoLogin, CancellationToken token)
+    private async Task TryEstablishConnectionAsync(bool autoLogin, bool settleOnLeader, CancellationToken token)
     {
         var retryCount = 0;
         var redirects = 0;
@@ -1118,7 +1127,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 {
                     await AutoLoginAsync(signInSettings, token);
 
-                    if (await RedirectAsync(token))
+                    if (settleOnLeader && await RedirectAsync(token))
                     {
                         await BackoffOrThrowAsync();
                         continue;

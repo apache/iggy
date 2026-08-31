@@ -28,20 +28,19 @@ use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
-// TODO(vsr): transparent retry-after-disconnect can weaken at-most-once semantics
-// for replicated writes. The transports currently disconnect, reconnect, and encode
-// the retry from the current ConsensusSession. If disconnect created a fresh VSR
-// client/session, the retried request gets a new (client_id, request_id) tuple, so
-// server-side deduplication cannot match a mutation that may already have committed
-// before the transport failure.
+// A reconnect creates a fresh VSR client and session. A replicated request
+// retried there gets a new (client_id, request_id) tuple, so server-side
+// deduplication cannot match a mutation that may already have committed before
+// the transport failure. `replay_after_session_reset_is_safe` therefore keeps
+// ambiguous replicated outcomes with the caller instead of replaying them.
 //
-// The fix is to keep the ConsensusSession's client_id and request counter across
-// reconnects and retry replicated writes under the same (client_id, request_id)
-// instead of re-registering fresh. Resume happens through the LOGIN path: the
+// A future transparent replay path can keep the ConsensusSession's client id
+// and request counter across reconnects and retry under the same identity.
+// Resume would happen through the LOGIN path: the
 // reconnecting client re-authenticates presenting its previous client_id, the
 // server verifies the authenticated user owns that entry, and the rebind commits
 // a Register that adopts the entry with its watermark and reply ring intact. Note
-// the epoch changes -- the rebind moves the fence to the new register's op -- so
+// the epoch changes because the rebind moves the fence to the new register's op, so
 // the session field must be taken from the new login reply, not carried over.
 //
 // There is deliberately no credential-free rebind: presenting (client, session)
@@ -161,6 +160,22 @@ pub(crate) fn operation_for_code(code: u32) -> Operation {
     }
 
     Operation::from_command_code(code).unwrap_or(Operation::NonReplicated)
+}
+
+/// Whether replaying `code` after reconnecting with a new session cannot
+/// apply it twice.
+pub(crate) fn replay_after_session_reset_is_safe(code: u32, error: &IggyError) -> bool {
+    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
+        || matches!(
+            error,
+            IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::Unauthenticated
+        )
+        || matches!(
+            operation_for_code(code),
+            Operation::NonReplicated | Operation::Logout
+        )
 }
 
 pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {

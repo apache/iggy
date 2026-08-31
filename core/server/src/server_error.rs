@@ -77,6 +77,21 @@ pub enum ServerError {
          committed journal tail may not have flushed"
     )]
     ShardPumpDied { shard_id: u16, reason: String },
+    /// A shard's message pump stopped because a partition could not commit
+    /// an op the cluster had already committed. The partition is fenced and
+    /// the server is shutting down; the exit is non-zero so an orchestrator
+    /// does not read a durability fault as a clean stop.
+    #[error(
+        "shard {shard_id} stopped: partition {namespace_raw} could not commit op {op}, \
+         which the cluster had already committed. The replica is divergent and was \
+         fenced; the server shut down so it cannot serve a prefix the cluster has \
+         moved past"
+    )]
+    ShardFatal {
+        shard_id: u16,
+        namespace_raw: u64,
+        op: u64,
+    },
     #[error(
         "shard {shard_id} message pump did not drain within {timeout:?}. \
          Committed journal tail may not have flushed"
@@ -284,9 +299,19 @@ pub enum ServerError {
 /// causes, and not all of them are at-rest corruption: an empty non-tail
 /// segment is a failed rebuild's orphan pairing, a hole is a stray or
 /// half-unlinked file, interior damage is bit rot (or a resurrected tail
-/// appended over), a divergent index is a mis-strided or foreign write, and
-/// offsets that do not continue the chain can be minted into byte-clean files
-/// by an upstream crash window as well as by damage.
+/// appended over), and offsets that do not continue the chain can be minted
+/// into byte-clean files by an upstream crash window as well as by damage.
+///
+/// An index that contradicts itself is deliberately NOT here, and neither is
+/// one the log cannot back UNLESS the topic runs under `enforce_fsync` and the
+/// gap is deeper than the single in-flight entry: entries are derived from the
+/// log, so recovery drops such an index whole and rebuilds it from a byte-0
+/// walk of the log rather than believing any part of it. What `enforce_fsync`
+/// adds is evidence from serialized completed flushes: an entry above chunk N
+/// means the log fdatasync covering chunk N completed before the later flush
+/// began. This is independent of reply timing and turns a deeper gap into
+/// evidence about the LOG. Absent that evidence the index only locates data;
+/// recovery verifies the log from byte 0.
 #[derive(Debug)]
 pub enum PartitionRecoveryRefusal {
     /// `recoverable_bytes` on the two chain-shape refusals is the sum of
@@ -305,16 +330,6 @@ pub enum PartitionRecoveryRefusal {
         next_start: u64,
         recoverable_bytes: u64,
     },
-    /// The index holds entries but no whole batch decodes AND verifies where
-    /// its last entry points, so index and log describe different files. The
-    /// damage probe ran first: anything verifying past the anchor's damage
-    /// refuses as [`Self::InteriorDamage`] instead.
-    IndexLogDivergence {
-        start_offset: u64,
-        end_offset: u64,
-        messages_size_bytes: u64,
-        indexed_size_bytes: u64,
-    },
     /// A complete, checksum-verifying batch survives PAST bytes that do not
     /// decode. A torn tail has nothing after it, so this is interior damage,
     /// and truncating at it would silently discard the surviving batches.
@@ -330,9 +345,12 @@ pub enum PartitionRecoveryRefusal {
     /// were re-examined -- a probe defect); the verification budget bounds
     /// the bytes handed to checksum verifies, whose claimed slices overlap,
     /// so residue packed with plausible headers can exhaust it from an
-    /// on-disk shape. Truncation is only ever sound for a proven torn tail,
-    /// so giving up keeps the bytes. The residue width is diagnostic only;
-    /// it is not a gate.
+    /// on-disk shape. The index anchor search charges the same verification
+    /// budget as it steps back through entries the log cannot back, so an
+    /// index packed with claims the log never proves ends here too instead
+    /// of paying a verify per entry. Truncation is only ever sound for a
+    /// proven torn tail, so giving up keeps the bytes. The residue width is
+    /// diagnostic only; it is not a gate.
     UnverifiedResidue {
         start_offset: u64,
         damage_position: u64,
@@ -365,13 +383,43 @@ pub enum PartitionRecoveryRefusal {
         batch_partition_id: u64,
         position: u64,
     },
-    /// Index entries must ascend in offset and position (they are appended,
-    /// one per flushed chunk, over a growing log); a regression means the
-    /// file was written mis-strided or over foreign bytes.
-    IndexEntriesNotMonotone { start_offset: u64, entry_index: u64 },
-    IndexEntryBeforeSegmentStart {
+    /// The sparse index of a topic running under `enforce_fsync` outruns its
+    /// log by more than the one entry a crash can legitimately strand there.
+    /// Persistence writes exactly one entry per flush chunk, chunks never
+    /// overlap, and flushes are serialized, so every entry below the last one
+    /// names a chunk whose log bytes completed their fdatasync. A completed
+    /// chunk can contain batches acknowledged before the flush threshold was
+    /// reached, while the in-flight chunk can do so too. Reply timing is not
+    /// the proof. Only the chunk in flight when the process died can have an
+    /// entry the log never backed. A deeper step-back therefore says the LOG
+    /// lost bytes it had already made durable, and rebuilding from what remains
+    /// could re-mint offsets, including offsets already returned to clients.
+    FsyncedLogLoss {
         start_offset: u64,
-        first_entry_offset: u64,
+        entry_count: u64,
+        provable_entries: u64,
+        /// Position of the highest entry the log still proves; 0 when it
+        /// proves none, which `provable_entries` disambiguates.
+        provable_position: u64,
+        /// Entries the backward search actually probed, which its own cap
+        /// holds below `entry_count` on a long index: `provable_entries == 0`
+        /// then means nothing proved in the searched window, not that the log
+        /// backs nothing.
+        searched_entries: u64,
+    },
+    /// Under `enforce_fsync`, the byte-0 rebuild after a dropped index proved
+    /// the log only through `walked_position`, short of `durable_position`,
+    /// the byte the index's own last entry proves the log had already
+    /// fdatasynced through (the flush that wrote the entry began only after
+    /// the previous chunk's log sync completed). The step-back gate measures
+    /// loss at entry granularity; this catches the sub-chunk shape it cannot:
+    /// bytes a completed flush made durable are gone mid-chunk, so truncating
+    /// to the walked prefix would re-mint their offsets.
+    FsyncedRebuildShortfall {
+        start_offset: u64,
+        entry_count: u64,
+        walked_position: u64,
+        durable_position: u64,
     },
     /// A writer reopening over recovered bounds found the on-disk length
     /// diverging from the size recovery just validated and truncated to.
@@ -407,18 +455,6 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                 "segment {previous_start} ends at offset {previous_end} but the next \
                  starts at {next_start}, leaving a hole in a chain holding \
                  {recoverable_bytes} recoverable bytes"
-            ),
-            Self::IndexLogDivergence {
-                start_offset,
-                end_offset,
-                messages_size_bytes,
-                indexed_size_bytes,
-            } => write!(
-                f,
-                "segment {start_offset} has message/index divergence: the index ends \
-                 at offset {end_offset}, byte {indexed_size_bytes}, where the \
-                 {messages_size_bytes}-byte log holds no batch that decodes and \
-                 verifies"
             ),
             Self::InteriorDamage {
                 start_offset,
@@ -469,21 +505,34 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
                  stamped for partition {batch_partition_id}; a foreign record in \
                  this log is preserved as evidence, not truncated"
             ),
-            Self::IndexEntriesNotMonotone {
+            Self::FsyncedLogLoss {
                 start_offset,
-                entry_index,
+                entry_count,
+                provable_entries,
+                provable_position,
+                searched_entries,
             } => write!(
                 f,
-                "segment {start_offset} index entry {entry_index} regresses in \
-                 offset or position; the index was not appended over this log"
+                "segment {start_offset} runs under enforce_fsync with {entry_count} sparse \
+                 index entries, but its log backs only {provable_entries} of the \
+                 {searched_entries} searched from the top (up to byte {provable_position}); \
+                 every entry below the last describes a log chunk whose fdatasync had \
+                 completed, so the log has lost previously durable data rather than the \
+                 index having outrun it"
             ),
-            Self::IndexEntryBeforeSegmentStart {
+            Self::FsyncedRebuildShortfall {
                 start_offset,
-                first_entry_offset,
+                entry_count,
+                walked_position,
+                durable_position,
             } => write!(
                 f,
-                "segment {start_offset} index claims offset {first_entry_offset}, \
-                 below the segment's own start"
+                "segment {start_offset} runs under enforce_fsync with {entry_count} sparse \
+                 index entries, and the byte-0 rebuild proved its log only through byte \
+                 {walked_position}, short of byte {durable_position} which the last \
+                 entry's own fdatasync ordering proves the log had already made durable; \
+                 the log has lost previously durable bytes mid-chunk, so rebuilding \
+                 would re-mint their offsets"
             ),
             Self::StorageSizeMismatch {
                 start_offset,

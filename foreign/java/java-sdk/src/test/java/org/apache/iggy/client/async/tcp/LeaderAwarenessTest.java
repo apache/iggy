@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -150,6 +151,47 @@ class LeaderAwarenessTest {
         @Test
         void shouldMatchIdenticalAddresses() {
             assertThat(isSameAddress("127.0.0.1", 8090, "127.0.0.1", 8090)).isTrue();
+        }
+
+        @Test
+        void shouldWalkEveryOtherRosterEndpointOnce() {
+            var first = new ConnectionInfo("iggy-0", 8090);
+            var second = new ConnectionInfo("iggy-1", 8091);
+            var third = new ConnectionInfo("iggy-2", 8092);
+
+            assertThat(LeaderAwareness.rosterWalkTargets(List.of(first, second, third), second, Set.of(second)))
+                    .containsExactly(third, first);
+        }
+
+        @Test
+        void shouldOmitAliasesOfTheCurrentEndpointFromRosterWalk() {
+            var current = new ConnectionInfo("localhost", 8090);
+            var alias = new ConnectionInfo("127.0.0.1", 8090);
+            var other = new ConnectionInfo("127.0.0.1", 8091);
+
+            assertThat(LeaderAwareness.rosterWalkTargets(List.of(alias, other), current, Set.of(current)))
+                    .containsExactly(other);
+        }
+
+        @Test
+        void shouldNotRevisitAnEndpointAlreadyTriedByTheRequest() {
+            var first = new ConnectionInfo("iggy-0", 8090);
+            var second = new ConnectionInfo("iggy-1", 8091);
+            var third = new ConnectionInfo("iggy-2", 8092);
+
+            assertThat(LeaderAwareness.rosterWalkTargets(List.of(first, second, third), second, Set.of(first, second)))
+                    .containsExactly(third);
+        }
+
+        @Test
+        void shouldStopAfterOneCompleteRosterPass() {
+            var first = new ConnectionInfo("iggy-0", 8090);
+            var second = new ConnectionInfo("iggy-1", 8091);
+            var third = new ConnectionInfo("iggy-2", 8092);
+
+            assertThat(LeaderAwareness.rosterWalkTargets(
+                            List.of(first, second, third), third, Set.of(first, second, third)))
+                    .isEmpty();
         }
 
         @Test

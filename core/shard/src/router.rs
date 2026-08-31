@@ -27,8 +27,11 @@ use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, Pr
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
+use partitions::FatalCommit;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How often the shard pump drives `VsrConsensus::tick`.
 ///
@@ -254,8 +257,25 @@ where
     /// Drain this shard's inbox and process each frame locally until the
     /// `stop` signal fires or the inbox disconnects, then drain any frames
     /// still queued so in-flight requests still get a response.
+    ///
+    /// Returns the commit fault that ended the pump, if one did. A fault
+    /// skips that queued drain: the frames in it are requests for a shard
+    /// holding a divergent partition, and answering them means re-entering
+    /// the commit path that just failed. The final flush still runs, so
+    /// every partition that CAN still reach disk does.
+    ///
+    /// `shutdown_flag` is the cross-thread server shutdown signal. The pump
+    /// flips it as soon as a commit fault is resolved, BEFORE the final
+    /// flush: the flush writes to the device whose failure raised the fault,
+    /// so it can stall indefinitely, and only the flag arms the watchdog and
+    /// the bounded pump drain that turn a stalled flush into a timed-out
+    /// non-zero exit instead of a process that reports healthy forever.
     #[allow(clippy::future_not_send)]
-    pub async fn run_message_pump(&self, stop: Receiver<()>)
+    pub async fn run_message_pump(
+        &self,
+        stop: Receiver<()>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Option<FatalCommit>
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
@@ -281,6 +301,7 @@ where
         // simulator (see `MessageBus::sleep`).
         let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
+        let mut fatal: Option<FatalCommit> = None;
         loop {
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
@@ -299,7 +320,10 @@ where
                     // decoupled from the pump again without reintroducing the
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
-                    self.tick_partitions(&mut namespace_scratch).await;
+                    if let Some(fault) = self.tick_partitions(&mut namespace_scratch).await {
+                        fatal = Some(fault);
+                        break;
+                    }
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -366,27 +390,87 @@ where
             }
         }
 
+        // A stop can win the select immediately after a frame fenced a
+        // partition, before the next tick observes it. Preserve that fault so
+        // shutdown cannot turn a durability failure into a clean pump exit.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
         // Drain remaining frames so in-flight requests get a response, and
         // the reply lane so already-forwarded replies still reach their
-        // clients before the bus tears down.
-        while let Ok(frame) = self.inbox.try_recv() {
-            if self.accept_frame_for_self(&frame) {
-                self.process_frame(frame).await;
-                self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
-                    .await;
-                self.apply_reconcile_ops();
+        // clients before the bus tears down. Skipped on a commit fault: a
+        // queued Ack or Commit frame for the fenced partition would re-enter
+        // the commit path that just failed, and `advance_commit_min` asserts
+        // on the gap the fault left. Those requests go unanswered and their
+        // clients time out, which is what a node stopping on a durability
+        // fault owes them.
+        if fatal.is_none() {
+            while let Ok(frame) = self.inbox.try_recv() {
+                if self.accept_frame_for_self(&frame) {
+                    self.process_frame(frame).await;
+                    self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
+                        .await;
+                    self.apply_reconcile_ops();
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        fatal = Some(fault);
+                        break;
+                    }
+                }
             }
         }
-        while let Ok(frame) = self.reply_inbox.try_recv() {
-            if self.accept_frame_for_self(&frame) {
-                self.process_frame(frame).await;
+        if fatal.is_none() {
+            while let Ok(frame) = self.reply_inbox.try_recv() {
+                if self.accept_frame_for_self(&frame) {
+                    self.process_frame(frame).await;
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        fatal = Some(fault);
+                        break;
+                    }
+                }
             }
+        }
+
+        if fatal.is_some() {
+            // Flipped BEFORE the final flush, not after the pump returns: the
+            // flush writes to the device whose failure raised the fault and
+            // can stall there indefinitely, and the flag is what arms the
+            // watchdog and the bounded pump drain. Siblings give up at most
+            // the flush window of extra serving.
+            shutdown_flag.store(true, Ordering::Relaxed);
         }
 
         // Final flush: committed messages still resident in the in-memory
         // journal must reach segment storage before the process exits, or a
-        // graceful restart recovers consumer offsets ahead of the data.
+        // graceful restart recovers consumer offsets ahead of the data. Runs
+        // on a fault too, the fenced partition included: its resident prefix
+        // is cluster-committed data, so writing what still reaches disk is
+        // strictly better than dropping it, and a second failure of an
+        // already-fenced partition is warned rather than propagated.
         self.flush_partitions().await;
+
+        // A failed flush fences its partition: the data it could not write is
+        // cluster-committed and now lives only in this process's memory, so a
+        // clean exit here would report a durability loss as a good shutdown.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
+        fatal
+    }
+
+    /// First partition commit fault currently fenced on this shard.
+    ///
+    /// The regular path observes faults in `tick_partitions`. This scan covers
+    /// the pump-exit edges where a stop signal wins before that tick, or a
+    /// queued frame fails while the pump is draining during shutdown.
+    fn first_partition_commit_fault(&self) -> Option<FatalCommit> {
+        let partitions = self.plane.partitions();
+        partitions.namespaces().find_map(|namespace| {
+            partitions
+                .get_by_ns(namespace)
+                .and_then(|partition| partition.fatal().cloned())
+        })
     }
 
     /// Sanity check at pump entry: every Consensus frame routed through
