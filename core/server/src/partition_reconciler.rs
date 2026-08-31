@@ -40,20 +40,19 @@
 //!   "unroutable", and falls back to `calculate_shard_assignment`. The frame
 //!   always reaches the shard that will own the partition.
 //! - `IggyShard::park_if_unmaterialised` holds it there until the matching
-//!   `InsertOwned` lands, then re-queues it onto this shard's inbox -- but not to
-//!   a DIFFERENT incarnation than the one it was addressed to. Each parked frame
+//!   `InsertOwned` lands, then hands it back to the pump -- but not to a
+//!   DIFFERENT incarnation than the one it was addressed to. Each parked frame
 //!   carries the committed `created_revision` observed when it was parked, and a
 //!   drain whose epoch disagrees with that stamp answers the client instead of
 //!   serving it: recycled slab keys make the namespace byte-identical, so such a
 //!   frame would otherwise land a dead topic's write inside the topic that
-//!   replaced it. One gap, recorded below: the stamp is re-derived if the frame
-//!   re-enters the park path from the inbox. A frame parked with NO stamp is
-//!   served; see `redispatch_parked_frames` for why a missing committed revision
-//!   is not evidence of a prior incarnation. Re-queuing appends, so a parked
-//!   frame is ordered behind whatever is already in the inbox. A frame the inbox
-//!   refuses is re-parked rather than answered, since the deny would ride the
-//!   same full sender, and the pump re-drives it (`retry_reparked_frames`) once
-//!   a slot frees.
+//!   replaced it. The stamp survives a second park, so a re-delivered frame
+//!   cannot be re-stamped with the incarnation that replaced its own. A frame
+//!   parked with NO stamp is served; see `redispatch_parked_frames` for why a
+//!   missing committed revision is not evidence of a prior incarnation. Delivery
+//!   is the pump's: `drain_redispatched_frames` runs before it reads the inbox
+//!   again, so a parked op is not ordered behind a later op of the same
+//!   partition already queued there, which the plane's gap check would drop.
 //! - `IggyShard::serves_committed_incarnation` refuses a namespace whose
 //!   committed `created_revision` disagrees with the epoch on the local row, so
 //!   a request arriving mid-teardown cannot be acked against the incarnation
@@ -123,26 +122,6 @@
 //! view change. It needs a normal-status repair driver. The park policy above
 //! shrinks the exposure to two cases, a genuinely exhausted byte budget and a
 //! namespace this shard cannot serve, but only the repair driver removes it.
-//!
-//! TODO(krishna): the park stamp is not stable across re-entry. A re-dispatched
-//! frame still in the inbox when a delete + recreate completes (`ConfirmRemove`
-//! removes and untombstones in one arm, then the rebuild lands) re-enters
-//! `park_if_unmaterialised` and is re-stamped with the NEW revision and
-//! `passes: 0`, then served against the replacement: the write the stamp exists
-//! to block. Narrow (a full delete + recreate has to finish while one frame
-//! waits), but the guarantee is not absolute the way the bullet above reads.
-//! Closing it needs the frame to carry provenance through the inbox instead of
-//! re-deriving it on arrival.
-//!
-//! TODO(krishna): re-dispatch APPENDS to the inbox, so a parked prepare loses its
-//! arrival position. `router.rs`'s `select_biased!` puts the consensus tick (which
-//! runs `apply_reconcile_ops`, and with it the re-dispatch) above the inbox arm,
-//! so a parked op N is re-queued *behind* an op N+1 that was already sitting in
-//! the inbox. The partition plane then sees N+1 first, rejects it against its
-//! backup gap check, and N+1 is gone -- with no normal-status repair driver to
-//! refetch it (see the TODO above). Ordering has to be restored at the plane, by
-//! buffering out-of-order prepares rather than dropping them, or by re-dispatching
-//! through a priority path that preserves op order.
 //!
 //! TODO(krishna): `serves_committed_incarnation` and the park stamp both call
 //! `Streams::created_revision_for_namespace`, now on the per-request fence path.
@@ -803,12 +782,11 @@ async fn reconcile_additions(
 /// snapshotted before `reconcile_additions` awaits `build_partition_fresh`, so a
 /// topic committing during those awaits is judged against a stale set.
 ///
-/// Everything else is aged: building, backed off, still committing, genuinely
-/// deleted, or materialised with frames the inbox refused.
-/// [`shard::IggyShard::age_parked_partition_frames`] answers CLIENT REQUESTS past
-/// `MAX_PARKED_PASSES` and leaves prepares alone, so no client waits out its read
-/// timeout and no committed op dies on a local-convergence signal. Residency
-/// only; see `ParkedFrame::passes`.
+/// Everything else is aged: building, backed off, still committing, or
+/// genuinely deleted. [`shard::IggyShard::age_parked_partition_frames`] answers
+/// CLIENT REQUESTS past `MAX_PARKED_PASSES` and leaves prepares alone, so no
+/// client waits out its read timeout and no committed op dies on a
+/// local-convergence signal. Residency only; see `ParkedFrame::passes`.
 ///
 /// A namespace with a staged, unapplied `InsertOwned` is exempt: its partition
 /// is on the way but reads as un-materialised here. The queue is asked per
@@ -845,11 +823,10 @@ fn reconcile_parked_frames(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
             counters.parked_reclaimed += 1;
             continue;
         }
-        // Materialised with frames still parked means the re-dispatch hit a full
-        // inbox and re-parked them. The pump retries every iteration, so aging is
-        // only the backstop for an inbox that never drains. Without it they have
-        // no exit: `reconcile_additions` stages no second `InsertOwned` for a
-        // namespace already in `IggyPartitions`.
+        // Un-materialised and still ours: the build is on the way or backed off,
+        // so age the requests rather than hold them for the process lifetime.
+        // Materialisation hands its frames straight to the pump, so a namespace
+        // in `IggyPartitions` no longer reaches here with any parked.
         if ctx.shard.age_parked_partition_frames(ns) > 0 {
             counters.parked_reclaimed += 1;
         }
@@ -1650,19 +1627,20 @@ mod tests {
     }
 
     /// [`build_test_shard`] with a sender mesh, for tests asserting on work
-    /// handed back to the pump (transient denies, parked-frame re-dispatch).
+    /// handed back to the pump (transient denies, frames queued on the inbox).
     /// Caller must keep the returned receiver alive; dropping it turns every
     /// `try_send` into `Disconnected`.
     ///
     /// Mesh covers `0..=shard_id` since consumers index `senders[shard_id]`.
     /// Peer receivers are dropped, so a misroute fails loudly instead of landing
     /// in this shard's inbox and reading as success.
-    /// Both receiving ends of a test shard's own sender-ring slot: parked
-    /// frames re-dispatch onto the main lane, staged client answers onto the
-    /// reply lane.
+    /// A test shard's own sender-ring slot: both receiving ends plus the
+    /// sending end, so a test can also put a frame on the main lane the way a
+    /// peer shard would.
     struct TestLanes {
         main: shard::Receiver<shard::ShardFrame>,
         reply: shard::Receiver<shard::ShardFrame>,
+        main_tx: shard::TaggedSender,
     }
 
     fn build_test_shard_with_inbox(
@@ -1675,13 +1653,14 @@ mod tests {
         let mut own_rx = None;
         for peer in 0..=shard_id {
             let (tx, rx, reply_rx) = shard::shard_channel(peer, capacity, capacity);
-            senders.push(tx);
             if peer == shard_id {
                 own_rx = Some(TestLanes {
                     main: rx,
                     reply: reply_rx,
+                    main_tx: tx.clone(),
                 });
             }
+            senders.push(tx);
         }
         let mut shard = Rc::into_inner(build_test_shard(shard_id, config, mux))
             .expect("freshly built shard is uniquely owned");
@@ -1692,8 +1671,8 @@ mod tests {
         )
     }
 
-    /// Drain a test shard's lanes into `(re-dispatched frames, staged client
-    /// sends)`: served parked frames vs answers headed for a client.
+    /// Drain a test shard's lanes into `(consensus frames, staged client
+    /// sends)`: work headed for the pump vs answers headed for a client.
     fn drain_inbox(lanes: &TestLanes) -> (usize, usize) {
         let mut served = 0;
         while let Ok(frame) = lanes.main.try_recv() {
@@ -1718,6 +1697,22 @@ mod tests {
     /// client.
     fn drain_staged_client_sends(lanes: &TestLanes) -> usize {
         drain_inbox(lanes).1
+    }
+
+    /// Take the prepares off a test shard's main lane in arrival order, as the
+    /// pump would read them, and return their op numbers.
+    fn drain_main_lane_prepare_ops(lanes: &TestLanes) -> Vec<u64> {
+        let mut ops = Vec::new();
+        while let Ok(frame) = lanes.main.try_recv() {
+            if let shard::ShardFrame::Consensus {
+                message: MessageBag::Prepare(prepare),
+                ..
+            } = frame
+            {
+                ops.push(prepare.header().op);
+            }
+        }
+        ops
     }
 
     fn make_ctx(
@@ -3533,10 +3528,15 @@ mod tests {
             0,
             "materialisation must drain the park entry"
         );
+        assert_eq!(
+            shard.redispatched_frame_count(),
+            1,
+            "the unstamped frame must be staged for the pump, not rejected"
+        );
         let (served, answered) = drain_inbox(&inbox);
         assert_eq!(
-            served, 1,
-            "the unstamped frame must be re-dispatched onto the pump, not rejected"
+            served, 0,
+            "the queue is the handoff, so nothing may be appended to the inbox"
         );
         assert_eq!(
             answered, 0,
@@ -3646,11 +3646,16 @@ mod tests {
         );
         reconcile_pass(&ctx).await;
 
+        assert_eq!(
+            shard.redispatched_frame_count(),
+            1,
+            "the parked prepare must be staged for re-dispatch; discarding it is \
+             silent committed-data loss, since a prepare has no client to answer"
+        );
         let (served, answered) = drain_inbox(&inbox);
         assert_eq!(
-            served, 1,
-            "the parked prepare must be re-dispatched; discarding it is silent \
-             committed-data loss, since a prepare has no client to answer"
+            served, 0,
+            "the queue is the handoff, so nothing may be appended to the inbox"
         );
         assert_eq!(answered, 0, "a prepare has no client deny to send");
         assert_eq!(
@@ -3700,6 +3705,149 @@ mod tests {
             shard.metrics().partition_frames_rejected_stale_value(),
             1,
             "and the reject must be counted"
+        );
+    }
+
+    /// The stamp has to survive re-delivery, not just the first drain. A
+    /// materialisation stages the frame, the delete half of a recreate then
+    /// leaves the namespace un-materialised, and the drain parks it a second
+    /// time: deriving a fresh stamp there picks up the replacement's committed
+    /// revision, and the rebuild would serve a dead incarnation's op into the
+    /// topic that recycled its slab keys.
+    #[compio::test]
+    async fn given_a_staged_frame_when_a_recreate_lands_before_the_drain_should_reject_it_as_stale()
+    {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-restamp");
+        seed_topic(&mux, 2, 0, "topic-restamp-first", vec![assignment(0, 1)]);
+
+        let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        // Parked against the FIRST incarnation, so it carries that revision.
+        park_one_prepare(&shard, ns, 7).await;
+        assert_eq!(shard.parked_frame_count(ns), 1);
+
+        // The matching incarnation materialises, so the frame stages. Nothing
+        // has drained it yet: that is the pump's next step.
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            shard.redispatched_frame_count(),
+            1,
+            "a stamp matching the materialised epoch must stage for the pump"
+        );
+
+        // Delete + recreate the same tuple. The teardown pass removes and
+        // untombstones, which is the state that makes the drain below re-park.
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            4,
+            0,
+            "topic-restamp-second",
+            vec![assignment(0, 2)],
+        );
+        reconcile_pass(&ctx).await;
+        assert!(
+            !shard.plane.partitions().contains(&ns),
+            "the teardown pass must have dropped the first incarnation"
+        );
+        assert!(
+            !shard.plane.partitions().is_tombstoned(&ns),
+            "and lifted the tombstone, or the drain takes the tombstone path"
+        );
+
+        shard.drain_redispatched_frames().await;
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            1,
+            "an un-materialised namespace must park the re-delivered frame again"
+        );
+        assert_eq!(shard.redispatched_frame_count(), 0);
+
+        // The rebuild lands at the recreate's revision.
+        reconcile_pass(&ctx).await;
+        assert!(
+            shard.plane.partitions().contains(&ns),
+            "the replacement must materialise"
+        );
+        assert_eq!(
+            shard.metrics().partition_frames_rejected_stale_value(),
+            1,
+            "the re-parked frame must keep the stamp it first parked with, so the \
+             replacement rejects it instead of serving a dead incarnation's op"
+        );
+        assert_eq!(
+            shard.redispatched_frame_count(),
+            0,
+            "and it must not be staged for the replacement"
+        );
+        assert_eq!(drain_inbox(&inbox).0, 0, "nothing may reach the pump");
+    }
+
+    /// Re-dispatch must not append to the shard's own inbox. `select_biased!`
+    /// ranks the consensus tick, which is where materialisation runs, above the
+    /// inbox arm, so a later op of the same partition can already be queued
+    /// there. Appended, the parked op lands behind it and the plane's backup gap
+    /// check drops the later one for not being `current_op + 1`, with nothing to
+    /// refetch it.
+    ///
+    /// The pump's order is the queue, then the inbox, so the assertions below
+    /// are on where each op sits at that moment. Whether the plane accepts them
+    /// is out of reach here: a solo primary never runs the gap check, and a
+    /// synthetic prepare cannot be applied.
+    #[compio::test]
+    async fn given_a_later_op_on_the_inbox_when_the_namespace_materialises_should_hand_back_the_parked_op_first()
+     {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-order");
+        seed_topic(&mux, 2, 0, "topic-order", vec![assignment(0, 1)]);
+
+        let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        park_one_prepare(&shard, ns, 5).await;
+        assert_eq!(shard.parked_frame_count(ns), 1);
+
+        // Op 6 reaches the inbox while op 5 is still parked, as it does whenever
+        // the primary keeps replicating through the convergence window.
+        inbox
+            .main_tx
+            .try_send(shard::ShardFrame::consensus(
+                0,
+                build_partition_prepare(ns, 6),
+            ))
+            .expect("capacity for one queued prepare");
+
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(
+            shard.parked_frame_count(ns),
+            0,
+            "materialisation must drain the park entry"
+        );
+        assert_eq!(
+            drain_main_lane_prepare_ops(&inbox),
+            vec![6],
+            "op 5 must not be appended behind op 6; the plane would then see 6 \
+             first and drop it as a gap"
+        );
+        assert_eq!(
+            shard.redispatched_frame_count(),
+            1,
+            "op 5 must be handed back through the queue the pump drains before it \
+             reads the inbox"
+        );
+        assert_eq!(
+            park_dropped_count(&shard),
+            0,
+            "and neither op may be counted as a drop"
         );
     }
 
@@ -4319,62 +4467,9 @@ mod tests {
         assert_eq!(park_overflow_count(&shard), 2);
     }
 
-    /// A refused re-dispatch re-parks the frame, and by then the namespace is
-    /// materialised, closing every other exit: the sweep skips a namespace in
-    /// `IggyPartitions` and `reconcile_additions` stages no second
-    /// `InsertOwned`. Before the pump retry the frame sat until a topic delete,
-    /// unanswered, with its bytes charged and the fast-skip never re-arming.
-    #[compio::test]
-    async fn a_re_parked_frame_is_re_dispatched_once_the_inbox_drains() {
-        let tmp = TempDir::new().expect("tempdir for system path");
-        let config = test_config(&tmp);
-        let mux = TestMux::default();
-        seed_stream(&mux, 1, "stream-repark");
-        seed_topic(&mux, 2, 0, "topic-repark", vec![assignment(0, 1)]);
-
-        // Capacity 1: `enqueue_reconcile_op`'s `ReconcileApply` marker takes the
-        // only slot, so the re-dispatch that follows is refused with `Full`.
-        let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 1);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
-        let ns = IggyNamespace::new(0, 0, 0);
-
-        park_one_request(&shard, ns).await;
-        reconcile_pass(&ctx).await;
-
-        assert!(
-            shard.plane.partitions().contains(&ns),
-            "the namespace must have materialised"
-        );
-        assert_eq!(
-            shard.parked_frame_count(ns),
-            1,
-            "the full inbox must have re-parked the frame rather than dropping it"
-        );
-
-        // What the pump does every iteration: consume a frame, then re-drive.
-        let (_served, _answered) = drain_inbox(&inbox);
-        shard.apply_reconcile_ops();
-
-        assert_eq!(
-            shard.parked_frame_count(ns),
-            0,
-            "the freed slot must let the retry drain the entry"
-        );
-        assert!(
-            !shard.has_parked_partition_frames(),
-            "and the byte budget must return, so the revision fast-skip can re-arm"
-        );
-        assert_eq!(
-            drain_inbox(&inbox).0,
-            1,
-            "the frame must reach the pump as a consensus frame, not be answered away"
-        );
-    }
-
-    /// A namespace mid-teardown is still in `IggyPartitions`, so it reads as
-    /// materialised while the fence forbids serving it. `ConfirmRemove` would
-    /// answer its frames, but a disk delete that keeps failing never enqueues
-    /// one, so the sweep has to.
+    /// A frame parks while the namespace is un-materialised, then teardown
+    /// fences it. `ConfirmRemove` would answer the frame, but a disk delete that
+    /// keeps failing never enqueues one, so the sweep has to.
     #[compio::test]
     async fn parked_frames_of_a_tombstoned_namespace_are_reclaimed_without_confirm_remove() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -4383,20 +4478,20 @@ mod tests {
         seed_stream(&mux, 1, "stream-tombstone-park");
         seed_topic(&mux, 2, 0, "topic-tombstone-park", vec![assignment(0, 1)]);
 
-        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 1);
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         park_one_request(&shard, ns).await;
-        reconcile_pass(&ctx).await;
         assert_eq!(
             shard.parked_frame_count(ns),
             1,
-            "the full inbox must have re-parked the frame"
+            "the request must park while the namespace is un-materialised"
         );
 
         // Teardown's synchronous fence, without the `ConfirmRemove` a wedged
-        // disk delete never reaches.
+        // disk delete never reaches. It also stops the pass below from building
+        // the namespace, which is what would otherwise drain the entry.
         shard.plane.partitions().tombstone(ns);
         shard.shards_table().remove(&ns);
 
@@ -4410,35 +4505,6 @@ mod tests {
             shard.plane.partitions().is_tombstoned(&ns),
             "and the fence must still be standing, so this was the sweep's doing"
         );
-    }
-
-    /// Residency backstop: an inbox that never drains must not hold a re-parked
-    /// frame forever, so `MAX_PARKED_PASSES` covers a materialised namespace too.
-    #[compio::test]
-    async fn a_re_parked_frame_ages_out_when_the_inbox_never_drains() {
-        let tmp = TempDir::new().expect("tempdir for system path");
-        let config = test_config(&tmp);
-        let mux = TestMux::default();
-        seed_stream(&mux, 1, "stream-repark-age");
-        seed_topic(&mux, 2, 0, "topic-repark-age", vec![assignment(0, 1)]);
-
-        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 1);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
-        let ns = IggyNamespace::new(0, 0, 0);
-
-        park_one_request(&shard, ns).await;
-        reconcile_pass(&ctx).await;
-        assert_eq!(shard.parked_frame_count(ns), 1, "re-parked on a full inbox");
-
-        for _ in 0..=PARK_MAX_PASSES {
-            reconcile_pass(&ctx).await;
-        }
-        assert_eq!(
-            shard.parked_frame_count(ns),
-            0,
-            "a materialised namespace must still be aged, or the frame is stranded"
-        );
-        assert!(!shard.has_parked_partition_frames());
     }
 
     /// Mirrors `MAX_PARKED_PER_NAMESPACE` in `shard::park_if_unmaterialised`.

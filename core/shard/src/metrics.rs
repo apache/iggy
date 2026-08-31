@@ -27,8 +27,8 @@
 //!   by plane.
 //! - `IggyShard::park_if_unmaterialised` - partition frames shed because the
 //!   park buffer is at its frame or byte cap.
-//! - `IggyShard::apply_reconcile_ops` - parked frames whose re-dispatch onto
-//!   this shard's own inbox was refused.
+//! - `IggyShard::retire_parked_frames` - parked frames retired with no client
+//!   to answer.
 //!
 //! The counter uses atomic interior mutability, safe to bump from `!Send`
 //! compio reactor contexts. Each shard owns its own instance, and the server
@@ -77,8 +77,9 @@ pub struct FrameDropLabel {
 ///
 /// `PARTITION` covers the partition plane: a frame shed because the namespace
 /// had not materialised and its park buffer was at capacity
-/// (`reason=park_overflow`), a re-dispatch the shard's own inbox refused, or a
-/// routing send the target inbox refused. A shed client request is answered with
+/// (`reason=park_overflow`), a parked frame retired with no client to answer
+/// (`reason=park_dropped`), or a routing send the target inbox refused. A shed
+/// client request is answered with
 /// a retriable status, so the client recovers -- but a shed *prepare* is not
 /// covered by retransmit once its op has reached quorum
 /// (`consensus::retransmit_targets` skips `ok_quorum_received`, and the

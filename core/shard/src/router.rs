@@ -346,6 +346,11 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
+                    // Before the next `inbox.recv()`, always: a materialisation
+                    // hands its parked frames back here, and the inbox may
+                    // already hold a LATER op of the same partition, which the
+                    // plane's gap check drops unless the parked one lands first.
+                    self.drain_redispatched_frames().await;
                     consensus_tick.set(rearm_tick());
                 }
                 frame = self.inbox.recv().fuse() => {
@@ -356,6 +361,7 @@ where
                                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
                                 // Tail drain catches reconcile ops whose marker was dropped.
                                 self.apply_reconcile_ops();
+                                self.drain_redispatched_frames().await;
                             }
                             // Guaranteed reply-lane service: `select_biased!`
                             // polls the main lane first, so a saturated main
@@ -418,6 +424,10 @@ where
                     }
                 }
             }
+            // Retired, not delivered: the pump is going away, so a staged frame
+            // has no later drain to reach the plane through. Runs before the
+            // reply-lane drain below, which is what carries the denies out.
+            self.retire_redispatched_frames();
         }
         if fatal.is_none() {
             while let Ok(frame) = self.reply_inbox.try_recv() {
@@ -527,6 +537,10 @@ where
     async fn process_lifecycle(&self, payload: LifecycleFrame)
     where
         B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
     {
         match payload {
             LifecycleFrame::ReplicaInboundSetup { fd, slot } => {
@@ -676,6 +690,7 @@ where
             }
             LifecycleFrame::ReconcileApply => {
                 self.apply_reconcile_ops();
+                self.drain_redispatched_frames().await;
             }
             LifecycleFrame::CleanPartition {
                 namespace,
