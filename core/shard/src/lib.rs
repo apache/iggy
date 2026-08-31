@@ -2556,7 +2556,7 @@ where
         self.dispatch_message(message, None).await;
     }
 
-    /// Deliver what [`Self::redispatch_parked_frames`] staged, in park order.
+    /// Deliver what `redispatch_parked_frames` staged, in park order.
     ///
     /// The pump runs this after every `apply_reconcile_ops` and before it reads
     /// the inbox again, which is what puts a parked op ahead of a later op of
