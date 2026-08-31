@@ -259,15 +259,59 @@ class TestQuicConfig:
             ("receive_window", -1),
             ("initial_mtu", -1),
             ("initial_mtu", 2**16),
+            ("max_concurrent_bidi_streams", 2**62),
+            ("receive_window", 2**62),
         ],
     )
     def test_out_of_range_numeric_field_is_rejected(
         self, field: str, out_of_range: int
     ):
-        """Test that a numeric field outside its wire type's range names itself."""
+        """Test that a numeric field outside its wire type's range names itself.
+
+        `max_concurrent_bidi_streams` and `receive_window` fit `u64`, but
+        quinn narrows them further into a `VarInt` (max `2**62 - 1`), so
+        `2**62` fits the wire type and must still be rejected.
+        """
         with pytest.raises(ValueError, match=field):
             # pyrefly: ignore  # bad-argument-type
             QuicConfig(**{field: out_of_range})
+
+    @pytest.mark.parametrize("field", ["keep_alive_interval", "max_idle_timeout"])
+    def test_duration_rounding_down_to_zero_millis_is_rejected(self, field: str):
+        """Test that a non-zero sub-millisecond duration names itself.
+
+        Both fields are raw millisecond counts to the Rust SDK where zero is a
+        magic value (disables the keep-alive, or falls back to quinn's own
+        default), so a duration that rounds down to zero would silently mean
+        something other than what was asked for.
+        """
+        with pytest.raises(ValueError, match=field):
+            # pyrefly: ignore  # bad-argument-type
+            QuicConfig(**{field: timedelta(microseconds=500)})
+
+    @pytest.mark.parametrize("field", ["keep_alive_interval", "max_idle_timeout"])
+    def test_exact_zero_duration_is_allowed(self, field: str):
+        """Test that an exact zero duration is still legal for these fields."""
+        # pyrefly: ignore  # bad-argument-type
+        config = QuicConfig(**{field: timedelta(0)})
+
+        assert getattr(config, field) == timedelta(0)
+
+    def test_initial_mtu_below_quinns_minimum_is_rejected(self):
+        """Test that an initial_mtu below 1200 fails at construction.
+
+        quinn silently raises anything smaller to that floor instead of
+        rejecting it, so accepting it here would let the getter read back a
+        value that is not the one actually in effect on the connection.
+        """
+        with pytest.raises(ValueError, match="initial_mtu"):
+            QuicConfig(initial_mtu=1199)
+
+    def test_initial_mtu_at_quinns_minimum_is_allowed(self):
+        """Test that exactly 1200, quinn's own floor, is accepted."""
+        config = QuicConfig(initial_mtu=1200)
+
+        assert config.initial_mtu == 1200
 
 
 @pytest.mark.unit
@@ -296,6 +340,10 @@ class TestAutoLoginAgainstServer:
             QuicConfig(
                 server_address=f"{host}:{port}",
                 auto_login=AutoLogin.username_password("iggy", "iggy"),
+                # The default reconnection policy retries forever: a missing
+                # listener would hang this test until the CI timeout instead
+                # of failing.
+                reconnection=QuicReconnectionConfig(enabled=False),
             )
         )
         await client.connect()
@@ -312,7 +360,15 @@ class TestAutoLoginAgainstServer:
         """Test that the same call fails when no credentials are configured."""
         host, port = get_quic_server_config()
 
-        client = IggyClient.quic(QuicConfig(server_address=f"{host}:{port}"))
+        client = IggyClient.quic(
+            QuicConfig(
+                server_address=f"{host}:{port}",
+                # The default reconnection policy retries forever: a missing
+                # listener would hang this test until the CI timeout instead
+                # of failing.
+                reconnection=QuicReconnectionConfig(enabled=False),
+            )
+        )
         await client.connect()
         await wait_for_ping(client)
 

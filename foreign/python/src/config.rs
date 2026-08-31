@@ -567,14 +567,18 @@ impl QuicConfig {
     ///     keep_alive_interval: Interval between QUIC keep-alive pings, or a zero
     ///         duration to disable them. Defaults to 5 seconds.
     ///     max_idle_timeout: How long the connection tolerates silence before it is
-    ///         considered dead, or a zero duration for no limit. Defaults to 10 seconds.
+    ///         considered dead, or a zero duration to use quinn's own default (30
+    ///         seconds) instead, since `configure()` skips the setter entirely when
+    ///         zero. Defaults to 10 seconds.
     ///     validate_certificate: Whether to validate the server certificate. Defaults
     ///         to disabled, unlike the TCP and WebSocket transports.
     ///
     /// Raises:
     ///     ValueError: If `server_address` is not a valid `host:port` pair, if a
-    ///         duration is negative, if `heartbeat_interval` is zero, or if a
-    ///         numeric field is outside the range of its underlying wire type.
+    ///         duration is negative, if `heartbeat_interval` is zero, if
+    ///         `keep_alive_interval` or `max_idle_timeout` is non-zero but rounds
+    ///         down to 0ms, if `initial_mtu` is below quinn's minimum of 1200, or if
+    ///         a numeric field is outside the range of its underlying wire type.
     #[new]
     #[pyo3(signature = (
         *,
@@ -658,26 +662,35 @@ impl QuicConfig {
         }
         if let Some(max_concurrent_bidi_streams) = max_concurrent_bidi_streams {
             inner.max_concurrent_bidi_streams =
-                u64_param(max_concurrent_bidi_streams, "max_concurrent_bidi_streams")?;
+                varint_param(max_concurrent_bidi_streams, "max_concurrent_bidi_streams")?;
         }
         if let Some(datagram_send_buffer_size) = datagram_send_buffer_size {
             inner.datagram_send_buffer_size =
                 u64_param(datagram_send_buffer_size, "datagram_send_buffer_size")?;
         }
         if let Some(initial_mtu) = initial_mtu {
-            inner.initial_mtu = u16_param(initial_mtu, "initial_mtu")?;
+            let initial_mtu = u16_param(initial_mtu, "initial_mtu")?;
+            if initial_mtu < QUINN_MIN_INITIAL_MTU {
+                return Err(PyValueError::new_err(format!(
+                    "'initial_mtu' must be at least {QUINN_MIN_INITIAL_MTU}; quinn silently \
+                     raises anything smaller to that floor, so the getter would no longer \
+                     match the value actually in effect"
+                )));
+            }
+            inner.initial_mtu = initial_mtu;
         }
         if let Some(send_window) = send_window {
             inner.send_window = u64_param(send_window, "send_window")?;
         }
         if let Some(receive_window) = receive_window {
-            inner.receive_window = u64_param(receive_window, "receive_window")?;
+            inner.receive_window = varint_param(receive_window, "receive_window")?;
         }
         if let Some(keep_alive_interval) = keep_alive_interval {
-            inner.keep_alive_interval = py_delta_to_millis(&keep_alive_interval)?;
+            inner.keep_alive_interval =
+                py_delta_to_millis(&keep_alive_interval, "keep_alive_interval")?;
         }
         if let Some(max_idle_timeout) = max_idle_timeout {
-            inner.max_idle_timeout = py_delta_to_millis(&max_idle_timeout)?;
+            inner.max_idle_timeout = py_delta_to_millis(&max_idle_timeout, "max_idle_timeout")?;
         }
         if let Some(validate_certificate) = validate_certificate {
             inner.validate_certificate = validate_certificate;
@@ -816,6 +829,27 @@ fn u16_param(value: i64, parameter: &str) -> PyResult<u16> {
     u16::try_from(value).map_err(|_| {
         PyValueError::new_err(format!("'{parameter}' must be between 0 and {}", u16::MAX))
     })
+}
+
+/// quinn clamps `TransportConfig::initial_mtu` up to this floor rather than
+/// rejecting a smaller value, so `QuicConfig` rejects it instead: otherwise the
+/// getter would read back a value that is not the one actually in effect.
+const QUINN_MIN_INITIAL_MTU: u16 = 1200;
+
+/// Converts a Python int to a `u64` that also fits `quinn::VarInt` (max
+/// `2^62 - 1`), which `max_concurrent_bidi_streams` and `receive_window` are
+/// narrowed into when the connection is configured. A `u64` in range for
+/// `u64::MAX` but not `VarInt::MAX` would otherwise only fail there, as an
+/// opaque `RuntimeError` instead of a `ValueError` naming the argument.
+fn varint_param(value: i64, parameter: &str) -> PyResult<u64> {
+    const VARINT_MAX: u64 = (1u64 << 62) - 1;
+    let value = u64_param(value, parameter)?;
+    if value > VARINT_MAX {
+        return Err(PyValueError::new_err(format!(
+            "'{parameter}' must be between 0 and {VARINT_MAX}"
+        )));
+    }
+    Ok(value)
 }
 
 /// What `IggyClient(...)` accepts: a bare `host:port` or a full `TcpConfig`.
