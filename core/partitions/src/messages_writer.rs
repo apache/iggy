@@ -178,9 +178,9 @@ fn preallocate_file(file: &File, file_path: &str, len: u64) {
     // sets `thread_pool_limit(0)` on the shard proactor, so `spawn_blocking`
     // has no worker to park a task on and compio panics the shard outright with
     // "the thread pool is needed but no worker thread is running". (That limit
-    // is skipped on macOS/aarch64, where the pool does exist -- see the FIXME
-    // there -- so the panic is Linux-and-most-targets, not universal. This arm
-    // is Linux-only regardless.)
+    // is skipped on macOS, whose polling driver routes fs through the pool, so
+    // the panic is Linux-and-most-targets, not universal. This arm is
+    // Linux-only regardless.)
     //
     // The cost is acceptable only because of what this call is: a metadata-only
     // extent reservation, microseconds on the local filesystems this option
