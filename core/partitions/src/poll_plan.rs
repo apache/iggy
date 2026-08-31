@@ -86,12 +86,15 @@ pub enum PartitionDirResolution {
 /// wipes the slots in place (`SegmentedLog::invalidate_sealed_read_state`):
 /// it recreates the same paths, so a clone surviving in a suspended walk must
 /// re-open by path and observe the fresh files rather than serve purged data.
-/// The active segment is never cached.
+/// The active segment uses the [`Self::fd`] slot only: it grows under the
+/// reader, so a size-derived memo on it would go stale, and its slot sits
+/// outside the sealed LRU (`SegmentedLog::reset_read_state` drops it wherever
+/// a segment changes sealed-ness).
 #[derive(Debug, Default)]
 pub struct SealedSegmentReadState {
     /// Read-only descriptor; compio `File` clones share the kernel fd, so a hit
     /// avoids the per-poll `openat` (an `io_uring` op prone to io-wq punts) and
-    /// preserves kernel readahead. `None` until the first sealed poll opens it.
+    /// preserves kernel readahead. `None` until the first poll opens it.
     pub(crate) fd: RefCell<Option<compio::fs::File>>,
     /// Sparse offset/timestamp index reloaded from the `.index` file the
     /// segment dropped at rotation, so a poll resolves the start byte in
@@ -99,7 +102,9 @@ pub struct SealedSegmentReadState {
     /// `None` until the first sealed poll loads it.
     pub(crate) index: RefCell<Option<IggyIndexCache>>,
     /// Whether the owning partition's sealed LRU currently tracks this handle.
-    /// Gates the fd store-back in `resolve_segment_file`: a walk crosses every
+    /// Gates the fd store-back in `resolve_segment_file` for a SEALED segment
+    /// (the active segment's slot is outside the LRU, so it always fills): a
+    /// walk crosses every
     /// sealed segment from the poll's start onward, but only the start segment
     /// is LRU-touched, so an untracked fill would retain a descriptor the
     /// `SEALED_READ_STATE_CAP` budget never counts. Set on touch, cleared on
@@ -132,8 +137,8 @@ pub type SealedSegmentHandle = Rc<SealedSegmentReadState>;
 
 /// Owned, borrow-free inputs for the disk tier of a poll (see module docs). A
 /// sealed segment reuses its cached [`SealedSegmentReadState`] (read fd + sparse
-/// index); the active segment (and any cache miss) opens by path and resolves
-/// from its resident index, because sealed segments drop both at rotation.
+/// index); the active segment reuses the cached fd but resolves from its
+/// resident index, because sealed segments drop that index at rotation.
 pub struct DiskReadPlan {
     pub(crate) partition_dir: PartitionDirResolution,
     /// Segments to walk, snapshotted from the poll's starting segment onward
@@ -150,10 +155,13 @@ pub struct DiskReadPlan {
 pub struct DiskSegment {
     pub(crate) start_offset: u64,
     pub(crate) persisted: u64,
-    /// Shared read state, cloned from the owning partition at plan time for a
-    /// SEALED segment; `None` for the active segment, which always opens fresh
-    /// and resolves from its resident index. See [`SealedSegmentReadState`].
-    pub(crate) read_state: Option<SealedSegmentHandle>,
+    /// Shared read state, cloned from the owning partition at plan time. See
+    /// [`SealedSegmentReadState`].
+    pub(crate) read_state: SealedSegmentHandle,
+    /// Whether the segment was sealed when the plan was built. Only a sealed
+    /// segment resolves its start byte from the shared sparse index; the active
+    /// one grows under the reader and uses its resident index instead.
+    pub(crate) sealed: bool,
 }
 
 /// Owned auto-commit input, applied off the partition borrow after a poll (see
@@ -519,8 +527,8 @@ impl DiskReadPlan {
         // then cached) and resolve the start byte so the walk skips straight to
         // the target instead of scanning the whole segment - the poll stall. A
         // miss or load failure keeps `start_position` (the pre-existing
-        // full-scan fallback). The active segment carries no read state, so its
-        // resident-index-resolved `start_position` is left untouched.
+        // full-scan fallback). An active first segment keeps its
+        // resident-index-resolved `start_position` untouched.
         let mut position = match self.segments.first() {
             Some(first) => self
                 .resolve_sealed_start(first, query, partition_dir)
@@ -620,31 +628,30 @@ impl DiskReadPlan {
         }
     }
 
-    /// Resolve the read-only descriptor for `segment`'s file. A sealed segment
-    /// clones its cached fd on a hit (sharing the kernel fd, no syscall) and, on
-    /// a miss, opens by path and stores the fd back so later polls skip the
-    /// `openat`. The active segment (no cache slot) always opens fresh. Returns
-    /// `None` only when the open exhausts its retries (the caller fails closed).
+    /// Resolve the read-only descriptor for `segment`'s file. A hit clones the
+    /// cached fd (sharing the kernel fd, no syscall); a miss opens by path and
+    /// stores the fd back so later polls skip the `openat`. Returns `None` only
+    /// when the open exhausts its retries (the caller fails closed).
     async fn resolve_segment_file(
         &self,
         segment: &DiskSegment,
         path: &str,
     ) -> Option<compio::fs::File> {
-        let Some(handle) = &segment.read_state else {
-            return self.open_segment_with_retry(path).await;
-        };
+        let handle = &segment.read_state;
         // Borrow only to clone the `Option<File>` out, never across the await.
         if let Some(cached) = handle.fd.borrow().clone() {
             return Some(cached);
         }
         let file = self.open_segment_with_retry(path).await?;
-        // Store back only while the pump tracks this handle; an untracked
-        // fill (walk-through segment, or a slot evicted mid-poll) would pin an
-        // fd outside the LRU budget, so it opens transiently instead. Benign
-        // race: a concurrent poll of the same segment may have filled the slot
-        // while this open was in flight; overwriting with an equivalent fd
-        // (same inode) is harmless.
-        if handle.tracked.get() {
+        // A sealed segment stores back only while the pump tracks its handle;
+        // an untracked fill (walk-through segment, or a slot evicted mid-poll)
+        // would pin an fd outside the LRU budget, so it opens transiently
+        // instead. The active segment's slot is not LRU-budgeted (one per
+        // partition, dropped when it seals), so it always fills. Benign race: a
+        // concurrent poll of the same segment may have filled the slot while
+        // this open was in flight; overwriting with an equivalent fd (same
+        // inode) is harmless, as is filling a slot the pump orphaned mid-poll.
+        if !segment.sealed || handle.tracked.get() {
             *handle.fd.borrow_mut() = Some(file.clone());
         }
         Some(file)
@@ -655,14 +662,20 @@ impl DiskReadPlan {
     /// whole on the first sealed poll and is cached on the shared handle; a
     /// larger one is binary-searched on file every poll and never materialized
     /// (see the constant). Returns `None` (keep the byte-0 fallback) for the
-    /// active segment (no handle), a below-range query, or an IO failure.
+    /// active segment, a below-range query, or an IO failure.
     async fn resolve_sealed_start(
         &self,
         segment: &DiskSegment,
         query: MessageLookup,
         partition_dir: &str,
     ) -> Option<u64> {
-        let handle = segment.read_state.as_ref()?;
+        // The active segment grows under the reader, so neither the shared
+        // sparse index nor the offset memo can describe it; its own resident
+        // index already resolved `start_position`.
+        if !segment.sealed {
+            return None;
+        }
+        let handle = &segment.read_state;
         // Cache hit: resolve under a short borrow, never across the await.
         let cached = handle
             .index
@@ -1074,7 +1087,8 @@ mod tests {
         let segment = DiskSegment {
             start_offset: 0,
             persisted: u64::MAX,
-            read_state: Some(Rc::clone(&handle)),
+            read_state: Rc::clone(&handle),
+            sealed: true,
         };
         let plan = DiskReadPlan {
             partition_dir: PartitionDirResolution::Resolved(dir.display().to_string()),

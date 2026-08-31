@@ -63,7 +63,9 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use metadata::{BoundSession, MetadataSubmitError};
 use partitions::state_transfer::TransferArtifact;
-use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
+use partitions::{
+    FatalCommit, IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer,
+};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
@@ -6428,7 +6430,15 @@ where
     /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
     #[allow(clippy::future_not_send)]
     #[allow(clippy::too_many_lines)]
-    pub async fn tick_partitions(&self, namespace_scratch: &mut Vec<IggyNamespace>)
+    /// Returns the commit fault that fenced a partition on this shard, if one
+    /// has. The pump turns it into a server shutdown: a fenced partition is
+    /// divergent from the cluster and can never advance again, so the tick
+    /// stops driving it and the node stops rather than serving a prefix the
+    /// cluster has moved past.
+    pub async fn tick_partitions(
+        &self,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) -> Option<FatalCommit>
     where
         B: MessageBus,
         MJ: JournalHandle,
@@ -6498,10 +6508,19 @@ where
         // already accepts.
         let mut transfers_inflight: Option<usize> = None;
 
+        let mut fatal: Option<FatalCommit> = None;
         for namespace in namespace_scratch.drain(..) {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
                 continue;
             };
+            // A fenced partition must not tick: its consensus would emit
+            // view-scoped sends for a log the cluster has already passed.
+            if let Some(fault) = partition.fatal() {
+                if fatal.is_none() {
+                    fatal = Some(fault.clone());
+                }
+                continue;
+            }
 
             let consensus = partition.consensus();
             // Only while a view change is live. A `Normal` tick has no consumer:
@@ -6705,6 +6724,8 @@ where
                 }
             }
         }
+
+        fatal
     }
 
     /// Flush every owned partition's committed journal prefix to segment
@@ -6731,11 +6752,16 @@ where
                 .flush_committed_messages(partitions.config())
                 .await
             {
-                tracing::warn!(
+                tracing::error!(
                     namespace_raw = namespace.inner(),
                     %error,
                     "failed to flush partition journal on shutdown"
                 );
+                // The bytes left behind are cluster-committed, so the pump
+                // must not let this exit report clean (it re-scans for faults
+                // after this flush). A partition already fenced by the commit
+                // path keeps its original fault.
+                partition.fence_flush_failure();
             }
         }
     }

@@ -86,7 +86,7 @@ use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
 use metadata::stm::user::Users;
 use partitions::{
-    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
+    FatalCommit, IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
 };
 use rustls::pki_types::ServerName;
 use server_common::Message;
@@ -1271,8 +1271,23 @@ async fn shard_main(
     // tracked pump would be cancelled by runtime teardown mid final-flush
     // and every graceful shutdown would silently drop the committed journal
     // tail that had not hit a flush threshold yet.
+    let pump_shutdown_flag = Arc::clone(&shutdown_flag_for_handoff);
     let mut pump_handle = Some(compio::runtime::spawn(async move {
-        pump_shard.run_message_pump(stop_rx).await;
+        // The pump itself flips the shared flag when a commit fault stops it,
+        // BEFORE its final flush, so a flush stalling on the failed device
+        // still reaches the watchdog and the bounded drain. Every sibling
+        // shard's watchdog drives its own graceful stop off the same flag;
+        // this shard's watchdog is what fires the token `shard_main` is
+        // parked on. The store below backstops the one fault the pump can
+        // only observe after that flip: a partition fenced by the final
+        // flush itself.
+        let fatal = pump_shard
+            .run_message_pump(stop_rx, Arc::clone(&pump_shutdown_flag))
+            .await;
+        if fatal.is_some() {
+            pump_shutdown_flag.store(true, Ordering::Relaxed);
+        }
+        fatal
     }));
 
     let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
@@ -1513,7 +1528,7 @@ async fn shard_main(
 /// wrapper alone cannot see it, and a shard that swallows it prints
 /// "exited cleanly" over a corpse.
 async fn await_pump_drain(
-    pump_handle: Option<compio::runtime::JoinHandle<()>>,
+    pump_handle: Option<compio::runtime::JoinHandle<Option<FatalCommit>>>,
     config: &ServerConfig,
     shard_id: u16,
 ) -> Result<(), ServerError> {
@@ -1541,7 +1556,26 @@ async fn await_pump_drain(
     // reaches the tracing sink too.
     let reason = match panic::catch_unwind(panic::AssertUnwindSafe(|| join_result.resume_unwind()))
     {
-        Ok(Some(())) => return Ok(()),
+        Ok(Some(None)) => return Ok(()),
+        // The pump drained and flushed; it just has nothing left to serve.
+        // Fail the shard so the process exits non-zero: a node that stopped
+        // because it could not persist a cluster-committed op must not look
+        // to an orchestrator like a clean shutdown.
+        Ok(Some(Some(fault))) => {
+            error!(
+                shard = shard_id,
+                namespace_raw = fault.namespace_raw,
+                op = fault.op,
+                operation = ?fault.operation,
+                "message pump stopped on a partition commit fault; \
+                 the server is shutting down"
+            );
+            return Err(ServerError::ShardFatal {
+                shard_id,
+                namespace_raw: fault.namespace_raw,
+                op: fault.op,
+            });
+        }
         Ok(None) => "task was cancelled".to_string(),
         Err(payload) => payload
             .downcast_ref::<&str>()
@@ -2549,6 +2583,10 @@ fn restore_metadata_consensus(
 /// Recover this partition's persisted segment chain, stamping each segment
 /// with the topic's effective segment size (the per-topic value when the
 /// topic was created with one, else the shard-wide configured size).
+///
+/// The topic's effective `enforce_fsync` goes in for the same reason: it is
+/// what tells recovery whether a durable index entry the log cannot back is a
+/// benign torn index or previously durable data the log lost.
 async fn recover_partition_segments(
     config: &ServerConfig,
     namespace: IggyNamespace,
@@ -2561,12 +2599,16 @@ async fn recover_partition_segments(
     let segment_size = runtime_options
         .segment_size
         .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let enforce_fsync = runtime_options
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     load_persisted_segments(
         config,
         stream_id,
         topic_id,
         partition_id,
         segment_size,
+        enforce_fsync,
         stats,
     )
     .await
@@ -4740,7 +4782,7 @@ mod tests {
             .expect("a fresh ServerConfig owns its system config")
             .sharding
             .shutdown_drain_timeout = iggy_common::IggyDuration::new(timeout);
-        let pump = compio::runtime::spawn(std::future::pending::<()>());
+        let pump = compio::runtime::spawn(std::future::pending::<Option<FatalCommit>>());
 
         let error = await_pump_drain(Some(pump), &config, 7)
             .await
@@ -4751,6 +4793,32 @@ mod tests {
                 shard_id: 7,
                 timeout: actual,
             } if actual == timeout
+        ));
+    }
+
+    #[compio::test]
+    async fn pump_stopped_by_a_commit_fault_is_not_reported_as_clean() {
+        // The pump drained and flushed, so the join succeeds. Reporting that
+        // as a clean exit would hand an orchestrator exit code 0 for a node
+        // that stopped because it could not persist a cluster-committed op.
+        let config = ServerConfig::default();
+        let fault = FatalCommit {
+            namespace_raw: 42,
+            op: 7,
+            operation: iggy_binary_protocol::Operation::SendMessages,
+        };
+        let pump = compio::runtime::spawn(async move { Some(fault) });
+
+        let error = await_pump_drain(Some(pump), &config, 3)
+            .await
+            .expect_err("a pump that stopped on a commit fault is not a clean exit");
+        assert!(matches!(
+            error,
+            ServerError::ShardFatal {
+                shard_id: 3,
+                namespace_raw: 42,
+                op: 7,
+            }
         ));
     }
 
