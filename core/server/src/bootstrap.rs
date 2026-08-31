@@ -1052,10 +1052,10 @@ async fn shard_main(
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
-                |mux_stm, client, timestamp| {
+                |mux_stm, client, stamp| {
                     mux_stm
                         .streams()
-                        .remove_consumer_group_member(client, timestamp);
+                        .remove_consumer_group_member(client, stamp);
                 },
             )
             .await
@@ -1297,7 +1297,6 @@ async fn shard_main(
         topology.cluster_id,
         topology.self_replica_id,
         topology.replica_count,
-        Arc::clone(&metadata_view),
     ));
     let reconcile_periodic = config
         .system
@@ -2081,10 +2080,7 @@ async fn build_shard_for_thread(
                     topology.cluster_id,
                     topology.self_replica_id,
                     topology.replica_count,
-                    // Quarantine-and-rebuild always finds a partition
-                    // directory already there, so this joins as a probing
-                    // backup and learns the live view; nothing to seed.
-                    None,
+                    partition_metadata.created_view,
                     Rc::clone(&bus),
                 )
                 .await?

@@ -170,6 +170,12 @@ pub struct Simulator {
     /// a run with it on studies a system more durable than Iggy is. See
     /// `IggyShard::init_partition`.
     restore_partition_frontier: bool,
+    /// The view each namespace was created in, what production records on the
+    /// committed partition and every replica seeds its group from. Read from the
+    /// metadata plane once, at the first seed, and reused for every later seed
+    /// of that namespace, a restart's included, so no replica seeds a view its
+    /// peers did not.
+    partition_created_views: HashMap<IggyNamespace, u32>,
     /// Replies a setup handshake pulled off the wire that were not its own.
     ///
     /// `await_setup_reply` steps the whole simulator, so it sees every client's
@@ -472,6 +478,7 @@ impl Simulator {
             entry_rng: Xoshiro256PlusPlus::seed_from_u64(SimSeeds::derive(seed).entry_shard),
             evicted: Vec::new(),
             restore_partition_frontier: false,
+            partition_created_views: HashMap::new(),
             deferred_client_replies: Vec::new(),
             seed,
             shell,
@@ -494,11 +501,19 @@ impl Simulator {
     // segment storage so that branch can be deleted.
     #[allow(clippy::cast_possible_truncation)]
     pub fn init_partition(&mut self, namespace: IggyNamespace) {
+        let Some(created_view) = self.partition_created_view(namespace) else {
+            return;
+        };
         for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
             }
-            materialise_partition(replica, namespace, self.restore_partition_frontier);
+            materialise_partition(
+                replica,
+                namespace,
+                self.restore_partition_frontier,
+                created_view,
+            );
         }
     }
 
@@ -513,7 +528,10 @@ impl Simulator {
     /// dispatch-shell poll path.
     ///
     #[allow(clippy::cast_possible_truncation)]
-    pub fn seed_stream_topic_partition(&self, namespace: IggyNamespace) {
+    pub fn seed_stream_topic_partition(&mut self, namespace: IggyNamespace) {
+        let Some(created_view) = self.partition_created_view(namespace) else {
+            return;
+        };
         for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
@@ -525,8 +543,20 @@ impl Simulator {
                 .metadata()
                 .mux_stm
                 .streams()
-                .seed_namespace(namespace, namespace.inner());
+                .seed_namespace(namespace, namespace.inner(), created_view);
         }
+    }
+
+    /// The view `namespace` was created in: the metadata plane's view at its
+    /// first seed, as the prepare of a real create carries it, and the same value
+    /// for every seed after. `None` with no live metadata consensus to read.
+    fn partition_created_view(&mut self, namespace: IggyNamespace) -> Option<u32> {
+        if let Some(&created_view) = self.partition_created_views.get(&namespace) {
+            return Some(created_view);
+        }
+        let created_view = self.metadata_view()?;
+        self.partition_created_views.insert(namespace, created_view);
+        Some(created_view)
     }
 
     /// Log `client` in against the deterministic root user through the dispatch
@@ -1063,9 +1093,13 @@ impl Simulator {
         let partition_logs = self.retain_partition_logs(idx, &partition_superblocks);
         // SORTED: seed order decides slab ids and `HashMap` order is per-process, so
         // an unsorted walk would stop replay being byte-identical. Also drives the
-        // re-materialisation loop below, which must agree with it.
-        let mut materialised: Vec<IggyNamespace> = partition_superblocks.keys().copied().collect();
-        materialised.sort_unstable_by_key(IggyNamespace::inner);
+        // re-materialisation loop below, which must agree with it. Each carries the
+        // view it was created in, as the metadata a real boot replays would.
+        let mut seed_namespaces: Vec<(IggyNamespace, u32)> = partition_superblocks
+            .keys()
+            .map(|&namespace| (namespace, self.partition_created_views[&namespace]))
+            .collect();
+        seed_namespaces.sort_unstable_by_key(|(namespace, _)| namespace.inner());
 
         // Durable VSR state from the retained superblock, before the rebuild, as
         // production reads it in `restore_metadata_consensus`.
@@ -1116,7 +1150,7 @@ impl Simulator {
                 recovered_state,
                 metadata_incarnation,
                 (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
-                &materialised,
+                &seed_namespaces,
             );
             if shard_idx == 0 {
                 metadata_bundle =
@@ -1153,11 +1187,12 @@ impl Simulator {
         // makes the carried-forward superblock load-bearing: the group recovers its
         // recorded `(view, log_view)` instead of re-entering view 0. The metadata half
         // of the seed already ran inside `new_shard`, ahead of the replay.
-        for namespace in materialised {
+        for (namespace, created_view) in seed_namespaces {
             materialise_partition(
                 &self.replicas[idx],
                 namespace,
                 self.restore_partition_frontier,
+                created_view,
             );
         }
 
@@ -1334,6 +1369,21 @@ impl Simulator {
             })
     }
 
+    /// The metadata plane's view, as the first live replica owning a metadata
+    /// consensus sees it.
+    fn metadata_view(&self) -> Option<u32> {
+        (0..self.replica_count)
+            .filter(|replica_idx| !self.crashed.contains(replica_idx))
+            .find_map(|replica_idx| {
+                self.replicas[usize::from(replica_idx)].shards[0]
+                    .plane
+                    .metadata()
+                    .consensus
+                    .as_ref()
+                    .map(consensus::VsrConsensus::view)
+            })
+    }
+
     #[must_use]
     pub(crate) fn primary_index(&self, namespace: IggyNamespace) -> Option<u8> {
         (0..self.replica_count)
@@ -1357,14 +1407,19 @@ impl Simulator {
 /// re-opens every partition directory it owns, so the sim must re-materialise too,
 /// else the superblock a restart carries forward is never read back and the
 /// recovered-view branch is dead code.
-fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace, restore_frontier: bool) {
+fn materialise_partition(
+    replica: &SimReplica,
+    namespace: IggyNamespace,
+    restore_frontier: bool,
+    created_view: u32,
+) {
     let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
     let owner = calculate_shard_assignment(&namespace, shard_count);
     // Commit the namespace first: a partition the metadata plane never heard of is
     // a shape production cannot produce, and the shard refuses client traffic whose
     // routing-row epoch it cannot match against a committed `created_revision`.
     let streams = replica.shards[0].plane.metadata().mux_stm.streams();
-    streams.seed_namespace(namespace, namespace.inner());
+    streams.seed_namespace(namespace, namespace.inner(), created_view);
     // No committed revision means the seed could not re-add the namespace, which
     // happens once a metadata workload has deleted its stream or topic: the seed's
     // `CreatePartitions` is then a committed REJECTION rather than an error, so it
@@ -1375,6 +1430,12 @@ fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace, restore
     let Some(epoch) = streams.created_revision_for_namespace(namespace) else {
         return;
     };
+    // Read back rather than trusted from the argument: the seed above is a no-op
+    // for a namespace a metadata op already committed, and production seeds from
+    // the committed partition, never from a live view.
+    let created_view = streams
+        .created_view_for_namespace(namespace)
+        .expect("a committed partition records its creation view");
     // One store per group, minted on first materialisation and reused after, so the
     // recorded view survives a replica restart.
     let superblock = Rc::clone(
@@ -1392,24 +1453,13 @@ fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace, restore
     // a second materialisation with no restart between would otherwise resurrect a
     // log the live partition has moved past.
     let retained = replica.partition_logs.borrow_mut().remove(&namespace);
-    // The view this replica's metadata plane is in, which is what a fresh
-    // group seeds from. Production reads it off the roster value shard 0
-    // publishes; here shard 0's consensus is right there. Without it the
-    // simulator materialises every group at view 0 and can never produce the
-    // plane split that costs production its writes.
-    let metadata_view = replica.shards[0]
-        .plane
-        .metadata()
-        .consensus
-        .as_ref()
-        .map(consensus::VsrConsensus::view);
     replica.shards[usize::from(owner)].init_partition(
         namespace,
         Some(superblock),
         recovered_state,
         retained,
         restore_frontier,
-        metadata_view,
+        created_view,
     );
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -1576,8 +1626,9 @@ mod tests {
              primary back at replica 0 both planes agree and the split cannot show"
         );
 
-        // Materialise a brand-new group. Every live replica seeds from its own
-        // metadata view, which is the value production reads off the roster.
+        // Materialise a brand-new group. Every live replica seeds from the view
+        // the create was committed in, which production reads off the committed
+        // partition.
         let namespace = IggyNamespace::new(1, 1, 0);
         sim.init_partition(namespace);
 
@@ -1615,6 +1666,120 @@ mod tests {
                 state.view
             );
         }
+    }
+
+    /// A replica that missed a group's creation materialises it after the
+    /// metadata plane elected again. It must seed the view the group was CREATED
+    /// in, not the live metadata view: seeded above the group's real view, its
+    /// empty log outranks every peer in the next DVC merge and the committed ops
+    /// collect a nack quorum, wedging the group for good.
+    #[test]
+    fn given_a_late_materialiser_when_the_metadata_view_moved_on_should_seed_the_creation_view() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let settle = |sim: &mut Simulator| {
+            for _ in 0..800 {
+                sim.step();
+            }
+        };
+        let reply_within = |sim: &mut Simulator, budget: usize| {
+            (0..budget).find_map(|_| {
+                let replies = sim.step();
+                (!replies.is_empty()).then(|| replies[0].deep_copy())
+            })
+        };
+
+        // Replica 0 is down while the group is created, at a metadata view its
+        // crash moved off 0.
+        sim.replica_crash(0);
+        settle(&mut sim);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        let created_view = sim
+            .partition_consensus_state(1, namespace)
+            .expect("replica 1 materialised the group")
+            .view;
+        assert!(
+            created_view > 0,
+            "crashing replica 0 must have moved the metadata plane off view 0, or a \
+             creation-view seed is indistinguishable from a view-0 start"
+        );
+
+        // Commit a write, so the group holds history a wrong seed could outrank.
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+        let primary = sim
+            .primary_index(namespace)
+            .expect("a live replica hosts the group");
+        let request = client.send_messages(namespace, &[Bytes::from_static(b"before")]);
+        sim.submit_request(client_id, primary, request.into_generic());
+        reply_within(&mut sim, 200).expect("the write commits on the fresh group");
+
+        // Replica 0 returns without the group, then the metadata plane elects
+        // again, so its live view now exceeds the view the group was created in.
+        sim.replica_restart(0);
+        settle(&mut sim);
+        let metadata_primary = sim
+            .metadata_primary_index()
+            .expect("a live replica owns metadata consensus");
+        sim.replica_crash(metadata_primary);
+        settle(&mut sim);
+        let moved_view = sim
+            .metadata_view()
+            .expect("a live replica owns metadata consensus");
+        assert!(
+            moved_view > created_view,
+            "the second election must move the metadata view ({moved_view}) past the \
+             group's creation view ({created_view})"
+        );
+
+        // Replica 0 materialises the group now.
+        sim.init_partition(namespace);
+        let seeded = sim
+            .partition_consensus_state(0, namespace)
+            .expect("replica 0 materialised the group")
+            .view;
+        assert_eq!(
+            seeded, created_view,
+            "a late materialiser must seed the group's creation view, not the live metadata \
+             view {moved_view}: above the group's real view its empty log wins the next merge"
+        );
+
+        // With replica 0 in, the group has a quorum again: it elects past its
+        // dead primary and commits a new write.
+        let settled_primary = (0..4)
+            .find_map(|_| {
+                settle(&mut sim);
+                (0..replica_count)
+                    .filter(|replica_idx| !sim.is_crashed(*replica_idx))
+                    .find(|replica_idx| {
+                        sim.partition_consensus_state(usize::from(*replica_idx), namespace)
+                            .is_some_and(|state| state.status == Status::Normal && state.is_primary)
+                    })
+            })
+            .expect("the group must elect a live primary once replica 0 joins it");
+        let request = client.send_messages(namespace, &[Bytes::from_static(b"after")]);
+        sim.submit_request(client_id, settled_primary, request.into_generic());
+        reply_within(&mut sim, 400).expect(
+            "a write must commit after the late materialiser joined; a wedged merge \
+             answers nothing",
+        );
     }
 
     /// A replica that advanced its view, persisted it through the superblock gate,
@@ -2531,7 +2696,7 @@ mod tests {
             executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
             let grow = Rc::clone(&sim.replicas[0].shards[0]);
             executor.spawn(async move {
-                grow.init_partition(ns_grow, None, None, None, false, None);
+                grow.init_partition(ns_grow, None, None, None, false, 0);
             });
             executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
         }))
@@ -2566,7 +2731,7 @@ mod tests {
         executor.run_until_stalled(POLL_BUDGET);
         let grow = Rc::clone(&sim.replicas[0].shards[0]);
         executor.spawn(async move {
-            grow.init_partition(ns_grow, None, None, None, false, None);
+            grow.init_partition(ns_grow, None, None, None, false, 0);
         });
         executor.run_until_stalled(POLL_BUDGET);
 

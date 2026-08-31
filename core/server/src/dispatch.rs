@@ -4329,6 +4329,7 @@ mod tests {
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
+            created_view: 0,
         };
         md.mux_stm
             .update(prepare_message(
