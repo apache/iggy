@@ -30,7 +30,8 @@ from datetime import timedelta
 
 import pytest
 
-from apache_iggy import HttpConfig, IggyClient
+from apache_iggy import Consumer, HttpConfig, IggyClient, PollingStrategy
+from apache_iggy import SendMessage as Message
 
 from .utils import get_http_server_config, wait_for_ping
 
@@ -46,6 +47,7 @@ class TestHttpConfig:
         assert config.api_url == "http://127.0.0.1:3000"
         assert config.retries == 3
         assert config.has_jwt is False
+        assert config.heartbeat_interval == timedelta(seconds=5)
 
     def test_every_field_round_trips(self):
         """Test that each configured field is readable back unchanged."""
@@ -53,11 +55,13 @@ class TestHttpConfig:
             api_url="http://127.0.0.1:3001",
             retries=5,
             jwt="a-token",
+            heartbeat_interval=timedelta(seconds=15),
         )
 
         assert config.api_url == "http://127.0.0.1:3001"
         assert config.retries == 5
         assert config.has_jwt is True
+        assert config.heartbeat_interval == timedelta(seconds=15)
 
     def test_arguments_are_keyword_only(self):
         """Test that the API URL cannot be passed positionally."""
@@ -119,7 +123,7 @@ class TestHttpConfig:
 
 
 @pytest.mark.unit
-class TestClientConstruction:
+class TestHttpClientConstruction:
     """Test what `IggyClient.http(...)` accepts."""
 
     def test_accepts_a_config(self):
@@ -143,3 +147,44 @@ class TestHttpConfigAgainstServer:
         client = IggyClient.http(HttpConfig(api_url=f"http://{host}:{port}"))
         await client.connect()
         await wait_for_ping(client)
+
+    @pytest.mark.asyncio
+    async def test_client_sends_and_polls_a_message(self, unique_name):
+        """Test a full round trip: login, create stream/topic, send, poll.
+
+        HTTP is a stateless per-request transport, so this is the part
+        `test_client_connects_and_pings` above does not cover: that a client
+        built from `HttpConfig` can actually carry a real workload.
+        """
+        host, port = get_http_server_config()
+        stream_name = unique_name()
+        topic_name = unique_name()
+        payload = f"payload-{unique_name()}"
+
+        client = IggyClient.http(HttpConfig(api_url=f"http://{host}:{port}"))
+        await client.connect()
+        await wait_for_ping(client)
+        await client.login_user("iggy", "iggy")
+
+        await client.create_stream(stream_name)
+        await client.create_topic(
+            stream=stream_name, name=topic_name, partitions_count=1
+        )
+        await client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=0,
+            messages=[Message(payload)],
+        )
+
+        polled_messages = await client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            consumer=Consumer.Single("http-round-trip"),
+            partition_id=0,
+            polling_strategy=PollingStrategy.First(),
+            count=1,
+            auto_commit=True,
+        )
+
+        assert [message.payload().decode() for message in polled_messages] == [payload]
