@@ -19,6 +19,7 @@ mod api;
 mod clickhouse;
 mod delta;
 mod doris;
+mod dynamodb;
 mod elasticsearch;
 mod fixtures;
 mod http;
