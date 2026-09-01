@@ -69,7 +69,6 @@ public class UsersTests
         var response = await client.GetUserAsync(Identifier.String(username));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Username.ShouldBe(username);
         response.Status.ShouldBe(UserStatus.Active);
         response.CreatedAt.ShouldBeGreaterThan(0u);
@@ -109,7 +108,6 @@ public class UsersTests
         var user = await client.GetUserAsync(Identifier.String(newUsername));
 
         user.ShouldNotBeNull();
-        user.Id.ShouldBeGreaterThanOrEqualTo(0u);
         user.Username.ShouldBe(newUsername);
         user.Status.ShouldBe(UserStatus.Active);
         user.CreatedAt.ShouldBeGreaterThan(0u);

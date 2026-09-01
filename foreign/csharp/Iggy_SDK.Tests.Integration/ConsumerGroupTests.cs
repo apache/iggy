@@ -54,7 +54,6 @@ public class ConsumerGroupTests
             Identifier.String(streamName), Identifier.String(TopicName), GroupName);
 
         consumerGroup.ShouldNotBeNull();
-        consumerGroup.Id.ShouldBeGreaterThanOrEqualTo(0u);
         consumerGroup.PartitionsCount.ShouldBe(PartitionsCount);
         consumerGroup.MembersCount.ShouldBe(0u);
         consumerGroup.Name.ShouldBe(GroupName);

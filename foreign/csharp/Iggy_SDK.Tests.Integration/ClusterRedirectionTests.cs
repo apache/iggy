@@ -135,7 +135,7 @@ public class ClusterRedirectionTests
         }
 
         authResponse.ShouldNotBeNull();
-        authResponse!.UserId.ShouldBeGreaterThanOrEqualTo(0u);
+        authResponse!.UserId.ShouldNotBe(uint.MaxValue);
 
         var address = client.GetCurrentAddress();
         address.ShouldNotBeNullOrEmpty();

@@ -41,7 +41,6 @@ public class StreamsTests
         var response = await client.CreateStreamAsync(name);
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Name.ShouldBe(name);
         response.Size.ShouldBe(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
@@ -157,7 +156,6 @@ public class StreamsTests
 
         var response = await client.GetStreamByIdAsync(Identifier.String(streamName));
         response.ShouldNotBeNull();
-        response.Id.ShouldBeGreaterThanOrEqualTo(0u);
         response.Name.ShouldBe(streamName);
         response.Size.ShouldBeGreaterThan(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));

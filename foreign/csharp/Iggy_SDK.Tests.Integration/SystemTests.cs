@@ -63,7 +63,6 @@ public class SystemTests
         response.ShouldNotBeNull();
         response.ClientId.ShouldBe(clientInfo.ClientId);
         response.UserId.ShouldNotBeNull();
-        response.UserId.Value.ShouldBeGreaterThanOrEqualTo(0u);
         response.Address.ShouldNotBeNullOrEmpty();
         response.Transport.ShouldBe(ClientTransport.Tcp);
         response.ConsumerGroupsCount.ShouldBe(0u);
@@ -141,17 +140,11 @@ public class SystemTests
 
         var response = await client.GetStatsAsync();
         response.ShouldNotBeNull();
-        response.ProcessId.ShouldBeGreaterThanOrEqualTo(0u);
+        response.ProcessId.ShouldNotBe(0u);
         response.CpuUsage.ShouldBeGreaterThanOrEqualTo(0);
         response.TotalCpuUsage.ShouldBeGreaterThanOrEqualTo(0);
-        response.MemoryUsage.ShouldBeGreaterThanOrEqualTo(0u);
-        response.TotalMemory.ShouldBeGreaterThanOrEqualTo(0u);
         response.AvailableMemory.ShouldNotBe(0u);
-        response.RunTime.ShouldBeGreaterThanOrEqualTo(0u);
         response.StartTime.ShouldBe(DateTimeOffset.UtcNow, TimeSpan.FromMinutes(5));
-        response.ReadBytes.ShouldBeGreaterThanOrEqualTo(0u);
-        response.WrittenBytes.ShouldBeGreaterThanOrEqualTo(0u);
-        response.MessagesSizeBytes.ShouldBeGreaterThanOrEqualTo(0u);
         response.StreamsCount.ShouldBeGreaterThanOrEqualTo(1u);
         response.TopicsCount.ShouldBeGreaterThanOrEqualTo(1u);
         response.PartitionsCount.ShouldBeGreaterThanOrEqualTo(1u);

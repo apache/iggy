@@ -41,11 +41,8 @@ public readonly struct Consumer
     /// <returns>Consumer instance</returns>
     public static Consumer New(int id)
     {
-        return new Consumer
-        {
-            ConsumerId = Identifier.Numeric(id),
-            Type = ConsumerType.Consumer
-        };
+        ArgumentOutOfRangeException.ThrowIfNegative(id);
+        return New((uint)id);
     }
 
     /// <summary>
@@ -83,11 +80,8 @@ public readonly struct Consumer
     /// <returns>Consumer instance</returns>
     public static Consumer Group(int id)
     {
-        return new Consumer
-        {
-            ConsumerId = Identifier.Numeric(id),
-            Type = ConsumerType.ConsumerGroup
-        };
+        ArgumentOutOfRangeException.ThrowIfNegative(id);
+        return Group((uint)id);
     }
 
     /// <summary>

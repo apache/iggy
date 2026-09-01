@@ -377,7 +377,7 @@ public sealed class BinaryMapper
     {
         // Arrange
         var (groupId, membersCount, partitionsCount, name) = ConsumerGroupFactory.CreateConsumerGroupResponseFields();
-        List<int> memberPartitions = Enumerable.Range(0, (int)partitionsCount).ToList();
+        List<uint> memberPartitions = Enumerable.Range(0, (int)partitionsCount).Select(i => (uint)i).ToList();
         var groupPayload
             = BinaryFactory.CreateGroupPayload(groupId, membersCount, partitionsCount, name, memberPartitions);
 
@@ -709,7 +709,27 @@ public sealed class BinaryMapper
         var payload = CreateClusterMetadataPayload("cluster", ("node-1", "10.0.0.1", 8090, 1, 1));
         var truncated = payload.AsSpan(0, payload.Length - 3).ToArray();
 
-        Assert.ThrowsAny<SystemException>(() => Mappers.BinaryMapper.MapClusterMetadata(truncated));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClusterMetadata(truncated));
+    }
+
+    [Fact]
+    public void MapClusterMetadata_TruncatedInsideLengthPrefix_Throws()
+    {
+        var payload = CreateClusterMetadataPayload("cluster", ("node-1", "10.0.0.1", 8090, 1, 1));
+        // cut inside the u32 length prefix of the node ip, right after the node name
+        var cut = 4 + "cluster".Length + 4 + 4 + "node-1".Length + 2;
+        var truncated = payload.AsSpan(0, cut).ToArray();
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClusterMetadata(truncated));
+    }
+
+    [Fact]
+    public void MapClusterMetadata_TruncatedBeforeNodesCount_Throws()
+    {
+        var payload = CreateClusterMetadataPayload("cluster");
+        var truncated = payload.AsSpan(0, payload.Length - 2).ToArray();
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClusterMetadata(truncated));
     }
 
     [Fact]
@@ -808,26 +828,25 @@ public sealed class BinaryMapper
         var payload = new byte[4];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, uint.MaxValue);
 
-        Assert.ThrowsAny<Exception>(() => Mappers.BinaryMapper.MapTopics(payload));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopics(payload));
     }
 
     [Fact]
-    public void TryMapHeaders_ValueLengthDisagreesWithKind_ReturnsNull()
+    public void MapHeaders_KeyLengthDisagreesWithKind_Throws()
     {
-        // key: string "A"; value: kind Uint64 (12) with a single byte.
-        var bytes = new byte[] { 2, 1, 0, 0, 0, 65, 12, 1, 0, 0, 0, 7 };
+        // key: kind Uint32 (11) with a single byte; value: string "v".
+        var bytes = new byte[] { 11, 1, 0, 0, 0, 65, 2, 1, 0, 0, 0, 118 };
 
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(bytes));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(bytes));
     }
 
     [Fact]
-    public void TryMapHeaders_FixedWidthValueOfMatchingLength_Parses()
+    public void MapHeaders_FixedWidthValueOfMatchingLength_Parses()
     {
         var bytes = new byte[] { 2, 1, 0, 0, 0, 65, 12, 8, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0 };
 
-        Dictionary<HeaderKey, HeaderValue>? headers = Mappers.BinaryMapper.TryMapHeaders(bytes);
+        Dictionary<HeaderKey, HeaderValue> headers = Mappers.BinaryMapper.MapHeaders(bytes);
 
-        Assert.NotNull(headers);
         var value = Assert.Single(headers).Value;
         Assert.Equal(HeaderKind.Uint64, value.Kind);
         Assert.Equal(7ul, value.ToUInt64());

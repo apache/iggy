@@ -450,8 +450,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 return;
             }
 
-            _lastPolledOffset.AddOrUpdate(messages.PartitionId, currentOffset,
-                (_, _) => currentOffset);
+            _lastPolledOffset[messages.PartitionId] = currentOffset;
 
             if (_config.PollingStrategy.Kind == MessagePolling.Offset)
             {

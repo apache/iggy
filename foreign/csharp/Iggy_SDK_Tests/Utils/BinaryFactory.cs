@@ -152,20 +152,8 @@ internal sealed class BinaryFactory
         return entry;
     }
 
-    internal static byte[] CreatePartitionPayload(int id, int segmentsCount, int currentOffset, ulong sizeBytes,
-        ulong messagesCount)
-    {
-        var payload = new byte[16];
-        BinaryPrimitives.WriteInt32LittleEndian(payload, id);
-        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(4), segmentsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(8), currentOffset);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(12), sizeBytes);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), messagesCount);
-        return payload;
-    }
-
     internal static byte[] CreateGroupPayload(uint id, uint membersCount, uint partitionsCount, string name,
-        List<int>? partitionsOnMember = null)
+        List<uint>? partitionsOnMember = null)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
         var payload = new byte[13 + nameBytes.Length + (partitionsOnMember?.Count * 4 + 8 ?? 0)];
@@ -177,11 +165,11 @@ internal sealed class BinaryFactory
         if (partitionsOnMember is not null)
         {
             var memberStart = 13 + nameBytes.Length;
-            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(memberStart), 30);
-            BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(memberStart + 4), partitionsOnMember.Count);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(memberStart), 30);
+            BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(memberStart + 4), (uint)partitionsOnMember.Count);
             for (var i = 0; i < partitionsOnMember.Count; i++)
             {
-                BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(memberStart + 8 + i * 4),
+                BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(memberStart + 8 + i * 4),
                     partitionsOnMember[i]);
             }
         }
@@ -214,22 +202,22 @@ internal sealed class BinaryFactory
 
         // Convert string properties to bytes and set them in the byte array
         var hostnameBytes = Encoding.UTF8.GetBytes(stats.Hostname);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(108, 4), hostnameBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(108, 4), (uint)hostnameBytes.Length);
         hostnameBytes.CopyTo(bytes, 112);
 
         var osNameBytes = Encoding.UTF8.GetBytes(stats.OsName);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(112 + hostnameBytes.Length, 4), osNameBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(112 + hostnameBytes.Length, 4), (uint)osNameBytes.Length);
         osNameBytes.CopyTo(bytes, 116 + hostnameBytes.Length);
 
         var osVersionBytes = Encoding.UTF8.GetBytes(stats.OsVersion);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(116 + hostnameBytes.Length + osNameBytes.Length, 4),
-            osVersionBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(116 + hostnameBytes.Length + osNameBytes.Length, 4),
+            (uint)osVersionBytes.Length);
         osVersionBytes.CopyTo(bytes, 120 + hostnameBytes.Length + osNameBytes.Length);
 
         var kernelVersionBytes = Encoding.UTF8.GetBytes(stats.KernelVersion);
-        BinaryPrimitives.WriteInt32LittleEndian(
+        BinaryPrimitives.WriteUInt32LittleEndian(
             bytes.AsSpan(120 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length, 4),
-            kernelVersionBytes.Length);
+            (uint)kernelVersionBytes.Length);
         kernelVersionBytes.CopyTo(bytes, 124 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length);
 
         return bytes;
