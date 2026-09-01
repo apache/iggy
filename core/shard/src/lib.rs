@@ -52,11 +52,11 @@ use iggy_common::variadic;
 use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
-use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
+use message_bus::{BusMessage, MessageBus};
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
@@ -687,10 +687,7 @@ pub enum LifecycleFrame {
     },
     /// A shard that doesn't hold the client's TCP connection forwards a
     /// client send to the owning shard (top 16 bits of `client_id`).
-    ForwardClientSend {
-        client_id: u128,
-        msg: Frozen<MESSAGE_ALIGN>,
-    },
+    ForwardClientSend { client_id: u128, msg: BusMessage },
     /// A peer shard hands a metadata consensus submit (login/logout) to
     /// shard 0, the metadata consensus owner. The committed op returns over
     /// the `reply` sender carried in [`MetadataSubmit`]. Always addressed to
@@ -3546,7 +3543,7 @@ where
         );
         let frame = ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
             client_id: request_header.client,
-            msg: reply.into_generic().into_frozen(),
+            msg: reply.into_generic().into_frozen().into(),
         });
         let Some(sender) = self.senders.get(self.id as usize) else {
             return false;

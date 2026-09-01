@@ -4433,6 +4433,7 @@ mod timestamp_clamp_tests {
 
     use super::*;
     use crate::LocalPipeline;
+    use message_bus::BusMessage;
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
 
@@ -4454,7 +4455,7 @@ mod timestamp_clamp_tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), message_bus::SendError> {
             Ok(())
         }
@@ -4767,6 +4768,7 @@ mod timestamp_clamp_tests {
 #[cfg(test)]
 mod vsr_consensus_tests {
     use super::*;
+    use message_bus::BusMessage;
 
     #[test]
     fn stage_transitions_follow_the_machine() {
@@ -4809,7 +4811,7 @@ mod vsr_consensus_tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), message_bus::SendError> {
             Ok(())
         }
@@ -5340,6 +5342,7 @@ mod quorum_tests {
 
     use super::*;
     use crate::LocalPipeline;
+    use message_bus::BusMessage;
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
 
@@ -5349,7 +5352,7 @@ mod quorum_tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), message_bus::SendError> {
             Ok(())
         }
