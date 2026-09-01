@@ -92,7 +92,9 @@ impl IggyConsumerBuilder {
         Self { topic, ..self }
     }
 
-    /// Sets the partition identifier.
+    /// Sets the partition to read. `None` lets a consumer group read its assigned partitions and
+    /// makes the server read partition `0` for a standalone consumer. `Some(n)` on a group member
+    /// pins every poll to that partition instead of the assignment.
     pub fn partition(self, partition: Option<u32>) -> Self {
         Self { partition, ..self }
     }
@@ -105,7 +107,7 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Sets the batch size for polling messages.
+    /// Sets how many messages one poll request fetches at most. Defaults to 1000.
     pub fn batch_length(self, batch_length: u32) -> Self {
         Self {
             batch_length,
@@ -121,6 +123,7 @@ impl IggyConsumerBuilder {
         }
     }
 
+    /// Same as [`auto_commit`](Self::auto_commit) with [`AutoCommit::Disabled`].
     pub fn commit_failed_messages(self) -> Self {
         Self {
             auto_commit: AutoCommit::Disabled,
