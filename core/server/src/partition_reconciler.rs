@@ -67,7 +67,7 @@
 //! `shards_table` is therefore a **cache of a deterministic hash**, never a
 //! readiness proof: every shard derives the same rows from the same committed
 //! metadata, and a row may exist before its partition does. Nothing may treat
-//! presence as "the owner is ready" - `dispatch::wait_for_partition_routable`
+//! presence as "the owner is ready" - `dispatch::partition::wait_for_partition_routable`
 //! documents why the owner-readiness probe that used to live there was both
 //! unnecessary and ineffective.
 //!

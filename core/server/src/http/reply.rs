@@ -36,8 +36,8 @@ use iggy_common::{
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
+use crate::dispatch::login_error::LoginRegisterError;
 use crate::http::error::{PartitionWriteError, WriteError};
-use crate::login_register::LoginRegisterError;
 
 /// Discriminate a partition write reply. Partition replies carry no result
 /// section - a denial is empty-bodied and a committed body, where there is one,
