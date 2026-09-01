@@ -38,6 +38,7 @@ internal sealed class ConsensusSession
     private readonly object _gate = new();
 #endif
     private UInt128 _clientId;
+    private ulong _generation;
     private bool _registerPending;
     private ulong _requestCounter;
     private ulong? _session;
@@ -85,6 +86,23 @@ internal sealed class ConsensusSession
             lock (_gate)
             {
                 return _session.HasValue;
+            }
+        }
+    }
+
+    /// <summary>
+    ///     Generation of the identity, bumped on every re-arm. Anything scoped to a server session - a
+    ///     consumer-group membership, say - compares the generation it was established under to detect that the
+    ///     session it lived on is gone, without inferring it from connection-state edges. Distinct from the
+    ///     fence epoch the wire protocol carries in <see cref="Session" />.
+    /// </summary>
+    internal ulong Generation
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _generation;
             }
         }
     }
@@ -185,14 +203,8 @@ internal sealed class ConsensusSession
         var sessionId = _session ?? throw VsrError.Exception(VsrError.UNAUTHENTICATED,
             "A replicated request requires a bound consensus session.");
 
-        // Partition ops replicate in their own per-partition group with no client-table dedup, so they too
-        // must leave the metadata counter untouched. Only metadata operations and logout consume an id: the
-        // server tracks request ids for those alone, and it accepts any id above the client's watermark.
-        if (operation.IsPartition())
-        {
-            return new SessionFrame(_clientId, _requestCounter, sessionId);
-        }
-
+        // Partition ops consume an id too, even though no partition-plane dedup exists yet: dedup needs
+        // each send to carry a distinct number, and the metadata watermark tolerates the gaps.
         var requestId = _requestCounter;
         _requestCounter = checked(_requestCounter + 1);
 
@@ -205,6 +217,7 @@ internal sealed class ConsensusSession
         _session = null;
         _requestCounter = 1;
         _registerPending = false;
+        _generation++;
     }
 
     private static UInt128 GenerateClientId()

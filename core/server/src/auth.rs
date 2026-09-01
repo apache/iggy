@@ -22,11 +22,11 @@
 //! surfaced as typed `Eviction` frames, transient ones as result-framed
 //! replay hints.
 
-use crate::bootstrap::{ShellBus, ShellShard};
 use crate::dispatch::{send_login_eviction, submit_register_on_owner};
 use crate::login_register::LoginRegisterError;
 use crate::responses::{build_login_register_reply, current_metadata_commit};
 use crate::session_manager::{ClientSdkInfo, SessionManager};
+use crate::shell::{ShellBus, ShellShard};
 use consensus::{MetadataHandle, build_result_rejection_reply};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::{ClientVersionInfo, EvictionReason, RoutedRequestHeader};
@@ -58,11 +58,11 @@ static DUMMY_PASSWORD_HASH: LazyLock<String> =
 
 /// Pay the one-time Argon2 cost of [`DUMMY_PASSWORD_HASH`] at boot instead of
 /// inside the first unknown-username login request.
-pub(crate) fn warm_dummy_password_hash() {
+pub fn warm_dummy_password_hash() {
     LazyLock::force(&DUMMY_PASSWORD_HASH);
 }
 
-pub(crate) fn verify_login_credentials<B, MJ, S, SB>(
+pub fn verify_login_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     username: &str,
     password: &str,
@@ -109,7 +109,7 @@ where
     })
 }
 
-pub(crate) fn verify_pat_credentials<B, MJ, S, SB>(
+pub fn verify_pat_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
 ) -> Result<u32, LoginRegisterError>
@@ -127,7 +127,7 @@ where
 /// seconds, `u64::MAX` when the PAT never expires). The HTTP extractor keys a
 /// per-token VSR session table on this expiry for lazy eviction; the wire and
 /// login paths only need the user id and go through [`verify_pat_credentials`].
-pub(crate) fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
+pub fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
 ) -> Result<(u32, u64), LoginRegisterError>
@@ -179,7 +179,7 @@ where
 }
 
 #[allow(clippy::future_not_send)]
-pub(crate) async fn complete_login_register<B, MJ, S, SB>(
+pub async fn complete_login_register<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
@@ -294,7 +294,7 @@ where
 /// SDK surfaces the real reason (every frame transport decodes
 /// `Command::Eviction`) instead of a decode error or a timeout.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn surface_login_failure<B, MJ, S, SB>(
+pub async fn surface_login_failure<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RoutedRequestHeader,

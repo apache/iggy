@@ -50,10 +50,10 @@ use metadata::permissioner::Permissioner;
 use server_common::Message;
 use tracing::warn;
 
-use crate::bootstrap::{ShellBus, ShellShard};
 use crate::responses::{
     build_deny_reply, current_metadata_commit, resolve_stream_id, resolve_topic_id,
 };
+use crate::shell::{ShellBus, ShellShard};
 
 /// Authorize a partition-plane op on its resolved (stream, topic) for the
 /// acting user, returning the deny status code or `None` to proceed. The

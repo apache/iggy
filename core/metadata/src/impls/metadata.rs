@@ -28,7 +28,7 @@ use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
     Consensus, EvictionContext, FatalReason, Pipeline, PipelineEntry, Plane, PlaneIdentity,
     PlaneKind, PreflightOutcome, PrepareRollback, Project, ReplicaLogContext, RequestLogEvent,
-    Sequencer, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
+    Sequencer, SessionEnd, SimEventKind, VsrConsensus, ack_preflight, ack_quorum_reached,
     apply_preflight_consensus_plane, build_eviction_message, build_reply_message,
     build_reply_message_with, build_result_rejection_reply, emit_sim_event, fatal,
     fence_old_prepare_by_commit, is_caught_up_primary,
@@ -338,7 +338,10 @@ impl<M> SnapshotCoordinator<M> {
     /// forced. Must stay >= the prepare-queue depth: the ops already
     /// pipelined while a checkpoint runs skip it and append into this
     /// margin.
-    const CHECKPOINT_MARGIN: usize = 64;
+    ///
+    /// Public so a caller sizing a journal can refuse a slot count at or below it:
+    /// such a journal checkpoints on every commit rather than on occupancy.
+    pub const CHECKPOINT_MARGIN: usize = 64;
 
     #[must_use]
     pub fn new(
@@ -366,7 +369,9 @@ impl<M> SnapshotCoordinator<M> {
     /// transfer serves and installs.
     #[must_use]
     pub fn snapshot_path(&self) -> std::path::PathBuf {
-        self.data_dir.join(super::METADATA_DIR).join("snapshot.bin")
+        self.data_dir
+            .join(super::METADATA_DIR)
+            .join(super::SNAPSHOT_FILE_NAME)
     }
 
     /// The last persisted checkpoint's `(op, checksum)`, `(0, 0)` when none.
@@ -623,7 +628,11 @@ pub fn apply_committed_prepare<M>(
     }
     if header.operation == Operation::Logout {
         if table_mutations_allowed {
-            client_table.borrow_mut().remove_client(header.client);
+            client_table.borrow_mut().remove_client(
+                header.client,
+                header.user_id,
+                SessionEnd::from_logout_request(header.request),
+            );
         }
         // Drop the disconnected client from every consumer group it joined and
         // rebalance, Logout's only state-machine effect.
@@ -650,7 +659,9 @@ pub fn apply_committed_prepare<M>(
     // client, and replica-local eviction makes a stale-request replay
     // reachable. Both are skips, not faults.
     if table_mutations_allowed {
-        let outcome = client_table.borrow_mut().commit_reply(header.client, reply);
+        let outcome = client_table
+            .borrow_mut()
+            .commit_reply(header.client, header.user_id, reply);
         log_commit_reply_outcome(outcome, header.client, header.op);
     }
 }
@@ -1164,21 +1175,48 @@ where
         // guard, not here.
         self.checkpoint_if_needed(consensus, journal).await;
 
-        // Backup: gap check (op == current_op + 1).
-        // Primary: sequencer pre-advanced by push_prepare_entry (guards
-        // sibling on_request races during journal.append await).
-        // TODO: promote the backup gap warn below to a hard assert or a
-        // repair-session trigger (message repair has landed; the drop-and-
-        // wait-for-retransmit path is the last soft handling left here).
+        // Backup: gap check against the JOURNAL head, not the sequencer.
+        //
+        // The two frontiers can disagree. The sequencer is pre-advanced on the
+        // primary by `push_prepare_entry` and re-synced on a backup only after a
+        // successful append, so a replica can carry a sequencer one ahead of what
+        // its WAL holds. Gating admission on it then rejects the very prepare that
+        // would heal the log: a backup with `last_op = 44` refused op 45 because
+        // its sequencer said to expect 46. The primary retransmits that op for the
+        // life of the process, every backup logs an out-of-order gap, it never
+        // reaches a commit quorum, and its client is never answered.
+        //
+        // `max(last_op, snapshot_op)`, never `last_op` alone. A state transfer
+        // installs a snapshot that IS ops `..=snapshot_op` applied and truncates the
+        // WAL above that floor rather than refilling below it, so `last_op` reads the
+        // receiver as needing an op the snapshot already contains and no peer will
+        // send again. That drop
+        // never heals: an offer built on a quiet cluster carries `commit_op ==
+        // snapshot_seq`, so the install lands `commit_min == commit_max`, and
+        // `maybe_request_metadata_repair`, the only path that refills the head,
+        // arms on `commit_min < commit_max`. With the other backup down the primary
+        // needs this replica's ack to commit anything, so the plane stops on a
+        // cluster still inside its quorum.
+        //
+        // The journal is the only frontier that answers "what can be appended
+        // next", which is what this check is for, and the hash-chain verification
+        // below is stated against it too. A prepare at or below the head that this
+        // replica already holds was re-acked and returned above. What reaches HERE
+        // is the next op or a gap, and not every gap is fillable: metadata repair
+        // covers only `commit_min + 1 ..= commit_max`, so an interior hole below
+        // the head and a forward gap above `commit_max` both sit outside it.
         let is_backup = consensus.is_follower();
         if is_backup {
-            if header.op != current_op + 1 {
+            let handle = journal.handle();
+            let journal_head = handle.last_op().unwrap_or(0).max(handle.snapshot_op());
+            if header.op != journal_head + 1 {
                 warn!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),
                     op = header.op,
-                    expected = current_op + 1,
+                    expected = journal_head + 1,
+                    sequencer_op = current_op,
                     "on_replicate: dropping out-of-order prepare (gap)"
                 );
                 return;
@@ -2740,9 +2778,11 @@ where
                 // Logout unregisters the VSR client session on every replica.
                 let reply = build_reply_message(&prepare_header, &bytes::Bytes::new());
                 if self.client_table_mutation_allowed(prepare_header.op) {
-                    self.client_table
-                        .borrow_mut()
-                        .remove_client(prepare_header.client);
+                    self.client_table.borrow_mut().remove_client(
+                        prepare_header.client,
+                        prepare_header.user_id,
+                        SessionEnd::from_logout_request(prepare_header.request),
+                    );
                 }
                 // Drop the disconnected client from every consumer group it
                 // joined and rebalance. Deterministic side-effect of the
@@ -2777,10 +2817,11 @@ where
                 // or below the state-transfer frontier are already reflected
                 // in the transferred table and are skipped.
                 if self.client_table_mutation_allowed(prepare_header.op) {
-                    let outcome = self
-                        .client_table
-                        .borrow_mut()
-                        .commit_reply(prepare_header.client, reply.clone());
+                    let outcome = self.client_table.borrow_mut().commit_reply(
+                        prepare_header.client,
+                        prepare_header.user_id,
+                        reply.clone(),
+                    );
                     log_commit_reply_outcome(outcome, prepare_header.client, prepare_header.op);
                 }
                 reply
@@ -3265,6 +3306,22 @@ where
         // (see `resolve_acting_user_id`); server-originated internal ops
         // (`CompleteConsumerGroupRevocation`, the PAT-cleaner delete) build their
         // prepare directly, bypassing this path, and keep `user_id` 0 (gate skips).
+        // A Logout is not gated, so it gets no acting user above, yet its apply
+        // removes a dedup fence keyed by user. Resolve the owner of the session
+        // it ends here, on the primary, from the live entry or its fence, so
+        // every replica drops the same fence; an unmatched session stamps 0
+        // and the apply leaves the fences alone.
+        if operation == Operation::Logout {
+            let request_header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
+                &mut message.as_mut_slice()[..size_of::<RoutedRequestHeader>()],
+            )
+            .expect("a routed request header was validated on receipt");
+            request_header.user_id = self
+                .client_table
+                .borrow()
+                .user_id_for_session(client_id, request_header.session)
+                .unwrap_or(0);
+        }
         if let Some(acting_user_id) =
             resolve_acting_user_id(operation, client_id, &self.client_table)?
         {
@@ -3368,6 +3425,11 @@ where
                     request,
                     derived_options,
                     partitions,
+                    // Minted once here, on the admitting primary, and sealed by
+                    // `checksum_body`: the header's `view` is restamped on a
+                    // post-view-change retransmit, so a body-carried copy is the
+                    // only per-op view every replica commits identically.
+                    created_view: consensus.view(),
                 }
                 .to_bytes();
                 Ok(build_prepare_message(
@@ -3401,6 +3463,8 @@ where
                 let body = PersistedCreatePartitionsRequest {
                     request,
                     partitions,
+                    // Same body-carried view as `PersistedCreateTopicRequest`.
+                    created_view: consensus.view(),
                 }
                 .to_bytes();
                 Ok(build_prepare_message(
@@ -3918,6 +3982,12 @@ fn log_commit_reply_outcome(outcome: CommitReply, client_id: u128, op: u64) {
             "commit_reply: committed op is older than the cached entry \
              (replica-local eviction replayed out of order); cache skipped"
         ),
+        CommitReply::AdvancedFence => tracing::trace!(
+            target: "iggy.metadata.diag",
+            client_id,
+            op,
+            "commit_reply: client evicted while being prepared; reply shipped, fence advanced"
+        ),
     }
 }
 
@@ -4017,6 +4087,7 @@ mod tests {
         // `crate::stm::stream::tests::populated_streams_snapshot_reencode_is_byte_stable`.
         let mut snapshot = IggySnapshot::new(7);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            fences: vec![],
             slots: vec![
                 (
                     0,
@@ -4068,6 +4139,7 @@ mod tests {
         const REPLY_LEN: usize = 512;
         let mut snapshot = IggySnapshot::new(1);
         snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+            fences: vec![],
             slots: vec![(
                 0,
                 consensus::ClientEntrySnapshot {
@@ -4536,7 +4608,7 @@ mod tests {
         let pat_success = committed_reply(CLIENT, 1, Operation::CreatePersonalAccessToken, 0);
         md.client_table
             .borrow_mut()
-            .commit_reply(CLIENT, pat_success);
+            .commit_reply(CLIENT, USER, pat_success);
 
         // Replaying request 1 as a PAT create must NOT return the cached
         // success; it must refuse with the name-taken code.
@@ -4562,7 +4634,7 @@ mod tests {
         );
         md.client_table
             .borrow_mut()
-            .commit_reply(CLIENT, pat_rejection);
+            .commit_reply(CLIENT, USER, pat_rejection);
         let reply = md
             .submit_request_in_process(pat_create_request(CLIENT, 2))
             .await
@@ -4801,6 +4873,201 @@ mod tests {
         assert!(
             is_caught_up_primary(consensus),
             "gate must reopen once the prefix is fully applied"
+        );
+    }
+
+    /// A backup admits the prepare its JOURNAL needs next, even when its
+    /// sequencer has run ahead of the journal.
+    ///
+    /// The two frontiers legitimately disagree: `on_start_view` sets the sequencer
+    /// to the view's announced head, deliberately ahead of what this replica
+    /// holds, because the bodies arrive afterwards by retransmit or repair. Gating
+    /// admission on the sequencer therefore rejected exactly the prepare that
+    /// would heal the log: a backup with journal head 44 refusing op 45 because
+    /// its adopted head said to expect 46. The primary retransmits that op
+    /// forever, every backup logs an out-of-order gap, it never reaches a commit
+    /// quorum, and its client is never answered. Systematic for any rejoining
+    /// replica, so the deterministic simulator wedged on every metadata workload
+    /// under crash/restart injection until this was gated on the journal.
+    #[compio::test]
+    async fn backup_admits_the_prepare_its_journal_needs_despite_a_leading_sequencer() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// Stands in for a head adopted from a `StartView` whose bodies have not
+        /// arrived, so it sits well above the empty journal.
+        const ADOPTED_HEAD: u64 = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0, so `primary_index(0) == 0` makes this a backup
+        // and `on_replicate` takes the gap-check branch.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        assert!(
+            consensus.is_follower(),
+            "replica 1 of 3 at view 0 must be a backup for this to exercise the gap check"
+        );
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        // Minted while the sequencer is still at 0, so it carries op 1: exactly
+        // what the empty journal needs next.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        assert_eq!(prepare.header().op, 1, "the first prepare must be op 1");
+
+        // Now run the sequencer ahead, as adopting a started view does.
+        consensus.sequencer().set_sequence(ADOPTED_HEAD);
+        let journal = md.journal.as_ref().unwrap();
+        assert_eq!(
+            journal.last_op(),
+            None,
+            "the journal must still be empty, else the divergence under test is absent"
+        );
+
+        md.on_replicate(prepare).await;
+
+        assert!(
+            journal.header(1).is_some(),
+            "backup dropped the prepare its journal needed next because its sequencer \
+             was ahead; the primary's retransmit of this op can never be accepted, so \
+             the op never commits and its client never gets a reply"
+        );
+    }
+
+    /// A state-transfer receiver admits the first live prepare above the floor it
+    /// installed, instead of waiting for an op the snapshot already contains.
+    ///
+    /// `install_state_transfer` moves the snapshot floor, the commit floor, the
+    /// sequencer and `commit_max`, and leaves the WAL head where it was: the
+    /// snapshot IS every op below the floor, so there is nothing left to append
+    /// for them. A gap check reading `last_op` alone therefore has the receiver
+    /// ask for `last_op + 1`, an op inside the snapshot that no peer will send
+    /// again, and it drops every live prepare forever.
+    ///
+    /// Nothing recovers it. An offer built on a quiet cluster carries `commit_op
+    /// == snapshot_seq`, so the install lands `commit_min == commit_max` and
+    /// `maybe_request_metadata_repair`, gated on `commit_min < commit_max`, never
+    /// arms; repair is the only path that could refill the head. With the
+    /// other backup down the primary needs this replica's ack to commit at all,
+    /// so a 3-node cluster still inside its quorum stops serving metadata.
+    #[compio::test]
+    async fn state_transfer_receiver_admits_the_first_prepare_above_the_installed_floor() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// The `snapshot_seq` of a transferred offer, far above anything this
+        /// replica's own WAL holds.
+        const INSTALLED_FLOOR: u64 = 400;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0, so `primary_index(0) == 0` makes this a backup
+        // and `on_replicate` takes the gap-check branch.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        assert!(
+            consensus.is_follower(),
+            "replica 1 of 3 at view 0 must be a backup for this to exercise the gap check"
+        );
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        // Give the WAL a head far below the floor about to be installed, which is
+        // what a replica that fell behind its peers' retention actually carries.
+        let first = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        md.on_replicate(first).await;
+        let journal = md.journal.as_ref().unwrap();
+        assert_eq!(
+            journal.last_op(),
+            Some(1),
+            "the WAL head must sit below the installed floor, else the divergence \
+             under test is absent"
+        );
+
+        // Exactly the frontiers `install_state_transfer` leaves for a quiet-cluster
+        // offer, where the manifest's `commit_op` equals its `snapshot_seq`.
+        journal.set_snapshot_op(INSTALLED_FLOOR);
+        consensus.set_commit_floor(INSTALLED_FLOOR);
+        consensus.sequencer().set_sequence(INSTALLED_FLOOR);
+        consensus.advance_commit_max(INSTALLED_FLOOR);
+        assert_eq!(
+            consensus.commit_min(),
+            consensus.commit_max(),
+            "the wedge needs an install with no repair left to arm; diverged \
+             frontiers heal through `maybe_request_metadata_repair`"
+        );
+
+        let next = md
+            .prepare_request(create_stream_request(CLIENT, 2, "s2"))
+            .expect("CreateStream is client-allowed");
+        assert_eq!(
+            next.header().op,
+            INSTALLED_FLOOR + 1,
+            "the primary numbers the next op off the installed floor"
+        );
+
+        md.on_replicate(next).await;
+
+        assert!(
+            journal
+                .header(usize::try_from(INSTALLED_FLOOR + 1).unwrap())
+                .is_some(),
+            "state-transfer receiver dropped the first prepare above its installed \
+             floor; the ops the snapshot already holds are never re-sent, and with \
+             `commit_min == commit_max` no repair arms, so this op never commits"
         );
     }
 

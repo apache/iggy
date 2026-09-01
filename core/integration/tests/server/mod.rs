@@ -39,7 +39,7 @@ mod stats_vsr;
 mod purge_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server suites below.
-mod http_client;
+pub(crate) mod http_client;
 // Raw-HTTP data-plane contract against the server's shard-0 listener.
 mod http_vsr;
 // Raw-HTTP wire-contract residue against the server (status codes + typed error
@@ -50,6 +50,9 @@ mod http_rbac;
 mod http_tls;
 // Binary GetClusterMetadata must serve the real roster from a VSR cluster.
 mod cluster_metadata_vsr;
+// A declared node.advertised_address outranks the bind address a
+// cluster-disabled server would otherwise publish.
+mod cluster_metadata_advertised;
 // A metadata view change must persist the advanced view and recover it from disk
 // across a replica restart.
 mod cluster_view_durability_vsr;

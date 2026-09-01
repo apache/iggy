@@ -69,14 +69,14 @@ async fn main() -> Result<(), IggyError> {
         // - `Next` - start polling from the next message after the last polled message based on the stored consumer offset.
         .polling_strategy(PollingStrategy::last())
         // Sets the polling retry interval in case of server disconnection.
-        .polling_retry_interval(IggyDuration::new_from_secs(1))
+        .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
         // Sets the number of retries and the interval when initializing the consumer if the stream or topic is not found.
         // Might be useful when the stream or topic is created dynamically by the producer.
         // The retry only occurs when configured and is disabled by default.
         // When you want to retry at most 5 times with an interval of 1 second,
         // you set `init_retries` to 5 and `init_interval` to 1 second.
         .init_retries(5)
-        .init_interval(IggyDuration::new_from_secs(1))
+        .init_interval(NonZeroIggyDuration::ONE_SECOND)
         // Optionally, set a custom client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
         // Key must be identical to the one used by the producer; thus ensure secure key exchange i.e. K8s secret etc.
         // Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.

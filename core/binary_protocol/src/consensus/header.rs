@@ -102,6 +102,21 @@ pub fn frame_checksum_bytes(header: &[u8; HEADER_SIZE]) -> u128 {
 /// `aligned_vec::AVec<u8, ConstAlign<16>>` for explicit alignment.
 pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     const COMMAND: Command;
+    /// Whether `checksum` carries the prepare identity, which covers the
+    /// operation byte: an unknown operation on such a frame can be
+    /// authenticated from the raw bytes even though the typed view refuses to
+    /// cast. False wherever `checksum` seals the frame or crosses the client
+    /// boundary.
+    const IDENTITY_CHECKSUMMED: bool = false;
+
+    /// Byte offset of this header's `operation` field, `None` when it carries
+    /// none.
+    ///
+    /// The typed decode reads the raw byte here after a failed checked cast,
+    /// so an operation a newer release added is reported as version skew
+    /// rather than corruption. An offset rather than a getter because the cast
+    /// has already failed by then, so no typed view of the header exists.
+    const OPERATION_OFFSET: Option<usize> = None;
 
     /// Whether a frame carrying `command` may be typed as this header.
     /// Defaults to an exact match; a header that serves several commands
@@ -272,7 +287,9 @@ pub struct RequestHeader {
     /// catch a `request` number reused for a different operation: a retry that
     /// disagrees with the stamp of the cached reply is refused rather than
     /// answered with the wrong reply. Zero means unstamped, which disables the
-    /// comparison; the wire currently sends zero.
+    /// comparison. The Rust SDK stamps the ops the table dedups; partition and
+    /// non-replicated ops, and the other SDKs, leave it zero. The server
+    /// verifies any nonzero stamp before routing.
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
@@ -477,6 +494,7 @@ fn validate_request_fields(
 }
 
 impl ConsensusHeader for RoutedRequestHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const COMMAND: Command = Command::Request;
     /// The client-wire [`RequestHeader`] this is promoted from is unsealed, and the
     /// promotion copies `checksum` verbatim, so there is nothing here to verify.
@@ -511,6 +529,7 @@ impl ConsensusHeader for RoutedRequestHeader {
 }
 
 impl ConsensusHeader for RequestHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const COMMAND: Command = Command::Request;
     const FRAME_SEALED: bool = false;
 
@@ -621,6 +640,7 @@ impl Default for ReplyHeader {
 }
 
 impl ConsensusHeader for ReplyHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const COMMAND: Command = Command::Reply;
     const FRAME_SEALED: bool = false;
 
@@ -971,6 +991,8 @@ impl Default for PrepareHeader {
 }
 
 impl ConsensusHeader for PrepareHeader {
+    const IDENTITY_CHECKSUMMED: bool = true;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const COMMAND: Command = Command::Prepare;
     const FRAME_SEALED: bool = false;
 
@@ -1037,6 +1059,23 @@ pub fn frame_body(frame: &[u8], size: u32) -> &[u8] {
     &frame[HEADER_SIZE..end]
 }
 
+/// Byte-level twin of [`PrepareHeader::identity_checksum`].
+///
+/// For a frame whose operation byte does not cast: an unknown discriminant
+/// blocks the typed view, but the identity covers the operation byte, so
+/// recomputing it over the raw bytes authenticates that byte before anything
+/// is claimed about it. Must agree with the typed method byte for byte; a unit
+/// test pins the equality.
+#[must_use]
+pub fn prepare_identity_checksum_bytes(header: &[u8; HEADER_SIZE]) -> u128 {
+    let mut covered = *header;
+    let checksum_at = core::mem::offset_of!(PrepareHeader, checksum);
+    covered[checksum_at..checksum_at + size_of::<u128>()].fill(0);
+    let view_at = core::mem::offset_of!(PrepareHeader, view);
+    covered[view_at..view_at + size_of::<u32>()].fill(0);
+    u128::from(twox_hash::XxHash3_64::oneshot(&covered))
+}
+
 impl PrepareHeader {
     /// Which prepare this is, independent of which view re-sent it.
     ///
@@ -1069,6 +1108,12 @@ impl PrepareHeader {
 pub struct RepairPrepareHeader(pub PrepareHeader);
 
 impl ConsensusHeader for RepairPrepareHeader {
+    // Transparent over `PrepareHeader`, so the operation sits at the same
+    // offset and its checksum field carries the same identity. Without these a
+    // repaired prepare carrying a newer release's operation is classified as a
+    // corrupt header instead of version skew.
+    const IDENTITY_CHECKSUMMED: bool = true;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(PrepareHeader, operation));
     const COMMAND: Command = Command::RepairPrepare;
     const FRAME_SEALED: bool = false;
 
@@ -1178,6 +1223,7 @@ impl Default for PrepareOkHeader {
 }
 
 impl ConsensusHeader for PrepareOkHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const FRAME_SEALED: bool = true;
 
     const COMMAND: Command = Command::PrepareOk;
@@ -2693,6 +2739,32 @@ fn validate_forward_frame(
 
 #[cfg(test)]
 mod tests {
+
+    // The byte-level twin exists for frames whose operation byte does not
+    // cast; if it ever disagrees with the typed method, a genuine
+    // newer-release prepare would be reported as corruption.
+    #[test]
+    fn byte_level_identity_checksum_matches_the_typed_method() {
+        let mut header = PrepareHeader {
+            command: Command::Prepare,
+            view: 42,
+            op: 7,
+            client: 0xCAFE,
+            operation: Operation::CreateStream,
+            size: u32::try_from(HEADER_SIZE).expect("header size fits in u32"),
+            ..Default::default()
+        };
+        header.checksum = header.identity_checksum();
+
+        let bytes: &[u8; HEADER_SIZE] = bytemuck::bytes_of(&header)
+            .try_into()
+            .expect("a consensus header is HEADER_SIZE bytes");
+        assert_eq!(
+            prepare_identity_checksum_bytes(bytes),
+            header.identity_checksum()
+        );
+    }
+    use super::prepare_identity_checksum_bytes;
     use super::{
         Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
         EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader,

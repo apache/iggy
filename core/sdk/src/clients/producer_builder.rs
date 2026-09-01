@@ -20,7 +20,8 @@ use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
+    EncryptorKind, Identifier, IggyExpiry, MaxTopicSize, NonZeroIggyDuration, Partitioner,
+    Partitioning,
 };
 use std::sync::Arc;
 
@@ -47,7 +48,7 @@ pub struct IggyProducerBuilder {
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
     send_retries_count: Option<u32>,
-    send_retries_interval: Option<IggyDuration>,
+    send_retries_interval: Option<NonZeroIggyDuration>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
     partitioning: Option<Partitioning>,
@@ -80,7 +81,7 @@ impl IggyProducerBuilder {
             topic_message_expiry: IggyExpiry::ServerDefault,
             topic_max_size: MaxTopicSize::ServerDefault,
             send_retries_count: Some(3),
-            send_retries_interval: Some(IggyDuration::ONE_SECOND),
+            send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
             mode: SendMode::default(),
         }
     }
@@ -186,7 +187,7 @@ impl IggyProducerBuilder {
     /// Sets the retry policy (maximum number of retries and interval between them) in case of messages sending failure.
     /// The error can be related either to disconnecting from the server or to the server rejecting the messages.
     /// Default is 3 retries with 1 second interval between them.
-    pub fn send_retries(self, retries: Option<u32>, interval: Option<IggyDuration>) -> Self {
+    pub fn send_retries(self, retries: Option<u32>, interval: Option<NonZeroIggyDuration>) -> Self {
         Self {
             send_retries_count: retries,
             send_retries_interval: interval,

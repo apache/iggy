@@ -22,7 +22,6 @@ use crate::context::RuntimeContext;
 use crate::error::RuntimeError;
 use crate::metrics::Metrics;
 use crate::source;
-use crate::state::{StateProvider, StateStorage};
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use iggy::prelude::IggyClient;
@@ -199,7 +198,6 @@ impl SourceManager {
         config: &SourceConfig,
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
-        state_path: &str,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let details = self
@@ -217,10 +215,19 @@ impl SourceManager {
 
         let plugin_id = PLUGIN_ID.fetch_add(1, Ordering::SeqCst);
 
-        let state_storage = source::get_state_storage(state_path, key);
-        let state = match &state_storage {
-            StateStorage::File(file) => file.load().await?,
-        };
+        let state_storage = context.state_factory.storage_for(key)?;
+        let state = state_storage
+            .load()
+            .await
+            .map_err(|load_error| match load_error {
+                iggy_connector_sdk::Error::TransientState(_)
+                | iggy_connector_sdk::Error::PermanentState(_)
+                | iggy_connector_sdk::Error::StateLatched => RuntimeError::StateLoadFailed {
+                    connector_key: key.to_string(),
+                    source: load_error,
+                },
+                other => RuntimeError::ConnectorSdkError(other),
+            })?;
 
         source::init_source(
             &container,
@@ -268,7 +275,6 @@ impl SourceManager {
         config_provider: &dyn ConnectorsConfigProvider,
         iggy_client: &IggyClient,
         metrics: &Arc<Metrics>,
-        state_path: &str,
         context: &Arc<RuntimeContext>,
     ) -> Result<(), RuntimeError> {
         let guard = {
@@ -294,7 +300,7 @@ impl SourceManager {
             .map_err(|e| RuntimeError::InvalidConfiguration(e.to_string()))?
             .ok_or_else(|| RuntimeError::SourceNotFound(key.to_string()))?;
 
-        self.start_connector(key, &config, iggy_client, metrics, state_path, context)
+        self.start_connector(key, &config, iggy_client, metrics, context)
             .await?;
         info!("Source connector: {key} restarted successfully.");
         Ok(())

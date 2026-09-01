@@ -23,9 +23,9 @@
 //! `NonReplicatedResponse` dispatch shim and the partition-namespace
 //! resolvers.
 
-use crate::bootstrap::{ShellBus, ShellShard};
 use crate::cluster_meta::ClusterRoster;
 use crate::session_manager::SessionManager;
+use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
 use bytes::{Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
@@ -106,7 +106,7 @@ use system_stats::SystemProbe;
 /// (`user_id`, transport kind, peer address) comes from the per-shard
 /// [`SessionManager`]; the `consumer_groups` list is read from the
 /// (replicated) consumer-group STM by the connection's bound VSR client id.
-pub(crate) fn build_get_personal_access_tokens_response<B, MJ, S, SB>(
+pub fn build_get_personal_access_tokens_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
@@ -143,7 +143,7 @@ where
     })
 }
 
-pub(crate) fn build_get_me_response<B, MJ, S, SB>(
+pub fn build_get_me_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
@@ -218,7 +218,7 @@ where
 /// `consumer_groups_count` is resolved from the connection's bound VSR client
 /// id against the replicated `Streams` STM (memberships are keyed by VSR id, not
 /// transport id). Connections that never bound (pre-register) count 0.
-pub(crate) fn connected_client_to_response<B, MJ, S, SB>(
+pub fn connected_client_to_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     info: &ConnectedClientInfo,
 ) -> ClientResponse
@@ -326,7 +326,7 @@ where
     resolve_partition_namespace(shard, stream_id, topic_id, partition_id)
 }
 
-pub(crate) fn resolve_partition_request_namespace<B, MJ, S, SB>(
+pub fn resolve_partition_request_namespace<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     operation: Operation,
     body: &[u8],
@@ -431,7 +431,7 @@ where
     )
 }
 
-pub(crate) fn resolve_partition_namespace<B, MJ, S, SB>(
+pub fn resolve_partition_namespace<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
@@ -494,7 +494,7 @@ fn wire_identifier_for_display(id: &WireIdentifier) -> Identifier {
 /// connected-client total, used only by the stats read: it comes from the async
 /// `ListClients` scatter-gather, which this sync builder cannot run, so both
 /// transport callers gather it up front (0 for every other opcode).
-pub(crate) fn build_non_replicated_response<B, MJ, S, SB>(
+pub fn build_non_replicated_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
     body: &[u8],
@@ -682,7 +682,7 @@ where
             (!(consensus.has_ceded_primaryship() && primary_index == consensus.replica()))
                 .then_some(primary_index)
         })
-        .or_else(|| roster.current_primary_index());
+        .or_else(|| roster.current_primary_replica_id());
     let metadata = roster.cluster_metadata(primary_index, client_ip);
     ClusterMetadataResponse {
         name: metadata.name,
@@ -886,7 +886,7 @@ static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Capture the configured data directory for `GetStats` disk reporting.
 /// Idempotent: only the first call (process bootstrap) takes effect.
-pub(crate) fn init_stats_data_path(path: PathBuf) {
+pub fn init_stats_data_path(path: PathBuf) {
     let _ = STATS_DATA_PATH.set(path);
 }
 
@@ -1279,7 +1279,7 @@ fn topic_not_found(stream_id: &WireIdentifier, topic_id: &WireIdentifier) -> Igg
     )
 }
 
-pub(crate) fn resolve_stream_id(
+pub fn resolve_stream_id(
     streams: &metadata::stm::stream::StreamsInner,
     identifier: &WireIdentifier,
 ) -> Option<usize> {
@@ -1292,7 +1292,7 @@ pub(crate) fn resolve_stream_id(
     }
 }
 
-pub(crate) fn resolve_topic_id(
+pub fn resolve_topic_id(
     streams: &metadata::stm::stream::StreamsInner,
     stream_id: usize,
     identifier: &WireIdentifier,
@@ -1409,7 +1409,7 @@ fn partition_response(
     })
 }
 
-pub(crate) enum NonReplicatedResponse {
+pub enum NonReplicatedResponse {
     Empty,
     Bytes(Bytes),
 }
@@ -1431,7 +1431,7 @@ impl NonReplicatedResponse {
     }
 }
 
-pub(crate) fn build_empty_reply(
+pub fn build_empty_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1447,7 +1447,7 @@ pub(crate) fn build_empty_reply(
 /// body, nonzero status); op carries the builder's session argument like every
 /// reply, and only the partition primary's pre-pipeline deny pins it to 0,
 /// stamped through `consensus::build_deny_reply_from_request`.
-pub(crate) fn build_deny_reply(
+pub fn build_deny_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1504,7 +1504,7 @@ fn build_result_framed_reply(
     )
 }
 
-pub(crate) fn build_login_register_reply(
+pub fn build_login_register_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1523,7 +1523,7 @@ pub(crate) fn build_login_register_reply(
     build_result_framed_reply(request_header, client_id, session, commit, &payload)
 }
 
-pub(crate) fn build_reply_from_bytes(
+pub fn build_reply_from_bytes(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1546,7 +1546,7 @@ pub(crate) fn build_reply_from_bytes(
 /// reusing the confirmed commit position from the committed reply. Otherwise
 /// (no token, a committed business rejection, or an eviction frame) the
 /// committed reply passes through unchanged.
-pub(crate) fn build_raw_pat_reply(
+pub fn build_raw_pat_reply(
     request_header: &RoutedRequestHeader,
     committed: Message<GenericHeader>,
     raw_token: Option<String>,
@@ -1600,7 +1600,7 @@ pub(crate) fn build_raw_pat_reply(
     Ok(reply.into_generic())
 }
 
-pub(crate) fn build_reply_with_body(
+pub fn build_reply_with_body(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1636,7 +1636,7 @@ pub(crate) fn build_reply_with_body(
     reply
 }
 
-pub(crate) fn current_metadata_commit<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> u64
+pub fn current_metadata_commit<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> u64
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1663,7 +1663,7 @@ where
 /// decrypt point, so encrypted records are rebuilt over the plaintext.
 ///
 /// Body layout: `[partition_id:4][current_offset:8][count:4][batch records...]`.
-pub(crate) fn build_polled_messages_body(
+pub fn build_polled_messages_body(
     partition_id: u32,
     current_offset: u64,
     fragments: PollFragments,
@@ -1715,7 +1715,7 @@ pub(crate) fn build_polled_messages_body(
 
 /// Build the `ConsumerOffsetResponse` reply body:
 /// `[partition_id:4][current_offset:8][stored_offset:8]`.
-pub(crate) fn build_consumer_offset_body(
+pub fn build_consumer_offset_body(
     partition_id: u32,
     current_offset: u64,
     stored_offset: u64,
@@ -1869,7 +1869,7 @@ mod tests {
         use metadata::stm::stream::{Partition, StreamsInner};
 
         let streams = StreamsInner::new();
-        let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0);
+        let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0, 0);
 
         // Registry miss: the owning shard has not started building.
         let predicted = partition_response(&streams, 0, 0, &partition).expect("response builds");
@@ -1914,8 +1914,8 @@ mod tests {
             options: iggy_common::ResourceOptions::default(),
             stats: topic_stats.clone(),
             partitions: vec![
-                Partition::new(0, 1, created_at, 0),
-                Partition::new(1, 1, created_at, 0),
+                Partition::new(0, 1, created_at, 0, 0),
+                Partition::new(1, 1, created_at, 0, 0),
             ],
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: ahash::AHashMap::default(),

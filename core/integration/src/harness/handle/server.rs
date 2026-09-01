@@ -187,35 +187,46 @@ impl ServerHandle {
         self.stdout_occurrences(marker) > 0
     }
 
-    /// Number of times `marker` appears in this node's stdout log. The log
-    /// file is TRUNCATED on every (re)start (it captures one process run),
-    /// so counts never carry across a restart; a marker seen after
-    /// `restart_server` was logged by the new process.
+    /// Number of times `marker` appears in this node's captured stdout, or in
+    /// its own logs when verbose mode makes the child inherit stdout. Captured
+    /// stdout is truncated on restart. The server log may span restarts, so
+    /// restart-sensitive callers must compare against a pre-restart baseline.
     ///
     /// ANSI escape sequences are stripped before matching: the server colors
     /// its tracing fields, so a `key=value` marker never matches the raw
     /// bytes (`key\x1b[0m\x1b[2m=\x1b[0m value`).
     #[must_use]
     pub fn stdout_occurrences(&self, marker: &str) -> usize {
-        self.stdout_path
-            .as_ref()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .map_or(0, |log| strip_ansi(&log).matches(marker).count())
+        self.stdout_plain().matches(marker).count()
     }
 
-    /// This node's stdout log with ANSI escapes stripped, the same text
-    /// [`Self::stdout_occurrences`] matches against. Empty when the log is
-    /// missing or unreadable.
+    /// This node's captured stdout with ANSI escapes stripped, or its own logs
+    /// when verbose mode disables the capture. Empty when neither source is
+    /// readable.
     ///
     /// For callers that need to PARSE a marker's fields (`checkpoint_op=193`
     /// reaches the file as `checkpoint_op\x1b[0m\x1b[2m=\x1b[0m193`) rather
     /// than just count occurrences of it.
     #[must_use]
     pub fn stdout_plain(&self) -> String {
-        self.stdout_path
+        let captured = self
+            .stdout_path
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok())
-            .map_or_else(String::new, |log| strip_ansi(&log))
+            .map(|log| strip_ansi(&log));
+        captured.unwrap_or_else(|| {
+            let own_logs = self.data_path().join("logs");
+            let Ok(entries) = fs::read_dir(own_logs) else {
+                return String::new();
+            };
+            let mut log = String::new();
+            for entry in entries.flatten() {
+                if let Ok(contents) = fs::read_to_string(entry.path()) {
+                    log.push_str(&contents);
+                }
+            }
+            log
+        })
     }
 
     /// Returns a `ClientBuilder` using the test transport.
@@ -881,6 +892,18 @@ impl TestBinary for ServerHandle {
             && std::env::var("IGGY_SHARD_RUNTIME_CAPACITY").is_err()
         {
             command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
+        }
+        // An explicit config-level override must be the test's logging
+        // contract. The server gives `RUST_LOG` precedence, so inheriting an
+        // ambient value could silently filter out markers the test asserts.
+        // A caller that explicitly puts `RUST_LOG` in `extra_envs` adds it back
+        // through `command.envs` below.
+        if self
+            .config
+            .extra_envs
+            .contains_key("IGGY_SYSTEM_LOGGING_LEVEL")
+        {
+            command.env_remove("RUST_LOG");
         }
         command.envs(&self.envs);
 

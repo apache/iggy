@@ -288,7 +288,7 @@ For configuration options and detailed help:
 You can also use environment variables to override any configuration setting:
 
 - Override TCP address
-   `IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server`
+   `IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server`
 
 - Set custom data path
    `IGGY_SYSTEM_PATH=/data/iggy cargo run --bin iggy-server`
@@ -391,7 +391,7 @@ producer.send(messages).await?;
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
     .auto_commit(AutoCommit::IntervalOrWhen(
-        IggyDuration::from_str("1s")?,
+        NonZeroIggyDuration::from_str("1s")?,
         AutoCommitWhen::ConsumingAllMessages,
     ))
     .create_consumer_group_if_not_exists()

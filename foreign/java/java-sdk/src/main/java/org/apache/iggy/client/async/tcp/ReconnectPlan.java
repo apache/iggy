@@ -19,31 +19,16 @@
 
 package org.apache.iggy.client.async.tcp;
 
-import org.apache.iggy.client.ConnectionInfo;
 import org.apache.iggy.config.RetryPolicy;
 
 import java.time.Duration;
 
 /**
- * Pure redial planning: which address to dial on a given reconnect attempt
- * and how long to wait before it.
+ * Pure redial planning: how long to wait before a given reconnect rotation.
  */
 final class ReconnectPlan {
 
     private ReconnectPlan() {}
-
-    /**
-     * Alternates reconnect dials between the current endpoint and the
-     * configured seed. After a leader redirect the current endpoint may die
-     * with the leader, and the seed is the way back to the rest of the
-     * cluster. Attempts are 1-based; odd attempts dial the current endpoint.
-     */
-    static ConnectionInfo target(ConnectionInfo current, ConnectionInfo seed, int attempt) {
-        if (current.equals(seed)) {
-            return current;
-        }
-        return attempt % 2 == 1 ? current : seed;
-    }
 
     /**
      * The delay before the given 1-based attempt: the policy's initial delay
