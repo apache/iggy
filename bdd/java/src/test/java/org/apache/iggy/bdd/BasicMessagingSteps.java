@@ -54,7 +54,7 @@ public class BasicMessagingSteps {
 
     @Given("I have a running Iggy server")
     public void runningServer() {
-        context.serverAddr = getenvOrDefault("IGGY_TCP_ADDRESS", "127.0.0.1:8090");
+        context.serverAddr = TestEnvironment.serverAddress();
         HostPort hostPort = HostPort.parse(context.serverAddr);
 
         IggyTcpClient client =
@@ -67,9 +67,7 @@ public class BasicMessagingSteps {
 
     @Given("I am authenticated as the root user")
     public void authenticatedRootUser() {
-        String username = getenvOrDefault("IGGY_ROOT_USERNAME", "iggy");
-        String password = getenvOrDefault("IGGY_ROOT_PASSWORD", "iggy");
-        getClient().users().login(username, password);
+        getClient().users().login(TestEnvironment.rootUsername(), TestEnvironment.rootPassword());
     }
 
     @Given("I have no streams in the system")
@@ -299,11 +297,6 @@ public class BasicMessagingSteps {
             throw new IllegalStateException("Iggy client not initialized");
         }
         return context.client;
-    }
-
-    private static String getenvOrDefault(String key, String defaultValue) {
-        String value = System.getenv(key);
-        return value == null || value.isBlank() ? defaultValue : value;
     }
 
     private static final class HostPort {

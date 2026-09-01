@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionStringOptions, IggyDuration, IggyError};
+use crate::{ConnectionStringOptions, IggyError, NonZeroIggyDuration};
 use std::str::FromStr;
 
 #[derive(Debug)]
 pub struct HttpConnectionStringOptions {
-    heartbeat_interval: IggyDuration,
+    heartbeat_interval: NonZeroIggyDuration,
     retries: u32,
 }
 
@@ -29,7 +29,7 @@ impl ConnectionStringOptions for HttpConnectionStringOptions {
         Some(self.retries)
     }
 
-    fn heartbeat_interval(&self) -> IggyDuration {
+    fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
 
@@ -58,7 +58,7 @@ impl ConnectionStringOptions for HttpConnectionStringOptions {
             }
         }
 
-        let heartbeat_interval = IggyDuration::from_str(heartbeat_interval.as_str())
+        let heartbeat_interval = NonZeroIggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
 
         let connection_string_options =
@@ -68,7 +68,7 @@ impl ConnectionStringOptions for HttpConnectionStringOptions {
 }
 
 impl HttpConnectionStringOptions {
-    pub fn new(heartbeat_interval: IggyDuration, retries: u32) -> Self {
+    pub fn new(heartbeat_interval: NonZeroIggyDuration, retries: u32) -> Self {
         Self {
             heartbeat_interval,
             retries,
@@ -79,8 +79,30 @@ impl HttpConnectionStringOptions {
 impl Default for HttpConnectionStringOptions {
     fn default() -> Self {
         Self {
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
             retries: 3,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_parse_a_heartbeat_interval() {
+        let options = HttpConnectionStringOptions::parse_options("heartbeat_interval=10s").unwrap();
+
+        assert_eq!(
+            NonZeroIggyDuration::from_str("10s").unwrap(),
+            options.heartbeat_interval()
+        );
+    }
+
+    #[test]
+    fn should_fail_with_a_zero_heartbeat_interval() {
+        let error = HttpConnectionStringOptions::parse_options("heartbeat_interval=none").err();
+
+        assert!(matches!(error, Some(IggyError::InvalidConnectionString)));
     }
 }

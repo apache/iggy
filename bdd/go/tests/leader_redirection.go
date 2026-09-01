@@ -22,21 +22,17 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/apache/iggy/bdd/go/tests/env"
 	"github.com/apache/iggy/foreign/go/client"
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/cucumber/godog"
 )
-
-const defaultRootUsername = "iggy"
-const defaultRootPassword = "iggy"
 
 type leaderCtxKey struct{}
 type leaderCtx struct {
@@ -90,25 +86,16 @@ func resolveServerAddress(role string, port uint16) string {
 
 	switch {
 	case role == "leader" && port == 8091:
-		if addr, ok := os.LookupEnv("IGGY_TCP_ADDRESS_LEADER"); ok {
-			return addr
-		}
-		return "iggy-leader:8091"
+		return env.LeaderAddress()
 
 	case role == "follower" && port == 8092:
-		if addr, ok := os.LookupEnv("IGGY_TCP_ADDRESS_FOLLOWER"); ok {
-			return addr
-		}
-		return "iggy-follower:8092"
+		return env.FollowerAddress()
 
 	case port == 8090:
-		if addr, ok := os.LookupEnv("IGGY_TCP_ADDRESS"); ok {
-			return addr
-		}
-		return "iggy-server:8090"
+		return env.ServerAddress()
 
 	default:
-		return "iggy-server:" + strconv.Itoa(int(port))
+		panic(fmt.Sprintf("no address mapping for role %q on port %d", role, port))
 	}
 }
 
@@ -323,12 +310,13 @@ func (s leaderSteps) whenAuthenticateRoot(ctx context.Context) error {
 		names = []string{"main"}
 	}
 
+	username, password := env.RootCredentials()
 	for _, name := range names {
 		cli, ok := c.Clients[name]
 		if !ok {
 			return fmt.Errorf("client %s should be created", name)
 		}
-		if _, err := cli.LoginUser(ctx, defaultRootUsername, defaultRootPassword); err != nil {
+		if _, err := cli.LoginUser(ctx, username, password); err != nil {
 			return err
 		}
 		// Small delay between multiple authentications to avoid race conditions

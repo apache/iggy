@@ -29,6 +29,7 @@ use super::cluster::{
 };
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
+use super::node::NodeConfig;
 use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
 use super::server::ServerConfig;
@@ -52,6 +53,7 @@ impl Default for ServerConfig {
             consumer_group: ConsumerGroupConfig::default(),
             data_maintenance: DataMaintenanceConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            node: NodeConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
             system: Arc::new(ServerSystemConfig::default()),
             quic: QuicConfig::default(),

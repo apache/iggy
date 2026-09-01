@@ -33,7 +33,6 @@ use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
 use tracing::warn;
 
-use crate::bootstrap::ServerShard;
 use crate::dispatch::{
     PartitionReplyMode, dispatch_partition_request, resolve_delete_segments_truncate,
     submit_client_request_on_owner, submit_logout_on_owner,
@@ -47,6 +46,7 @@ use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
 use crate::http::wire::build_request_message;
 use crate::pat::rewrite_pat_request_for_user;
+use crate::shell::ServerShard;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 

@@ -28,20 +28,19 @@ use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
-// TODO(vsr): transparent retry-after-disconnect can weaken at-most-once semantics
-// for replicated writes. The transports currently disconnect, reconnect, and encode
-// the retry from the current ConsensusSession. If disconnect created a fresh VSR
-// client/session, the retried request gets a new (client_id, request_id) tuple, so
-// server-side deduplication cannot match a mutation that may already have committed
-// before the transport failure.
+// A reconnect creates a fresh VSR client and session. A replicated request
+// retried there gets a new (client_id, request_id) tuple, so server-side
+// deduplication cannot match a mutation that may already have committed before
+// the transport failure. `replay_after_session_reset_is_safe` therefore keeps
+// ambiguous replicated outcomes with the caller instead of replaying them.
 //
-// The fix is to keep the ConsensusSession's client_id and request counter across
-// reconnects and retry replicated writes under the same (client_id, request_id)
-// instead of re-registering fresh. Resume happens through the LOGIN path: the
+// A future transparent replay path can keep the ConsensusSession's client id
+// and request counter across reconnects and retry under the same identity.
+// Resume would happen through the LOGIN path: the
 // reconnecting client re-authenticates presenting its previous client_id, the
 // server verifies the authenticated user owns that entry, and the rebind commits
 // a Register that adopts the entry with its watermark and reply ring intact. Note
-// the epoch changes -- the rebind moves the fence to the new register's op -- so
+// the epoch changes because the rebind moves the fence to the new register's op, so
 // the session field must be taken from the new login reply, not carried over.
 //
 // There is deliberately no credential-free rebind: presenting (client, session)
@@ -95,23 +94,23 @@ pub(crate) fn encode_request_header(
                     session.current_request_id(),
                     session.session().unwrap_or(0),
                 )
-            } else if operation.is_partition() {
-                // Consumes an id even though no partition-plane dedup exists
-                // yet: dedup needs each send to carry a distinct number, and
-                // the metadata watermark tolerates the resulting gaps
-                // (`client_table.rs`: "There is no `RequestGap`").
-                let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
-                (operation, session.next_request_id(), session_id)
             } else {
+                // Partition ops consume an id too, even though nothing dedups
+                // them yet: dedup needs each send to carry a distinct number,
+                // and the metadata watermark tolerates the resulting gaps
+                // (`client_table.rs`: "There is no `RequestGap`").
                 let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
                 (operation, session.next_request_id(), session_id)
             }
         }
     };
-    // Every replicated op stamps: the stamp is what lets a dedup layer tell a
-    // genuine retry from a request id reused for different bytes.
-    // NonReplicated ops bypass dedup, so the hash pass buys nothing there.
-    let request_checksum = if operation == Operation::NonReplicated {
+    // Stamped only for the ops the server's `ClientTable` dedups, and only by this
+    // SDK: the others leave the field zero, which the server reads as unstamped.
+    // Partition ops are the large payloads and already carry `batch_checksum` over
+    // the same bytes, and nothing dedups them, so hashing here would only buy the
+    // server a second full-payload pass in `verify_request_checksum`. NonReplicated
+    // ops bypass dedup too.
+    let request_checksum = if operation.is_partition() || operation == Operation::NonReplicated {
         0
     } else {
         u128::from(calculate_checksum(payload))
@@ -155,12 +154,28 @@ pub(crate) fn encode_request_header(
 /// the authority: an unmapped code is forwarded as non-replicated (the code
 /// rides `RequestHeader.reserved`, which that path already stamps) and the
 /// server answers with a proper error if it does not know it.
-fn operation_for_code(code: u32) -> Operation {
+pub(crate) fn operation_for_code(code: u32) -> Operation {
     if code == LOGOUT_USER_CODE {
         return Operation::Logout;
     }
 
     Operation::from_command_code(code).unwrap_or(Operation::NonReplicated)
+}
+
+/// Whether replaying `code` after reconnecting with a new session cannot
+/// apply it twice.
+pub(crate) fn replay_after_session_reset_is_safe(code: u32, error: &IggyError) -> bool {
+    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
+        || matches!(
+            error,
+            IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::Unauthenticated
+        )
+        || matches!(
+            operation_for_code(code),
+            Operation::NonReplicated | Operation::Logout
+        )
 }
 
 pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {
@@ -485,27 +500,29 @@ mod tests {
     }
 
     #[test]
-    fn request_checksum_is_stamped_for_replicated_operations() {
+    fn request_checksum_is_stamped_only_for_deduped_operations() {
         // The stamp exists to stop a reused `request` number matching a dedup
-        // entry recorded for different bytes, so every replicated op carries
-        // it; NonReplicated ops bypass dedup and skip the hashing pass.
+        // entry recorded for different bytes, so it is worth its hashing pass only
+        // where `ClientTable` dedups. Partition ops are the large payloads and
+        // already carry `batch_checksum` over the same bytes; NonReplicated ops
+        // bypass dedup. Neither stamps.
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
         let payload = Bytes::from_static(b"payload");
 
         let metadata =
             encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        // Hashed against the framed body rather than the `payload` the encoder was
+        // handed, so a slice mistake between what is stamped and what is sent fails
+        // here instead of reaching the server's `verify_request_checksum`.
         assert_eq!(
             decode_request_header(&metadata).request_checksum,
-            u128::from(calculate_checksum(&payload)),
+            u128::from(calculate_checksum(&metadata[HEADER_SIZE..])),
         );
 
         let partition =
             encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload).unwrap();
-        assert_eq!(
-            decode_request_header(&partition).request_checksum,
-            u128::from(calculate_checksum(&payload)),
-        );
+        assert_eq!(decode_request_header(&partition).request_checksum, 0);
 
         let ping = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
         assert_eq!(decode_request_header(&ping).request_checksum, 0);

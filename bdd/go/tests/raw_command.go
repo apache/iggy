@@ -21,8 +21,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
+	"github.com/apache/iggy/bdd/go/tests/env"
 	"github.com/apache/iggy/foreign/go/client"
 	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -46,11 +46,7 @@ func getRawCommandCtx(ctx context.Context) *rawCommandCtx {
 type rawCommandSteps struct{}
 
 func (rawCommandSteps) givenRunningServer(ctx context.Context) error {
-	address := os.Getenv("IGGY_TCP_ADDRESS")
-	if address == "" {
-		address = "127.0.0.1:8090"
-	}
-	getRawCommandCtx(ctx).serverAddr = address
+	getRawCommandCtx(ctx).serverAddr = env.ServerAddress()
 	return nil
 }
 
@@ -63,7 +59,8 @@ func (rawCommandSteps) givenAuthenticationAsRoot(ctx context.Context) error {
 	if err = iggyClient.Connect(ctx); err != nil {
 		return fmt.Errorf("connect client: %w", err)
 	}
-	if _, err = iggyClient.LoginUser(ctx, "iggy", "iggy"); err != nil {
+	username, password := env.RootCredentials()
+	if _, err = iggyClient.LoginUser(ctx, username, password); err != nil {
 		return fmt.Errorf("authenticate client: %w", err)
 	}
 	state.client = iggyClient

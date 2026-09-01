@@ -104,7 +104,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.11
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: cargo-llvm-cov
 
@@ -195,18 +195,24 @@ jobs:
           fail_ci_if_error: false
 
   csharp-coverage:
-    name: C# coverage baseline
+    name: C# coverage baseline (${{ matrix.framework }})
     needs: detect
     if: needs.detect.outputs.csharp == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [net8.0, net10.0]
     steps:
       - uses: actions/checkout@v7.0.1
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v6.0.0
         with:
-          dotnet-version: "10.0.x"
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -230,13 +236,15 @@ jobs:
         working-directory: foreign/csharp
         run: |
           dotnet restore Iggy_SDK.sln
-          dotnet build Iggy_SDK.sln --no-restore
+          dotnet build Iggy_SDK_Tests --no-restore --framework ${{ matrix.framework }}
+          dotnet build Iggy_SDK.Tests.Integration --no-restore --framework ${{ matrix.framework }}
 
       - name: Run unit tests with coverage
         working-directory: foreign/csharp
         run: |
           dotnet test \
             --project Iggy_SDK_Tests \
+            --framework ${{ matrix.framework }} \
             --no-build \
             --verbosity normal \
             --coverage \
@@ -248,27 +256,25 @@ jobs:
         working-directory: foreign/csharp
         env:
           IGGY_SERVER_DOCKER_IMAGE: ${{ steps.docker_build.outputs.docker_image }}
+          IGGY_TEST_LOGS_DIR: ./reports/container-logs
+          IGGY_TEST_CLUSTER_NODES: "3"
         run: |
           dotnet test \
             --project Iggy_SDK.Tests.Integration \
+            --framework ${{ matrix.framework }} \
             --no-build \
             --verbosity normal \
             --coverage \
             --coverage-output-format cobertura \
             --coverage-output coverage.cobertura.xml \
-            --results-directory ./reports/integration
-
-      - name: Merge coverage reports
-        working-directory: foreign/csharp
-        run: |
-          dotnet tool install --global dotnet-coverage
-          dotnet-coverage merge ./reports/**/*.cobertura.xml -f cobertura -o ./reports/coverage.cobertura.xml
+            --results-directory ./reports/integration \
+            -- --retry-failed-tests 3
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: foreign/csharp/reports/coverage.cobertura.xml
+          files: foreign/csharp/reports/unit/coverage.cobertura.xml,foreign/csharp/reports/integration/coverage.cobertura.xml
           disable_search: true
           flags: csharp
           fail_ci_if_error: false
@@ -293,12 +299,12 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.11
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Install dependencies
         run: |
@@ -510,6 +516,10 @@ jobs:
           go test -v -race -coverprofile=../../reports/go-coverage-unit.out ./...
 
       - name: Run BDD tests with coverage
+        env:
+          IGGY_TCP_ADDRESS: 127.0.0.1:8090
+          IGGY_ROOT_USERNAME: iggy
+          IGGY_ROOT_PASSWORD: iggy
         run: |
           cd bdd/go
           mkdir -p ../../reports

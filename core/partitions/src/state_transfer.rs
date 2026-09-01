@@ -2481,6 +2481,10 @@ where
                 self.log.index_writers_mut()[last] = Some(Rc::new(index_writer));
             }
             self.log.segments_mut()[last].sealed = false;
+            // The active and sealed read-state caches live under different
+            // rules (see `SegmentedLog::reset_read_state`), so the slot cannot
+            // carry its sealed identity into active use.
+            self.log.reset_read_state(last);
         }
 
         // The installed segments supersede every journaled op; stale
@@ -2804,6 +2808,10 @@ where
         minted_next_offset: u64,
         staged_was_empty: bool,
     ) -> Result<(), iggy_common::IggyError> {
+        // The empty plant below can land on a base offset this sweep unlinks,
+        // so an in-flight poll's cached read fd would keep serving the retired
+        // inodes as live data. Same hazard and same fix as `purge`.
+        self.log.invalidate_sealed_read_state();
         while let Some((_, mut storage)) = self.log.retire_front() {
             let _ = storage.shutdown();
         }
