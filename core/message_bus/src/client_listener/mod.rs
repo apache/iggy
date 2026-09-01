@@ -85,11 +85,15 @@
 //! violation). DoS-shaped abuse is bounded instead by handshake-grace
 //! timeouts and the bus-wide [`crate::installer`] backpressure budget.
 
-use crate::{GenericHeader, Message};
-use compio::net::{TcpListener, TcpSocket};
-use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
+
+use compio::net::TcpListener;
+use iggy_common::IggyError;
+use socket2::SockRef;
+
+use crate::socket_opts::bind_reusable_tcp_listener;
+use crate::{GenericHeader, Message};
 
 pub mod quic;
 pub mod tcp;
@@ -100,45 +104,22 @@ pub mod wss;
 /// Bind a TCP listener with `TCP_NODELAY` set, the shared shape used by
 /// the plain-TCP and WS pre-upgrade client listeners.
 ///
-/// compio 0.19 replaced `TcpListener::bind_with_options(addr, SocketOpts)`
-/// with the `TcpSocket` builder; this preserves the prior `nodelay(true)`
-/// bind. `SO_REUSEADDR` is set so a restarted server can rebind the port
-/// while a previous client connection lingers in `TIME_WAIT` (matching the
-/// replica and TLS listeners; QUIC sets no reuse flag since UDP has no
-/// `TIME_WAIT`); `SO_REUSEPORT` is intentionally not set: only shard 0
-/// binds the client listeners (see each caller).
-///
-/// On Linux, compio submits this path's bind and listen as
-/// `IORING_OP_BIND` and `IORING_OP_LISTEN`. Mainline Linux added both in
-/// 6.11. Shard 0 has no blocking fallback pool, so an older kernel without
-/// vendor backports panics during listener startup.
+/// Binding stays synchronous through `bind_reusable_tcp_listener` so shard
+/// startup does not depend on compio's `IORING_OP_BIND` and
+/// `IORING_OP_LISTEN` fallback path. `TCP_NODELAY` remains set on the listener
+/// to preserve the previous plain-TCP and WebSocket bind configuration.
 ///
 /// # Errors
 ///
-/// Returns [`IggyError::CannotBindToSocket`] if the bind/listen fails.
-#[allow(clippy::future_not_send)]
-pub async fn bind_nodelay_listener(
-    addr: SocketAddr,
-) -> Result<(TcpListener, SocketAddr), IggyError> {
-    let socket = match addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4().await,
-        SocketAddr::V6(_) => TcpSocket::new_v6().await,
-    }
-    .map_err(|e| IggyError::IoError(e.to_string()))?;
-    socket
-        .set_nodelay(true)
-        .map_err(|e| IggyError::IoError(e.to_string()))?;
-    socket
-        .set_reuseaddr(true)
-        .map_err(|e| IggyError::IoError(e.to_string()))?;
-    socket
-        .bind(addr)
-        .await
+/// Returns [`IggyError::CannotBindToSocket`] if the bind or listen fails, or
+/// [`IggyError::IoError`] if configuring `TCP_NODELAY` or reading the bound
+/// address fails.
+pub fn bind_nodelay_listener(addr: SocketAddr) -> Result<(TcpListener, SocketAddr), IggyError> {
+    let listener = bind_reusable_tcp_listener(addr)
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
-    let listener = socket
-        .listen(libc::SOMAXCONN)
-        .await
-        .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))?;
+    SockRef::from(&listener)
+        .set_tcp_nodelay(true)
+        .map_err(|e| IggyError::IoError(e.to_string()))?;
     let actual = listener
         .local_addr()
         .map_err(|e| IggyError::IoError(e.to_string()))?;
@@ -152,3 +133,26 @@ pub async fn bind_nodelay_listener(
 /// `RequestHeader` message with the same handler signature, regardless
 /// of whether the wire is plain TCP, TLS, WS, WSS, or QUIC.
 pub type RequestHandler = Rc<dyn Fn(u128, Message<GenericHeader>)>;
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use server_common::executor::create_shard_executor;
+    use socket2::SockRef;
+
+    use super::bind_nodelay_listener;
+
+    #[test]
+    fn given_a_shard_executor_when_binding_a_client_listener_should_preserve_nodelay() {
+        let runtime = create_shard_executor().unwrap();
+        runtime.block_on(async {
+            let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0);
+
+            let (listener, bound_addr) = bind_nodelay_listener(addr).unwrap();
+
+            assert_ne!(bound_addr.port(), 0);
+            assert!(SockRef::from(&listener).tcp_nodelay().unwrap());
+        });
+    }
+}

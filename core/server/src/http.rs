@@ -95,7 +95,7 @@ use crate::server_error::ServerError;
 /// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
 /// credentials cannot be loaded, or the listener cannot bind to `addr`.
 #[allow(clippy::too_many_arguments)]
-pub async fn start(
+pub fn start(
     shard: &Rc<ServerShard>,
     addr: SocketAddr,
     http_config: &HttpConfig,
@@ -104,7 +104,7 @@ pub async fn start(
     cluster: &ClusterConfig,
     system_config: Arc<ServerSystemConfig>,
     self_advertised: &str,
-    self_ports: TransportPorts,
+    self_ports: &TransportPorts,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
@@ -139,7 +139,7 @@ pub async fn start(
     // Same early-fail rule for the scrape path: axum panics on a route
     // without a leading '/', so reject it as a config error instead.
     let metrics_endpoint = metrics::validated_endpoint(&http_config.metrics)?;
-    let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
+    let (listener, bound_addr) = client_listener::tcp::bind(addr)?;
 
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
@@ -156,7 +156,7 @@ pub async fn start(
             // ports arrive resolved from the caller.
             self_ports: TransportPorts {
                 http: Some(bound_addr.port()),
-                ..self_ports
+                ..self_ports.clone()
             },
             // The HTTP listener is shard-0-only, where the live consensus
             // handle supplies the leader; the published-view fallback is

@@ -15,16 +15,12 @@ A Helm chart for Apache Iggy server and web-ui
 
 Iggy server uses `io_uring` for high-performance async I/O. This requires:
 
-1. **Linux io_uring support on the node**
+1. **Linux kernel 5.19 or newer on the node**
 
-   * Mainline Linux 6.11 or newer provides all io_uring features Iggy currently needs during startup.
-   * Shard rings require `IORING_SETUP_COOP_TASKRUN` and `IORING_SETUP_TASKRUN_FLAG` from Linux 5.19.
-   * Listener startup uses `IORING_OP_SOCKET`, `IORING_OP_BIND`, and `IORING_OP_LISTEN`.
-   * Mainline Linux added bind and listen in 6.11. Vendor kernels may backport them to an older release.
-   * If an opcode is missing, compio uses a blocking fallback that Iggy disables on shard threads.
-   * The server then fails during startup. The node kernel matters, not the container image.
-   * Ubuntu 24.04 GA uses Linux 6.8 and lacks the mainline bind and listen opcodes.
-   * On Ubuntu 24.04 GA, install `linux-generic-hwe-24.04` before running Iggy.
+   * Shard rings require `IORING_SETUP_COOP_TASKRUN` and `IORING_SETUP_TASKRUN_FLAG`.
+   * Compio's asynchronous socket creation requires `IORING_OP_SOCKET`.
+   * Mainline Linux provides these features starting in 5.19.
+   * Older kernels fail during shard startup. The node kernel matters, not the container image.
 
 2. **IPC_LOCK capability** - For locking memory required by io_uring
 3. **Unconfined seccomp profile** - To allow io_uring syscalls

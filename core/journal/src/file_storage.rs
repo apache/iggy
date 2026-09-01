@@ -21,6 +21,7 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use std::cell::{Cell, UnsafeCell};
 use std::fs;
 use std::io;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 /// File-backed storage implementing the `Storage` trait.
@@ -60,26 +61,28 @@ impl FileStorage {
 
     /// Truncate the file to `len` bytes and make the new length durable.
     ///
-    /// Synchronous `std::fs` on a separate descriptor, not compio: compio's
-    /// `set_len` submits `IORING_OP_FTRUNCATE`, which landed in mainline Linux
-    /// 6.9. When the opcode is unavailable, the driver falls back to its
-    /// blocking pool, and shard proactors run with `thread_pool_limit(0)`, so
-    /// the fallback panics the shard instead of repairing the WAL. `std::fs`
-    /// needs neither the opcode nor the pool. The sole caller is boot-time
-    /// torn-tail repair, so blocking the shard thread here costs nothing.
+    /// Synchronous `std::fs` on a duplicate of the open descriptor, not compio:
+    /// compio's `set_len` submits `IORING_OP_FTRUNCATE`, which landed in
+    /// mainline Linux 6.9. When the opcode is unavailable, the driver falls
+    /// back to its blocking pool, and shard proactors run with
+    /// `thread_pool_limit(0)`, so the fallback panics the shard instead of
+    /// repairing the WAL. `std::fs` needs neither the opcode nor the pool. The
+    /// sole caller is boot-time torn-tail repair, so blocking the shard thread
+    /// here costs nothing.
     ///
     /// `sync_all` makes the durable-truncation contract explicit and matches
     /// segment recovery. Its additional metadata synchronization is acceptable
     /// because this runs only during boot-time repair.
     ///
     /// # Errors
-    /// Returns an I/O error if the file cannot be opened, truncated, or synced.
-    pub fn truncate(&self, len: u64) -> io::Result<()> {
-        let file = fs::OpenOptions::new().write(true).open(&self.path)?;
+    /// Returns an I/O error if the descriptor cannot be cloned, truncated, or synced.
+    pub(crate) fn truncate(&self, len: u64) -> io::Result<()> {
+        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
+        let file = unsafe { &*self.file.get() };
+        let file = fs::File::from(file.as_fd().try_clone_to_owned()?);
         file.set_len(len)?;
-        file.sync_all()?;
         self.write_offset.set(len);
-        Ok(())
+        file.sync_all()
     }
 
     /// Fsync the file to disk.
@@ -194,12 +197,9 @@ mod tests {
     use server_common::executor::create_shard_executor;
     use tempfile::tempdir;
 
-    /// Torn-tail repair runs on a shard executor, which builds its proactor
-    /// with `thread_pool_limit(0)`. Any truncate that reaches compio's
-    /// blocking pool panics that shard rather than repairing the WAL, which
-    /// is what mainline Linux did before 6.9 while `set_len` was an `io_uring`
-    /// submission. Driving the repair through a real shard executor is the only
-    /// way to keep the no-blocking-pool constraint pinned.
+    /// Pins the synchronous truncate signature and verifies it works inside a
+    /// shard executor with no blocking pool. A modern test kernel supports
+    /// `IORING_OP_FTRUNCATE`, so this does not reproduce compio's fallback.
     #[test]
     fn given_a_shard_executor_with_no_blocking_pool_when_truncating_should_repair_the_file() {
         let runtime = create_shard_executor().unwrap();
@@ -216,26 +216,23 @@ mod tests {
         });
     }
 
-    /// The repair has to survive the crash it is repairing from: a reopen
-    /// that still saw the torn tail would walk and truncate it again on every
-    /// boot, and a reopen that saw a longer file would resurrect the bytes
-    /// recovery just proved dead.
     #[test]
-    fn given_a_truncated_file_when_reopened_should_see_the_shortened_length() {
+    fn given_a_replaced_path_when_truncating_should_truncate_the_open_file() {
         let runtime = create_shard_executor().unwrap();
         runtime.block_on(async {
             let dir = tempdir().unwrap();
             let path = dir.path().join("journal.wal");
-            {
-                let storage = FileStorage::open(&path).await.unwrap();
-                storage.write_append(vec![0xAB_u8; 128]).await.unwrap();
-                storage.fsync().await.unwrap();
-                storage.truncate(64).unwrap();
-            }
+            let renamed_path = dir.path().join("journal.renamed.wal");
+            let storage = FileStorage::open(&path).await.unwrap();
+            storage.write_append(vec![0xAB_u8; 128]).await.unwrap();
+            std::fs::rename(&path, &renamed_path).unwrap();
+            std::fs::write(&path, vec![0xCD_u8; 256]).unwrap();
 
-            let reopened = FileStorage::open(&path).await.unwrap();
+            storage.truncate(64).unwrap();
 
-            assert_eq!(reopened.file_len(), 64);
+            assert_eq!(storage.file_len(), 64);
+            assert_eq!(std::fs::metadata(&renamed_path).unwrap().len(), 64);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
         });
     }
 }

@@ -3319,10 +3319,9 @@ async fn start_tcp_runtime(
             &config.cluster,
             Arc::clone(&config.system),
             &self_advertised,
-            self_ports,
+            &self_ports,
             shard_metrics_all,
-        )
-        .await?;
+        )?;
     }
 
     Ok(())
@@ -3484,7 +3483,7 @@ async fn start_manual_runtime(
         None
     };
 
-    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients).await?;
+    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients)?;
     write_current_config(
         config,
         Some(topology.self_replica_id),
@@ -3849,7 +3848,7 @@ fn mint_client_meta(
     ClientConnMeta::new(coord.mint_shard_zero_client_id(), peer_addr, transport)
 }
 
-async fn start_client_listeners(
+fn start_client_listeners(
     shard: &Rc<ServerShard>,
     config: &ServerConfig,
     topology: &TcpTopology,
@@ -3859,7 +3858,6 @@ async fn start_client_listeners(
 
     if config.tcp.enabled && !config.tcp.tls.enabled {
         let (listener, bound_addr) = client_listener::tcp::bind(topology.client_listen_addr)
-            .await
             .map_err(|source| {
                 error!(
                     addr = %topology.client_listen_addr,
@@ -3878,7 +3876,12 @@ async fn start_client_listeners(
     }
 
     if let Some(ws_addr) = topology.ws_listen_addr {
-        bound.ws = Some(start_websocket_listener(shard, config, ws_addr, accepted_clients).await?);
+        bound.ws = Some(start_websocket_listener(
+            shard,
+            config,
+            ws_addr,
+            accepted_clients,
+        )?);
     }
 
     if let Some(quic_addr) = topology.quic_listen_addr {
@@ -4080,7 +4083,7 @@ fn load_tcp_tls_server_credentials(
 /// `websocket.tls.enabled` (the plain-WS accept loop must not also bind the
 /// port -- a plain upgrade parser fed a TLS `ClientHello` rejects every
 /// connection with an httparse error), plain WS otherwise.
-async fn start_websocket_listener(
+fn start_websocket_listener(
     shard: &Rc<ServerShard>,
     config: &ServerConfig,
     ws_addr: SocketAddr,
@@ -4101,11 +4104,10 @@ async fn start_websocket_listener(
         shard.bus.track_background(wss_handle);
         Ok(bound_addr)
     } else {
-        let (listener, bound_addr) =
-            client_listener::ws::bind(ws_addr).await.map_err(|source| {
-                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
-                source
-            })?;
+        let (listener, bound_addr) = client_listener::ws::bind(ws_addr).map_err(|source| {
+            error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
+            source
+        })?;
         let token = shard.bus.token();
         let accepted_ws = accepted_clients.ws.clone();
         let ws_handle = compio::runtime::spawn(async move {
