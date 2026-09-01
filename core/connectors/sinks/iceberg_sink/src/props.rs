@@ -30,6 +30,9 @@ fn get_props_s3(config: &IcebergSinkConfig) -> Result<HashMap<String, String>, E
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("s3.region".to_string(), config.store_region.clone());
     props.insert("s3.endpoint".to_string(), config.store_url.clone());
+    // iceberg-storage-opendal 0.10 defaults to virtual-host-style addressing,
+    // which breaks MinIO-style endpoints; keep the path-style behavior.
+    props.insert("s3.path-style-access".to_string(), "true".to_string());
     match (&config.store_access_key_id, &config.store_secret_access_key) {
         (Some(access_key_id), Some(secret_access_key)) => {
             props.insert("s3.access-key-id".to_string(), access_key_id.clone());
@@ -73,6 +76,7 @@ mod tests {
         let props = get_props_s3(&config).expect("Should succeed without credentials");
         assert_eq!(props.get("s3.region").unwrap(), "us-east-1");
         assert_eq!(props.get("s3.endpoint").unwrap(), "http://localhost:9000");
+        assert_eq!(props.get("s3.path-style-access").unwrap(), "true");
         assert!(!props.contains_key("s3.access-key-id"));
         assert!(!props.contains_key("s3.secret-access-key"));
     }

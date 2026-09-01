@@ -117,7 +117,7 @@ async fn write_data_files(
     table: &Table,
     messages_schema: Schema,
 ) -> Result<Vec<DataFile>, Error> {
-    let location = DefaultLocationGenerator::new(table.metadata().clone()).map_err(|err| {
+    let location = DefaultLocationGenerator::new(table.metadata()).map_err(|err| {
         error!(
             "Failed to get location on table: {}. Error: {}",
             table.metadata().uuid(),
@@ -340,14 +340,22 @@ pub trait Router: std::fmt::Debug + Sync + Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iceberg::Runtime as IcebergRuntime;
     use iceberg::spec::{
         FormatVersion, Literal, NestedField, PrimitiveLiteral, PrimitiveType,
         Schema as IcebergSchema, SortOrder, TableMetadataBuilder, Transform, Type,
         UnboundPartitionSpec,
     };
     use std::collections::HashMap;
+    use std::sync::OnceLock;
 
     const REGION_FIELD_ID: i32 = 2;
+
+    // Table keeps only tokio handles, so the runtime must outlive every table.
+    fn test_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create runtime"))
+    }
 
     fn in_memory_table(partition_spec: UnboundPartitionSpec) -> Table {
         let schema = IcebergSchema::builder()
@@ -379,6 +387,7 @@ mod tests {
             .identifier(TableIdent::from_strs(["test", "events"]).expect("Failed to build ident"))
             .metadata(metadata)
             .file_io(FileIO::new_with_memory())
+            .runtime(IcebergRuntime::new(test_runtime()))
             .build()
             .expect("Failed to build table")
     }
@@ -390,8 +399,7 @@ mod tests {
     }
 
     fn write(table: &Table, payloads: &[Payload]) -> Vec<DataFile> {
-        tokio::runtime::Runtime::new()
-            .expect("Failed to create runtime")
+        test_runtime()
             .block_on(write_data_files(payloads, table, Schema::Json))
             .expect("Failed to write data files")
     }
@@ -448,13 +456,11 @@ mod tests {
         let data_files = write(&table, &payloads);
         let file_path = data_files[0].file_path().to_string();
 
-        let exists_after_delete = tokio::runtime::Runtime::new()
-            .expect("Failed to create runtime")
-            .block_on(async {
-                assert!(table.file_io().exists(&file_path).await.expect("exists"));
-                delete_uncommitted_files(table.file_io(), &data_files).await;
-                table.file_io().exists(&file_path).await.expect("exists")
-            });
+        let exists_after_delete = test_runtime().block_on(async {
+            assert!(table.file_io().exists(&file_path).await.expect("exists"));
+            delete_uncommitted_files(table.file_io(), &data_files).await;
+            table.file_io().exists(&file_path).await.expect("exists")
+        });
 
         assert!(!exists_after_delete);
     }
