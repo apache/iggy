@@ -73,6 +73,24 @@ public readonly struct Partitioning
     }
 
     /// <summary>
+    ///     Creates a partitioning strategy that use a specific partition id.
+    /// </summary>
+    /// <param name="value">Partition id</param>
+    /// <returns>Partitioning instance</returns>
+    public static Partitioning PartitionId(uint value)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
+
+        return new Partitioning
+        {
+            Kind = Enums.Partitioning.PartitionId,
+            Length = 4,
+            Value = bytes
+        };
+    }
+
+    /// <summary>
     ///     Creates a partitioning strategy that use message key as partitioning value.
     /// </summary>
     /// <param name="value">>Message key as string</param>

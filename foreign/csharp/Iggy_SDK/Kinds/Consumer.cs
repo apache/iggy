@@ -53,6 +53,20 @@ public readonly struct Consumer
     /// </summary>
     /// <param name="id">Identifier value</param>
     /// <returns>Consumer instance</returns>
+    public static Consumer New(uint id)
+    {
+        return new Consumer
+        {
+            ConsumerId = Identifier.Numeric(id),
+            Type = ConsumerType.Consumer
+        };
+    }
+
+    /// <summary>
+    ///     Creates a new regular consumer identifier.
+    /// </summary>
+    /// <param name="id">Identifier value</param>
+    /// <returns>Consumer instance</returns>
     public static Consumer New(string id)
     {
         return new Consumer
@@ -68,6 +82,20 @@ public readonly struct Consumer
     /// <param name="id">Identifier value</param>
     /// <returns>Consumer instance</returns>
     public static Consumer Group(int id)
+    {
+        return new Consumer
+        {
+            ConsumerId = Identifier.Numeric(id),
+            Type = ConsumerType.ConsumerGroup
+        };
+    }
+
+    /// <summary>
+    ///     Creates a new consumer group identifier.
+    /// </summary>
+    /// <param name="id">Identifier value</param>
+    /// <returns>Consumer instance</returns>
+    public static Consumer Group(uint id)
     {
         return new Consumer
         {

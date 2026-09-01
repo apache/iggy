@@ -136,8 +136,6 @@ public partial class IggyConsumer
                 return;
             }
 
-            var partitionId = (uint)rental.PartitionId;
-
             var hasLastOffset = _lastPolledOffset.TryGetValue(rental.PartitionId, out var lastPolledPartitionOffset);
 
             var currentOffset = 0ul;
@@ -155,7 +153,7 @@ public partial class IggyConsumer
                 batchHandle.Acquire();
                 try
                 {
-                    await PublishRentedAsync(batchHandle, message, partitionId, MessageStatus.Success, null, ct);
+                    await PublishRentedAsync(batchHandle, message, rental.PartitionId, MessageStatus.Success, null, ct);
                 }
                 catch
                 {
@@ -177,13 +175,13 @@ public partial class IggyConsumer
                             lastPolledPartitionOffset, rental.PartitionId);
                     }
 
-                    await StoreOffsetAsync(lastPolledPartitionOffset, partitionId, false, ct);
+                    await StoreOffsetAsync(lastPolledPartitionOffset, rental.PartitionId, false, ct);
                 }
 
                 return;
             }
 
-            _lastPolledOffset.AddOrUpdate(rental.PartitionId, currentOffset, (_, _) => currentOffset);
+            _lastPolledOffset[rental.PartitionId] = currentOffset;
 
             if (_config.PollingStrategy.Kind == MessagePolling.Offset)
             {

@@ -61,7 +61,7 @@ public sealed class BinaryMapper
     public void MapOffsets_ReturnsValidOffsetResponse()
     {
         // Arrange
-        var partitionId = Random.Shared.Next(1, 19);
+        var partitionId = (uint)Random.Shared.Next(1, 19);
         var currentOffset = (ulong)Random.Shared.Next(420, 69420);
         var storedOffset = (ulong)Random.Shared.Next(69, 420);
         var payload = BinaryFactory.CreateOffsetPayload(partitionId, currentOffset, storedOffset);
@@ -153,7 +153,7 @@ public sealed class BinaryMapper
         // Arrange
         var (id, _, sizeBytes, messagesCount, name, createdAt) = StreamFactory.CreateStreamsResponseFields();
         // Topics are decoded count-driven, so the header count must match the appended topics.
-        var topicsCount = 1;
+        var topicsCount = 1u;
         var streamPayload
             = BinaryFactory.CreateStreamPayload(id, topicsCount, name, sizeBytes, messagesCount, createdAt);
         var (topicId1, partitionsCount1, topicName1, messageExpiry1, topicSizeBytes1, messagesCountTopic1,
@@ -337,7 +337,7 @@ public sealed class BinaryMapper
         payload.Add(12);
         payload.AddRange(BitConverter.GetBytes(64u)); // claims 64 bytes that are not there
 
-        Assert.Throws<InvalidOperationException>(() =>
+        Assert.Throws<MalformedResponseException>(() =>
             Mappers.BinaryMapper.MapOptionSpecs(payload.ToArray()));
     }
 
@@ -392,6 +392,64 @@ public sealed class BinaryMapper
         Assert.Equal(memberPartitions.Count, (int)partitionsCount);
         Assert.NotNull(response.Members);
         Assert.Single(response.Members);
+    }
+
+    [Fact]
+    public void MapConsumerGroup_NegativeMemberPartitionsCount_Throws()
+    {
+        var payload = new byte[21];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), 1); // group id
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4, 4), 3); // group partitions_count
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8, 4), 1); // members_count
+        payload[12] = 0; // name_len
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(13, 4), 42); // member id
+        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(17, 4), -2); // member partitions_count
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapConsumerGroup(payload));
+    }
+
+    [Fact]
+    public void MapConsumerGroup_MemberPartitionsCountExceedsPayload_Throws()
+    {
+        var payload = BinaryFactory.CreateGroupPayload(1, 1, 3, "group", [0, 1, 2]);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(13 + "group".Length + 4, 4), uint.MaxValue);
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapConsumerGroup(payload));
+    }
+
+    [Fact]
+    public void MapConsumerGroup_TruncatedMemberHeader_Throws()
+    {
+        var payload = BinaryFactory.CreateGroupPayload(1, 1, 3, "group", [0, 1, 2]);
+        var truncated = payload.AsSpan(0, 13 + "group".Length + 5).ToArray();
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapConsumerGroup(truncated));
+    }
+
+    [Fact]
+    public void MapConsumerGroup_NameLengthExceedsPayload_Throws()
+    {
+        var payload = BinaryFactory.CreateGroupPayload(1, 0, 3, "group");
+        payload[12] = byte.MaxValue;
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapConsumerGroup(payload));
+    }
+
+    [Fact]
+    public void MapConsumerGroups_MultiByteName_KeepsWalkAligned()
+    {
+        var first = BinaryFactory.CreateGroupPayload(1, 2, 3, "grüppe");
+        var second = BinaryFactory.CreateGroupPayload(2, 4, 5, "other");
+        var combined = new byte[first.Length + second.Length];
+        first.CopyTo(combined, 0);
+        second.CopyTo(combined, first.Length);
+
+        var responses = Mappers.BinaryMapper.MapConsumerGroups(combined);
+
+        Assert.Equal(2, responses.Count);
+        Assert.Equal("grüppe", responses[0].Name);
+        Assert.Equal(2u, responses[1].Id);
+        Assert.Equal("other", responses[1].Name);
     }
 
     [Fact]
@@ -451,7 +509,7 @@ public sealed class BinaryMapper
         using var rental = Mappers.BinaryMapper.MapRentedMessages(combined, EmptyMemoryOwner.Instance,
             encryptor);
 
-        Assert.Equal(7, rental.PartitionId);
+        Assert.Equal(7u, rental.PartitionId);
         Assert.Equal(101ul, rental.CurrentOffset);
         Assert.Equal(2, rental.Messages.Count);
 
@@ -474,7 +532,7 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapRentedMessages_WithEncryptor_NegativePayloadLength_ThrowsInsteadOfSpinning()
+    public void MapRentedMessages_WithEncryptor_NegativePayloadLength_Throws()
     {
         var encryptor = new AesMessageEncryptor(AesMessageEncryptor.GenerateKey());
 
@@ -614,5 +672,200 @@ public sealed class BinaryMapper
         var cipherHeaders = plainHeaders.Length > 0 ? encryptor.EncryptToArray(plainHeaders) : [];
 
         return BinaryFactory.CreateMessageFrame(0, Guid.NewGuid(), offsetDelta, 0, cipherHeaders, cipherPayload);
+    }
+
+    [Fact]
+    public void MapClusterMetadata_OversizedNodesCount_Throws()
+    {
+        var payload = new byte[8];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), 0); // cluster name length
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4, 4), uint.MaxValue); // nodes count
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClusterMetadata(payload));
+    }
+
+    [Fact]
+    public void MapClusterMetadata_MultiByteNodeName_KeepsWalkAligned()
+    {
+        var payload = CreateClusterMetadataPayload("cluster",
+            ("nödé-1", "10.0.0.1", 8090, 1, 1),
+            ("node-2", "10.0.0.2", 8091, 0, 1));
+
+        var metadata = Mappers.BinaryMapper.MapClusterMetadata(payload);
+
+        Assert.Equal("cluster", metadata.Name);
+        Assert.Equal(2, metadata.Nodes.Length);
+        Assert.Equal("nödé-1", metadata.Nodes[0].Name);
+        Assert.Equal("10.0.0.1", metadata.Nodes[0].Ip);
+        Assert.Equal(8090, metadata.Nodes[0].Endpoints.Tcp);
+        Assert.Equal("node-2", metadata.Nodes[1].Name);
+        Assert.Equal("10.0.0.2", metadata.Nodes[1].Ip);
+        Assert.Equal(8091, metadata.Nodes[1].Endpoints.Tcp);
+    }
+
+    [Fact]
+    public void MapClusterMetadata_TruncatedNode_Throws()
+    {
+        var payload = CreateClusterMetadataPayload("cluster", ("node-1", "10.0.0.1", 8090, 1, 1));
+        var truncated = payload.AsSpan(0, payload.Length - 3).ToArray();
+
+        Assert.ThrowsAny<SystemException>(() => Mappers.BinaryMapper.MapClusterMetadata(truncated));
+    }
+
+    [Fact]
+    public void MapClusterMetadata_NameLengthExceedsPayload_Throws()
+    {
+        var payload = CreateClusterMetadataPayload("cluster", ("node-1", "10.0.0.1", 8090, 1, 1));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), uint.MaxValue);
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClusterMetadata(payload));
+    }
+
+    [Fact]
+    public void MapClient_OversizedConsumerGroupsCount_Throws()
+    {
+        var payload = new byte[17];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), 1); // client id
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4, 4), 1); // user id
+        payload[8] = 1; // transport tcp
+        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(9, 4), 0); // address length
+        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(13, 4), int.MaxValue); // consumer groups count
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClient(payload));
+    }
+
+    [Theory]
+    [InlineData(0, ClientTransport.Unknown)]
+    [InlineData(1, ClientTransport.Tcp)]
+    [InlineData(2, ClientTransport.Quic)]
+    [InlineData(3, ClientTransport.Http)]
+    [InlineData(4, ClientTransport.WebSocket)]
+    [InlineData(9, ClientTransport.Unknown)]
+    public void MapClient_MapsEveryWireTransport(byte wire, ClientTransport expected)
+    {
+        var payload = CreateClientPayload(userId: 7, transport: wire);
+
+        var response = Mappers.BinaryMapper.MapClient(payload);
+
+        Assert.Equal(expected, response.Transport);
+        Assert.Equal(7u, response.UserId);
+    }
+
+    [Fact]
+    public void MapClient_UnauthenticatedSentinel_YieldsNullUserId()
+    {
+        var payload = CreateClientPayload(userId: uint.MaxValue, transport: 1);
+
+        var response = Mappers.BinaryMapper.MapClient(payload);
+
+        Assert.Null(response.UserId);
+    }
+
+    [Theory]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(200)]
+    public void MapClusterMetadata_UnknownStatus_MapsToUnknown(byte status)
+    {
+        var payload = CreateClusterMetadataPayload("cluster", ("node", "127.0.0.1", 8090, 1, status));
+
+        var metadata = Mappers.BinaryMapper.MapClusterMetadata(payload);
+
+        Assert.Equal(ClusterNodeStatus.Unknown, metadata.Nodes[0].Status);
+    }
+
+    [Fact]
+    public void MapClusterMetadata_UnknownRole_Throws()
+    {
+        var payload = CreateClusterMetadataPayload("cluster", ("node", "127.0.0.1", 8090, 2, 0));
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClusterMetadata(payload));
+    }
+
+    [Fact]
+    public void MapClient_AddressLengthAboveInt32_ThrowsMalformed()
+    {
+        var payload = CreateClientPayload(userId: 7, transport: 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(9, 4), 0x8000_0000);
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapClient(payload));
+    }
+
+    private static byte[] CreateClientPayload(uint userId, byte transport)
+    {
+        var payload = new byte[17];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0, 4), 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4, 4), userId);
+        payload[8] = transport;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(9, 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(13, 4), 0);
+        return payload;
+    }
+
+    [Fact]
+    public void MapTopics_OversizedTopicsCount_Throws()
+    {
+        var payload = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, uint.MaxValue);
+
+        Assert.ThrowsAny<Exception>(() => Mappers.BinaryMapper.MapTopics(payload));
+    }
+
+    [Fact]
+    public void TryMapHeaders_ValueLengthDisagreesWithKind_ReturnsNull()
+    {
+        // key: string "A"; value: kind Uint64 (12) with a single byte.
+        var bytes = new byte[] { 2, 1, 0, 0, 0, 65, 12, 1, 0, 0, 0, 7 };
+
+        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(bytes));
+    }
+
+    [Fact]
+    public void TryMapHeaders_FixedWidthValueOfMatchingLength_Parses()
+    {
+        var bytes = new byte[] { 2, 1, 0, 0, 0, 65, 12, 8, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0 };
+
+        Dictionary<HeaderKey, HeaderValue>? headers = Mappers.BinaryMapper.TryMapHeaders(bytes);
+
+        Assert.NotNull(headers);
+        var value = Assert.Single(headers).Value;
+        Assert.Equal(HeaderKind.Uint64, value.Kind);
+        Assert.Equal(7ul, value.ToUInt64());
+    }
+
+    [Fact]
+    public void MapHeaders_ValueLengthDisagreesWithKind_Throws()
+    {
+        var bytes = new byte[] { 2, 1, 0, 0, 0, 65, 6, 2, 0, 0, 0, 7, 0 };
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(bytes));
+    }
+
+    private static byte[] CreateClusterMetadataPayload(string clusterName,
+        params (string name, string ip, ushort tcp, byte role, byte status)[] nodes)
+    {
+        var buffer = new List<byte>();
+        WriteString(buffer, clusterName);
+        buffer.AddRange(BitConverter.GetBytes((uint)nodes.Length));
+        foreach (var (name, ip, tcp, role, status) in nodes)
+        {
+            WriteString(buffer, name);
+            WriteString(buffer, ip);
+            buffer.AddRange(BitConverter.GetBytes(tcp));
+            buffer.AddRange(BitConverter.GetBytes((ushort)0)); // quic
+            buffer.AddRange(BitConverter.GetBytes((ushort)0)); // http
+            buffer.AddRange(BitConverter.GetBytes((ushort)0)); // websocket
+            buffer.Add(role);
+            buffer.Add(status);
+        }
+
+        return buffer.ToArray();
+
+        static void WriteString(List<byte> buffer, string value)
+        {
+            var bytes = Encoding.UTF8.GetBytes(value);
+            buffer.AddRange(BitConverter.GetBytes((uint)bytes.Length));
+            buffer.AddRange(bytes);
+        }
     }
 }

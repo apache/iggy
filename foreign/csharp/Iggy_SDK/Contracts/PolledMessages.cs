@@ -25,7 +25,7 @@ public sealed class PolledMessages
     /// <summary>
     ///     Partition identifier for the messages.
     /// </summary>
-    public required int PartitionId { get; init; }
+    public required uint PartitionId { get; init; }
 
     /// <summary>
     ///     Current offset for the partition.

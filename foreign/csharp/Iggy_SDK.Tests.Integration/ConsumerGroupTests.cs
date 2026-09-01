@@ -129,8 +129,8 @@ public class ConsumerGroupTests
         // Verify via GetMe that the client is now a member of the consumer group
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(1);
-        me.ConsumerGroups.ShouldContain(x => x.GroupId == (int)cg!.Id);
+        me.ConsumerGroupsCount.ShouldBe(1u);
+        me.ConsumerGroups.ShouldContain(x => x.GroupId == cg!.Id);
     }
 
     [Test]
@@ -165,8 +165,8 @@ public class ConsumerGroupTests
         // Verify via GetMe that the client is no longer a member of the consumer group
         var me = await client.GetMeAsync();
         me.ShouldNotBeNull();
-        me.ConsumerGroupsCount.ShouldBe(0);
-        me.ConsumerGroups.ShouldNotContain(x => x.GroupId == (int)cg.Id);
+        me.ConsumerGroupsCount.ShouldBe(0u);
+        me.ConsumerGroups.ShouldNotContain(x => x.GroupId == cg.Id);
     }
 
     [Test]

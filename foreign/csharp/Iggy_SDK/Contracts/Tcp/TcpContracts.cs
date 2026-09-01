@@ -260,7 +260,7 @@ internal static class TcpContracts
         bytes[9] = data.Global.SendMessages ? (byte)1 : (byte)0;
 
 
-        if (data.Streams is not null)
+        if (data.Streams is { Count: > 0 })
         {
             var streamsCount = data.Streams.Count;
             var currentStream = 1;
@@ -268,7 +268,7 @@ internal static class TcpContracts
             var position = 11;
             foreach (var (streamId, stream) in data.Streams)
             {
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], streamId);
+                BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], streamId);
                 position += 4;
 
                 bytes[position] = stream.ManageStream ? (byte)1 : (byte)0;
@@ -288,7 +288,7 @@ internal static class TcpContracts
 
                     foreach (var (topicId, topic) in stream.Topics)
                     {
-                        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], topicId);
+                        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], topicId);
                         position += 4;
 
                         bytes[position] = topic.ManageTopic ? (byte)1 : (byte)0;
@@ -325,7 +325,7 @@ internal static class TcpContracts
         }
         else
         {
-            bytes[0] = 0;
+            bytes[10] = 0;
         }
 
         return bytes.ToArray();
@@ -335,7 +335,7 @@ internal static class TcpContracts
     {
         var size = 10;
 
-        if (data.Streams is not null)
+        if (data.Streams is { Count: > 0 })
         {
             size += 1;
             foreach (var (_, stream) in data.Streams)

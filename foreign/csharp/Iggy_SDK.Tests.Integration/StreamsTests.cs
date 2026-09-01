@@ -46,7 +46,7 @@ public class StreamsTests
         response.Size.ShouldBe(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.MessagesCount.ShouldBe(0u);
-        response.TopicsCount.ShouldBe(0);
+        response.TopicsCount.ShouldBe(0u);
         response.Topics.ShouldBeEmpty();
     }
 
@@ -98,7 +98,7 @@ public class StreamsTests
         response.Size.ShouldBe(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.MessagesCount.ShouldBe(0u);
-        response.TopicsCount.ShouldBe(0);
+        response.TopicsCount.ShouldBe(0u);
         response.Topics.ShouldBeEmpty();
     }
 
@@ -119,7 +119,7 @@ public class StreamsTests
         response.Size.ShouldBe(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.MessagesCount.ShouldBe(0u);
-        response.TopicsCount.ShouldBe(0);
+        response.TopicsCount.ShouldBe(0u);
         response.Topics.ShouldBeEmpty();
     }
 
@@ -162,7 +162,7 @@ public class StreamsTests
         response.Size.ShouldBeGreaterThan(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromMinutes(1));
         response.MessagesCount.ShouldBe(7u);
-        response.TopicsCount.ShouldBe(2);
+        response.TopicsCount.ShouldBe(2u);
         response.Topics.Count().ShouldBe(2);
 
         var topic = response.Topics.First(x => x.Name == topicName1);
@@ -222,7 +222,7 @@ public class StreamsTests
             purged => purged?.MessagesCount == 0, TimeSpan.FromSeconds(10));
         stream.ShouldNotBeNull();
         stream.MessagesCount.ShouldBe(0u);
-        stream.TopicsCount.ShouldBe(1);
+        stream.TopicsCount.ShouldBe(1u);
     }
 
     [Test]

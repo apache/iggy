@@ -88,7 +88,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     ///     <c>RESYNC_REQUIRED_PARTITION_SENTINEL</c> (<c>u32::MAX</c>). The reply header carries no status for an
     ///     empty poll, so the sentinel is the only channel the coordinator has to ask for a re-sync.
     /// </summary>
-    private const int VsrResyncRequiredPartitionSentinel = -1;
+    private const uint VsrResyncRequiredPartitionSentinel = uint.MaxValue;
 
     /// <summary>
     ///     Shared empty poll result. An idle consumer loop returns one on every iteration, and the instance owns
@@ -158,7 +158,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 response.ServerVersion, response.ServerProtocolVersion);
             SetConnectionState(ConnectionState.Authenticated);
 
-            var authResponse = new AuthResponse((int)response.UserId, null);
+            var authResponse = new AuthResponse(response.UserId, null);
             if (IsConnecting)
             {
                 return authResponse;
@@ -227,7 +227,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                 $"Partitioning kind {partitioning.Kind} cannot be resolved to a partition id.")
         };
 
-        return Partitioning.PartitionId((int)partition);
+        return Partitioning.PartitionId(partition);
     }
 
     private async ValueTask<uint> TopicPartitionCountAsync(Identifier streamId, Identifier topicId,

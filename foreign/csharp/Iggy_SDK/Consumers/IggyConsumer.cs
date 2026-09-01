@@ -46,7 +46,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly IggyConsumerConfig _config;
     private readonly SemaphoreSlim _connectionStateSemaphore = new(1, 1);
     private readonly EventAggregator<ConsumerErrorEventArgs> _consumerErrorEvents;
-    private readonly ConcurrentDictionary<int, ulong> _lastPolledOffset = new();
+    private readonly ConcurrentDictionary<uint, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
     private readonly SemaphoreSlim _pollingSemaphore = new(1, 1);
     private readonly Channel<ReceivedRentedMessage> _rentedChannel;
@@ -235,7 +235,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
         if (resetLastPolled)
         {
-            _lastPolledOffset[(int)partitionId] = offset;
+            _lastPolledOffset[partitionId] = offset;
         }
     }
 
@@ -428,7 +428,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     Message = message,
                     CurrentOffset = message.Header.Offset,
-                    PartitionId = (uint)messages.PartitionId,
+                    PartitionId = messages.PartitionId,
                     Status = MessageStatus.Success,
                     Error = null
                 };
@@ -444,7 +444,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     _logger.LogDebug("No new messages found, committing offset {Offset} for partition {PartitionId}",
                         lastPolledPartitionOffset, messages.PartitionId);
-                    await StoreOffsetAsync(lastPolledPartitionOffset, (uint)messages.PartitionId, false, ct);
+                    await StoreOffsetAsync(lastPolledPartitionOffset, messages.PartitionId, false, ct);
                 }
 
                 return;
