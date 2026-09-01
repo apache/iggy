@@ -38,6 +38,18 @@ for review.
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
 
+### System Dependencies
+
+Building the workspace needs `protoc` on the `PATH`, because the Apache Fluss
+connector's client compiles its protocol definitions in a build script.
+
+```bash
+sudo apt-get install -y protobuf-compiler   # Debian / Ubuntu
+brew install protobuf                       # macOS
+```
+
+Alternatively, point `PROTOC` at an existing binary.
+
 ### Quality Checks
 
 For Rust code:
