@@ -25,6 +25,7 @@ store_access_key_id = "admin"
 store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
+store_path_style_access = true
 ```
 
 ## Configuration Options
@@ -40,6 +41,7 @@ store_class = "s3"
 - **store_secret_access_key**: The secret key used to upload data to the object storage.
 - **store_region**: The region of the object storage, if applicable.
 - **store_class**: The storage class to use. **Currently, only S3-compatible storage is supported.**
+- **store_path_style_access**: Use path-style S3 URLs (`http://host/bucket/key`). Defaults to `true`, which MinIO-style endpoints require; set to `false` for stores that only accept virtual-hosted-style URLs.
 
 ## Dynamic Routing
 
@@ -66,6 +68,7 @@ store_access_key_id = "admin"
 store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
+store_path_style_access = true
 
 [sinks.iceberg.transforms.add_fields]
 enabled = true

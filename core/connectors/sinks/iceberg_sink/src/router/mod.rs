@@ -37,7 +37,6 @@ use iceberg::{
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
 use parquet::file::properties::WriterProperties;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -83,7 +82,8 @@ async fn write_data(
     let data_files = write_data_files(messages, table, messages_schema).await?;
 
     // Data files are kept on commit failure: the catalog may have applied the
-    // commit before the error surfaced, and retries must check that first.
+    // commit before the error surfaced, and deleting files referenced by a
+    // committed snapshot would corrupt the table.
     let table_commit = Transaction::new(table);
 
     let action = table_commit.fast_append().add_data_files(data_files);
@@ -98,7 +98,7 @@ async fn write_data(
         Error::TransactionApplyError(chain)
     })?;
 
-    let _table = tx.commit(catalog).await.map_err(|err| {
+    tx.commit(catalog).await.map_err(|err| {
         let chain = format_error_chain(&err);
         error!(
             "Failed to commit transaction on table with UUID: {}, Error: {}",
@@ -159,6 +159,14 @@ async fn write_data_files(
             }
         })
         .collect();
+
+    if msgs.is_empty() {
+        error!(
+            "Batch of {} messages has no JSON payloads, the Iceberg sink requires schema = json",
+            messages.len()
+        );
+        return Err(Error::InvalidPayloadType);
+    }
 
     let cursor = JsonArrowReader::new(msgs.as_slice());
     let reader = ReaderBuilder::new(Arc::new(
@@ -276,29 +284,27 @@ impl TableWriter {
     }
 
     async fn write(&mut self, batch: RecordBatch) -> Result<(), Error> {
-        let partitioned_batches = match &self.partitioner {
-            Partitioner::Unpartitioned(partition_key) => vec![(partition_key.clone(), batch)],
-            Partitioner::Partitioned(splitter) => splitter.split(&batch).map_err(|err| {
-                let chain = format_error_chain(&err);
-                error!("Error while splitting record batch by partition: {}", chain);
-                Error::InvalidRecordValue(chain)
-            })?,
-        };
-        for (partition_key, partition_batch) in partitioned_batches {
-            let writer = match self.writers.entry(partition_key.data().clone()) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let writer = self
-                        .builder
-                        .build(Some(partition_key))
-                        .await
-                        .map_err(write_failure)?;
-                    entry.insert(writer)
+        let Self {
+            partitioner,
+            builder,
+            writers,
+        } = self;
+        match partitioner {
+            Partitioner::Unpartitioned(partition_key) => {
+                write_partition(writers, builder, partition_key, batch).await
+            }
+            Partitioner::Partitioned(splitter) => {
+                let partitioned_batches = splitter.split(&batch).map_err(|err| {
+                    let chain = format_error_chain(&err);
+                    error!("Error while splitting record batch by partition: {}", chain);
+                    Error::InvalidRecordValue(chain)
+                })?;
+                for (partition_key, partition_batch) in partitioned_batches {
+                    write_partition(writers, builder, &partition_key, partition_batch).await?;
                 }
-            };
-            writer.write(partition_batch).await.map_err(write_failure)?;
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Closes every partition writer even after one of them fails, so the
@@ -320,6 +326,28 @@ impl TableWriter {
         }
         (data_files, first_error)
     }
+}
+
+/// The partition key is cloned only when a writer is created, not on every batch.
+async fn write_partition(
+    writers: &mut HashMap<Struct, ParquetDataFileWriter>,
+    builder: &ParquetDataFileWriterBuilder,
+    partition_key: &PartitionKey,
+    batch: RecordBatch,
+) -> Result<(), Error> {
+    if let Some(writer) = writers.get_mut(partition_key.data()) {
+        return writer.write(batch).await.map_err(write_failure);
+    }
+    let writer = builder
+        .build(Some(partition_key.clone()))
+        .await
+        .map_err(write_failure)?;
+    writers
+        .entry(partition_key.data().clone())
+        .or_insert(writer)
+        .write(batch)
+        .await
+        .map_err(write_failure)
 }
 
 fn write_failure(err: iceberg::Error) -> Error {
@@ -477,5 +505,15 @@ mod tests {
         assert!(data_files[0].partition().fields().is_empty());
         assert!(data_files[0].file_path().contains("/data/"));
         assert!(!data_files[0].file_path().contains("region="));
+    }
+
+    #[test]
+    fn given_batch_without_json_payloads_should_fail_with_invalid_payload_type() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let payloads = vec![Payload::Text("not json".to_string())];
+
+        let result = test_runtime().block_on(write_data_files(&payloads, &table, Schema::Text));
+
+        assert!(matches!(result, Err(Error::InvalidPayloadType)));
     }
 }
