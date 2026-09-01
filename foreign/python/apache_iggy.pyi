@@ -1194,6 +1194,46 @@ class IggyClient:
         Raises:
             RuntimeError: If an identifier is invalid or the request fails.
         """
+    def create_partitions(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partitions_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Create partitions for a topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partitions_count: Number of partitions to create.
+
+        Returns:
+            An awaitable that resolves to `None` when the partitions are created.
+
+        Raises:
+            RuntimeError: If an identifier is invalid or the request fails.
+        """
+    def delete_partitions(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+        partitions_count: builtins.int,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete partitions from a topic.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            topic_id: Topic identifier as `str | int`.
+            partitions_count: Number of partitions to delete.
+
+        Returns:
+            An awaitable that resolves to `None` when the partitions are deleted.
+
+        Raises:
+            RuntimeError: If an identifier is invalid or the request fails.
+        """
     def create_consumer_group(
         self,
         stream_id: builtins.str | builtins.int,
