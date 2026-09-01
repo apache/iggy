@@ -29,6 +29,7 @@
 
 #include <gtest/gtest.h>
 
+#include "iggy.hpp"
 #include "lib.rs.h"
 
 inline iggy::ffi::Identifier make_string_identifier(const std::string &value) {
@@ -138,6 +139,15 @@ class E2ETestFixture : public ::testing::Test {
         EXPECT_NO_THROW(client->connect());
         EXPECT_NO_THROW(client->login_user("iggy", "iggy"));
 
+        return client;
+    }
+
+    iggy::IggyBlockingClient GetLoggedOutHighLevelClient() { return iggy::IggyBlockingClient::Builder().Build(); }
+
+    iggy::IggyBlockingClient GetLoggedInHighLevelClient(std::string username = "iggy", std::string password = "iggy") {
+        auto client = GetLoggedOutHighLevelClient();
+        client.Connect();
+        client.Login(std::move(username), std::move(password));
         return client;
     }
 
