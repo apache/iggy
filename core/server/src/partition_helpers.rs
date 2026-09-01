@@ -432,7 +432,7 @@ pub async fn ensure_initial_segment(
 /// [`ServerError::PartitionSuperblockIo`] when the directory or a slot
 /// cannot be read; the `VersionUnknown` / `Unverifiable` / `Undecodable` /
 /// `IdentityMismatch` variants when a record exists but cannot be trusted.
-pub(crate) async fn open_partition_superblock(
+pub async fn open_partition_superblock(
     partition_dir: &str,
     identity: ReplicaIdentity,
 ) -> Result<(Rc<PingPongSuperblock>, Option<VsrState>), ServerError> {
@@ -609,7 +609,7 @@ pub async fn build_partition_fresh(
     // Request queue holds 2x the prepare depth (buffered requests drain as
     // prepares commit); depth is the per-partition `[partition]` knob.
     let prepare_queue_depth = config.partition.prepare_queue_depth;
-    let timers = crate::bootstrap::consensus_timers(config);
+    let timers = crate::shell::consensus_timers(config);
     let consensus = VsrConsensus::restored(
         cluster_id,
         self_replica_id,

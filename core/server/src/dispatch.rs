@@ -28,7 +28,6 @@ use crate::auth::{
     complete_login_register, surface_login_failure, verify_login_credentials,
     verify_pat_credentials,
 };
-use crate::bootstrap::{ShellBus, ShellShard, ShellShardHandle};
 use crate::cluster_meta::ClusterRoster;
 use crate::consumer_group::{
     maybe_rewrite_consumer_group_request, maybe_rewrite_consumer_offset_request,
@@ -48,6 +47,7 @@ use crate::responses::{
 };
 use crate::segment_cleaner::UNENFORCEABLE_TOPIC_SIZE_WARN;
 use crate::session_manager::SessionManager;
+use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use crate::snapshot;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::{request_body, usize_to_u32, verify_request_checksum};
@@ -130,10 +130,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-pub(crate) type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
-pub(crate) type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
+pub type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
+pub type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
 
-pub(crate) fn make_client_request_handler<B, MJ, S, SB>(
+pub fn make_client_request_handler<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<ServerSystemConfig>,
@@ -181,9 +181,7 @@ where
 /// its `SessionManager` and push them back over the reply sender. The
 /// aggregation across all shards happens in
 /// [`shard::IggyShard::list_all_clients`].
-pub(crate) fn make_list_clients_handler(
-    sessions: &Rc<RefCell<SessionManager>>,
-) -> ListClientsHandler {
+pub fn make_list_clients_handler(sessions: &Rc<RefCell<SessionManager>>) -> ListClientsHandler {
     let sessions = Rc::clone(sessions);
     Rc::new(move |reply| {
         let clients: Vec<ConnectedClientInfo> = sessions.borrow().iter_clients().collect();
@@ -198,7 +196,7 @@ pub(crate) fn make_list_clients_handler(
 /// against the local partitions plane and push the result back over the
 /// carried reply sender. The requesting shard bounds the wait with a
 /// timeout, so a dropped reply degrades to a client-visible read failure.
-pub(crate) fn make_partition_read_handler<B, MJ, S, SB>(
+pub fn make_partition_read_handler<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> PartitionReadHandler
 where
@@ -451,7 +449,7 @@ fn build_auto_commit_request(
     )
 }
 
-pub(crate) fn make_deferred_replica_message_handler<B, MJ, S, SB>(
+pub fn make_deferred_replica_message_handler<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> MessageHandler
 where
@@ -469,7 +467,7 @@ where
     })
 }
 
-pub(crate) fn make_deferred_client_request_handler<B, MJ, S, SB>(
+pub fn make_deferred_client_request_handler<B, MJ, S, SB>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     sessions: &Rc<RefCell<SessionManager>>,
@@ -538,7 +536,7 @@ where
 /// proposal. Spawns a task so the awaiting peer is woken once the op
 /// commits. Submit failures are returned verbatim so the peer can preserve
 /// unknown-outcome retry semantics.
-pub(crate) fn make_metadata_submit_handler<B, MJ, S, SB>(
+pub fn make_metadata_submit_handler<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> shard::MetadataSubmitHandler
 where
@@ -790,7 +788,7 @@ fn pop_next_client_request(
 /// Zero passes here because a zero-partition TOPIC is legal (legacy
 /// `create_topic` admits `0..=MAX`); the add/remove requests reject it in
 /// [`validate_partitions_change_count`].
-pub(crate) const fn validate_partitions_count(partitions_count: u32) -> Result<(), IggyError> {
+pub const fn validate_partitions_count(partitions_count: u32) -> Result<(), IggyError> {
     if partitions_count > MAX_PARTITIONS_PER_REQUEST {
         return Err(IggyError::TooManyPartitions);
     }
@@ -803,9 +801,7 @@ pub(crate) const fn validate_partitions_count(partitions_count: u32) -> Result<(
 /// force every shard through a rebalance pass. Legacy rejects it with
 /// `TooManyPartitions` in both handlers (`1..=MAX` on create, `== 0` on
 /// delete), so the code matches rather than inventing a new one.
-pub(crate) const fn validate_partitions_change_count(
-    partitions_count: u32,
-) -> Result<(), IggyError> {
+pub const fn validate_partitions_change_count(partitions_count: u32) -> Result<(), IggyError> {
     if partitions_count == 0 {
         return Err(IggyError::TooManyPartitions);
     }
@@ -820,7 +816,7 @@ pub(crate) const fn validate_partitions_change_count(
 /// `segment_size_bytes` is the topic's RESOLVED segment size (explicit
 /// option, else this node's default), so a per-topic segment above the
 /// global default still floors the topic cap.
-pub(crate) fn validate_topic_bounds(
+pub fn validate_topic_bounds(
     partitions_count: u32,
     max_topic_size: MaxTopicSize,
     segment_size_bytes: u64,
@@ -832,7 +828,7 @@ pub(crate) fn validate_topic_bounds(
 /// A topic cap below one segment can never be enforced: the first segment
 /// already exceeds it. Split out of [`validate_topic_bounds`] because update
 /// admission checks the cap without a partitions count to check.
-pub(crate) fn validate_topic_size_floor(
+pub fn validate_topic_size_floor(
     max_topic_size: MaxTopicSize,
     segment_size_bytes: u64,
 ) -> Result<(), IggyError> {
@@ -858,7 +854,7 @@ pub(crate) fn validate_topic_size_floor(
 ///
 /// Warns rather than rejects: which caps are accepted is client-visible wire
 /// behavior, and tightening it would break topics that already exist.
-pub(crate) fn warn_unenforceable_topic_size(
+pub fn warn_unenforceable_topic_size(
     max_topic_size: MaxTopicSize,
     segment_size_bytes: u64,
     max_message_size_bytes: usize,
@@ -888,7 +884,7 @@ pub(crate) fn warn_unenforceable_topic_size(
 /// partition shrinks the share: a cap that cleared the floor when the topic was
 /// created can stop clearing it here. The request carries only the delta, so
 /// the stored cap, segment size and current partition count come from metadata.
-pub(crate) fn warn_unenforceable_topic_size_on_partition_add(
+pub fn warn_unenforceable_topic_size_on_partition_add(
     streams: &Streams,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
@@ -920,7 +916,7 @@ pub(crate) fn warn_unenforceable_topic_size_on_partition_add(
 /// keys are rejected rather than skipped: a silently ignored knob would hand
 /// the client server defaults without it ever learning. Streams and users
 /// have no catalog keys yet, so `known` is empty for both until one lands.
-pub(crate) fn validate_option_keys(options: &WireOptions, known: &[&str]) -> Result<(), IggyError> {
+pub fn validate_option_keys(options: &WireOptions, known: &[&str]) -> Result<(), IggyError> {
     for entry in options {
         // Wire validation already enforced UTF-8 string keys.
         let key = String::from_utf8_lossy(entry.key);
@@ -1468,7 +1464,7 @@ async fn handle_get_me<B, MJ, S, SB>(
 /// `vsr_client_id` keys the consumer-group offset fence (the member id),
 /// not the transport id stamped into the partition-op header.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
+pub async fn dispatch_partition_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
     vsr_client_id: u128,
@@ -2007,7 +2003,7 @@ async fn send_unauthenticated_eviction<B, MJ, S, SB>(
 /// groups + rebalances via the replicated `Logout`) and sends a session-
 /// terminal `Eviction(StaleClient)` so the client fails fast and can reconnect.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn run_heartbeat_verifier<B, MJ, S, SB>(
+pub async fn run_heartbeat_verifier<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     interval: std::time::Duration,
@@ -2474,14 +2470,14 @@ fn empty_polled_messages_body(partition_id: u32) -> Bytes {
     Bytes::from(body)
 }
 
-pub(crate) type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, PollingArgs);
+pub type DecodedPollRequest = (IggyNamespace, u32, PollingConsumer, PollingArgs);
 
 /// Resolve a decoded poll request into its owning-shard read: namespace,
 /// partition, polling consumer, and args. Shared by the TCP dispatch (client
 /// id = the connection's bound VSR client) and the HTTP route (client id 0,
 /// which fences group polls closed).
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn resolve_poll_request<B, MJ, S, SB>(
+pub fn resolve_poll_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &PollMessagesRequest,
     client_id: u128,
@@ -2548,7 +2544,7 @@ where
 /// namespace, partition, and polling consumer. Shared by the TCP dispatch and
 /// the HTTP route; needs no client id because offset reads are not fenced
 /// (any client may read a group's offset, member or not).
-pub(crate) fn resolve_consumer_offset_request<B, MJ, S, SB>(
+pub fn resolve_consumer_offset_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &GetConsumerOffsetRequest,
 ) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError>
@@ -3082,7 +3078,7 @@ fn build_forward_logout_result_message(
 /// reply (shard-0 inbox full / shutdown) maps to a transient `Canceled`, which
 /// the caller wraps so the SDK replays.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_register_on_owner<B, MJ, S, SB>(
+pub async fn submit_register_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     user_id: u32,
@@ -3112,7 +3108,7 @@ where
 
 /// Logout counterpart of [`submit_register_on_owner`].
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_logout_on_owner<B, MJ, S, SB>(
+pub async fn submit_logout_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     vsr_client_id: u128,
     session: u64,
@@ -3283,7 +3279,7 @@ async fn handle_delete_segments_request<B, MJ, S, SB>(
 /// the error.
 #[allow(clippy::future_not_send)]
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) async fn resolve_delete_segments_truncate<B, MJ, S, SB>(
+pub async fn resolve_delete_segments_truncate<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     template: &RoutedRequestHeader,
     client_id: u128,
@@ -3445,7 +3441,7 @@ fn submit_disconnect_logout<B, MJ, S, SB>(
 /// `client` id (it's the VSR id, not the transport/home-shard-encoding id).
 /// `None` = transient submit failure (SDK read-timeout replays).
 #[allow(clippy::future_not_send)]
-pub(crate) async fn submit_client_request_on_owner<B, MJ, S, SB>(
+pub async fn submit_client_request_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
 ) -> Option<Message<GenericHeader>>
@@ -3759,7 +3755,7 @@ async fn handle_login_register_request<B, MJ, S, SB>(
 /// metadata shard and zeroed elsewhere -- the SDK only reads the reason,
 /// plus the protocol window on `IncompatibleProtocol`.
 #[allow(clippy::future_not_send)]
-pub(crate) async fn send_login_eviction<B, MJ, S, SB>(
+pub async fn send_login_eviction<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     vsr_client_id: u128,
@@ -3799,7 +3795,7 @@ pub(crate) async fn send_login_eviction<B, MJ, S, SB>(
     }
 }
 
-pub(crate) fn upgrade_shard_handle<B, MJ, S, SB>(
+pub fn upgrade_shard_handle<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> Option<Rc<ShellShard<B, MJ, S, SB>>>
 where
