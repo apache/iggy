@@ -478,7 +478,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     }
 
     let target = snapshot_target_namespaces(ctx);
-    let target_set: AHashSet<IggyNamespace> = target.iter().map(|(ns, _)| *ns).collect();
+    let target_set: AHashSet<IggyNamespace> = target.iter().map(|partition| partition.ns).collect();
     let mut counters = PassCounters::default();
 
     reconcile_additions(ctx, target, &mut counters).await;
@@ -530,14 +530,19 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
 #[allow(clippy::too_many_lines)]
 async fn reconcile_additions(
     ctx: &ReconcilerCtx,
-    target: Vec<(IggyNamespace, u64)>,
+    target: Vec<TargetPartition>,
     counters: &mut PassCounters,
 ) {
     let shard_id = ctx.shard.id;
     let partitions = ctx.shard.plane.partitions();
     let total_shards = u32::from(ctx.total_shards);
 
-    for (ns, epoch) in target {
+    for TargetPartition {
+        ns,
+        epoch,
+        created_view,
+    } in target
+    {
         if partitions.contains(&ns) {
             // Tombstoned but still in the map. Two cases, told apart by
             // whether teardown's disk delete succeeded:
@@ -676,6 +681,7 @@ async fn reconcile_additions(
             ctx.cluster_id,
             ctx.self_replica_id,
             ctx.replica_count,
+            created_view,
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -1056,11 +1062,21 @@ fn snapshot_topic_live_groups(ctx: &ReconcilerCtx) -> AHashMap<(usize, usize), A
     })
 }
 
-/// Committed `(namespace, created_revision)` pairs. The epoch lets the
-/// additions pass detect a stale local incarnation after slab-key reuse
-/// without an `Arc<TopicStats>` clone per partition; stats are fetched
-/// lazily in [`fetch_partition_stats`] only for namespaces actually built.
-fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<(IggyNamespace, u64)> {
+/// One committed partition the additions pass has to account for.
+struct TargetPartition {
+    ns: IggyNamespace,
+    /// The committed `created_revision`. Lets the pass detect a stale local
+    /// incarnation after slab-key reuse without an `Arc<TopicStats>` clone per
+    /// partition; stats are fetched lazily in [`fetch_partition_stats`] only
+    /// for namespaces actually built.
+    epoch: u64,
+    /// The view a fresh materialisation seeds its consensus group with; see
+    /// `build_partition_fresh`.
+    created_view: u32,
+}
+
+/// Every committed partition, as the additions pass needs it.
+fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<TargetPartition> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         // TODO(krishna): O(committed partitions) per non-skipped pass (here +
         // reconcile_removals). The revision fast-skip hides this in steady
@@ -1070,8 +1086,11 @@ fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<(IggyNamespace, u64)> 
         for (_, stream) in &inner.items {
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
-                    let ns = IggyNamespace::new(stream.id, topic_id, partition.id);
-                    entries.push((ns, partition.created_revision));
+                    entries.push(TargetPartition {
+                        ns: IggyNamespace::new(stream.id, topic_id, partition.id),
+                        epoch: partition.created_revision,
+                        created_view: partition.created_view,
+                    });
                 }
             }
         }
@@ -1235,6 +1254,7 @@ mod tests {
     use metadata::IggyMetadata;
     use metadata::MuxStateMachine;
     use metadata::impls::metadata::IggySnapshot;
+    use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::StateMachine;
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
@@ -1446,6 +1466,7 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: assignments,
+            created_view: 0,
         };
         mux.update(build_prepare(
             op,
@@ -1667,6 +1688,18 @@ mod tests {
         ))
     }
 
+    /// The committed `created_view` of `ns`, what a reconcile pass would seed
+    /// a fresh build with.
+    fn created_view(ctx: &ReconcilerCtx, ns: IggyNamespace) -> u32 {
+        ctx.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_view_for_namespace(ns)
+            .expect("committed namespace records its creation view")
+    }
+
     /// Tests run reconcile + pump-side apply inline since no real pump exists.
     async fn reconcile_pass(ctx: &ReconcilerCtx) {
         reconcile_once(ctx).await;
@@ -1809,6 +1842,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -1838,6 +1872,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
+            created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -1999,6 +2034,7 @@ mod tests {
                         partitions_count: 2,
                     },
                     partitions: vec![assignment(0, 3), assignment(1, 4)],
+                    created_view: 0,
                 },
             ))
             .expect("CreatePartitions apply succeeds");
@@ -2545,7 +2581,9 @@ mod tests {
             .expect("partition is materialised")
             .repair = Some(RepairSession {
             nonce: NONCE,
-            to_op: 5,
+            view: 0,
+            commit_to_op: 5,
+            fetch_to_op: 5,
             floor: None,
             peer: 1,
             first_batch_offset: None,
@@ -3189,6 +3227,7 @@ mod tests {
                     partitions_count: 1,
                 },
                 partitions: vec![assignment(0, 3)],
+                created_view: 0,
             },
         ))
         .expect("CreatePartitions apply succeeds");

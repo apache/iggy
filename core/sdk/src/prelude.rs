@@ -33,7 +33,7 @@ pub use crate::client_wrappers::connection_info::ConnectionInfo;
 pub use crate::clients::client::IggyClient;
 pub use crate::clients::client_builder::IggyClientBuilder;
 pub use crate::clients::consumer::{
-    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage,
+    AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, IggyConsumerState, ReceivedMessage,
 };
 pub use crate::clients::consumer_builder::IggyConsumerBuilder;
 pub use crate::clients::producer::IggyProducer;
@@ -55,9 +55,10 @@ pub use iggy_common::{
     HeaderKind, HeaderValue, HttpClientConfig, HttpClientConfigBuilder, HttpMethod, IdKind,
     Identifier, IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView,
     IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
-    IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, OptionSpec, OptionValue, OptionsScope,
-    Partition, Partitioner, Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages,
-    PolledMessages, PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
+    IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, NonZeroDurationError,
+    NonZeroIggyDuration, OptionSpec, OptionValue, OptionsScope, Partition, Partitioner,
+    Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages,
+    PollingKind, PollingStrategy, QuicClientConfig, QuicClientConfigBuilder,
     QuicClientReconnectionConfig, ResourceOptions, SendMessages, SendMessagesConfirmationResponse,
     SendMessagesResponse, Sizeable, SnapshotCompression, Stats, Stream, StreamDetails,
     StreamPermissions, StreamUpdateOptions, SystemSnapshotType, TcpClientConfig,

@@ -41,4 +41,10 @@ interface LoginRoutingHook {
      * @return the identity returned by the successful Register response
      */
     CompletableFuture<IdentityInfo> loginOnLeader(Supplier<CompletableFuture<IdentityInfo>> loginAttempt);
+
+    /**
+     * Drops any login kept for replay. Called on an explicit sign-out: there
+     * is no session left to restore, and a redial must not resurrect one.
+     */
+    default void forgetLogin() {}
 }

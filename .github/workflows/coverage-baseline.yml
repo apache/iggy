@@ -104,7 +104,7 @@ jobs:
           free-disk-space-aggressive: "true"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.11
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: cargo-llvm-cov
 
@@ -299,12 +299,12 @@ jobs:
           save-cache: "false"
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@v2.85.11
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: cargo-llvm-cov
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
 
       - name: Install dependencies
         run: |
@@ -516,6 +516,10 @@ jobs:
           go test -v -race -coverprofile=../../reports/go-coverage-unit.out ./...
 
       - name: Run BDD tests with coverage
+        env:
+          IGGY_TCP_ADDRESS: 127.0.0.1:8090
+          IGGY_ROOT_USERNAME: iggy
+          IGGY_ROOT_PASSWORD: iggy
         run: |
           cd bdd/go
           mkdir -p ../../reports

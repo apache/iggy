@@ -254,7 +254,7 @@ impl Topic {
 
     /// Options admission resolved for the keys the client did not send.
     ///
-    /// Same shape as [`Self::options`]. These would have resolved differently
+    /// Same shape as `options`. These would have resolved differently
     /// under another server configuration.
     #[getter]
     pub fn derived_options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {
@@ -345,7 +345,7 @@ impl TopicDetails {
 
     /// Options admission resolved for the keys the client did not send.
     ///
-    /// Same shape as [`Self::options`]. These would have resolved differently
+    /// Same shape as `options`. These would have resolved differently
     /// under another server configuration.
     #[getter]
     pub fn derived_options<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, UserHeaders>> {

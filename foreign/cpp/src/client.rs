@@ -23,7 +23,8 @@ use iggy::prelude::{
     ConsumerOffsetClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
     IggyClientBuilder as RustIggyClientBuilder, IggyDuration as RustIggyDuration,
     IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
-    MessageClient, OptionsScope as RustOptionsScope, PartitionClient, Partitioning,
+    MessageClient, NonZeroIggyDuration as RustNonZeroIggyDuration,
+    OptionsScope as RustOptionsScope, PartitionClient, Partitioning,
     Permissions as RustPermissions, PollingStrategy, SegmentClient,
     SnapshotCompression as RustSnapshotCompression, StreamClient, StreamUpdateOptions,
     SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
@@ -102,9 +103,11 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
             .then_some(config.reconnection_max_retries),
     );
     if config.has_reconnection_interval {
-        builder = builder.with_reconnection_interval(RustIggyDuration::from(
-            config.reconnection_interval_micros,
-        ));
+        let reconnection_interval =
+            RustNonZeroIggyDuration::try_from(config.reconnection_interval_micros).map_err(
+                |error| format!("Invalid reconnection interval: {error}"),
+            )?;
+        builder = builder.with_reconnection_interval(reconnection_interval);
     }
     if config.has_reestablish_after {
         builder =
