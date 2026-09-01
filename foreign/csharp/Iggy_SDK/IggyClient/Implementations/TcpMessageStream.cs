@@ -1066,12 +1066,12 @@ public sealed partial class TcpMessageStream : IIggyClient
             try
             {
                 socket = new Socket(ServerAddress.AddressFamilyOf(host), SocketType.Stream, ProtocolType.Tcp);
-                if (_configuration.SendBufferSize is > 0)
+                if (_configuration.SendBufferSize.HasValue)
                 {
                     socket.SendBufferSize = _configuration.SendBufferSize.Value;
                 }
 
-                if (_configuration.ReceiveBufferSize is > 0)
+                if (_configuration.ReceiveBufferSize.HasValue)
                 {
                     socket.ReceiveBufferSize = _configuration.ReceiveBufferSize.Value;
                 }

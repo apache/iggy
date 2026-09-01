@@ -80,7 +80,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
     BaseAddress = "127.0.0.1:8090",
     Protocol = Protocol.Tcp,
 
-    // Buffer sizes (optional, in bytes, default: null (for OS automatic))
+    // Socket buffer sizes in bytes (optional, null = OS default)
     ReceiveBufferSize = null,
     SendBufferSize = null,
 
