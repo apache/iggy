@@ -2117,6 +2117,32 @@ async fn evict_stale_client<B, MJ, S, SB>(
     }
 }
 
+/// Reject a non-zero wait timeout until active-server deferred waits are implemented.
+async fn reject_deferred_poll<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: &Message<RoutedRequestHeader>,
+    transport_client_id: u128,
+    wait_timeout_us: u64,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    warn!(
+        transport_client_id,
+        wait_timeout_us, "deferred poll waits are not available on the active server"
+    );
+    send_non_replicated_deny(
+        shard,
+        request,
+        transport_client_id,
+        IggyError::FeatureUnavailable.as_code(),
+    )
+    .await;
+}
+
 /// Serve `poll_messages`: resolve the partition namespace, run the read on
 /// the owning shard ([`shard::IggyShard::partition_read`]), and re-encode
 /// the stored batches into the legacy wire `PolledMessages` body.
@@ -2148,6 +2174,10 @@ async fn handle_poll_messages<B, MJ, S, SB>(
         .await;
         return;
     };
+    if wire.wait_timeout_us != 0 {
+        reject_deferred_poll(shard, request, transport_client_id, wire.wait_timeout_us).await;
+        return;
+    }
     // Gate on (stream, topic) before touching the partition plane. A resolution
     // miss falls through to the resolve path below (empty-poll / not-found); a
     // denial replies status!=0 with an empty body, distinct from the empty-poll
@@ -2493,6 +2523,9 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    if wire.wait_timeout_us != 0 {
+        return Err(IggyError::FeatureUnavailable);
+    }
     let strategy = polling_strategy_from_wire(&wire.strategy)?;
     let args = PollingArgs::new(strategy, wire.count, wire.auto_commit);
 

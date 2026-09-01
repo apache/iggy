@@ -88,6 +88,49 @@ async fn given_missing_partition_when_polling_should_reject_partition_not_found(
     assert_eq!(valid.messages.len(), 0, "empty topic polls empty");
 }
 
+#[iggy_harness(test_client_transport = [Tcp])]
+async fn given_non_zero_wait_timeout_when_polling_should_reject_feature_unavailable(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    client
+        .create_stream("poll-timeout-stream")
+        .await
+        .expect("create stream");
+    let stream_id = Identifier::from_str_value("poll-timeout-stream").expect("stream identifier");
+    client
+        .create_topic(
+            &stream_id,
+            "poll-timeout-topic",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create topic");
+    let topic_id = Identifier::from_str_value("poll-timeout-topic").expect("topic identifier");
+
+    let result = client
+        .poll_messages_with_timeout(
+            &stream_id,
+            &topic_id,
+            Some(0),
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            1,
+            false,
+            Duration::from_secs(1),
+        )
+        .await;
+
+    assert!(
+        matches!(&result, Err(error) if error.as_code() == IggyError::FeatureUnavailable.as_code()),
+        "the active server must reject unsupported deferred waits, got {result:?}"
+    );
+}
+
 #[iggy_harness(
     test_client_transport = [Tcp]
 )]

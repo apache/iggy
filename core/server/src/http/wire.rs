@@ -118,6 +118,7 @@ pub(in crate::http) fn poll_wire_request(
         },
         count: query.count,
         auto_commit: query.auto_commit,
+        wait_timeout_us: 0,
     })
 }
 
@@ -422,6 +423,7 @@ mod tests {
         assert_eq!(wire.strategy.value, 0);
         assert_eq!(wire.count, 25);
         assert!(wire.auto_commit);
+        assert_eq!(wire.wait_timeout_us, 0);
     }
 
     #[test]
