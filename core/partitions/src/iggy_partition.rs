@@ -5183,7 +5183,7 @@ mod tests {
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
     use iggy_binary_protocol::{Command, ReplyHeader, WireConsumer, WireEncode};
-    use message_bus::SendError;
+    use message_bus::{BusMessage, SendError};
     use server_common::MESSAGE_ALIGN;
     use server_common::send_messages::{
         COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
@@ -5570,9 +5570,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            data: Frozen<MESSAGE_ALIGN>,
+            data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
-            self.sent_to_clients.borrow_mut().push((client_id, data));
+            self.sent_to_clients
+                .borrow_mut()
+                .push((client_id, data.into().into_contiguous()));
             Ok(())
         }
 

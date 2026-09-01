@@ -27,8 +27,8 @@
 //!   by plane.
 //! - `IggyShard::park_if_unmaterialised` - partition frames shed because the
 //!   park buffer is at its frame or byte cap.
-//! - `IggyShard::apply_reconcile_ops` - parked frames whose re-dispatch onto
-//!   this shard's own inbox was refused.
+//! - `IggyShard::retire_parked_frames` - parked frames retired with no client
+//!   to answer.
 //!
 //! The counter uses atomic interior mutability, safe to bump from `!Send`
 //! compio reactor contexts. Each shard owns its own instance, and the server
@@ -77,18 +77,14 @@ pub struct FrameDropLabel {
 ///
 /// `PARTITION` covers the partition plane: a frame shed because the namespace
 /// had not materialised and its park buffer was at capacity
-/// (`reason=park_overflow`), a re-dispatch the shard's own inbox refused, or a
-/// routing send the target inbox refused. A shed client request is answered with
-/// a retriable status, so the client recovers -- but a shed *prepare* is not
-/// covered by retransmit once its op has reached quorum
-/// (`consensus::retransmit_targets` skips `ok_quorum_received`, and the
-/// partition plane creates a repair session only in `on_start_view`), so it
-/// leaves that backup behind until an unrelated view change.
-//
-// TODO(krishna): give the partition plane a normal-status repair driver so a
-// shed or refused prepare is repaired without waiting for a view change. Until
-// then `variant=partition` is the only signal that a backup may be stranded
-// behind `commit_max`.
+/// (`reason=park_overflow`), a parked frame retired with no client to answer
+/// (`reason=park_dropped`), an incarnation rejection, or a routing send the
+/// target inbox refused. A shed client request is answered with a retriable
+/// status. A shed prepare may no longer be covered by retransmit once its op
+/// reached quorum, but a later `CommitMessage` that advances the backup's
+/// frontier arms same-view journal repair. If the primary evicted the range,
+/// repair escalates to partition state transfer. The counter therefore signals
+/// a data-plane gap or recovery burden, not a requirement for a view change.
 pub mod frame_drop_variant {
     pub const CONSENSUS: &str = "consensus";
     pub const FD_TRANSFER: &str = "fd_transfer";
@@ -114,11 +110,12 @@ pub mod frame_drop_variant {
 /// `PARK_OVERFLOW` ticks when a partition frame arrives for a namespace this
 /// shard has not materialised and the per-namespace park buffer is already at
 /// its cap, so the frame is shed with no reply. `PARK_DROPPED` ticks when a
-/// frame that did park leaves unserved: its namespace became unreachable, or a
-/// request outlived `MAX_PARKED_PASSES` with no pump to take the deny. A request
-/// also bumps `partition_requests_denied_transient_total` when answered;
-/// replicated traffic has nobody to answer, so this is the only record the op
-/// was destroyed.
+/// frame that did park leaves unserved: its namespace became unreachable, its
+/// incarnation stamp was rejected, reclassification failed, or a request
+/// outlived `MAX_PARKED_PASSES` with no pump to take the deny. A request also
+/// bumps `partition_requests_denied_transient_total` when answered; replicated
+/// traffic has nobody to answer, so this is the direct record that local bytes
+/// were destroyed and repair may be required.
 pub mod frame_drop_reason {
     /// Operation discriminant unknown to this build: the sender is newer.
     ///
