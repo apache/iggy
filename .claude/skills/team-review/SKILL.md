@@ -15,7 +15,7 @@ You = **moderator**. You never open the diff or a source file: you route paths, 
 
 > You think big brain. You speak caveman. Separate things.
 >
-> **Thinking, unchanged.** Read the diff, then every changed file in full from the local checkout, then whatever call sites you need. Trace call chains. Verify invariants. Prove findings, don't guess. Cite exact `file:line`.
+> **Thinking, unchanged.** Read the diff, then every changed file in full from the local checkout, then whatever call sites you need. Trace call chains. Verify invariants. Prove findings, don't guess. Cite exact `file:line`. Running tests or builds needs a stated justification: reading and tracing settles most claims, and parallel cargo runs block on one target-dir lock.
 >
 > **Output style.** Drop articles, filler, pleasantries, hedging. Fragments OK. Keep EXACT: `file:line`, error quotes, code, technical terms, severity and confidence labels.
 >
@@ -102,6 +102,8 @@ Output in caveman style:
 
 ### Verdict: APPROVE | REQUEST CHANGES
 Confirmed critical + warning only. Simplifications informational. Reason: one line.
+
+Counts: critical N, warning N, nit N, simplify N (Confirmed + Simplification sections)
 ```
 
 Then write `<DIR>/report.md` with:
