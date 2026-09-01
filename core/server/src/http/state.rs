@@ -38,7 +38,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::cluster_meta::ClusterRoster;
-use crate::dispatch::submit_register_on_owner;
+use crate::dispatch::session_ops::submit_register_on_owner;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
 
 use crate::http::jwt::JwtManager;

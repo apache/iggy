@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::auth::warm_dummy_password_hash;
 use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes, self_advertised_address};
 use crate::config_writer::write_current_config;
+use crate::dispatch::partition::make_partition_read_handler;
+use crate::dispatch::session_ops::warm_dummy_password_hash;
+use crate::dispatch::submit::make_metadata_submit_handler;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
-    make_deferred_replica_message_handler, make_list_clients_handler, make_metadata_submit_handler,
-    make_partition_read_handler,
+    make_deferred_replica_message_handler, make_list_clients_handler,
 };
 use crate::http;
 use crate::partition_helpers::{
@@ -1252,8 +1253,13 @@ async fn shard_main(
         let hb_sessions = Rc::clone(&sessions);
         let hb_interval = config.heartbeat.interval.get_duration();
         let hb_handle = compio::runtime::spawn(async move {
-            crate::dispatch::run_heartbeat_verifier(hb_shard, hb_sessions, hb_interval, hb_stop_rx)
-                .await;
+            crate::dispatch::session_ops::run_heartbeat_verifier(
+                hb_shard,
+                hb_sessions,
+                hb_interval,
+                hb_stop_rx,
+            )
+            .await;
         });
         bus.track_background(hb_handle);
         Some(hb_stop_tx)
