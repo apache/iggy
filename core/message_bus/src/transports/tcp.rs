@@ -296,28 +296,37 @@ async fn writer_loop(
 
 /// `write_vectored_all` over `iovecs`, at most `IOV_MAX` entries per call so
 /// a frame fragmented past the syscall limit (a wide poll reply) cannot fail
-/// with `EINVAL`. Leaves `iovecs` empty, keeping its allocation for the next
-/// batch.
+/// with `EMSGSIZE` (the socket path is `io_uring` `sendmsg(2)`). Leaves
+/// `iovecs` empty with an allocation ready for the next batch.
 #[allow(clippy::future_not_send)]
 async fn write_iovecs(
     write_half: &mut TcpStream,
     iovecs: &mut Vec<Frozen<MESSAGE_ALIGN>>,
 ) -> io::Result<()> {
-    let mut chunk = mem::take(iovecs);
-    loop {
-        let rest = if chunk.len() > IOV_MAX {
-            chunk.split_off(IOV_MAX)
-        } else {
-            Vec::new()
-        };
-        let compio::BufResult(result, mut returned) = write_half.write_vectored_all(chunk).await;
+    if iovecs.len() <= IOV_MAX {
+        let compio::BufResult(result, mut returned) =
+            write_half.write_vectored_all(mem::take(iovecs)).await;
         result?;
-        if rest.is_empty() {
-            returned.clear();
-            *iovecs = returned;
+        returned.clear();
+        *iovecs = returned;
+        return Ok(());
+    }
+    // Chunk through a cursor and one reused scratch vec. `split_off`-style
+    // chunking memmoves the whole tail per syscall, O(n^2) over a batch of n
+    // iovecs on the shard's single-threaded executor, and n is client-chosen
+    // (an unclamped poll count fans out to 1-2 iovecs per batch).
+    let mut source = mem::take(iovecs).into_iter();
+    let mut scratch = Vec::with_capacity(IOV_MAX);
+    loop {
+        scratch.extend(source.by_ref().take(IOV_MAX));
+        if scratch.is_empty() {
+            *iovecs = scratch;
             return Ok(());
         }
-        chunk = rest;
+        let compio::BufResult(result, mut returned) = write_half.write_vectored_all(scratch).await;
+        result?;
+        returned.clear();
+        scratch = returned;
     }
 }
 
@@ -428,8 +437,8 @@ mod tests {
     }
 
     /// A frame fragmented past `IOV_MAX` must reach the peer whole and in
-    /// order: `writev` rejects more than `IOV_MAX` iovecs with `EINVAL`, so
-    /// the writer has to chunk the flattened batch instead of failing it.
+    /// order: `sendmsg` rejects more than `IOV_MAX` iovecs with `EMSGSIZE`,
+    /// so the writer has to chunk the flattened batch instead of failing it.
     #[compio::test]
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
     async fn run_writes_frames_fragmented_past_iov_max() {

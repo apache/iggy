@@ -23,9 +23,10 @@ use std::ptr::NonNull;
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
-/// Linux `IOV_MAX`: the most iovecs one `writev(2)` accepts. Vectored
-/// writers must chunk their buffer lists at this many entries or the
-/// syscall fails with `EINVAL`.
+/// Linux `IOV_MAX`: the most iovecs one vectored IO syscall accepts.
+/// Vectored writers must chunk their buffer lists at this many entries or
+/// the syscall fails: `EINVAL` from `writev(2)`/`pwritev(2)` (segment file
+/// writes), `EMSGSIZE` from `sendmsg(2)` (socket writes).
 pub const IOV_MAX: usize = 1024;
 
 #[derive(Debug, Clone)]
@@ -279,6 +280,13 @@ impl<const ALIGN: usize> From<Owned<ALIGN>> for Frozen<ALIGN> {
 impl<const ALIGN: usize> Frozen<ALIGN> {
     pub fn as_slice(&self) -> &[u8] {
         self.inner.as_slice()
+    }
+
+    /// Whether `self` and `other` refcount the same backing allocation,
+    /// regardless of their sliced windows. Any hit keeps the whole
+    /// allocation alive, not just the window.
+    pub fn shares_allocation(&self, other: &Self) -> bool {
+        self.inner.ctrlb == other.inner.ctrlb
     }
 
     pub fn split_at(self, split_at: usize) -> (Prefix<ALIGN>, Frozen<ALIGN>) {

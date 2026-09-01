@@ -30,10 +30,10 @@
 //! No value in this module holds a partition reference, so executing a plan is
 //! sound on a detached task concurrently with the pump's own writes.
 
-use crate::PollFragments;
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{MessageLookup, push_selected_batch_fragments, select_batch_slice};
+use crate::{Fragment, PollFragments};
 use compio::io::AsyncReadAtExt;
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
@@ -572,6 +572,7 @@ impl DiskReadPlan {
                     faulted = true;
                     break 'walk;
                 };
+                let fragments_before_chunk = fragments.len();
                 let ChunkWalk { consumed, corrupt } = walk_disk_chunk(
                     &chunk,
                     query,
@@ -586,6 +587,7 @@ impl DiskReadPlan {
                     },
                     self.namespace_raw,
                 );
+                unpin_sparse_chunk(&mut fragments, fragments_before_chunk, &chunk);
                 if corrupt {
                     // A batch that does not match its own checksum. Fail closed like
                     // an IO fault: serving it hands a consumer data provably not what
@@ -1032,6 +1034,54 @@ struct ChunkWalk {
     corrupt: bool,
 }
 
+/// A fragment sliced from a disk chunk keeps the WHOLE chunk allocation
+/// alive until the reply frame is written out, and a reply can sit in a
+/// per-connection mailbox for a while. Copy the matched bytes out when they
+/// cover less than this fraction of the chunk, so a sparse match (a
+/// `count=1` poll off a cold partition) cannot pin ~1 MiB per queued reply;
+/// a dense catch-up read keeps the zero-copy path, where retained bytes stay
+/// within this factor of shipped bytes.
+const SPARSE_CHUNK_PIN_DIVISOR: usize = 4;
+
+/// Rewrite the fragments `walk_disk_chunk` pushed (those from index
+/// `walked_from` on) to slices of one compact copy when their combined
+/// length is a sparse fraction of `chunk`. See [`SPARSE_CHUNK_PIN_DIVISOR`].
+fn unpin_sparse_chunk(
+    fragments: &mut PollFragments<4096>,
+    walked_from: usize,
+    chunk: &Frozen<4096>,
+) {
+    let pushed = &mut fragments[walked_from..];
+    // Rewritten-header fragments in the walk own their bytes; only slices of
+    // `chunk` pin it.
+    let borrowed: usize = pushed
+        .iter()
+        .filter(|fragment| fragment.borrows_from(chunk))
+        .map(Fragment::len)
+        .sum();
+    if borrowed == 0 || borrowed >= chunk.len() / SPARSE_CHUNK_PIN_DIVISOR {
+        return;
+    }
+
+    let mut compact = Owned::<4096>::zeroed(borrowed);
+    let mut cursor = 0;
+    for fragment in pushed.iter().filter(|f| f.borrows_from(chunk)) {
+        let bytes = fragment.as_slice();
+        compact.as_mut_slice()[cursor..cursor + bytes.len()].copy_from_slice(bytes);
+        cursor += bytes.len();
+    }
+    let compact = Frozen::from(compact);
+    let mut cursor = 0;
+    for fragment in pushed.iter_mut() {
+        if !fragment.borrows_from(chunk) {
+            continue;
+        }
+        let len = fragment.len();
+        *fragment = Fragment::slice(compact.clone(), cursor, cursor + len);
+        cursor += len;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1183,52 @@ mod tests {
             Owned::<4096>::zeroed(8).into(),
         ));
         fragments
+    }
+
+    /// A sparse match must not pin the whole disk chunk: the matched bytes
+    /// are copied out byte-for-byte and the fragments stop borrowing the
+    /// chunk allocation. A dense match keeps the zero-copy slices, and
+    /// fragments that already own their bytes (rewritten batch headers) are
+    /// never touched.
+    #[test]
+    fn unpin_sparse_chunk_bounds_chunk_retention() {
+        let chunk_len = 1 << 20;
+        let mut backing = Owned::<4096>::zeroed(chunk_len);
+        for (position, byte) in backing.as_mut_slice().iter_mut().enumerate() {
+            *byte = u8::try_from(position % 251).unwrap();
+        }
+        let chunk = Frozen::from(backing);
+
+        let mut fragments = PollFragments::<4096>::new();
+        fragments.push(Fragment::whole(Owned::<4096>::zeroed(256).into()));
+        fragments.push(Fragment::slice(chunk.clone(), 512, 512 + 600));
+        fragments.push(Fragment::slice(chunk.clone(), 4096, 4096 + 300));
+        let first = fragments[1].as_slice().to_vec();
+        let second = fragments[2].as_slice().to_vec();
+        unpin_sparse_chunk(&mut fragments, 0, &chunk);
+        assert!(
+            !fragments[1].borrows_from(&chunk) && !fragments[2].borrows_from(&chunk),
+            "sparse slices must be copied out of the chunk"
+        );
+        assert_eq!(fragments[1].as_slice(), &first[..]);
+        assert_eq!(fragments[2].as_slice(), &second[..]);
+        assert!(
+            fragments[1].borrows_from(&fragments[2].clone().into_frozen()),
+            "copies pack into one compact allocation"
+        );
+        assert_eq!(fragments[0].len(), 256);
+
+        let mut fragments = PollFragments::<4096>::new();
+        fragments.push(Fragment::slice(
+            chunk.clone(),
+            0,
+            chunk_len / SPARSE_CHUNK_PIN_DIVISOR,
+        ));
+        unpin_sparse_chunk(&mut fragments, 0, &chunk);
+        assert!(
+            fragments[0].borrows_from(&chunk),
+            "dense slice keeps the zero-copy path"
+        );
     }
 
     fn consumer_auto_commit(offsets: Arc<ConsumerOffsets>, consumer_id: u32) -> AutoCommitCtx {
