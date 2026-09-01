@@ -170,7 +170,6 @@ impl Partitioning {
     }
 
     /// Maximum size of the Partitioning struct
-    /// by implementing Sizeable/ get_size_bytes().
     #[doc(hidden)]
     pub const fn maximum_byte_size() -> usize {
         2 + 255

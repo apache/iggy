@@ -92,8 +92,8 @@
 //! - **Spacing** applies `linger_time` between consecutive sends.
 //!
 //! Only in **background** mode:
-//! - **Batching** collects number of buffered sends until the batch size in bytes, the message
-//!   count, or the linger interval is reached, whichever comes first.
+//! - **Batching** collects until the batch size in bytes, the number of sends,
+//!   or the linger interval is reached, whichever comes first.
 //! - **Shard workers** run several send loops in parallel (`num_shards`), which
 //!   helps when one producer writes to several streams or topics.
 //! - A **sharding strategy** ([`Sharding`]) decides which worker a batch goes to:
@@ -116,7 +116,7 @@
 //!   `timestamp`) that tracks position.
 //! - **Auto-commit** ([`AutoCommit`]) stores the offset on an interval, or when
 //!   messages are polled, consumed one by one, consumed in full, or every Nth
-//!   message, so a restart resumes where it left off.
+//!   message. A restart resumes from that last commit.
 //! - **Manual offset control** to store, read, or delete the offset of any
 //!   partition yourself when auto-commit is disabled or not enough.
 //! - A **shared state handle** ([`IggyConsumerState`]) that another task can clone

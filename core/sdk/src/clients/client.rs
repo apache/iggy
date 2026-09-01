@@ -274,7 +274,7 @@ impl IggyClient {
     /// If the value of an option is
     /// - a duration pass a `humantime` string such as `5s`, `500ms`, or `1h 1m 1s`.
     ///   These are cast into an [`IggyDuration`]/[`NonZeroIggyDuration`].
-    ///   Note, `unlimited`, `none`, `disabled`, and `0` parse to zero.
+    ///   For [`IggyDuration`], `unlimited`, `none`, `disabled`, and `0` parse to zero.
     /// - a retry count use either the literal `unlimited` or a number such as `5`.
     /// - a bool use the literal `true` or `false`.
     /// - bytes and millisecond options provide a number such as `1024`.
@@ -310,9 +310,9 @@ impl IggyClient {
     /// ## QUIC
     ///
     /// - `validate_certificate`: bool. Verify the server certificate. Default: `false`.
-    /// - `heartbeat_interval`: [`IggyDuration`]. Client heartbeat period. Default: `5s`.
+    /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `reconnection_max_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
-    /// - `reconnection_interval`: [`IggyDuration`]. Wait between reconnection attempts. Default: `1s`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
     /// - `reconnection_reestablish_after`: [`IggyDuration`]. Grace period before reconnecting. Default: `5s`.
     /// - `response_buffer_size`: u64. Number of bytes in the response receive buffer. Default: `10000000`.
     /// - `max_concurrent_bidi_streams`: u64. Number of concurrent bidirectional streams. Default: `10000`.
@@ -365,9 +365,9 @@ impl IggyClient {
     ///
     /// ## WebSocket
     ///
-    /// - `heartbeat_interval`: [`IggyDuration`]. Client heartbeat period. Default: `5s`.
+    /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `reconnection_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
-    /// - `reconnection_interval`: [`IggyDuration`]. Wait between reconnection attempts. Default: `1s`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Grace period before reconnecting. Default: `5s`.
     /// - `read_buffer_size`: usize. Size of the read buffer in bytes. Default: `131072`.
     /// - `write_buffer_size`: usize. Size of the write buffer in bytes. Default: `131072`.
@@ -387,7 +387,7 @@ impl IggyClient {
     /// let client = IggyClient::builder_from_connection_string(
     ///     "iggy+ws://user:secret@localhost:8092\
     ///      ?heartbeat_interval=5s&reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
-    ///      &read_buffer_size=131072&write_buffer_size=131072&\
+    ///      &read_buffer_size=131072&write_buffer_size=131072\
     ///      &max_message_size=67108864&max_frame_size=16777216&accept_unmasked_frames=false\
     ///      &tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem&tls_validate_certificate=true",
     /// )?
@@ -608,7 +608,7 @@ impl IggyClient {
     /// # Examples
     ///
     /// Connect a client, build a consumer pinned to partition 1, and configure
-    /// it to auto-commit its offset so a restart resumes where it left off.
+    /// it to auto-commit when messages are polled.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
@@ -680,7 +680,7 @@ impl IggyClient {
     /// # Examples
     ///
     /// Connect a client, build a member of a consumer group, and configure it to
-    /// auto-commit its offset so a restart resumes where it left off.
+    /// auto-commit when polled.
     ///
     /// ```no_run
     /// use iggy::prelude::*;
@@ -784,7 +784,7 @@ impl IggyClient {
             topic.try_into()?,
             topic.to_owned(),
             self.encryptor.clone(),
-            None,
+            self.partitioner.clone(),
         ))
     }
 
