@@ -68,10 +68,9 @@ impl FileStorage {
     /// nor the pool. The sole caller is boot-time torn-tail repair, so
     /// blocking the shard thread here costs nothing.
     ///
-    /// `sync_all`, not `sync_data`: the file length is metadata, and without
-    /// it a power cut right after the repair re-presents the torn tail on the
-    /// next boot. Mirrors the write-then-fsync the `write_append` path pairs
-    /// with, and the truncate-then-`sync_all` segment recovery performs.
+    /// `sync_all` makes the durable-truncation contract explicit and matches
+    /// segment recovery. Its additional metadata synchronization is acceptable
+    /// because this runs only during boot-time repair.
     ///
     /// # Errors
     /// Returns an I/O error if the file cannot be opened, truncated, or synced.
