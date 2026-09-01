@@ -15,14 +15,39 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# cargo-rail change detection configuration
-# See: https://github.com/loadingalias/cargo-rail
-
-[change-detection]
-# Changes to these paths trigger a full workspace rebuild/retest
-infrastructure = [
-    "Cargo.lock",
-    "rust-toolchain.toml",
-    ".cargo/**",
-    ".github/**",
+[plan.work.runtime-artifacts]
+scope = "cargo"
+cargo_prerequisites = [
+    { source_work = "cargo.test", when = [
+        { package = "integration" },
+    ], require = [
+        { package = "server", target = { name = "iggy-server", kind = "bin" } },
+        { package = "iggy-cli", target = { name = "iggy", kind = "bin" } },
+        { package = "iggy-bench", target = { name = "iggy-bench", kind = "bin" } },
+        { package = "iggy-connectors", target = { name = "iggy-connectors", kind = "bin" } },
+        { package = "iggy-mcp", target = { name = "iggy-mcp", kind = "bin" } },
+        { package = "iggy_connector_clickhouse_sink", target = { name = "iggy_connector_clickhouse_sink", kind = "cdylib" } },
+        { package = "iggy_connector_delta_sink", target = { name = "iggy_connector_delta_sink", kind = "cdylib" } },
+        { package = "iggy_connector_doris_sink", target = { name = "iggy_connector_doris_sink", kind = "cdylib" } },
+        { package = "iggy_connector_elasticsearch_sink", target = { name = "iggy_connector_elasticsearch_sink", kind = "cdylib" } },
+        { package = "iggy_connector_elasticsearch_source", target = { name = "iggy_connector_elasticsearch_source", kind = "cdylib" } },
+        { package = "iggy_connector_http_sink", target = { name = "iggy_connector_http_sink", kind = "cdylib" } },
+        { package = "iggy_connector_iceberg_sink", target = { name = "iggy_connector_iceberg_sink", kind = "cdylib" } },
+        { package = "iggy_connector_influxdb_sink", target = { name = "iggy_connector_influxdb_sink", kind = "cdylib" } },
+        { package = "iggy_connector_influxdb_source", target = { name = "iggy_connector_influxdb_source", kind = "cdylib" } },
+        { package = "iggy_connector_meilisearch_sink", target = { name = "iggy_connector_meilisearch_sink", kind = "cdylib" } },
+        { package = "iggy_connector_mongodb_sink", target = { name = "iggy_connector_mongodb_sink", kind = "cdylib" } },
+        { package = "iggy_connector_postgres_sink", target = { name = "iggy_connector_postgres_sink", kind = "cdylib" } },
+        { package = "iggy_connector_postgres_source", target = { name = "iggy_connector_postgres_source", kind = "cdylib" } },
+        { package = "iggy_connector_quickwit_sink", target = { name = "iggy_connector_quickwit_sink", kind = "cdylib" } },
+        { package = "iggy_connector_random_source", target = { name = "iggy_connector_random_source", kind = "cdylib" } },
+        { package = "iggy_connector_redshift_sink", target = { name = "iggy_connector_redshift_sink", kind = "cdylib" } },
+        { package = "iggy_connector_s3_sink", target = { name = "iggy_connector_s3_sink", kind = "cdylib" } },
+        { package = "iggy_connector_stdout_sink", target = { name = "iggy_connector_stdout_sink", kind = "cdylib" } },
+        { package = "iggy_connector_surrealdb_sink", target = { name = "iggy_connector_surrealdb_sink", kind = "cdylib" } },
+    ] },
 ]
+
+[plan.work.edge-images]
+scope = "variants"
+variant_catalog = ".github/config/edge-image-variants.json"

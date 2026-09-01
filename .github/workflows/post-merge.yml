@@ -60,23 +60,51 @@ jobs:
             chmod +x /usr/local/bin/yq
           fi
 
-      # cargo-rail computes the affected crate set for the Docker :edge gate.
-      # Metadata-only `cargo rail plan` (no compile), so it runs on the runner's
-      # preinstalled cargo (version pinned by rust-toolchain.toml) and skips the
-      # heavyweight build-cache restore.
-      - name: Install cargo-rail
-        uses: taiki-e/install-action@v2.86.3
-        with:
-          tool: cargo-rail
+      # Planning is an optimization. A failure falls back to refreshing every
+      # Docker image in the component registry.
+      - name: Plan affected edge images
+        id: rail
+        continue-on-error: true
+        uses: loadingalias/cargo-rail-action@78ad385a85627484a5b634cf1bc3caa1de872c6a # v8.2.0
 
       - name: Check all components
         id: check
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+          PLAN_READER: ${{ steps.rail.outputs.plan-reader }}
+          PLAN_STATUS: ${{ steps.rail.outcome }}
         run: |
-          chmod +x scripts/extract-version.sh
+          set -euo pipefail
 
-          # Refresh :edge only for Docker images whose crate closure or build
-          # context changed in this push (DAG gate). Fail-open to all images.
-          DOCKER_COMPONENTS=$(scripts/ci/edge-affected-images.sh "${{ github.event.before }}" "${{ github.sha }}")
+          COMPONENTS_JSON=$(yq -o=json -I=0 '.components' .github/config/publish.yml)
+          ALL_DOCKER_COMPONENTS=$(jq -r \
+            '[to_entries[] | select(.value.registry == "dockerhub") | .key] | join(",")' \
+            <<< "$COMPONENTS_JSON")
+
+          IMAGE_MATRIX=all
+          if [[ "$PLAN_STATUS" == "success" ]] &&
+            python3 "$PLAN_READER" verify-checkout "$PLAN_FILE" &&
+            IMAGE_MATRIX=$(python3 "$PLAN_READER" matrix "$PLAN_FILE" edge-images); then
+            echo "::notice::Using validated Cargo-Rail edge image plan"
+          else
+            echo "::warning::Cargo-Rail plan unavailable or invalid; refreshing all edge images"
+          fi
+
+          if [[ "$IMAGE_MATRIX" == "all" ]]; then
+            DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
+          elif DOCKER_COMPONENTS=$(jq -er --argjson configured "$COMPONENTS_JSON" '
+            [.include[].component] as $selected
+            | if ($selected | all(. as $component | $configured[$component].registry == "dockerhub"))
+              then $selected | join(",")
+              else error("Cargo-Rail selected an unknown Docker component")
+              end
+          ' <<< "$IMAGE_MATRIX"); then
+            :
+          else
+            echo "::warning::Cargo-Rail edge image matrix is invalid; refreshing all edge images"
+            DOCKER_COMPONENTS="$ALL_DOCKER_COMPONENTS"
+          fi
+
           echo "docker_components=$DOCKER_COMPONENTS" >> "$GITHUB_OUTPUT"
           echo "Docker components to refresh: ${DOCKER_COMPONENTS:-<none>}"
 
