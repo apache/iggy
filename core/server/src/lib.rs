@@ -43,10 +43,8 @@ pub(crate) mod shard_allocator;
 pub mod systemd;
 
 // spine: the request path - shell vocabulary, dispatch funnel, per-domain ops.
-pub(crate) mod auth;
 pub(crate) mod consumer_group;
 pub(crate) mod dispatch;
-pub(crate) mod login_register;
 pub(crate) mod pat;
 pub(crate) mod responses;
 pub mod session_manager;

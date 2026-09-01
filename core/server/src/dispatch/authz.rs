@@ -60,7 +60,7 @@ use crate::shell::{ShellBus, ShellShard};
 /// namespace already resolved, so the entity exists; a `None` user id (which
 /// the bound-session gate should preclude) fails closed with `Unauthenticated`
 /// rather than allow an unattributed write.
-pub(super) fn authorize_partition_op<B, MJ, S, SB>(
+pub(in crate::dispatch) fn authorize_partition_op<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     operation: Operation,
     user_id: Option<u32>,
@@ -139,7 +139,7 @@ where
 /// better, the connection decodes replies in lockstep and would wedge on every
 /// later request.
 #[allow(clippy::future_not_send)]
-pub(super) async fn send_deny_reply<B, MJ, S, SB>(
+pub(in crate::dispatch) async fn send_deny_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RoutedRequestHeader,
@@ -172,7 +172,7 @@ pub(super) async fn send_deny_reply<B, MJ, S, SB>(
 /// commit frontier. The status is the only field a pre-authenticated caller
 /// needs, while the live commit would expose cluster write activity.
 #[allow(clippy::future_not_send)]
-pub(super) async fn send_unbound_deny_reply<B, MJ, S, SB>(
+pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     transport_client_id: u128,
     request_header: &RoutedRequestHeader,
@@ -202,7 +202,7 @@ pub(super) async fn send_unbound_deny_reply<B, MJ, S, SB>(
 
 /// Run an unscoped non-replicated-read rule for the acting user. A `None` user
 /// id (only the pre-auth path, which serves ungated codes) fails closed.
-pub(super) fn authorize_uid<B, MJ, S, SB>(
+pub(in crate::dispatch) fn authorize_uid<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     user_id: Option<u32>,
     rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
@@ -227,7 +227,7 @@ where
 /// (stream, topic). `None` proceeds (allowed, or a resolution miss the caller's
 /// own not-found path handles); `Some(status)` denies. A `None` user id fails
 /// closed.
-pub(super) fn authorize_partition_read<B, MJ, S, SB>(
+pub(in crate::dispatch) fn authorize_partition_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
@@ -263,7 +263,7 @@ where
 /// topic]) against committed state first. The PAT list is self-scoped, so
 /// authentication is its whole rule, and `GET_CLUSTER_METADATA` -- which
 /// describes the private replica network -- is gated the same way.
-pub(super) fn authorize_default_read<B, MJ, S, SB>(
+pub(in crate::dispatch) fn authorize_default_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
     body: &[u8],
@@ -337,7 +337,7 @@ where
 /// surfaces the typed error, so a poll denial never reaches the empty-poll
 /// "0 messages" body path.
 #[allow(clippy::future_not_send)]
-pub(super) async fn send_non_replicated_deny<B, MJ, S, SB>(
+pub(in crate::dispatch) async fn send_non_replicated_deny<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: &Message<RoutedRequestHeader>,
     transport_client_id: u128,
