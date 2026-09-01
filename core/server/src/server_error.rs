@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::shard_allocator::ShardingError;
 use consensus::VsrStateError;
 use metadata::impls::recovery::RecoveryError;
 use server_common::log::LogError;
 use shard::ShardCtorError;
-use shard_allocator::ShardingError;
 use std::path::PathBuf;
 use thiserror::Error;
 

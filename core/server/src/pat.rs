@@ -37,7 +37,7 @@ use server_common::Message;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-pub(crate) fn maybe_rewrite_pat_request(
+pub fn maybe_rewrite_pat_request(
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     max_tokens_per_user: u32,
@@ -65,7 +65,7 @@ pub(crate) fn maybe_rewrite_pat_request(
 /// form scoped to `user_id` (`only_if_expired` false); every other operation
 /// passes through unchanged with `None` (the HTTP write core routes all of
 /// its ops here, so the non-PAT arm is a no-op, not `unreachable`).
-pub(crate) fn rewrite_pat_request_for_user(
+pub fn rewrite_pat_request_for_user(
     user_id: u32,
     max_tokens_per_user: u32,
     pat_count_of: impl FnOnce(u32) -> usize,
