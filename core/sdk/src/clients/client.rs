@@ -66,9 +66,8 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///
 /// The [`ClientWrapper`] lives behind an [`IggyRwLock`] so that the connection
 /// can be shared safely. You create a single client and use it from many tasks
-/// at once (e.g. producers, consumers). Many operations can read
-/// from the connection concurrently, while actions that reshape it, like
-/// connecting, reconnecting, or logging in, briefly take exclusive access.
+/// at once (e.g. producers, consumers). Every operation takes a shared read
+/// guard.
 ///
 /// A [`Partitioner`] and a client-side [`EncryptorKind`] are optional, and both
 /// default to disabled. The [`Partitioner`] computes on the client-side the target
@@ -113,17 +112,18 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// 1. Construct a client from a connection string ([`from_connection_string()`]),
 ///    from the [`builder()`], or by wrapping an existing transport client with
 ///    [`new()`] / [`create()`].
-/// 2. Call [`connect()`] to establish the connection. If the transport was
+/// 2. Call [`connect()`] to establish the transport-level connection. If the transport was
 ///    configured with auto-login, this also authenticates. Otherwise call
-///    [`login_user()`] afterwards.
+///    [`login_user()`] afterwards. For HTTP always call [`login_user()`] instead of [`connect()`].
 /// 3. Spawn [`IggyConsumer`]s and [`IggyProducer`]s to write to, and consume messages
 ///    from, the server.
 /// 4. To shut everything down, call [`IggyConsumer::shutdown()`] on each consumer to store their
 ///    final offset and leave consumer groups. Then, call [`IggyProducer::shutdown()`] on each
 ///    [`IggyProducer`] so that _background_ producers flush the latest state. Finally,
-///    call [`shutdown()`] on the [`IggyClient`] which closes the connection and stops the heartbeat.
+///    call [`shutdown()`] on the [`IggyClient`] which closes the connection.
 ///    Use [`disconnect()`] rather than [`shutdown()`] to close the connection but keep the client usable, as a
-///    client that has been shut down cannot reconnect.
+///    client that has been shut down cannot reconnect. Note, if `auto-login` is configured, the client
+///    will reconnect automatically and undo the disconnect.
 ///
 /// # Examples
 ///
@@ -147,7 +147,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// // A background producer batches in the background, retries failed sends,
 /// // and creates a topic.
 /// let producer = client
-///     .producer("orders", "created")?
+///     .producer("stream_name", "topic_name")?
 ///     .background(
 ///         BackgroundConfig::builder()
 ///             .batch_length(1000)
@@ -168,7 +168,7 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///     .await?;
 ///
 /// // A consumer pinned to one partition, committing its offset
-/// // automatically so a restart resumes where it left off.
+/// // automatically when messages are polled (not consumed!).
 /// let mut consumer = client
 ///     .consumer("consumer_name", "stream_name", "topic_name", 1)?
 ///     .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
@@ -184,6 +184,11 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///     break;
 /// }
 ///
+/// // Finish commit before stopping (comp. method docs).
+/// consumer.shutdown().await?;
+/// // Finish flush before stopping (comp. method docs).
+/// producer.shutdown().await;
+///
 /// client.shutdown().await?;
 /// # Ok(())
 /// # }
@@ -195,8 +200,10 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 /// [`IggyProducer::shutdown()`]: crate::prelude::IggyProducer::shutdown
 /// [`new()`]: IggyClient::new
 /// [`create()`]: IggyClient::create
+/// [`send_binary_request`]: IggyClient::send_binary_request
+/// [`send_http_request`]: IggyClient::send_http_request
 /// [`shutdown()`]: IggyClient::shutdown
-/// [`login_user()`]: IggyClient::login_user
+/// [`login_user()`]: crate::prelude::UserClient::login_user
 /// [`connect()`]: IggyClient::connect
 /// [`disconnect()`]: IggyClient::disconnect
 /// [`producer()`]: IggyClient::producer
@@ -266,7 +273,7 @@ impl IggyClient {
     ///
     /// If the value of an option is
     /// - a duration pass a `humantime` string such as `5s`, `500ms`, or `1h 1m 1s`.
-    ///   These are cast into an [`IggyDuration`].
+    ///   These are cast into an [`IggyDuration`]/[`NonZeroIggyDuration`].
     ///   Note, `unlimited`, `none`, `disabled`, and `0` parse to zero.
     /// - a retry count use either the literal `unlimited` or a number such as `5`.
     /// - a bool use the literal `true` or `false`.
@@ -280,9 +287,9 @@ impl IggyClient {
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
     /// - `tls_ca_file`: filesystem path. Extra CA certificate to trust. Default: unset.
     /// - `reconnection_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
-    /// - `reconnection_interval`: [`IggyDuration`]. Wait between reconnection attempts. Default: `1s`.
+    /// - `reconnection_interval`: [`NonZeroIggyDuration`]. Wait between reconnection attempts. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Grace period before reconnecting. Default: `5s`.
-    /// - `heartbeat_interval`: [`IggyDuration`]. Client heartbeat period. Default: `5s`.
+    /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `nodelay`: `bool`. Disable Nagle's algorithm (`TCP_NODELAY`). Default: `false`.
     ///
     /// ```no_run
@@ -346,11 +353,12 @@ impl IggyClient {
     /// ```no_run
     /// use iggy::prelude::*;
     ///
-    /// # fn run() -> Result<(), IggyError> {
+    /// # async fn run() -> Result<(), IggyError> {
     /// let client = IggyClient::builder_from_connection_string(
-    ///     "iggy+http://user:secret@localhost:3000?heartbeat_interval=5s&retries=3",
+    ///     "iggy+http://localhost:3000?heartbeat_interval=5s&retries=3",
     /// )?
     /// .build()?;
+    /// client.login_user("user", "password").await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -361,11 +369,11 @@ impl IggyClient {
     /// - `reconnection_retries`: "unlimited" or u32. Number of attempts to connect. Default: `unlimited`.
     /// - `reconnection_interval`: [`IggyDuration`]. Wait between reconnection attempts. Default: `1s`.
     /// - `reestablish_after`: [`IggyDuration`]. Grace period before reconnecting. Default: `5s`.
-    /// - `read_buffer_size`: usize. Size of the read buffer in bytes. Default: unset.
-    /// - `write_buffer_size`: usize. Size of the write buffer in bytes. Default: unset.
-    /// - `max_write_buffer_size`: usize. Maximum size of the write buffer in bytes. Default: unset.
-    /// - `max_message_size`: usize. Maximum accepted message size in bytes. Default: unset.
-    /// - `max_frame_size`: usize. Maximum accepted frame size in bytes. Default: unset.
+    /// - `read_buffer_size`: usize. Size of the read buffer in bytes. Default: `131072`.
+    /// - `write_buffer_size`: usize. Size of the write buffer in bytes. Default: `131072`.
+    /// - `max_write_buffer_size`: usize. Maximum size of the write buffer in bytes. Default: `usize::MAX`.
+    /// - `max_message_size`: usize. Maximum accepted message size in bytes. Default: `67108864`.
+    /// - `max_frame_size`: usize. Maximum accepted frame size in bytes. Default: `16777216`.
     /// - `accept_unmasked_frames`: bool. Accept/ decline unmasked frames. Default: `false`.
     /// - `tls`: `bool`. Enable/disbale TLS. Default: `false`.
     /// - `tls_domain`: string. Server name to validate the certificate against. Default: unset.
@@ -377,9 +385,9 @@ impl IggyClient {
     ///
     /// # fn run() -> Result<(), IggyError> {
     /// let client = IggyClient::builder_from_connection_string(
-    ///     "iggy+ws://user:secret@localhost:8090\
+    ///     "iggy+ws://user:secret@localhost:8092\
     ///      ?heartbeat_interval=5s&reconnection_retries=unlimited&reconnection_interval=1s&reestablish_after=5s\
-    ///      &read_buffer_size=131072&write_buffer_size=131072&max_write_buffer_size=131072\
+    ///      &read_buffer_size=131072&write_buffer_size=131072&\
     ///      &max_message_size=67108864&max_frame_size=16777216&accept_unmasked_frames=false\
     ///      &tls=true&tls_domain=localhost&tls_ca_file=/etc/iggy/ca.pem&tls_validate_certificate=true",
     /// )?
@@ -393,6 +401,7 @@ impl IggyClient {
     /// Returns [`IggyError::InvalidConnectionString`] if the connection string is malformed.
     ///
     /// [`IggyDuration`]: crate::prelude::IggyDuration
+    /// [`NonZeroIggyDuration`]: crate::prelude::NonZeroIggyDuration
     pub fn builder_from_connection_string(
         connection_string: &str,
     ) -> Result<IggyClientBuilder, IggyError> {
@@ -462,6 +471,7 @@ impl IggyClient {
     /// malformed.
     ///
     /// [`builder_from_connection_string`]: IggyClient::builder_from_connection_string
+    /// [`create`]: IggyClient::create
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
             TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
@@ -485,7 +495,7 @@ impl IggyClient {
     /// The partitioner picks the target partition for messages published without
     /// an explicit partition assigned to them. Note, that setting a [`Partitioner`] overrides a producer's
     /// [`Partitioning`](crate::prelude::Partitioning) the partition id is
-    /// computed client-side and the partitioning strategy is forced to [`PartitioningKind::PartitionID`] using the computed ID.
+    /// computed client-side and the partitioning strategy is forced to [`PartitioningKind::PartitionId`] using the computed ID.
     /// The encryptor encrypts payloads before they leave the client. Pass [`None`] for either to
     /// disable it, just as [`new`](IggyClient::new) does for both.
     ///
@@ -531,6 +541,7 @@ impl IggyClient {
     /// ```
     ///
     /// [`Partitioner`]: crate::prelude::Partitioner
+    /// [`PartitioningKind::PartitionId`]: iggy_common::PartitioningKind::PartitionId
     /// [`EncryptorKind`]: crate::prelude::EncryptorKind
     /// [`TcpClient`]: crate::prelude::TcpClient
     /// [`ClientWrapper`]: crate::prelude::ClientWrapper
@@ -624,6 +635,9 @@ impl IggyClient {
     ///
     /// Returns [`IggyError::InvalidIdentifier`] if `name`, `stream`, or `topic`
     /// is not a valid identifier.
+    ///
+    /// [`ConsumerKind::Consumer`]: crate::prelude::ConsumerKind::Consumer
+    /// [`IggyConsumer`]: crate::prelude::IggyConsumer
     pub fn consumer(
         &self,
         name: &str,
@@ -651,7 +665,11 @@ impl IggyClient {
     /// load-balanced group. The provided name identifies the group.
     /// Registers the member for every partition of `topic` in `stream`. The
     /// group then balances those partitions across its members, so each message is
-    /// delivered to exactly one member.
+    /// delivered to exactly one member. When consumers leave or join a group,
+    /// rebalancing (re-assigning consumers to partitions) might deliver messages again
+    /// in cases where they were polled, but the read did not commit yet.
+    /// Since the new consumer starts reading from the last commit, messages are delivered
+    /// at-least-once.
     ///
     /// For a consumer pinned to a single partition, use
     /// [`consumer`](IggyClient::consumer) instead.
@@ -689,6 +707,9 @@ impl IggyClient {
     ///
     /// Returns [`IggyError::InvalidIdentifier`] if `name`, `stream`, or `topic`
     /// is not a valid identifier.
+    ///
+    /// [`ConsumerKind::ConsumerGroup`]: crate::prelude::ConsumerKind::ConsumerGroup
+    /// [`IggyConsumer`]: crate::prelude::IggyConsumer
     pub fn consumer_group(
         &self,
         name: &str,
@@ -711,11 +732,8 @@ impl IggyClient {
     ///
     /// Copies the client and the encryptor registered with the [`IggyClient`]
     /// into a [`IggyProducerBuilder`] and returns it.
-    /// The [`Partitioner`] is applied by the client when messages are sent without
-    /// an explicit partition assigned to them. Note that, setting a [`Partitioner`] overrides the producer's
-    /// [`Partitioning`](crate::prelude::Partitioning). The partition id is
-    /// computed client-side and the partitioning strategy is forced to [`PartitioningKind::PartitionID`] using the computed id.
     ///
+    /// Binds a producer to the provided stream and topic.
     /// Refer to the [`IggyProducer`] type and the [`IggyProducerBuilder`]
     /// for details on how a producer can be configured.
     ///
@@ -756,6 +774,8 @@ impl IggyClient {
     ///
     /// Returns [`IggyError::InvalidIdentifier`] if `stream` or `topic` is not a
     /// valid identifier.
+    ///
+    /// [`IggyProducer`]: crate::prelude::IggyProducer
     pub fn producer(&self, stream: &str, topic: &str) -> Result<IggyProducerBuilder, IggyError> {
         Ok(IggyProducerBuilder::new(
             self.client.clone(),
@@ -879,7 +899,7 @@ impl IggyClient {
     /// let client = IggyClient::from_connection_string(
     ///     "iggy+http://user:secret@localhost:3000",
     /// )?;
-    /// client.connect().await?;
+    /// client.login_user("user", "password").await?;
     ///
     /// let response = client
     ///     .send_http_request(HttpMethod::Get, "/stats", None)

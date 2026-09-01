@@ -28,7 +28,7 @@ use std::{
 /// A type that defines a what strategy the server should choose to partition the messages.
 ///
 /// Iggy uses a hierarchical model for append-only logs. A stream contains topics which hold partitions. Each partition is an append-only log.[^note]
-/// A producer of messages such as an [`IggyProducer`], that appends messages to the log can choose between three partitioning strategies.
+/// A producer of messages such as an `IggyProducer`, that appends messages to the log can choose between three partitioning strategies.
 /// - `Balanced` - the partition ID is calculated by the server using the round-robin algorithm.
 /// - `MessagesKey` - the partition ID is calculated by the server using the hash of the provided messages key.
 /// - `PartitionId` - the partition ID is provided by the client.
@@ -37,6 +37,9 @@ use std::{
 /// based on your concrete implementation of [`Partitioner::calculate_partition_id()`].
 ///
 /// [^note]: [Website docs on how Iggy organizes data.](https://iggy.apache.org/docs/#how-iggy-organizes-data)
+///
+/// [`Partitioner`]: crate::Partitioner
+/// [`Partitioner::calculate_partition_id()`]: crate::Partitioner::calculate_partition_id
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub struct Partitioning {
@@ -167,7 +170,6 @@ impl Partitioning {
     }
 
     /// Maximum size of the Partitioning struct
-    /// NOTE(haubur) I think this can be removed as it seems to be superseded
     /// by implementing Sizeable/ get_size_bytes().
     #[doc(hidden)]
     pub const fn maximum_byte_size() -> usize {

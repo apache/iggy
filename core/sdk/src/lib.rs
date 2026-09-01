@@ -54,7 +54,7 @@
 //! - [`IggyClient`] is the entry point and the full API surface. It owns the
 //!   connection and implements every domain trait, including [`MessageClient`]
 //!   with the raw [`send_messages`] and [`poll_messages`] primitives. For both, each call
-//!   is a single, stateless request, i.e. there is no batching, retries, offset tracking,
+//!   ignores producer and consumer level policies, i.e. there is no batching, retries, offset tracking,
 //!   or polling loop.
 //! - [`IggyProducer`] exposes all configuration and functionality to produce (send)
 //!   messages to a specific topic in a stream. It shares the connection from the
@@ -88,10 +88,11 @@
 //!
 //! Only in **direct** mode:
 //! - **Chunking** splits an input larger than `batch_length` into several
-//!   requests, and `linger_time` sets a minimum delay between them.
+//!   requests.
+//! - **Spacing** applies `linger_time` between consecutive sends.
 //!
 //! Only in **background** mode:
-//! - **Batching** collects messages until the batch size in bytes, the message
+//! - **Batching** collects number of buffered sends until the batch size in bytes, the message
 //!   count, or the linger interval is reached, whichever comes first.
 //! - **Shard workers** run several send loops in parallel (`num_shards`), which
 //!   helps when one producer writes to several streams or topics.
@@ -146,9 +147,9 @@
 //! [`IggyProducerBuilder`] / [`IggyConsumerBuilder`] and setting each option
 //! with a method call, you describe the whole setup once in an
 //! [`IggyStreamConfig`] (or in a single [`IggyProducerConfig`] /
-//! [`IggyConsumerConfig`] when you only need one side) and build from it. The result is
-//! the same [`IggyProducer`] and [`IggyConsumer`] the builders produce, backed
-//! by the same [`IggyClient`].
+//! [`IggyConsumerConfig`] when you only need one side) and build from it.
+//! However, both provide a subset of available configurations only.
+//! If you need full control use the builders instead.
 //!
 //! # Low-level API
 //!
@@ -164,10 +165,6 @@
 //!   ([`TcpClient`], [`QuicClient`], and so on) instead of configuring a
 //!   transport-agnostic [`IggyClient`]. Swapping transports means swapping the
 //!   type, not changing a connection-string scheme.
-//! - **No managed connection.** [`IggyClient`] owns a shared connection and
-//!   spawns a heartbeat task to keep it alive. A transport client does neither.
-//!   You own the connection lifecycle and must ping the server
-//!   yourself if you want that liveness signal.
 //! - **No producer or consumer helpers.** [`IggyProducer`] and [`IggyConsumer`]
 //!   are spawned from an [`IggyClient`], so a raw transport client gives you no
 //!   background batching, retries, polling loop, auto-commit, consumer-group
