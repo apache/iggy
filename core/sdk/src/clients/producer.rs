@@ -566,9 +566,8 @@ unsafe impl Sync for IggyProducer {}
 /// if let Err(IggyError::ProducerSendFailed { cause, failed, committed, .. }) =
 ///     producer.send(messages).await
 /// {
-///     // `committed` contains confirmations returned for earlier chunks. `failed` is the
-///     // unconfirmed tail. Depending on `cause`, its first request may already have committed, so
-///     // resending it can create duplicates.
+///     // `committed` holds confirmations for earlier chunks, `failed` the unconfirmed tail. See
+///     // "Retrying and what a failure means" before resending `failed`.
 ///     eprintln!("{} messages have no usable confirmation: {cause}", failed.len());
 ///     eprintln!("{} chunk(s) were confirmed before the failure", committed.len());
 /// }
@@ -594,8 +593,8 @@ unsafe impl Sync for IggyProducer {}
 /// dispatcher runs [`BackgroundConfig::num_shards`] workers, each buffering the batches routed to it
 /// and flushing them when one of three limits is hit: [`BackgroundConfig::batch_length`] queued
 /// sends, [`BackgroundConfig::batch_size`] bytes, or the next
-/// [`BackgroundConfig::linger_time`] deadline. Buffered sends that share a stream, topic, and
-/// partitioning are merged into one request.
+/// [`BackgroundConfig::linger_time`] deadline. Adjacent buffered sends that share a stream, topic,
+/// and partitioning are merged into one request.
 ///
 /// The sharding strategy decides how background dispatch affects message order:
 /// - [`BackgroundConfig::sharding`] routes a batch to a worker. The default [`OrderedSharding`] picks
@@ -614,16 +613,15 @@ unsafe impl Sync for IggyProducer {}
 /// until it frees up (the default), block with a timeout and fail with
 /// [`IggyError::BackgroundSendTimeout`], or fail right away with
 /// [`IggyError::BackgroundSendBufferOverflow`]. A single send larger than the whole budget always
-/// fails with the latter, whatever the mode.
+/// fails with [`IggyError::BackgroundSendBufferOverflow`], whatever the mode.
 ///
 /// In contrast to the direct mode, which awaits the confirmations from the server, a background send
 /// has no caller left to return to. Write failures are reported to
 /// [`BackgroundConfig::error_callback`] instead. It receives the cause, the unconfirmed tail, and
-/// confirmations returned for earlier chunks. The first request in the unconfirmed tail may have
-/// committed before its response was lost or its confirmation failed to decode, so retrying it can
-/// create duplicates. The default callback logs the context and drops it. A custom
-/// [`ErrorCallback`] can retain or persist failed sends according to the application's at-least-once
-/// policy.
+/// confirmations returned for earlier chunks, see
+/// [Retrying and what a failure means](#retrying-and-what-a-failure-means). The default callback
+/// logs the context and drops it. A custom [`ErrorCallback`] can retain or persist failed sends
+/// according to the application's at-least-once policy.
 ///
 /// # Where messages land and ordering
 ///
@@ -676,12 +674,14 @@ unsafe impl Sync for IggyProducer {}
 /// A retry is the same request sent again unchanged, meaning a producer never rewrites, splits, or
 /// reorders a batch to retry a send. [`send_retries()`] sets how many times it may try and how
 /// later retries are paced. The default allows three retries and configures a one-second interval.
-/// The current interval timer fires immediately on its first tick, so the first retry is immediate
-/// and later retries are spaced by the interval. The retry policy applies to both direct and
-/// background producers.
+/// The first retry is immediate. Later retries wait for the next tick of an interval timer, so they
+/// are at most one interval apart, and an attempt that outlasts the interval is followed by the next
+/// one right away. Passing `None` as the interval retries back-to-back without any delay. The retry
+/// policy applies to both direct and background producers.
 ///
-/// A request can fail after the server has already appended it. Sending it again can therefore write
-/// the same messages twice, leaving the batch in the partition at multiple offsets. A consumer that
+/// A request can fail after the server has already appended it, so the first request of an
+/// unconfirmed tail may already be in the partition. Sending the tail again can therefore write the
+/// same messages twice, leaving the batch in the partition at multiple offsets. A consumer that
 /// cannot accept duplicates must recognize them itself.
 ///
 /// What is retried, and what is not:
@@ -692,7 +692,7 @@ unsafe impl Sync for IggyProducer {}
 /// | the request failed without an indication that it committed | yes, the identical request is sent again | the confirmation of the attempt that finally succeeds, or the last error once the retry budget is spent |
 /// | the batch committed, but its confirmation could not be read ([`IggyError::InvalidBytesResponse`] or [`IggyError::InvalidJsonResponse`], raised on the HTTP transport only) | no | the write did happen and retrying would duplicate it on purpose |
 /// | encrypting or partitioning the batch failed | no | that cause, with the whole batch returned as unconfirmed because nothing was sent, although earlier messages may already have been encrypted in place |
-/// | [`send_retries()`] passed `None` or `0` | no | the outcome of the single attempt |
+/// | [`send_retries()`] passed `None` or `0` | no | the outcome of the single attempt, which skips the sign-in check above and fails with the transport error when the client is disconnected |
 ///
 /// To be precise: the budget is spent per request. Every chunk of a split is a request that gets its own retry budget.
 /// Also, waiting for the client to sign in is counted separately from retrying the write itself.
@@ -703,11 +703,9 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// - A **direct** send returns them to the caller as [`IggyError::ProducerSendFailed`]. `committed`
 ///   contains confirmations returned for earlier chunks, while `failed` is the unconfirmed tail.
-///   Inspect `cause` before resending it. A request can commit before its response is lost, so the
-///   first request in that tail may already have committed and resending can duplicate messages.
-///   Encryption mutates messages before sending or partitioning, so `failed` contains encrypted
-///   messages when an encryptor is configured. Passing them back to the same producer would encrypt
-///   them again.
+///   Inspect `cause` before resending it. Encryption mutates messages before sending or
+///   partitioning, so `failed` contains encrypted messages when an encryptor is configured. Passing
+///   them back to the same producer would encrypt them again.
 /// - A **background** send returned to its caller long before the write, so they go to
 ///   [`BackgroundConfig::error_callback`] as an
 ///   [`ErrorCtx`](crate::clients::producer_error_callback::ErrorCtx) instead, once no further
@@ -761,7 +759,6 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// [`IggyClient`]: crate::clients::client::IggyClient
 /// [`IggyClient::producer()`]: crate::clients::client::IggyClient::producer
-/// [`IggyConsumer`]: crate::clients::consumer::IggyConsumer
 /// [`IggyProducerBuilder`]: crate::clients::producer_builder::IggyProducerBuilder
 /// [`BackgroundConfig`]: crate::clients::producer_config::BackgroundConfig
 /// [`BackgroundConfig::batch_length`]: crate::clients::producer_config::BackgroundConfig::batch_length
@@ -867,9 +864,11 @@ impl IggyProducer {
     ///
     /// Initialization ensures that:
     /// - The producer subscribes to client [`DiagnosticEvent`] values and tracks whether sending is
-    ///   currently allowed. Sending is enabled only while the client is signed in. A connection
-    ///   without an authenticated session is not enough. Connect, disconnect, sign-out, and shutdown
-    ///   events all disable sending until another sign-in event arrives.
+    ///   currently allowed. The gate starts open and follows the events observed after this call:
+    ///   connect, disconnect, sign-out, and shutdown close it, and only a sign-in reopens it. It is
+    ///   checked only when
+    ///   [`send_retries()`](crate::clients::producer_builder::IggyProducerBuilder::send_retries)
+    ///   allows at least one retry.
     /// - the stream exists, creating it when `create_stream_if_not_exists` is set (the default).
     /// - the topic exists, creating it when `create_topic_if_not_exists` is set (the default), with
     ///   the partitions count, message expiry and max size passed to
@@ -934,9 +933,9 @@ impl IggyProducer {
     /// [`IggyError::ProducerClosed`] after [`shutdown()`](Self::shutdown),
     /// [`IggyError::BackgroundSendBufferOverflow`] or [`IggyError::BackgroundSendTimeout`] under
     /// back pressure, and [`IggyError::BackgroundSendError`] when a worker is gone. A batch larger
-    /// than [`max_buffer_size`] always fails with the former, however idle the producer is. Failures
-    /// of the write itself reach [`error_callback`] instead, which drops the messages unless it is
-    /// implemented to keep them.
+    /// than [`max_buffer_size`] always fails with [`IggyError::BackgroundSendBufferOverflow`],
+    /// however idle the producer is. Failures of the write itself reach [`error_callback`] instead,
+    /// which drops the messages unless it is implemented to keep them.
     ///
     /// [`BackpressureMode::Block`]: crate::clients::producer_config::BackpressureMode::Block
     /// [`error_callback`]: crate::clients::producer_config::BackgroundConfig::error_callback
@@ -1042,8 +1041,10 @@ impl IggyProducer {
     /// Shuts the producer down.
     ///
     /// For a background producer, this drains the dispatcher queues, flushes the remaining shard
-    /// buffers, waits for writes and error callbacks to finish, and then returns. Dropping a
-    /// background producer instead provides no such guarantee and can lose buffered messages.
+    /// buffers, waits for writes and error callbacks to finish, and then returns. Stop every sender
+    /// first: a send racing the shutdown can be queued after the drain and is lost without an error.
+    /// Dropping a background producer instead provides no such guarantee and can lose buffered
+    /// messages.
     ///
     /// A direct producer has nothing buffered, so calling `shutdown()` is a no-op.
     pub async fn shutdown(self) {

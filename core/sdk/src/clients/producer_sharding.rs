@@ -167,9 +167,6 @@ impl ShardMessageWithPermit {
 /// [`ProducerDispatcher`](crate::clients::producer_dispatcher::ProducerDispatcher),
 /// together with the channel (queue) that feeds it.
 ///
-/// Shards are owned and handled by the [`ProducerDispatcher`]. If the dispatcher can do everything
-/// you want, there is no need to handle them directly.
-///
 /// Each shard owns a task that buffers sends routed to it, merges adjacent sends that share a
 /// destination, and writes them through [`ProducerCoreBackend::send_internal`].
 ///
@@ -190,7 +187,8 @@ impl ShardMessageWithPermit {
 ///   another send before a flush check.
 /// - **The stop broadcast** sent by the dispatcher on shutdown. Marks the shard closed
 ///   so later sends fail with [`IggyError::ProducerClosed`], drains what is still
-///   queued, flushes once, then ends the loop.
+///   queued, flushes once, then ends the loop. A send that races the stop signal can be queued
+///   after that drain and is lost without an error.
 ///   Dropping the [`ProducerDispatcher`] instead of shutting it down provides no completion
 ///   guarantee and can lose buffered messages.
 ///

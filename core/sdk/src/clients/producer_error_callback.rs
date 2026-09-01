@@ -74,14 +74,9 @@ pub struct ErrorCtx {
     pub topic_name: String,
     /// Per-send partitioning override, or `None` when the producer configuration was used.
     pub partitioning: Option<Arc<Partitioning>>,
-    /// Unconfirmed tail of the send.
-    ///
-    /// Depending on [`Self::cause`], its first request may have committed even though no usable
-    /// confirmation reached the producer. Retrying this collection can therefore create duplicates.
-    /// When the producer uses an encryptor, these messages have already been encrypted in place.
+    /// Unconfirmed tail of the send, see [`ErrorCtx`] for what resending it means.
     pub messages: Arc<Vec<IggyMessage>>,
-    /// Confirmations returned for chunks before the failure. `messages` is the unconfirmed tail,
-    /// which may include a committed request when its confirmation could not be decoded.
+    /// Confirmations returned for chunks before the failure.
     pub committed: Arc<Vec<SendMessagesConfirmationResponse>>,
 }
 
@@ -101,7 +96,9 @@ pub struct ErrorCtx {
 /// - It runs on its own task rather than on a shard worker, so awaiting it does not stall batching.
 ///   Calls are serialized. One failure is handled at a time, and the unbounded error channel can
 ///   grow while a callback is slow.
-/// - A panic inside it is caught and logged, and the next failure is still delivered.
+/// - A panic inside the returned future is caught and logged, and the next failure is still
+///   delivered. A panic in [`call()`](Self::call) itself, before the future is returned, ends the
+///   error task, and every later failure is dropped silently.
 /// - `Send + Sync + Debug + 'static` is required because the dispatcher's task owns the callback for
 ///   the producer's lifetime and [`BackgroundConfig`] implements [`Debug`].
 ///
@@ -148,12 +145,14 @@ pub struct ErrorCtx {
 ///     }
 /// }
 ///
+/// # async fn example() {
 /// let (failures, receiver) = tokio::sync::mpsc::unbounded_channel();
 /// tokio::spawn(drain(receiver));
 ///
 /// let config = BackgroundConfig::builder()
 ///     .error_callback(Arc::new(Box::new(FailedMessages { failures })))
 ///     .build();
+/// # }
 /// ```
 ///
 /// [`BackgroundConfig`]: crate::clients::producer_config::BackgroundConfig

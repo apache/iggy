@@ -78,7 +78,8 @@ pub enum BackpressureMode {
 ///
 /// `0` disables the [`batch_size`](Self::batch_size) and
 /// [`batch_length`](Self::batch_length) flush thresholds. A zero
-/// [`linger_time`](Self::linger_time) schedules immediate flush checks. A zero
+/// [`linger_time`](Self::linger_time) keeps the flush deadline always due, so each worker task spins
+/// and burns a core. Keep it above zero. A zero
 /// [`max_buffer_size`](Self::max_buffer_size) is treated as unbounded. A zero
 /// [`max_in_flight`](Self::max_in_flight) uses `Semaphore::MAX_PERMITS`, and a zero
 /// [`num_shards`](Self::num_shards) is read as one worker.
@@ -133,7 +134,8 @@ pub struct BackgroundConfig {
     /// empty.
     /// A worker flushes as soon as any of `linger_time`, [`batch_length`](Self::batch_length) or
     /// [`batch_size`](Self::batch_size) is reached. Lowering it reduces the time the write is delayed
-    /// at the price of smaller writes.
+    /// at the price of smaller writes. `0` makes the worker spin, see
+    /// [Zero values](BackgroundConfig#zero-values).
     ///
     /// Note that [`IggyDuration::from`] reads a plain number as **microseconds**, so the default of
     /// `1000` is 1 ms.
@@ -144,9 +146,7 @@ pub struct BackgroundConfig {
     /// The dispatcher runs one task that owns this callback. A worker invokes it with an [`ErrorCtx`]
     /// when its backend returns [`IggyError::ProducerSendFailed`]. Other error variants from a custom
     /// backend are logged by the worker without invoking this callback. The context contains the
-    /// cause, destination, unconfirmed tail, and
-    /// confirmations returned for earlier chunks. A request can commit before its response is lost,
-    /// so retrying the unconfirmed tail can create duplicates.
+    /// cause, destination, unconfirmed tail, and confirmations returned for earlier chunks.
     ///
     /// The default [`LogErrorCallback`] logs the failure and drops the messages with the context.
     /// Implement [`ErrorCallback`] with your own logic to keep them.
@@ -222,10 +222,7 @@ pub struct BackgroundConfig {
 ///
 /// A send that fails part way through returns [`IggyError::ProducerSendFailed`], where `committed`
 /// holds the confirmations returned for earlier requests and `failed` holds the unconfirmed tail.
-/// A request can commit before its response is lost, leaving it in `failed` even though the server
-/// accepted it. Resending that tail is therefore an at-least-once operation and may create
-/// duplicates. Encryption mutates messages before sending, so `failed` contains encrypted messages
-/// when an encryptor is configured and must not be passed back through the same producer unchanged.
+/// See [`send()`] for what resending that tail means.
 ///
 /// # Examples
 ///
