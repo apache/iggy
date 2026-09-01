@@ -20,7 +20,7 @@ use compio::io::AsyncWriteAtExt;
 use iggy_common::IggyError;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::trace;
+use tracing::{error, trace};
 
 #[derive(Debug)]
 pub struct IggyIndexWriter {
@@ -35,7 +35,8 @@ impl IggyIndexWriter {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be opened, synchronized, or queried for metadata.
+    /// Returns an error if the file cannot be opened, synchronized, or queried for
+    /// metadata, or if the on-disk length does not match the seeded size counter.
     pub async fn new(
         file_path: &str,
         index_size_bytes: Rc<AtomicU64>,
@@ -63,7 +64,21 @@ impl IggyIndexWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            index_size_bytes.store(actual_index_size, Ordering::Relaxed);
+            // Refusal rationale documented on `IggyError::SegmentSizeMismatchAtOpen`.
+            let expected_index_size = index_size_bytes.load(Ordering::Relaxed);
+            if actual_index_size != expected_index_size {
+                error!(
+                    target: "iggy.partitions.storage",
+                    file = file_path,
+                    on_disk_size = actual_index_size,
+                    expected_size = expected_index_size,
+                    "sparse index file size does not match the seeded size at open"
+                );
+                return Err(IggyError::SegmentSizeMismatchAtOpen(
+                    actual_index_size,
+                    expected_index_size,
+                ));
+            }
         }
 
         let size = index_size_bytes.load(Ordering::Relaxed);
@@ -82,14 +97,17 @@ impl IggyIndexWriter {
         })
     }
 
-    /// Appends encoded sparse index bytes to the backing file.
+    /// Appends encoded sparse index bytes at the current write cursor and
+    /// returns how many bytes landed. The cursor is left where it was: the
+    /// caller advances it with `advance` once the companion segment save has
+    /// also succeeded.
     ///
     /// # Errors
     ///
     /// Returns an error if the index bytes cannot be written or synced to disk.
-    pub async fn save_indexes(&self, indexes: Vec<u8>) -> Result<(), IggyError> {
+    pub(crate) async fn save_indexes(&self, indexes: Vec<u8>) -> Result<u64, IggyError> {
         if indexes.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let len = indexes.len();
@@ -100,9 +118,6 @@ impl IggyIndexWriter {
             .await
             .0
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
-
-        self.index_size_bytes
-            .fetch_add(len as u64, Ordering::Release);
 
         if self.fsync {
             self.fsync().await?;
@@ -115,7 +130,14 @@ impl IggyIndexWriter {
             position,
             "saved sparse index bytes to file"
         );
-        Ok(())
+        Ok(len as u64)
+    }
+
+    /// Move the write cursor forward over `bytes` that are now durable. Split
+    /// out of the save so the index and segment cursors advance together, only
+    /// once both halves have succeeded.
+    pub(crate) fn advance(&self, bytes: u64) {
+        self.index_size_bytes.fetch_add(bytes, Ordering::Release);
     }
 
     /// Flushes buffered index file contents to disk.
@@ -133,5 +155,31 @@ impl IggyIndexWriter {
             .await
             .map_err(|_| IggyError::CannotWriteToFile)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[compio::test]
+    async fn given_seeded_size_diverging_from_disk_when_opening_existing_file_should_return_size_mismatch_error()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("segment.index");
+        std::fs::write(&path, [7u8; 96]).unwrap();
+
+        let result = IggyIndexWriter::new(
+            path.to_str().unwrap(),
+            Rc::new(AtomicU64::new(32)),
+            false,
+            true,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(IggyError::SegmentSizeMismatchAtOpen(96, 32))
+        ));
     }
 }

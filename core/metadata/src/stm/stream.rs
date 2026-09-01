@@ -89,6 +89,10 @@ pub struct PartitionSnapshot {
     /// `#[serde(default)]` so pre-purge snapshots restore at 0.
     #[serde(default)]
     pub purge_generation: u64,
+    /// `#[serde(default)]` so snapshots predating this field restore at 0, the
+    /// view every group started in before it existed.
+    #[serde(default)]
+    pub created_view: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +105,15 @@ pub struct Partition {
     /// reused the slab key, so the local partition is stale and must be torn
     /// down before rebuild.
     pub created_revision: u64,
+    /// View the admitting primary minted the create in, read off the request
+    /// body (never the prepare header, whose `view` a post-view-change
+    /// retransmit restamps per delivery). Every replica seeds the partition's
+    /// consensus group from it, so they all name the same primary: the metadata
+    /// primary at creation, which is what the roster advertises. Never above
+    /// the group's current view, since the group starts here and views only
+    /// climb, so a replica materialising late joins at or below its peers, the
+    /// floor a view-0 start used to be.
+    pub created_view: u32,
     /// Replicated delete watermark: the reconciler on every replica removes
     /// sealed segments with `end_offset` below this. Advanced monotonically by
     /// `TruncatePartition` (the resolved form of a client `DeleteSegments`).
@@ -123,12 +136,14 @@ impl Partition {
         consensus_group_id: u64,
         created_at: IggyTimestamp,
         created_revision: u64,
+        created_view: u32,
     ) -> Self {
         Self {
             id,
             consensus_group_id,
             created_at,
             created_revision,
+            created_view,
             deleted_up_to_offset: 0,
             purge_generation: 0,
         }
@@ -1363,6 +1378,22 @@ impl Streams {
     /// nothing in the type enforces that density.
     #[must_use]
     pub fn created_revision_for_namespace(&self, namespace: IggyNamespace) -> Option<u64> {
+        self.with_committed_partition(namespace, |partition| partition.created_revision)
+    }
+
+    /// Committed [`Partition::created_view`] for the exact partition the
+    /// `namespace` tuple denotes; resolved like
+    /// [`Self::created_revision_for_namespace`].
+    #[must_use]
+    pub fn created_view_for_namespace(&self, namespace: IggyNamespace) -> Option<u32> {
+        self.with_committed_partition(namespace, |partition| partition.created_view)
+    }
+
+    fn with_committed_partition<T>(
+        &self,
+        namespace: IggyNamespace,
+        read: impl FnOnce(&Partition) -> T,
+    ) -> Option<T> {
         self.inner.read(|inner| {
             let stream = inner.items.get(namespace.stream_id())?;
             let topic = stream.topics.get(namespace.topic_id())?;
@@ -1370,13 +1401,13 @@ impl Streams {
             if let Some(partition) = topic.partitions.get(partition_id)
                 && partition.id == partition_id
             {
-                return Some(partition.created_revision);
+                return Some(read(partition));
             }
             topic
                 .partitions
                 .iter()
                 .find(|partition| partition.id == partition_id)
-                .map(|partition| partition.created_revision)
+                .map(read)
         })
     }
 
@@ -1408,6 +1439,7 @@ impl Streams {
         stream_slab: usize,
         topic_slab: usize,
         target_partitions: &[CreatedPartitionAssignment],
+        created_view: u32,
     ) {
         let stream_wire =
             WireIdentifier::numeric(u32::try_from(stream_slab).expect("sim stream slab fits u32"));
@@ -1439,6 +1471,7 @@ impl Streams {
                         },
                         derived_options: WireOptions::empty(),
                         partitions,
+                        created_view,
                     },
                     IggyTimestamp::from(1),
                 ))
@@ -1458,12 +1491,20 @@ impl Streams {
     /// the missing partition. Mirrors [`Users::ensure_root_user`](crate::stm::user::Users::ensure_root_user): a seed
     /// helper that bypasses consensus, never a production runtime path.
     ///
+    /// `created_view` stands in for the view a real create's admitting primary
+    /// mints into the request body; see [`Partition::created_view`].
+    ///
     /// # Panics
     /// Panics if the apply is attempted on a reader handle rather than the
     /// writer (never for the simulator's writer-backed STM), or if a slab id
     /// exceeds the `u32` wire identifier space.
     #[cfg(any(test, feature = "simulator"))]
-    pub fn seed_namespace(&self, namespace: IggyNamespace, consensus_group_id: u64) {
+    pub fn seed_namespace(
+        &self,
+        namespace: IggyNamespace,
+        consensus_group_id: u64,
+        created_view: u32,
+    ) {
         let stream_slab = namespace.stream_id();
         let topic_slab = namespace.topic_id();
         let partition_id =
@@ -1496,7 +1537,7 @@ impl Streams {
             })
             .collect();
         self.seed_stream_slabs(stream_slab);
-        self.seed_topic_slabs(stream_slab, topic_slab, &target_partitions);
+        self.seed_topic_slabs(stream_slab, topic_slab, &target_partitions, created_view);
 
         if self.created_revision_for_namespace(namespace).is_some() {
             return;
@@ -1529,6 +1570,7 @@ impl Streams {
                             .expect("sim partition count fits u32"),
                     },
                     partitions,
+                    created_view,
                 },
                 IggyTimestamp::from(1),
             ))
@@ -1850,6 +1892,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                     consensus_group_id: partition.consensus_group_id,
                     created_at: timestamp,
                     created_revision: new_revision,
+                    created_view: self.created_view,
                     deleted_up_to_offset: 0,
                     purge_generation: 0,
                 };
@@ -2140,6 +2183,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 consensus_group_id: partition.consensus_group_id,
                 created_at: timestamp,
                 created_revision: new_revision,
+                created_view: self.created_view,
                 deleted_up_to_offset: 0,
                 purge_generation: 0,
             });
@@ -2247,6 +2291,7 @@ impl Snapshotable for Streams {
                                             consensus_group_id: p.consensus_group_id,
                                             created_at: p.created_at,
                                             created_revision: p.created_revision,
+                                            created_view: p.created_view,
                                             deleted_up_to_offset: p.deleted_up_to_offset,
                                             purge_generation: p.purge_generation,
                                         })
@@ -2365,6 +2410,7 @@ impl StreamsInner {
                             consensus_group_id: p.consensus_group_id,
                             created_at: p.created_at,
                             created_revision: p.created_revision,
+                            created_view: p.created_view,
                             deleted_up_to_offset: p.deleted_up_to_offset,
                             purge_generation: p.purge_generation,
                         })
@@ -2489,6 +2535,7 @@ mod tests {
             ..TopicCreateOptions::default()
         };
         let request = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
@@ -2521,6 +2568,51 @@ mod tests {
             !topic.options.get(&size_key).unwrap().explicit,
             "derived key is marked derived"
         );
+    }
+
+    /// The seed every replica materialises a group from is the body-carried
+    /// `created_view`, minted once by the admitting primary. A header-derived
+    /// view would differ per replica after a post-view-change retransmit.
+    #[test]
+    fn create_ops_record_the_body_carried_view_on_the_partition() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 7,
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("t").unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 1,
+            }],
+        };
+        let reply = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::from(1));
+        assert_eq!(reply.code, 0, "create topic must succeed");
+
+        let create_partitions = CreatePartitionsWithAssignmentsRequest {
+            created_view: 9,
+            request: CreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            },
+            partitions: vec![CreatedPartitionAssignment {
+                partition_id: 0,
+                consensus_group_id: 2,
+            }],
+        };
+        let reply = StateHandler::apply(&create_partitions, &mut inner, IggyTimestamp::from(2));
+        assert_eq!(reply.code, 0, "create partitions must succeed");
+
+        let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
+        assert_eq!(topic.partitions[0].created_view, 7);
+        assert_eq!(topic.partitions[1].created_view, 9);
     }
 
     /// A client may send the literal 0 that means "resolve the default". The
@@ -2558,6 +2650,7 @@ mod tests {
             &mut sentinel,
         );
         let request = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
@@ -2656,6 +2749,7 @@ mod tests {
         for stream_id in 0..2u32 {
             for topic_name in ["logs", "events"] {
                 let create_topic = CreateTopicWithAssignmentsRequest {
+                    created_view: 0,
                     request: make_topic_request(stream_id, 2, topic_name),
                     derived_options: WireOptions::empty(),
                     partitions: vec![
@@ -2724,6 +2818,7 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 2, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![
@@ -2752,6 +2847,7 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 2, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![
@@ -2768,6 +2864,7 @@ mod tests {
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
 
         let create_partitions = CreatePartitionsWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -2807,6 +2904,7 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 2, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![
@@ -2841,6 +2939,7 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 2, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![
@@ -2857,6 +2956,7 @@ mod tests {
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
 
         let create_partitions = CreatePartitionsWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -2894,6 +2994,7 @@ mod tests {
         create_stream(&mut inner, "stream");
         // Topic missing => validation failure path
         let create_partitions = CreatePartitionsWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(99),
@@ -2936,6 +3037,7 @@ mod tests {
             let mut inner = StreamsInner::new();
             create_stream(&mut inner, "stream");
             let create_topic = CreateTopicWithAssignmentsRequest {
+                created_view: 0,
                 request: make_topic_request(0, partitions_count, "topic"),
                 derived_options: WireOptions::empty(),
                 partitions: (0..partitions_count)
@@ -2991,6 +3093,7 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "stream");
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 1, "topic"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
@@ -3090,6 +3193,7 @@ mod tests {
     fn given_counted_partitions_when_apply_purge_stream_should_zero_every_topic() {
         let mut inner = inner_with_registered_partition();
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 1, "metrics"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
@@ -3188,6 +3292,7 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "alpha");
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 1, "logs"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
@@ -3302,6 +3407,7 @@ mod tests {
         let mut inner = StreamsInner::new();
         create_stream(&mut inner, "alpha");
         let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 1, "logs"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
@@ -3396,6 +3502,7 @@ mod tests {
 
         for index in 0..MAX_TOPICS {
             let request = CreateTopicWithAssignmentsRequest {
+                created_view: 0,
                 request: make_topic_request(0, 0, &format!("t{index}")),
                 derived_options: WireOptions::empty(),
                 partitions: Vec::new(),
@@ -3405,6 +3512,7 @@ mod tests {
         }
 
         let overflow = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 0, "one-too-many"),
             derived_options: WireOptions::empty(),
             partitions: Vec::new(),
@@ -3434,6 +3542,7 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let seed = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 1, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
@@ -3448,6 +3557,7 @@ mod tests {
 
         // Resolves to MAX_PARTITIONS - 1: the last legal id.
         let last = CreatePartitionsWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -3465,6 +3575,7 @@ mod tests {
         );
 
         let overflow = CreatePartitionsWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -3496,6 +3607,7 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let request = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 1, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
@@ -3567,6 +3679,7 @@ mod tests {
         create_stream(&mut inner, "s");
         for name in ["a", "b", "c"] {
             let request = CreateTopicWithAssignmentsRequest {
+                created_view: 0,
                 request: make_topic_request(0, 0, name),
                 derived_options: WireOptions::empty(),
                 partitions: Vec::new(),
@@ -3625,6 +3738,7 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let request = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 2, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![
@@ -3659,6 +3773,7 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let seed = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 1, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
@@ -3672,6 +3787,7 @@ mod tests {
         );
 
         let duplicate = CreatePartitionsWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
@@ -3710,6 +3826,7 @@ mod tests {
         create_stream(&mut inner, "s");
 
         let seed = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: make_topic_request(0, 1, "t"),
             derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
@@ -3723,6 +3840,7 @@ mod tests {
         );
 
         let distinct = CreatePartitionsWithAssignmentsRequest {
+            created_view: 0,
             request: WireCreatePartitionsRequest {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),

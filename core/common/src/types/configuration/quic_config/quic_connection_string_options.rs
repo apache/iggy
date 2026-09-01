@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionStringOptions, IggyDuration, IggyError, QuicClientReconnectionConfig};
+use crate::{
+    ConnectionStringOptions, IggyDuration, IggyError, NonZeroIggyDuration,
+    QuicClientReconnectionConfig,
+};
 use std::str::FromStr;
 
 #[derive(Debug)]
@@ -30,7 +33,7 @@ pub struct QuicConnectionStringOptions {
     keep_alive_interval: u64,
     max_idle_timeout: u64,
     validate_certificate: bool,
-    heartbeat_interval: IggyDuration,
+    heartbeat_interval: NonZeroIggyDuration,
 }
 
 impl QuicConnectionStringOptions {
@@ -80,7 +83,7 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
         self.reconnection.max_retries
     }
 
-    fn heartbeat_interval(&self) -> IggyDuration {
+    fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
 
@@ -203,13 +206,13 @@ impl ConnectionStringOptions for QuicConnectionStringOptions {
                         .map_err(|_| IggyError::InvalidNumberValue)?,
                 ),
             },
-            interval: IggyDuration::from_str(reconnection_interval.as_str())
+            interval: NonZeroIggyDuration::from_str(reconnection_interval.as_str())
                 .map_err(|_| IggyError::InvalidConnectionString)?,
             reestablish_after: IggyDuration::from_str(reconnection_reestablish_after.as_str())
                 .map_err(|_| IggyError::InvalidConnectionString)?,
         };
 
-        let heartbeat_interval = IggyDuration::from_str(heartbeat_interval.as_str())
+        let heartbeat_interval = NonZeroIggyDuration::from_str(heartbeat_interval.as_str())
             .map_err(|_| IggyError::InvalidConnectionString)?;
 
         let connection_string_options = QuicConnectionStringOptions::new(
@@ -243,7 +246,7 @@ impl QuicConnectionStringOptions {
         keep_alive_interval: u64,
         max_idle_timeout: u64,
         validate_certificate: bool,
-        heartbeat_interval: IggyDuration,
+        heartbeat_interval: NonZeroIggyDuration,
     ) -> Self {
         Self {
             reconnection,
@@ -274,7 +277,7 @@ impl Default for QuicConnectionStringOptions {
             keep_alive_interval: 5000,
             max_idle_timeout: 10000,
             validate_certificate: false,
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
+            heartbeat_interval: NonZeroIggyDuration::from_str("5s").unwrap(),
         }
     }
 }

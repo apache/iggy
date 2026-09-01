@@ -28,6 +28,16 @@ cleaner_enabled = true
 # Interval for running the message cleaner.
 interval = "1 m"
 
+# This node's own client-facing identity, used when 'cluster.enabled' is false.
+[node]
+# A literal IP or a DNS hostname, without a port. Named to match its roster
+# counterpart 'cluster.nodes.advertised_address', which answers the same
+# question per node. The unspecified address ("0.0.0.0", "::") is rejected: it
+# is the bind address's answer to a question clients are not asking. Commented
+# out here because the shipped 'tcp.address' binds a concrete address and needs
+# no declaration.
+#advertised_address = "broker-1.example.com"
+
 # HTTP server configuration
 [http]
 # Determines if the HTTP server is active.
@@ -48,6 +58,12 @@ enabled = true
 address = "127.0.0.1:3000"
 
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
+# HTTP produce requests are not framed by the message bus, so this body cap is
+# what bounds the widest batch record the HTTP path can persist. Boot refuses a
+# value above the frozen 256 MiB recovery ceiling (see
+# message_bus.max_message_size), and a body above message_bus.max_message_size
+# can still admit a batch that no peer accepts a replication frame for -- keep
+# this at or below that cap unless replica_count = 1.
 max_request_size = "2 MB"
 
 # Enables the embedded Web UI dashboard at '/ui'.
@@ -437,9 +453,14 @@ path = "partitions"
 validate_checksum = true
 
 # Durability and flush cadence are per topic, set at CreateTopic:
-#   enforce_fsync                     - fsync each write (false when unset)
+#   enforce_fsync                     - fdatasync each flush (false when unset)
 #   messages_required_to_save         - flush after this many messages (1024)
 #   size_of_messages_required_to_save - flush after this many bytes (1 MiB)
+# enforce_fsync decides whether a flush syncs, never whether one happens. A
+# write is acknowledged when it commits, which precedes its flush unless that
+# commit trips a threshold, and the partition journal holding the unflushed
+# remainder is in memory and is not replayed at boot. Acks are therefore
+# durability-gated only at messages_required_to_save = 1.
 
 # Segment configuration
 [system.segment]
@@ -462,6 +483,90 @@ archive_expired = false
 # Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).
 # Unsupported: setting this to `true` aborts boot.
 recreate_missing_state = false
+
+# At boot, segment recovery walks each partition's segments: bytes after the
+# last decodable batch of a genuinely torn tail are physically truncated from
+# the .log/.index files. Every index entry is derived from a batch the log
+# already held, so an index is never evidence about the log: one the log
+# contradicts is repaired, not believed. It is DROPPED whole and rebuilt from
+# a byte-0 walk when it holds no whole 24-byte entry, when its entries
+# regress in offset or position, when an entry does not match the log batch's
+# offset, timestamp, partition and position, when its first entry is not the
+# segment's own start offset at position 0, or when the log cannot back its
+# LAST entry. Only an index whose
+# last entry the log proves anchors a walk, which then runs from that entry
+# to the file end. Under the topic's enforce_fsync = true an index the log
+# cannot back is measured against the log first: a gap of more than ONE entry
+# refuses the partition instead of rebuilding, because fsync lets the index
+# outrun the log by at most the chunk in flight at the crash, so a wider gap
+# is previously durable data the log lost.
+#
+# The byte-0 walk is deliberately not narrowed to the entries the log still
+# proves. An anchor picked that way can sit ABOVE damage, and the residue
+# probe only ever looks forward from where a walk stopped, so a hole under
+# the anchor would go unread while end_offset still advertised the offsets
+# over it. Reaching that branch means the index and the log already disagree,
+# so the extra bytes read are bounded by the segments a crash actually tore.
+#
+# Every batch a walk accepts passes its own checksum. With enforce_fsync =
+# false, the index only locates data because page-cache writeback can preserve
+# a later log page while losing an earlier one, so recovery walks every segment
+# from byte 0. A clean walk preserves the existing index and performs no disk
+# mutation. With enforce_fsync = true, completed serialized log fdatasyncs
+# prove the prefix before the last index entry, so a healthy boot starts at
+# that last entry and leaves earlier at-rest damage to the read path's
+# validate_checksum. Wherever a recovery walk finds damage, it truncates only
+# when nothing decodable follows and refuses when something does.
+#
+# The non-fsync verification pass therefore reads and checksums every log byte
+# at boot, although it keeps a clean index in place. A byte-0 repair walk also
+# rebuilds a missing or contradicted index durably, adding two fsyncs per
+# repaired segment. Either path can take minutes over thousands of segments.
+# A restore that dropped every .index repairs every segment; an ordinary
+# fsynced crash usually repairs only its tail segment. A slow boot is therefore
+# not by itself evidence of a stall. Before, the repair shapes refused boot.
+#
+# Either walk refuses a verifying batch whose base offset does not continue
+# the chain, or whose partition_id stamp is not this partition's. The one
+# exception is the first batch at an index-derived anchor: the offset it
+# fails to match is the ENTRY's, not the log's, so a mismatch there breaks
+# the walk as a stale entry, leaving the verdict to the byte-0 rebuild. A
+# batch that fails its own checksum is damage rather than data
+# whatever its fields claim: the walk stops there and the residue goes
+# through the damage probe like any other torn tail, so a bit flip in a tail
+# batch's offset truncates instead of refusing the partition, regardless of
+# the flip's direction.
+#
+# Damage in the middle of a segment is never silently truncated: the
+# partition is refused, as is trailing residue whose verification cost
+# exhausts the probe's residue-derived work budgets while walked batches
+# exist (residue after a walk that proved nothing recovers the segment as
+# empty instead, fencing the file pair aside whole). With peer replicas the
+# refused files are moved to a .fenced.N directory beside the partition,
+# which is rebuilt empty and refilled from a peer. With replica_count = 1
+# there is no peer, so nothing is moved and nothing is rebuilt: the refused
+# files stay at their original paths, the partition is tombstoned (unrouted,
+# clients get the retriable transient status, never an empty poll that would
+# read as a healthy empty partition), and the same refusal is re-derived and
+# re-logged on every boot. The tombstone lifts in exactly two ways: a
+# chain-shape refusal whose planned chain provably holds ZERO recoverable
+# bytes rebuilds through .fenced.N at boot, and deleting the
+# stream/topic/partition removes the refused files and clears the fence, so
+# a recreate of the same ids starts clean. One refusal is not durable: a
+# length divergence found when a writer reopens a file recovery just
+# truncated clears on the next boot, so that tombstone lasts only for the
+# life of the process.
+#
+# .fenced.N has a second producer, on a partition that recovers FINE: a tail
+# segment holding bytes that decode to nothing anywhere is moved there and
+# the segment recovered empty, so the partition serves without those bytes.
+# One fresh directory per such segment, so .fenced.0, .fenced.1, ... can
+# accumulate under a healthy partition. .fenced.N alone therefore does not
+# mean a partition was refused -- grep the boot log for "refusing the
+# recovered segment chain", which names the directory and the reason.
+#
+# The metadata WAL truncates genuinely torn tails too; interior WAL damage
+# or oversized trailing bytes refuse boot instead.
 
 # Memory pool configuration
 [system.memory_pool]
@@ -617,9 +722,9 @@ key_file = ""
 # PEM trust anchor(s) the dialer verifies peer certificates against.
 # Unused when self_signed = true.
 # The dialer verifies each peer against the 'ip' string from that peer's
-# cluster.nodes entry, so a roster of literal IPs needs peer certificates
-# carrying matching IP SANs. Hostname-only certificates fail verification;
-# use hostnames in the roster if the certificates only have DNS SANs.
+# cluster.nodes entry, and that string is the TLS server name as well as a
+# literal IP, so every peer certificate needs a matching IP SAN. A
+# certificate carrying only DNS SANs fails verification.
 ca_file = ""
 
 # Shard-0 coordinator placement.
@@ -693,7 +798,7 @@ skip_shard_zero_for_clients = false
 #
 #   [[cluster.nodes]]
 #   name = "iggy-node-1"
-#   ip = "10.0.1.5"                        # replica plane + last-resort fallback
+#   ip = "10.0.1.5"                        # replica plane, literal IP only
 #   advertised_address = "203.0.113.10"    # catch-all for unmatched clients
 #   replica_id = 0
 #   ports = { tcp = 8090, http = 3000, tcp_replica = 9090 }
@@ -855,7 +960,9 @@ prepare_queue_depth = 32
 # Size of the metadata WAL's in-memory index, in slots (one committed but
 # not-yet-snapshotted op per slot). Larger values buy more headroom
 # between forced checkpoints at the cost of memory and bigger WAL
-# rewrites per checkpoint.
+# rewrites per checkpoint. Reducing this for an existing data directory is
+# refused at boot if the live WAL suffix collides in the smaller index;
+# restore the previous value to recover.
 journal_slots = 1024
 
 # Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS
@@ -920,10 +1027,11 @@ transfer_served_cache_bytes_max = "2176 MiB"
 #
 # The shipped value sits EXACTLY at that floor: 1024 MiB + the shipped 64 MiB
 # max_message_size. Raising max_message_size alone therefore refuses boot --
-# raise this one by the same amount in the same edit. Raising it above the floor
-# for headroom also DIVIDES the serving concurrency derived from
-# transfer_served_cache_bytes_max above, so raise that in step. Must be > 0 and
-# <= "64 GiB".
+# raise this one by the same amount in the same edit (max_message_size itself
+# tops out at the frozen 256 MiB recovery ceiling; see its own note). Raising
+# this above the floor for headroom also DIVIDES the serving concurrency
+# derived from transfer_served_cache_bytes_max above, so raise that in step.
+# Must be > 0 and <= "64 GiB".
 transfer_artifact_bytes_max = "1088 MiB"
 
 # Message bus configuration.
@@ -938,7 +1046,11 @@ transfer_artifact_bytes_max = "1088 MiB"
 # call. Hard upper bound: IOV_MAX/2 = 512 on Linux.
 max_batch = 256
 
-# Wire-level cap on a single framed message.
+# Wire-level cap on a single framed message. Boot refuses a value above the
+# frozen 256 MiB ceiling: segment recovery derives fixed scan and allocation
+# limits from the widest LEGAL record, so batches admitted above the ceiling
+# would be refused as implausible on a later boot. Raising it past 64 MiB
+# also breaks Go clients, whose frame cap is a hard 64 MiB constant.
 max_message_size = "64 MiB"
 
 # Bound on the per-peer mpsc queue. The writer task drains; the

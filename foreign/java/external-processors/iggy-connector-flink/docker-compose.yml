@@ -26,6 +26,7 @@ services:
       - "3000:3000"  # HTTP API / Web UI
     environment:
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_NODE_ADVERTISED_ADDRESS=iggy
       - IGGY_HTTP_ADDRESS=0.0.0.0:3000
       - IGGY_QUIC_ADDRESS=0.0.0.0:8080
       - IGGY_SYSTEM_LOGGING_LEVEL=info

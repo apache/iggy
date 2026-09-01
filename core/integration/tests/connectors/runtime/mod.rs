@@ -18,3 +18,4 @@
 mod benchmark;
 mod error_isolation;
 mod offset_commit;
+mod http_state;

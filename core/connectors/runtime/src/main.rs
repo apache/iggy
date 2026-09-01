@@ -142,9 +142,7 @@ async fn main() -> Result<(), RuntimeError> {
 
     log::init_logging(&config.telemetry, &config.logging, VERSION);
 
-    std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
-
-    info!("State will be stored in: {}", config.state.path);
+    let state_factory = state::factory_from_config(&config.state)?;
 
     let iggy_clients = Arc::new(stream::init(config.iggy.clone()).await?);
 
@@ -161,7 +159,7 @@ async fn main() -> Result<(), RuntimeError> {
     let (sources, failed_sources) = source::init(
         sources_config.clone(),
         &iggy_clients.producer,
-        &config.state.path,
+        &state_factory,
     )
     .await?;
 
@@ -208,7 +206,7 @@ async fn main() -> Result<(), RuntimeError> {
         &failed_sources,
         connectors_config_provider,
         iggy_clients.clone(),
-        config.state.path.clone(),
+        state_factory,
     );
     for (key, container) in sink_containers_by_key {
         if let Some(details) = context.sinks.get(&key).await {

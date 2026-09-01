@@ -16,7 +16,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
 # Function to extract the version number from the commit message using regular expressions
 function extract_version {
   local commit_message="$1"

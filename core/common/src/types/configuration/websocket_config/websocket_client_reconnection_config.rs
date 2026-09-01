@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::IggyDuration;
+use crate::{IggyDuration, NonZeroIggyDuration};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -33,7 +33,7 @@ pub struct WebSocketClientReconnectionConfig {
     /// The maximum number of retries. If None, will retry infinitely.
     pub max_retries: Option<u32>,
     /// The interval between retries.
-    pub interval: IggyDuration,
+    pub interval: NonZeroIggyDuration,
     /// The time to wait before attempting to reestablish connection.
     pub reestablish_after: IggyDuration,
 }
@@ -43,7 +43,7 @@ impl Default for WebSocketClientReconnectionConfig {
         WebSocketClientReconnectionConfig {
             enabled: true,
             max_retries: None,
-            interval: IggyDuration::from_str("1s").unwrap(),
+            interval: NonZeroIggyDuration::from_str("1s").unwrap(),
             reestablish_after: IggyDuration::from_str("5s").unwrap(),
         }
     }

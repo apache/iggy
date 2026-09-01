@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::auth::warm_dummy_password_hash;
-use crate::cluster_meta::ClusterRoster;
+use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes, self_advertised_address};
 use crate::config_writer::write_current_config;
 use crate::dispatch::{
     make_client_request_handler, make_deferred_client_request_handler,
@@ -29,16 +29,23 @@ use crate::partition_helpers::{
     open_partition_superblock,
 };
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
-use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
+use crate::server_error::{
+    PartitionRecoveryRefusal, ServerError, ShardJoinFailure, ShardJoinFailureKind,
+};
 use crate::session_manager::SessionManager;
+use crate::shard_allocator::{ShardAllocator, ShardInfo};
+use crate::shell::{
+    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ServerShard, ShellBus,
+    ShellHandlers, ShellShardHandle, consensus_timers, repair_retry_ticks,
+};
 use compio::runtime::ResumeUnwind;
 use configs::server::{ServerConfig, ServerSystemConfig};
 use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
 use consensus::{
-    ClientTable, ConsensusTimers, JoinMode, LocalPipeline, MetadataHandle, PartitionsHandle,
-    PipelineEntry, Sequencer, VsrConsensus, VsrRestore,
+    ClientTable, JoinMode, LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry,
+    Sequencer, VsrConsensus, VsrRestore,
 };
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
@@ -51,7 +58,7 @@ use iggy_common::defaults::{
     MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use iggy_common::{
-    Aes256GcmEncryptor, EncryptorKind, IggyByteSize, PartitionStats, TopicRuntimeOptions, variadic,
+    Aes256GcmEncryptor, EncryptorKind, IggyByteSize, IggyError, PartitionStats, TopicRuntimeOptions,
 };
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
@@ -62,7 +69,7 @@ use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::auth::{self, ReplicaAuth};
 use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
 use message_bus::replica::io as replica_io;
-use message_bus::replica::listener::{self as replica_listener, MessageHandler};
+use message_bus::replica::listener::{self as replica_listener};
 use message_bus::transports::quic::server_config_with_cert;
 use message_bus::transports::tls::{
     AcceptAnyServerCert, REPLICA_ALPN, TlsServerCredentials, install_default_crypto_provider,
@@ -73,17 +80,13 @@ use message_bus::{
     AcceptedWsClientFn, AcceptedWssClientFn, ConnectionInstaller, DialedReplicaFn, IggyMessageBus,
     MAX_INFLIGHT_REPLICA_HANDSHAKES, MessageBus, ReplicaOwnerTable, connector,
 };
-use metadata::IggyMetadata;
-use metadata::MuxStateMachine;
 use metadata::ReplicaIdentity;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::impls::recovery::recover;
-use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
-use metadata::stm::stream::{Partition, Streams};
-use metadata::stm::user::Users;
+use metadata::stm::stream::Partition;
 use partitions::{
-    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
+    FatalCommit, IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
 };
 use rustls::pki_types::ServerName;
 use server_common::Message;
@@ -97,18 +100,16 @@ use shard::builder::IggyShardBuilder;
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
-    CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
-    PartitionConsensusConfig, PartitionReadHandler, Receiver as ShardReceiver, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_mesh_channels,
+    CoordinatorConfig, LifecycleFrame, PartitionConsensusConfig, Receiver as ShardReceiver,
+    ShardFrame, ShardIdentity, TaggedSender, channel, shard_mesh_channels,
 };
-use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -119,76 +120,6 @@ const SHARD_REPLICA_ID: u8 = 0;
 
 pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
 pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
-
-type ServerMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
-
-/// Cross-thread bundle carrying one `ReadHandleFactory` per metadata
-/// state. Shard 0 mints one after `recover()` and broadcasts a clone to
-/// every peer shard; each peer rebuilds a reader-mode
-/// [`ServerMuxStateMachine`] on its own runtime, skipping the WAL.
-type ServerMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
-
-pub(crate) type ServerMetadata = IggyMetadata<
-    VsrConsensus<Rc<IggyMessageBus>>,
-    PrepareJournal,
-    IggySnapshot,
-    ServerMuxStateMachine,
->;
-
-/// The shard type the dispatch layer is generic over.
-///
-/// `B`/`MJ`/`S`/`SB` are free; the metadata state machine (`M`) and shards
-/// table (`T`) are pinned, being identical in production and the simulator.
-/// Production instantiates it as [`ServerShard`], defaulting `SB` to the
-/// on-disk [`PingPongSuperblock`]; the simulator supplies its own
-/// `B`/`MJ`/`S`/`SB`.
-pub type ShellShard<B, MJ, S, SB = PingPongSuperblock> =
-    IggyShard<B, MJ, S, ServerMuxStateMachine, PapayaShardsTable, SB>;
-
-/// Late-bound self-reference the deferred dispatch handlers upgrade per frame.
-pub type ShellShardHandle<B, MJ, S, SB = PingPongSuperblock> =
-    Rc<RefCell<Option<Weak<ShellShard<B, MJ, S, SB>>>>>;
-
-/// Bus bounds the dispatch/pump path needs (matches `run_message_pump`).
-/// Blanket-impl'd, so it is only shorthand for the four underlying bounds.
-pub trait ShellBus: MessageBus + ConnectionInstaller + Clone + 'static {}
-impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
-
-/// The five dispatch handlers a shard is built with, plus the
-/// [`SessionManager`] the request-plane pair shares.
-///
-/// Both production (`build_shard_for_thread`) and the simulator's shell
-/// mode construct these through [`wire_shell_handlers`], so the request
-/// plane is wired one way. The simulator's shell-off fast path uses
-/// [`ShellHandlers::noop`] instead.
-pub struct ShellHandlers {
-    pub on_replica_message: MessageHandler,
-    pub on_client_request: RequestHandler,
-    pub on_metadata_submit: MetadataSubmitHandler,
-    pub on_list_clients: ListClientsHandler,
-    pub on_partition_read: PartitionReadHandler,
-    /// Bound by the client-request handler, read by the get-clients
-    /// handler; the caller keeps it to reach locally-homed sessions.
-    pub sessions: Rc<RefCell<SessionManager>>,
-}
-
-impl ShellHandlers {
-    /// Inert handlers for the shell-off fast path: every callback is a
-    /// no-op over an empty [`SessionManager`]. Behaviorally identical to
-    /// hand-written no-op closures, so a caller can keep one destructure
-    /// site across both toggle states.
-    #[must_use]
-    pub fn noop() -> Self {
-        Self {
-            on_replica_message: Rc::new(|_, _| {}),
-            on_client_request: Rc::new(|_, _| {}),
-            on_metadata_submit: Rc::new(|_| {}),
-            on_list_clients: Rc::new(|_| {}),
-            on_partition_read: Rc::new(|_, _, _| {}),
-            sessions: Rc::new(RefCell::new(SessionManager::new())),
-        }
-    }
-}
 
 /// Build the deferred dispatch handlers for `shard_handle` against `bus`.
 ///
@@ -224,8 +155,6 @@ where
         sessions,
     }
 }
-
-pub type ServerShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>;
 
 /// Result of a multi-shard bootstrap.
 ///
@@ -724,7 +653,7 @@ fn validate_sharding_runtime_knobs(
 /// `(senders, inboxes)` channels, and spawns one OS thread per shard.
 ///
 /// Each thread pins itself (`nix::sched::sched_setaffinity` on Linux via
-/// [`ShardInfo::bind_cpu`]), binds memory to its NUMA node when
+/// `ShardInfo::bind_cpu`), binds memory to its NUMA node when
 /// configured, builds a fresh `compio::runtime::Runtime` (one
 /// `io_uring` instance per shard), and runs `shard_main` inside it.
 ///
@@ -1049,10 +978,10 @@ async fn shard_main(
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
-                |mux_stm, client, timestamp| {
+                |mux_stm, client, stamp| {
                     mux_stm
                         .streams()
-                        .remove_consumer_group_member(client, timestamp);
+                        .remove_consumer_group_member(client, stamp);
                 },
             )
             .await
@@ -1268,8 +1197,23 @@ async fn shard_main(
     // tracked pump would be cancelled by runtime teardown mid final-flush
     // and every graceful shutdown would silently drop the committed journal
     // tail that had not hit a flush threshold yet.
+    let pump_shutdown_flag = Arc::clone(&shutdown_flag_for_handoff);
     let mut pump_handle = Some(compio::runtime::spawn(async move {
-        pump_shard.run_message_pump(stop_rx).await;
+        // The pump itself flips the shared flag when a commit fault stops it,
+        // BEFORE its final flush, so a flush stalling on the failed device
+        // still reaches the watchdog and the bounded drain. Every sibling
+        // shard's watchdog drives its own graceful stop off the same flag;
+        // this shard's watchdog is what fires the token `shard_main` is
+        // parked on. The store below backstops the one fault the pump can
+        // only observe after that flip: a partition fenced by the final
+        // flush itself.
+        let fatal = pump_shard
+            .run_message_pump(stop_rx, Arc::clone(&pump_shutdown_flag))
+            .await;
+        if fatal.is_some() {
+            pump_shutdown_flag.store(true, Ordering::Relaxed);
+        }
+        fatal
     }));
 
     let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
@@ -1509,7 +1453,7 @@ async fn shard_main(
 /// wrapper alone cannot see it, and a shard that swallows it prints
 /// "exited cleanly" over a corpse.
 async fn await_pump_drain(
-    pump_handle: Option<compio::runtime::JoinHandle<()>>,
+    pump_handle: Option<compio::runtime::JoinHandle<Option<FatalCommit>>>,
     config: &ServerConfig,
     shard_id: u16,
 ) -> Result<(), ServerError> {
@@ -1537,7 +1481,26 @@ async fn await_pump_drain(
     // reaches the tracing sink too.
     let reason = match panic::catch_unwind(panic::AssertUnwindSafe(|| join_result.resume_unwind()))
     {
-        Ok(Some(())) => return Ok(()),
+        Ok(Some(None)) => return Ok(()),
+        // The pump drained and flushed; it just has nothing left to serve.
+        // Fail the shard so the process exits non-zero: a node that stopped
+        // because it could not persist a cluster-committed op must not look
+        // to an orchestrator like a clean shutdown.
+        Ok(Some(Some(fault))) => {
+            error!(
+                shard = shard_id,
+                namespace_raw = fault.namespace_raw,
+                op = fault.op,
+                operation = ?fault.operation,
+                "message pump stopped on a partition commit fault; \
+                 the server is shutting down"
+            );
+            return Err(ServerError::ShardFatal {
+                shard_id,
+                namespace_raw: fault.namespace_raw,
+                op: fault.op,
+            });
+        }
         Ok(None) => "task was cancelled".to_string(),
         Err(payload) => payload
             .downcast_ref::<&str>()
@@ -1748,32 +1711,44 @@ fn spawn_shutdown_watchdog(
 /// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
 /// the real topology. `self_*` back only the cluster-disabled self-synthesis
 /// and carry the requested listener ports from the resolved topology, not the
-/// bound ones (a `:0` wildcard is reported as 0).
+/// bound ones (a `:0` wildcard is reported as 0). The self address resolves
+/// through [`self_advertised_address`], which boot validation has already
+/// guaranteed names somewhere a client can dial.
 fn build_cluster_roster(
+    shard_id: u16,
     config: &ServerConfig,
     topology: &TcpTopology,
     metadata_view: Arc<AtomicU64>,
-) -> ClusterRoster {
-    ClusterRoster {
+) -> Result<ClusterRoster, ServerError> {
+    let declared = config.node.advertised_address.as_deref();
+    let self_advertised = self_advertised_address(declared, derived_bind_ip(topology, config));
+    // The roster answers this per node, so a value here would be read by
+    // nobody. Silence would leave the operator believing it took effect.
+    // Every shard builds its own roster off the same config, so keep the
+    // operator-facing explanation to one line per process.
+    if declared.is_some() && config.cluster.enabled && shard_id == 0 {
+        warn!(
+            "node.advertised_address is set but cluster.enabled is true, so it is ignored; \
+             the client-facing address of each node comes from its cluster.nodes entry"
+        );
+    }
+    Ok(ClusterRoster {
         enabled: config.cluster.enabled,
         name: config.cluster.name.clone(),
-        nodes: config
-            .cluster
-            .nodes
-            .iter()
-            .cloned()
-            .map(Into::into)
-            .collect(),
-        self_ip: topology.client_listen_addr.ip().to_string(),
+        nodes: resolved_roster_nodes(&config.cluster).map_err(ServerError::Config)?,
+        self_advertised,
         self_ports: configs::cluster::TransportPorts {
-            tcp: Some(topology.client_listen_addr.port()),
+            tcp: config
+                .tcp
+                .enabled
+                .then(|| topology.client_listen_addr.port()),
             quic: topology.quic_listen_addr.map(|addr| addr.port()),
             http: topology.http_listen_addr.map(|addr| addr.port()),
             websocket: topology.ws_listen_addr.map(|addr| addr.port()),
             tcp_replica: None,
         },
         metadata_view,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1911,23 +1886,83 @@ async fn build_shard_for_thread(
         {
             Ok(partition) => partition,
             // ONE damaged local chain must not take the node down. The shapes
-            // this refuses are exactly what a failed state-transfer quarantine
-            // leaves behind, so fence that group the same way the runtime path
-            // does -- move its segment files aside, keeping the superblock so it
-            // cannot re-enter view 0 -- and materialise it fresh. The ordinary
+            // this refuses are structural -- what a failed state-transfer
+            // quarantine leaves behind, or damage the recovery walk proved
+            // inside a segment. What follows depends on whether a peer can
+            // restore the data. With peers, the segment files are fenced
+            // aside (keeping the superblock so the group cannot re-enter
+            // view 0), the group is materialised fresh, and the ordinary
             // rejoin path (repair, then state transfer on a refused floor)
-            // recovers its data from a peer.
-            Err(ServerError::PartitionChainRefused { dir, reason, .. }) => {
+            // refills it. Single-replica, only a chain-shape refusal whose
+            // planned chain provably holds ZERO recoverable bytes still
+            // fences and rebuilds: nothing servable is at stake, so an empty
+            // rebuild hides no loss. The verdict variant alone is not that
+            // evidence -- a hole and an orphan empty segment both fire over
+            // fully populated chains -- which is why the gate reads the byte
+            // total the refusal carries. Every other refusal tombstones,
+            // leaving its files exactly where they are: a rebuilt empty
+            // partition answers polls exactly like a healthy empty one and
+            // hides the loss, while an unrouted namespace is a failure an
+            // operator can see.
+            Err(ServerError::PartitionRecoveryRefused { dir, reason, .. }) => {
                 let partition_dir = dir.to_string_lossy().into_owned();
+                let rebuild_for_rejoin = topology.replica_count > 1
+                    || matches!(
+                        reason,
+                        PartitionRecoveryRefusal::Hole {
+                            recoverable_bytes: 0,
+                            ..
+                        } | PartitionRecoveryRefusal::EmptyNonTailSegment {
+                            recoverable_bytes: 0,
+                            ..
+                        }
+                    );
                 error!(
                     stream_id,
                     topic_id,
                     partition_id = partition_metadata.id,
                     partition_dir,
                     %reason,
-                    "refusing the recovered segment chain; fencing this partition and \
-                     rebuilding it empty for the rejoin path"
+                    "refusing the recovered segment chain"
                 );
+                // A pass-A refusal folded nothing into the stats (recovery
+                // counts only accepted chains), but the hydrate-reopen refusal
+                // arrives after a fully counted load, so clear them either way.
+                partition_stats.zero_out_all();
+                if !rebuild_for_rejoin {
+                    // No quarantine here, mirroring the superblock arm below:
+                    // a tombstone is only durable if its cause is. Fencing the
+                    // chain aside would leave the next boot zero segments to
+                    // walk, so it would re-seed from the surviving superblock,
+                    // plant a fresh segment, and serve the partition empty
+                    // with no refusal logged. Left at their real paths, the
+                    // same files re-derive this verdict (and this log line)
+                    // every boot, and the reconciler's tombstone gate keeps
+                    // the namespace away from a fresh build, whose
+                    // initial-segment open would truncate the oldest refused
+                    // segment in place. The one refusal whose cause is NOT
+                    // durable is `StorageSizeMismatch`: it fires from the
+                    // reopen right after recovery truncated the same file, so
+                    // the next boot re-walks the already-truncated bytes and,
+                    // unless the length diverges again, accepts the chain
+                    // instead of re-tombstoning -- acceptable for an
+                    // assertion that the filesystem lied about a length.
+                    // `%reason` repeated on purpose: this is the line an
+                    // operator greps to enumerate dark partitions, so it has
+                    // to carry the verdict on its own.
+                    error!(
+                        stream_id,
+                        topic_id,
+                        partition_id = partition_metadata.id,
+                        partition_dir,
+                        %reason,
+                        "no peer replica holds this partition's data; leaving the refused \
+                         segment files in place and tombstoning it instead of serving it \
+                         empty"
+                    );
+                    partitions.tombstone(namespace);
+                    continue;
+                }
                 match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
                     Ok(fenced_dir) => error!(
                         stream_id,
@@ -1958,13 +1993,10 @@ async fn build_shard_for_thread(
                             "failed to quarantine the refused segment files; leaving this \
                              partition tombstoned rather than rebuilding over them"
                         );
-                        partition_stats.zero_out_all();
                         partitions.tombstone(namespace);
                         continue;
                     }
                 }
-                // The refused load already folded its segment counts in.
-                partition_stats.zero_out_all();
                 build_partition_fresh(
                     config,
                     namespace,
@@ -1974,6 +2006,7 @@ async fn build_shard_for_thread(
                     topology.cluster_id,
                     topology.self_replica_id,
                     topology.replica_count,
+                    partition_metadata.created_view,
                     Rc::clone(&bus),
                 )
                 .await?
@@ -2035,10 +2068,11 @@ async fn build_shard_for_thread(
     sessions
         .borrow_mut()
         .set_cluster_roster(Rc::new(build_cluster_roster(
+            shard_id,
             config,
             topology,
             metadata_view,
-        )));
+        )?));
     let shard_name = format!("server-shard-{shard_id}");
     let built = IggyShardBuilder::new(
         ShardIdentity::new(shard_id, shard_name),
@@ -2147,13 +2181,6 @@ const _: () =
 const _: () =
     assert!(consensus::DVC_HEADERS_MAX == iggy_binary_protocol::consensus::DVC_HEADERS_MAX);
 const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
-/// Convert a consensus-timer interval to whole ticks, floored at one tick so a
-/// sub-tick value still fires and saturated on overflow.
-fn duration_to_ticks(interval: Duration) -> u64 {
-    let ticks = interval.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis();
-    u64::try_from(ticks.max(1)).unwrap_or(u64::MAX)
-}
-
 /// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count.
 /// Retries pin at the backoff cap after warmup, so the window divided by
 /// [`journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS`] bounds how
@@ -2174,14 +2201,6 @@ fn superblock_window_to_failures(window: Duration) -> u64 {
     }
     let cap_micros = u128::from(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
     u64::try_from((window.as_micros() / cap_micros).max(1)).unwrap_or(u64::MAX)
-}
-
-/// `[cluster] heartbeat_timeout` in consensus ticks. Every consensus group
-/// (metadata and per-partition planes alike) gets the same window: the failure
-/// it guards against - a primary that stopped heartbeating - is host-level, not
-/// per-plane.
-pub(crate) fn cluster_heartbeat_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.heartbeat_timeout.get_duration())
 }
 
 /// Floor for the post-restart read-recovery deadline (see
@@ -2217,76 +2236,6 @@ pub(crate) fn recovery_barrier_deadline(
         .saturating_mul(RECOVERY_BARRIER_MULTIPLIER)
         .max(view_change_status.saturating_mul(RECOVERY_BARRIER_MULTIPLIER))
         .max(RECOVERY_BARRIER_DEADLINE_FLOOR)
-}
-
-/// `[cluster] commit_broadcast_interval` in consensus ticks: how often the
-/// primary broadcasts its commit point, the cluster's liveness feed. Applied
-/// to every consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn commit_broadcast_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.commit_broadcast_interval.get_duration())
-}
-
-/// `[cluster] prepare_retransmit_interval` in consensus ticks: how often the
-/// primary retransmits un-acked prepares. Applied to every consensus group,
-/// matching `cluster_heartbeat_ticks`.
-pub(crate) fn prepare_retransmit_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.prepare_retransmit_interval.get_duration())
-}
-
-/// `[cluster] view_change_retransmit_interval` in consensus ticks: how often a
-/// replica retransmits its `StartViewChange` / `DoViewChange` during a view
-/// change. Applied to every consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn view_change_retransmit_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(
-        config
-            .cluster
-            .view_change_retransmit_interval
-            .get_duration(),
-    )
-}
-
-/// `[cluster] view_change_status_timeout` in consensus ticks: the stalled
-/// view-change backstop before escalating to a fresh election. Applied to every
-/// consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn view_change_status_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.view_change_status_timeout.get_duration())
-}
-
-/// `[cluster] request_start_view_retransmit_interval` in consensus ticks: how
-/// often a recovering or view-change backup re-requests the current `StartView`.
-/// Applied to every consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn request_start_view_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(
-        config
-            .cluster
-            .request_start_view_retransmit_interval
-            .get_duration(),
-    )
-}
-
-/// The full `[cluster]` timer set every consensus group boots with, built
-/// once so the planes cannot diverge in what they apply.
-pub(crate) fn consensus_timers(config: &ServerConfig) -> ConsensusTimers {
-    ConsensusTimers {
-        normal_heartbeat_ticks: cluster_heartbeat_ticks(config),
-        commit_message_ticks: commit_broadcast_ticks(config),
-        prepare_ticks: prepare_retransmit_ticks(config),
-        view_change_retransmit_ticks: view_change_retransmit_ticks(config),
-        view_change_status_ticks: view_change_status_ticks(config),
-        request_start_view_ticks: request_start_view_ticks(config),
-        probe_attempts_max: config.cluster.view_probe_attempts_max,
-    }
-}
-
-/// `[cluster] repair_retry_interval` in consensus ticks: how long a stalled
-/// journal-repair stream waits before re-requesting its window. Both planes'
-/// repair loops share it, so it is applied once per shard (not per consensus
-/// group). Clamped to `u32`, the width of the session idle-tick counter.
-pub(crate) fn repair_retry_ticks(config: &ServerConfig) -> u32 {
-    u32::try_from(duration_to_ticks(
-        config.cluster.repair_retry_interval.get_duration(),
-    ))
-    .unwrap_or(u32::MAX)
 }
 
 /// Shard 0's half of a metadata recovery: everything [`recover`] produced except the
@@ -2388,6 +2337,9 @@ fn restore_metadata_consensus(
             // re-derives, and it re-probes as a backup.
             durable_view: recovered_state.map(|state| (state.view, state.log_view)),
             view_fallback: last_header.map(|header| header.view),
+            // Metadata, not a partition group: it has a journal to infer from
+            // and no second plane to line up with.
+            seed_view: None,
             // Fresh random incarnation each boot, so a StartView addressed to
             // a previous incarnation still in flight is ignored
             // (`handle_start_view` guard). `| 1` guarantees the non-zero the
@@ -2481,6 +2433,10 @@ fn restore_metadata_consensus(
 /// Recover this partition's persisted segment chain, stamping each segment
 /// with the topic's effective segment size (the per-topic value when the
 /// topic was created with one, else the shard-wide configured size).
+///
+/// The topic's effective `enforce_fsync` goes in for the same reason: it is
+/// what tells recovery whether a durable index entry the log cannot back is a
+/// benign torn index or previously durable data the log lost.
 async fn recover_partition_segments(
     config: &ServerConfig,
     namespace: IggyNamespace,
@@ -2493,12 +2449,16 @@ async fn recover_partition_segments(
     let segment_size = runtime_options
         .segment_size
         .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let enforce_fsync = runtime_options
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     load_persisted_segments(
         config,
         stream_id,
         topic_id,
         partition_id,
         segment_size,
+        enforce_fsync,
         stats,
     )
     .await
@@ -2579,6 +2539,7 @@ async fn load_partition(
                 .as_ref()
                 .map(|state| (state.view, state.log_view)),
             view_fallback: None,
+            seed_view: None,
             incarnation: None,
             join,
         },
@@ -2605,13 +2566,14 @@ async fn load_partition(
         config.partition.evicted_ring_capacity,
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
-    partition.set_partition_dir(partition_dir);
+    partition.set_partition_dir(partition_dir.clone());
     // Before the hydrate: the durable record is keyed by incarnation, so a
     // `purge.gen` left behind by a previous life of this namespace reads 0.
     partition.set_created_revision(partition_metadata.created_revision);
     partition.hydrate_applied_purge_generation().await?;
     hydrate_partition_log(
         &mut partition,
+        &partition_dir,
         stream_id,
         topic_id,
         partition_id,
@@ -2677,6 +2639,7 @@ async fn load_partition(
 /// resolved topic option now, which is the whole point of the per-topic move.
 async fn hydrate_partition_log(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    partition_dir: &str,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
@@ -2716,9 +2679,10 @@ async fn hydrate_partition_log(
             storage.index_writer.as_ref(),
         ) {
             let index_path = index_reader.path();
-            // Share the storage's size counters: the readers bound reads by
-            // these atomics, so a writer with a private counter persists bytes
-            // the readers never learn about.
+            let start_offset = partition.log.segments()[active_index].start_offset;
+            // Share the storage's size counters: they are the write cursors.
+            // A private counter would let the append position diverge from the
+            // segment bookkeeping that index entries and poll bounds rely on.
             let messages_size_counter = storage_messages_writer.size_counter();
             let index_size_counter = storage_index_writer.size_counter();
             partition.log.messages_writers_mut()[active_index] = Some(Rc::new(
@@ -2739,7 +2703,14 @@ async fn hydrate_partition_log(
                         error = %source,
                         "failed to initialize persisted messages writer"
                     );
-                    source
+                    hydrate_reopen_error(
+                        source,
+                        partition_dir,
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        start_offset,
+                    )
                 })?,
             ));
             partition.log.index_writers_mut()[active_index] = Some(Rc::new(
@@ -2754,13 +2725,56 @@ async fn hydrate_partition_log(
                             error = %source,
                             "failed to initialize persisted sparse index writer"
                         );
-                        source
+                        hydrate_reopen_error(
+                            source,
+                            partition_dir,
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            start_offset,
+                        )
                     })?,
             ));
         }
     }
 
     Ok(())
+}
+
+/// Routes a hydrate-reopen writer failure. The seed-vs-stat divergence guard
+/// (`SegmentSizeMismatchAtOpen`) is a post-condition assertion on recovery's
+/// own truncation: pass C truncates every file to its recovered size before
+/// storage and writers reopen it, so the guard can only fire if the
+/// filesystem lied about a length or a change broke that truncate-then-open
+/// contract. Kept as defense-in-depth and routed as a structural refusal
+/// because a retried boot cannot help. Every other failure here (open, stat,
+/// sync) is transient I/O and stays node-fatal: a retried boot can still
+/// serve the partition, while fencing would quarantine healthy data (and at
+/// `replica_count = 1` tombstone the partition outright).
+fn hydrate_reopen_error(
+    source: IggyError,
+    partition_dir: &str,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+    start_offset: u64,
+) -> ServerError {
+    match source {
+        IggyError::SegmentSizeMismatchAtOpen(on_disk_bytes, expected_bytes) => {
+            ServerError::PartitionRecoveryRefused {
+                dir: PathBuf::from(partition_dir),
+                stream_id,
+                topic_id,
+                partition_id,
+                reason: PartitionRecoveryRefusal::StorageSizeMismatch {
+                    start_offset,
+                    on_disk_bytes,
+                    expected_bytes,
+                },
+            }
+        }
+        transient => transient.into(),
+    }
 }
 
 fn resolve_tcp_topology(
@@ -2960,15 +2974,75 @@ fn merge_roster_port_with_bind_ip(
     listen_addr
 }
 
+/// The client-facing listeners paired with the config key naming their bind
+/// address, in the order [`ServerConfig::client_listeners`] derives the
+/// published client-facing address from them. `None` marks a listener that is
+/// switched off and therefore binds nothing.
+fn client_listeners(
+    topology: &TcpTopology,
+    config: &ServerConfig,
+) -> [(&'static str, Option<SocketAddr>); 4] {
+    [
+        (
+            "tcp.address",
+            config.tcp.enabled.then_some(topology.client_listen_addr),
+        ),
+        ("websocket.address", topology.ws_listen_addr),
+        ("quic.address", topology.quic_listen_addr),
+        ("http.address", topology.http_listen_addr),
+    ]
+}
+
+/// The bind interface the published client-facing address names when none is
+/// declared: the first enabled listener's, the same one boot validation gated
+/// its wildcard refusal on. With every client listener off nothing dials this
+/// node, so the tcp bind address stands in for an answer no client reads.
+fn derived_bind_ip(topology: &TcpTopology, config: &ServerConfig) -> IpAddr {
+    client_listeners(topology, config)
+        .into_iter()
+        .find_map(|(_, listen_addr)| listen_addr)
+        .unwrap_or(topology.client_listen_addr)
+        .ip()
+}
+
+/// Whether the address cluster metadata publishes for this node misses one of
+/// its own listeners. Only a derived address is judged: it names one
+/// listener's bind interface, so a listener on a different one is unreachable
+/// at the published address. A declared `node.advertised_address` is
+/// deliberate (NAT, a public name) and says nothing about which local
+/// interface serves a transport, so it stays quiet.
+fn derived_address_misses_listener(
+    declared: Option<&str>,
+    self_advertised: &str,
+    listen_addr: SocketAddr,
+) -> bool {
+    declared.is_none() && roster_ip_unreachable_from_bind_addr(self_advertised, listen_addr)
+}
+
 /// Whether a dialer aiming at the advertised roster ip misses `listen_addr`. An
 /// unspecified bind covers every interface, and a roster ip that parses as
 /// neither IPv4 nor IPv6 (a DNS name, say) can resolve to the bound interface,
-/// so both cases stay quiet.
+/// so both cases stay quiet. Both sides reduce to the canonical form first, so
+/// the v4-mapped wildcard (`[::ffff:0.0.0.0]`, which a dual-stack host binds as
+/// `0.0.0.0`) stays quiet as well and `10.0.0.5` matches `::ffff:10.0.0.5`.
 fn roster_ip_unreachable_from_bind_addr(roster_ip: &str, listen_addr: SocketAddr) -> bool {
-    !listen_addr.ip().is_unspecified()
+    let bind_ip = listen_addr.ip().to_canonical();
+    !bind_ip.is_unspecified()
         && roster_ip
             .parse::<IpAddr>()
-            .is_ok_and(|parsed| parsed != listen_addr.ip())
+            .is_ok_and(|parsed| parsed.to_canonical() != bind_ip)
+}
+
+fn wildcard_listener_under_loopback_address(
+    declared: Option<&str>,
+    self_advertised: &str,
+    listen_addr: SocketAddr,
+) -> bool {
+    declared.is_none()
+        && listen_addr.ip().to_canonical().is_unspecified()
+        && self_advertised
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.to_canonical().is_loopback())
 }
 
 fn resolve_cluster_replica_peers(
@@ -3026,6 +3100,44 @@ async fn start_tcp_runtime(
         .await?;
     }
 
+    // Cluster metadata carries one host for all four transports, so a listener
+    // the derived host does not reach is unreachable at it. Only a derived
+    // address is judged, and never against the listener it was derived from.
+    let declared = config.node.advertised_address.as_deref();
+    let self_advertised = self_advertised_address(declared, derived_bind_ip(topology, config));
+    // A roster entry answers this per node in cluster mode, so the derived
+    // address is never served and none of these listeners are judged against it.
+    let listeners = client_listeners(topology, config);
+    if !config.cluster.enabled
+        && let Some(derived_from) = listeners
+            .iter()
+            .find_map(|(key, listen_addr)| listen_addr.map(|_| *key))
+    {
+        for (key, listen_addr) in listeners {
+            let Some(listen_addr) = listen_addr.filter(|_| key != derived_from) else {
+                continue;
+            };
+            if derived_address_misses_listener(declared, &self_advertised, listen_addr) {
+                warn!(
+                    "{key} binds {listen_addr} but cluster metadata publishes {self_advertised}, \
+                     derived from {derived_from}; a client reading that metadata would not reach \
+                     this listener. Set node.advertised_address to the address clients dial."
+                );
+            } else if wildcard_listener_under_loopback_address(
+                declared,
+                &self_advertised,
+                listen_addr,
+            ) {
+                warn!(
+                    "{key} binds the wildcard {listen_addr} but cluster metadata publishes the \
+                     loopback {self_advertised}, derived from {derived_from}; a client reaching \
+                     this listener from another host is told an address that points back at \
+                     itself. Set node.advertised_address to the address clients dial."
+                );
+            }
+        }
+    }
+
     // HTTP is served over TCP but sits outside the replica_io / manual client
     // reactor, so it binds independently. Shard-0 gating comes from the sole
     // caller of this function.
@@ -3047,10 +3159,10 @@ async fn start_tcp_runtime(
             config.personal_access_token.max_tokens_per_user,
             &config.cluster,
             Arc::clone(&config.system),
-            self_ports,
+            &self_advertised,
+            &self_ports,
             shard_metrics_all,
-        )
-        .await?;
+        )?;
     }
 
     Ok(())
@@ -3212,7 +3324,7 @@ async fn start_manual_runtime(
         None
     };
 
-    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients).await?;
+    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients)?;
     write_current_config(
         config,
         Some(topology.self_replica_id),
@@ -3577,7 +3689,7 @@ fn mint_client_meta(
     ClientConnMeta::new(coord.mint_shard_zero_client_id(), peer_addr, transport)
 }
 
-async fn start_client_listeners(
+fn start_client_listeners(
     shard: &Rc<ServerShard>,
     config: &ServerConfig,
     topology: &TcpTopology,
@@ -3587,7 +3699,6 @@ async fn start_client_listeners(
 
     if config.tcp.enabled && !config.tcp.tls.enabled {
         let (listener, bound_addr) = client_listener::tcp::bind(topology.client_listen_addr)
-            .await
             .map_err(|source| {
                 error!(
                     addr = %topology.client_listen_addr,
@@ -3606,7 +3717,12 @@ async fn start_client_listeners(
     }
 
     if let Some(ws_addr) = topology.ws_listen_addr {
-        bound.ws = Some(start_websocket_listener(shard, config, ws_addr, accepted_clients).await?);
+        bound.ws = Some(start_websocket_listener(
+            shard,
+            config,
+            ws_addr,
+            accepted_clients,
+        )?);
     }
 
     if let Some(quic_addr) = topology.quic_listen_addr {
@@ -3808,7 +3924,7 @@ fn load_tcp_tls_server_credentials(
 /// `websocket.tls.enabled` (the plain-WS accept loop must not also bind the
 /// port -- a plain upgrade parser fed a TLS `ClientHello` rejects every
 /// connection with an httparse error), plain WS otherwise.
-async fn start_websocket_listener(
+fn start_websocket_listener(
     shard: &Rc<ServerShard>,
     config: &ServerConfig,
     ws_addr: SocketAddr,
@@ -3829,11 +3945,10 @@ async fn start_websocket_listener(
         shard.bus.track_background(wss_handle);
         Ok(bound_addr)
     } else {
-        let (listener, bound_addr) =
-            client_listener::ws::bind(ws_addr).await.map_err(|source| {
-                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
-                source
-            })?;
+        let (listener, bound_addr) = client_listener::ws::bind(ws_addr).map_err(|source| {
+            error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
+            source
+        })?;
         let token = shard.bus.token();
         let accepted_ws = accepted_clients.ws.clone();
         let ws_handle = compio::runtime::spawn(async move {
@@ -4618,7 +4733,7 @@ mod tests {
             .expect("a fresh ServerConfig owns its system config")
             .sharding
             .shutdown_drain_timeout = iggy_common::IggyDuration::new(timeout);
-        let pump = compio::runtime::spawn(std::future::pending::<()>());
+        let pump = compio::runtime::spawn(std::future::pending::<Option<FatalCommit>>());
 
         let error = await_pump_drain(Some(pump), &config, 7)
             .await
@@ -4629,6 +4744,32 @@ mod tests {
                 shard_id: 7,
                 timeout: actual,
             } if actual == timeout
+        ));
+    }
+
+    #[compio::test]
+    async fn pump_stopped_by_a_commit_fault_is_not_reported_as_clean() {
+        // The pump drained and flushed, so the join succeeds. Reporting that
+        // as a clean exit would hand an orchestrator exit code 0 for a node
+        // that stopped because it could not persist a cluster-committed op.
+        let config = ServerConfig::default();
+        let fault = FatalCommit {
+            namespace_raw: 42,
+            op: 7,
+            operation: iggy_binary_protocol::Operation::SendMessages,
+        };
+        let pump = compio::runtime::spawn(async move { Some(fault) });
+
+        let error = await_pump_drain(Some(pump), &config, 3)
+            .await
+            .expect_err("a pump that stopped on a commit fault is not a clean exit");
+        assert!(matches!(
+            error,
+            ServerError::ShardFatal {
+                shard_id: 3,
+                namespace_raw: 42,
+                op: 7,
+            }
         ));
     }
 
@@ -4861,6 +5002,139 @@ mod tests {
         assert!(!roster_ip_unreachable_from_bind_addr(
             "10.0.0.5",
             addr("10.0.0.5:18070")
+        ));
+    }
+
+    #[test]
+    fn derived_address_warns_only_when_it_misses_a_listener() {
+        // Derived from a loopback tcp.address while another transport serves
+        // an external interface: metadata would publish an address no client
+        // reaches. Every non-TCP listener carries the same exposure, since one
+        // host is published for all four.
+        for listener in ["10.0.0.5:3000", "10.0.0.5:8080", "10.0.0.5:8092"] {
+            assert!(
+                derived_address_misses_listener(None, "127.0.0.1", addr(listener)),
+                "{listener} is not reachable at 127.0.0.1"
+            );
+        }
+        // Same interface, and a wildcard bind that covers any of them.
+        assert!(!derived_address_misses_listener(
+            None,
+            "10.0.0.5",
+            addr("10.0.0.5:3000")
+        ));
+        assert!(!derived_address_misses_listener(
+            None,
+            "127.0.0.1",
+            addr("0.0.0.0:3000")
+        ));
+        // A declared address is deliberate and unrelated to local interfaces.
+        assert!(!derived_address_misses_listener(
+            Some("broker-1.example.com"),
+            "broker-1.example.com",
+            addr("10.0.0.5:3000")
+        ));
+    }
+
+    #[test]
+    fn wildcard_listener_warns_only_under_a_derived_loopback_address() {
+        // Metadata says 127.0.0.1 while this listener takes connections from
+        // anywhere: whoever arrives from another host is told to dial itself.
+        assert!(wildcard_listener_under_loopback_address(
+            None,
+            "127.0.0.1",
+            addr("0.0.0.0:3000")
+        ));
+        assert!(wildcard_listener_under_loopback_address(
+            None,
+            "127.0.0.1",
+            addr("[::]:3000")
+        ));
+        // A published address that is reachable from elsewhere is what the
+        // wildcard listener wants, so there is nothing to say.
+        assert!(!wildcard_listener_under_loopback_address(
+            None,
+            "10.0.0.5",
+            addr("0.0.0.0:3000")
+        ));
+        // A concrete bind is the other warning's business, not this one's.
+        assert!(!wildcard_listener_under_loopback_address(
+            None,
+            "127.0.0.1",
+            addr("10.0.0.5:3000")
+        ));
+        // A declared address is deliberate; a loopback one is a local setup.
+        assert!(!wildcard_listener_under_loopback_address(
+            Some("127.0.0.1"),
+            "127.0.0.1",
+            addr("0.0.0.0:3000")
+        ));
+    }
+
+    #[test]
+    fn derived_bind_ip_follows_the_first_enabled_listener() {
+        let mut config: ServerConfig =
+            toml::from_str(include_str!("../config.toml")).expect("shipped config deserializes");
+        let topology = |ws: Option<&str>, http: Option<&str>| TcpTopology {
+            cluster_id: 0,
+            self_replica_id: 0,
+            replica_count: 1,
+            client_listen_addr: addr("127.0.0.1:8090"),
+            replica_listen_addr: None,
+            ws_listen_addr: ws.map(addr),
+            quic_listen_addr: None,
+            http_listen_addr: http.map(addr),
+            tcp_tls_listen_addr: None,
+            peers: Vec::new(),
+        };
+        let expected = |ip: &str| ip.parse::<IpAddr>().unwrap();
+
+        assert_eq!(
+            derived_bind_ip(
+                &topology(Some("10.0.0.5:8092"), Some("10.0.0.6:3000")),
+                &config
+            ),
+            expected("127.0.0.1")
+        );
+
+        config.tcp.enabled = false;
+        assert_eq!(
+            derived_bind_ip(
+                &topology(Some("10.0.0.5:8092"), Some("10.0.0.6:3000")),
+                &config
+            ),
+            expected("10.0.0.5"),
+            "websocket is next in line once tcp is off"
+        );
+        assert_eq!(
+            derived_bind_ip(&topology(None, Some("10.0.0.6:3000")), &config),
+            expected("10.0.0.6"),
+            "with websocket and quic off too, http answers"
+        );
+        assert_eq!(
+            derived_bind_ip(&topology(None, None), &config),
+            expected("127.0.0.1"),
+            "with every client listener off the value reaches no client anyway"
+        );
+    }
+
+    #[test]
+    fn roster_mismatch_warning_is_silent_for_v4_mapped_binds() {
+        // `[::ffff:0.0.0.0]` is the v4 wildcard and `::ffff:10.0.0.5` is
+        // `10.0.0.5`, so neither reaches the dialer any differently than the
+        // plain spelling the case above covers.
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("[::ffff:0.0.0.0]:18070")
+        ));
+        assert!(!roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("[::ffff:10.0.0.5]:18070")
+        ));
+        // A genuine mismatch still warns through the mapped spelling.
+        assert!(roster_ip_unreachable_from_bind_addr(
+            "10.0.0.5",
+            addr("[::ffff:127.0.0.1]:18070")
         ));
     }
 }

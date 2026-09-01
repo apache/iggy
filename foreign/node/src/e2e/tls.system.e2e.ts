@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 // TLS integration tests for the Node.js SDK.
 //
@@ -38,6 +37,7 @@ import { resolve } from 'node:path';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Client } from '../client/client.js';
+import type { TlsOption } from '../client/client.type.js';
 import { Partitioning, Consumer, PollingStrategy } from '../wire/index.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 
@@ -126,6 +126,69 @@ describe('e2e -> tls', { skip: !tlsEnabled && 'IGGY_TCP_TLS_ENABLED is not set' 
     assert.equal(polled.messages.length, 3);
 
     await c.stream.delete({ streamId: streamName });
+  });
+
+  it('e2e -> tls::connect via connection string', async () => {
+    const [, port] = getIggyAddress();
+
+    // The tls_ca_file path is resolved by the connection string parser;
+    // the certificate itself is read when the TLS socket connects.
+    const csClient = new Client(
+      'iggy://iggy:iggy@localhost:' +
+      `${port}?tls=true&tls_ca_file=${caCertPath}`
+    );
+    try {
+      // tls=true alone: servername defaults to the DNS host.
+      assert.equal(csClient._config.transport, 'TLS');
+      const options = csClient._config.options as TlsOption;
+      assert.equal(options.servername, undefined);
+      assert.ok(await csClient.system.ping());
+      assert.deepEqual(
+        await csClient.session.login(credentials),
+        { userId: 0 }
+      );
+    } finally {
+      await csClient.destroy();
+    }
+  });
+
+  it('e2e -> tls::connect via connection string with explicit tls_domain',
+    async () => {
+      const [, port] = getIggyAddress();
+
+      const csClient = new Client(
+        'iggy://iggy:iggy@localhost:' +
+        `${port}?tls=true&tls_domain=localhost&tls_ca_file=${caCertPath}` +
+        '&heartbeat_interval=15s'
+      );
+      try {
+        assert.equal(csClient._config.transport, 'TLS');
+        assert.equal(
+          (csClient._config.options as TlsOption).servername,
+          'localhost'
+        );
+        assert.equal(csClient._config.heartbeatInterval, 15000);
+        assert.ok(await csClient.system.ping());
+      } finally {
+        await csClient.destroy();
+      }
+    }
+  );
+
+  it('e2e -> tls::rejects a wrong ca path with a TypeError', () => {
+    // The client is constructed eagerly, so an unreadable CA file surfaces
+    // as a TypeError from the constructor instead of a raw ENOENT Error
+    // leaking from the socket layer.
+    assert.throws(
+      () =>
+        new Client(
+          'iggy://iggy:iggy@localhost:8090' +
+          '?tls=true&tls_ca_file=/does/not/exist.pem'
+        ),
+      (error: unknown) =>
+        error instanceof TypeError &&
+        /cannot read tls_ca_file/.test(error.message)
+    );
   });
 
   it('e2e -> tls::logout', async () => {

@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, OptionSpec, OptionsScope, Snapshot,
-    SnapshotCompression, Stats, SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec, OptionsScope,
+    Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
 };
 use async_trait::async_trait;
 
@@ -49,7 +49,7 @@ pub trait SystemClient {
     async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError>;
     /// Ping the server to check if it's alive.
     async fn ping(&self) -> Result<(), IggyError>;
-    async fn heartbeat_interval(&self) -> IggyDuration;
+    async fn heartbeat_interval(&self) -> NonZeroIggyDuration;
     /// Re-sync the cached consumer-group assignments from the coordinator.
     ///
     /// Driven off the heartbeat so a member picks up a new generation (e.g. a

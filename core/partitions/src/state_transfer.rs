@@ -41,8 +41,8 @@ use consensus::{ArtifactProgress, Sequencer as _, StateArtifactHasher, state_art
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use server_common::SegmentStorage;
 use server_common::send_messages::decode_batch_slice;
+use server_common::{SegmentStorage, yield_to_reactor};
 use std::collections::HashSet;
 use std::fmt;
 use std::mem::size_of;
@@ -2347,6 +2347,10 @@ where
                 self.log.index_writers_mut()[last] = Some(Rc::new(index_writer));
             }
             self.log.segments_mut()[last].sealed = false;
+            // The active and sealed read-state caches live under different
+            // rules (see `SegmentedLog::reset_read_state`), so the slot cannot
+            // carry its sealed identity into active use.
+            self.log.reset_read_state(last);
         }
 
         // The installed segments supersede every journaled op; stale
@@ -2663,6 +2667,10 @@ where
         minted_next_offset: u64,
         staged_was_empty: bool,
     ) -> Result<(), iggy_common::IggyError> {
+        // The empty plant below can land on a base offset this sweep unlinks,
+        // so an in-flight poll's cached read fd would keep serving the retired
+        // inodes as live data. Same hazard and same fix as `purge`.
+        self.log.invalidate_sealed_read_state();
         while let Some((_, mut storage)) = self.log.retire_front() {
             let _ = storage.shutdown();
         }
@@ -2798,26 +2806,14 @@ impl std::error::Error for SpillError {}
 /// per-poll binary-search fallback.
 const INDEX_STRIDE_BYTES: usize = 64 * 1024;
 
-/// Hand the core back to the reactor mid-CPU-pass.
-///
-/// Reactor only: the consensus tick shares this task as a sibling
-/// `select_biased!` arm, and arms are not polled while one arm's body awaits, so
-/// yielding here does not unfreeze ticks or heartbeats.
-///
-/// A zero-duration timer, NOT a bare self-waking yield: this runtime does not
-/// reliably re-poll a task that woke itself from inside its own poll, and a
-/// pump that suspends that way stops driving consensus entirely (the frame
-/// handler never resumes, ticks stop, the node goes quiet until something else
-/// wakes it). Registering with the reactor is what every other yield on these
-/// paths does -- the serving side yields through real file reads.
-async fn yield_to_reactor() {
-    compio::time::sleep(std::time::Duration::ZERO).await;
-}
-
 /// Chunk size for the offer build's streaming checksum pass. Large enough
 /// that per-chunk overhead is noise, small enough that the pump yields to
-/// the reactor many times per segment.
-const OFFER_HASH_CHUNK_LEN: usize = 1 << 20;
+/// the reactor many times per segment. Sized against the yield's real cost:
+/// `yield_to_reactor` is ~12 us per call, so at 1 MiB (~21 us of hashing per
+/// chunk) the yields would add over half the pass again; 4 MiB keeps the
+/// un-yielded stretch a bounded ~80 us CPU pass at ~15% overhead, and
+/// matches the recovery walk's `SCAN_WINDOW_CAPACITY`.
+const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
 
 /// Bytes one offer-build round may read and hash before it refuses and resumes
 /// on the next request.
