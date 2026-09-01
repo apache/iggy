@@ -448,14 +448,29 @@ pub fn find_partition_superblock_dir(root: &Path) -> Option<PathBuf> {
 /// Index of the node the metadata roster marks as leader, resolved by matching
 /// the roster's TCP port against each node's bound address.
 ///
+/// Reads through node 0. Use [`leader_node_index_via`] where node 0 may be
+/// down or where the roster must be read from a named node.
+///
 /// # Panics
 /// If no root client connects, the roster query fails, no node is marked
 /// leader, or the leader's port matches no harness node.
 pub async fn leader_node_index(harness: &TestHarness) -> usize {
+    leader_node_index_via(harness, 0).await
+}
+
+/// [`leader_node_index`] reading the roster through node `via`.
+///
+/// Named separately because which node answers matters once node 0 may be
+/// down: the roster read is auth-gated, so it needs a node that can complete a
+/// login, and a client built against a dead node cannot.
+///
+/// # Panics
+/// As [`leader_node_index`].
+pub async fn leader_node_index_via(harness: &TestHarness, via: usize) -> usize {
     let client = harness
-        .root_client_for_node(0)
+        .root_client_for_node(via)
         .await
-        .expect("a root client (redirecting to the leader if node 0 is not it)");
+        .expect("a root client (redirecting to the leader if the dialed node is not it)");
     let metadata = client
         .get_cluster_metadata()
         .await

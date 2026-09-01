@@ -682,7 +682,7 @@ where
             (!(consensus.has_ceded_primaryship() && primary_index == consensus.replica()))
                 .then_some(primary_index)
         })
-        .or_else(|| roster.current_primary_index());
+        .or_else(|| roster.current_primary_replica_id());
     let metadata = roster.cluster_metadata(primary_index, client_ip);
     ClusterMetadataResponse {
         name: metadata.name,
@@ -1869,7 +1869,7 @@ mod tests {
         use metadata::stm::stream::{Partition, StreamsInner};
 
         let streams = StreamsInner::new();
-        let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0);
+        let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0, 0);
 
         // Registry miss: the owning shard has not started building.
         let predicted = partition_response(&streams, 0, 0, &partition).expect("response builds");
@@ -1914,8 +1914,8 @@ mod tests {
             options: iggy_common::ResourceOptions::default(),
             stats: topic_stats.clone(),
             partitions: vec![
-                Partition::new(0, 1, created_at, 0),
-                Partition::new(1, 1, created_at, 0),
+                Partition::new(0, 1, created_at, 0, 0),
+                Partition::new(1, 1, created_at, 0, 0),
             ],
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
             consumer_groups: ahash::AHashMap::default(),

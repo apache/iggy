@@ -89,6 +89,22 @@ spec:
                   name: {{ include "iggy.fullname" . }}-root-credentials
                   key: password
   {{- end }}{{- end}}
+  {{- $declaredInEnv := false }}
+  {{- range .Values.server.env }}
+    {{- if eq .name "IGGY_NODE_ADVERTISED_ADDRESS" }}
+      {{- if not .value }}
+        {{- fail "IGGY_NODE_ADVERTISED_ADDRESS is declared in server.env with an empty value. The server reads that as unset and refuses to start behind a wildcard bind. Give the entry the address clients dial, or drop it and set server.advertisedAddress." }}
+      {{- end }}
+      {{- $declaredInEnv = true }}
+    {{- end }}
+  {{- end }}
+  {{- if and $declaredInEnv .Values.server.advertisedAddress }}
+    {{- fail "IGGY_NODE_ADVERTISED_ADDRESS is set in server.env and server.advertisedAddress is also set. The server.env entry wins and server.advertisedAddress is ignored. Please set only one." }}
+  {{- end }}
+  {{- if not $declaredInEnv }}
+            - name: IGGY_NODE_ADVERTISED_ADDRESS
+              value: {{ .Values.server.advertisedAddress | default (printf "%s.%s.svc.cluster.local" (include "iggy.fullname" .) .Release.Namespace) | quote }}
+  {{- end }}
   {{- if .Values.server.env }}
     {{- range .Values.server.env }}
             - name: {{ .name }}

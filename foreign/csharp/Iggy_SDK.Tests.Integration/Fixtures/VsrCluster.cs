@@ -291,6 +291,7 @@ internal sealed class VsrCluster : IAsyncDisposable
 
         if (!ClusterEnabled)
         {
+            environment["IGGY_NODE_ADVERTISED_ADDRESS"] = "127.0.0.1";
             return environment;
         }
 
