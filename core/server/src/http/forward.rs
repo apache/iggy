@@ -82,7 +82,7 @@ use crate::http::error::{
     CustomError, error_response, gateway_timeout_response, primary_http_socket, with_retry_after,
 };
 use crate::http::extractor::{bearer_token, resolve_credential};
-use crate::http::state::{HttpInner, VIEW_HEADER};
+use crate::http::state::{ForwardState, HttpInner, VIEW_HEADER};
 use crate::server_error::ServerError;
 
 /// Marker stamped on every forwarded request. Loop guard only: a node that is
@@ -134,23 +134,6 @@ const RESPONSE_CAPACITY_HINT: usize = 64 * 1024;
 /// relayed response carries the serving primary's view, not this follower's
 /// (the view layer only fills the header when absent).
 const RELAYED_RESPONSE_HEADERS: [HeaderName; 3] = [CONTENT_TYPE, RETRY_AFTER, VIEW_HEADER];
-
-/// Per-node forwarding context hung off `HttpInner`: the outbound client
-/// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
-/// request-body buffer bound, and the in-flight budget.
-pub(in crate::http) struct ForwardState {
-    /// False when no cluster-wide bearer key material exists (no configured
-    /// JWT secret, no cluster PSK): a forwarded bearer would 401 on the
-    /// primary, so the middleware passes through and followers answer with
-    /// the transient 503 instead.
-    active: bool,
-    client: cyper::Client,
-    /// Also read by the 307 redirect builder: the primary is assumed to serve
-    /// the same scheme as this node (uniform cluster HTTP config).
-    pub(in crate::http) scheme: &'static str,
-    body_limit: usize,
-    in_flight: Cell<u32>,
-}
 
 /// Build the [`ForwardState`] at listener startup.
 ///

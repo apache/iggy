@@ -12048,6 +12048,7 @@ dependencies = [
  "compio",
  "configs",
  "consensus",
+ "cpu_allocation",
  "crossfire",
  "ctrlc",
  "cyper",
@@ -12082,7 +12083,9 @@ dependencies = [
  "opentelemetry_sdk",
  "papaya",
  "partitions",
+ "proc-macro2",
  "prometheus-client",
+ "quote",
  "rand 0.10.2",
  "ringbuffer",
  "rmp-serde",
@@ -12097,9 +12100,9 @@ dependencies = [
  "serde_json",
  "server_common",
  "shard",
- "shard_allocator",
  "socket2 0.6.5",
  "strum 0.28.0",
+ "syn 2.0.119",
  "sysinfo 0.39.6",
  "system_stats",
  "tempfile",
@@ -12229,17 +12232,6 @@ dependencies = [
  "partitions",
  "prometheus-client",
  "server_common",
- "thiserror 2.0.19",
- "tracing",
-]
-
-[[package]]
-name = "shard_allocator"
-version = "0.1.0"
-dependencies = [
- "cpu_allocation",
- "hwlocality",
- "nix",
  "thiserror 2.0.19",
  "tracing",
 ]
