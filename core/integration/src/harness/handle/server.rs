@@ -307,6 +307,12 @@ impl ServerHandle {
         self.envs
             .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
+        // On a 4-core CI runner every server computes the same `0..4` range, so
+        // pinned shards of concurrently running tests pile onto the same cores
+        // and starve each other. Leave thread placement to the scheduler.
+        self.envs
+            .entry("IGGY_SYSTEM_SHARDING_PIN_CORES".to_string())
+            .or_insert_with(|| "false".to_string());
 
         self.envs
             .entry("IGGY_ROOT_USERNAME".to_string())
