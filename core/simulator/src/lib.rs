@@ -50,8 +50,8 @@ use replica::{Replica, SIM_INBOX_CAPACITY, new_shard};
 use seeds::SimSeeds;
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
-use shard::CONSENSUS_TICK_INTERVAL;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
+use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -948,7 +948,7 @@ impl Simulator {
                 assert_eq!(
                     pending_redispatch,
                     0,
-                    "lost redispatch: replica {replica_id} shard {} priority queue holds \
+                    "lost redispatch: replica {replica_id} shard {} redispatch queue holds \
                      {pending_redispatch} frame(s) at quiescence (seed {:#x}, schedule hash {:#x})",
                     shard.id,
                     self.seed,
@@ -1470,7 +1470,7 @@ fn materialise_partition(
         recovered_state,
         retained,
         restore_frontier,
-        created_view,
+        PartitionMaterialisation::new(epoch, created_view),
     );
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -2668,9 +2668,9 @@ mod tests {
             "materialisation must move every parked prepare to the pump queue"
         );
 
-        // No virtual-time advance here. The inbox wake alone polls the pump,
-        // so only the inbox arm's queue-first fence can put ops 1 and 2 ahead
-        // of this op 3 frame.
+        // No virtual-time advance here. The materialisation marker and inbox
+        // wake poll the pump, whose ranked redispatch arm must put ops 1 and 2
+        // ahead of this op 3 frame.
         lagging_shard.dispatch(later_prepare.into_generic());
         sim.run_pumps();
         let lagging_holds_later = sim.replicas[1]
@@ -2713,6 +2713,57 @@ mod tests {
         let first = parked_prepare_redispatch_trace(0x5CED_4005);
         let second = parked_prepare_redispatch_trace(0x5CED_4005);
         assert_eq!(first, second, "same seed diverged on parked redispatch");
+    }
+
+    #[test]
+    fn redispatched_solo_request_commits_without_another_inbox_frame() {
+        const CLIENT_ID: u128 = 1;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: 1,
+            client_count: 1,
+            seed: 0x5CED_4006,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(1, 1, std::iter::once(CLIENT_ID), network_opts);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.seed_stream_topic_partition(namespace);
+
+        let client = SimClient::new(CLIENT_ID);
+        sim.shell_login(&client);
+        let request = client.send_messages(namespace, &[Bytes::from_static(b"solo-redispatch")]);
+        let shard = Rc::clone(&sim.replicas[0].shards[0]);
+        let request = server_common::MessageBag::try_from(request.into_generic())
+            .expect("valid send request");
+        futures::executor::block_on(shard.on_message(request));
+        assert_eq!(
+            shard.parked_frame_count(namespace),
+            1,
+            "the request must park before materialisation"
+        );
+
+        sim.init_partition(namespace);
+        assert_eq!(
+            shard.redispatched_frame_count(),
+            1,
+            "materialisation must stage and wake the parked request"
+        );
+
+        // No network or virtual-time step follows materialisation. The ranked
+        // redispatch arm must deliver this request and process its self-ack in
+        // the same pump iteration.
+        sim.run_pumps();
+        let state = sim
+            .partition_consensus_state(0, namespace)
+            .expect("the materialised solo partition has consensus state");
+        assert_eq!(state.commit_min, 1, "the self-ack must commit the request");
+        assert_eq!(shard.redispatched_frame_count(), 0);
     }
 
     /// The dispatch shell's reason to exist: detect the PR #3557 async-concurrency
@@ -2874,7 +2925,14 @@ mod tests {
             executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
             let grow = Rc::clone(&sim.replicas[0].shards[0]);
             executor.spawn(async move {
-                grow.init_partition(ns_grow, None, None, None, false, 0);
+                grow.init_partition(
+                    ns_grow,
+                    None,
+                    None,
+                    None,
+                    false,
+                    PartitionMaterialisation::new(0, 0),
+                );
             });
             executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
         }))
@@ -2909,7 +2967,14 @@ mod tests {
         executor.run_until_stalled(POLL_BUDGET);
         let grow = Rc::clone(&sim.replicas[0].shards[0]);
         executor.spawn(async move {
-            grow.init_partition(ns_grow, None, None, None, false, 0);
+            grow.init_partition(
+                ns_grow,
+                None,
+                None,
+                None,
+                false,
+                PartitionMaterialisation::new(0, 0),
+            );
         });
         executor.run_until_stalled(POLL_BUDGET);
 

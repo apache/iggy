@@ -46,13 +46,14 @@
 //!   drain whose epoch disagrees with that stamp answers the client instead of
 //!   serving it: recycled slab keys make the namespace byte-identical, so such a
 //!   frame would otherwise land a dead topic's write inside the topic that
-//!   replaced it. The stamp survives a second park, so a re-delivered frame
-//!   cannot be re-stamped with the incarnation that replaced its own. A frame
-//!   parked with NO stamp is served; see `redispatch_parked_frames` for why a
-//!   missing committed revision is not evidence of a prior incarnation. Delivery
-//!   is the pump's: `drain_redispatched_frames` runs before it reads the inbox
-//!   again, so a parked op is not ordered behind a later op of the same
-//!   partition already queued there, which the plane's gap check would drop.
+//!   replaced it. Production prevents a second park by ranking redispatch above
+//!   inbox work and applying incarnation changes only on the pump. Carrying the
+//!   stamp through re-delivery is defence in depth for off-pump staging such as
+//!   simulator materialisation. A frame parked with NO stamp is served; see
+//!   `redispatch_parked_frames` for why a missing committed revision is not
+//!   evidence of a prior incarnation. The redispatch select arm takes one frame
+//!   per iteration before the inbox arm, so a parked op is not ordered behind a
+//!   later op of the same partition already queued there.
 //! - `IggyShard::serves_committed_incarnation` refuses a namespace whose
 //!   committed `created_revision` disagrees with the epoch on the local row, so
 //!   a request arriving mid-teardown cannot be acked against the incarnation
@@ -88,9 +89,9 @@
 //!
 //! They apply asymmetrically, because the two frame classes fail differently. A
 //! shed request costs a retry: answered with a retriable status, re-issued by
-//! the SDK. A shed prepare is permanent loss on this replica, with no client to
-//! answer and `consensus::retransmit_targets` skipping any op that already
-//! reached quorum.
+//! the SDK. A shed prepare has no client to retry it and leaves the replica
+//! behind until a later commit heartbeat exposes the gap and arms same-view
+//! journal repair.
 //!
 //! All three bind a request: refused when admitting it would cross a byte budget
 //! or the frame cap, answered past `MAX_PARKED_PASSES`. Only the byte budgets
@@ -114,14 +115,11 @@
 //! materialization barrier this module used to promise, and the barrier is gone
 //! (see above) while these are not:
 //!
-//! TODO(krishna): a shed or discarded *prepare* has no recovery once its op has
-//! reached quorum. `consensus::retransmit_targets` skips entries with
-//! `ok_quorum_received`, and the partition plane creates a repair session only
-//! in `on_start_view` -- `tick_partitions` re-drives an existing session but
-//! cannot open one -- so the backup stays behind `commit_max` until an unrelated
-//! view change. It needs a normal-status repair driver. The park policy above
-//! shrinks the exposure to two cases, a genuinely exhausted byte budget and a
-//! namespace this shard cannot serve, but only the repair driver removes it.
+//! A shed prepare is not retransmitted once its op reached quorum, but it is not
+//! stranded until a view change. A later `CommitMessage` that advances the
+//! backup's frontier runs `maybe_request_partition_repair`; an evicted repair
+//! range escalates to partition state transfer. The park policy still avoids
+//! manufacturing that recovery work unless a byte budget is already spent.
 //!
 //! TODO(krishna): `serves_committed_incarnation` and the park stamp both call
 //! `Streams::created_revision_for_namespace`, now on the per-request fence path.
@@ -3483,9 +3481,8 @@ mod tests {
     }
 
     /// The replicated-prepare shape, which no other test covers and where both
-    /// park critical are worst: a prepare has no client, so `deny_parked_frame`
-    /// no-ops on it and anything that discards it loses committed data silently,
-    /// with no normal-status repair driver to refetch it.
+    /// park critical are worst: a prepare has no client, so discarding it forces
+    /// the backup to wait for a later commit heartbeat and journal repair.
     ///
     /// A backup receives the prepare before its own metadata commits (so the frame
     /// parks unstamped), then applies the commit and materialises. The prepare must
@@ -3525,7 +3522,7 @@ mod tests {
             shard.redispatched_frame_count(),
             1,
             "the parked prepare must be staged for re-dispatch; discarding it is \
-             silent committed-data loss, since a prepare has no client to answer"
+             an avoidable gap, since a prepare has no client to retry it"
         );
         let (served, answered) = drain_inbox(&inbox);
         assert_eq!(
@@ -3581,14 +3578,20 @@ mod tests {
             1,
             "and the reject must be counted"
         );
+        assert_eq!(
+            park_dropped_count(&shard),
+            1,
+            "a rejected prepare has no client deny, so its destruction must be recorded"
+        );
     }
 
-    /// The stamp has to survive re-delivery, not just the first drain. A
-    /// materialisation stages the frame, the delete half of a recreate then
-    /// leaves the namespace un-materialised, and the drain parks it a second
-    /// time: deriving a fresh stamp there picks up the replacement's committed
-    /// revision, and the rebuild would serve a dead incarnation's op into the
-    /// topic that recycled its slab keys.
+    /// Defence-in-depth for off-pump staging: materialisation stages the frame,
+    /// the delete half of a recreate leaves the namespace unmaterialised, and
+    /// explicit test delivery parks it a second time. Production cannot take
+    /// this interleaving because every pump-side reconcile apply returns to the
+    /// higher-ranked redispatch arm before another incarnation change can run.
+    /// The carried stamp still prevents simulator or test staging from deriving
+    /// the replacement's revision on that second park.
     #[compio::test]
     async fn given_a_staged_frame_when_a_recreate_lands_before_the_drain_should_reject_it_as_stale()
     {
@@ -3635,7 +3638,10 @@ mod tests {
             "and lifted the tombstone, or the drain takes the tombstone path"
         );
 
-        shard.drain_redispatched_frames().await;
+        assert!(
+            shard.dispatch_one_redispatched_frame_for_test().await,
+            "the defence-in-depth frame must be available for explicit delivery"
+        );
         assert_eq!(
             shard.parked_frame_count(ns),
             1,
@@ -3667,8 +3673,8 @@ mod tests {
     /// ranks the consensus tick, which is where materialisation runs, above the
     /// inbox arm, so a later op of the same partition can already be queued
     /// there. Appended, the parked op lands behind it and the plane's backup gap
-    /// check drops the later one for not being `current_op + 1`, with nothing to
-    /// refetch it.
+    /// check drops the later one for not being `current_op + 1`. Same-view repair
+    /// can heal that gap later, but redispatch must not manufacture it.
     ///
     /// The pump's order is the queue, then the inbox, so the assertions below
     /// are on where each op sits at that moment. Whether the plane accepts them
@@ -3821,7 +3827,7 @@ mod tests {
         assert_eq!(
             park_dropped_count(&shard),
             0,
-            "the prepare must be retained: destroying it is unrecoverable"
+            "the prepare must be retained instead of forcing journal repair"
         );
 
         // Retained across an unbounded number of further passes.
@@ -3998,9 +4004,9 @@ mod tests {
     }
 
     /// The age bound answers requests and steps over prepares. Expiring a
-    /// prepare is permanent loss (no client, and `retransmit_targets` skips an op
-    /// already at quorum), and passes are commit-driven, so a create burst
-    /// elapses four in milliseconds across every parked namespace at once.
+    /// prepare would force same-view repair despite the bytes still being held
+    /// locally, and passes are commit-driven, so a create burst elapses four in
+    /// milliseconds across every parked namespace at once.
     #[compio::test]
     async fn aging_answers_requests_and_never_expires_a_prepare() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -4075,8 +4081,8 @@ mod tests {
     }
 
     /// A frame larger than the per-namespace cap failed the check even against
-    /// an empty entry, so it could never park. Unrecoverable for a prepare:
-    /// `retransmit_targets` skips an op already at quorum.
+    /// an empty entry, so it could never park. A prepare already at quorum may
+    /// no longer retransmit, so shedding it forces later same-view repair.
     #[compio::test]
     async fn a_frame_over_the_namespace_byte_cap_still_parks_into_an_empty_entry() {
         const OVER_NAMESPACE_CAP: usize = 5 * 1024 * 1024;
