@@ -33,14 +33,17 @@ under the License.
 
 Iggy server uses `io_uring` for high-performance async I/O. This requires:
 
-1. **Required io_uring setup features** - The node must provide both flags:
+1. **Linux io_uring support on the node**
 
-   * `IORING_SETUP_COOP_TASKRUN`
-   * `IORING_SETUP_TASKRUN_FLAG`
+   * Mainline Linux 6.11 or newer provides all io_uring features Iggy currently needs during startup.
+   * Shard rings require `IORING_SETUP_COOP_TASKRUN` and `IORING_SETUP_TASKRUN_FLAG` from Linux 5.19.
+   * Listener startup uses `IORING_OP_SOCKET`, `IORING_OP_BIND`, and `IORING_OP_LISTEN`.
+   * Mainline Linux added bind and listen in 6.11. Vendor kernels may backport them to an older release.
+   * If an opcode is missing, compio uses a blocking fallback that Iggy disables on shard threads.
+   * The server then fails during startup. The node kernel matters, not the container image.
+   * Ubuntu 24.04 GA uses Linux 6.8 and lacks the mainline bind and listen opcodes.
+   * On Ubuntu 24.04 GA, install `linux-generic-hwe-24.04` before running Iggy.
 
-   Mainline Linux provides both starting in 5.19. Vendor kernels may backport them to older kernel versions.
-
-   The server fails during startup if either is unavailable. Node capabilities matter, not the container image.
 2. **IPC_LOCK capability** - For locking memory required by io_uring
 3. **Unconfined seccomp profile** - To allow io_uring syscalls
 

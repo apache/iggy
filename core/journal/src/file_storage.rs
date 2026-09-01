@@ -61,12 +61,12 @@ impl FileStorage {
     /// Truncate the file to `len` bytes and make the new length durable.
     ///
     /// Synchronous `std::fs` on a separate descriptor, not compio: compio's
-    /// `set_len` submits `IORING_OP_FTRUNCATE`, which landed in kernel 6.9.
-    /// Below that the driver falls back to its blocking pool, and shard
-    /// proactors run with `thread_pool_limit(0)`, so the fallback panics the
-    /// shard instead of repairing the WAL. `std::fs` needs neither the opcode
-    /// nor the pool. The sole caller is boot-time torn-tail repair, so
-    /// blocking the shard thread here costs nothing.
+    /// `set_len` submits `IORING_OP_FTRUNCATE`, which landed in mainline Linux
+    /// 6.9. When the opcode is unavailable, the driver falls back to its
+    /// blocking pool, and shard proactors run with `thread_pool_limit(0)`, so
+    /// the fallback panics the shard instead of repairing the WAL. `std::fs`
+    /// needs neither the opcode nor the pool. The sole caller is boot-time
+    /// torn-tail repair, so blocking the shard thread here costs nothing.
     ///
     /// `sync_all` makes the durable-truncation contract explicit and matches
     /// segment recovery. Its additional metadata synchronization is acceptable
@@ -197,9 +197,9 @@ mod tests {
     /// Torn-tail repair runs on a shard executor, which builds its proactor
     /// with `thread_pool_limit(0)`. Any truncate that reaches compio's
     /// blocking pool panics that shard rather than repairing the WAL, which
-    /// is what every kernel below 6.9 did while `set_len` was an `io_uring`
-    /// submission. Driving the repair through a real shard executor is the
-    /// only way to keep the no-blocking-pool constraint pinned.
+    /// is what mainline Linux did before 6.9 while `set_len` was an `io_uring`
+    /// submission. Driving the repair through a real shard executor is the only
+    /// way to keep the no-blocking-pool constraint pinned.
     #[test]
     fn given_a_shard_executor_with_no_blocking_pool_when_truncating_should_repair_the_file() {
         let runtime = create_shard_executor().unwrap();

@@ -108,6 +108,11 @@ pub mod wss;
 /// `TIME_WAIT`); `SO_REUSEPORT` is intentionally not set: only shard 0
 /// binds the client listeners (see each caller).
 ///
+/// On Linux, compio submits this path's bind and listen as
+/// `IORING_OP_BIND` and `IORING_OP_LISTEN`. Mainline Linux added both in
+/// 6.11. Shard 0 has no blocking fallback pool, so an older kernel without
+/// vendor backports panics during listener startup.
+///
 /// # Errors
 ///
 /// Returns [`IggyError::CannotBindToSocket`] if the bind/listen fails.

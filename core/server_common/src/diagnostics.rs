@@ -65,9 +65,11 @@ pub fn enrich_runtime_create_error(error: std::io::Error) -> std::io::Error {
             RUNTIME_CREATE_DIAGNOSTIC.call_once(print_invalid_io_uring_args_info);
             format!(
                 "the kernel rejected io_uring setup flags shard executors require \
-                 (IORING_SETUP_COOP_TASKRUN + IORING_SETUP_TASKRUN_FLAG need Linux \
-                 >= {MIN_KERNEL_MAJOR}.{MIN_KERNEL_MINOR} with full io_uring support; \
-                 WSL2 kernels are often incomplete)"
+                 (IORING_SETUP_COOP_TASKRUN + IORING_SETUP_TASKRUN_FLAG entered \
+                 mainline Linux in {SHARD_SETUP_MIN_KERNEL_MAJOR}.{SHARD_SETUP_MIN_KERNEL_MINOR}, \
+                 while current listener startup also needs IORING_OP_BIND and \
+                 IORING_OP_LISTEN from {MAINLINE_MIN_KERNEL_MAJOR}.{MAINLINE_MIN_KERNEL_MINOR}. \
+                 WSL2 and vendor kernels may provide a different feature set)"
             )
         }
         _ => return error,
@@ -206,11 +208,18 @@ pub fn print_io_uring_permission_info() {
     print_discord_link();
 }
 
-/// Minimum kernel version for IORING_SETUP_COOP_TASKRUN and IORING_SETUP_TASKRUN_FLAG.
+/// Mainline Linux version providing every io_uring feature Iggy currently
+/// requires during startup, including `IORING_OP_BIND` and `IORING_OP_LISTEN`.
 #[cfg(target_os = "linux")]
-const MIN_KERNEL_MAJOR: u32 = 5;
+const MAINLINE_MIN_KERNEL_MAJOR: u32 = 6;
 #[cfg(target_os = "linux")]
-const MIN_KERNEL_MINOR: u32 = 19;
+const MAINLINE_MIN_KERNEL_MINOR: u32 = 11;
+
+/// Mainline Linux version that introduced the shard ring setup flags.
+#[cfg(target_os = "linux")]
+const SHARD_SETUP_MIN_KERNEL_MAJOR: u32 = 5;
+#[cfg(target_os = "linux")]
+const SHARD_SETUP_MIN_KERNEL_MINOR: u32 = 19;
 
 /// Minimum kernel version for kernel.io_uring_disabled sysctl.
 #[cfg(target_os = "linux")]
@@ -236,7 +245,10 @@ pub fn print_invalid_io_uring_args_info() {
     eprintln!("    - IORING_SETUP_COOP_TASKRUN (cooperative task running)");
     eprintln!("    - IORING_SETUP_TASKRUN_FLAG (task runner flag notification)");
     eprintln!(
-        "  These flags require Linux kernel >= {MIN_KERNEL_MAJOR}.{MIN_KERNEL_MINOR} with full io_uring support."
+        "  Mainline Linux added these flags in {SHARD_SETUP_MIN_KERNEL_MAJOR}.{SHARD_SETUP_MIN_KERNEL_MINOR}."
+    );
+    eprintln!(
+        "  Current listener startup also needs IORING_OP_BIND and IORING_OP_LISTEN from mainline Linux {MAINLINE_MIN_KERNEL_MAJOR}.{MAINLINE_MIN_KERNEL_MINOR}."
     );
     eprintln!();
 
@@ -265,8 +277,11 @@ pub fn print_incomplete_io_uring_ops_info() {
     eprintln!("  io_uring setup succeeded (shards started), but at runtime compio");
     eprintln!("  probed the kernel and a required opcode was absent. This is common");
     eprintln!("  on WSL2 and on older or cut-down kernels whose io_uring support is");
-    eprintln!("  incomplete. Some opcodes need a kernel newer than the shard-setup");
-    eprintln!("  floor below.");
+    eprintln!("  incomplete. Some opcodes require a newer kernel than the ring");
+    eprintln!("  setup flags.");
+    eprintln!();
+    eprintln!("  Current Iggy listener startup submits IORING_OP_BIND and");
+    eprintln!("  IORING_OP_LISTEN through compio. Mainline Linux added both in 6.11.");
     eprintln!();
 
     report_io_uring_environment();
@@ -300,9 +315,11 @@ fn report_io_uring_environment() {
 
         if let Some((major, minor)) = parse_kernel_version(&release) {
             kernel_version = Some((major, minor));
-            if (major, minor) < (MIN_KERNEL_MAJOR, MIN_KERNEL_MINOR) {
+            if (major, minor) < (MAINLINE_MIN_KERNEL_MAJOR, MAINLINE_MIN_KERNEL_MINOR) {
                 detected_issues.push(format!(
-                    "Kernel {major}.{minor} is too old (need >= {MIN_KERNEL_MAJOR}.{MIN_KERNEL_MINOR})"
+                    "Kernel {major}.{minor} predates the mainline Linux \
+                     {MAINLINE_MIN_KERNEL_MAJOR}.{MAINLINE_MIN_KERNEL_MINOR} feature set. \
+                     Verify whether the vendor kernel backports the required io_uring features"
                 ));
             }
         } else {
@@ -318,8 +335,8 @@ fn report_io_uring_environment() {
         if release_is_wsl || proc_version_is_wsl {
             eprintln!("  Environment: WSL2 (Microsoft kernel fork detected)");
             detected_issues.push(
-                "WSL2 kernels often ship incomplete io_uring: missing setup flags or \
-                 opcodes even at version >= 5.19"
+                "WSL2 kernels may ship incomplete io_uring support even when their \
+                 reported version is new enough"
                     .to_string(),
             );
         }
@@ -386,8 +403,9 @@ fn report_io_uring_environment() {
     eprintln!("  To resolve this:");
     eprintln!();
     eprintln!(
-        "  1. Upgrade to Linux kernel >= {MIN_KERNEL_MAJOR}.{MIN_KERNEL_MINOR} (>= {SYSCTL_IO_URING_DISABLED_KERNEL_MAJOR}.{SYSCTL_IO_URING_DISABLED_KERNEL_MINOR} recommended)"
+        "  1. Use mainline Linux >= {MAINLINE_MIN_KERNEL_MAJOR}.{MAINLINE_MIN_KERNEL_MINOR} or a vendor kernel with the required io_uring features"
     );
+    eprintln!("     Required listener opcodes: IORING_OP_BIND and IORING_OP_LISTEN");
     eprintln!();
     eprintln!("  2. If running under WSL2:");
     eprintln!("     - Update WSL: wsl --update  (from PowerShell)");
@@ -457,6 +475,9 @@ mod tests {
         let raw = std::io::Error::new(std::io::ErrorKind::InvalidInput, "EINVAL");
         let message = enrich_runtime_create_error(raw).to_string();
         assert!(message.contains("IORING_SETUP_COOP_TASKRUN"), "{message}");
+        assert!(message.contains("5.19"), "{message}");
+        assert!(message.contains("IORING_OP_BIND"), "{message}");
+        assert!(message.contains("6.11"), "{message}");
     }
 
     #[test]
