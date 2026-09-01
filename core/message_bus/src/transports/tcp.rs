@@ -245,6 +245,8 @@ async fn writer_loop(
     let _wake_reader = scopeguard::guard(conn_shutdown, |s| s.trigger());
     let mut batch: Vec<BusMessage> = Vec::with_capacity(max_batch);
     let mut iovecs: Vec<Frozen<MESSAGE_ALIGN>> = Vec::with_capacity(max_batch);
+    // Sized by the first wide batch; most connections never need it.
+    let mut scratch: Vec<Frozen<MESSAGE_ALIGN>> = Vec::new();
     let mut shutdown_fut = Box::pin(shutdown.wait().fuse());
 
     loop {
@@ -279,7 +281,7 @@ async fn writer_loop(
         for frame in batch.drain(..) {
             iovecs.extend(frame.into_fragments());
         }
-        let result = write_iovecs(&mut write_half, &mut iovecs).await;
+        let result = write_iovecs(&mut write_half, &mut iovecs, &mut scratch).await;
 
         if let Err(e) = result {
             error!(
@@ -296,12 +298,14 @@ async fn writer_loop(
 
 /// `write_vectored_all` over `iovecs`, at most `IOV_MAX` entries per call so
 /// a frame fragmented past the syscall limit (a wide poll reply) cannot fail
-/// with `EMSGSIZE` (the socket path is `io_uring` `sendmsg(2)`). Leaves
-/// `iovecs` empty with an allocation ready for the next batch.
+/// with `EMSGSIZE` (the socket path is `io_uring` `sendmsg(2)`). `scratch`
+/// carries each chunk in flight. Leaves both vecs empty with their
+/// allocations intact for the next batch.
 #[allow(clippy::future_not_send)]
 async fn write_iovecs(
     write_half: &mut TcpStream,
     iovecs: &mut Vec<Frozen<MESSAGE_ALIGN>>,
+    scratch: &mut Vec<Frozen<MESSAGE_ALIGN>>,
 ) -> io::Result<()> {
     if iovecs.len() <= IOV_MAX {
         let compio::BufResult(result, mut returned) =
@@ -311,22 +315,21 @@ async fn write_iovecs(
         *iovecs = returned;
         return Ok(());
     }
-    // Chunk through a cursor and one reused scratch vec. `split_off`-style
-    // chunking memmoves the whole tail per syscall, O(n^2) over a batch of n
-    // iovecs on the shard's single-threaded executor, and n is client-chosen
-    // (an unclamped poll count fans out to 1-2 iovecs per batch).
-    let mut source = mem::take(iovecs).into_iter();
-    let mut scratch = Vec::with_capacity(IOV_MAX);
+    // A full-range drain shifts nothing, so the batch moves into `scratch` in
+    // O(n). Draining `IOV_MAX` at a time from the front would memmove the tail
+    // per syscall, O(n^2) over a client-chosen n (an unclamped poll count fans
+    // out to 1-2 iovecs per batch) on the shard's single-threaded executor.
+    let mut source = iovecs.drain(..);
     loop {
         scratch.extend(source.by_ref().take(IOV_MAX));
         if scratch.is_empty() {
-            *iovecs = scratch;
             return Ok(());
         }
-        let compio::BufResult(result, mut returned) = write_half.write_vectored_all(scratch).await;
+        let compio::BufResult(result, mut returned) =
+            write_half.write_vectored_all(mem::take(scratch)).await;
         result?;
         returned.clear();
-        scratch = returned;
+        *scratch = returned;
     }
 }
 
@@ -436,53 +439,84 @@ mod tests {
         let _ = server_handle.await;
     }
 
-    /// A frame fragmented past `IOV_MAX` must reach the peer whole and in
-    /// order: `sendmsg` rejects more than `IOV_MAX` iovecs with `EMSGSIZE`,
-    /// so the writer has to chunk the flattened batch instead of failing it.
+    /// A frame fragmented to `IOV_MAX` or past it must reach the peer whole
+    /// and in order: `sendmsg` rejects more than `IOV_MAX` iovecs with
+    /// `EMSGSIZE`, so the writer has to chunk the flattened batch instead of
+    /// failing it. Each frame goes out alone in its batch (the follow-up frame
+    /// is sent only once the peer has it), so the iovec count is exactly the
+    /// fragment count and the chunk boundaries land where the cases say.
     #[compio::test]
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
-    async fn run_writes_frames_fragmented_past_iov_max() {
-        const FRAME_LEN: usize = 2 * IOV_MAX;
+    async fn run_writes_frames_fragmented_at_and_past_iov_max() {
         let (client, server) = local_pair().await;
         let (client_out, _client_in, client_shutdown, client_handle) =
             drive(TcpTransportConn::new(client));
         let (_server_out, server_in, server_shutdown, server_handle) =
             drive(TcpTransportConn::new(server));
-
-        let whole = Message::<GenericHeader>::new(FRAME_LEN)
-            .transmute_header(|_, h: &mut GenericHeader| {
-                h.command = Command::Ping;
-                h.size = FRAME_LEN as u32;
-            })
-            .into_frozen();
-        // Header whole in the first fragment (the frame contract), body as one
-        // byte per fragment.
-        let mut fragments = server_common::ResponseFragments::with_capacity(FRAME_LEN);
-        fragments.push(whole.slice(..HEADER_SIZE));
-        fragments.extend((HEADER_SIZE..FRAME_LEN).map(|at| whole.slice(at..=at)));
-        assert!(fragments.len() > IOV_MAX);
-        let fragmented =
-            Message::<GenericHeader, server_common::ResponseBacking>::try_from(fragments)
-                .expect("fragments form a valid frame")
-                .into_inner();
-        client_out.send(fragmented).await.unwrap();
-        client_out
-            .send(header_only(Command::Request).into())
-            .await
-            .unwrap();
-
         let recv_with_timeout = || async {
             compio::time::timeout(Duration::from_secs(2), server_in.recv())
                 .await
                 .expect("recv within 2s")
                 .expect("ok")
         };
-        let ping = recv_with_timeout().await;
-        assert_eq!(ping.header().command, Command::Ping);
-        assert_eq!(ping.header().size as usize, FRAME_LEN);
-        assert_eq!(ping.as_slice(), whole.as_slice());
-        let request = recv_with_timeout().await;
-        assert_eq!(request.header().command, Command::Request);
+
+        // One connection for all cases so a chunked batch is followed by both
+        // a single-iovec one and a wider one. A full single chunk, one iovec
+        // over it, the original `2 * IOV_MAX`-byte repro, and an exact multiple
+        // of the chunk size.
+        for fragment_count in [
+            IOV_MAX,
+            IOV_MAX + 1,
+            2 * IOV_MAX - HEADER_SIZE + 1,
+            2 * IOV_MAX,
+        ] {
+            // Header whole in the first fragment (the frame contract), body as
+            // one byte per fragment.
+            let frame_len = HEADER_SIZE + fragment_count - 1;
+            let whole = Message::<GenericHeader>::new(frame_len)
+                .transmute_header(|_, h: &mut GenericHeader| {
+                    h.command = Command::Ping;
+                    h.size = frame_len as u32;
+                })
+                .into_frozen();
+            let mut fragments = server_common::ResponseFragments::with_capacity(fragment_count);
+            fragments.push(whole.slice(..HEADER_SIZE));
+            fragments.extend((HEADER_SIZE..frame_len).map(|at| whole.slice(at..=at)));
+            assert_eq!(fragments.len(), fragment_count);
+            let fragmented =
+                Message::<GenericHeader, server_common::ResponseBacking>::try_from(fragments)
+                    .expect("fragments form a valid frame")
+                    .into_inner();
+            client_out.send(fragmented).await.unwrap();
+
+            let ping = recv_with_timeout().await;
+            assert_eq!(
+                ping.header().command,
+                Command::Ping,
+                "{fragment_count} fragments"
+            );
+            assert_eq!(
+                ping.header().size as usize,
+                frame_len,
+                "{fragment_count} fragments"
+            );
+            assert_eq!(
+                ping.as_slice(),
+                whole.as_slice(),
+                "{fragment_count} fragments"
+            );
+
+            client_out
+                .send(header_only(Command::Request).into())
+                .await
+                .unwrap();
+            let request = recv_with_timeout().await;
+            assert_eq!(
+                request.header().command,
+                Command::Request,
+                "{fragment_count} fragments"
+            );
+        }
 
         client_shutdown.trigger();
         server_shutdown.trigger();
