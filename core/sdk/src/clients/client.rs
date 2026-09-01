@@ -347,7 +347,7 @@ impl IggyClient {
     /// Hence, transport specific configuration is abstracted away.
     ///
     /// Configurable options are:
-    /// - `heartbeat_interval`: [`IggyDuration`]. Client heartbeat period. Default: `5s`.
+    /// - `heartbeat_interval`: [`NonZeroIggyDuration`]. Client heartbeat period. Default: `5s`.
     /// - `retries`: u32. Number of retries when sending a request. Default: `3`.
     ///
     /// ```no_run
