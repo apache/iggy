@@ -36,20 +36,19 @@ use tokio::task::JoinHandle;
 /// holds at once, and [`max_in_flight`](BackgroundConfig::max_in_flight), the upper bound on the
 /// requests being written at once across all of its workers.
 ///
-/// A background send is a dispatch of messages to a [`Shard`]. Dispatching means, that the messages are send down the
-/// sending end of a channel, where the receiver is listened on a [`Shard`] worker.
-/// So a batch is queued and the write happens later, on one of the [`Shard`] workers this type owns.
-/// Consequently, errors from writes surface on `Shard`s which channel those errors back to the dispatcher's callback
-/// (comp. [`Self::new()`]). These errors are logged with the default [`LogErrorCallback`], but other
-/// implementations of the [`ErrorCallback`] trait can be set through
-/// [`BackgroundConfig::error_callback`].
+/// A background send dispatches messages to a [`Shard`] through a channel. The batch is queued and
+/// the write happens later on one of the shard workers owned by this type. Write failures therefore
+/// surface on a shard after the queueing caller has returned. The shard forwards each failure to the
+/// dispatcher's error task, which invokes [`BackgroundConfig::error_callback`]. The default
+/// [`LogErrorCallback`] logs the failure, and applications can provide another [`ErrorCallback`]
+/// implementation.
 ///
-/// Which worker a batch lands on, and what that means for ordering, is described on
+/// Which worker a batch lands on, and what that means for ordering, is described in
 /// [`IggyProducer`](crate::clients::producer::IggyProducer).
 ///
 /// # Examples
 ///
-/// Configuring background send through the producer builder:
+/// Configuring background sending through the producer builder:
 ///
 /// ```rust,no_run
 /// use iggy::prelude::*;
@@ -71,8 +70,8 @@ use tokio::task::JoinHandle;
 /// # }
 /// ```
 ///
-/// You can implement your own backend/ logic on how to send and wrap the dispatcher around that.
-/// Here, just print instead of sending anything to a server for illustration.
+/// You can also implement a backend and wrap the dispatcher around it. This example prints instead
+/// of sending anything to a server.
 ///
 /// ```rust,no_run
 /// use iggy::clients::producer::ProducerCoreBackend;
@@ -111,7 +110,7 @@ use tokio::task::JoinHandle;
 ///     .dispatch(vec![IggyMessage::from_str("hello")?], stream, topic, None)
 ///     .await?;
 ///
-/// // Writes what is still queued. Dropping the dispatcher instead discards it.
+/// // Writes what is still queued. Dropping the dispatcher instead may lose buffered messages.
 /// dispatcher.shutdown().await;
 /// # Ok(())
 /// # }
@@ -122,30 +121,30 @@ use tokio::task::JoinHandle;
 /// ## Memory budget
 ///
 /// [`dispatch()`](Self::dispatch) charges a batch against a budget of
-/// [`BackgroundConfig::max_buffer_size`] bytes before queueing it, and the charge is released once a
-/// worker has written the batch, so the budget covers what is waiting in the queues as well as what
-/// is on the wire. What gets charged is the size [`ShardMessage`] reports, which counts the stream
-/// and topic identifiers alongside the messages rather than the payloads alone.
+/// [`BackgroundConfig::max_buffer_size`] bytes before queueing it. The charge is released when
+/// [`ProducerCoreBackend::send_internal`] returns, so the budget covers queued sends and requests
+/// whose result is still pending. What gets charged is the size [`ShardMessage`] reports, which
+/// counts stream and topic identifiers alongside the messages rather than payloads alone.
 ///
-/// This budget is the only backpressure a background send can observe, and
-/// [`BackgroundConfig::failure_mode`] decides what exhausting it does to the caller. The second
-/// limit, [`BackgroundConfig::max_in_flight`], is shared by the workers rather than the callers: a
-/// worker takes one of its permits for the batch it is about to write, so it bounds concurrent
-/// writes across all workers, not queued bytes.
+/// [`BackgroundConfig::failure_mode`] decides how the byte budget backpressures the caller. The
+/// bounded channel feeding each shard is a separate source of backpressure and can also make a
+/// dispatch wait. The second configured limit, [`BackgroundConfig::max_in_flight`], is shared by the
+/// workers rather than the callers. A worker takes one of its permits for the batch it is about to
+/// write, so it bounds concurrent writes across all workers, not queued bytes.
 ///
-/// ## In-flight Limit
+/// ## In-flight limit
 ///
-/// You can configure the `ProducerDispatcher` with a maximum number of requests that are allowed to be
-/// written concurrently through [`BackgroundConfig::max_in_flight`]. That budget is shared by every
-/// worker rather than granted per worker, and its default is one. Note, that you risk losing the ordering of batches
-/// if you increase that number. For adjacent messages split in two batches sending of the first batch might fail and trigger a retry.
-/// However, that batch might be raced by the second batch should it succeed immediately.
+/// [`BackgroundConfig::max_in_flight`] limits how many workers may write concurrently. The permit
+/// pool is shared by every worker and defaults to one. A shard itself remains sequential for every
+/// value: it awaits a request and all of its retries before starting its next request. Raising the
+/// limit therefore affects concurrency between shards. It can expose reordering only when the
+/// configured sharding strategy sends one ordered destination to different shards.
 ///
 /// # Shutdown
 ///
-/// [`shutdown()`](Self::shutdown) is what makes the queued batches observable. It stops the workers,
-/// waits for their last flush, and only then returns. Dropping the dispatcher instead ends the
-/// workers wherever they are and discards whatever they still hold.
+/// [`shutdown()`](Self::shutdown) broadcasts a stop signal, drains every shard channel, flushes each
+/// remaining buffer, and waits for the shard and error tasks. Dropping the dispatcher provides no
+/// such completion guarantee and can lose batches that a shard has buffered but not written.
 ///
 /// [`ErrorCallback`]: crate::clients::producer_error_callback::ErrorCallback
 /// [`LogErrorCallback`]: crate::clients::producer_error_callback::LogErrorCallback
@@ -159,29 +158,37 @@ pub struct ProducerDispatcher {
 }
 
 impl ProducerDispatcher {
-    /// Spawns the [`Shard`]s, i.e. the workers that can write messages to the server.
+    /// Spawns the [`Shard`] workers that write messages to the server.
     ///
-    /// The `ProducerDispatcher` spawns and owns the `Shards` on which the write load
-    /// is distributed. Which of the [`BackgroundConfig::num_shards`] is picked to write is decided
-    /// by [`BackgroundConfig::sharding`].
+    /// The dispatcher owns the shards over which writes are distributed.
+    /// [`BackgroundConfig::sharding`] decides which of the
+    /// [`BackgroundConfig::num_shards`] workers receives each batch.
     ///
-    /// Additionally, a dispatcher starts a task that listens for error callbacks. So should a `Shard` fail
-    /// to write some messages (including retries), that failure is not received on the same task,
-    /// but hits the [`ErrorCallback`] set as [`BackgroundConfig::error_callback`].
+    /// The dispatcher also starts an error task. When a shard receives
+    /// [`IggyError::ProducerSendFailed`] from its backend, it sends the context to this task, which
+    /// invokes the [`ErrorCallback`] configured through [`BackgroundConfig::error_callback`]. A
+    /// custom backend error that is not `ProducerSendFailed` is logged by the shard and does not
+    /// invoke the callback.
     ///
-    /// To cap the amount of data a dispatcher handles two semaphores are initialized from
-    /// [`BackgroundConfig::max_buffer_size`] and [`BackgroundConfig::max_in_flight`]. Both are shared
-    /// by every `Shard` and therefore hold for the entire producer, rather than per worker. They
+    /// Two semaphores enforce [`BackgroundConfig::max_buffer_size`] and
+    /// [`BackgroundConfig::max_in_flight`]. Both are shared by every shard and therefore apply to
+    /// the entire producer rather than per worker. They
     /// count different things at different points of a batch's life: `max_buffer_size` is charged in
     /// bytes by [`dispatch()`](Self::dispatch) before the batch is queued and released once it has
-    /// been written, so it bounds queued and in-flight bytes together, while `max_in_flight` is taken
-    /// as one permit by the worker that is about to write and released when that request returns, so
+    /// completed, so it bounds queued and in-flight bytes together, while `max_in_flight` is taken
+    /// as one permit by a worker that is about to write and released when that request returns, so
     /// it bounds concurrent requests and says nothing about their size. A batch therefore has to pass
     /// the byte budget to enter a queue, and to take a request slot to leave it.
     ///
+    /// # Panics
+    ///
+    /// Panics when a nonzero [`BackgroundConfig::max_buffer_size`] or
+    /// [`BackgroundConfig::max_in_flight`] exceeds `Semaphore::MAX_PERMITS`.
+    ///
     /// # Examples
     ///
-    /// Four workers writing in parallel, fed round-robin, with a budget of 64 MiB in queued bytes:
+    /// Four workers allowed to write in parallel, fed round-robin, with a 64 MiB budget for queued
+    /// and in-flight bytes:
     ///
     /// ```rust,no_run
     /// # use iggy::clients::producer::ProducerCoreBackend;
@@ -207,6 +214,7 @@ impl ProducerDispatcher {
     ///     backend,
     ///     BackgroundConfig::builder()
     ///         .num_shards(4)
+    ///         .max_in_flight(4)
     ///         // Ordering is given up for throughput: a batch can land on any of the four workers.
     ///         .sharding(Box::new(BalancedSharding::default()))
     ///         .max_buffer_size(IggyByteSize::from(64 * 1024 * 1024))
@@ -215,8 +223,10 @@ impl ProducerDispatcher {
     /// # }
     /// ```
     ///
-    /// `num_shards(0)` is read as one worker, and both limits read `0` as unbounded, so this
-    /// dispatcher writes from a single worker and never refuses a batch for lack of budget:
+    /// `num_shards(0)` is read as one worker. A zero byte budget is treated as unbounded and a zero
+    /// in-flight limit uses the semaphore maximum. This dispatcher therefore never refuses a batch
+    /// for lack of byte-budget capacity, although its bounded shard channel can still make dispatch
+    /// wait:
     ///
     /// ```rust,no_run
     /// # use iggy::clients::producer::ProducerCoreBackend;
@@ -312,19 +322,22 @@ impl ProducerDispatcher {
 
     /// Queues a batch on one of the worker [`Shard`]s and returns without waiting for it to be written.
     ///
-    /// The batch is charged against the [`BackgroundConfig::max_buffer_size`] budget before it is
-    /// queued (a semaphore), and the permit travels with it so those bytes stay charged until a worker has written
-    /// them. A batch larger than the entire budget can never be charged and fails with
+    /// The batch is charged against the [`BackgroundConfig::max_buffer_size`] semaphore before it is
+    /// queued. Its permit travels with it, so those bytes stay charged until
+    /// [`ProducerCoreBackend::send_internal`] returns. A batch larger than the entire budget can
+    /// never be charged and fails with
     /// [`IggyError::BackgroundSendBufferOverflow`].
     ///
     /// When the budget is exhausted, [`BackgroundConfig::failure_mode`] decides what happens to the
     /// caller. [`BackpressureMode::FailImmediately`] gives up with
-    /// [`IggyError::BackgroundSendBufferOverflow`], [`BackpressureMode::Block`] waits for as long as
-    /// it takes to acquire the message bytes from the budget, and [`BackpressureMode::BlockWithTimeout`] waits
-    /// for its duration before failing with [`IggyError::BackgroundSendTimeout`]. None of the three retries.
+    /// [`IggyError::BackgroundSendBufferOverflow`], [`BackpressureMode::Block`] waits until enough
+    /// capacity is released, and [`BackpressureMode::BlockWithTimeout`] waits for its duration before
+    /// failing with [`IggyError::BackgroundSendTimeout`]. These modes do not control retries of the
+    /// server write.
     ///
-    /// [`BackgroundConfig::sharding`] then picks the worker based on the configured strategy, and the batch is handed to its queue.
-    /// That queue is bounded (=256), exceeding that limit can force the caller to wait.
+    /// [`BackgroundConfig::sharding`] then picks the worker, and the batch is handed to that worker's
+    /// queue. The queue holds 256 entries, so a full queue can make the caller wait independently of
+    /// the byte-budget failure mode.
     ///
     /// # Errors
     ///
@@ -332,7 +345,14 @@ impl ProducerDispatcher {
     /// [`IggyError::BackgroundSendError`] if the picked worker is already gone, which leaves the
     /// batch unqueued and unsent in both cases. The budget can additionally fail the call with
     /// [`IggyError::BackgroundSendBufferOverflow`] or [`IggyError::BackgroundSendTimeout`] as
-    /// described above.
+    /// described above. `BackgroundSendBufferOverflow` is also returned when the batch's reported
+    /// size does not fit the semaphore API's `u32` permit count, including when the configured byte
+    /// budget is unbounded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the configured [`Sharding`](crate::clients::producer_sharding::Sharding)
+    /// implementation returns an index outside the dispatcher's shard list.
     ///
     /// # Examples
     ///
@@ -372,7 +392,8 @@ impl ProducerDispatcher {
     ///     )
     ///     .await?;
     ///
-    /// // Nothing is written yet. Both batches are queued, and a worker writes them later.
+    /// // Dispatch only guarantees that the first batch was queued. A worker may already have
+    /// // started or completed its write.
     /// dispatcher
     ///     .dispatch(vec![IggyMessage::from_str("order updated")?], stream, topic, None)
     ///     .await?;
@@ -492,6 +513,8 @@ impl ProducerDispatcher {
             &shard_message.stream,
             &shard_message.topic,
         );
+
+        debug_assert!(shard_ix < self.shards.len());
 
         let shard = &self.shards[shard_ix];
 

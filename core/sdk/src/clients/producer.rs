@@ -477,17 +477,15 @@ unsafe impl Sync for IggyProducer {}
 /// Appends messages to one topic of one stream.
 ///
 /// A topic is split into partitions, and a partition is an ordered log that producers append to.
-/// The `IggyProducer` is an interface that allows you to configure [where](#where-messages-are-sent-to)
-/// and [how](#how-messages-are-sent) messages are send.
+/// `IggyProducer` lets you configure [where](#where-messages-land-and-ordering) and
+/// [how](#how-messages-are-sent) messages are sent.
 ///
 /// # Creating a producer
 ///
-/// The easiest way is to use the [`IggyClient`] with a pre-configured connection. Then
-/// [`IggyClient::producer()`] returns a [`IggyProducerBuilder`] that is already set with the connection
-/// from the client.
+/// The easiest way to create a producer is through an [`IggyClient`] with a configured connection.
+/// [`IggyClient::producer()`] returns an [`IggyProducerBuilder`] that uses that client's connection.
 ///
-/// Note, building never talks to the server. [`init()`](Self::init) must be awaited once before the
-/// first message is sent.
+/// Building never talks to the server. [`init()`](Self::init) must be awaited before the first send.
 ///
 /// # Examples
 ///
@@ -540,13 +538,13 @@ unsafe impl Sync for IggyProducer {}
 /// // Returns once the batch is queued. The send itself happens on a background worker.
 /// producer.send_one(IggyMessage::from_str("hello")?).await?;
 ///
-/// // Without this, everything still queued is dropped.
+/// // Without graceful shutdown, buffered messages have no completion guarantee and may be lost.
 /// producer.shutdown().await;
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// Keying messages to a partition and telling apart what was written from what was not:
+/// Keying messages to a partition and separating confirmed chunks from the unconfirmed tail:
 ///
 /// ```rust,no_run
 /// use iggy::prelude::*;
@@ -568,9 +566,11 @@ unsafe impl Sync for IggyProducer {}
 /// if let Err(IggyError::ProducerSendFailed { cause, failed, committed, .. }) =
 ///     producer.send(messages).await
 /// {
-///     // `committed` is the prefix that is durable, `failed` is what to send again.
-///     eprintln!("{} messages were not written: {cause}", failed.len());
-///     eprintln!("{} chunk(s) committed before the failure", committed.len());
+///     // `committed` contains confirmations returned for earlier chunks. `failed` is the
+///     // unconfirmed tail. Depending on `cause`, its first request may already have committed, so
+///     // resending it can create duplicates.
+///     eprintln!("{} messages have no usable confirmation: {cause}", failed.len());
+///     eprintln!("{} chunk(s) were confirmed before the failure", committed.len());
 /// }
 /// # Ok(())
 /// # }
@@ -584,26 +584,32 @@ unsafe impl Sync for IggyProducer {}
 /// A **direct** producer (the default) sends from the calling task. [`send()`](Self::send) awaits
 /// the server and returns its [confirmations](#confirmations). A batch longer than
 /// [`DirectConfig::batch_length`] is split into that many messages per request, and the requests are
-/// awaited one after another, so a failure in the middle leaves the chunks before it written.
-/// [`DirectConfig::linger_time`] is the smallest gap between two requests. It does
-/// not space out the chunks within one send.
+/// awaited one after another, so a failure in the middle leaves confirmations for the successful
+/// prefix. [`DirectConfig::linger_time`] requests a minimum gap between sequential send calls. It
+/// does not space out chunks within one call and does not serialize concurrent callers.
 ///
-/// A **background** producer hands the batch to a [`ProducerDispatcher`] and returns before anything is sent, so
-/// its [`send()`](Self::send) reports nothing about the write, and never any confirmations. The
+/// A **background** producer hands the batch to a [`ProducerDispatcher`] and returns after queueing
+/// it without waiting for the write. A worker may already have started or completed the write by
+/// then, but [`send()`](Self::send) reports no write result and returns no confirmations. The
 /// dispatcher runs [`BackgroundConfig::num_shards`] workers, each buffering the batches routed to it
 /// and flushing them when one of three limits is hit: [`BackgroundConfig::batch_length`] queued
-/// sends, [`BackgroundConfig::batch_size`] bytes, or [`BackgroundConfig::linger_time`] since the last
-/// flush. Buffered sends that share a stream, topic and partitioning are merged into one request.
+/// sends, [`BackgroundConfig::batch_size`] bytes, or the next
+/// [`BackgroundConfig::linger_time`] deadline. Buffered sends that share a stream, topic, and
+/// partitioning are merged into one request.
 ///
-/// Two settings of a background producer decide message order:
+/// The sharding strategy decides how background dispatch affects message order:
 /// - [`BackgroundConfig::sharding`] routes a batch to a worker. The default [`OrderedSharding`] picks
 ///   it from the stream and the topic, so everything going to one topic stays on one worker and keeps
-///   its order. [`BalancedSharding`] spreads batches round-robin for throughput and gives up ordering.
-/// - [`BackgroundConfig::max_in_flight`] bounds the requests in flight across all workers, one by
-///   default. A higher value lets a retried batch land after a later one that succeeded first.
+///   its order. [`BalancedSharding`] spreads batches round-robin and gives up ordering, which can
+///   improve throughput when multiple shards are allowed to write concurrently.
+/// - [`BackgroundConfig::max_in_flight`] bounds concurrent writes across workers. A worker itself
+///   remains sequential for every value and awaits retries before starting its next request. Raising
+///   this setting does not break the per-topic order provided by [`OrderedSharding`], but it allows
+///   strategies that spread one topic across workers to write those shards concurrently.
 ///
-/// Since a background send is queued rather than written, the dispatcher holds a bounded amount of
-/// memory, [`BackgroundConfig::max_buffer_size`] bytes over all workers.
+/// Since a background send is queued rather than written, the dispatcher charges queued and
+/// in-flight sends against [`BackgroundConfig::max_buffer_size`] over all workers. The default is
+/// bounded, while a value of zero disables the byte budget.
 /// [`BackgroundConfig::failure_mode`] decides what a send does when that budget is exhausted. You can block
 /// until it frees up (the default), block with a timeout and fail with
 /// [`IggyError::BackgroundSendTimeout`], or fail right away with
@@ -612,15 +618,18 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// In contrast to the direct mode, which awaits the confirmations from the server, a background send
 /// has no caller left to return to. Write failures are reported to
-/// [`BackgroundConfig::error_callback`] instead, which receives the cause, the messages that were not
-/// written and the confirmations of the chunks that were. The default callback logs them.
-/// However, you can configure your own [`ErrorCallback`] to handle failed messages.
+/// [`BackgroundConfig::error_callback`] instead. It receives the cause, the unconfirmed tail, and
+/// confirmations returned for earlier chunks. The first request in the unconfirmed tail may have
+/// committed before its response was lost or its confirmation failed to decode, so retrying it can
+/// create duplicates. The default callback logs the context and drops it. A custom
+/// [`ErrorCallback`] can retain or persist failed sends according to the application's at-least-once
+/// policy.
 ///
 /// # Where messages land and ordering
 ///
-/// The partition is the unit of order in Iggy. Inside one partition, messages sit at increasing
-/// offsets in the order the server appended them, and that never changes. Between partitions there
-/// is no order at all, so a consumer reading a topic of several partitions sees them interleaved.
+/// The partition is the unit of order in Iggy. Inside one partition, messages receive increasing
+/// offsets in the server's append order. Between partitions there is no global order, so a consumer
+/// reading several partitions can observe their messages interleaved.
 ///
 /// Two messages therefore stay in order only if both of these hold:
 /// 1. they are appended to the **same partition**, and
@@ -631,20 +640,20 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// | Setting | Order | What happens |
 /// | --- | --- | --- |
-/// | [`Partitioning::balanced()`], the default | broken | the server picks a partition per request, so consecutive sends, and the chunks one split send turns into, are scattered over the topic |
-/// | [`Partitioning::partition_id()`], [`Partitioning::messages_key()`] with a stable key, [`partitioner()`] returning a stable id | kept | every batch is appended to the same log |
-/// | one task, awaiting each [`send()`](Self::send) before the next | kept | the requests reach the partition in the order they were made |
-/// | several tasks sharing the producer, or sends that are not awaited before the next one starts | broken | the requests race, and the one that arrives first is appended first, whichever task called first |
-/// | `direct` producer | kept | the calling task writes the chunks of a send one after another |
-/// | `background` producer with [`OrderedSharding`], the default | kept | one stream and topic is bound to one worker, which writes what it queued in queue order |
-/// | `background` producer with [`BalancedSharding`] | broken | consecutive batches are handed to different workers that buffer and write in parallel, so a later batch can be written first |
-/// | [`BackgroundConfig::max_in_flight`] of `1`, the default | kept | a worker finishes one request, retries included, before starting the next |
-/// | [`BackgroundConfig::max_in_flight`] above `1` | broken | a batch being retried can be overtaken by a later batch that succeeded straight away |
+/// | [`Partitioning::balanced()`], the default | not guaranteed with multiple partitions | the server chooses a partition per request, so consecutive sends and chunks may land in different logs |
+/// | [`Partitioning::partition_id()`], [`Partitioning::messages_key()`] with a stable key, [`partitioner()`] returning a stable id | same partition | every batch is routed to the same log, satisfying the first ordering requirement |
+/// | one task, awaiting each [`send()`](Self::send) before the next | sequential | requests reach a partition in call order |
+/// | several tasks sharing the producer, or overlapping sends | not guaranteed | requests race, so call order does not determine append order |
+/// | `direct` producer | sequential within one call | the calling task writes that call's chunks one after another |
+/// | `background` producer with [`OrderedSharding`], the default | sequential per stream/topic pair | one pair is bound to one worker, which writes its queue in order |
+/// | `background` producer with [`BalancedSharding`] and multiple shards | not guaranteed | consecutive batches can reach different workers, so a later batch may be written first |
+/// | [`BackgroundConfig::max_in_flight`] | depends on sharding | it controls concurrency between workers, while each worker remains sequential |
 ///
-/// In short, per partition order survives if you name the partition and let one writer write to it, e.g. a keyed or fixed
-/// partitioning sending from a single task or a `background` producer with ordered sharding and
-/// only one request in-flight. Any topic can carry several such orders at once, one per key,
-/// since [`Partitioning::messages_key()`] keeps each key on its own partition.
+/// In short, per-partition order survives if you name the partition and let one sequential writer
+/// write to it, for example keyed or fixed partitioning from one task, or a background producer with
+/// ordered sharding. [`Partitioning::messages_key()`] maps the same key consistently to a partition
+/// for a fixed topic layout. Different keys can share a partition, so this does not create a
+/// separate physical log per key.
 ///
 /// One thing this does not protect against is a message appearing twice. Delivery is at-least-once,
 /// so a retried batch can be appended a second time at a higher offset, see
@@ -652,48 +661,58 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// # Confirmations
 ///
-/// A successful send returns [`SendMessagesResponse`], holding one
-/// [`SendMessagesConfirmationResponse`] per chunk. Each recording a partition and the
-/// `base_offset` the first message of that chunk got. See [`send()`](Self::send) for what the value
-/// does and does not promise.
+/// A successful direct send returns [`SendMessagesResponse`], normally holding one
+/// [`SendMessagesConfirmationResponse`] per chunk. Each confirmation records a partition and the
+/// `base_offset` assigned to the first message in that chunk. A legacy server may return no
+/// confirmation payload, and a background producer always returns an empty confirmation list.
+///
+/// A confirmation means the server committed the batch in memory. It does not mean the batch was
+/// fsynced. After a crash and restart, a later batch can receive an offset that a client recorded
+/// before the crash. Delivery is also at least once, so a retry can commit the same messages at
+/// another offset.
 ///
 /// # Retrying and what a failure means
 ///
-/// A retry is the same request sent again, unchanged, meaning a producer never rewrites, splits or
+/// A retry is the same request sent again unchanged, meaning a producer never rewrites, splits, or
 /// reorders a batch to retry a send. [`send_retries()`] sets how many times it may try and how
-/// long it waits in between, three times one second apart by default. The configured retry policy holds
-/// for both direct and background consumers.
+/// later retries are paced. The default allows three retries and configures a one-second interval.
+/// The current interval timer fires immediately on its first tick, so the first retry is immediate
+/// and later retries are spaced by the interval. The retry policy applies to both direct and
+/// background producers.
 ///
-/// A request can fail after the server has already appended it. Thus, sending it again then writes the
-/// same messages twice and a batch can sit in the partition more than once, at different offsets.
-/// Hence, a consumer that cannot live with duplicates has to recognise them itself.
+/// A request can fail after the server has already appended it. Sending it again can therefore write
+/// the same messages twice, leaving the batch in the partition at multiple offsets. A consumer that
+/// cannot accept duplicates must recognize them itself.
 ///
 /// What is retried, and what is not:
 ///
 /// | Situation | Retried | What the caller ends up with |
 /// | --- | --- | --- |
 /// | the client is not signed in, so nothing may be sent yet | yes | the send goes ahead as soon as the client is signed in, or fails with [`IggyError::CannotSendMessagesDueToClientDisconnection`] once the retry budget is spent |
-/// | the request reached the server and failed | yes, the identical request is sent again | the confirmation of the attempt that finally succeeds, or the last error once the retry budget is spent |
+/// | the request failed without an indication that it committed | yes, the identical request is sent again | the confirmation of the attempt that finally succeeds, or the last error once the retry budget is spent |
 /// | the batch committed, but its confirmation could not be read ([`IggyError::InvalidBytesResponse`] or [`IggyError::InvalidJsonResponse`], raised on the HTTP transport only) | no | the write did happen and retrying would duplicate it on purpose |
-/// | encrypting or partitioning the batch failed | no | that cause, with the whole batch reported as unwritten, since nothing ever left the producer |
+/// | encrypting or partitioning the batch failed | no | that cause, with the whole batch returned as unconfirmed because nothing was sent, although earlier messages may already have been encrypted in place |
 /// | [`send_retries()`] passed `None` or `0` | no | the outcome of the single attempt |
 ///
 /// To be precise: the budget is spent per request. Every chunk of a split is a request that gets its own retry budget.
 /// Also, waiting for the client to sign in is counted separately from retrying the write itself.
 ///
-/// Where a failure surfaces is the one thing the two modes disagree on. Either way it names the same
-/// three pieces: the `cause`, the messages that were not written, and the confirmations of the
-/// chunks that were.
+/// Where a failure surfaces is the main difference between the two modes. Either way it names the
+/// same three pieces: the `cause`, the unconfirmed tail, and confirmations returned for earlier
+/// chunks.
 ///
-/// - A **direct** send returns them to the caller as [`IggyError::ProducerSendFailed`]. Sending
-///   `failed` again completes the send, while `committed` says what does not be sent
-///   again.
+/// - A **direct** send returns them to the caller as [`IggyError::ProducerSendFailed`]. `committed`
+///   contains confirmations returned for earlier chunks, while `failed` is the unconfirmed tail.
+///   Inspect `cause` before resending it. A request can commit before its response is lost, so the
+///   first request in that tail may already have committed and resending can duplicate messages.
+///   Encryption mutates messages before sending or partitioning, so `failed` contains encrypted
+///   messages when an encryptor is configured. Passing them back to the same producer would encrypt
+///   them again.
 /// - A **background** send returned to its caller long before the write, so they go to
 ///   [`BackgroundConfig::error_callback`] as an
-///   [`ErrorCtx`](crate::clients::producer_error_callback::ErrorCtx) instead, once the retries above
-///   are spent. The default callback logs the failure and drops the messages. Consequently, if you need
-///   to keep failed messages you need to implement your own [`ErrorCallback`] to handle them.
-///
+///   [`ErrorCtx`](crate::clients::producer_error_callback::ErrorCtx) instead, once no further
+///   automatic retry will be attempted. The default callback logs the failure and drops the context.
+///   Implement [`ErrorCallback`] when failed sends must be retained.
 ///
 /// # Options and defaults
 ///
@@ -706,7 +725,7 @@ unsafe impl Sync for IggyProducer {}
 /// | [`direct()`] / [`background()`] | [`direct()`] with the [`DirectConfig`] defaults, 1000 messages per request and no linger time | whether a send waits for the write |
 /// | [`partitioning()`] | [`Partitioning::balanced()`] | which partition a batch lands in |
 /// | [`partitioner()`] | none | computing the partition on the client instead |
-/// | [`send_retries()`] | three retries, one second apart | retrying a failed request |
+/// | [`send_retries()`] | three retries, one-second interval after the immediate first retry | retrying a failed request |
 /// | [`create_stream_if_not_exists()`] | on | creating the stream during [`init()`](Self::init) |
 /// | [`create_topic_if_not_exists()`] | on, one partition, server defaults for expiry and max size | creating the topic during [`init()`](Self::init) |
 /// | [`encryptor()`] | inherited from the client | encrypting payloads and user headers |
@@ -717,25 +736,28 @@ unsafe impl Sync for IggyProducer {}
 ///
 /// # Encryption
 ///
-/// When the [`IggyClient`] was created with an encryptor, payloads and user headers are encrypted
-/// before a batch leaves the producer, which is only useful if the consumer decrypts them with a
-/// matching key. This is guaranteed if you spawned both the [`IggyProducer`] and the [`IggyConsumer`]
-/// from the same [`IggyClient`]. A message that cannot be encrypted fails the whole send.
+/// When the [`IggyClient`] was created with an encryptor, a producer built from that client inherits
+/// it and encrypts payloads and user headers before a batch leaves the producer. A consumer must use
+/// a matching key to decrypt them. Producers and consumers built from the same client inherit the
+/// same encryptor unless either builder overrides or clears it. An encryption failure fails the
+/// whole send before any request leaves the producer. Encryption runs before a custom
+/// [`partitioner()`], so that partitioner observes the encrypted payload and user headers.
 ///
 /// # Concurrency
 ///
 /// `IggyProducer` is `Send` and `Sync` but not `Clone`, and every send method takes `&self`. An
-/// `Arc<IggyProducer>` is therefore shared across tasks without further wrapping, and a background
-/// producer is built for exactly that, since its workers are what serialize the writes.
+/// `Arc<IggyProducer>` can therefore be shared across tasks without further wrapping. A background
+/// dispatcher routes those calls into worker queues and preserves order only within each worker.
 ///
 /// Concurrent direct sends are independent requests, so nothing orders them against each other. The
 /// chunk order described above holds within one call to [`send()`](Self::send) only.
 ///
 /// # Shutting down
 ///
-/// Call [`shutdown()`](Self::shutdown) once done producing. It takes the producer by value and
-/// flushes what a `background` producer still holds. Note, that dropping it instead discards buffered messages
-/// silently. A `direct` producer has nothing buffered and nothing to lose, calling shutdown on it is a no-op.
+/// Call [`shutdown()`](Self::shutdown) when production is complete. It takes the producer by value,
+/// drains a background producer's queues, flushes its remaining buffers, and waits for the worker
+/// and error tasks. Dropping a background producer provides no completion guarantee and can lose
+/// buffered messages. A direct producer has nothing buffered, so shutdown is a no-op.
 ///
 /// [`IggyClient`]: crate::clients::client::IggyClient
 /// [`IggyClient::producer()`]: crate::clients::client::IggyClient::producer
@@ -840,20 +862,20 @@ impl IggyProducer {
 
     /// Initializes the producer and makes it ready to send messages.
     ///
-    /// This must be called before the first send. Calling it again on an initialized producer does
-    /// nothing and returns immediately.
+    /// This must be called before the first send. Calling it again after successful initialization
+    /// does nothing and returns immediately.
     ///
     /// Initialization ensures that:
-    /// - the producer subscribes to connection lifecycle events coming from the server ([`DiagnosticEvent`]) in order to
-    ///   track whether it is allowed to send messages. Sending is only enabled while
-    ///   the client is signed in. An established connection is not enough. On status connected, disconnect, sign out and shutdown
-    ///   the producer is not allowed to send messages.
+    /// - The producer subscribes to client [`DiagnosticEvent`] values and tracks whether sending is
+    ///   currently allowed. Sending is enabled only while the client is signed in. A connection
+    ///   without an authenticated session is not enough. Connect, disconnect, sign-out, and shutdown
+    ///   events all disable sending until another sign-in event arrives.
     /// - the stream exists, creating it when `create_stream_if_not_exists` is set (the default).
     /// - the topic exists, creating it when `create_topic_if_not_exists` is set (the default), with
     ///   the partitions count, message expiry and max size passed to
     ///   [`IggyProducerBuilder::create_topic_if_not_exists`](crate::clients::producer_builder::IggyProducerBuilder::create_topic_if_not_exists).
-    ///   Note, that initializing the topic with `init()` only gives you authority about those three options. The rest of possible settings
-    ///   are defaults of [`TopicCreateOptions`].
+    ///   These are the only topic options controlled by producer initialization. All other settings
+    ///   come from [`TopicCreateOptions::default`].
     ///
     /// # Errors
     ///
@@ -872,9 +894,11 @@ impl IggyProducer {
     /// | | `direct` producer | `background` producer |
     /// | --- | --- | --- |
     /// | the call returns | once the server has answered every request the batch was split into | once the batch is queued on a worker |
-    /// | `Ok` means | the messages are written | the messages are accepted for writing, nothing more |
-    /// | confirmations | one per request, in order | always empty |
+    /// | `Ok` means | the server returned success for every request | the messages were accepted into a worker queue, nothing more |
+    /// | confirmations | normally one per request, in order, but legacy servers may return none | always empty |
     /// | a write that fails | comes back as [`IggyError::ProducerSendFailed`] | goes to [`error_callback`] later |
+    ///
+    /// An empty `messages` vector is a no-op in both modes and returns an empty confirmation list.
     ///
     /// # Confirmations
     ///
@@ -883,10 +907,12 @@ impl IggyProducer {
     /// An offset is a position, not an identity. Delivery is at-least-once, so an earlier retry may
     /// have committed the same messages at a lower offset, see
     /// [Retrying and what a failure means](IggyProducer#retrying-and-what-a-failure-means).
+    /// A confirmation reports an in-memory commit, not an fsync. A crash and restart can therefore
+    /// lose an acknowledged batch and later reuse an offset the client already observed.
     ///
     /// # How long the call takes
     ///
-    /// Neither mode is as quick as its name suggests:
+    /// Both modes can wait:
     ///
     /// - A `direct` send first waits out whatever is left of [`DirectConfig::linger_time`] since the
     ///   previous send, then awaits its requests one after another, so it returns no earlier than the
@@ -894,14 +920,15 @@ impl IggyProducer {
     /// - A `background` send waits when the dispatcher has no room for the batch, which
     ///   [`failure_mode`] configures. The default [`BackpressureMode::Block`] waits for as long as it
     ///   takes. It can wait on the queue of the worker it was routed to as well, which holds 256
-    ///   batches.
+    ///   queued sends.
     ///
     /// # Errors
     ///
-    /// A `direct` producer fails with [`IggyError::ProducerSendFailed`] once the retries are
-    /// exhausted. The cause is [`IggyError::CannotSendMessagesDueToClientDisconnection`] when the client never became ready,
-    /// an encryption or partitioning failure raised before anything left the producer, or whatever
-    /// the server raised.
+    /// A `direct` producer wraps a send failure in [`IggyError::ProducerSendFailed`]. The cause can be
+    /// [`IggyError::CannotSendMessagesDueToClientDisconnection`] after the readiness retry budget is
+    /// exhausted, an encryption or partitioning failure raised before anything left the producer,
+    /// a server or transport error after write retries, or an unreadable confirmation for a request
+    /// that may already have committed.
     ///
     /// A `background` producer only reports what queueing the batch ran into:
     /// [`IggyError::ProducerClosed`] after [`shutdown()`](Self::shutdown),
@@ -927,8 +954,6 @@ impl IggyProducer {
         let stream_id = self.core.stream_id.clone();
         let topic_id = self.core.topic_id.clone();
 
-        // Either send messages in a background task if a dispatcher exists or
-        // send internal/ direct on this task.
         match &self.dispatcher {
             Some(disp) => disp
                 .dispatch(messages, stream_id, topic_id, None)
@@ -942,9 +967,10 @@ impl IggyProducer {
         }
     }
 
-    /// Sends a single message.
+    /// Sends one message.
     ///
-    /// [`IggyProducer::send`] but for single messages.
+    /// This has the same mode-dependent confirmation, backpressure, retry, and error semantics as
+    /// [`IggyProducer::send`].
     pub async fn send_one(&self, message: IggyMessage) -> Result<SendMessagesResponse, IggyError> {
         self.send(vec![message]).await
     }
@@ -1015,12 +1041,11 @@ impl IggyProducer {
 
     /// Shuts the producer down.
     ///
-    /// If the producer is a background producer, this method calls the
-    /// [`ProducerDispatcher::shutdown()`] method to gracefully finish in-flight work.
-    /// (comp. docs of [`ProducerDispatcher::shutdown()`] for details.
+    /// For a background producer, this drains the dispatcher queues, flushes the remaining shard
+    /// buffers, waits for writes and error callbacks to finish, and then returns. Dropping a
+    /// background producer instead provides no such guarantee and can lose buffered messages.
     ///
-    /// A direct producer has nothing to finish. Calling `shutdown()` on a direct producer
-    /// is a no-op.
+    /// A direct producer has nothing buffered, so calling `shutdown()` is a no-op.
     pub async fn shutdown(self) {
         if let Some(dispatcher) = self.dispatcher {
             dispatcher.shutdown().await;

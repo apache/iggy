@@ -34,7 +34,12 @@ use crate::clients::producer_error_callback::ErrorCtx;
 /// Implementors of this trait define how to choose a shard for a given batch of messages.
 /// This allows customizing message routing based on message content, stream/topic identifiers,
 /// or round-robin load balancing.
+///
+/// [`pick_shard`](Self::pick_shard) must return an index smaller than `num_shards`. The dispatcher
+/// normalizes a configured shard count of zero to one, so `num_shards` passed here is never zero.
+/// Returning an out-of-range index makes dispatch panic when it indexes the shard list.
 pub trait Sharding: Send + Sync + std::fmt::Debug + 'static {
+    /// Chooses the zero-based shard index for one batch.
     fn pick_shard(
         &self,
         num_shards: usize,
@@ -90,11 +95,19 @@ impl Sharding for OrderedSharding {
     }
 }
 
+/// One producer send after the dispatcher has selected its destination metadata.
+///
+/// A sharding strategy sees the messages, stream, and topic before this value is queued. The
+/// optional partitioning value overrides the producer's configured partitioning for this send.
 #[derive(Debug)]
 pub struct ShardMessage {
+    /// Target stream.
     pub stream: Arc<Identifier>,
+    /// Target topic.
     pub topic: Arc<Identifier>,
+    /// Messages carried by this send.
     pub messages: Vec<IggyMessage>,
+    /// Per-send partitioning override, or `None` to use the producer configuration.
     pub partitioning: Option<Arc<Partitioning>>,
 }
 
@@ -113,12 +126,13 @@ impl Sizeable for ShardMessage {
     }
 }
 
-// Represents a [`ShardMessage`] that is allowed to be send.
-//
-// There is a limit on how many (message) bytes can be send concurrently.
-// Before a message can be send, it needs to acquire the proper byte budget
-// from a tokio semaphore of size `max_buffer_size`.
+/// A [`ShardMessage`] together with its charge against the dispatcher's byte budget.
+///
+/// The optional permit is acquired before the message enters a shard queue and remains owned by
+/// this value until the worker finishes the write or drops the message. Keeping permits from merged
+/// messages separate avoids the `u32` permit-count limit in Tokio's semaphore API.
 pub struct ShardMessageWithPermit {
+    /// Routed send and destination metadata.
     pub inner: ShardMessage,
     size_bytes: u64,
     bytes_permit: Option<OwnedSemaphorePermit>,
@@ -126,6 +140,9 @@ pub struct ShardMessageWithPermit {
 }
 
 impl ShardMessageWithPermit {
+    /// Wraps `msg` with its previously acquired byte-budget permit.
+    ///
+    /// `bytes_permit` is `None` when the dispatcher's byte budget is unbounded.
     pub fn new(msg: ShardMessage, bytes_permit: Option<OwnedSemaphorePermit>) -> Self {
         let size_bytes = msg.get_size_bytes().as_bytes_u64();
         Self {
@@ -153,8 +170,8 @@ impl ShardMessageWithPermit {
 /// Shards are owned and handled by the [`ProducerDispatcher`]. If the dispatcher can do everything
 /// you want, there is no need to handle them directly.
 ///
-/// Each shard owns a task that builds the batches from messages routed to it, merges adjacent batches that share a
-/// destination, and writes them out through [`ProducerCoreBackend::send_internal`].
+/// Each shard owns a task that buffers sends routed to it, merges adjacent sends that share a
+/// destination, and writes them through [`ProducerCoreBackend::send_internal`].
 ///
 /// The dispatcher enqueues a batch by sending it on that channel, which returns once the batch is
 /// queued. Shards are created and owned by the dispatcher, so they are rarely handled directly.
@@ -163,18 +180,19 @@ impl ShardMessageWithPermit {
 ///
 /// The task selects over three sources:
 ///
-/// - **An enqueued batch.** [`ShardMessageWithPermit`]s are appended to the buffer,
-///   which is then flushed if it has reached [`batch_length`](BackgroundConfig::batch_length) messages or
-///   [`batch_size`](BackgroundConfig::batch_size) bytes. Either limit is disabled (unlimited) when
+/// - **An enqueued send.** [`ShardMessageWithPermit`]s are appended to the buffer, which is flushed
+///   once it reaches [`batch_length`](BackgroundConfig::batch_length) queued sends or
+///   [`batch_size`](BackgroundConfig::batch_size) reported bytes. Either threshold is disabled when
 ///   configured as `0`.
-/// - **The linger deadline**, [`linger_time`](BackgroundConfig::linger_time) after the
-///   last flush. If this deadline is met, a buffer is flushed regardless of whether it is full or not.
-///   This sets an upper bound on the time a batch waits to be filled up, before flushing.
+/// - **The periodic linger deadline.** At each
+///   [`linger_time`](BackgroundConfig::linger_time) deadline, a non-empty buffer is flushed whether
+///   or not either batching threshold was reached. This bounds how long a non-empty buffer waits for
+///   another send before a flush check.
 /// - **The stop broadcast** sent by the dispatcher on shutdown. Marks the shard closed
 ///   so later sends fail with [`IggyError::ProducerClosed`], drains what is still
 ///   queued, flushes once, then ends the loop.
-///   Note, should the [`ProducerDispatcher`] be dropped instead of gracefully shutdown, already enqueued messages
-///   will be dropped and lost.
+///   Dropping the [`ProducerDispatcher`] instead of shutting it down provides no completion
+///   guarantee and can lose buffered messages.
 ///
 /// [`ProducerDispatcher`]: crate::clients::producer_dispatcher::ProducerDispatcher
 pub struct Shard {
@@ -184,7 +202,7 @@ pub struct Shard {
 }
 
 impl Shard {
-    /// Spawns the worker task described in the [type docs](Shard).
+    /// Spawns the worker task described in the [`Shard`] type documentation.
     pub fn new(
         core: Arc<impl ProducerCoreBackend>,
         config: Arc<BackgroundConfig>,
@@ -306,10 +324,6 @@ impl Shard {
                 )
                 .await;
 
-            // Asynchronous error callback for users running background
-            // writes for messages.
-            // If the send failed the Shard needs to notify the
-            // user who is listening on the error channel.
             if let Err(error) = result {
                 if let IggyError::ProducerSendFailed {
                     failed,
@@ -335,15 +349,13 @@ impl Shard {
                 }
             }
         }
-        // The buffer was drained above.
-        // buffer_bytes needs to be reset as well.
         *buffer_bytes = 0;
     }
 
-    /// Sends a single [`ShardMessageWithPermit`].
+    /// Queues one [`ShardMessageWithPermit`] on this worker.
     ///
-    /// Only sends if the [`Shard`] is not closed.
-    /// Sends the message to this `Shard`s worker to be enqueued.
+    /// Returns [`IggyError::ProducerClosed`] after graceful shutdown has closed the shard, or
+    /// [`IggyError::BackgroundSendError`] if its worker channel is disconnected.
     pub(crate) async fn send(&self, message: ShardMessageWithPermit) -> Result<(), IggyError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(IggyError::ProducerClosed);

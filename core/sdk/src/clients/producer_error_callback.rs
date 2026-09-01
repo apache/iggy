@@ -23,74 +23,92 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::error;
 
-/// Everything that is known about a background send that failed.
+/// Everything known about a background write that did not return a usable confirmation.
 ///
-/// A [`background()`] producer returns from [`send()`] once the batch is queued and the write itself
-/// happens later, on one of the dispatcher's worker [`Shard`]s. So for the caller there
-/// is no `Result` to handle acknowledgments or failures. Instead, the worker puts the failure into an
-/// `ErrorCtx`, sends it to a dedicated error callback worker, where it lands on the
-/// [`BackgroundConfig::error_callback`], i.e. something that implements the [`ErrorCallback`] trait.
+/// A [`background()`] producer returns from [`send()`] once the batch is queued. The write happens
+/// later on one of the dispatcher's worker [`Shard`]s, when there is no caller waiting for its
+/// result. The worker therefore sends an `ErrorCtx` to the dedicated error task, which invokes the
+/// [`ErrorCallback`] configured in [`BackgroundConfig::error_callback`].
 ///
 /// # What to do with it
 ///
-/// [`messages`](Self::messages) is a batch that failed to commit to the server and therefore may be sent again.
-/// [`stream`](Self::stream), [`topic`](Self::topic) and [`partitioning`](Self::partitioning) are the
-/// destination it was meant for. Note, that configured retries at the dispatcher are already spent at this point.
-/// A callback can resend it, park it in a dead letter store, write it to disk, or raise an
-/// The default implementation [`LogErrorCallback`] logs the error messages. A background producer that keeps it
-/// loses every message a background write fails on. However, you can also
-/// implement the [`ErrorCallback`] trait yourself and come up with your own logic that defines
-/// what should be done with failures.
+/// [`messages`](Self::messages) is the unconfirmed tail of the send. No further automatic retry will
+/// be attempted. Depending on [`cause`](Self::cause), the retry budget may be exhausted, the failure
+/// may be deliberately non-retriable, or encryption or partitioning may have failed before a request
+/// was sent. The tail is not proof that nothing committed. A request can commit before its response
+/// is lost, and an HTTP confirmation decoding failure specifically occurs after a successful status.
+/// Resending `messages` is therefore an at-least-once operation and can create duplicates.
+/// Encryption mutates messages before the write, so this tail contains encrypted messages when the
+/// producer uses an encryptor. Passing them back through the same producer would encrypt them again.
+///
+/// [`stream`](Self::stream) and [`topic`](Self::topic) identify the destination.
+/// [`partitioning`](Self::partitioning) contains only the per-send override passed to the dispatcher.
+/// `None` means the producer's configured or default partitioning was used, not that the request had
+/// no partitioning. A callback can retain the context, persist it in a dead-letter store, alert an
+/// operator, or retry it when duplicate delivery is acceptable. The default [`LogErrorCallback`]
+/// only logs the failure and then drops the context.
 ///
 /// [`background()`]: crate::clients::producer_builder::IggyProducerBuilder::background
-/// [`direct()`]: crate::clients::producer_builder::IggyProducerBuilder::direct
-/// [`encryptor()`]: crate::clients::producer_builder::IggyProducerBuilder::encryptor
-/// [`send_retries()`]: crate::clients::producer_builder::IggyProducerBuilder::send_retries
 /// [`send()`]: crate::clients::producer::IggyProducer::send
-/// [`send_to()`]: crate::clients::producer::IggyProducer::send_to
-/// [`shutdown()`]: crate::clients::producer::IggyProducer::shutdown
 /// [`BackgroundConfig::error_callback`]: crate::clients::producer_config::BackgroundConfig::error_callback
-/// [`ProducerDispatcher`]: crate::clients::producer_dispatcher::ProducerDispatcher
 /// [`Shard`]: crate::clients::producer_sharding::Shard
 #[derive(Debug)]
 pub struct ErrorCtx {
+    /// Error that ended the send. No further automatic retry will be attempted.
     pub cause: Box<IggyError>,
+    /// Stream identifier used by the failed request.
     pub stream: Arc<Identifier>,
+    /// Stream name configured when the producer was built.
+    ///
+    /// For a failure from
+    /// [`IggyProducer::send_to`](crate::clients::producer::IggyProducer::send_to), this may not name
+    /// [`Self::stream`].
     pub stream_name: String,
+    /// Topic identifier used by the failed request.
     pub topic: Arc<Identifier>,
+    /// Topic name configured when the producer was built.
+    ///
+    /// For a failure from
+    /// [`IggyProducer::send_to`](crate::clients::producer::IggyProducer::send_to), this may not name
+    /// [`Self::topic`].
     pub topic_name: String,
+    /// Per-send partitioning override, or `None` when the producer configuration was used.
     pub partitioning: Option<Arc<Partitioning>>,
+    /// Unconfirmed tail of the send.
+    ///
+    /// Depending on [`Self::cause`], its first request may have committed even though no usable
+    /// confirmation reached the producer. Retrying this collection can therefore create duplicates.
+    /// When the producer uses an encryptor, these messages have already been encrypted in place.
     pub messages: Arc<Vec<IggyMessage>>,
-    /// Confirmations of the chunks that committed before the failure; `messages`
-    /// is the tail that did not.
+    /// Confirmations returned for chunks before the failure. `messages` is the unconfirmed tail,
+    /// which may include a committed request when its confirmation could not be decoded.
     pub committed: Arc<Vec<SendMessagesConfirmationResponse>>,
 }
 
-/// Handles a background send that failed, in place of the caller that is no longer there.
+/// Handles a background write failure after the queueing caller has returned.
 ///
 /// A [`background()`](crate::clients::producer_builder::IggyProducerBuilder::background) producer
-/// acknowledges a send once it is queued, so a write that fails afterwards has nobody to return an
-/// error to. The dispatcher owns one implementation of this trait, set with
-/// [`BackgroundConfig::error_callback`], and invokes it with an [`ErrorCtx`] for every request that
-/// fails.
+/// acknowledges a send once it is queued, so a later write failure cannot be returned by
+/// [`IggyProducer::send`]. The dispatcher owns one implementation of this trait, set with
+/// [`BackgroundConfig::error_callback`], and invokes it with an [`ErrorCtx`] whenever a worker's
+/// backend returns [`IggyError::ProducerSendFailed`]. Other error variants from a custom backend are
+/// logged by the worker without invoking this callback.
 ///
 /// # Implementing it
 ///
-/// - [`call()`](Self::call) returns a boxed future the dispatcher awaits, so the callback may do I/O.
-/// - It runs on a task of its own, never on a worker, so awaiting it does not stall batching. Calls
-///   are serialized though: one failure is handled at a time, and a slow callback lets the queue of
-///   pending failures grow, since that channel is unbounded.
+/// - [`call()`](Self::call) returns a boxed future that the error task awaits, so the callback may do
+///   asynchronous I/O.
+/// - It runs on its own task rather than on a shard worker, so awaiting it does not stall batching.
+///   Calls are serialized. One failure is handled at a time, and the unbounded error channel can
+///   grow while a callback is slow.
 /// - A panic inside it is caught and logged, and the next failure is still delivered.
-/// - `Send + Sync + Debug + 'static` because the dispatcher's task owns it for as long as the
-///   producer lives, and [`BackgroundConfig`] is [`Debug`].
-/// - Do not call back into the producer that owns the callback. The callback is built first and
-///   handed to the config, so the producer does not exist yet; forward the context to something that
-///   does.
+/// - `Send + Sync + Debug + 'static` is required because the dispatcher's task owns the callback for
+///   the producer's lifetime and [`BackgroundConfig`] implements [`Debug`].
 ///
 /// # Example
 ///
-/// Hand every failed batch to a task that outlives the send instead of dropping it. The callback
-/// itself only forwards the context, so a slow store never holds up the failures queued behind it:
+/// Forward each failed batch to a separate task instead of dropping it. The callback only enqueues
+/// the context, so a slow store does not hold up later callbacks:
 ///
 /// ```no_run
 /// use iggy::clients::producer_error_callback::{ErrorCallback, ErrorCtx};
@@ -117,7 +135,7 @@ pub struct ErrorCtx {
 ///     }
 /// }
 ///
-/// // Implements however lost messages should be handled. Here, we warn. Could also write to file, notify, ...
+/// // Replace this warning with durable storage or another application-specific policy.
 /// async fn drain(mut failures: UnboundedReceiver<ErrorCtx>) {
 ///     while let Some(ctx) = failures.recv().await {
 ///         warn!(
@@ -125,7 +143,7 @@ pub struct ErrorCtx {
 ///             stream_name = ctx.stream_name,
 ///             topic_name = ctx.topic_name,
 ///             num_messages = ctx.messages.len(),
-///             "Storing failed batch",
+///             "Received failed batch",
 ///         );
 ///     }
 /// }
@@ -140,18 +158,19 @@ pub struct ErrorCtx {
 ///
 /// [`BackgroundConfig`]: crate::clients::producer_config::BackgroundConfig
 /// [`BackgroundConfig::error_callback`]: crate::clients::producer_config::BackgroundConfig::error_callback
+/// [`IggyProducer::send`]: crate::clients::producer::IggyProducer::send
 pub trait ErrorCallback: Send + Sync + Debug + 'static {
-    /// Handles one failed request, described by `ctx`.
+    /// Handles one failed request described by `ctx`.
     ///
-    /// Called once per failed request by the dispatcher's error task, which awaits the returned
-    /// future before taking the next failure off the queue.
+    /// The dispatcher's error task calls this once per failed request and awaits the returned future
+    /// before taking the next failure from the queue.
     fn call(&self, ctx: ErrorCtx) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 }
 
-/// Default implementation of [`ErrorCallback`] that logs the error using `tracing::error!`.
+/// Default [`ErrorCallback`] implementation that logs the error using `tracing::error!`.
 ///
-/// Logs include stream, topic, optional partitioning, number of messages, how
-/// many chunks committed before the failure, and the cause.
+/// Logs include stream, topic, optional partitioning, number of messages, how many earlier chunks
+/// returned confirmations, and the cause.
 ///
 /// The messages themselves are dropped with the context, so a background producer that keeps this
 /// callback has no way to recover them. Implement [`ErrorCallback`] to hold on to them.
