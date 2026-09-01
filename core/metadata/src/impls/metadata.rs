@@ -3425,6 +3425,11 @@ where
                     request,
                     derived_options,
                     partitions,
+                    // Minted once here, on the admitting primary, and sealed by
+                    // `checksum_body`: the header's `view` is restamped on a
+                    // post-view-change retransmit, so a body-carried copy is the
+                    // only per-op view every replica commits identically.
+                    created_view: consensus.view(),
                 }
                 .to_bytes();
                 Ok(build_prepare_message(
@@ -3458,6 +3463,8 @@ where
                 let body = PersistedCreatePartitionsRequest {
                     request,
                     partitions,
+                    // Same body-carried view as `PersistedCreateTopicRequest`.
+                    created_view: consensus.view(),
                 }
                 .to_bytes();
                 Ok(build_prepare_message(

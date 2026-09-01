@@ -1598,8 +1598,9 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
         // Header validation requires `session > 0 && request > 0` for
         // non-register ops. The partition plane itself is sessionless
         // (at-least-once, no `ClientTable` dedup), so the bound VSR
-        // session merely satisfies validation, and a zero request id
-        // (the SDK does not number data-plane ops) is normalized.
+        // session merely satisfies validation. Current SDKs do number
+        // partition ops, but older and internal callers may still send
+        // zero, so a zero id is normalized to the compatibility value 1.
         new_header.session = bound_session;
         new_header.request = new_header.request.max(1);
     });
@@ -4329,6 +4330,7 @@ mod tests {
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
+            created_view: 0,
         };
         md.mux_stm
             .update(prepare_message(
