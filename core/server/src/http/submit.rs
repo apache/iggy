@@ -28,12 +28,10 @@ use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
-use message_bus::BusMessage;
 use metadata::impls::metadata::StreamsFrontend;
-use server_common::Message;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
-use crate::bootstrap::ServerShard;
 use crate::dispatch::{
     dispatch_partition_request, resolve_delete_segments_truncate, submit_client_request_on_owner,
     submit_logout_on_owner,
@@ -47,6 +45,7 @@ use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
 use crate::http::wire::build_request_message;
 use crate::pat::rewrite_pat_request_for_user;
+use crate::shell::ServerShard;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 
@@ -370,7 +369,7 @@ pub(in crate::http) async fn partition_write_replicated(
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
-) -> Result<(BusMessage, ReplyHeader), PartitionWriteError> {
+) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
     // Admission sits here rather than before body decode: axum's extractors
     // already buffered and deserialized the body (bounded by the router-wide
     // `DefaultBodyLimit`) before the handler ran, so the caps gate what is
@@ -414,7 +413,10 @@ pub(in crate::http) async fn partition_write_replicated(
     // reply after a timeout sheds at the bus instead of leaking a waiter.
     drop(guard);
     match outcome {
-        Ok(Ok(reply)) => classify_partition_reply(&reply).map(|header| (reply, header)),
+        Ok(Ok(reply)) => {
+            let reply = reply.into_contiguous();
+            classify_partition_reply(&reply).map(|header| (reply, header))
+        }
         // Cancelled (reply target torn down by session eviction mid-wait) or
         // elapsed: same caller contract either way - outcome unknown, 504.
         Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),

@@ -578,8 +578,10 @@ pub struct ClientTable {
 
 /// Whether two integrity stamps for the same request number disagree.
 ///
-/// Zero means unstamped (the wire integrity fields are zeroed today), and an
-/// unstamped side carries no evidence either way, so it never conflicts.
+/// Zero means unstamped, and an unstamped side carries no evidence either way,
+/// so it never conflicts. The Rust SDK stamps the ops this table dedups;
+/// partition ops and the other SDKs still send zero, so a conflict is only ever
+/// detectable between two stamped frames.
 const fn checksums_conflict(stored: u128, received: u128) -> bool {
     stored != 0 && received != 0 && stored != received
 }
@@ -2679,6 +2681,36 @@ mod tests {
         // And committing the jump moves the watermark to it.
         table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 9, 12));
         assert_eq!(table.get_watermark(1), Some(9));
+    }
+
+    // The shape a client that spends request ids off the metadata plane
+    // produces: partition-plane ids never reach this table, so the next
+    // metadata request arrives with a gap under it. It executes, moves the
+    // watermark to itself, and its retry still replays the original reply --
+    // gaps cost the skipped ids and nothing else.
+    #[test]
+    fn check_request_dedups_a_metadata_request_that_arrives_after_a_gap() {
+        let (mut table, epoch) = table_with_client();
+        table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 1, 11));
+        // Requests 2..=5 went to the partition plane, which keeps no table.
+        assert!(matches!(
+            table.check_request(1, epoch, 6, 0),
+            RequestStatus::New
+        ));
+
+        table.commit_reply(1, TEST_USER_ID, make_reply_for(1, 6, 12));
+        assert_eq!(table.get_watermark(1), Some(6));
+        match table.check_request(1, epoch, 6, 0) {
+            RequestStatus::Duplicate(cached) => {
+                assert_eq!(cached.header().request, 6);
+                assert_eq!(
+                    cached.header().commit,
+                    12,
+                    "the original reply, not a re-run"
+                );
+            }
+            other => panic!("expected the gapped request to dedup, got {other:?}"),
+        }
     }
 
     #[test]

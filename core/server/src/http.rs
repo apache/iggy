@@ -36,6 +36,8 @@ mod session;
 mod state;
 mod submit;
 mod tls;
+#[cfg(feature = "iggy-web")]
+mod web;
 mod wire;
 
 use std::cell::{Cell, RefCell};
@@ -64,7 +66,6 @@ use send_wrapper::SendWrapper;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
-use crate::bootstrap::ServerShard;
 use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes};
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
@@ -80,6 +81,7 @@ use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
 use crate::http::state::{HttpInner, HttpState, insert_view_header};
 use crate::server_error::ServerError;
+use crate::shell::ServerShard;
 
 /// Bind the shard-0 HTTP listener and spawn the `cyper-axum` serve loop as a
 /// background task on shard 0's compio runtime. Serves HTTPS when
@@ -95,7 +97,7 @@ use crate::server_error::ServerError;
 /// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
 /// credentials cannot be loaded, or the listener cannot bind to `addr`.
 #[allow(clippy::too_many_arguments)]
-pub async fn start(
+pub fn start(
     shard: &Rc<ServerShard>,
     addr: SocketAddr,
     http_config: &HttpConfig,
@@ -104,7 +106,7 @@ pub async fn start(
     cluster: &ClusterConfig,
     system_config: Arc<ServerSystemConfig>,
     self_advertised: &str,
-    self_ports: TransportPorts,
+    self_ports: &TransportPorts,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
@@ -139,7 +141,7 @@ pub async fn start(
     // Same early-fail rule for the scrape path: axum panics on a route
     // without a leading '/', so reject it as a config error instead.
     let metrics_endpoint = metrics::validated_endpoint(&http_config.metrics)?;
-    let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
+    let (listener, bound_addr) = client_listener::tcp::bind(addr)?;
 
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
@@ -156,7 +158,7 @@ pub async fn start(
             // ports arrive resolved from the caller.
             self_ports: TransportPorts {
                 http: Some(bound_addr.port()),
-                ..self_ports
+                ..self_ports.clone()
             },
             // The HTTP listener is shard-0-only, where the live consensus
             // handle supplies the leader; the published-view fallback is
@@ -300,7 +302,7 @@ fn router(
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client));
     let local = match metrics_endpoint {
-        Some(endpoint) => local.route(endpoint, get(metrics::get_metrics)),
+        Some(endpoint) => local.route(endpoint, get(handlers::get_metrics)),
         None => local,
     };
     let router = Router::new()
@@ -458,7 +460,7 @@ fn merge_web_ui(router: Router, web_ui: bool) -> Router {
     #[cfg(feature = "iggy-web")]
     let router = if web_ui {
         info!("Web UI enabled at /ui");
-        router.merge(crate::web::router())
+        router.merge(web::router())
     } else {
         router
     };

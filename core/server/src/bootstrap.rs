@@ -33,14 +33,19 @@ use crate::server_error::{
     PartitionRecoveryRefusal, ServerError, ShardJoinFailure, ShardJoinFailureKind,
 };
 use crate::session_manager::SessionManager;
+use crate::shard_allocator::{ShardAllocator, ShardInfo};
+use crate::shell::{
+    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ServerShard, ShellBus,
+    ShellHandlers, ShellShardHandle, consensus_timers, repair_retry_ticks,
+};
 use compio::runtime::ResumeUnwind;
 use configs::server::{ServerConfig, ServerSystemConfig};
 use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
 use consensus::{
-    ClientTable, ConsensusTimers, JoinMode, LocalPipeline, MetadataHandle, PartitionsHandle,
-    PipelineEntry, Sequencer, VsrConsensus, VsrRestore,
+    ClientTable, JoinMode, LocalPipeline, MetadataHandle, PartitionsHandle, PipelineEntry,
+    Sequencer, VsrConsensus, VsrRestore,
 };
 // `try_send` / `try_recv` resolve through these traits on `MAsyncTx` /
 // `MAsyncRx`; the metadata-handoff loops below depend on the
@@ -53,8 +58,7 @@ use iggy_common::defaults::{
     MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
 };
 use iggy_common::{
-    Aes256GcmEncryptor, EncryptorKind, IggyByteSize, IggyError, PartitionStats,
-    TopicRuntimeOptions, variadic,
+    Aes256GcmEncryptor, EncryptorKind, IggyByteSize, IggyError, PartitionStats, TopicRuntimeOptions,
 };
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
@@ -65,7 +69,7 @@ use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::auth::{self, ReplicaAuth};
 use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx};
 use message_bus::replica::io as replica_io;
-use message_bus::replica::listener::{self as replica_listener, MessageHandler};
+use message_bus::replica::listener::{self as replica_listener};
 use message_bus::transports::quic::server_config_with_cert;
 use message_bus::transports::tls::{
     AcceptAnyServerCert, REPLICA_ALPN, TlsServerCredentials, install_default_crypto_provider,
@@ -76,15 +80,11 @@ use message_bus::{
     AcceptedWsClientFn, AcceptedWssClientFn, ConnectionInstaller, DialedReplicaFn, IggyMessageBus,
     MAX_INFLIGHT_REPLICA_HANDSHAKES, MessageBus, ReplicaOwnerTable, connector,
 };
-use metadata::IggyMetadata;
-use metadata::MuxStateMachine;
 use metadata::ReplicaIdentity;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::impls::recovery::recover;
-use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::Snapshot;
-use metadata::stm::stream::{Partition, Streams};
-use metadata::stm::user::Users;
+use metadata::stm::stream::Partition;
 use partitions::{
     FatalCommit, IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig,
 };
@@ -100,18 +100,16 @@ use shard::builder::IggyShardBuilder;
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
 use shard::{
-    CoordinatorConfig, IggyShard, LifecycleFrame, ListClientsHandler, MetadataSubmitHandler,
-    PartitionConsensusConfig, PartitionReadHandler, Receiver as ShardReceiver, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_mesh_channels,
+    CoordinatorConfig, LifecycleFrame, PartitionConsensusConfig, Receiver as ShardReceiver,
+    ShardFrame, ShardIdentity, TaggedSender, channel, shard_mesh_channels,
 };
-use shard_allocator::{ShardAllocator, ShardInfo};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -122,76 +120,6 @@ const SHARD_REPLICA_ID: u8 = 0;
 
 pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";
 pub const IGGY_ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
-
-type ServerMuxStateMachine = MuxStateMachine<variadic!(Users, Streams)>;
-
-/// Cross-thread bundle carrying one `ReadHandleFactory` per metadata
-/// state. Shard 0 mints one after `recover()` and broadcasts a clone to
-/// every peer shard; each peer rebuilds a reader-mode
-/// [`ServerMuxStateMachine`] on its own runtime, skipping the WAL.
-type ServerMetadataBundle = <variadic!(Users, Streams) as WithFactory>::Bundle;
-
-pub(crate) type ServerMetadata = IggyMetadata<
-    VsrConsensus<Rc<IggyMessageBus>>,
-    PrepareJournal,
-    IggySnapshot,
-    ServerMuxStateMachine,
->;
-
-/// The shard type the dispatch layer is generic over.
-///
-/// `B`/`MJ`/`S`/`SB` are free; the metadata state machine (`M`) and shards
-/// table (`T`) are pinned, being identical in production and the simulator.
-/// Production instantiates it as [`ServerShard`], defaulting `SB` to the
-/// on-disk [`PingPongSuperblock`]; the simulator supplies its own
-/// `B`/`MJ`/`S`/`SB`.
-pub type ShellShard<B, MJ, S, SB = PingPongSuperblock> =
-    IggyShard<B, MJ, S, ServerMuxStateMachine, PapayaShardsTable, SB>;
-
-/// Late-bound self-reference the deferred dispatch handlers upgrade per frame.
-pub type ShellShardHandle<B, MJ, S, SB = PingPongSuperblock> =
-    Rc<RefCell<Option<Weak<ShellShard<B, MJ, S, SB>>>>>;
-
-/// Bus bounds the dispatch/pump path needs (matches `run_message_pump`).
-/// Blanket-impl'd, so it is only shorthand for the four underlying bounds.
-pub trait ShellBus: MessageBus + ConnectionInstaller + Clone + 'static {}
-impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
-
-/// The five dispatch handlers a shard is built with, plus the
-/// [`SessionManager`] the request-plane pair shares.
-///
-/// Both production (`build_shard_for_thread`) and the simulator's shell
-/// mode construct these through [`wire_shell_handlers`], so the request
-/// plane is wired one way. The simulator's shell-off fast path uses
-/// [`ShellHandlers::noop`] instead.
-pub struct ShellHandlers {
-    pub on_replica_message: MessageHandler,
-    pub on_client_request: RequestHandler,
-    pub on_metadata_submit: MetadataSubmitHandler,
-    pub on_list_clients: ListClientsHandler,
-    pub on_partition_read: PartitionReadHandler,
-    /// Bound by the client-request handler, read by the get-clients
-    /// handler; the caller keeps it to reach locally-homed sessions.
-    pub sessions: Rc<RefCell<SessionManager>>,
-}
-
-impl ShellHandlers {
-    /// Inert handlers for the shell-off fast path: every callback is a
-    /// no-op over an empty [`SessionManager`]. Behaviorally identical to
-    /// hand-written no-op closures, so a caller can keep one destructure
-    /// site across both toggle states.
-    #[must_use]
-    pub fn noop() -> Self {
-        Self {
-            on_replica_message: Rc::new(|_, _| {}),
-            on_client_request: Rc::new(|_, _| {}),
-            on_metadata_submit: Rc::new(|_| {}),
-            on_list_clients: Rc::new(|_| {}),
-            on_partition_read: Rc::new(|_, _, _| {}),
-            sessions: Rc::new(RefCell::new(SessionManager::new())),
-        }
-    }
-}
 
 /// Build the deferred dispatch handlers for `shard_handle` against `bus`.
 ///
@@ -227,8 +155,6 @@ where
         sessions,
     }
 }
-
-pub type ServerShard = ShellShard<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>;
 
 /// Result of a multi-shard bootstrap.
 ///
@@ -727,7 +653,7 @@ fn validate_sharding_runtime_knobs(
 /// `(senders, inboxes)` channels, and spawns one OS thread per shard.
 ///
 /// Each thread pins itself (`nix::sched::sched_setaffinity` on Linux via
-/// [`ShardInfo::bind_cpu`]), binds memory to its NUMA node when
+/// `ShardInfo::bind_cpu`), binds memory to its NUMA node when
 /// configured, builds a fresh `compio::runtime::Runtime` (one
 /// `io_uring` instance per shard), and runs `shard_main` inside it.
 ///
@@ -1052,10 +978,10 @@ async fn shard_main(
                 |mux_stm| {
                     ensure_default_root_user(mux_stm);
                 },
-                |mux_stm, client, timestamp| {
+                |mux_stm, client, stamp| {
                     mux_stm
                         .streams()
-                        .remove_consumer_group_member(client, timestamp);
+                        .remove_consumer_group_member(client, stamp);
                 },
             )
             .await
@@ -1297,7 +1223,6 @@ async fn shard_main(
         topology.cluster_id,
         topology.self_replica_id,
         topology.replica_count,
-        Arc::clone(&metadata_view),
     ));
     let reconcile_periodic = config
         .system
@@ -2081,10 +2006,7 @@ async fn build_shard_for_thread(
                     topology.cluster_id,
                     topology.self_replica_id,
                     topology.replica_count,
-                    // Quarantine-and-rebuild always finds a partition
-                    // directory already there, so this joins as a probing
-                    // backup and learns the live view; nothing to seed.
-                    None,
+                    partition_metadata.created_view,
                     Rc::clone(&bus),
                 )
                 .await?
@@ -2259,13 +2181,6 @@ const _: () =
 const _: () =
     assert!(consensus::DVC_HEADERS_MAX == iggy_binary_protocol::consensus::DVC_HEADERS_MAX);
 const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
-/// Convert a consensus-timer interval to whole ticks, floored at one tick so a
-/// sub-tick value still fires and saturated on overflow.
-fn duration_to_ticks(interval: Duration) -> u64 {
-    let ticks = interval.as_millis() / shard::CONSENSUS_TICK_INTERVAL.as_millis();
-    u64::try_from(ticks.max(1)).unwrap_or(u64::MAX)
-}
-
 /// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count.
 /// Retries pin at the backoff cap after warmup, so the window divided by
 /// [`journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS`] bounds how
@@ -2286,14 +2201,6 @@ fn superblock_window_to_failures(window: Duration) -> u64 {
     }
     let cap_micros = u128::from(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
     u64::try_from((window.as_micros() / cap_micros).max(1)).unwrap_or(u64::MAX)
-}
-
-/// `[cluster] heartbeat_timeout` in consensus ticks. Every consensus group
-/// (metadata and per-partition planes alike) gets the same window: the failure
-/// it guards against - a primary that stopped heartbeating - is host-level, not
-/// per-plane.
-pub(crate) fn cluster_heartbeat_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.heartbeat_timeout.get_duration())
 }
 
 /// Floor for the post-restart read-recovery deadline (see
@@ -2329,76 +2236,6 @@ pub(crate) fn recovery_barrier_deadline(
         .saturating_mul(RECOVERY_BARRIER_MULTIPLIER)
         .max(view_change_status.saturating_mul(RECOVERY_BARRIER_MULTIPLIER))
         .max(RECOVERY_BARRIER_DEADLINE_FLOOR)
-}
-
-/// `[cluster] commit_broadcast_interval` in consensus ticks: how often the
-/// primary broadcasts its commit point, the cluster's liveness feed. Applied
-/// to every consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn commit_broadcast_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.commit_broadcast_interval.get_duration())
-}
-
-/// `[cluster] prepare_retransmit_interval` in consensus ticks: how often the
-/// primary retransmits un-acked prepares. Applied to every consensus group,
-/// matching `cluster_heartbeat_ticks`.
-pub(crate) fn prepare_retransmit_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.prepare_retransmit_interval.get_duration())
-}
-
-/// `[cluster] view_change_retransmit_interval` in consensus ticks: how often a
-/// replica retransmits its `StartViewChange` / `DoViewChange` during a view
-/// change. Applied to every consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn view_change_retransmit_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(
-        config
-            .cluster
-            .view_change_retransmit_interval
-            .get_duration(),
-    )
-}
-
-/// `[cluster] view_change_status_timeout` in consensus ticks: the stalled
-/// view-change backstop before escalating to a fresh election. Applied to every
-/// consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn view_change_status_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(config.cluster.view_change_status_timeout.get_duration())
-}
-
-/// `[cluster] request_start_view_retransmit_interval` in consensus ticks: how
-/// often a recovering or view-change backup re-requests the current `StartView`.
-/// Applied to every consensus group, matching `cluster_heartbeat_ticks`.
-pub(crate) fn request_start_view_ticks(config: &ServerConfig) -> u64 {
-    duration_to_ticks(
-        config
-            .cluster
-            .request_start_view_retransmit_interval
-            .get_duration(),
-    )
-}
-
-/// The full `[cluster]` timer set every consensus group boots with, built
-/// once so the planes cannot diverge in what they apply.
-pub(crate) fn consensus_timers(config: &ServerConfig) -> ConsensusTimers {
-    ConsensusTimers {
-        normal_heartbeat_ticks: cluster_heartbeat_ticks(config),
-        commit_message_ticks: commit_broadcast_ticks(config),
-        prepare_ticks: prepare_retransmit_ticks(config),
-        view_change_retransmit_ticks: view_change_retransmit_ticks(config),
-        view_change_status_ticks: view_change_status_ticks(config),
-        request_start_view_ticks: request_start_view_ticks(config),
-        probe_attempts_max: config.cluster.view_probe_attempts_max,
-    }
-}
-
-/// `[cluster] repair_retry_interval` in consensus ticks: how long a stalled
-/// journal-repair stream waits before re-requesting its window. Both planes'
-/// repair loops share it, so it is applied once per shard (not per consensus
-/// group). Clamped to `u32`, the width of the session idle-tick counter.
-pub(crate) fn repair_retry_ticks(config: &ServerConfig) -> u32 {
-    u32::try_from(duration_to_ticks(
-        config.cluster.repair_retry_interval.get_duration(),
-    ))
-    .unwrap_or(u32::MAX)
 }
 
 /// Shard 0's half of a metadata recovery: everything [`recover`] produced except the
@@ -3323,10 +3160,9 @@ async fn start_tcp_runtime(
             &config.cluster,
             Arc::clone(&config.system),
             &self_advertised,
-            self_ports,
+            &self_ports,
             shard_metrics_all,
-        )
-        .await?;
+        )?;
     }
 
     Ok(())
@@ -3488,7 +3324,7 @@ async fn start_manual_runtime(
         None
     };
 
-    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients).await?;
+    let bound_clients = start_client_listeners(shard, config, topology, &accepted_clients)?;
     write_current_config(
         config,
         Some(topology.self_replica_id),
@@ -3853,7 +3689,7 @@ fn mint_client_meta(
     ClientConnMeta::new(coord.mint_shard_zero_client_id(), peer_addr, transport)
 }
 
-async fn start_client_listeners(
+fn start_client_listeners(
     shard: &Rc<ServerShard>,
     config: &ServerConfig,
     topology: &TcpTopology,
@@ -3863,7 +3699,6 @@ async fn start_client_listeners(
 
     if config.tcp.enabled && !config.tcp.tls.enabled {
         let (listener, bound_addr) = client_listener::tcp::bind(topology.client_listen_addr)
-            .await
             .map_err(|source| {
                 error!(
                     addr = %topology.client_listen_addr,
@@ -3882,7 +3717,12 @@ async fn start_client_listeners(
     }
 
     if let Some(ws_addr) = topology.ws_listen_addr {
-        bound.ws = Some(start_websocket_listener(shard, config, ws_addr, accepted_clients).await?);
+        bound.ws = Some(start_websocket_listener(
+            shard,
+            config,
+            ws_addr,
+            accepted_clients,
+        )?);
     }
 
     if let Some(quic_addr) = topology.quic_listen_addr {
@@ -4084,7 +3924,7 @@ fn load_tcp_tls_server_credentials(
 /// `websocket.tls.enabled` (the plain-WS accept loop must not also bind the
 /// port -- a plain upgrade parser fed a TLS `ClientHello` rejects every
 /// connection with an httparse error), plain WS otherwise.
-async fn start_websocket_listener(
+fn start_websocket_listener(
     shard: &Rc<ServerShard>,
     config: &ServerConfig,
     ws_addr: SocketAddr,
@@ -4105,11 +3945,10 @@ async fn start_websocket_listener(
         shard.bus.track_background(wss_handle);
         Ok(bound_addr)
     } else {
-        let (listener, bound_addr) =
-            client_listener::ws::bind(ws_addr).await.map_err(|source| {
-                error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
-                source
-            })?;
+        let (listener, bound_addr) = client_listener::ws::bind(ws_addr).map_err(|source| {
+            error!(addr = %ws_addr, error = %source, "failed to bind websocket listener");
+            source
+        })?;
         let token = shard.bus.token();
         let accepted_ws = accepted_clients.ws.clone();
         let ws_handle = compio::runtime::spawn(async move {

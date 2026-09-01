@@ -20,7 +20,7 @@ use compio::{
     io::AsyncWriteAtExt,
 };
 use iggy_common::{IggyByteSize, IggyError};
-use server_common::iobuf::Frozen;
+use server_common::iobuf::{Frozen, IOV_MAX};
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
@@ -29,8 +29,6 @@ use tracing::{error, warn};
 
 #[cfg(target_os = "linux")]
 use nix::fcntl::{FallocateFlags, fallocate};
-
-const MAX_IOV_COUNT: usize = 1024;
 
 #[derive(Debug)]
 pub struct MessagesWriter {
@@ -217,7 +215,7 @@ async fn write_frozen_chunked<const ALIGN: usize>(
     mut position: u64,
     buffers: &[Frozen<ALIGN>],
 ) -> Result<(), IggyError> {
-    for chunk in buffers.chunks(MAX_IOV_COUNT) {
+    for chunk in buffers.chunks(IOV_MAX) {
         let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
         let chunk_vec: Vec<_> = chunk.to_vec();
 

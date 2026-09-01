@@ -52,13 +52,17 @@ use crate::stm::user::UsersSnapshot;
 /// position out of place. The bump is what turns that into
 /// `UnsupportedFormatVersion` instead of an opaque deserializer error, or worse a
 /// silent misread.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
+///
+/// Version 5: `PartitionSnapshot` gained `created_view` as a trailing, defaulted
+/// field.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
-/// Version 4 added the client table's dedup fences as a trailing, defaulted
-/// field, so a version 3 checkpoint decodes under the current layout and simply
-/// carries none. Accepting it is what lets a node upgrade in place instead of
+/// Versions 4 and 5 each appended a trailing, defaulted field (the client
+/// table's dedup fences, then `PartitionSnapshot::created_view`), so a version 3
+/// or 4 checkpoint decodes under the current layout and simply carries the
+/// defaults. Accepting them is what lets a node upgrade in place instead of
 /// refusing its own last checkpoint; anything older than 3 changed field
 /// positions and is refused as before.
 pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 3;
@@ -568,7 +572,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 4;
+        const PINNED_VERSION: u32 = 5;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -597,6 +601,8 @@ mod tests {
         // keeps version 3 readable, so a further append here needs the same
         // treatment or a bump.
         const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
+        // Version 5 appended `created_view` the same way.
+        const PARTITION_FIELD_COUNT: u32 = 7;
 
         let client_table = consensus::ClientTableSnapshot {
             slots: Vec::new(),
@@ -632,6 +638,22 @@ mod tests {
             rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
             TOPIC_FIELD_COUNT,
             "TopicSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let partition = PartitionSnapshot {
+            id: 0,
+            consensus_group_id: 0,
+            created_at: IggyTimestamp::default(),
+            created_revision: 0,
+            deleted_up_to_offset: 0,
+            purge_generation: 0,
+            created_view: 0,
+        };
+        let encoded = rmp_serde::to_vec(&partition).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            PARTITION_FIELD_COUNT,
+            "PartitionSnapshot's field count changed; default the new field or bump the version"
         );
 
         let stream = StreamSnapshot {
@@ -861,6 +883,7 @@ mod tests {
                                 created_revision: 0,
                                 deleted_up_to_offset: 0,
                                 purge_generation: 0,
+                                created_view: 0,
                             }],
                             consumer_groups: Vec::new(),
                             // Nonzero and distinct from every id above so the
