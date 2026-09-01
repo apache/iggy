@@ -28,6 +28,7 @@ mod meilisearch;
 mod mongodb;
 mod postgres;
 mod quickwit;
+mod rabbitmq;
 mod redshift;
 mod s3;
 mod surrealdb;
@@ -82,6 +83,11 @@ pub use postgres::{
     PostgresSourceOps,
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
+pub use rabbitmq::{
+    RabbitMqOps, RabbitMqSinkDirectFixture, RabbitMqSinkFanoutFixture, RabbitMqSinkFixture,
+    RabbitMqSinkHeadersFixture, RabbitMqSinkRawSchemaFixture, RabbitMqSinkUnroutableFixture,
+    RabbitMqSinkWithoutMetadataFixture,
+};
 pub use redshift::{
     RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
     RedshiftSinkVarbyteFixture,

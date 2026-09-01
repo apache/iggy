@@ -44,6 +44,7 @@ members = [
     "core/connectors/sinks/mongodb_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
+    "core/connectors/sinks/rabbitmq_sink",
     "core/connectors/sinks/redshift_sink",
     "core/connectors/sinks/s3_sink",
     "core/connectors/sinks/stdout_sink",
@@ -218,6 +219,7 @@ journal = { path = "core/journal" }
 js-sys = "0.3"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
 keyring-core = "1.0.0"
+lapin = "2.5.1"
 lazy_static = "1.5.0"
 left-right = "0.11"
 libc = "0.2.188"
