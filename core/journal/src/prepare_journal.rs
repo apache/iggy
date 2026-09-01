@@ -575,8 +575,25 @@ impl PrepareJournal {
 
             let slot = slot_for_op(header.op, slot_count);
 
-            // Note: Regarding duplicate op in WAL. We rewrite it with whichever
-            // is the latest entry.
+            // Match append's collision fence while rebuilding the index. Reopening
+            // with fewer configured slots can otherwise hide an unsnapshotted op
+            // even though its bytes remain in the WAL. A duplicate op deliberately
+            // keeps the latest entry, and a snapshotted op is safe to evict.
+            if let Some(existing) = headers[slot]
+                && existing.op != header.op
+                && existing.op > snapshot_op
+            {
+                return Err(JournalError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal slot collision while rebuilding the index: op {} and \
+                         unsnapshotted op {} map to slot {slot} with slot_count={slot_count} \
+                         (snapshot_op={snapshot_op}); restore the previous \
+                         metadata.journal_slots value or checkpoint before shrinking it",
+                        header.op, existing.op,
+                    ),
+                )));
+            }
             headers[slot] = Some(header);
             offsets[slot] = Some(pos);
 
@@ -2097,6 +2114,70 @@ mod tests {
         drop(journal);
         let journal = PrepareJournal::open(&path, 0).await.unwrap();
         assert_eq!(journal.last_op(), Some(3));
+    }
+
+    #[compio::test]
+    async fn reopen_with_fewer_slots_rejects_unsnapshotted_collision_without_changing_wal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        drop(journal);
+        let wal_before = std::fs::read(&path).unwrap();
+
+        let error = PrepareJournal::open_with_slots(&path, 0, 2)
+            .await
+            .expect_err("shrinking the index must not hide an unsnapshotted entry");
+
+        assert!(
+            error.to_string().contains("journal slot collision"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            wal_before,
+            "a refused scan must leave the WAL intact"
+        );
+    }
+
+    #[compio::test]
+    async fn reopen_keeps_latest_duplicate_op() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.set_snapshot_op(1);
+        journal.append(make_prepare(1, 64)).await.unwrap();
+        drop(journal);
+
+        let journal = PrepareJournal::open_with_slots(&path, 0, 2).await.unwrap();
+        let header = *journal.header(1).expect("duplicate op must remain indexed");
+        assert_eq!(header.size as usize, HEADER_SIZE + 64);
+        assert_eq!(
+            journal
+                .entry_at(&header)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice()
+                .len(),
+            HEADER_SIZE + 64
+        );
+    }
+
+    #[compio::test]
+    async fn reopen_with_fewer_slots_can_evict_snapshotted_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        drop(journal);
+
+        let journal = PrepareJournal::open_with_slots(&path, 1, 2).await.unwrap();
+        assert!(journal.header(1).is_none());
+        assert_eq!(journal.header(3).map(|header| header.op), Some(3));
     }
 
     const POISON_REASON: &str = "test: simulated post-rename failure";

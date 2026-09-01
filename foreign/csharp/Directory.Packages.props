@@ -36,7 +36,7 @@ under the License.
         <PackageVersion Include="Shouldly" Version="4.3.0" />
         <PackageVersion Include="System.IO.Hashing" Version="10.0.0" />
         <PackageVersion Include="Testcontainers" Version="4.14.0" />
-        <PackageVersion Include="TUnit" Version="1.65.0" />
+        <PackageVersion Include="TUnit" Version="1.65.51" />
         <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.0">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
