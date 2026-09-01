@@ -499,8 +499,8 @@ fn resource_options_to_ffi(
 /// value. A key this build cannot read at all is dropped rather than guessed.
 pub(crate) fn ffi_options_to_raw(
     options: Vec<ffi::HeaderEntry>,
-) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let mut raw = std::collections::BTreeMap::new();
+) -> Result<BTreeMap<String, String>, String> {
+    let mut raw = BTreeMap::new();
     for entry in options {
         let RustHeaderEntry { key, value } = RustHeaderEntry::try_from(entry)?;
         let key = key

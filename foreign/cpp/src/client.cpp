@@ -54,12 +54,122 @@ void IggyBlockingClient::Shutdown() {
 }
 
 LoginInfo IggyBlockingClient::Login(std::string username, std::string password) {
-    return RethrowAsIggyException(
-        [this, &username, &password] { return Handle()->login_user(std::move(username), std::move(password)); });
+    return RethrowAsIggyException([this, &username, &password] {
+        return LoginInfo::FromFfi(Handle()->login_user(std::move(username), std::move(password)));
+    });
 }
 
 void IggyBlockingClient::Logout() {
     RethrowAsIggyException([this] { Handle()->logout_user(); });
+}
+
+StreamDetails IggyBlockingClient::CreateStream(std::string name) {
+    return RethrowAsIggyException(
+        [this, &name] { return StreamDetails::FromFfi(Handle()->create_stream(std::move(name))); });
+}
+
+void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name) {
+    return RethrowAsIggyException([this, &stream, &name] { Handle()->update_stream(stream.ToFfi(), std::move(name)); });
+}
+
+std::vector<Stream> IggyBlockingClient::GetStreams() {
+    return RethrowAsIggyException([this] {
+        std::vector<Stream> streams;
+        auto ffi_streams = Handle()->get_streams();
+        streams.reserve(ffi_streams.size());
+        for (auto &stream : ffi_streams) {
+            streams.push_back(Stream::FromFfi(std::move(stream)));
+        }
+        return streams;
+    });
+}
+
+StreamDetails IggyBlockingClient::GetStream(const Identifier &stream) {
+    return RethrowAsIggyException(
+        [this, &stream] { return StreamDetails::FromFfi(Handle()->get_stream(stream.ToFfi())); });
+}
+
+void IggyBlockingClient::DeleteStream(const Identifier &stream) {
+    return RethrowAsIggyException([this, &stream] { Handle()->delete_stream(stream.ToFfi()); });
+}
+
+void IggyBlockingClient::PurgeStream(const Identifier &stream) {
+    return RethrowAsIggyException([this, &stream] { Handle()->purge_stream(stream.ToFfi()); });
+}
+
+TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
+                                             std::string name,
+                                             const std::uint32_t partitions_count,
+                                             const CompressionAlgorithm compression_algorithm,
+                                             const Expiry message_expiry,
+                                             const MaxTopicSize max_topic_size,
+                                             ResourceOptions options) {
+    return RethrowAsIggyException(
+        [this, &stream, &name, partitions_count, &compression_algorithm, &message_expiry, &max_topic_size, &options] {
+            return TopicDetails::FromFfi(Handle()->create_topic(
+                stream.ToFfi(), std::move(name), partitions_count,
+                std::string(compression_algorithm.CompressionAlgorithmValue()),
+                std::string(message_expiry.ExpiryKind()), message_expiry.ExpiryValue(),
+                std::string(max_topic_size.MaxTopicSizeValue()), ResourceOptions::ToFfi(std::move(options))));
+        });
+}
+
+void IggyBlockingClient::UpdateTopic(const Identifier &stream,
+                                     const Identifier &topic,
+                                     std::string name,
+                                     const CompressionAlgorithm compression_algorithm,
+                                     const Expiry message_expiry,
+                                     const MaxTopicSize max_topic_size,
+                                     ResourceOptions options) {
+    return RethrowAsIggyException(
+        [this, &stream, &topic, &name, &compression_algorithm, &message_expiry, &max_topic_size, &options] {
+            Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), std::move(name),
+                                   std::string(compression_algorithm.CompressionAlgorithmValue()),
+                                   std::string(message_expiry.ExpiryKind()), message_expiry.ExpiryValue(),
+                                   std::string(max_topic_size.MaxTopicSizeValue()),
+                                   ResourceOptions::ToFfi(std::move(options)));
+        });
+}
+
+std::vector<Topic> IggyBlockingClient::GetTopics(const Identifier &stream) {
+    return RethrowAsIggyException([this, &stream] {
+        std::vector<Topic> topics;
+        auto ffi_topics = Handle()->get_topics(stream.ToFfi());
+        topics.reserve(ffi_topics.size());
+        for (auto &topic : ffi_topics) {
+            topics.push_back(Topic::FromFfi(std::move(topic)));
+        }
+        return topics;
+    });
+}
+
+TopicDetails IggyBlockingClient::GetTopic(const Identifier &stream, const Identifier &topic) {
+    return RethrowAsIggyException(
+        [this, &stream, &topic] { return TopicDetails::FromFfi(Handle()->get_topic(stream.ToFfi(), topic.ToFfi())); });
+}
+
+void IggyBlockingClient::DeleteTopic(const Identifier &stream, const Identifier &topic) {
+    return RethrowAsIggyException([this, &stream, &topic] { Handle()->delete_topic(stream.ToFfi(), topic.ToFfi()); });
+}
+
+void IggyBlockingClient::PurgeTopic(const Identifier &stream, const Identifier &topic) {
+    return RethrowAsIggyException([this, &stream, &topic] { Handle()->purge_topic(stream.ToFfi(), topic.ToFfi()); });
+}
+
+void IggyBlockingClient::CreatePartitions(const Identifier &stream,
+                                          const Identifier &topic,
+                                          const std::uint32_t partitions_count) {
+    return RethrowAsIggyException([this, &stream, &topic, partitions_count] {
+        Handle()->create_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count);
+    });
+}
+
+void IggyBlockingClient::DeletePartitions(const Identifier &stream,
+                                          const Identifier &topic,
+                                          const std::uint32_t partitions_count) {
+    return RethrowAsIggyException([this, &stream, &topic, partitions_count] {
+        Handle()->delete_partitions(stream.ToFfi(), topic.ToFfi(), partitions_count);
+    });
 }
 
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {
