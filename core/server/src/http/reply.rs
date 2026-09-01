@@ -33,8 +33,7 @@ use iggy_common::{
     ConsumerGroupDetails, IggyError, StreamDetails, TopicDetails, UserInfoDetails,
     eviction_reason_to_error,
 };
-use message_bus::BusMessage;
-use server_common::Message;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
 use crate::http::error::{PartitionWriteError, WriteError};
@@ -60,7 +59,7 @@ use crate::login_register::LoginRegisterError;
 /// keeps that a single parse whose failure mode is already decided here, rather
 /// than a second one whose fallback would have to invent a body.
 pub(in crate::http) fn classify_partition_reply(
-    reply: &BusMessage,
+    reply: &Frozen<MESSAGE_ALIGN>,
 ) -> Result<ReplyHeader, PartitionWriteError> {
     let header = reply
         .as_slice()
@@ -93,7 +92,7 @@ pub(in crate::http) fn classify_partition_reply(
 /// `header` is the one [`classify_partition_reply`] graded, so this reads the
 /// body without re-deriving its extent.
 pub(in crate::http) fn send_confirmations(
-    reply: &BusMessage,
+    reply: &Frozen<MESSAGE_ALIGN>,
     header: &ReplyHeader,
 ) -> Option<SendMessagesResponse> {
     let body = partition_reply_body(reply, header);
@@ -115,7 +114,7 @@ pub(in crate::http) fn send_confirmations(
 /// A partition reply's body past the header, bounded by the header's `size`
 /// rather than by the buffer length: `size` is the frame's authoritative
 /// extent, and the typed decoders reject trailing bytes.
-fn partition_reply_body<'a>(reply: &'a BusMessage, header: &ReplyHeader) -> &'a [u8] {
+fn partition_reply_body<'a>(reply: &'a Frozen<MESSAGE_ALIGN>, header: &ReplyHeader) -> &'a [u8] {
     reply
         .as_slice()
         .get(HEADER_SIZE..header.size as usize)
@@ -362,7 +361,7 @@ mod tests {
         );
     }
 
-    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> BusMessage {
+    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> Frozen<MESSAGE_ALIGN> {
         reply.into_generic().into_frozen()
     }
 
@@ -486,7 +485,7 @@ mod tests {
         ));
     }
 
-    fn send_reply(body: &Bytes) -> BusMessage {
+    fn send_reply(body: &Bytes) -> Frozen<MESSAGE_ALIGN> {
         let prepare = PrepareHeader {
             command: Command::Prepare,
             operation: Operation::SendMessages,
