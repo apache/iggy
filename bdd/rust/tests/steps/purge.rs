@@ -19,10 +19,9 @@ use crate::common::purge_context::PurgeContext;
 use crate::helpers::test_data::create_test_messages;
 use cucumber::{given, then, when};
 use iggy::prelude::{
-    Client, ClientWrapper, CompressionAlgorithm, Consumer, ConsumerKind, DEFAULT_ROOT_PASSWORD,
-    DEFAULT_ROOT_USERNAME, Identifier, IggyError, IggyExpiry, MaxTopicSize, MessageClient,
-    Partitioning, PollingStrategy, StreamClient, SystemClient, TcpClient, TcpClientConfig,
-    TopicClient, UserClient,
+    Client, ClientWrapper, Consumer, ConsumerKind, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
+    Identifier, IggyError, IggyExpiry, MessageClient, Partitioning, PollingStrategy, StreamClient,
+    SystemClient, TcpClient, TcpClientConfig, TopicClient, TopicCreateOptions, UserClient,
 };
 use std::sync::Arc;
 
@@ -93,11 +92,11 @@ pub async fn given_have_topic(
         .create_topic(
             &Identifier::numeric(stream_id).unwrap(),
             &topic_name,
-            partitions_count,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(partitions_count),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("Should be able to create topic");
