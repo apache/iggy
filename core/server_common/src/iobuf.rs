@@ -121,6 +121,10 @@ impl<const ALIGN: usize> Owned<ALIGN> {
         &mut self.inner
     }
 
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.inner.extend_from_slice(bytes);
+    }
+
     pub fn split_at(self, split_at: usize) -> (Prefix<ALIGN>, Frozen<ALIGN>) {
         assert!(split_at <= self.inner.len());
 
@@ -659,6 +663,16 @@ mod tests {
         v.extend_from_slice(b"abc");
         let prefix = Prefix::<A>::from_aligned_vec(v);
         assert_eq!(prefix.as_slice(), b"abc");
+    }
+
+    #[test]
+    fn owned_extend_from_slice_fills_reserved_capacity_in_place() {
+        let mut o: Owned<A> = Owned::with_capacity(6);
+        let capacity = o.buf_capacity();
+        o.extend_from_slice(b"abc");
+        o.extend_from_slice(b"def");
+        assert_eq!(o.as_slice(), b"abcdef");
+        assert_eq!(o.buf_capacity(), capacity);
     }
 
     //  Owned::split_at: shared control block / disjoint views

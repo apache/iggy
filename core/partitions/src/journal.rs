@@ -1199,12 +1199,9 @@ pub fn unpin_sparse_source(
         return;
     }
 
-    let mut compact = Owned::<4096>::zeroed(borrowed);
-    let mut cursor = 0;
+    let mut compact = Owned::<4096>::with_capacity(borrowed);
     for fragment in pushed.iter().filter(|f| f.borrows_from(source)) {
-        let bytes = fragment.as_slice();
-        compact.as_mut_slice()[cursor..cursor + bytes.len()].copy_from_slice(bytes);
-        cursor += bytes.len();
+        compact.extend_from_slice(fragment.as_slice());
     }
     let compact = Frozen::from(compact);
     let mut cursor = 0;
