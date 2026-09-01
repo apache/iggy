@@ -1,0 +1,220 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The `iggy-view` response header: the serving node's current VSR view,
+//! stamped on the success and redirect responses of authenticated flows and
+//! withheld wherever it could reach a caller that proved no credential. Raw
+//! `reqwest`, because the header itself is the contract.
+
+use std::future::Future;
+use std::time::Instant;
+
+use iggy::prelude::*;
+use integration::harness::TestHarness;
+use integration::iggy_harness;
+use reqwest::{Response, StatusCode};
+use serde_json::json;
+use tokio::time::sleep;
+
+use crate::server::http_client::{HttpClient, LOGIN_RETRY_INTERVAL, LOGIN_TIMEOUT};
+
+const VIEW_HEADER: &str = "iggy-view";
+
+/// The view number a response carries, if any. A header that is present but
+/// not a view number is a contract violation, not an absence.
+fn view_number(response: &Response) -> Option<u64> {
+    response.headers().get(VIEW_HEADER).map(|value| {
+        value
+            .to_str()
+            .expect("iggy-view must be ASCII")
+            .parse()
+            .expect("iggy-view must be a view number")
+    })
+}
+
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_an_authenticated_request_when_it_succeeds_should_carry_the_iggy_view_header(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+
+    let response = http.get("/streams").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        view_number(&response).is_some(),
+        "a successful authenticated response must carry {VIEW_HEADER}"
+    );
+}
+
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_a_request_without_credentials_when_it_is_rejected_should_omit_the_iggy_view_header(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+
+    let response = http.get_anonymous("/streams").await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        view_number(&response).is_none(),
+        "an error response must not leak {VIEW_HEADER} to an unauthenticated caller"
+    );
+}
+
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_the_ping_route_when_it_succeeds_should_omit_the_iggy_view_header(
+    harness: &TestHarness,
+) {
+    let http = HttpClient::login_root(harness).await;
+
+    let response = http.get_anonymous("/ping").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        view_number(&response).is_none(),
+        "the pre-auth probe must not carry {VIEW_HEADER}"
+    );
+}
+
+/// `http://host:port` of a harness node's HTTP listener.
+fn node_url(harness: &TestHarness, node: usize) -> String {
+    let addr = harness.node(node).http_addr().expect("node http address");
+    format!("http://{addr}")
+}
+
+/// Harness indexes of the node the roster marks `Leader` and of one it marks
+/// `Follower`. The harness emits the roster in node order, so a roster
+/// position is a harness index. Every node reads `Follower` until shard 0
+/// publishes its first view, so the roster is polled within the shared
+/// warmup budget until it marks a leader.
+async fn leader_and_follower(harness: &TestHarness) -> (usize, usize) {
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect to node 0");
+    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    loop {
+        let metadata = client
+            .get_cluster_metadata()
+            .await
+            .expect("get cluster metadata");
+        let position =
+            |role: ClusterNodeRole| metadata.nodes.iter().position(|node| node.role == role);
+        if let (Some(leader), Some(follower)) = (
+            position(ClusterNodeRole::Leader),
+            position(ClusterNodeRole::Follower),
+        ) {
+            return (leader, follower);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the roster did not mark a leader within {LOGIN_TIMEOUT:?}, got {metadata}"
+        );
+        sleep(LOGIN_RETRY_INTERVAL).await;
+    }
+}
+
+/// Repeat `request` while the follower answers 503, which it does until it
+/// can resolve the primary from its own view; bounded by the shared warmup
+/// budget, as cluster_metadata_vsr does. A 503 is the retry-safe class: the
+/// request provably never entered a pipeline.
+async fn until_primary_resolved<F, Fut>(request: F) -> Response
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Response>,
+{
+    let deadline = Instant::now() + LOGIN_TIMEOUT;
+    loop {
+        let response = request().await;
+        if response.status() != StatusCode::SERVICE_UNAVAILABLE {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "follower did not resolve the primary within {LOGIN_TIMEOUT:?}"
+        );
+        sleep(LOGIN_RETRY_INTERVAL).await;
+    }
+}
+
+/// The view the primary stamps on its own successful response: the value a
+/// follower's redirect or relay must agree with.
+async fn primary_view(primary: &HttpClient) -> u64 {
+    view_number(&primary.get("/streams").await).expect("the primary stamps its own view")
+}
+
+/// Three nodes, the smallest cluster that keeps a quorum through a leader
+/// change, one shard each so every request is served by shard 0, where the
+/// metadata consensus lives (see cluster_metadata_vsr.rs). No `http.jwt`
+/// secret and no `cluster.auth`: bearers are node-local, forwarding is off,
+/// and a follower answers a linearizable read with the 307 primary redirect.
+#[iggy_harness(cluster_nodes = 3, server(system.sharding.cpu_allocation = "0..1"))]
+async fn given_a_follower_when_it_redirects_a_linearizable_read_should_carry_the_iggy_view_header(
+    harness: &TestHarness,
+) {
+    let (leader, follower) = leader_and_follower(harness).await;
+    let primary = HttpClient::login_root_no_redirect(node_url(harness, leader)).await;
+    let http = HttpClient::login_root_no_redirect(node_url(harness, follower)).await;
+
+    let response = until_primary_resolved(|| http.get("/streams?consistency=linearizable")).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "a keyless follower must redirect a linearizable read to the primary"
+    );
+    assert_eq!(
+        view_number(&response),
+        Some(primary_view(&primary).await),
+        "the primary redirect must carry the cluster's current view in {VIEW_HEADER}"
+    );
+}
+
+/// The same three-node shape with cluster-wide bearer key material, which
+/// switches follower-to-primary forwarding on: a control-plane write posted
+/// to the follower is answered by the primary, and the relayed response must
+/// carry the header the primary stamped.
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(
+        system.sharding.cpu_allocation = "0..1",
+        http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+        http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+    )
+)]
+async fn given_a_follower_when_it_relays_a_forwarded_write_should_carry_the_iggy_view_header(
+    harness: &TestHarness,
+) {
+    let (leader, follower) = leader_and_follower(harness).await;
+    let primary = HttpClient::login_root_no_redirect(node_url(harness, leader)).await;
+    let http = HttpClient::login_root_no_redirect(node_url(harness, follower)).await;
+    let body = json!({ "name": "forwarded-stream" });
+
+    let response = until_primary_resolved(|| http.post_json("/streams", &body)).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the follower must relay the primary's answer to a control-plane write"
+    );
+    assert_eq!(
+        view_number(&response),
+        Some(primary_view(&primary).await),
+        "a relayed response must carry the view the primary stamped in {VIEW_HEADER}"
+    );
+}

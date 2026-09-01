@@ -102,7 +102,7 @@ pub(in crate::http) struct HttpInner {
     /// Per-key registration barrier: prevents a thundering herd of first
     /// requests for one credential from each running its own `Register`.
     pub(in crate::http) registrations: RegistrationBarrier,
-    pub(in crate::http) roster: ClusterRoster,
+    pub(in crate::http) roster: Rc<ClusterRoster>,
     /// Cap on live per-credential sessions: half the configured `[metadata]
     /// clients_table_max`, so HTTP sessions cannot crowd the TCP/QUIC/WS virtual
     /// clients out of the shared VSR client table. Read by `resolve_session`

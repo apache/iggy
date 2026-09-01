@@ -254,6 +254,16 @@ fn build_servers(
         return Ok(vec![ServerHandle::with_config(config, context.clone())]);
     }
 
+    // The roster below names every node's ports before any node boots, which
+    // is exactly what ephemeral ports cannot do.
+    if config.ephemeral_ports {
+        return Err(TestBinaryError::InvalidState {
+            message: format!(
+                "ephemeral_ports needs a single node, but the harness has {node_count} nodes"
+            ),
+        });
+    }
+
     // Multi-node cluster: pre-reserve all ports
     let cluster_ports = ClusterPortReserver::reserve(node_count, config.ip_kind, &config)?;
     let all_addrs = cluster_ports.all_addresses();
