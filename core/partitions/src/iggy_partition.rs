@@ -7656,8 +7656,6 @@ mod tests {
         );
     }
 
-    /// A half that failed never advanced its cursor, so the retry rewrites
-    /// the same positions: one copy of the batch, one index entry.
     #[cfg(target_os = "linux")]
     #[compio::test]
     async fn given_a_persist_failure_on_a_committed_op_should_fence_the_partition_not_panic() {
@@ -7744,6 +7742,9 @@ mod tests {
         assert_eq!(kept.operation, Operation::StoreConsumerOffset);
     }
 
+    /// A half that failed never advanced its cursor, so the retry rewrites
+    /// the same positions: one copy of the batch, one index entry.
+    #[cfg(target_os = "linux")]
     #[compio::test]
     async fn given_failed_persist_when_retried_with_a_healthy_writer_should_overwrite_the_same_positions()
      {

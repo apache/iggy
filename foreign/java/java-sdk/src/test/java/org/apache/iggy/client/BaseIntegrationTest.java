@@ -91,6 +91,7 @@ public abstract class BaseIntegrationTest {
                     .withEnv("IGGY_ROOT_PASSWORD", "iggy")
                     .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
                     .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
+                    .withEnv("IGGY_NODE_ADVERTISED_ADDRESS", "127.0.0.1")
                     .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
                             .withCapAdd(Capability.SYS_NICE)
                             .withSecurityOpts(List.of("seccomp:unconfined"))

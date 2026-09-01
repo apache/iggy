@@ -55,24 +55,15 @@ use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
 use std::cell::Cell;
 
-/// Partition-plane request ids are offset into the top half of the `u64` space
-/// so they never collide with the small, contiguous metadata ids in the
-/// auditor's `(client, request)` map. The metadata sequence would have to reach
-/// `2^63` to overlap, which no run approaches.
-const PARTITION_ID_BASE: u64 = 1 << 63;
-
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
     client_id: u128,
-    /// Contiguous `1, 2, 3, …` request ids for metadata/replicated ops, the
-    /// sequence the server's `ClientTable` dedups and requires gap-free.
+    /// Monotonic `1, 2, 3, …` request ids shared by every replicated op,
+    /// metadata and partition alike, which is what the SDKs send. One sequence
+    /// also issues each id exactly once per client, so a delayed or duplicated
+    /// partition reply can never carry the `(client, request)` key of a live
+    /// metadata entry in the auditor's map. See [`SimClient::next_request_id`].
     request_counter: Cell<u64>,
-    /// Separate id sequence for partition-plane ops, offset into a disjoint
-    /// range ([`PARTITION_ID_BASE`]). The partition plane has no client-table
-    /// dedup and treats the id as an opaque echo, so a partition id never
-    /// collides with a metadata id, even under reply duplication. See
-    /// [`SimClient::request_id_for`].
-    partition_counter: Cell<u64>,
     /// Deterministic per-message id source for produced messages. The real SDK
     /// mints a random UUID for a zero message id before encoding; that mint is
     /// unseeded, so under the deterministic executor a produce's replicated
@@ -100,7 +91,6 @@ impl SimClient {
         Self {
             client_id,
             request_counter: Cell::new(0),
-            partition_counter: Cell::new(0),
             message_counter: Cell::new(0),
             session: Cell::new(0),
             shell_wire: Cell::new(false),
@@ -157,30 +147,21 @@ impl SimClient {
         self.session.set(session);
     }
 
-    /// Assign the wire request id for `operation`, keyed by plane.
+    /// Assign the wire request id for the next replicated op.
     ///
-    /// Metadata/replicated ops advance a contiguous `1, 2, 3, …` counter, matching
-    /// the real SDK. Gaps are admitted rather than fatal (`check_request` answers
-    /// `New` to anything above the watermark; there is no `RequestGap`), but the
-    /// dedup ring is sized for a contiguous sequence. Partition ops are at-least-once
-    /// with no dedup and the server
-    /// treats their id as an opaque echo, so they draw from a separate counter
-    /// offset into a disjoint range ([`PARTITION_ID_BASE`]). A partition id can
-    /// therefore never equal a metadata id, so a delayed or duplicated partition
-    /// reply is never misattributed to a metadata entry in the auditor's
-    /// `(client, request)` map (which would trip the group guard and drop a
-    /// live metadata op). This holds regardless of reply duplication, not only
-    /// while clients are one-in-flight.
-    fn request_id_for(&self, operation: Operation) -> u64 {
-        if operation.is_partition() {
-            let next = self.partition_counter.get() + 1;
-            self.partition_counter.set(next);
-            PARTITION_ID_BASE + next
-        } else {
-            let next = self.request_counter.get() + 1;
-            self.request_counter.set(next);
-            next
-        }
+    /// Every replicated op advances one counter, metadata and partition alike,
+    /// which is what the SDKs send: a partition op needs its own number for a
+    /// retry to be recognisable, and the ids it spends cost the metadata plane
+    /// nothing, because `ClientTable` admits anything above the watermark
+    /// (`client_table.rs`: "There is no `RequestGap`").
+    ///
+    /// `NonReplicated` reads never reach here — the poll path builds its own
+    /// header and reads the counter without advancing it, matching the SDK,
+    /// since the server ignores the id for ops the table never sees.
+    fn next_request_id(&self) -> u64 {
+        let next = self.request_counter.get() + 1;
+        self.request_counter.set(next);
+        next
     }
 
     fn session_id(&self) -> u64 {
@@ -623,10 +604,10 @@ impl SimClient {
     /// `count` messages from offset 0 of `group`'s partition.
     ///
     /// A `NonReplicated` read: the command code sits in the header's
-    /// `reserved` prefix, and the request id ECHOES the current metadata
-    /// counter without advancing it (matching the SDK), so a read never
-    /// gaps the replicated sequence the server's `ClientTable` requires
-    /// gap-free. Requires a bound session (polls are auth-gated).
+    /// `reserved` prefix, and the request id ECHOES the current counter
+    /// without advancing it (matching the SDK). The server ignores the id for
+    /// ops its `ClientTable` never sees, so burning one would buy nothing.
+    /// Requires a bound session (polls are auth-gated).
     ///
     /// # Panics
     /// Panics if the session is unbound or the request buffer is invalid.
@@ -779,7 +760,7 @@ impl SimClient {
             request_checksum: 0,
             timestamp: 0, // TODO: Use actual timestamp
             session: self.session_id(),
-            request: self.request_id_for(operation),
+            request: self.next_request_id(),
             group,
             ..Default::default()
         }
@@ -813,29 +794,29 @@ fn namespace_ids(ns: IggyNamespace) -> (WireIdentifier, WireIdentifier, Option<u
 mod tests {
     use super::*;
 
-    // A partition send between two metadata ops must not consume a metadata
-    // request number: the server's `ClientTable` requires the metadata sequence
-    // gap-free (`committed + 1`), else a gap permanently wedges the client's
-    // metadata plane. Partition ops draw from a separate counter in a disjoint
-    // range (`PARTITION_ID_BASE`), so the metadata sequence stays `1, 2, 3`
-    // regardless of interleaved sends and a partition id never collides with a
-    // metadata id.
+    // A partition send consumes a request id like any other replicated op, so
+    // an interleaved run numbers both planes from one sequence and the metadata
+    // ids arrive with gaps under them. That is the pattern the SDKs produce, and
+    // the server admits it: `ClientTable` compares against a watermark rather
+    // than requiring contiguity (`client_table.rs`: "There is no `RequestGap`"),
+    // so a metadata op landing above the watermark executes and moves it.
     #[test]
-    fn partition_ops_do_not_gap_the_metadata_request_sequence() {
+    fn every_replicated_op_advances_the_one_request_sequence() {
         let client = SimClient::new(7);
+        client.bind_session(1);
 
-        // Metadata ops advance (1, 2, 3); interleaved sends draw their own
-        // disjoint sequence and leave the metadata counter untouched.
-        assert_eq!(client.request_id_for(Operation::CreateStream), 1);
-        assert_eq!(
-            client.request_id_for(Operation::SendMessages),
-            PARTITION_ID_BASE + 1
-        );
-        assert_eq!(client.request_id_for(Operation::CreateStream), 2);
-        assert_eq!(
-            client.request_id_for(Operation::SendMessages),
-            PARTITION_ID_BASE + 2
-        );
-        assert_eq!(client.request_id_for(Operation::CreateStream), 3);
+        let interleaved = [
+            Operation::CreateStream,
+            Operation::SendMessages,
+            Operation::CreateStream,
+            Operation::SendMessages,
+            Operation::CreateStream,
+        ];
+        let ids: Vec<u64> = interleaved
+            .into_iter()
+            .map(|operation| client.header(operation, METADATA_GROUP, 0).request)
+            .collect();
+
+        assert_eq!(ids, vec![1, 2, 3, 4, 5], "plane must not fork the sequence");
     }
 }

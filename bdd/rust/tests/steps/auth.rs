@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::common::global_context::GlobalContext;
+use crate::helpers::env::{root_password, root_username};
 use cucumber::given;
 use iggy::prelude::*;
 use std::sync::Arc;
@@ -42,7 +43,7 @@ pub async fn given_authenticated_as_root(world: &mut GlobalContext) {
 
     client.ping().await.expect("Server should respond to ping");
     client
-        .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
+        .login_user(&root_username(), &root_password())
         .await
         .expect("Failed to login as root");
 

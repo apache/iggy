@@ -65,7 +65,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
 use crate::bootstrap::ServerShard;
-use crate::cluster_meta::ClusterRoster;
+use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes};
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
@@ -95,7 +95,7 @@ use crate::server_error::ServerError;
 /// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
 /// credentials cannot be loaded, or the listener cannot bind to `addr`.
 #[allow(clippy::too_many_arguments)]
-pub async fn start(
+pub fn start(
     shard: &Rc<ServerShard>,
     addr: SocketAddr,
     http_config: &HttpConfig,
@@ -103,7 +103,8 @@ pub async fn start(
     max_tokens_per_user: u32,
     cluster: &ClusterConfig,
     system_config: Arc<ServerSystemConfig>,
-    self_ports: TransportPorts,
+    self_advertised: &str,
+    self_ports: &TransportPorts,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
@@ -138,7 +139,7 @@ pub async fn start(
     // Same early-fail rule for the scrape path: axum panics on a route
     // without a leading '/', so reject it as a config error instead.
     let metrics_endpoint = metrics::validated_endpoint(&http_config.metrics)?;
-    let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
+    let (listener, bound_addr) = client_listener::tcp::bind(addr)?;
 
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
@@ -149,13 +150,13 @@ pub async fn start(
         roster: ClusterRoster {
             enabled: cluster.enabled,
             name: cluster.name.clone(),
-            nodes: cluster.nodes.iter().cloned().map(Into::into).collect(),
-            self_ip: bound_addr.ip().to_string(),
+            nodes: resolved_roster_nodes(cluster).map_err(ServerError::Config)?,
+            self_advertised: self_advertised.to_owned(),
             // The self node reports the live bound HTTP port; the other client
             // ports arrive resolved from the caller.
             self_ports: TransportPorts {
                 http: Some(bound_addr.port()),
-                ..self_ports
+                ..self_ports.clone()
             },
             // The HTTP listener is shard-0-only, where the live consensus
             // handle supplies the leader; the published-view fallback is

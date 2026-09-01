@@ -64,6 +64,7 @@ php -r 'var_dump(extension_loaded("iggy-php"));'
 docker run --rm --name iggy-php-test \
   -p 8090:8090 \
   -p 3000:3000 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
   apache/iggy:latest
 ```
 
@@ -80,7 +81,7 @@ The tests assume:
 - username: `iggy`
 - password: `iggy`
 
-Override them with `IGGY_HOST`, `IGGY_PORT`, `IGGY_USERNAME`, and `IGGY_PASSWORD`.
+Override them with `IGGY_TCP_ADDRESS`, `IGGY_ROOT_USERNAME`, and `IGGY_ROOT_PASSWORD`.
 
 ## Usage
 

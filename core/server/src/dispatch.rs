@@ -1598,8 +1598,9 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
         // Header validation requires `session > 0 && request > 0` for
         // non-register ops. The partition plane itself is sessionless
         // (at-least-once, no `ClientTable` dedup), so the bound VSR
-        // session merely satisfies validation, and a zero request id
-        // (the SDK does not number data-plane ops) is normalized.
+        // session merely satisfies validation. Current SDKs do number
+        // partition ops, but older and internal callers may still send
+        // zero, so a zero id is normalized to the compatibility value 1.
         new_header.session = bound_session;
         new_header.request = new_header.request.max(1);
     });
@@ -4329,6 +4330,7 @@ mod tests {
                 partition_id: 0,
                 consensus_group_id: 1,
             }],
+            created_view: 0,
         };
         md.mux_stm
             .update(prepare_message(
@@ -5106,8 +5108,13 @@ mod tests {
         let multi_node = Rc::new(ClusterRoster {
             enabled: true,
             name: "test-cluster".to_owned(),
-            nodes: vec![roster_node("node-0").into(), roster_node("node-1").into()],
-            self_ip: "127.0.0.1".to_owned(),
+            nodes: ["node-0", "node-1"]
+                .map(|name| {
+                    configs::cluster::ResolvedClusterNode::try_from(roster_node(name))
+                        .expect("valid roster node")
+                })
+                .to_vec(),
+            self_advertised: "127.0.0.1".to_owned(),
             self_ports: TransportPorts::default(),
             metadata_view: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,

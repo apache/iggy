@@ -28,6 +28,16 @@ cleaner_enabled = true
 # Interval for running the message cleaner.
 interval = "1 m"
 
+# This node's own client-facing identity, used when 'cluster.enabled' is false.
+[node]
+# A literal IP or a DNS hostname, without a port. Named to match its roster
+# counterpart 'cluster.nodes.advertised_address', which answers the same
+# question per node. The unspecified address ("0.0.0.0", "::") is rejected: it
+# is the bind address's answer to a question clients are not asking. Commented
+# out here because the shipped 'tcp.address' binds a concrete address and needs
+# no declaration.
+#advertised_address = "broker-1.example.com"
+
 # HTTP server configuration
 [http]
 # Determines if the HTTP server is active.
@@ -712,9 +722,9 @@ key_file = ""
 # PEM trust anchor(s) the dialer verifies peer certificates against.
 # Unused when self_signed = true.
 # The dialer verifies each peer against the 'ip' string from that peer's
-# cluster.nodes entry, so a roster of literal IPs needs peer certificates
-# carrying matching IP SANs. Hostname-only certificates fail verification;
-# use hostnames in the roster if the certificates only have DNS SANs.
+# cluster.nodes entry, and that string is the TLS server name as well as a
+# literal IP, so every peer certificate needs a matching IP SAN. A
+# certificate carrying only DNS SANs fails verification.
 ca_file = ""
 
 # Shard-0 coordinator placement.
@@ -788,7 +798,7 @@ skip_shard_zero_for_clients = false
 #
 #   [[cluster.nodes]]
 #   name = "iggy-node-1"
-#   ip = "10.0.1.5"                        # replica plane + last-resort fallback
+#   ip = "10.0.1.5"                        # replica plane, literal IP only
 #   advertised_address = "203.0.113.10"    # catch-all for unmatched clients
 #   replica_id = 0
 #   ports = { tcp = 8090, http = 3000, tcp_replica = 9090 }
@@ -950,7 +960,9 @@ prepare_queue_depth = 32
 # Size of the metadata WAL's in-memory index, in slots (one committed but
 # not-yet-snapshotted op per slot). Larger values buy more headroom
 # between forced checkpoints at the cost of memory and bigger WAL
-# rewrites per checkpoint.
+# rewrites per checkpoint. Reducing this for an existing data directory is
+# refused at boot if the live WAL suffix collides in the smaller index;
+# restore the previous value to recover.
 journal_slots = 1024
 
 # Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS

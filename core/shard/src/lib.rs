@@ -3543,6 +3543,9 @@ where
     /// materialisation and wrong for a restart: a rebuilt partition with no data
     /// reports `commit_offset` 0, which reads as a regression rather than a
     /// harness that discarded the log.
+    ///
+    /// `created_view` is the view the metadata plane created the namespace in;
+    /// see `fresh_group_start`.
     // `feature = "simulator"` alone, unlike its neighbours: the body names items
     // `partitions` gates the same way, and a `test` arm cannot turn those on.
     // Under `cargo test -p shard` that arm fires from shard's own `cfg(test)`
@@ -3557,7 +3560,7 @@ where
         recovered_state: Option<consensus::VsrState>,
         retained: Option<partitions::RetainedPartitionState>,
         restore_frontier: bool,
-        metadata_view: Option<u32>,
+        created_view: u32,
     ) where
         B: MessageBus + Clone,
     {
@@ -3578,15 +3581,15 @@ where
         // The SAME decision `build_partition_fresh` makes, not a copy of it.
         // This path cannot call that builder (it does real filesystem work and
         // this runs on in-memory storage), and while the two decided
-        // separately the simulator exercised neither the metadata-view seed nor
-        // the plane split it closes. `retained` is populated only by the
+        // separately the simulator exercised neither the creation-view seed
+        // nor the plane split it closes. `retained` is populated only by the
         // restart path, which is this path's evidence of a prior life.
         let durable_view = recovered_state
             .as_ref()
             .map(|state| (state.view, state.log_view));
         let restarted = retained.is_some() && self.partition_consensus.replica_count > 1;
         let consensus::FreshGroupStart { join, seed_view } =
-            consensus::fresh_group_start(restarted, durable_view, metadata_view);
+            consensus::fresh_group_start(restarted, durable_view, created_view);
 
         // Recorded view first, exactly as the two boot paths order it: restoring
         // after `init` would advertise a view older than the recorded one.
