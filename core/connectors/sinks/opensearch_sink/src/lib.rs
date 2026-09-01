@@ -952,12 +952,24 @@ fn parse_bulk_response(
         });
     }
 
-    // The top-level flag lets a clean batch skip the per-item scan entirely.
+    // The top-level flag lets a clean batch skip failure classification, but
+    // each item still needs a sanity check: `errors: false` is only trustworthy
+    // if every item actually carries an operation result with a 2xx status.
     if !response
         .get("errors")
         .and_then(Value::as_bool)
         .unwrap_or(true)
     {
+        for (position, item) in items.iter().enumerate() {
+            let status = item
+                .as_object()
+                .and_then(|item| item.values().next())
+                .and_then(|result| result.get("status"))
+                .and_then(Value::as_u64);
+            if !status.is_some_and(|status| (200..300).contains(&status)) {
+                return Err(BulkResponseError::MalformedItem { position });
+            }
+        }
         return Ok(BulkAttempt {
             indexed: items.len(),
             ..BulkAttempt::default()
@@ -2081,6 +2093,19 @@ mod tests {
         assert!(matches!(
             parse_bulk_response(&response, 2),
             Err(BulkResponseError::MalformedItem { position: 1 })
+        ));
+    }
+
+    #[test]
+    fn given_clean_flag_bulk_response_with_malformed_item_should_be_rejected_as_unparsable() {
+        let response = json!({
+            "errors": false,
+            "items": [{}]
+        });
+
+        assert!(matches!(
+            parse_bulk_response(&response, 1),
+            Err(BulkResponseError::MalformedItem { position: 0 })
         ));
     }
 
