@@ -36,6 +36,8 @@ mod session;
 mod state;
 mod submit;
 mod tls;
+#[cfg(feature = "iggy-web")]
+mod web;
 mod wire;
 
 use std::cell::{Cell, RefCell};
@@ -64,7 +66,6 @@ use send_wrapper::SendWrapper;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
-use crate::bootstrap::ServerShard;
 use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes};
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
@@ -80,6 +81,7 @@ use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
 use crate::http::state::{HttpInner, HttpState, insert_view_header};
 use crate::server_error::ServerError;
+use crate::shell::ServerShard;
 
 /// Bind the shard-0 HTTP listener and spawn the `cyper-axum` serve loop as a
 /// background task on shard 0's compio runtime. Serves HTTPS when
@@ -300,7 +302,7 @@ fn router(
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client));
     let local = match metrics_endpoint {
-        Some(endpoint) => local.route(endpoint, get(metrics::get_metrics)),
+        Some(endpoint) => local.route(endpoint, get(handlers::get_metrics)),
         None => local,
     };
     let router = Router::new()
@@ -458,7 +460,7 @@ fn merge_web_ui(router: Router, web_ui: bool) -> Router {
     #[cfg(feature = "iggy-web")]
     let router = if web_ui {
         info!("Web UI enabled at /ui");
-        router.merge(crate::web::router())
+        router.merge(web::router())
     } else {
         router
     };
