@@ -4470,7 +4470,7 @@ mod tests {
 
     fn reply_status(reply: &message_bus::BusMessage) -> u32 {
         bytemuck::checked::try_from_bytes::<ReplyHeader>(
-            &reply.as_ref()[..size_of::<ReplyHeader>()],
+            &reply.first().as_slice()[..size_of::<ReplyHeader>()],
         )
         .expect("deny reply carries a valid ReplyHeader")
         .status

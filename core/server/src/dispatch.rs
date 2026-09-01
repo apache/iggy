@@ -41,7 +41,7 @@ use crate::pat::maybe_rewrite_pat_request;
 use crate::responses::{
     NonReplicatedResponse, build_consumer_offset_body, build_deny_reply, build_empty_reply,
     build_get_me_response, build_get_personal_access_tokens_response,
-    build_non_replicated_response, build_polled_messages_body, build_raw_pat_reply,
+    build_non_replicated_response, build_polled_messages_reply, build_raw_pat_reply,
     connected_client_to_response, current_metadata_commit, resolve_partition_namespace,
     resolve_partition_request_namespace,
 };
@@ -103,10 +103,10 @@ use iggy_common::{
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::client_listener::RequestHandler;
 use message_bus::framing::MAX_MESSAGE_SIZE;
 use message_bus::replica::listener::MessageHandler;
+use message_bus::{AUTO_COMMIT_CLIENT_ID, BusMessage};
 use metadata::impls::metadata::{
     BoundSession, MetadataSubmitError, StreamsFrontend, build_truncate_partition_client_message,
     build_truncate_partition_client_message_with_identifiers,
@@ -1941,11 +1941,30 @@ async fn send_non_replicated_bytes<B, MJ, S, SB>(
         request.header().session,
         commit,
     );
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
+    send_reply_frame(
+        shard,
+        transport_client_id,
+        reply.into_generic().into_frozen(),
+        label,
+    )
+    .await;
+}
+
+/// Hand a built reply frame to the bus for `transport_client_id`.
+#[allow(clippy::future_not_send)]
+async fn send_reply_frame<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    transport_client_id: u128,
+    frame: impl Into<BusMessage>,
+    label: &'static str,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if let Err(error) = shard.bus.send_to_client(transport_client_id, frame).await {
         warn!(transport_client_id, label, error = %error, "failed to send non-replicated reply");
     }
 }
@@ -2169,20 +2188,27 @@ async fn handle_poll_messages<B, MJ, S, SB>(
                 Some(PartitionReadReply::Poll {
                     fragments,
                     current_offset,
-                }) => build_polled_messages_body(
+                }) => match build_polled_messages_reply(
+                    request.header(),
+                    current_metadata_commit(shard),
                     partition_id,
                     current_offset,
                     fragments,
                     shard.plane.partitions().config().encryptor.as_deref(),
-                )
-                .unwrap_or_else(|error| {
-                    warn!(
-                        transport_client_id,
-                        error = %error,
-                        "failed to re-encode polled batches; replying empty poll"
-                    );
-                    empty_polled_messages_body(partition_id)
-                }),
+                ) {
+                    Ok(reply) => {
+                        send_reply_frame(shard, transport_client_id, reply, "poll_messages").await;
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(
+                            transport_client_id,
+                            error = %error,
+                            "failed to re-encode polled batches; replying empty poll"
+                        );
+                        empty_polled_messages_body(partition_id)
+                    }
+                },
                 other => {
                     warn!(
                         transport_client_id,
@@ -3823,6 +3849,7 @@ mod tests {
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::variadic;
     use journal::prepare_journal::PrepareJournal;
+    use message_bus::BusMessage;
     use message_bus::client_listener::RequestHandler;
     use message_bus::fd_transfer::DupedFd;
     use message_bus::installer::ConnectionInstaller;
@@ -3895,11 +3922,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            data: Frozen<MESSAGE_ALIGN>,
+            data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             self.client_replies
                 .borrow_mut()
-                .push((client_id, data.as_slice().to_vec()));
+                .push((client_id, data.into().into_contiguous().as_slice().to_vec()));
             Ok(())
         }
         async fn send_to_replica(
@@ -4496,7 +4523,10 @@ mod tests {
     fn reply_lane_forward(client_id: u128) -> ShardFrame {
         ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
             client_id,
-            msg: server_common::iobuf::Owned::<MESSAGE_ALIGN>::zeroed(64).into(),
+            msg: server_common::iobuf::Frozen::from(
+                server_common::iobuf::Owned::<MESSAGE_ALIGN>::zeroed(64),
+            )
+            .into(),
         })
     }
 
@@ -4646,7 +4676,7 @@ mod tests {
             if let ShardFrame::Lifecycle(LifecycleFrame::ForwardClientSend { client_id, msg }) =
                 frame
             {
-                denies.push((client_id, msg.as_slice().to_vec()));
+                denies.push((client_id, msg.into_contiguous().as_slice().to_vec()));
             }
         }
         assert_eq!(

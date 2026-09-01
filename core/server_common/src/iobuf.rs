@@ -23,6 +23,11 @@ use std::ptr::NonNull;
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
+/// Linux `IOV_MAX`: the most iovecs one `writev(2)` accepts. Vectored
+/// writers must chunk their buffer lists at this many entries or the
+/// syscall fails with `EINVAL`.
+pub const IOV_MAX: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct Owned<const ALIGN: usize = 4096> {
     inner: AVec<u8, ConstAlign<ALIGN>>,
