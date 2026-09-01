@@ -27,7 +27,8 @@
 //! Granularity is the module FILE. Parent<->child edges are exempt: a root
 //! composing its children (and children reaching items the root defines) is
 //! the pattern working as intended. Sibling and cross-tree cycles are the
-//! rot this guard exists to stop.
+//! rot this guard exists to stop. `#[cfg(test)]` modules are outside the
+//! graph whether they are inline or their own file.
 //!
 //! `WHITELIST` carries the known survivors. Each entry must still be a live
 //! cycle - a stale entry fails the test, so the list can only shrink.
@@ -37,9 +38,9 @@ use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Known mutual edges, as unordered pairs of module paths. Burned down per
-/// refactor PR; the auth<->dispatch cycle dies with the dispatch/ login merge.
-const WHITELIST: [(&str, &str); 1] = [("auth", "dispatch")];
+/// Known mutual edges, as unordered pairs of module paths. Burned down to
+/// empty by the dispatch/ login merge; new entries need a written ruling.
+const WHITELIST: [(&str, &str); 0] = [];
 
 type Module = Vec<String>;
 
@@ -104,11 +105,15 @@ fn module_graph_is_a_dag_modulo_whitelist() {
 /// Map every source file under `src/` to its module path. `lib.rs` is the
 /// crate root `[]`; `main.rs`/`args.rs` belong to the bin target and are
 /// skipped (their `crate::` is a different crate).
+///
+/// Modules a parent declares under `#[cfg(test)]` are dropped with their whole
+/// subtree: `scan_items` already skips inline `#[cfg(test)] mod`, and a test
+/// harness in its own file must not become a production graph node.
 fn collect_modules(src: &Path) -> Vec<(Module, PathBuf)> {
     let mut files = Vec::new();
     walk(src, &mut files);
     files.sort();
-    files
+    let mut modules: Vec<(Module, PathBuf)> = files
         .into_iter()
         .filter_map(|file| {
             let relative = file
@@ -126,7 +131,35 @@ fn collect_modules(src: &Path) -> Vec<(Module, PathBuf)> {
             }
             Some((module, file))
         })
-        .collect()
+        .collect();
+
+    let gated = cfg_test_file_modules(&modules);
+    modules.retain(|(module, _)| {
+        !gated.contains(module) && !gated.iter().any(|root| is_ancestor(root, module))
+    });
+    modules
+}
+
+/// Module paths a parent declares as `#[cfg(test)] mod name;` (no inline body).
+fn cfg_test_file_modules(modules: &[(Module, PathBuf)]) -> BTreeSet<Module> {
+    let mut gated = BTreeSet::new();
+    for (module, file) in modules {
+        let source = std::fs::read_to_string(file)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", file.display()));
+        let ast = syn::parse_file(&source)
+            .unwrap_or_else(|error| panic!("cannot parse {}: {error}", file.display()));
+        for item in &ast.items {
+            if let syn::Item::Mod(declaration) = item
+                && declaration.content.is_none()
+                && is_cfg_test(&declaration.attrs)
+            {
+                let mut child = module.clone();
+                child.push(declaration.ident.to_string());
+                gated.insert(child);
+            }
+        }
+    }
+    gated
 }
 
 fn walk(dir: &Path, files: &mut Vec<PathBuf>) {

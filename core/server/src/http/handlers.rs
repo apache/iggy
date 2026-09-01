@@ -118,11 +118,11 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
-use crate::auth::{verify_login_credentials, verify_pat_credentials};
+use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
+use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::dispatch::{
-    resolve_consumer_offset_request, resolve_poll_request, validate_option_keys,
-    validate_topic_bounds, validate_topic_size_floor, warn_unenforceable_topic_size,
-    warn_unenforceable_topic_size_on_partition_add,
+    validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
+    warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
 };
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
