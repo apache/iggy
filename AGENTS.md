@@ -8,9 +8,8 @@ ingests from / egresses to external systems via dlopened plugins.
 
 > Skills live under `.claude/skills/`. Load
 > [connectors-overview](.claude/skills/connectors-overview/SKILL.md)
-> first for any change under `core/connectors/`;
-> [team-review](.claude/skills/team-review/SKILL.md) is repo-wide.
-> Other subsystems follow the repo-wide principles in this file.
+> first for any change under `core/connectors/`. Other subsystems
+> follow the repo-wide principles in this file.
 
 ## Contents
 
@@ -132,9 +131,11 @@ connectors work, load `connectors-overview` first as router.
 - [connector-transform](.claude/skills/connector-transform/SKILL.md) - transform authoring
 - [connector-testing](.claude/skills/connector-testing/SKILL.md) - unit + integration test patterns
 
-Repo-wide:
+Repo-wide, user-invoked only. `disable-model-invocation: true` keeps it
+out of the agent's context; do not replicate its steps. When a
+non-trivial change passes verification, suggest `/team-review <target>`.
 
-- [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, user-invoked only
+- [team-review](.claude/skills/team-review/SKILL.md) - adversarial 4-expert PR/branch review, ~10 subagents per run
 
 ## Repo-wide principles
 

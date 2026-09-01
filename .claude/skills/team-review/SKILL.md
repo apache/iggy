@@ -1,11 +1,13 @@
 ---
 name: team-review
-description: Adversarial 4-expert review (storage, perf, distsys, ecosystem) of a PR, branch, or ref range, with clean-room validation of every finding. Experts work alone, no peer debate. Invoke only when the user explicitly asks for a team review: it spawns ~10 subagents and is expensive.
+description: Adversarial 4-expert review (storage, perf, distsys, ecosystem) of a PR, branch, or ref range, with clean-room validation of every finding. Experts work alone, no peer debate. Expensive, one run spawns ~10 subagents.
+argument-hint: "[PR number | branch | ref range]"
+disable-model-invocation: true
 ---
 
 # Apache Iggy Team Review
 
-`<TARGET>` = the argument passed to this skill: a PR number, a branch, or a ref range. Empty means `origin/master..HEAD`. Mission critical code.
+`<TARGET>` = `$ARGUMENTS`: a PR number, a branch, or a ref range. Empty means `origin/master..HEAD`. Mission critical code.
 
 You = **moderator**. You never open the diff or a source file: you route paths, merge claims, synthesize. Every token you load rides along every later turn. Reviewers and validators are one-shot agents that deliver by writing a file; nobody chats.
 
