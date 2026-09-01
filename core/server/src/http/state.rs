@@ -34,7 +34,6 @@ use iggy_common::{ClusterMetadata, IggyTimestamp};
 use message_bus::InstanceToken;
 use metadata::MetadataSubmitError;
 use send_wrapper::SendWrapper;
-use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::bootstrap::ServerShard;
@@ -45,8 +44,8 @@ use crate::http::forward::ForwardState;
 use crate::http::jwt::JwtManager;
 use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
-    BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
-    forget_if_same, live_entry, sweep_expired,
+    BarrierEntry, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier, forget_if_same,
+    live_entry, sweep_expired,
 };
 
 /// Response header carrying the current VSR view number. Stamped by
@@ -210,6 +209,25 @@ impl HttpInner {
         }
     }
 
+    /// Highest metadata op the credential behind `key` has been told
+    /// committed, or `0` when this node has told it none - an unknown key, so
+    /// no write of its ever ran here and there is nothing to read back.
+    ///
+    /// Deliberately NOT expiry-filtered, unlike [`Self::live_session`]: the
+    /// number is a consistency floor, not a capability, and the request that
+    /// consults it has already re-verified the bearer. Dropping the floor
+    /// because a swept-but-still-present entry aged out would reintroduce the
+    /// stale read for exactly the callers still holding a committed reply.
+    ///
+    /// Confines the shared `RefCell` borrow to this call, so it can never span
+    /// the read gate's `.await`.
+    pub(in crate::http) fn metadata_watermark(&self, key: &str) -> u64 {
+        self.sessions
+            .borrow()
+            .get(key)
+            .map_or(0, |session| session.metadata_watermark.get())
+    }
+
     /// Clone the live (non-expired) entry for `key`, if present. Confines the
     /// shared `RefCell` borrow to this call so it can never span an `.await`.
     fn live_session(&self, key: &str, now_secs: u64) -> Option<Rc<HttpSession>> {
@@ -341,17 +359,19 @@ impl HttpInner {
             );
             return Err(AuthError::SessionIdTaken);
         }
-        Ok(Rc::new(HttpSession {
+        // `bound.epoch` also seeds the read gate's watermark: a HEALTHY BACKUP
+        // forwards the register to the primary (see
+        // `submit_register_local_or_forward`), so this node can hand back an
+        // epoch its own commit walk has not reached, and the caller's first
+        // read would otherwise be served from state older than the register it
+        // is holding.
+        Ok(Rc::new(HttpSession::registered(
             key,
             client_id,
-            session: bound.epoch,
+            bound.epoch,
             user_id,
             expiry,
-            gate: Mutex::new(FIRST_REQUEST_ID),
-            data_request: Cell::new(FIRST_REQUEST_ID),
-            registry_token: Cell::new(None),
-            in_flight_writes: Cell::new(0),
-        }))
+        )))
     }
 
     /// Drop the session table entry for `session`, but only if it is still the

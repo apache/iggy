@@ -471,6 +471,14 @@ pub(in crate::http) enum ReadError {
     /// [`service_unavailable`] body, retryable once the cluster re-commits the
     /// suffix.
     RecoveryIncomplete,
+    /// A metadata read waited out its budget with this node's applied frontier
+    /// still below the op the caller was told committed. Fail-closed on the
+    /// same retryable 503 as [`Self::RecoveryIncomplete`]: the two are the same
+    /// hazard (serving state the caller already saw replaced) reached from
+    /// different directions, and 503 is what the binary transports' equivalent
+    /// refusal (`TransientNotCommitted`) already renders as, so an SDK that
+    /// speaks both sees one answer. Never a 2xx with stale state.
+    MetadataFrontierUnreached,
     /// A partition read (poll / consumer-offset) got no reply from the owning
     /// shard within the mesh budget. 504 like a produce timeout: the outcome is
     /// unknown (the abandoned read may still be running), so the caller retries.
@@ -486,7 +494,7 @@ impl IntoResponse for ReadError {
             Self::NotFound => CustomError::ResourceNotFound.into_response(),
             Self::NotPrimary => not_primary_response(),
             Self::RedirectToPrimary(location) => primary_redirect_response(&location),
-            Self::RecoveryIncomplete => service_unavailable(),
+            Self::RecoveryIncomplete | Self::MetadataFrontierUnreached => service_unavailable(),
             Self::Timeout => gateway_timeout_response(
                 "partition_read_timeout",
                 "the partition owner did not answer the read in time; retry",
@@ -814,6 +822,22 @@ mod tests {
         assert_eq!(
             recovery.headers().get(RETRY_AFTER),
             not_primary.headers().get(RETRY_AFTER)
+        );
+    }
+
+    // An unreached read frontier must never degrade into a 2xx carrying stale
+    // state, and must not read as terminal either: it is the same retryable 503
+    // the recovery barrier's expiry renders, so an SDK retries rather than
+    // surfacing the read as failed.
+    #[test]
+    fn metadata_frontier_unreached_renders_the_same_retryable_503_as_the_barrier() {
+        let frontier = ReadError::MetadataFrontierUnreached.into_response();
+        let recovery = ReadError::RecoveryIncomplete.into_response();
+        assert_eq!(frontier.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(frontier.status(), recovery.status());
+        assert_eq!(
+            frontier.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from(RETRY_AFTER_SECONDS))
         );
     }
 }

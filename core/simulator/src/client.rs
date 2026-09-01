@@ -16,7 +16,7 @@
 // under the License.
 
 use bytes::{Bytes, BytesMut};
-use iggy_binary_protocol::codes::POLL_MESSAGES_CODE;
+use iggy_binary_protocol::codes::{GET_STREAM_CODE, POLL_MESSAGES_CODE};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -36,7 +36,8 @@ use iggy_binary_protocol::requests::personal_access_tokens::{
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
-    CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
+    CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, PurgeStreamRequest,
+    UpdateStreamRequest,
 };
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, PurgeTopicRequest, UpdateTopicRequest,
@@ -646,6 +647,48 @@ impl SimClient {
         buffer.extend_from_slice(&body);
         Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
             .expect("poll request must be valid")
+    }
+
+    /// Build a `GET_STREAM` read for `name`.
+    ///
+    /// A `NonReplicated` metadata read, so it is answered from whichever
+    /// replica's state machine the request lands on rather than routed to the
+    /// primary: the command code sits in the header's `reserved` prefix, the
+    /// group is the metadata sentinel, and the request id echoes the counter
+    /// without advancing it (matching [`Self::poll_messages`] and the SDK).
+    /// Requires a bound session, since the read is auth-gated.
+    ///
+    /// # Panics
+    /// Panics if `name` is not a valid wire name or the request buffer is
+    /// invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn get_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
+        let body = GetStreamRequest {
+            stream_id: WireIdentifier::named(name).expect("stream name must be valid"),
+        }
+        .to_bytes();
+
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let total_size = header_size + body.len();
+        let mut reserved = [0u8; 52];
+        reserved[..4].copy_from_slice(&GET_STREAM_CODE.to_le_bytes());
+        let header = RoutedRequestHeader {
+            command: iggy_binary_protocol::Command::Request,
+            operation: Operation::NonReplicated,
+            size: total_size as u32,
+            client: self.client_id,
+            session: self.session_id(),
+            request: self.request_counter.get(),
+            reserved,
+            group: METADATA_GROUP,
+            ..Default::default()
+        };
+
+        let mut buffer = Vec::with_capacity(total_size);
+        buffer.extend_from_slice(bytemuck::bytes_of(&header));
+        buffer.extend_from_slice(&body);
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("get stream request must be valid")
     }
 
     /// Store offset with explicit `AckLevel`. `NoAck` takes the primary's

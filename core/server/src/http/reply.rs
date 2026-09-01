@@ -156,7 +156,7 @@ pub(in crate::http) fn committed_payload(
 /// entered the pipeline and is safe to re-issue anywhere, while
 /// `TransientNotCommitted` may still commit and only a same-session same-id
 /// replay is safe.
-pub(in crate::http) fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
+pub fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
     match result_code(reply_body(reply)) {
         Some(code) if code == IggyError::TransientNotCommitted.as_code() => {
             Some(IggyError::TransientNotCommitted)

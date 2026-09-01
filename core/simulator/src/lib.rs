@@ -57,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 /// Poll budget per [`DetExecutor::run_until_stalled`]. Pumps are event-driven, so
 /// hitting it means a task is spin-waking: a bug, panicked with the seed.
@@ -395,6 +395,10 @@ impl Simulator {
             // reader-mode mirror from it and reads committed metadata through the
             // shared handle. Built in index order, so shard 0's bundle exists first.
             let mut metadata_bundle: Option<replica::SimMetadataBundle> = None;
+            // One applied-metadata frontier per REPLICA, shared by its shards,
+            // as the server bootstrap mints one per process. Volatile: a restart
+            // below builds a fresh cell, matching a rebooted node.
+            let metadata_applied_frontier = Arc::new(AtomicU64::new(0));
             for shard_idx in 0..shards_per_replica {
                 let inbox = inboxes[usize::from(shard_idx)]
                     .take()
@@ -429,6 +433,7 @@ impl Simulator {
                     (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
                     // Fresh boot: `init_partition` seeds later, before any workload.
                     &[],
+                    Arc::clone(&metadata_applied_frontier),
                 );
                 if shard_idx == 0 {
                     metadata_bundle = Some(
@@ -1066,6 +1071,7 @@ impl Simulator {
     /// # Panics
     /// If the replica is not crashed, or its shard count does not fit `u16`; mesh
     /// construction caps it.
+    #[allow(clippy::too_many_lines)]
     pub fn replica_restart(&mut self, replica_index: u8) {
         assert!(
             self.crashed.contains(&replica_index),
@@ -1120,6 +1126,7 @@ impl Simulator {
         let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
         let mut pump_tasks = Vec::with_capacity(usize::from(shards_per_replica));
         let mut metadata_bundle: Option<replica::SimMetadataBundle> = None;
+        let metadata_applied_frontier = Arc::new(AtomicU64::new(0));
         for shard_idx in 0..shards_per_replica {
             let inbox = inboxes[usize::from(shard_idx)]
                 .take()
@@ -1151,6 +1158,7 @@ impl Simulator {
                 metadata_incarnation,
                 (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
                 &seed_namespaces,
+                Arc::clone(&metadata_applied_frontier),
             );
             if shard_idx == 0 {
                 metadata_bundle =
@@ -4822,5 +4830,371 @@ mod repair_frontier_tests {
             "the rejoined replica never repaired an op below its own head, so \
              nothing about the repair frontier was exercised"
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_read_frontier_tests {
+    //! A client that committed a metadata write and then re-homed onto a
+    //! lagging backup must never be served the pre-write state.
+    //!
+    //! The window is not peer shards on one node: a committed reply is only
+    //! produced after `gated_apply` published, and every shard reads the same
+    //! left-right buffers. It is a node whose commit walk trails the epoch the
+    //! client already holds. Register forwarding is the supported way to get
+    //! there -- a backup verifies the credentials itself, forwards only the
+    //! consensus proposal, and binds the committed session while its own
+    //! `commit_journal` is still behind that op (see `server::auth`).
+    //!
+    //! Blocking replication INTO one backup while the quorum commits without
+    //! it produces the lag deterministically, and the login still completes
+    //! because `ForwardRegister` / `ForwardRegisterResult` are left flowing.
+    //!
+    //! One shard per replica for the end-to-end read, deliberately. The harness
+    //! homes each inbound client packet on a seeded-random shard while every
+    //! shard owns its own `SessionManager`, so on a multi-shard replica a bound
+    //! session cannot reliably receive its own follow-up requests -- and the lag
+    //! under test is the node's, not a shard's.
+    //!
+    //! The second test is the other half: peer shards are not the WINDOW, but
+    //! they are how a peer-homed read learns the node's position at all, and
+    //! sharing one frontier cell across a replica's shards is what makes that
+    //! work. It runs multi-shard and drives the cell directly, so it needs no
+    //! session and dodges the homing problem entirely.
+
+    use super::*;
+    use crate::client::SimClient;
+    use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
+    use iggy_binary_protocol::{Command, RoutedRequestHeader, WireDecode};
+
+    /// Replica 0 leads the metadata plane at view 0, so this one is a backup
+    /// for the whole run and is the node the client re-homes onto.
+    const LAGGING: u8 = 1;
+
+    /// Steps the read is given while the backup is still cut off. A server that
+    /// answers a metadata read from an unconverged state answers within a
+    /// couple of these; the gate must hold the read past all of them.
+    ///
+    /// Well under the gate's own poll budget, so expiry cannot masquerade as a
+    /// held read.
+    const STALE_WINDOW_STEPS: u32 = 50;
+
+    /// Steps allowed for repair to reach the backup and the held read to answer
+    /// once replication is restored.
+    const CONVERGE_STEPS: u32 = 2_000;
+
+    /// The frames that would let the backup learn the committed writes. Journal
+    /// repair and `StartView` adoption are cut with the same knife as live
+    /// replication: any one of them left open closes the lag this exercises.
+    const REPLICATION_FRAMES: [Command; 5] = [
+        Command::Prepare,
+        Command::Commit,
+        Command::RepairPrepare,
+        Command::RepairDone,
+        Command::StartView,
+    ];
+
+    /// A stream deleted before the client re-homed must not come back on the
+    /// backup that has not applied the delete yet.
+    #[test]
+    fn given_backup_behind_the_client_epoch_when_reading_a_deleted_stream_should_not_serve_it() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let stream_name = "read-your-writes";
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x1A7E_0F31,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replica_count),
+            1,
+            std::iter::once(client_id),
+            network_opts,
+        );
+
+        let client = SimClient::new(client_id);
+        sim.shell_login(&client);
+
+        // The create lands on every replica: the backup has to HOLD the stream
+        // for the read below to be able to serve a stale one.
+        let created = commit_write(&mut sim, client_id, 0, client.create_stream(stream_name));
+        step_until_applied(&mut sim, LAGGING, created);
+
+        // Cut replication into the backup, so the delete commits on the quorum
+        // formed by the primary and the remaining replica and never reaches it.
+        // Journal repair and `StartView` adoption go with it: any one of them
+        // left open closes the lag this exercises.
+        set_replication(&mut sim, LAGGING, false);
+
+        let deleted = commit_write(&mut sim, client_id, 0, client.delete_stream(stream_name));
+        assert!(
+            deleted > created,
+            "the delete must commit above the create, else the read below cannot \
+             distinguish the two states"
+        );
+
+        // Re-home the same client onto the backup. The login is forwarded, so
+        // the session it binds IS a committed op above the delete while the
+        // backup's own applied frontier is still below it.
+        sim.shell_login_via(&client, LAGGING);
+        assert!(
+            sim.network.delivered_any(Command::ForwardRegister),
+            "no ForwardRegister crossed the wire: the backup answered the login \
+             itself, so the client never re-homed"
+        );
+        let lagging_commit = metadata_commit(&sim, usize::from(LAGGING));
+        assert!(
+            (created..deleted).contains(&lagging_commit),
+            "the backup applied up to op {lagging_commit}, outside the window \
+             [{created}, {deleted}) this test needs: it must hold the create and \
+             miss the delete"
+        );
+        assert_eq!(
+            read_stream_name_on(&sim, LAGGING, stream_name),
+            Some(stream_name.to_string()),
+            "the backup no longer holds the deleted stream, so a read cannot \
+             serve a stale one and the assertions below prove nothing"
+        );
+
+        let read = client.get_stream(stream_name);
+        let request_id = read.header().request;
+        sim.submit_request(client_id, LAGGING, read.into_generic());
+
+        // Phase 1: still cut off. Any answer here is served from state that
+        // predates the delete the client already saw committed.
+        let mut early = None;
+        for _ in 0..STALE_WINDOW_STEPS {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                early = Some(reply);
+                break;
+            }
+        }
+        if let Some(reply) = early {
+            panic!(
+                "the backup answered a metadata read while its applied frontier \
+                 ({}) was below the client's committed epoch ({deleted}): status={}, \
+                 stream={:?}",
+                metadata_commit(&sim, usize::from(LAGGING)),
+                reply.header().status,
+                read_stream_name(&reply),
+            );
+        }
+
+        // Phase 2: restore replication. The held read must answer from the
+        // converged state, which no longer holds the stream.
+        set_replication(&mut sim, LAGGING, true);
+        for _ in 0..CONVERGE_STEPS {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                assert_eq!(
+                    reply.header().status,
+                    0,
+                    "the read failed instead of answering once the backup converged"
+                );
+                assert_eq!(
+                    read_stream_name(&reply),
+                    None,
+                    "the converged backup still serves the deleted stream"
+                );
+                return;
+            }
+        }
+        panic!(
+            "no answer to the held metadata read within {CONVERGE_STEPS} steps of \
+             restored replication; backup applied frontier {}, client epoch {deleted}",
+            metadata_commit(&sim, usize::from(LAGGING)),
+        );
+    }
+
+    /// Shards per replica for the sharing test below. Two is the whole
+    /// population that matters: shard 0 and one peer.
+    const SHARED_FRONTIER_SHARDS: u16 = 2;
+
+    /// Advance applied to shard 0, chosen above whatever recovery seeded so a
+    /// peer reading the pre-advance value cannot pass by accident.
+    const SHARED_FRONTIER_ADVANCE: u64 = 7;
+
+    /// A peer shard owns no metadata consensus, so `commit_min` -- the number
+    /// the pre-existing read barrier gates on -- does not exist there at all.
+    /// The applied frontier is the only thing its read gate can consult, and it
+    /// arrives by being ONE cell per process rather than one per shard.
+    ///
+    /// Nothing else in the system observes that. A private cell per shard still
+    /// compiles, still serves every read, and its only symptom is that each
+    /// metadata read homed on a peer shard parks for the whole deadline and
+    /// then fails retryable -- a latency cliff behind a warning, not an error.
+    /// So the invariant is asserted directly rather than through a request: a
+    /// peer must see an advance it did not make.
+    #[test]
+    fn given_a_peer_shard_when_shard_zero_advances_the_frontier_should_observe_it() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x5EED_5A11,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let sim = Simulator::with_shards(
+            usize::from(replica_count),
+            SHARED_FRONTIER_SHARDS,
+            std::iter::once(1u128),
+            network_opts,
+        );
+
+        let shards = &sim.replicas[0].shards;
+        assert_eq!(
+            shards.len(),
+            usize::from(SHARED_FRONTIER_SHARDS),
+            "the replica did not build the peer shard this test needs"
+        );
+        for (shard_idx, shard) in shards.iter().enumerate().skip(1) {
+            assert!(
+                shard.plane.metadata().consensus.is_none(),
+                "shard {shard_idx} owns consensus, so it is not the peer whose \
+                 only source for the frontier is shard 0's cell"
+            );
+        }
+
+        let advanced = shards[0].plane.metadata().applied_frontier() + SHARED_FRONTIER_ADVANCE;
+        shards[0]
+            .plane
+            .metadata()
+            .advance_applied_frontier(advanced);
+
+        for (shard_idx, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard.plane.metadata().applied_frontier(),
+                advanced,
+                "shard {shard_idx} did not observe shard 0's advance: the \
+                 applied-frontier cell is per shard, not per process, so every \
+                 metadata read homed here parks until its deadline"
+            );
+        }
+    }
+
+    /// Open or close every replication route from the primary into `replica`.
+    fn set_replication(sim: &mut Simulator, replica: u8, open: bool) {
+        for frame in REPLICATION_FRAMES {
+            let filter = sim
+                .network
+                .link_filter_mut(ProcessId::Replica(0), ProcessId::Replica(replica));
+            if open {
+                filter.insert(frame);
+            } else {
+                filter.remove(frame);
+            }
+        }
+    }
+
+    /// Step until `replica` has applied `op`, so the state the read sees is the
+    /// one this test set up rather than whatever the last reply happened to
+    /// leave behind.
+    fn step_until_applied(sim: &mut Simulator, replica: u8, op: u64) {
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if metadata_commit(sim, usize::from(replica)) >= op {
+                return;
+            }
+            sim.step();
+        }
+        panic!(
+            "replica {replica} never applied op {op} (stuck at {})",
+            metadata_commit(sim, usize::from(replica)),
+        );
+    }
+
+    /// Read `name` straight out of a replica's committed metadata, bypassing
+    /// the read path under test.
+    fn read_stream_name_on(sim: &Simulator, replica: u8, name: &str) -> Option<String> {
+        sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| {
+                inner
+                    .items
+                    .iter()
+                    .find(|(_, stream)| &*stream.name == name)
+                    .map(|(_, stream)| stream.name.to_string())
+            })
+    }
+
+    /// Submit one replicated metadata write to `target`, step until its reply
+    /// lands, and return the op it committed at.
+    fn commit_write(
+        sim: &mut Simulator,
+        client_id: u128,
+        target: u8,
+        request: Message<RoutedRequestHeader>,
+    ) -> u64 {
+        let request_id = request.header().request;
+        sim.submit_request(client_id, target, request.into_generic());
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                assert_eq!(
+                    reply.header().status,
+                    0,
+                    "metadata write {request_id} was refused"
+                );
+                assert!(
+                    !setup_reply_is_transient(&reply),
+                    "metadata write {request_id} was rejected in transit, so it never \
+                     committed and cannot anchor the read below"
+                );
+                return reply.header().commit;
+            }
+        }
+        panic!("metadata write {request_id} never committed");
+    }
+
+    /// The stream name a `GetStream` reply carries, or `None` for the
+    /// empty-body not-found answer.
+    fn read_stream_name(reply: &Message<ReplyHeader>) -> Option<String> {
+        let body = reply
+            .as_slice()
+            .get(size_of::<ReplyHeader>()..reply.header().size as usize)
+            .unwrap_or_default();
+        if body.is_empty() {
+            return None;
+        }
+        let (response, _) = GetStreamResponse::decode(body)
+            .expect("a non-empty GetStream reply must decode as GetStreamResponse");
+        Some(response.stream.name.as_str().to_string())
+    }
+
+    /// Committed metadata op on a replica's shard 0.
+    fn metadata_commit(sim: &Simulator, replica_idx: usize) -> u64 {
+        sim.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus")
+            .commit_min()
     }
 }

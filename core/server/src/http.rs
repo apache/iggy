@@ -31,7 +31,7 @@ mod jwks;
 mod jwt;
 mod metrics;
 mod reads;
-mod reply;
+pub mod reply;
 mod session;
 mod state;
 mod submit;

@@ -802,6 +802,10 @@ pub fn bootstrap(
     // Shared metadata-group view: written by shard 0's publisher task, read by
     // every shard's cluster-metadata roster so leader marking works off-shard.
     let metadata_view = Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN));
+    // Shared applied-metadata frontier: shard 0's commit path advances it, every
+    // shard's read gate reads it. Minted here, before any shard exists, because
+    // a shard holding a private cell would gate reads on a number nothing moves.
+    let metadata_applied_frontier = Arc::new(AtomicU64::new(0));
     // Every shard's metric handles, minted before the threads spawn: each
     // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
     // the whole set (counters are Arc-backed, so cross-thread reads see the
@@ -842,6 +846,7 @@ pub fn bootstrap(
         };
 
         let metadata_view_for_shard = Arc::clone(&metadata_view);
+        let applied_frontier_for_shard = Arc::clone(&metadata_applied_frontier);
         let shard_metrics_for_shard = shard_metrics_all.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
@@ -860,6 +865,7 @@ pub fn bootstrap(
                     barrier_for_shard,
                     owner_table_for_shard,
                     metadata_view_for_shard,
+                    applied_frontier_for_shard,
                     shard_metrics_for_shard,
                 )
             }) {
@@ -925,6 +931,7 @@ fn run_shard_thread(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     metadata_view: Arc<AtomicU64>,
+    metadata_applied_frontier: Arc<AtomicU64>,
     shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
@@ -968,6 +975,7 @@ fn run_shard_thread(
             barrier,
             owner_table,
             metadata_view,
+            metadata_applied_frontier,
             shard_metrics_all,
         ))
         .await
@@ -997,6 +1005,7 @@ async fn shard_main(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     metadata_view: Arc<AtomicU64>,
+    metadata_applied_frontier: Arc<AtomicU64>,
     shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
@@ -1148,7 +1157,15 @@ async fn shard_main(
         superblock_for_metadata,
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
-    );
+    )
+    .with_applied_frontier(metadata_applied_frontier);
+    // Recovery already replayed the committed WAL prefix into the state
+    // machine, so the frontier resumes where the commit walk will rather than
+    // at zero -- otherwise every read on a rebooted node parks until its
+    // deadline. No-op on peer shards, which share shard 0's cell.
+    if let Some(consensus) = metadata.consensus.as_ref() {
+        metadata.advance_applied_frontier(consensus.commit_min());
+    }
     // Size the VSR client table before listeners bind and any client registers.
     // Must precede the recovered-table install below: the setter rebuilds the
     // table from scratch, so running it afterwards would drop every resumed

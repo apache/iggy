@@ -79,6 +79,18 @@ pub struct Connection {
     pub last_heartbeat: Instant,
     /// Recorded at login; `None` until the connection authenticates.
     pub sdk: Option<ClientSdkInfo>,
+    /// Highest metadata op this connection has been told committed.
+    ///
+    /// Seeded from the bound session (the register's own commit op, which
+    /// floors everything the client committed before it re-homed) and raised by
+    /// every committed reply relayed on this connection. The read gate holds a
+    /// local read until the node's applied frontier covers it, so a client
+    /// cannot be served state older than a write it already saw acked.
+    ///
+    /// Per-connection rather than per-client: the number only has to cover what
+    /// THIS socket was told, and a client that reconnects re-seeds from the
+    /// session it binds.
+    pub metadata_watermark: u64,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -141,6 +153,7 @@ impl SessionManager {
                 state: ConnectionState::Connected,
                 last_heartbeat: Instant::now(),
                 sdk: None,
+                metadata_watermark: 0,
             });
     }
 
@@ -268,13 +281,45 @@ impl SessionManager {
         }
 
         // Now mutate the target connection.
-        self.connections.get_mut(&connection_id).unwrap().state = ConnectionState::Bound {
+        let bound = self
+            .connections
+            .get_mut(&connection_id)
+            .expect("bind_session: connection validated above, single-threaded");
+        bound.state = ConnectionState::Bound {
             user_id,
             client_id,
             session,
         };
+        // The session IS the register's commit op, so it floors every metadata
+        // op this client saw committed before it re-homed here. Without the
+        // seed a re-homed connection reads at zero and the gate admits the
+        // pre-write state its own last write already replaced.
+        bound.metadata_watermark = bound.metadata_watermark.max(session);
         self.client_to_connection.insert(client_id, connection_id);
         Ok(())
+    }
+
+    /// Raise this connection's metadata watermark to `commit`. Monotone, so a
+    /// late or out-of-order reply cannot lower it; no-op for an unknown
+    /// connection.
+    ///
+    /// Only committed replies belong here. A pre-consensus rejection stamps the
+    /// primary's `commit_max`, which is an op this connection was never
+    /// promised and, on a backup-homed connection, one it would then wait for.
+    pub fn record_metadata_watermark(&mut self, connection_id: u128, commit: u64) {
+        if let Some(conn) = self.connections.get_mut(&connection_id) {
+            conn.metadata_watermark = conn.metadata_watermark.max(commit);
+        }
+    }
+
+    /// The highest metadata op this connection was told committed, or `0` when
+    /// it was told none (an unknown or still-unbound connection, which has no
+    /// write to read back).
+    #[must_use]
+    pub fn metadata_watermark(&self, connection_id: u128) -> u64 {
+        self.connections
+            .get(&connection_id)
+            .map_or(0, |conn| conn.metadata_watermark)
     }
 
     /// Look up the consensus session for a connection.
@@ -602,5 +647,47 @@ mod tests {
             None,
             "a second disconnect has nothing left to release"
         );
+    }
+
+    /// The bind seed is what makes a re-homed connection safe: the register's
+    /// commit op floors every metadata op the client committed elsewhere, so
+    /// the read gate cannot admit the pre-write state on a node that has not
+    /// caught up. A recorder that could lower the mark would undo it.
+    #[test]
+    fn given_a_bound_connection_when_replies_arrive_should_keep_the_watermark_monotone() {
+        let mut mgr = SessionManager::new();
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5200), ClientTransportKind::Tcp);
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            0,
+            "an unbound connection was promised nothing"
+        );
+
+        mgr.login(conn, 3).unwrap();
+        mgr.bind_session(conn, 100, 42).unwrap();
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            42,
+            "the bound session is the register's commit op and floors the mark"
+        );
+
+        mgr.record_metadata_watermark(conn, 50);
+        mgr.record_metadata_watermark(conn, 7);
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            50,
+            "a lower commit must not lower the mark"
+        );
+    }
+
+    /// An unknown connection is not an error: the disconnect callback can win
+    /// the race against a reply relay, and a gate reading `0` then serves the
+    /// read instead of parking a socket that is already gone.
+    #[test]
+    fn given_an_unknown_connection_when_recording_a_watermark_should_be_inert() {
+        let mut mgr = SessionManager::new();
+        mgr.record_metadata_watermark(9, 5);
+        assert_eq!(mgr.metadata_watermark(9), 0);
     }
 }

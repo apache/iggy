@@ -37,6 +37,7 @@ use crate::dispatch::authz::{
     authorize_default_read, authorize_partition_op, authorize_partition_read, authorize_uid,
     send_deny_reply, send_non_replicated_deny, send_unbound_deny_reply,
 };
+use crate::http::reply::transient_code;
 use crate::login_register::LoginRegisterError;
 use crate::pat::maybe_rewrite_pat_request;
 use crate::responses::{
@@ -60,10 +61,10 @@ use consensus::{
 };
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE,
-    LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE, POLL_MESSAGES_CODE,
-    SYNC_CONSUMER_GROUP_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE,
+    GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
+    GET_STATS_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
+    POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
@@ -92,8 +93,9 @@ use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, Command, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
     ForwardLogoutOutcome, ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
     ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, KIND_CONSUMER_GROUP,
-    MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, RequestHeader, RoutedRequestHeader,
-    WireDecode, WireEncode, WireIdentifier, WireOptions, is_protocol_compatible,
+    MAX_PARTITIONS_PER_REQUEST, Operation, ProtocolVersion, ReplyHeader, RequestHeader,
+    RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireOptions,
+    is_protocol_compatible,
 };
 use iggy_common::{
     IggyByteSize, IggyError, MaxTopicSize, PollingStrategy, SnapshotCompression,
@@ -1356,6 +1358,13 @@ async fn handle_client_request<B, MJ, S, SB>(
     // shard 0 can't route by the consensus client id (no home-shard bits).
     match submit_client_request_on_owner(shard, request).await {
         Some(reply) => {
+            // Recorded before the reply reaches the socket, so a read the client
+            // sends the instant it decodes this frame already sees the mark.
+            if let Some(commit) = committed_reply_commit(&reply) {
+                sessions
+                    .borrow_mut()
+                    .record_metadata_watermark(transport_client_id, commit);
+            }
             // The raw PAT token never enters consensus (it is non-deterministic
             // and secret), so the committed reply body is empty. Substitute the
             // raw-token response here, on the minting client's home shard, using
@@ -1607,6 +1616,107 @@ pub(crate) async fn dispatch_partition_request<B, MJ, S, SB>(
     shard.dispatch(request.into_generic());
 }
 
+/// Poll cadence while a read waits for this node's applied metadata frontier.
+/// The consensus tick, so a node one commit behind resumes on the next commit
+/// broadcast rather than a tick later.
+const READ_FRONTIER_POLL: Duration = Duration::from_millis(10);
+
+/// Polls a held read is given before it fails retryable: 3s at the cadence
+/// above. Long enough to ride out a view change, far below the SDK's 30s
+/// request budget, inside which it replays the same id on the same connection.
+const READ_FRONTIER_MAX_POLLS: u32 = 300;
+
+/// Hold a local metadata read until this node has applied everything the
+/// connection was told committed.
+///
+/// A committed reply hands the client an op number; answering its next read
+/// from a state machine below that op contradicts the frame the client is
+/// holding. The lag is real on a node whose commit walk trails the client's
+/// epoch -- a backup that forwarded the client's register binds a committed
+/// session while its own `commit_journal` is still behind it (see
+/// [`crate::auth`]) -- so the gate is not about peer shards: every shard of a
+/// node reads one shared frontier and gates identically.
+///
+/// Fast path is a single `Acquire` load and no await, which is what keeps an
+/// uncontended read shared-nothing. Otherwise it polls the bus timer (virtual
+/// under the simulator, wall clock in production) from inside the
+/// per-connection drain task, so only this connection waits. Expiry fails
+/// loud and retryable rather than serving state the client already saw
+/// replaced; the log carries both numbers so a frontier that stopped moving
+/// is visible instead of showing up as a hang.
+#[allow(clippy::future_not_send)]
+async fn await_metadata_read_frontier<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    transport_client_id: u128,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    // Own statement: the borrow has to be released before the poll below, which
+    // awaits on the same task the session manager's mutators run on.
+    let watermark = sessions.borrow().metadata_watermark(transport_client_id);
+    let metadata = shard.plane.metadata();
+    if metadata.applied_frontier() >= watermark {
+        return Ok(());
+    }
+    for _ in 0..READ_FRONTIER_MAX_POLLS {
+        shard.bus.sleep(READ_FRONTIER_POLL).await;
+        if metadata.applied_frontier() >= watermark {
+            return Ok(());
+        }
+    }
+    warn!(
+        frontier = metadata.applied_frontier(),
+        watermark, "metadata read frontier unreached past deadline; failing the read retryable"
+    );
+    Err(IggyError::TransientNotCommitted)
+}
+
+/// The commit position a COMMITTED metadata reply carries, or `None` when the
+/// frame promises the client nothing.
+///
+/// Three frames arrive on this path and only one is a promise. An eviction is
+/// an `EvictionHeader` whose bytes would cast cleanly as a reply, so the
+/// command is checked first (same guard as [`build_raw_pat_reply`]). A
+/// pre-consensus rejection stamps the primary's `commit_max`, an op the caller
+/// was never told committed and, on a backup-homed caller, one the read gate
+/// would then wait for. A committed business rejection (duplicate name, bad
+/// expiry) DID commit and counts.
+///
+/// Shared with the HTTP write path, which grades the same three frames off the
+/// same submit entry point (`submit_client_request_on_owner`); one classifier
+/// is what keeps the two planes' watermarks meaning the same thing.
+pub(crate) fn committed_reply_commit(reply: &Message<GenericHeader>) -> Option<u64> {
+    if reply.header().command != Command::Reply || transient_code(reply).is_some() {
+        return None;
+    }
+    let header = reply.as_slice().get(..size_of::<ReplyHeader>())?;
+    bytemuck::checked::try_from_bytes::<ReplyHeader>(header)
+        .ok()
+        .map(|header| header.commit)
+}
+
+/// Whether `code`'s answer comes from the metadata state machine, and so must
+/// not be served below the caller's watermark.
+///
+/// The two exclusions only look like metadata reads: `DescribeOptions` decodes
+/// a static catalog, and `GetClusterMetadata` answers from the configured
+/// roster plus the consensus view. Holding either buys no consistency, and the
+/// roster read is on the SDK's leader-discovery path, where the wait would be
+/// real.
+///
+/// Shared with the HTTP read path, which gates the identical set of command
+/// codes through `build_non_replicated_response`: two lists would drift, and a
+/// code dropped from one plane's list is a silent stale read on that plane.
+pub(crate) const fn read_needs_metadata_frontier(code: u32) -> bool {
+    !matches!(code, DESCRIBE_OPTIONS_CODE | GET_CLUSTER_METADATA_CODE)
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn handle_non_replicated_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -1655,6 +1765,13 @@ async fn handle_non_replicated_request<B, MJ, S, SB>(
             handle_get_me(shard, sessions, transport_client_id, &request).await;
         }
         GET_PERSONAL_ACCESS_TOKENS_CODE => {
+            if let Err(error) =
+                await_metadata_read_frontier(shard, sessions, transport_client_id).await
+            {
+                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
             handle_get_personal_access_tokens(shard, sessions, transport_client_id, &request).await;
         }
         GET_CLIENTS_CODE => {
@@ -1739,6 +1856,14 @@ async fn handle_non_replicated_request<B, MJ, S, SB>(
             handle_sync_consumer_group(shard, transport_client_id, &request).await;
         }
         _ => {
+            if read_needs_metadata_frontier(code)
+                && let Err(error) =
+                    await_metadata_read_frontier(shard, sessions, transport_client_id).await
+            {
+                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
             let roster = sessions.borrow().cluster_roster();
             let client_ip = client_address.map(|address| address.ip());
             if client_ip.is_none() {

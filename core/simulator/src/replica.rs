@@ -39,6 +39,7 @@ use shard::shards_table::PapayaShardsTable;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 // TODO: Make configurable
 const CLUSTER_ID: u128 = 1;
@@ -156,6 +157,7 @@ pub fn new_shard(
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
     seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
+    applied_frontier: Arc<AtomicU64>,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
@@ -303,7 +305,8 @@ pub fn new_shard(
         superblock,
         mux,
         data_dir,
-    );
+    )
+    .with_applied_frontier(applied_frontier);
 
     // Both halves are load-bearing: the pairing keeps a later view-change superblock
     // write from regressing to `(0, 0)`, and the folded table is the floor the replayed
@@ -366,6 +369,12 @@ pub fn new_shard(
                 entry,
             );
         }
+    }
+    // Same seed the server bootstrap does after its own replay: the frontier
+    // resumes where the commit walk will, so a read on a rebuilt replica does
+    // not park until its deadline. No-op on peer shards, which share the cell.
+    if let Some(consensus) = metadata.consensus.as_ref() {
+        metadata.advance_applied_frontier(consensus.commit_min());
     }
     // Mint the peers' read-side bundle AFTER reconstruction so it reflects the
     // recovered state. Shard 0 only; peers pass it back in as `reader_bundle`.

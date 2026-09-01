@@ -66,6 +66,8 @@ use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
 
 fn freeze_client_reply(
@@ -769,6 +771,21 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// whole snapshot on shard 0's pump, and hands each requester its own
     /// multi-MB copy.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
+    /// Highest metadata op whose apply has been PUBLISHED on this node, shared
+    /// by every shard.
+    ///
+    /// `consensus.commit_min()` answers the same question but exists only on
+    /// shard 0, so a read served by a peer shard has no way to tell whether the
+    /// node caught up to an op its client already saw committed. One
+    /// process-wide atomic does, for one `Acquire` load on the read fast path.
+    ///
+    /// Written `Release` right after each apply's `publish()`, read `Acquire`;
+    /// observing `>= op` therefore happens-after that publish, so a following
+    /// left-right `enter()` is guaranteed to see the op. `fetch_max` rather
+    /// than `store` because three writers move it -- the commit loop, the
+    /// recovery seed, and a state-transfer install -- and only monotonicity
+    /// makes their order irrelevant.
+    applied_frontier: Arc<AtomicU64>,
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB>
@@ -808,11 +825,41 @@ where
             commit_notifier: RefCell::new(None),
             client_table_frontier: Cell::new(0),
             transfer_offer_cache: RefCell::new(None),
+            applied_frontier: Arc::new(AtomicU64::new(0)),
         }
     }
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
+    /// Share one process-wide applied frontier with every other shard.
+    ///
+    /// Consumed at construction rather than swapped in later: a shard that
+    /// served a read against its own private cell would gate on a number that
+    /// never moves. Shard 0 mints the cell in bootstrap, before any shard is
+    /// built, and hands each shard a clone.
+    #[must_use]
+    pub fn with_applied_frontier(mut self, applied_frontier: Arc<AtomicU64>) -> Self {
+        self.applied_frontier = applied_frontier;
+        self
+    }
+
+    /// Highest metadata op this NODE has applied and published, readable on
+    /// every shard. Reads gate on it so a client cannot be served state older
+    /// than a write it already saw acked.
+    #[must_use]
+    pub fn applied_frontier(&self) -> u64 {
+        self.applied_frontier.load(Ordering::Acquire)
+    }
+
+    /// Publish `op` as applied. Monotone, so a lower value is a no-op.
+    ///
+    /// Must run AFTER the apply's `publish()` and, on the commit path, in the
+    /// same await-free region as `advance_commit_min`: a reader that sees the
+    /// frontier must be guaranteed to see the op's effects.
+    pub fn advance_applied_frontier(&self, op: u64) {
+        self.applied_frontier.fetch_max(op, Ordering::Release);
+    }
+
     /// Slot capacity of the LIVE client table, i.e. the largest transferred
     /// table this replica can absorb.
     ///
@@ -1839,6 +1886,7 @@ where
             if snapshot_seq > consensus.sequencer().current_sequence() {
                 consensus.sequencer().set_sequence(snapshot_seq);
             }
+            self.advance_applied_frontier(snapshot_seq);
         }
         // Before the superblock write, so the durable record carries the frontier
         // this transfer just established rather than the pre-transfer one.
@@ -2827,6 +2875,10 @@ where
                 reply
             };
             consensus.advance_commit_min(prepare_header.op);
+            // Paired with the counter bump, and before the reply leaves: a
+            // client that holds this reply may re-home onto any shard and read,
+            // and the read gate admits it only once the frontier covers the op.
+            self.advance_applied_frontier(prepare_header.op);
             emit_sim_event(SimEventKind::OperationCommitted, &event);
 
             // Fire subscriber BEFORE wire send. Slot already updated
@@ -3574,6 +3626,7 @@ where
                 prepare,
             );
             consensus.advance_commit_min(op);
+            self.advance_applied_frontier(op);
             debug!("commit_journal: committed op={op}");
         }
     }
@@ -5671,6 +5724,12 @@ mod tests {
         assert!(
             journal_handle.header(1).is_some() && journal_handle.header(2).is_some(),
             "ops at or below the floor stay for the walk and tail repair"
+        );
+        assert_eq!(
+            md.applied_frontier(),
+            SNAPSHOT_SEQ,
+            "the snapshot IS ops up to its sequence applied, so the read gate has \
+             to admit reads at the floor the install jumped to"
         );
     }
 

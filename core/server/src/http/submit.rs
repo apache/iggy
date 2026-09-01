@@ -35,8 +35,8 @@ use tracing::warn;
 
 use crate::bootstrap::ServerShard;
 use crate::dispatch::{
-    dispatch_partition_request, resolve_delete_segments_truncate, submit_client_request_on_owner,
-    submit_logout_on_owner,
+    committed_reply_commit, dispatch_partition_request, resolve_delete_segments_truncate,
+    submit_client_request_on_owner, submit_logout_on_owner,
 };
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
@@ -115,6 +115,16 @@ pub(in crate::http) async fn submit_committed(
     compio::runtime::spawn(async move {
         let result =
             submit_gated(&shard, &task_session, operation, max_tokens_per_user, &body).await;
+        // Recorded here rather than after the await below, for the same reason
+        // the submit is detached: a caller that disconnected mid-write still
+        // committed the op, and its next request on this credential must not be
+        // served state older than what committed. Ordered before the wake, so a
+        // read issued the instant the response lands already sees the mark.
+        if let Ok((_, reply, _)) = &result
+            && let Some(commit) = committed_reply_commit(reply)
+        {
+            task_session.record_metadata_watermark(commit);
+        }
         // A failed send means the handler died mid-await; the submit itself
         // already completed, which is the invariant that matters.
         let _ = result_slot.send(result);
