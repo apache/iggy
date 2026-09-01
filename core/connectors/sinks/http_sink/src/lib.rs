@@ -408,6 +408,8 @@ impl HttpSink {
                 serde_json::to_value(encoded)
                     .map_err(|e| Error::Serialization(format!("EncodedPayload: {}", e)))
             }
+            Payload::Bson(value) => serde_json::to_value(value)
+                .map_err(|error| Error::Serialization(format!("BSON payload: {error}"))),
         }
     }
 
@@ -1519,6 +1521,26 @@ mod tests {
         let result = sink.payload_to_json(payload).unwrap();
         assert_eq!(result["name"], "test");
         assert_eq!(result["count"], 42);
+    }
+
+    #[test]
+    fn given_bson_payload_should_convert_to_json_document() {
+        let sink = given_sink_with_defaults();
+        let payload = Payload::Bson(bson::doc! {
+            "name": "iggy",
+            "count": 42,
+            "nested": {
+                "active": true
+            }
+        });
+
+        let result = sink
+            .payload_to_json(payload)
+            .expect("BSON document should convert to JSON");
+
+        assert_eq!(result["name"], "iggy");
+        assert_eq!(result["count"], 42);
+        assert_eq!(result["nested"]["active"], true);
     }
 
     #[test]

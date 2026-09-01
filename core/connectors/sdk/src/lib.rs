@@ -18,12 +18,14 @@
 use async_trait::async_trait;
 use base64::{self, Engine};
 use decoders::{
-    avro::AvroStreamDecoder, flatbuffer::FlatBufferStreamDecoder, json::JsonStreamDecoder,
-    proto::ProtoStreamDecoder, raw::RawStreamDecoder, text::TextStreamDecoder,
+    avro::AvroStreamDecoder, bson::BsonStreamDecoder, flatbuffer::FlatBufferStreamDecoder,
+    json::JsonStreamDecoder, proto::ProtoStreamDecoder, raw::RawStreamDecoder,
+    text::TextStreamDecoder,
 };
 use encoders::{
-    avro::AvroStreamEncoder, flatbuffer::FlatBufferStreamEncoder, json::JsonStreamEncoder,
-    proto::ProtoStreamEncoder, raw::RawStreamEncoder, text::TextStreamEncoder,
+    avro::AvroStreamEncoder, bson::BsonStreamEncoder, flatbuffer::FlatBufferStreamEncoder,
+    json::JsonStreamEncoder, proto::ProtoStreamEncoder, raw::RawStreamEncoder,
+    text::TextStreamEncoder,
 };
 use iggy::prelude::{HeaderKey, HeaderValue};
 use prost::Message;
@@ -154,6 +156,7 @@ pub enum Payload {
     Proto(String),
     FlatBuffer(Vec<u8>),
     Avro(Vec<u8>),
+    Bson(bson::Document),
 }
 
 impl Payload {
@@ -168,6 +171,7 @@ impl Payload {
             Payload::Proto(text) => Ok(text.into_bytes()),
             Payload::FlatBuffer(value) => Ok(value),
             Payload::Avro(value) => Ok(value),
+            Payload::Bson(document) => document.to_vec().map_err(|_| Error::InvalidBsonPayload),
         }
     }
 
@@ -197,6 +201,7 @@ impl Payload {
             Payload::Proto(text) => Ok(text.as_bytes().to_vec()),
             Payload::FlatBuffer(value) => Ok(value.clone()),
             Payload::Avro(value) => Ok(value.clone()),
+            Payload::Bson(document) => document.to_vec().map_err(|_| Error::InvalidBsonPayload),
         }
     }
 }
@@ -214,6 +219,11 @@ impl std::fmt::Display for Payload {
             Payload::Proto(text) => write!(f, "Proto({text})"),
             Payload::FlatBuffer(value) => write!(f, "FlatBuffer({} bytes)", value.len()),
             Payload::Avro(value) => write!(f, "Avro({} bytes)", value.len()),
+            Payload::Bson(value) => write!(
+                f,
+                "Bson({})",
+                serde_json::to_string_pretty(value).unwrap_or_default()
+            ),
         }
     }
 }
@@ -237,6 +247,8 @@ pub enum Schema {
     FlatBuffer,
     #[strum(to_string = "avro")]
     Avro,
+    #[strum(to_string = "bson")]
+    Bson,
 }
 
 impl Schema {
@@ -261,6 +273,7 @@ impl Schema {
             },
             Schema::FlatBuffer => Ok(Payload::FlatBuffer(value)),
             Schema::Avro => Ok(Payload::Avro(value)),
+            Schema::Bson => BsonStreamDecoder.decode(value),
         }
     }
 
@@ -272,6 +285,7 @@ impl Schema {
             Schema::Proto => Arc::new(ProtoStreamDecoder::default()),
             Schema::FlatBuffer => Arc::new(FlatBufferStreamDecoder::default()),
             Schema::Avro => Arc::new(AvroStreamDecoder::default()),
+            Schema::Bson => Arc::new(BsonStreamDecoder),
         }
     }
 
@@ -283,6 +297,7 @@ impl Schema {
             Schema::Proto => Arc::new(ProtoStreamEncoder::default()),
             Schema::FlatBuffer => Arc::new(FlatBufferStreamEncoder::default()),
             Schema::Avro => Arc::new(AvroStreamEncoder::default()),
+            Schema::Bson => Arc::new(BsonStreamEncoder),
         }
     }
 }
@@ -406,6 +421,8 @@ pub enum Error {
     InvalidPayloadType,
     #[error("Invalid JSON payload.")]
     InvalidJsonPayload,
+    #[error("Invalid BSON payload.")]
+    InvalidBsonPayload,
     #[error("Invalid text payload.")]
     InvalidTextPayload,
     #[error("Cannot decode schema {0}")]
