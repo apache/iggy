@@ -181,10 +181,10 @@ impl ShardMessageWithPermit {
 ///   once it reaches [`batch_length`](BackgroundConfig::batch_length) queued sends or
 ///   [`batch_size`](BackgroundConfig::batch_size) reported bytes. Either threshold is disabled when
 ///   configured as `0`.
-/// - **The periodic linger deadline.** At each
-///   [`linger_time`](BackgroundConfig::linger_time) deadline, a non-empty buffer is flushed whether
-///   or not either batching threshold was reached. This bounds how long a non-empty buffer waits for
-///   another send before a flush check.
+/// - **The linger deadline.** Armed when a send enters an empty buffer and due
+///   [`linger_time`](BackgroundConfig::linger_time) later, it flushes the buffer whether or not
+///   either batching threshold was reached. An empty buffer arms nothing, so an idle shard does not
+///   wake up.
 /// - **The stop broadcast** sent by the dispatcher on shutdown. Marks the shard closed
 ///   so later sends fail with [`IggyError::ProducerClosed`], drains what is still
 ///   queued, flushes once, then ends the loop. A send that races the stop signal can be queued
@@ -215,14 +215,18 @@ impl Shard {
         let handle = tokio::spawn(async move {
             let mut buffer = Vec::new();
             let mut buffer_bytes = 0;
-            let mut last_flush = tokio::time::Instant::now();
+            // Armed by the first send buffered after a flush and polled only while the buffer is
+            // non-empty, so an idle shard never wakes up and a zero linger cannot spin.
+            let mut linger_deadline = tokio::time::Instant::now();
 
             loop {
-                let deadline = last_flush + config.linger_time.get_duration();
                 tokio::select! {
                     maybe_msg = rx.recv_async() => {
                         match maybe_msg {
                             Ok(msg) => {
+                                if buffer.is_empty() {
+                                    linger_deadline = tokio::time::Instant::now() + config.linger_time.get_duration();
+                                }
                                 buffer_bytes += msg.size_bytes as usize;
                                 buffer.push(msg);
                                 debug!(
@@ -249,18 +253,13 @@ impl Shard {
                                         new_buffer_bytes = buffer_bytes,
                                         "Buffer flushed"
                                     );
-
-                                    last_flush = tokio::time::Instant::now();
                                 }
                             }
                             Err(_) => break,
                         }
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        if !buffer.is_empty() {
-                            Self::flush_buffer(&core, &slots_permit, &mut buffer, &mut buffer_bytes, &err_sender).await;
-                        }
-                        last_flush = tokio::time::Instant::now();
+                    _ = tokio::time::sleep_until(linger_deadline), if !buffer.is_empty() => {
+                        Self::flush_buffer(&core, &slots_permit, &mut buffer, &mut buffer_bytes, &err_sender).await;
                     }
                     _ = stop_rx.recv() => {
                         closed_clone.store(true, Ordering::Release);
@@ -699,6 +698,63 @@ mod tests {
         shard.send(wrapped).await.unwrap();
 
         sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn test_shard_flushes_at_once_with_zero_linger() {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let sends_seen_by_mock = sends.clone();
+        let mut mock = MockProducerCoreBackend::new();
+        mock.expect_send_internal().returning(move |_, _, _, _| {
+            sends_seen_by_mock.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(no_confirmations()) })
+        });
+
+        let config = Arc::new(
+            BackgroundConfig::builder()
+                .batch_length(10)
+                .batch_size(10_000)
+                .linger_time(IggyDuration::from(0))
+                .build(),
+        );
+        let permit_bytes = Arc::new(Semaphore::new(10_000));
+        let slots_permit = Arc::new(Semaphore::new(100));
+
+        let (stop_tx, stop_rx) = broadcast::channel(1);
+        let shard = Shard::new(
+            Arc::new(mock),
+            config,
+            slots_permit,
+            flume::unbounded().0,
+            stop_rx,
+        );
+
+        let message = ShardMessage {
+            stream: dummy_identifier(),
+            topic: dummy_identifier(),
+            messages: vec![dummy_message(1)],
+            partitioning: None,
+        };
+        let wrapped = ShardMessageWithPermit::new(
+            message,
+            Some(permit_bytes.clone().acquire_many_owned(1).await.unwrap()),
+        );
+        shard.send(wrapped).await.unwrap();
+
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "a zero linger must flush without waiting for a batching threshold"
+        );
+
+        stop_tx.send(()).unwrap();
+        shard.handle.await.unwrap();
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            1,
+            "the stop flush must find nothing left"
+        );
     }
 
     #[tokio::test]

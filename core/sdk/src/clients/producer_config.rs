@@ -61,7 +61,7 @@ pub enum BackpressureMode {
 /// | [`sharding`](Self::sharding) | [`OrderedSharding`] | which worker a batch is queued on |
 /// | [`batch_size`](Self::batch_size) | 1 MiB | flush once a worker holds this many bytes |
 /// | [`batch_length`](Self::batch_length) | 1000 | flush once a worker holds this many queued sends |
-/// | [`linger_time`](Self::linger_time) | 1 ms | maximum time until the next periodic flush check |
+/// | [`linger_time`](Self::linger_time) | 1 ms | how long a worker holds a non-empty buffer before flushing it |
 /// | [`max_buffer_size`](Self::max_buffer_size) | 32 MiB | bytes the whole producer may hold |
 /// | [`failure_mode`](Self::failure_mode) | [`BackpressureMode::Block`] | what a send does when that budget is full |
 /// | [`max_in_flight`](Self::max_in_flight) | 1 | requests being written at once |
@@ -78,8 +78,7 @@ pub enum BackpressureMode {
 ///
 /// `0` disables the [`batch_size`](Self::batch_size) and
 /// [`batch_length`](Self::batch_length) flush thresholds. A zero
-/// [`linger_time`](Self::linger_time) keeps the flush deadline always due, so each worker task spins
-/// and burns a core. Keep it above zero. A zero
+/// [`linger_time`](Self::linger_time) flushes as soon as the worker picks up a send. A zero
 /// [`max_buffer_size`](Self::max_buffer_size) is treated as unbounded. A zero
 /// [`max_in_flight`](Self::max_in_flight) uses `Semaphore::MAX_PERMITS`, and a zero
 /// [`num_shards`](Self::num_shards) is read as one worker.
@@ -128,14 +127,12 @@ pub struct BackgroundConfig {
     /// [`Shard`]: crate::clients::producer_sharding::Shard
     #[builder(default = 1)]
     pub num_shards: usize,
-    /// Upper bound on how long a worker holds a non-empty buffer before the next flush check.
+    /// Upper bound on how long a worker holds a non-empty buffer before flushing it.
     ///
-    /// The deadline runs from the previous flush check, including checks made while the buffer is
-    /// empty.
+    /// The window starts when a send enters an empty buffer, so an idle worker does not wake up.
     /// A worker flushes as soon as any of `linger_time`, [`batch_length`](Self::batch_length) or
     /// [`batch_size`](Self::batch_size) is reached. Lowering it reduces the time the write is delayed
-    /// at the price of smaller writes. `0` makes the worker spin, see
-    /// [Zero values](BackgroundConfig#zero-values).
+    /// at the price of smaller writes. `0` flushes as soon as the worker picks up a send.
     ///
     /// Note that [`IggyDuration::from`] reads a plain number as **microseconds**, so the default of
     /// `1000` is 1 ms.

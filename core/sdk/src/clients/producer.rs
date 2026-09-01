@@ -592,9 +592,9 @@ unsafe impl Sync for IggyProducer {}
 /// then, but [`send()`](Self::send) reports no write result and returns no confirmations. The
 /// dispatcher runs [`BackgroundConfig::num_shards`] workers, each buffering the batches routed to it
 /// and flushing them when one of three limits is hit: [`BackgroundConfig::batch_length`] queued
-/// sends, [`BackgroundConfig::batch_size`] bytes, or the next
-/// [`BackgroundConfig::linger_time`] deadline. Adjacent buffered sends that share a stream, topic,
-/// and partitioning are merged into one request.
+/// sends, [`BackgroundConfig::batch_size`] bytes, or [`BackgroundConfig::linger_time`] since the
+/// first of them was buffered. Adjacent buffered sends that share a stream, topic, and partitioning
+/// are merged into one request.
 ///
 /// The sharding strategy decides how background dispatch affects message order:
 /// - [`BackgroundConfig::sharding`] routes a batch to a worker. The default [`OrderedSharding`] picks

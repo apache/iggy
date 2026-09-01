@@ -17,10 +17,12 @@
 
 use crate::clients::producer::ProducerCoreBackend;
 use crate::clients::producer_config::{BackgroundConfig, BackpressureMode};
-use crate::clients::producer_error_callback::ErrorCtx;
+use crate::clients::producer_error_callback::{ErrorCallback, ErrorCtx};
 use crate::clients::producer_sharding::{Shard, ShardMessage, ShardMessageWithPermit};
 use futures::FutureExt;
 use iggy_common::{Identifier, IggyByteSize, IggyError, IggyMessage, Partitioning, Sizeable};
+use std::any::Any;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Semaphore, broadcast};
@@ -275,10 +277,7 @@ impl ProducerDispatcher {
 
         let handle = tokio::spawn(async move {
             while let Ok(ctx) = err_rx.recv_async().await {
-                if let Err(panic) = std::panic::AssertUnwindSafe(err_callback.call(ctx))
-                    .catch_unwind()
-                    .await
-                {
+                if let Err(panic) = call_error_callback(&**err_callback, ctx).await {
                     tracing::error!("error_callback panicked: {:?}", panic);
                 }
             }
@@ -552,6 +551,16 @@ impl ProducerDispatcher {
     }
 }
 
+/// Catches a panic in `call()` itself as well as in the future it returns, so one misbehaving
+/// callback cannot end the error task and silently drop every later failure.
+async fn call_error_callback(
+    callback: &(dyn ErrorCallback + Send + Sync),
+    ctx: ErrorCtx,
+) -> Result<(), Box<dyn Any + Send>> {
+    let future = std::panic::catch_unwind(AssertUnwindSafe(|| callback.call(ctx)))?;
+    AssertUnwindSafe(future).catch_unwind().await
+}
+
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
@@ -562,7 +571,6 @@ mod tests {
     use tokio::time::sleep;
 
     use crate::clients::producer::{MockProducerCoreBackend, no_confirmations};
-    use crate::clients::producer_error_callback::ErrorCallback;
     use crate::clients::producer_sharding::Sharding;
 
     use super::*;
@@ -888,5 +896,66 @@ mod tests {
 
         assert_eq!(error_called.load(Ordering::SeqCst), 1);
         assert_eq!(last_batch_len.load(Ordering::SeqCst), 1);
+    }
+
+    /// Panics inside `call()` itself, before any future exists, on the first invocation only.
+    #[derive(Debug)]
+    struct PanicOnceErrorCallback {
+        called: Arc<AtomicUsize>,
+    }
+
+    impl ErrorCallback for PanicOnceErrorCallback {
+        fn call(&self, _ctx: ErrorCtx) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            if self.called.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("first failure panics before returning a future");
+            }
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn test_error_task_survives_panic_in_error_callback_call() {
+        let mut mock = MockProducerCoreBackend::new();
+        mock.expect_send_internal().returning(|_, _, _, _| {
+            Box::pin(async {
+                Err(IggyError::ProducerSendFailed {
+                    cause: Box::new(IggyError::Error),
+                    failed: Arc::new(vec![dummy_message(10)]),
+                    committed: Arc::new(Vec::new()),
+                    stream_name: "1".to_string(),
+                    topic_name: "1".to_string(),
+                })
+            })
+        });
+
+        let called = Arc::new(AtomicUsize::new(0));
+        let config = BackgroundConfig::builder()
+            .num_shards(1)
+            .error_callback(Arc::new(Box::new(PanicOnceErrorCallback {
+                called: called.clone(),
+            })))
+            .build();
+        let dispatcher = ProducerDispatcher::new(Arc::new(mock), config);
+
+        // Distinct topics keep the two sends from merging into one request, whichever branch of
+        // the worker ends up flushing them.
+        for topic_id in 1..=2 {
+            dispatcher
+                .dispatch(
+                    vec![dummy_message(10)],
+                    dummy_identifier(),
+                    Arc::new(Identifier::numeric(topic_id).unwrap()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        dispatcher.shutdown().await;
+
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            2,
+            "the failure after the panicking one must still reach the callback"
+        );
     }
 }

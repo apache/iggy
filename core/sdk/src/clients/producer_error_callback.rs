@@ -96,9 +96,8 @@ pub struct ErrorCtx {
 /// - It runs on its own task rather than on a shard worker, so awaiting it does not stall batching.
 ///   Calls are serialized. One failure is handled at a time, and the unbounded error channel can
 ///   grow while a callback is slow.
-/// - A panic inside the returned future is caught and logged, and the next failure is still
-///   delivered. A panic in [`call()`](Self::call) itself, before the future is returned, ends the
-///   error task, and every later failure is dropped silently.
+/// - A panic inside it, whether in [`call()`](Self::call) itself or in the returned future, is
+///   caught and logged, and the next failure is still delivered.
 /// - `Send + Sync + Debug + 'static` is required because the dispatcher's task owns the callback for
 ///   the producer's lifetime and [`BackgroundConfig`] implements [`Debug`].
 ///
