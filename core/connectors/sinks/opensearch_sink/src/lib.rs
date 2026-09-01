@@ -119,7 +119,6 @@ impl std::fmt::Debug for OpenSearchSink {
     }
 }
 
-#[derive(Debug)]
 struct ResolvedOpenSearchSinkConfig {
     url: String,
     index: String,
@@ -137,6 +136,32 @@ struct ResolvedOpenSearchSinkConfig {
     max_retry_delay: Duration,
     max_open_retries: u32,
     verbose_logging: bool,
+}
+
+// `derive(Debug)` would print `url` verbatim; `open()` isn't what redacts it.
+impl std::fmt::Debug for ResolvedOpenSearchSinkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedOpenSearchSinkConfig")
+            .field("url", &redact_url_credentials(&self.url))
+            .field("index", &self.index)
+            .field("username", &self.username)
+            .field("password", &self.password)
+            .field(
+                "create_index_if_not_exists",
+                &self.create_index_if_not_exists,
+            )
+            .field("index_mapping", &self.index_mapping)
+            .field("include_metadata", &self.include_metadata)
+            .field("batch_size", &self.batch_size)
+            .field("timeout", &self.timeout)
+            .field("refresh", &self.refresh)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
+            .field("max_retry_delay", &self.max_retry_delay)
+            .field("max_open_retries", &self.max_open_retries)
+            .field("verbose_logging", &self.verbose_logging)
+            .finish()
+    }
 }
 
 impl From<OpenSearchSinkConfig> for ResolvedOpenSearchSinkConfig {
@@ -952,9 +977,7 @@ fn parse_bulk_response(
         });
     }
 
-    // The top-level flag lets a clean batch skip failure classification, but
-    // each item still needs a sanity check: `errors: false` is only trustworthy
-    // if every item actually carries an operation result with a 2xx status.
+    // `errors: false` is only trustworthy if every item has a 2xx result.
     if !response
         .get("errors")
         .and_then(Value::as_bool)
@@ -1245,6 +1268,23 @@ fn normalize_url(raw: &str) -> Result<String, Error> {
         );
     }
     Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Textual, not `Url::parse`-based: a schemeless URL has no `//` authority for
+/// `Url` to strip credentials from, so it would leave them untouched.
+fn redact_url_credentials(raw: &str) -> String {
+    let (scheme, rest) = raw.split_once("://").unwrap_or(("", raw));
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let (authority, remainder) = rest.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+
+    if scheme.is_empty() {
+        format!("{authority}{remainder}")
+    } else {
+        format!("{scheme}://{authority}{remainder}")
+    }
 }
 
 /// The stripping below is unreachable from `open()`'s only call site: `normalize_url`
@@ -2901,6 +2941,42 @@ mod tests {
         let rendered = format!("{sink:?}");
 
         assert!(!rendered.contains("hunter2"), "{rendered}");
+    }
+
+    // Regression test: Debug can run before open() ever validates the URL.
+    #[test]
+    fn given_debug_formatted_sink_with_url_credentials_should_redact_them() {
+        let mut config = base_config();
+        config.url = "https://admin:hunter2@opensearch.example.com:9200".to_string();
+
+        let rendered = format!("{:?}", sink_with_config(config));
+
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("opensearch.example.com"), "{rendered}");
+    }
+
+    #[test]
+    fn given_url_without_credentials_should_be_unchanged() {
+        assert_eq!(
+            redact_url_credentials("https://opensearch.example.com:9200/path"),
+            "https://opensearch.example.com:9200/path"
+        );
+    }
+
+    #[test]
+    fn given_url_with_credentials_should_redact_them() {
+        assert_eq!(
+            redact_url_credentials("https://admin:hunter2@opensearch.example.com:9200/path"),
+            "https://opensearch.example.com:9200/path"
+        );
+    }
+
+    #[test]
+    fn given_schemeless_url_with_credentials_should_redact_them() {
+        assert_eq!(
+            redact_url_credentials("admin:hunter2@opensearch.example.com:9200"),
+            "opensearch.example.com:9200"
+        );
     }
 
     #[test]
