@@ -232,6 +232,23 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 * `IGGY_TCP_ADDRESS=0.0.0.0:8090`
 * `IGGY_QUIC_ADDRESS=0.0.0.0:8080`
 
+A wildcard bind says which interfaces accept connections, not where clients
+reach the pod, so the server also needs the address to publish in cluster
+metadata. Server builds that carry the setting refuse to start without it;
+older ones, including the `0.7.0` this chart pins by default, have no such
+refusal and log the variable as unknown and ignored. Either way the chart
+sets `IGGY_NODE_ADVERTISED_ADDRESS` to the in-cluster Service DNS name;
+override it with `server.advertisedAddress` when clients arrive through a
+LoadBalancer or an Ingress.
+
+Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` yourself works too:
+the chart then leaves its own default out, so the variable is declared once.
+Give that entry a non-empty value; an empty one suppresses the chart default
+and reaches the server as unset, so the render fails instead.
+Setting it in `server.env` and in `server.advertisedAddress` at the same time
+is refused at render time rather than resolved silently, since only the
+`server.env` entry would take effect.
+
 ## Accessing the Server
 
 ### Port Forward

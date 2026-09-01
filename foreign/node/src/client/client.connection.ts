@@ -17,8 +17,9 @@
 
 import { EventEmitter } from 'node:events';
 import type { Socket } from 'node:net';
-import { createConnection } from 'node:net';
+import { createConnection, isIP } from 'node:net';
 import { connect as TLSConnect } from 'node:tls';
+import { readFileSync } from 'node:fs';
 import type { ClientConfig, TlsOption, TcpOption, ReconnectOption } from "./client.type.js"
 import { debug } from './client.debug.js';
 import { DEFAULT_MAX_RESPONSE_FRAME_SIZE } from './client.config.js';
@@ -47,8 +48,26 @@ const createTcpSocket = (options: TcpOption): Socket => {
  * @returns TLS socket
  */
 const createTlsSocket = ({ port, ...options }: TlsOption): Socket => {
-  const socket = TLSConnect(port, options);
-  return socket;
+  const { caFile, ...tlsOptions } = options;
+  if (caFile !== undefined)
+    tlsOptions.ca = readCaCertificate(caFile);
+  // An SNI-routing terminator needs a server name in the ClientHello;
+  // IP literals are never sent as SNI, matching the Rust SDK's fallback.
+  if (typeof tlsOptions.host === 'string' &&
+      tlsOptions.servername === undefined &&
+      isIP(tlsOptions.host) === 0)
+    tlsOptions.servername = tlsOptions.host;
+  return TLSConnect(port, tlsOptions);
+};
+
+// A missing or unreadable CA file is a configuration error rather than a
+// transient I/O failure, hence the TypeError instead of the raw ENOENT.
+const readCaCertificate = (caFile: string): Buffer => {
+  try {
+    return readFileSync(caFile);
+  } catch {
+    throw new TypeError(`cannot read tls_ca_file "${caFile}"`);
+  }
 };
 
 /**
@@ -96,14 +115,16 @@ const DefaultReconnectOption: ReconnectOption = {
 /**
  * Waits before a reconnection attempt.
  *
- * @param timer - Delay in milliseconds before recreating
- * @returns Promise resolving after the delay
+ * The timer is unref'd: a queued command fails fast on 'disconnected', so
+ * the retry loop is background work that must not keep the process alive.
+ *
+ * @param interval - Delay in milliseconds before dialing again
  */
-function waitForReconnect(timer = 1000): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, timer);
+const waitForReconnect = (interval: number): Promise<void> =>
+  new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, interval);
+    (timeout as NodeJS.Timeout).unref();
   });
-}
 
 /** Socket error with optional error code */
 type SocketError = Error & { code?: string };
@@ -483,6 +504,35 @@ export class IggyConnection extends EventEmitter {
   }
 
   /**
+   * The roster endpoint after the one this connection is on, for a request
+   * the current node keeps refusing to admit. Metadata and partition
+   * consensus groups elect independently, so the metadata leader can hold a
+   * follower replica of the partition a request targets, and only walking
+   * the roster reaches that group's primary. `undefined` when the roster
+   * names nowhere else to go.
+   */
+  nextRosterEndpoint(visited: Set<string>): Endpoint | undefined {
+    const roster = this.rosterEndpoints;
+    if (roster.length === 0)
+      return undefined;
+    const index = roster.findIndex(
+      (endpoint) => this.isConnectedTo(endpoint.host, endpoint.port)
+    );
+    if (index >= 0)
+      visited.add(endpointKey(roster[index]));
+    const start = index < 0 ? 0 : (index + 1) % roster.length;
+    for (let offset = 0; offset < roster.length; offset += 1) {
+      const candidate = roster[(start + offset) % roster.length];
+      const key = endpointKey(candidate);
+      if (visited.has(key) || this.isConnectedTo(candidate.host, candidate.port))
+        continue;
+      visited.add(key);
+      return candidate;
+    }
+    return undefined;
+  }
+
+  /**
    * Endpoints a redial rotates through, likeliest first: where the client
    * currently is, the endpoint it was configured with, then the roster it
    * learned while connected. After a leader redirect the current endpoint may
@@ -616,3 +666,6 @@ const normalizeHost = (host?: string): string => {
     ? '127.0.0.1'
     : normalized;
 };
+
+export const endpointKey = (endpoint: Endpoint): string =>
+  `${normalizeHost(endpoint.host)}:${endpoint.port}`;

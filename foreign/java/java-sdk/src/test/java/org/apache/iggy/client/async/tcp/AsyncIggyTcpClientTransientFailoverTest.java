@@ -68,7 +68,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final int EVICTION_STALE_CLIENT = 13;
 
     @Test
-    void shouldRecheckLeaderAndReplayNotAcceptedMutation() throws Exception {
+    void shouldWalkRosterAndReplayNotAcceptedMutation() throws Exception {
         InetAddress loopback = InetAddress.getLoopbackAddress();
         try (ServerSocket oldLeaderSocket = new ServerSocket(0, 1, loopback);
                 ServerSocket newLeaderSocket = new ServerSocket(0, 1, loopback)) {
@@ -105,6 +105,77 @@ class AsyncIggyTcpClientTransientFailoverTest {
             }
             oldLeader.get(5, TimeUnit.SECONDS);
             newLeader.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldWalkPastTwoRefusingReplicasToThePartitionPrimary() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket metadataLeaderSocket = new ServerSocket(0, 1, loopback);
+                ServerSocket followerSocket = new ServerSocket(0, 1, loopback);
+                ServerSocket partitionPrimarySocket = new ServerSocket(0, 1, loopback)) {
+            int metadataLeaderPort = metadataLeaderSocket.getLocalPort();
+            int followerPort = followerSocket.getLocalPort();
+            int partitionPrimaryPort = partitionPrimarySocket.getLocalPort();
+            AtomicInteger accepted = new AtomicInteger();
+            CompletableFuture<Void> metadataLeader = serve(metadataLeaderSocket, request -> {
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED,
+                            threeNodeMetadata(metadataLeaderPort, followerPort, partitionPrimaryPort));
+                }
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.operation() == OPERATION_CREATE_STREAM) {
+                    return Response.error(OPERATION_CREATE_STREAM, TRANSIENT_NOT_ACCEPTED);
+                }
+                throw new IllegalStateException("Unexpected request to metadata leader: " + request);
+            });
+            CompletableFuture<Void> follower = serve(followerSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(2));
+                }
+                if (request.operation() == OPERATION_CREATE_STREAM) {
+                    return Response.error(OPERATION_CREATE_STREAM, TRANSIENT_NOT_ACCEPTED);
+                }
+                throw new IllegalStateException("Unexpected request to follower: " + request);
+            });
+            CompletableFuture<Void> partitionPrimary = serve(partitionPrimarySocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(3));
+                }
+                if (request.operation() == OPERATION_CREATE_STREAM) {
+                    accepted.incrementAndGet();
+                    ByteBuf body = Unpooled.buffer(Integer.BYTES);
+                    body.writeIntLE(0);
+                    return Response.success(OPERATION_CREATE_STREAM, body);
+                }
+                throw new IllegalStateException("Unexpected request to partition primary: " + request);
+            });
+
+            AsyncIggyTcpClient client = AsyncIggyTcpClient.builder()
+                    .host(loopback.getHostAddress())
+                    .port(metadataLeaderPort)
+                    .credentials("iggy", "iggy")
+                    .requestTimeout(Duration.ofSeconds(15))
+                    .build();
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+
+                byte[] response = client.sendBinaryRequest(CREATE_STREAM_CODE, new byte[0])
+                        .get(15, TimeUnit.SECONDS);
+
+                assertThat(response).isEmpty();
+                assertThat(client.getConnectionInfo().port()).isEqualTo(partitionPrimaryPort);
+                assertThat(accepted).hasValue(1);
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            metadataLeader.get(5, TimeUnit.SECONDS);
+            follower.get(5, TimeUnit.SECONDS);
+            partitionPrimary.get(5, TimeUnit.SECONDS);
         }
     }
 
@@ -386,23 +457,38 @@ class AsyncIggyTcpClientTransientFailoverTest {
         return serve(server, 1, handler);
     }
 
+    /**
+     * Runs blocking socket I/O on one dedicated daemon thread per mock node.
+     * The common fork-join pool has only cores minus one workers on small CI
+     * runners, so three blocking nodes can starve the client continuations the
+     * test is waiting for when the full suite runs concurrently.
+     */
     private static CompletableFuture<Void> serve(ServerSocket server, int connectionCount, RequestHandler handler) {
-        return CompletableFuture.runAsync(() -> {
-            try {
-                for (int connection = 0; connection < connectionCount; connection++) {
-                    try (Socket socket = server.accept()) {
-                        InputStream input = socket.getInputStream();
-                        OutputStream output = socket.getOutputStream();
-                        Request request;
-                        while ((request = readRequest(input)) != null) {
-                            writeResponse(output, request, handler.handle(request));
+        CompletableFuture<Void> serving = new CompletableFuture<>();
+        Thread serverThread = new Thread(
+                () -> {
+                    try {
+                        for (int connection = 0; connection < connectionCount; connection++) {
+                            try (Socket socket = server.accept()) {
+                                InputStream input = socket.getInputStream();
+                                OutputStream output = socket.getOutputStream();
+                                Request request;
+                                while ((request = readRequest(input)) != null) {
+                                    writeResponse(output, request, handler.handle(request));
+                                }
+                            }
                         }
+                        serving.complete(null);
+                    } catch (IOException error) {
+                        serving.completeExceptionally(new IllegalStateException("Mock VSR server failed", error));
+                    } catch (RuntimeException error) {
+                        serving.completeExceptionally(error);
                     }
-                }
-            } catch (IOException error) {
-                throw new IllegalStateException("Mock VSR server failed", error);
-            }
-        });
+                },
+                "transient-failover-server-" + server.getLocalPort());
+        serverThread.setDaemon(true);
+        serverThread.start();
+        return serving;
     }
 
     private static Request readRequest(InputStream input) throws IOException {
@@ -478,6 +564,16 @@ class AsyncIggyTcpClientTransientFailoverTest {
         body.writeIntLE(2);
         writeNode(body, "old-node", oldLeaderPort, oldLeaderPort == leaderPort);
         writeNode(body, "new-node", newLeaderPort, newLeaderPort == leaderPort);
+        return body;
+    }
+
+    private static ByteBuf threeNodeMetadata(int firstPort, int secondPort, int thirdPort) {
+        ByteBuf body = Unpooled.buffer();
+        writeString(body, "test-cluster");
+        body.writeIntLE(3);
+        writeNode(body, "metadata-leader", firstPort, true);
+        writeNode(body, "follower", secondPort, false);
+        writeNode(body, "partition-primary", thirdPort, false);
         return body;
     }
 

@@ -19,7 +19,7 @@
 //! `UserNotFound` (fabricated user). `UsernameAlreadyExists` not targeted.
 
 use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -44,7 +44,7 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::UserNotFound];
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
