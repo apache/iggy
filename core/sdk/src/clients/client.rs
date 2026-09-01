@@ -155,10 +155,9 @@ const SESSION_CONTROL_CODES: [u32; 5] = [
 ///             .build(),
 ///     )
 ///     .partitioning(Partitioning::balanced())
-///     .send_retries(Some(3), Some(IggyDuration::ONE_SECOND))
+///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
 ///     .create_topic_if_not_exists(
 ///         3,
-///         None,
 ///         IggyExpiry::ServerDefault,
 ///         MaxTopicSize::ServerDefault,
 ///     )
@@ -738,10 +737,9 @@ impl IggyClient {
     /// let producer = client
     ///     .producer("stream_name", "topic_name")? // returns IggyProducerBuilder from IggyClient
     ///     .partitioning(Partitioning::balanced())
-    ///     .send_retries(Some(3), Some(IggyDuration::ONE_SECOND))
+    ///     .send_retries(Some(3), Some(NonZeroIggyDuration::ONE_SECOND))
     ///     .create_topic_if_not_exists(
     ///         3,
-    ///         None,
     ///         IggyExpiry::ServerDefault,
     ///         MaxTopicSize::ServerDefault,
     ///     )
