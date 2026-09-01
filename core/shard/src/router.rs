@@ -357,6 +357,14 @@ where
                     match frame {
                         Ok(frame) => {
                             if self.accept_frame_for_self(&frame) {
+                                // No-op in production, where staging happens only
+                                // under `apply_reconcile_ops` and every arm drains
+                                // before selecting again. The simulator's
+                                // `init_partition` stages from outside the pump,
+                                // and this frame can be a LATER op of the same
+                                // partition: deliver the staged prefix first, or
+                                // the plane's gap check drops the frame.
+                                self.drain_redispatched_frames().await;
                                 self.process_frame(frame).await;
                                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
                                 // Tail drain catches reconcile ops whose marker was dropped.
@@ -418,6 +426,11 @@ where
                     self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
                         .await;
                     self.apply_reconcile_ops();
+                    // A dropped ReconcileApply marker can leave an InsertOwned
+                    // staged until this shutdown drain. Deliver the parked prefix
+                    // before taking another inbox frame, exactly as the live pump
+                    // does, or a later prepare can reach the gap check first.
+                    self.drain_redispatched_frames().await;
                     if let Some(fault) = self.first_partition_commit_fault() {
                         fatal = Some(fault);
                         break;

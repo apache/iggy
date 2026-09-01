@@ -902,12 +902,13 @@ impl Simulator {
         }
     }
 
-    /// Lost-wake tripwire. At executor quiescence every live pump must have drained
-    /// its inbox; a non-empty one on a non-crashed replica means a frame reached the
-    /// channel without waking the target pump. Every pump holds a standing
+    /// Lost-work tripwire. At executor quiescence every live pump must have drained
+    /// both inbox lanes and its parked-frame redispatch queue. A non-empty lane on a
+    /// non-crashed replica means a frame reached the channel without waking the
+    /// target pump. A non-empty redispatch queue means a materialisation staged work
+    /// without the pump's priority drain completing. Every pump holds a standing
     /// `CONSENSUS_TICK_INTERVAL` timer, so the next `advance_time` would re-poll and
-    /// silently drain it, masking the exact wake-loss class this harness exists to
-    /// catch. Trip here instead.
+    /// silently drain either case, masking the fault. Trip here instead.
     ///
     /// Incomplete by construction: only catches a lost wakeup while the un-woken
     /// frame is still queued at quiescence, since a later frame that does wake the
@@ -939,6 +940,16 @@ impl Simulator {
                     0,
                     "lost wakeup: replica {replica_id} shard {} reply lane holds \
                      {pending_replies} frame(s) at quiescence (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
+                let pending_redispatch = shard.redispatched_frame_count();
+                assert_eq!(
+                    pending_redispatch,
+                    0,
+                    "lost redispatch: replica {replica_id} shard {} priority queue holds \
+                     {pending_redispatch} frame(s) at quiescence (seed {:#x}, schedule hash {:#x})",
                     shard.id,
                     self.seed,
                     self.executor.schedule_hash(),
@@ -2432,11 +2443,10 @@ mod tests {
     /// behind VSR retransmit.
     ///
     /// `park_overflow` is deliberately NOT excluded. The reconciler is unwired here
-    /// (`init_partition` mirrors its outcome directly), so nothing drains the park
-    /// buffer and a parked frame is never re-dispatched or swept. Non-zero
-    /// `park_overflow` therefore means frames shed for a namespace that will never
-    /// materialise, which is the fault class this catches rather than the
-    /// back-pressure it would be in production.
+    /// and only an explicit `init_partition` mirrors its materialisation outcome and
+    /// drains the matching park entry. Non-zero `park_overflow` therefore means
+    /// frames shed for a namespace the driver never materialised, which is the fault
+    /// class this catches rather than the back-pressure it would be in production.
     ///
     /// Same reason the park buffer must be empty at quiescence: a frame still parked
     /// has no drainer, so it is neither delivered nor answered.
@@ -2451,7 +2461,8 @@ mod tests {
                 assert!(
                     shard.parked_namespaces().is_empty(),
                     "replica {replica_idx} shard {shard_idx} left partition frames parked; the \
-                     simulator wires no reconciler, so nothing will deliver or answer them"
+                     simulator wires no reconciler, so only explicit materialisation can \
+                     deliver or answer them"
                 );
             }
         }
@@ -2537,6 +2548,171 @@ mod tests {
             schedule_a, schedule_b,
             "shell schedule diverged at same seed"
         );
+    }
+
+    fn successful_send_reply_count(replies: &[Message<ReplyHeader>]) -> usize {
+        replies
+            .iter()
+            .filter(|reply| {
+                reply.header().operation == iggy_binary_protocol::Operation::SendMessages
+                    && reply.header().status == 0
+            })
+            .count()
+    }
+
+    fn retained_prepare(
+        sim: &Simulator,
+        replica: usize,
+        namespace: IggyNamespace,
+        op: u64,
+    ) -> Message<iggy_binary_protocol::PrepareHeader> {
+        let partitions = sim.replicas[replica]
+            .partition_shard(namespace)
+            .plane
+            .partitions();
+        let partition = partitions.get_by_ns(&namespace).expect("partition");
+        let stored = partition
+            .log
+            .journal()
+            .inner
+            .repair_entry(op)
+            .unwrap_or_else(|| panic!("replica {replica} retains prepare op {op} for repair"));
+        Message::<iggy_binary_protocol::PrepareHeader>::try_from(server_common::iobuf::Owned::<
+            { server_common::MESSAGE_ALIGN },
+        >::copy_from_slice(
+            stored.as_slice()
+        ))
+        .expect("journaled prepare remains a valid frame")
+    }
+
+    /// Leave one backup without the partition while the primary commits two
+    /// sends through the other backup. The lagging replica parks both replicated
+    /// prepares. A third prepare is withheld from it, then placed on its inbox
+    /// after simulator materialisation stages the parked prefix. Running the pump
+    /// without advancing its tick forces the inbox arm to drain the prefix first.
+    fn parked_prepare_redispatch_trace(seed: u64) -> (usize, Vec<PartitionOffsets>, u64) {
+        const CLIENT_ID: u128 = 1;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: 3,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(3, 1, std::iter::once(CLIENT_ID), network_opts);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.seed_stream_topic_partition(namespace);
+        let created_view = sim.partition_created_views[&namespace];
+
+        // Replica 0 is the view-0 primary. Replica 2 supplies quorum while
+        // replica 1 has committed metadata but no local partition yet.
+        materialise_partition(&sim.replicas[0], namespace, false, created_view);
+        materialise_partition(&sim.replicas[2], namespace, false, created_view);
+
+        let client = SimClient::new(CLIENT_ID);
+        sim.shell_login(&client);
+        for payload in [
+            Bytes::from_static(b"parked-redispatch-0"),
+            Bytes::from_static(b"parked-redispatch-1"),
+        ] {
+            let request = client.send_messages(namespace, std::slice::from_ref(&payload));
+            sim.submit_request(CLIENT_ID, 0, request.into_generic());
+        }
+
+        let lagging_shard = Rc::clone(&sim.replicas[1].shards[0]);
+        let mut successful_replies = 0usize;
+        let mut parked = 0usize;
+        for _ in 0..500 {
+            successful_replies += successful_send_reply_count(&sim.step());
+            parked = lagging_shard.parked_frame_count(namespace);
+            if successful_replies >= 2 && parked >= 2 {
+                break;
+            }
+        }
+        assert!(
+            successful_replies >= 2,
+            "primary never committed both sends"
+        );
+        assert!(parked >= 2, "lagging backup never parked both prepares");
+
+        // Keep the third prepare off replica 1's network path. Replica 0 can
+        // still commit it through replica 2, after which its journal supplies
+        // the exact wire frame to put on the lagging backup's inbox below.
+        sim.network.process_disable(ProcessId::Replica(1));
+        let third = client.send_messages(namespace, &[Bytes::from_static(b"parked-redispatch-2")]);
+        sim.submit_request(CLIENT_ID, 0, third.into_generic());
+        for _ in 0..500 {
+            successful_replies += successful_send_reply_count(&sim.step());
+            if successful_replies >= 3 {
+                break;
+            }
+        }
+        assert!(
+            successful_replies >= 3,
+            "primary never committed the later send"
+        );
+        let later_prepare = retained_prepare(&sim, 0, namespace, 3);
+        sim.network.process_enable(ProcessId::Replica(1));
+
+        materialise_partition(&sim.replicas[1], namespace, false, created_view);
+        assert_eq!(lagging_shard.parked_frame_count(namespace), 0);
+        assert_eq!(
+            lagging_shard.redispatched_frame_count(),
+            parked,
+            "materialisation must move every parked prepare to the pump queue"
+        );
+
+        // No virtual-time advance here. The inbox wake alone polls the pump,
+        // so only the inbox arm's queue-first fence can put ops 1 and 2 ahead
+        // of this op 3 frame.
+        lagging_shard.dispatch(later_prepare.into_generic());
+        sim.run_pumps();
+        let lagging_holds_later = sim.replicas[1]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .is_some_and(|partition| partition.log.journal().inner.header_by_op(3).is_some());
+        assert!(
+            lagging_holds_later,
+            "inbox op 3 reached the gap check before the redispatched prefix"
+        );
+
+        let expected = sim
+            .offsets(0, namespace)
+            .expect("primary partition offsets");
+        let mut converged = false;
+        for _ in 0..500 {
+            sim.step();
+            converged = (0..3).all(|replica| sim.offsets(replica, namespace) == Some(expected));
+            if converged {
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "redispatched prepares did not converge the backup"
+        );
+        assert_eq!(lagging_shard.redispatched_frame_count(), 0);
+        assert_no_frame_drops(&sim);
+
+        let offsets = (0..3)
+            .map(|replica| sim.offsets(replica, namespace).expect("partition offsets"))
+            .collect();
+        (parked, offsets, sim.schedule_hash())
+    }
+
+    #[test]
+    fn parked_prepare_redispatch_is_seed_replayable() {
+        let first = parked_prepare_redispatch_trace(0x5CED_4005);
+        let second = parked_prepare_redispatch_trace(0x5CED_4005);
+        assert_eq!(first, second, "same seed diverged on parked redispatch");
     }
 
     /// The dispatch shell's reason to exist: detect the PR #3557 async-concurrency

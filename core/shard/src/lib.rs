@@ -3546,6 +3546,10 @@ where
     ///
     /// `created_view` is the view the metadata plane created the namespace in;
     /// see `fresh_group_start`.
+    ///
+    /// Once inserted, this also runs the same parked-frame redispatch as
+    /// `ReconcileOp::InsertOwned`. The simulator bypasses the reconciler build,
+    /// but it must not bypass the pump handoff that follows materialisation.
     // `feature = "simulator"` alone, unlike its neighbours: the body names items
     // `partitions` gates the same way, and a `test` arm cannot turn those on.
     // Under `cargo test -p shard` that arm fires from shard's own `cfg(test)`
@@ -3563,6 +3567,7 @@ where
         created_view: u32,
     ) where
         B: MessageBus + Clone,
+        M: StreamsFrontend,
     {
         let partitions = self.plane.partitions();
         if partitions.contains(&namespace) {
@@ -3666,6 +3671,15 @@ where
         // store resumes minting at 0 while its group is at N.
         partition.restore_offset_frontier(recovered_state.as_ref());
         partitions.insert(namespace, partition);
+        if let Some(epoch) = self
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+        {
+            self.redispatch_parked_frames(namespace, epoch);
+        }
     }
 
     /// Resolve the single partition a VSR control frame addresses, keyed by
