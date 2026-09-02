@@ -43,9 +43,6 @@ server:
     tcp: 8090
     # -- WebSocket protocol port
     websocket: 8092
-    # -- Replica-to-replica consensus port. Only published when
-    # `server.cluster.enabled` is true.
-    tcpReplica: 9090
 
   service:
     # -- Service type for the server

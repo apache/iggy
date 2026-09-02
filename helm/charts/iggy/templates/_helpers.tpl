@@ -124,11 +124,12 @@ the pod is already scheduled.
     {{- if not .ip }}
       {{- fail (printf "server.cluster.nodes entry %q has no ip. The replica listener binds this address verbatim, so it must be a literal IP the pod owns." .name) }}
     {{- end }}
-    {{- if not (regexMatch "^[0-9a-fA-F.:]+$" .ip) }}
-      {{- fail (printf "server.cluster.nodes entry %q has ip %q, which the server parses as an IP address and rejects. Use server.cluster.nodes[*].advertisedAddress for the hostname clients dial." .name .ip) }}
+    {{- $ip := toString .ip }}
+    {{- if not (regexMatch "^[0-9a-fA-F.:]+$" $ip) }}
+      {{- fail (printf "server.cluster.nodes entry %q has ip %q, which the server parses as an IP address and rejects. Use server.cluster.nodes[*].advertisedAddress for the hostname clients dial." .name $ip) }}
     {{- end }}
-    {{- if or (eq .ip "0.0.0.0") (eq .ip "::") }}
-      {{- fail (printf "server.cluster.nodes entry %q has the wildcard ip %q. Every peer dials this address verbatim, so it has to name one interface." .name .ip) }}
+    {{- if or (eq $ip "0.0.0.0") (eq $ip "::") }}
+      {{- fail (printf "server.cluster.nodes entry %q has the wildcard ip %q. Every peer dials this address verbatim, so it has to name one interface." .name $ip) }}
     {{- end }}
     {{- if kindIs "invalid" .replicaId }}
       {{- fail (printf "server.cluster.nodes entry %q has no replicaId" .name) }}
@@ -156,10 +157,12 @@ server takes every listener port from its own roster entry and never falls back
 to the top-level ones, so a node whose entry names other ports has to reach the
 container ports, the probes and the Service targets as well. `server.ports`
 supplies the per-field default there and the whole answer outside cluster mode.
+`tcpReplica` has no top-level default because the roster owns it: it is
+mandatory on every entry and there is no replica listener outside cluster mode.
 */}}
 {{- define "iggy.serverPorts" -}}
   {{- $ports := .Values.server.ports }}
-  {{- $resolved := dict "http" $ports.http "quic" $ports.quic "tcp" $ports.tcp "websocket" $ports.websocket "tcpReplica" $ports.tcpReplica }}
+  {{- $resolved := dict "http" $ports.http "quic" $ports.quic "tcp" $ports.tcp "websocket" $ports.websocket }}
   {{- if .Values.server.cluster.enabled }}
     {{- $selfReplicaId := int .Values.server.cluster.selfReplicaId }}
     {{- range .Values.server.cluster.nodes }}

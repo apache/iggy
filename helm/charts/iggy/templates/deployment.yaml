@@ -52,10 +52,17 @@ spec:
   {{- if (include "iggy.createsSecret" .) }}
     {{- $secretsChecksum = (include (print $.Template.BasePath "/server-secrets.yaml") . | sha256sum) }}
   {{- end }}
-  {{- if or $secretsChecksum .Values.podAnnotations }}
+  {{- $rootChecksum := "" }}
+  {{- if and .Values.server.users.root.createSecret (not .Values.server.users.root.existingSecret.name) }}
+    {{- $rootChecksum = (include (print $.Template.BasePath "/root-user-credentials.yaml") . | sha256sum) }}
+  {{- end }}
+  {{- if or $secretsChecksum $rootChecksum .Values.podAnnotations }}
       annotations:
     {{- if $secretsChecksum }}
         checksum/server-secrets: {{ $secretsChecksum }}
+    {{- end }}
+    {{- if $rootChecksum }}
+        checksum/root-user-credentials: {{ $rootChecksum }}
     {{- end }}
     {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}

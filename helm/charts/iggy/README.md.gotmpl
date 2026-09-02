@@ -167,8 +167,9 @@ Deployment.apps "iggy-n0" is invalid: spec.strategy.rollingUpdate: Forbidden:
   may not be specified when strategy `type` is 'Recreate'
 ```
 
-Run that one upgrade with `helm upgrade --server-side=false`, which replaces the
-strategy in place. Set `server.strategy` explicitly if you want a different
+On Helm 4, run that one upgrade with `helm upgrade --server-side=false`, which
+replaces the strategy in place. Helm 3 has no such flag, since it does not use
+server-side apply. Set `server.strategy` explicitly if you want a different
 strategy.
 
 ### Roster rules
@@ -203,10 +204,12 @@ kubectl create secret generic iggy-cluster-secrets \
 ```
 
 `examples/cluster-3-node.yaml` points `server.users.root`, `server.encryption`,
-`server.jwt` and `server.cluster.auth` at that one Secret. The last three also
-accept an inline value, which the chart turns into its own Secret; that is
-convenient for a single node and a poor fit for a cluster, since the value then
-lives in every release's stored values.
+`server.jwt` and `server.cluster.auth` at that one Secret. All four also accept
+an inline value, which the chart turns into a Secret of its own:
+`<release>-root-credentials` for the root username and password,
+`<release>-secrets` for the other three. That is convenient for a single node
+and a poor fit for a cluster, since the value then lives in every release's
+stored values.
 
 * **`server.users.root`** seeds the root user. Every node creates it locally
   from its own `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD`, so a password that

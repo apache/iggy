@@ -149,8 +149,9 @@ Deployment.apps "iggy-n0" is invalid: spec.strategy.rollingUpdate: Forbidden:
   may not be specified when strategy `type` is 'Recreate'
 ```
 
-Run that one upgrade with `helm upgrade --server-side=false`, which replaces the
-strategy in place. Set `server.strategy` explicitly if you want a different
+On Helm 4, run that one upgrade with `helm upgrade --server-side=false`, which
+replaces the strategy in place. Helm 3 has no such flag, since it does not use
+server-side apply. Set `server.strategy` explicitly if you want a different
 strategy.
 
 ### Roster rules
@@ -185,10 +186,12 @@ kubectl create secret generic iggy-cluster-secrets \
 ```
 
 `examples/cluster-3-node.yaml` points `server.users.root`, `server.encryption`,
-`server.jwt` and `server.cluster.auth` at that one Secret. The last three also
-accept an inline value, which the chart turns into its own Secret; that is
-convenient for a single node and a poor fit for a cluster, since the value then
-lives in every release's stored values.
+`server.jwt` and `server.cluster.auth` at that one Secret. All four also accept
+an inline value, which the chart turns into a Secret of its own:
+`<release>-root-credentials` for the root username and password,
+`<release>-secrets` for the other three. That is convenient for a single node
+and a poor fit for a cluster, since the value then lives in every release's
+stored values.
 
 * **`server.users.root`** seeds the root user. Every node creates it locally
   from its own `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD`, so a password that
@@ -485,7 +488,7 @@ pre-commit install
 | podSecurityContext | object | `{"seccompProfile":{"type":"Unconfined"}}` | Pod security context (server uses io_uring, requires unconfined seccomp) |
 | resources | object | `{}` | Resource limits and requests for server |
 | securityContext | object | `{"capabilities":{"add":["IPC_LOCK"]}}` | Container security context (server requires IPC_LOCK for io_uring) |
-| server | object | `{"advertisedAddress":"","affinity":{},"cluster":{"auth":{"enabled":false,"existingSecret":{"name":"","previousSharedSecretKey":"clusterPreviousSharedSecret","sharedSecretKey":"clusterSharedSecret"},"previousSharedSecret":"","sharedSecret":""},"enabled":false,"name":"iggy-cluster","nodes":[],"requireHostNetwork":true,"selfReplicaId":0},"enabled":true,"encryption":{"enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""},"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"extraArgs":[],"hostNetwork":false,"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":""},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"jwt":{"decodingSecret":"","encodingSecret":"","existingSecret":{"decodingSecretKey":"jwtDecodingSecret","encodingSecretKey":"jwtEncodingSecret","name":""}},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090,"tcpReplica":9090,"websocket":8092},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"strategy":{},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
+| server | object | `{"advertisedAddress":"","affinity":{},"cluster":{"auth":{"enabled":false,"existingSecret":{"name":"","previousSharedSecretKey":"clusterPreviousSharedSecret","sharedSecretKey":"clusterSharedSecret"},"previousSharedSecret":"","sharedSecret":""},"enabled":false,"name":"iggy-cluster","nodes":[],"requireHostNetwork":true,"selfReplicaId":0},"enabled":true,"encryption":{"enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""},"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"extraArgs":[],"hostNetwork":false,"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":""},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"jwt":{"decodingSecret":"","encodingSecret":"","existingSecret":{"decodingSecretKey":"jwtDecodingSecret","encodingSecretKey":"jwtEncodingSecret","name":""}},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090,"websocket":8092},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"strategy":{},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
 | server.advertisedAddress | string | `""` | Client-facing address published in cluster metadata. Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but setting both is refused at render time. Empty falls back to the in-cluster Service DNS name. Ignored in cluster mode, where the address comes from the node's roster entry, so setting both is refused there too. |
 | server.affinity | object | `{}` | Affinity rules for server pods |
 | server.cluster.auth | object | `{"enabled":false,"existingSecret":{"name":"","previousSharedSecretKey":"clusterPreviousSharedSecret","sharedSecretKey":"clusterSharedSecret"},"previousSharedSecret":"","sharedSecret":""}` | Replica-to-replica authentication on the consensus port. When enabled every peer must complete an authenticated handshake or be rejected, and a shared secret becomes mandatory. Enabling it on a running cluster is a coordinated-restart change, not a rolling one. |
@@ -533,7 +536,6 @@ pre-commit install
 | server.ports.http | int | `3000` | HTTP API port |
 | server.ports.quic | int | `8080` | QUIC protocol port (UDP) |
 | server.ports.tcp | int | `8090` | TCP protocol port |
-| server.ports.tcpReplica | int | `9090` | Replica-to-replica consensus port. Only published when `server.cluster.enabled` is true. |
 | server.ports.websocket | int | `8092` | WebSocket protocol port |
 | server.replicaCount | int | `1` | Number of server replicas |
 | server.service.port | int | `3000` | Service port for the server |
