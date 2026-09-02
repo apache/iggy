@@ -93,8 +93,8 @@ impl IggyConsumerBuilder {
     }
 
     /// Sets the partition to read. `None` lets a consumer group read its assigned partitions and
-    /// makes the server read partition `0` for a standalone consumer. `Some(n)` on a group member
-    /// pins every poll to that partition instead of the assignment.
+    /// makes the server read partition `0` for a standalone consumer. `Some(n)` is for standalone
+    /// consumers. A group member ignores it with a warning and reads its assignment.
     pub fn partition(self, partition: Option<u32>) -> Self {
         Self { partition, ..self }
     }
@@ -123,15 +123,8 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Same as [`auto_commit`](Self::auto_commit) with [`AutoCommit::Disabled`].
-    pub fn commit_failed_messages(self) -> Self {
-        Self {
-            auto_commit: AutoCommit::Disabled,
-            ..self
-        }
-    }
-
-    /// Automatically joins the consumer group if the consumer is a part of a consumer group.
+    /// Joins the consumer group during `init()` and again after the membership was lost, for
+    /// example after a reconnect. On by default.
     pub fn auto_join_consumer_group(self) -> Self {
         Self {
             auto_join_consumer_group: true,
@@ -139,7 +132,9 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Does not automatically join the consumer group if the consumer is a part of a consumer group.
+    /// Leaves joining the consumer group to the caller. The member polls as soon as `init()`
+    /// returns, and a poll without a membership fails with
+    /// [`IggyError::ConsumerGroupMemberNotFound`](iggy_common::IggyError::ConsumerGroupMemberNotFound).
     pub fn do_not_auto_join_consumer_group(self) -> Self {
         Self {
             auto_join_consumer_group: false,
@@ -195,7 +190,9 @@ impl IggyConsumerBuilder {
         }
     }
 
-    /// Sets the polling retry interval in case of server disconnection.
+    /// Sets how long a poll waits before the next attempt while it is blocked: after a
+    /// disconnect, after a failed group join, or while the group member holds no partitions.
+    /// One second by default.
     pub fn polling_retry_interval(self, interval: NonZeroIggyDuration) -> Self {
         Self {
             polling_retry_interval: interval,
@@ -233,7 +230,7 @@ impl IggyConsumerBuilder {
 
     /// Builds the consumer.
     ///
-    /// Note: After building the consumer, `init()` must be invoked before producing messages.
+    /// Note: After building the consumer, `init()` must be invoked before consuming messages.
     pub fn build(self) -> IggyConsumer {
         IggyConsumer::new(
             self.client,

@@ -29,7 +29,11 @@ use tracing::error;
 /// - `messages`: the collection of messages.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolledMessages {
-    /// The identifier of the partition. If it's '0', then there's no partition assigned to the consumer group member.
+    /// The identifier of the partition. An empty reply can carry a sentinel instead of a real
+    /// id: [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION) for a consumer-group member
+    /// that holds no partitions, or
+    /// [`RESYNC_REQUIRED_PARTITION_SENTINEL`](crate::RESYNC_REQUIRED_PARTITION_SENTINEL) when
+    /// the server fenced a stale group assignment.
     pub partition_id: u32,
     /// The current offset of the partition.
     pub current_offset: u64,
