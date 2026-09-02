@@ -24,5 +24,8 @@ use cucumber::World;
 
 #[tokio::main]
 async fn main() {
-    PurgeContext::run("../../bdd/scenarios/stream_topic_purge.feature").await;
+    PurgeContext::cucumber()
+        .fail_on_skipped()
+        .run_and_exit("../../bdd/scenarios/stream_topic_purge.feature")
+        .await;
 }
