@@ -67,13 +67,17 @@ pub(in crate::boot) async fn start_tcp_runtime(
     shard_metrics_all: &[ShardMetrics],
 ) -> Result<(), ServerError> {
     // HTTP is served over TCP but sits outside the replica_io / manual client
-    // reactor, so it binds on its own: first, so its port is known when the
-    // roster and `current_config.toml` are written, and served last, so no
-    // request is answered before they are. Shard-0 gating comes from the sole
-    // caller of this function.
+    // reactor, so it binds on its own. Config first, so a bad `[http.*]`
+    // section fails boot before any listener accepts. Socket only after the
+    // replica peer dial below has returned: against a peer that drops SYNs
+    // that dial blocks for the kernel retry budget, and a port listening with
+    // no serve loop behind it would pass TCP readiness probes the whole time.
+    // Served last, once the roster and `current_config.toml` know the port, so
+    // no request is answered before they do. Shard-0 gating comes from the
+    // sole caller of this function.
     let http = topology
         .http_listen_addr
-        .map(|addr| http::bind(addr, &config.http, &config.cluster))
+        .map(|addr| http::prepare(addr, &config.http, &config.cluster))
         .transpose()?;
 
     let mut bound = if config.tcp.enabled && !config.tcp.tls.enabled {
@@ -136,6 +140,7 @@ pub(in crate::boot) async fn start_tcp_runtime(
         }
     }
 
+    let http = http.map(http::PreparedHttp::bind).transpose()?;
     bound.http = http.as_ref().map(|http| http.bound_addr);
     roster.bound_ports.publish(TransportPorts::from(&bound));
     write_current_config(config, Some(topology.self_replica_id), &bound).await?;

@@ -82,13 +82,12 @@ use crate::http::state::{ForwardState, HttpInner, HttpState, insert_view_header}
 use crate::server_error::ServerError;
 use crate::shell::ServerShard;
 
-/// The shard-0 HTTP listener between bind and serve: the config products the
-/// serve loop needs, validated before the socket opened, held apart so the
-/// bound port can be published (cluster roster, `current_config.toml`) before
-/// any request is answered.
-pub struct BoundHttp {
-    listener: TcpListener,
-    pub bound_addr: SocketAddr,
+/// The shard-0 HTTP listener before its socket exists: the address to bind
+/// and the config products the serve loop needs. Built first at boot, so a
+/// bad `[http.*]` section fails before any listener accepts; [`Self::bind`]
+/// opens the socket.
+pub struct PreparedHttp {
+    addr: SocketAddr,
     jwt: JwtManager,
     forward: ForwardState,
     cors: Option<CorsLayer>,
@@ -96,20 +95,30 @@ pub struct BoundHttp {
     max_request_size: usize,
 }
 
-/// Validate the HTTP config and bind the shard-0 listener; [`start`] serves
+/// The shard-0 HTTP listener between bind and serve, held apart so the bound
+/// port can be published (cluster roster, `current_config.toml`) before any
+/// request is answered.
+pub struct BoundHttp {
+    listener: TcpListener,
+    pub bound_addr: SocketAddr,
+    prepared: PreparedHttp,
+}
+
+/// Validate the HTTP config and build what the serve loop needs, without
+/// opening the socket; [`PreparedHttp::bind`] binds it and [`start`] serves
 /// it. The caller gates this to shard 0 and to `http.enabled`.
 ///
 /// # Errors
 ///
 /// Returns [`ServerError`] if the JWT manager cannot be built from
 /// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
-/// forwarding credentials cannot be loaded, or the listener cannot bind to
-/// `addr`.
-pub fn bind(
+/// forwarding credentials cannot be loaded, or the `[http.metrics]` endpoint
+/// is not a route path.
+pub fn prepare(
     addr: SocketAddr,
     http_config: &HttpConfig,
     cluster: &ClusterConfig,
-) -> Result<BoundHttp, ServerError> {
+) -> Result<PreparedHttp, ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
     // from the cluster PSK, so a bearer minted on any node verifies on every
     // node - the invariant follower-to-primary forwarding depends on.
@@ -132,8 +141,8 @@ pub fn bind(
         usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
     let forward =
         forward::build_forward_state(&http_config.tls, max_request_size, forwarding_active)?;
-    // Validated before bind so a bad [http.cors] fails boot before the socket
-    // opens and the "started" log prints.
+    // Validated here, before the socket opens, so a bad [http.cors] fails boot
+    // before the "started" log prints.
     let cors = http_config
         .cors
         .enabled
@@ -142,19 +151,36 @@ pub fn bind(
     // Same early-fail rule for the scrape path: axum panics on a route
     // without a leading '/', so reject it as a config error instead.
     let metrics_endpoint = metrics::validated_endpoint(&http_config.metrics)?;
-    let (listener, bound_addr) = client_listener::tcp::bind(addr).map_err(|source| {
-        error!(addr = %addr, error = %source, "failed to bind HTTP listener");
-        source
-    })?;
-    Ok(BoundHttp {
-        listener,
-        bound_addr,
+    Ok(PreparedHttp {
+        addr,
         jwt,
         forward,
         cors,
         metrics_endpoint,
         max_request_size,
     })
+}
+
+impl PreparedHttp {
+    /// Open the socket. Kept apart from [`prepare`] so the caller can order it
+    /// after any boot step that may block, and the port never sits listening
+    /// with nothing serving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the listener cannot bind to the prepared
+    /// address.
+    pub fn bind(self) -> Result<BoundHttp, ServerError> {
+        let (listener, bound_addr) = client_listener::tcp::bind(self.addr).map_err(|source| {
+            error!(addr = %self.addr, error = %source, "failed to bind HTTP listener");
+            source
+        })?;
+        Ok(BoundHttp {
+            listener,
+            bound_addr,
+            prepared: self,
+        })
+    }
 }
 
 /// Assemble the router over a bound listener and spawn the `cyper-axum`
@@ -184,11 +210,15 @@ pub fn start(
     let BoundHttp {
         listener,
         bound_addr,
-        jwt,
-        forward,
-        cors,
-        metrics_endpoint,
-        max_request_size,
+        prepared:
+            PreparedHttp {
+                jwt,
+                forward,
+                cors,
+                metrics_endpoint,
+                max_request_size,
+                ..
+            },
     } = bound;
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
