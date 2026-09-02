@@ -259,7 +259,10 @@ impl DynamoDbSink {
             loader = loader.region(Region::new(region.clone()));
         }
         if let Some(endpoint) = &self.config.endpoint {
-            info!("Using custom DynamoDB endpoint: {endpoint}");
+            info!(
+                "Using custom DynamoDB endpoint: {}",
+                redact_endpoint(endpoint)
+            );
             loader = loader.endpoint_url(endpoint);
         }
         if let (Some(access_key_id), Some(secret_access_key)) =
@@ -898,6 +901,23 @@ fn number_size(number: &str) -> usize {
     let digits = number.chars().filter(char::is_ascii_digit).count();
     let sign = usize::from(number.starts_with('-'));
     (digits.div_ceil(2) + 1 + sign).min(MAX_NUMBER_SIZE)
+}
+
+/// A custom endpoint is operator supplied and may carry user information or a
+/// query string, so only its scheme and host are logged. User information is
+/// dropped before the path is cut, because a secret access key contains `/`
+/// often enough that cutting first would print a part of it.
+fn redact_endpoint(endpoint: &str) -> String {
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, endpoint),
+    };
+    let authority = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let host = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    match scheme {
+        Some(scheme) => format!("{scheme}://{host}"),
+        None => host.to_owned(),
+    }
 }
 
 fn is_transient_error<E, R>(error: &SdkError<E, R>) -> bool
@@ -1712,5 +1732,22 @@ mod tests {
         let result = sink.build_client().await;
 
         assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
+    }
+
+    #[test]
+    fn given_an_endpoint_with_user_information_when_redacted_should_keep_only_the_host() {
+        assert_eq!(
+            redact_endpoint("https://key:secret@dynamodb.example.com/write?token=abc"),
+            "https://dynamodb.example.com"
+        );
+        assert_eq!(
+            redact_endpoint("https://key:sec/ret@dynamodb.example.com"),
+            "https://dynamodb.example.com"
+        );
+        assert_eq!(
+            redact_endpoint("http://localhost:8000"),
+            "http://localhost:8000"
+        );
+        assert_eq!(redact_endpoint("localhost:8000/path"), "localhost:8000");
     }
 }
