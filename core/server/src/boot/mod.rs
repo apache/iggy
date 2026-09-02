@@ -33,7 +33,6 @@ mod threads;
 mod topology;
 
 pub use credentials::apply_default_root_credentials;
-pub(crate) use recovery::load_partition_or_fence;
 pub use threads::ShardHandles;
 
 use crate::boot::credentials::{

@@ -146,8 +146,9 @@
 //! discriminator, like `checkpoint_id` on every prepare
 //! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
-use crate::boot::load_partition_or_fence;
-use crate::partition_helpers::{build_partition_fresh, delete_partitions_from_disk};
+use crate::partition_helpers::{
+    build_partition_fresh, delete_partitions_from_disk, load_partition_or_fence,
+};
 use crate::shell::ServerShard;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
