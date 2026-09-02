@@ -68,8 +68,13 @@ same primary key. Redelivery of the same message therefore writes the same item
 again as long as the key is deterministic.
 
 When the payload does not carry the configured `partition_key_field`, the
-connector injects a key built from the stream, topic, partition, and message ID.
-When `sort_key_field` is configured and missing, the message offset is injected.
+connector injects a key built from the stream, topic, partition, and message
+offset, with each name prefixed by its byte length so that a name containing the
+separator cannot build another topic's key. The offset identifies a message
+inside its partition and stays the same on redelivery, unlike the message ID,
+which is `0` for every message sent without an explicit one. When
+`sort_key_field` is configured and missing, the message offset is injected.
+
 A payload value always wins over the injected one, so a message that carries the
 key field with an empty value, or with a value that is neither a string, a
 number, nor binary, is skipped rather than falling back to the injected key,

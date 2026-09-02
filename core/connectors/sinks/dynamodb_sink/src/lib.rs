@@ -558,7 +558,7 @@ impl DynamoDbSink {
                 AttributeValue::S(build_message_key(
                     topic_metadata,
                     messages_metadata,
-                    message.id,
+                    message.offset,
                 ))
             });
         if let Some(sort_key_field) = &self.sort_key_field {
@@ -678,14 +678,22 @@ fn key_attribute_signature(value: Option<&AttributeValue>) -> String {
     }
 }
 
+/// The offset identifies a message inside its partition, and a redelivery of
+/// that message carries the same one, so the key stays stable without relying
+/// on a message ID that defaults to `0`. Stream and topic names may contain the
+/// separator, so each one is prefixed with its byte length.
 fn build_message_key(
     topic_metadata: &TopicMetadata,
     messages_metadata: &MessagesMetadata,
-    message_id: u128,
+    offset: u64,
 ) -> String {
+    let stream = &topic_metadata.stream;
+    let topic = &topic_metadata.topic;
     format!(
-        "{}:{}:{}:{message_id}",
-        topic_metadata.stream, topic_metadata.topic, messages_metadata.partition_id
+        "{}:{stream}:{}:{topic}:{}:{offset}",
+        stream.len(),
+        topic.len(),
+        messages_metadata.partition_id
     )
 }
 
@@ -944,7 +952,7 @@ mod tests {
         );
         assert_eq!(
             item[DEFAULT_PARTITION_KEY_FIELD],
-            AttributeValue::S("test_stream:test_topic:1:42".to_owned())
+            AttributeValue::S("11:test_stream:10:test_topic:1:7".to_owned())
         );
     }
 
@@ -1162,8 +1170,50 @@ mod tests {
         };
 
         assert_ne!(
-            build_message_key(&first_topic, &messages_metadata, 42),
-            build_message_key(&second_topic, &messages_metadata, 42)
+            build_message_key(&first_topic, &messages_metadata, 7),
+            build_message_key(&second_topic, &messages_metadata, 7)
+        );
+    }
+
+    #[test]
+    fn given_messages_without_an_id_when_built_should_produce_different_keys() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let topic_metadata = given_topic_metadata();
+        let messages_metadata = given_messages_metadata();
+        let mut first = given_message(given_json_payload(r#"{"name":"first"}"#));
+        first.id = 0;
+        let mut second = given_message(given_json_payload(r#"{"name":"second"}"#));
+        second.id = 0;
+        second.offset = 8;
+
+        let first_item = sink
+            .build_item(&topic_metadata, &messages_metadata, &mut first)
+            .expect("build item");
+        let second_item = sink
+            .build_item(&topic_metadata, &messages_metadata, &mut second)
+            .expect("build item");
+
+        assert_ne!(
+            first_item[DEFAULT_PARTITION_KEY_FIELD],
+            second_item[DEFAULT_PARTITION_KEY_FIELD]
+        );
+    }
+
+    #[test]
+    fn given_names_containing_the_separator_when_built_should_produce_different_keys() {
+        let messages_metadata = given_messages_metadata();
+        let first_topic = TopicMetadata {
+            stream: "a:b".to_owned(),
+            topic: "c".to_owned(),
+        };
+        let second_topic = TopicMetadata {
+            stream: "a".to_owned(),
+            topic: "b:c".to_owned(),
+        };
+
+        assert_ne!(
+            build_message_key(&first_topic, &messages_metadata, 7),
+            build_message_key(&second_topic, &messages_metadata, 7)
         );
     }
 

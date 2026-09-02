@@ -22,7 +22,7 @@ use iggy::prelude::{IggyMessage, Partitioning};
 use iggy_common::{Identifier, MessageClient};
 use integration::harness::{TestHarness, seeds};
 use integration::iggy_harness;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -64,11 +64,12 @@ async fn given_json_messages_when_sink_consumes_should_write_items(
             .iter()
             .any(|item| string_attribute(item, "name") == "second")
     );
-    assert!(
-        items
-            .iter()
-            .all(|item| !string_attribute(item, "iggy_id").is_empty())
-    );
+    let keys = items
+        .iter()
+        .map(|item| string_attribute(item, "iggy_id"))
+        .collect::<HashSet<_>>();
+    assert_eq!(keys.len(), payloads.len());
+    assert!(!keys.iter().any(|key| key.is_empty()));
     assert!(
         items
             .iter()
@@ -128,7 +129,35 @@ async fn given_more_messages_than_a_batch_write_when_sink_consumes_should_write_
     server(connectors_runtime(config_path = "tests/connectors/dynamodb/sink.toml")),
     seed = seeds::connector_stream
 )]
-async fn given_the_same_message_ids_when_sink_consumes_twice_should_overwrite_the_items(
+async fn given_payload_keys_when_sink_consumes_twice_should_overwrite_the_items(
+    harness: &TestHarness,
+    fixture: DynamoDbSinkFixture,
+) {
+    let first = [
+        serde_json::json!({"iggy_id": "a", "name": "first"}),
+        serde_json::json!({"iggy_id": "b", "name": "second"}),
+    ];
+    send_messages(harness, &first).await;
+    fixture
+        .wait_for_items(first.len())
+        .await
+        .expect("wait for DynamoDB items");
+
+    let second = [
+        serde_json::json!({"iggy_id": "a", "name": "third"}),
+        serde_json::json!({"iggy_id": "b", "name": "fourth"}),
+    ];
+    send_messages(harness, &second).await;
+
+    let items = wait_for_names(&fixture, &["third", "fourth"]).await;
+    assert_eq!(items.len(), first.len());
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/dynamodb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_messages_at_new_offsets_when_sink_consumes_twice_should_keep_every_item(
     harness: &TestHarness,
     fixture: DynamoDbSinkFixture,
 ) {
@@ -148,12 +177,15 @@ async fn given_the_same_message_ids_when_sink_consumes_twice_should_overwrite_th
     ];
     send_messages(harness, &second).await;
 
-    let items = wait_for_names(&fixture, &["third", "fourth"]).await;
-    assert_eq!(items.len(), first.len());
+    let items = fixture
+        .wait_for_items(first.len() + second.len())
+        .await
+        .expect("wait for DynamoDB items");
+    assert_eq!(items.len(), first.len() + second.len());
 }
 
-/// The second batch reuses the message ids of the first one, so the item count
-/// stays the same and only the payload tells the two rounds apart.
+/// The second batch carries the key of the first one, so the item count stays
+/// the same and only the payload tells the two rounds apart.
 async fn wait_for_names(
     fixture: &DynamoDbSinkFixture,
     names: &[&str],
@@ -178,12 +210,12 @@ async fn send_messages(harness: &TestHarness, payloads: &[serde_json::Value]) {
     let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
     let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
 
+    // No explicit ID, which is how most producers send messages, so the sink
+    // has to key the items on something other than the message ID.
     let mut messages = payloads
         .iter()
-        .enumerate()
-        .map(|(i, payload)| {
+        .map(|payload| {
             IggyMessage::builder()
-                .id((i + 1) as u128)
                 .payload(Bytes::from(serde_json::to_vec(payload).expect("serialize")))
                 .build()
                 .expect("build message")
