@@ -1293,7 +1293,7 @@ impl ClientTable {
     ///
     /// The peer's cap may exceed this node's, so when the input is longer than
     /// `clients_max` the entries with the newest commits survive, which is what
-    /// [`Self::evict_oldest`] would have converged on had the surplus been
+    /// the oldest-commit eviction would have converged on had the surplus been
     /// folded in one by one. Zero client ids are dropped, as
     /// [`Self::commit_request`] drops them.
     ///
