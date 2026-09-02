@@ -32,10 +32,9 @@ use metadata::impls::metadata::StreamsFrontend;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
-use crate::dispatch::{
-    dispatch_partition_request, resolve_delete_segments_truncate, submit_client_request_on_owner,
-    submit_logout_on_owner,
-};
+use crate::dispatch::partition::{dispatch_partition_request, resolve_delete_segments_truncate};
+use crate::dispatch::session_ops::submit_logout_on_owner;
+use crate::dispatch::submit::submit_client_request_on_owner;
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::http::reply::{

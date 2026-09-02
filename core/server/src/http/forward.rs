@@ -68,7 +68,7 @@ use configs::http::HttpTlsConfig;
 use consensus::MetadataHandle;
 use futures::StreamExt;
 use iggy_common::IggyError;
-use message_bus::transports::tls::{install_default_crypto_provider, load_pem};
+use message_bus::transports::tls::load_pem;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -156,13 +156,17 @@ pub(in crate::http) fn build_forward_state(
     body_limit: usize,
     active: bool,
 ) -> Result<ForwardState, ServerError> {
-    // Unconditional: cyper's rustls connector resolves the process default
-    // provider even when the client only ever dials plain http.
-    install_default_crypto_provider();
     let builder = cyper::Client::builder()
         // The retry loop re-resolves the primary from the local roster; a
         // followed `Location` would let the peer steer the bearer anywhere.
         .redirect(cyper::redirect::Policy::none());
+    // `bootstrap()` installs the process-level provider before any shard
+    // thread exists; both `ClientConfig` builders below panic without one, so
+    // fail the boot instead. A unit test building this state installs it
+    // itself, as http/tls.rs does.
+    let provider = CryptoProvider::get_default().ok_or_else(|| ServerError::HttpForwardClient {
+        reason: "no process-level rustls CryptoProvider installed".to_string(),
+    })?;
     let (builder, scheme) = if tls.enabled {
         let credentials =
             load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
@@ -178,10 +182,7 @@ pub(in crate::http) fn build_forward_state(
                 reason: "TLS certificate chain is empty".to_string(),
             }
         })?;
-        let algorithms = CryptoProvider::get_default()
-            // Installed above; absence is unreachable.
-            .expect("default crypto provider installed")
-            .signature_verification_algorithms;
+        let algorithms = provider.signature_verification_algorithms;
         let config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier { pinned, algorithms }))
@@ -726,7 +727,8 @@ mod tests {
                 .map(|node| ResolvedClusterNode::try_from(node).expect("valid roster node"))
                 .collect(),
             self_advertised: "127.0.0.1".to_owned(),
-            self_ports: TransportPorts::default(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: Arc::default(),
             metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
             )),

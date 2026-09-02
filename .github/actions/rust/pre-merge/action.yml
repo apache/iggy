@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, test-3, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, test-3, test-storage-compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -84,19 +84,22 @@ runs:
     # a subset of crates changed.
     # Safety: cargo check/clippy run on the full workspace separately, catching all
     # compilation errors. This only scopes test BUILD and EXECUTION.
+    # test-storage-compat is excluded from the DAG and coverage setup below:
+    # storage-compat.sh builds two explicit binaries and drives its own nextest
+    # run, and reads none of the /tmp plan files or the llvm-cov environment.
     - name: Fetch base branch for DAG analysis
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: git fetch origin master --depth=1 2>/dev/null || true
       shell: bash
 
     - name: Install cargo-rail
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-rail
 
     - name: Compute affected crates (cargo-rail)
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: |
         METADATA_JSON=$(cargo metadata --format-version 1 --no-deps 2>/dev/null || echo "{}")
         TOTAL_CRATES=$(echo "$METADATA_JSON" | jq '.workspace_members | length' 2>/dev/null || echo "?")
@@ -202,18 +205,25 @@ runs:
       shell: bash
 
     - name: Install cargo-llvm-cov
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-llvm-cov
 
     - name: Build and test with coverage
-      if: startsWith(inputs.task, 'test-')
+      # test-storage-compat drives its own nextest invocation from
+      # scripts/ci/storage-compat.sh. Without this exclusion it would also run
+      # here with an empty PARTITION_FLAG, i.e. a fourth *unpartitioned* copy
+      # of the whole suite on top of test-1/2/3.
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: |
         # Parse partition index from task name (test-1 -> hash:1/3, test-2 -> hash:2/3, ...).
         # TEST_PARTITIONS must match the number of test-N tasks in
         # .github/config/components.yml. Cluster bootstrap makes each test
         # CPU-heavy, so partitions stay small.
+        # The regex is numeric-only on purpose: non-numeric test-* tasks
+        # (test-storage-compat) opt out of partitioning rather than producing
+        # an out-of-range hash:N/3.
         TEST_PARTITIONS=3
         TASK="${{ inputs.task }}"
         PARTITION_FLAG=""
@@ -381,6 +391,17 @@ runs:
         cargo llvm-cov report --codecov --output-path codecov.json
         echo "Coverage report generated: codecov.json"
         ls -la codecov.json
+      shell: bash
+
+    # On-disk format backwards compatibility. The script builds an iggy-server
+    # from the master tip under the checked-out merge ref (origin/master off a
+    # pull_request run) and one from HEAD, seeds a data directory with the
+    # former and reads it back with the latter. It does its own shallow fetch
+    # of the baseline commit and exits non-zero if it cannot resolve one, so
+    # the default depth-1 checkout is sufficient here.
+    - name: Storage format backwards compatibility
+      if: inputs.task == 'test-storage-compat'
+      run: ./scripts/ci/storage-compat.sh
       shell: bash
 
     # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /
