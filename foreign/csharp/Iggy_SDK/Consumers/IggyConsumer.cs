@@ -46,7 +46,7 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     Backoff after a group poll reported <see cref="PolledMessages.NO_ASSIGNED_PARTITION" />. Without it a
     ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
     /// </summary>
-    private const int NoAssignedPartitionBackoffMs = 1_000;
+    private const int NoAssignedPartitionBackoffMs = 100;
 
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
