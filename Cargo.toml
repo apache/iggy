@@ -50,6 +50,7 @@ members = [
     "core/connectors/sinks/surrealdb_sink",
     "core/connectors/sources/elasticsearch_source",
     "core/connectors/sources/influxdb_source",
+    "core/connectors/sources/jdbc_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/consensus",
@@ -213,6 +214,7 @@ iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.3" }
 indexmap = "2.14.0"
 integration = { path = "core/integration" }
 ipnet = "2.12.0"
+jni = { version = "0.21", features = ["invocation"] }
 journal = { path = "core/journal" }
 js-sys = "0.3"
 jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }

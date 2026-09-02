@@ -25,6 +25,7 @@ mod http;
 mod http_config_provider;
 mod iceberg;
 mod influxdb;
+mod jdbc;
 mod meilisearch;
 mod mongodb;
 mod postgres;
@@ -37,8 +38,45 @@ mod s3;
 mod stdout;
 mod surrealdb;
 
-use iggy_common::IggyTimestamp;
+use iggy::prelude::{IggyClient, IggyMessage, Partitioning};
+use iggy_common::Client;
+use iggy_common::{
+    CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, MessageClient, PolledMessages,
+    StreamClient, TopicClient, TopicCreateOptions,
+};
+use integration::harness::{ConnectorsRuntimeConfig, IpAddrKind, TestHarness, TestServerConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+const DEFAULT_TEST_STREAM: &str = "test_stream";
+const DEFAULT_TEST_TOPIC: &str = "test_topic";
+
+fn setup_runtime() -> ConnectorsRuntime {
+    ConnectorsRuntime {
+        harness: TestHarness::builder()
+            .server(
+                TestServerConfig::builder()
+                    .ip_kind(IpAddrKind::V4)
+                    .quic_enabled(false)
+                    .http_enabled(false)
+                    .websocket_enabled(false)
+                    .extra_envs(HashMap::from([
+                        // The harness pre-reserves a fixed TCP port (see PortReserver),
+                        // so the server binds a non-zero port. That relies on the server
+                        // writing current_config.toml on bind regardless of how the port
+                        // was chosen (see config_writer::write_current_config); the harness
+                        // reads that file to discover the bound address before it considers
+                        // startup complete.
+                        ("IGGY_TCP_ADDRESS".to_owned(), "127.0.0.1:0".to_owned()),
+                    ]))
+                    .build(),
+            )
+            .build()
+            .unwrap(),
+        stream: "".to_owned(),
+        topic: "".to_owned(),
+    }
+}
 
 const ONE_DAY_MICROS: u64 = 24 * 60 * 60 * 1_000_000;
 
@@ -64,4 +102,158 @@ pub fn create_test_messages(count: usize) -> Vec<TestMessage> {
             timestamp: (base_timestamp + (i - 1) as u64 * ONE_DAY_MICROS) as i64,
         })
         .collect()
+}
+
+#[derive(Debug)]
+struct ConnectorsRuntime {
+    stream: String,
+    topic: String,
+    harness: TestHarness,
+}
+
+#[derive(Debug)]
+struct ConnectorsIggyClient {
+    stream: String,
+    topic: String,
+    client: IggyClient,
+}
+
+impl ConnectorsIggyClient {
+    /// Send messages to the configured stream/topic (used by sink connector tests).
+    #[allow(dead_code)]
+    async fn send_messages(
+        &self,
+        messages: &mut [IggyMessage],
+    ) -> Result<(), iggy_common::IggyError> {
+        self.client
+            .send_messages(
+                &self.stream.clone().try_into().unwrap(),
+                &self.topic.clone().try_into().unwrap(),
+                &Partitioning::balanced(),
+                messages,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// Poll up to `count` messages from the configured stream/topic.
+    ///
+    /// `count` is the caller's, because it bounds how much a collect-until-N loop
+    /// can drain per attempt: a batch smaller than what the caller waits for turns
+    /// the loop's attempt budget into a cap on the total it can ever see, so the
+    /// test fails on a slow runner even though the source delivered everything.
+    /// Sibling source tests poll in batches of 100.
+    async fn get_messages(&self, count: u32) -> Result<PolledMessages, iggy_common::IggyError> {
+        self.client
+            .poll_messages(
+                &self.stream.clone().try_into().unwrap(),
+                &self.topic.clone().try_into().unwrap(),
+                None,
+                &iggy_common::Consumer::new("test_consumer".try_into().unwrap()),
+                &iggy_common::PollingStrategy::next(),
+                count,
+                true,
+            )
+            .await
+    }
+}
+
+#[derive(Debug)]
+pub struct IggySetup {
+    pub stream: String,
+    pub topic: String,
+}
+
+impl Default for IggySetup {
+    fn default() -> Self {
+        Self {
+            stream: DEFAULT_TEST_STREAM.to_owned(),
+            topic: DEFAULT_TEST_TOPIC.to_owned(),
+        }
+    }
+}
+
+impl ConnectorsRuntime {
+    pub async fn init(
+        &mut self,
+        config_path: &str,
+        envs: Option<HashMap<String, String>>,
+        iggy_setup: IggySetup,
+    ) {
+        let config_path = format!("tests/connectors/{config_path}");
+        let mut all_envs = HashMap::new();
+        all_envs.insert(
+            "IGGY_CONNECTORS_CONFIG_PATH".to_owned(),
+            config_path.to_owned(),
+        );
+
+        if let Some(envs) = envs {
+            for (k, v) in envs {
+                all_envs.insert(k, v);
+            }
+        }
+
+        // Start the iggy server
+        self.harness
+            .start()
+            .await
+            .expect("Failed to start test harness");
+
+        let client = self.create_iggy_client().await;
+        client
+            .create_stream(&iggy_setup.stream)
+            .await
+            .expect("Failed to create stream");
+        let stream_id = iggy_setup
+            .stream
+            .clone()
+            .try_into()
+            .expect("Invalid stream name in Iggy setup");
+        client
+            .create_topic(
+                &stream_id,
+                &iggy_setup.topic,
+                &TopicCreateOptions {
+                    partitions_count: Some(1),
+                    compression_algorithm: Some(CompressionAlgorithm::None),
+                    message_expiry: Some(IggyExpiry::ServerDefault),
+                    max_topic_size: Some(MaxTopicSize::ServerDefault),
+                    ..TopicCreateOptions::default()
+                },
+            )
+            .await
+            .expect("Failed to create topic");
+        client.shutdown().await.expect("Failed to shutdown client");
+
+        let connectors_config = ConnectorsRuntimeConfig::builder()
+            .extra_envs(all_envs)
+            .build();
+
+        self.harness
+            .server_mut()
+            .set_connectors_runtime_config(connectors_config);
+        self.harness
+            .server_mut()
+            .start_dependents()
+            .await
+            .expect("Failed to start connectors runtime");
+
+        self.stream = iggy_setup.stream;
+        self.topic = iggy_setup.topic;
+    }
+
+    pub async fn create_client(&self) -> ConnectorsIggyClient {
+        ConnectorsIggyClient {
+            stream: self.stream.clone(),
+            topic: self.topic.clone(),
+            client: self.create_iggy_client().await,
+        }
+    }
+
+    async fn create_iggy_client(&self) -> IggyClient {
+        self.harness
+            .tcp_root_client()
+            .await
+            .expect("Failed to create root TCP client")
+    }
 }
