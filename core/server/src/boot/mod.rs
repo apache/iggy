@@ -50,8 +50,9 @@ use crate::boot::recovery::{
     RecoveredOwnerState, build_shard_for_thread, restore_metadata_consensus,
 };
 use crate::boot::threads::{
-    StopSignals, await_pump_drain, join_partial_shard_survivors, resolve_shard_assignments,
-    run_shard_thread, spawn_shutdown_watchdog, validate_sharding_runtime_knobs,
+    StopSignals, await_pump_drain, install_panic_hook, join_partial_shard_survivors,
+    resolve_shard_assignments, run_shard_thread, spawn_shutdown_watchdog,
+    validate_sharding_runtime_knobs,
 };
 use crate::boot::topology::{RosterCells, resolve_tcp_topology};
 use crate::dispatch::partition::make_partition_read_handler;
@@ -272,6 +273,9 @@ pub fn bootstrap(
     let (senders, mut inboxes, mut reply_inboxes) =
         shard_mesh_channels(total_shards, inbox_capacity, reply_inbox_capacity);
     let shutdown_flag = Arc::new(AtomicBool::new(false));
+    // Before the first shard thread exists, so no panic on a shard, in the
+    // thread body or in a task compio's `spawn` would swallow, escapes it.
+    let first_panic = install_panic_hook(Arc::clone(&shutdown_flag));
     let config = Arc::new(config);
     // One owner table per server process, Arc-cloned into every shard's bus so
     // any shard's bus reads the same atomic slots that the owning
@@ -403,6 +407,7 @@ pub fn bootstrap(
         shutdown_flag,
         shard_threads,
         join_timeout: config.system.sharding.shutdown_join_timeout.get_duration(),
+        first_panic,
     })
 }
 

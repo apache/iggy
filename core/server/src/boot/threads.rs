@@ -32,23 +32,26 @@ use partitions::FatalCommit;
 use server_common::executor::create_shard_executor;
 use shard::metrics::ShardMetrics;
 use shard::{Receiver as ShardReceiver, Sender, ShardFrame, TaggedSender};
+use std::backtrace::Backtrace;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use std::{panic, thread};
 use tracing::{error, info, warn};
 
 /// Result of a multi-shard bootstrap.
 ///
-/// Carries the cross-thread shutdown flag and one OS-thread `JoinHandle`
-/// per shard. The caller flips the flag via [`Self::install_ctrlc_handler`]
-/// and then drains every shard via [`Self::join_all`], bounded by
-/// `join_timeout` (`system.sharding.shutdown_join_timeout`).
+/// Carries the cross-thread shutdown flag, one OS-thread `JoinHandle`
+/// per shard, and the first panic [`install_panic_hook`] recorded. The
+/// caller flips the flag via [`Self::install_ctrlc_handler`] and then
+/// drains every shard via [`Self::join_all`], bounded by `join_timeout`
+/// (`system.sharding.shutdown_join_timeout`).
 pub struct ShardHandles {
     pub(in crate::boot) shutdown_flag: Arc<AtomicBool>,
     pub(in crate::boot) shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerError>>)>,
     pub(in crate::boot) join_timeout: Duration,
+    pub(in crate::boot) first_panic: Arc<OnceLock<String>>,
 }
 
 impl ShardHandles {
@@ -98,7 +101,9 @@ impl ShardHandles {
     /// returned a `Result::Err`, panicked, or wedged past the deadline.
     /// The variant carries every per-shard failure in shard-id order so
     /// the caller does not need to read the trace log to discover
-    /// late-failing shards.
+    /// late-failing shards. Returns [`ServerError::Panicked`] when every
+    /// thread exited `Ok` but the panic hook recorded a panic: a task
+    /// compio's `spawn` caught, which no thread result can carry.
     pub fn join_all(self) -> Result<(), ServerError> {
         let mut failures: Vec<ShardJoinFailure> = Vec::new();
         // Armed on the first poll that observes the shutdown flag, shared
@@ -157,12 +162,53 @@ impl ShardHandles {
                 }
             }
         }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(ServerError::ShardJoinFailures { failures })
+        if !failures.is_empty() {
+            return Err(ServerError::ShardJoinFailures { failures });
         }
+        self.first_panic.get().map_or_else(
+            || Ok(()),
+            |description| {
+                Err(ServerError::Panicked {
+                    description: description.clone(),
+                })
+            },
+        )
     }
+}
+
+/// Install the process-wide panic hook and return the slot it records
+/// the first panic into.
+///
+/// The hook runs on the panicking thread before the unwind, so it sees
+/// every panic on a shard: the thread body, whose unwind
+/// [`run_shard_thread`] already turns into a join failure, and the tasks
+/// compio's `spawn` catches, which nothing observes while the server
+/// runs (a dead listener or connection task leaves every thread exiting
+/// `Ok`). It logs the panic with its backtrace, records the first one for
+/// [`ShardHandles::join_all`] to fail the exit on, and flips the shutdown
+/// flag so every shard drains instead of the half-alive state one dead
+/// task leaves behind. The previous hook still runs after it, so stderr
+/// keeps the standard panic line.
+pub(in crate::boot) fn install_panic_hook(shutdown_flag: Arc<AtomicBool>) -> Arc<OnceLock<String>> {
+    let first_panic = Arc::new(OnceLock::new());
+    let recorded = Arc::clone(&first_panic);
+    let previous_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let current = thread::current();
+        let thread_name = current.name().unwrap_or("<unnamed>");
+        let location = info
+            .location()
+            .map_or_else(|| "<unknown>".to_string(), ToString::to_string);
+        let message = panic_payload_to_string(info.payload());
+        let backtrace = Backtrace::force_capture();
+        error!(thread = thread_name, location = %location, backtrace = %backtrace, "{message}");
+        let _ = recorded.set(format!(
+            "thread '{thread_name}' panicked at {location}: {message}"
+        ));
+        shutdown_flag.store(true, Ordering::Relaxed);
+        previous_hook(info);
+    }));
+    first_panic
 }
 
 /// Poll cadence for the bounded shard joins. Coarse enough to cost
@@ -679,6 +725,53 @@ mod tests {
         assert!(
             deadline.is_none(),
             "the join deadline must not arm before the shutdown flag flips"
+        );
+    }
+
+    #[test]
+    fn join_all_fails_the_exit_on_a_panic_no_thread_surfaced() {
+        // A listener or connection task panic leaves every shard thread
+        // exiting Ok; only the hook's record can keep that from reading
+        // as a clean shutdown to an orchestrator.
+        let first_panic = Arc::new(OnceLock::new());
+        first_panic
+            .set("thread 'shard-0' panicked at listener.rs:1:1: boom".to_string())
+            .expect("a fresh slot accepts the first record");
+        let handle = thread::spawn(|| -> Result<(), ServerError> { Ok(()) });
+        let handles = ShardHandles {
+            shutdown_flag: Arc::new(AtomicBool::new(true)),
+            shard_threads: vec![(0, handle)],
+            join_timeout: Duration::from_secs(1),
+            first_panic,
+        };
+        let error = handles
+            .join_all()
+            .expect_err("a recorded panic must fail the exit even when every thread exited Ok");
+        assert!(
+            matches!(&error, ServerError::Panicked { description } if description.contains("boom")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn panic_hook_records_the_panic_and_flips_the_shutdown_flag() {
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let first_panic = install_panic_hook(Arc::clone(&shutdown_flag));
+        let joined = thread::Builder::new()
+            .name("shard-7".to_string())
+            .spawn(|| panic!("injected task panic"))
+            .expect("spawn")
+            .join();
+        assert!(joined.is_err(), "the thread must have panicked");
+        assert!(
+            shutdown_flag.load(Ordering::Relaxed),
+            "a panic anywhere must drive the whole server down"
+        );
+        let description = first_panic.get().expect("the hook records the first panic");
+        assert!(
+            description.starts_with("thread 'shard-7' panicked at ")
+                && description.ends_with(": injected task panic"),
+            "unexpected record: {description}"
         );
     }
 
