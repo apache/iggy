@@ -48,7 +48,8 @@ verbose_logging = false
   overhead of nested lists and maps, and rounds every estimate up.
 - `max_retries`: Retries after the first attempt. Defaults to `3`.
 - `retry_delay`: First retry delay as a humantime string. Defaults to `500ms`.
-- `max_retry_delay`: Upper bound of the exponential backoff. Defaults to `5s`.
+- `max_retry_delay`: Upper bound of a single backoff, jitter included.
+  Defaults to `5s`.
 - `verbose_logging`: Log per-batch results at info level. Defaults to `false`.
 
 ## Behavior

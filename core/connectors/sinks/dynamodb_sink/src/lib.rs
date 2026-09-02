@@ -572,13 +572,19 @@ impl DynamoDbSink {
         }
     }
 
-    async fn backoff(&self, attempt: u32) {
-        let delay = jitter(exponential_backoff(
+    /// Jitter adds up to 20%, so the delay is clamped afterwards to keep
+    /// `max_retry_delay` a real upper bound.
+    fn backoff_delay(&self, attempt: u32) -> Duration {
+        jitter(exponential_backoff(
             self.retry_delay,
             attempt - 1,
             self.max_retry_delay,
-        ));
-        tokio::time::sleep(delay).await;
+        ))
+        .min(self.max_retry_delay)
+    }
+
+    async fn backoff(&self, attempt: u32) {
+        tokio::time::sleep(self.backoff_delay(attempt)).await;
     }
 
     fn build_item(
@@ -1674,5 +1680,17 @@ mod tests {
         assert_eq!(number_size("1"), 2);
         assert_eq!(number_size("-12345"), 5);
         assert_eq!(number_size(&"9".repeat(100)), MAX_NUMBER_SIZE);
+    }
+
+    #[test]
+    fn given_a_jittered_delay_when_backing_off_should_stay_within_max_retry_delay() {
+        let mut config = given_default_config();
+        config.retry_delay = Some("1s".to_owned());
+        config.max_retry_delay = Some("5s".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+
+        for attempt in 1..=10 {
+            assert!(sink.backoff_delay(attempt) <= Duration::from_secs(5));
+        }
     }
 }
