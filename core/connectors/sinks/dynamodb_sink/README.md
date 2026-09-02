@@ -115,4 +115,6 @@ provisioned and on-demand capacity modes as well as multi-Region tables.
 Validation and access errors are permanent and returned without a retry.
 
 Items larger than `max_item_size` are logged and skipped instead of failing the
-whole batch.
+whole batch. So are records carrying a number outside the range DynamoDB
+stores, between 1E-130 and 1E+126 in magnitude, because the service answers a
+permanent validation error for the whole request.

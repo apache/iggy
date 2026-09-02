@@ -53,6 +53,9 @@ const NESTED_CONTAINER_OVERHEAD: usize = 3;
 const NESTED_ELEMENT_OVERHEAD: usize = 1;
 /// DynamoDB stores a number in at most 21 bytes.
 const MAX_NUMBER_SIZE: usize = 21;
+/// DynamoDB stores a number whose magnitude lies between 1E-130 and 1E+126.
+const MIN_NUMBER_MAGNITUDE: f64 = 1e-130;
+const MAX_NUMBER_MAGNITUDE: f64 = 1e126;
 /// DynamoDB rejects a partition key value longer than 2,048 bytes.
 const MAX_PARTITION_KEY_SIZE: usize = 2048;
 /// DynamoDB rejects a sort key value longer than 1,024 bytes.
@@ -705,7 +708,7 @@ fn parse_duration(raw: Option<&str>, default: &str) -> Duration {
 /// is nested under a single payload attribute.
 fn payload_into_item(payload: Payload) -> Result<HashMap<String, AttributeValue>, Error> {
     match payload {
-        Payload::Json(value) => Ok(match json_into_attribute_value(value) {
+        Payload::Json(value) => Ok(match json_into_attribute_value(value)? {
             AttributeValue::M(item) => item,
             other => HashMap::from([(PAYLOAD_FIELD.to_owned(), other)]),
         }),
@@ -718,7 +721,7 @@ fn payload_into_item(payload: Payload) -> Result<HashMap<String, AttributeValue>
             // buffer rewritten and only the copy can be thrown away.
             let mut buffer = bytes.clone();
             let attribute = match simd_json::to_owned_value(&mut buffer) {
-                Ok(value) => json_into_attribute_value(value),
+                Ok(value) => json_into_attribute_value(value)?,
                 Err(_) => AttributeValue::B(Blob::new(bytes)),
             };
             Ok(match attribute {
@@ -732,8 +735,8 @@ fn payload_into_item(payload: Payload) -> Result<HashMap<String, AttributeValue>
     }
 }
 
-fn json_into_attribute_value(value: OwnedValue) -> AttributeValue {
-    match value {
+fn json_into_attribute_value(value: OwnedValue) -> Result<AttributeValue, Error> {
+    Ok(match value {
         OwnedValue::Static(StaticNode::Null) => AttributeValue::Null(true),
         OwnedValue::Static(StaticNode::Bool(value)) => AttributeValue::Bool(value),
         OwnedValue::Static(StaticNode::I64(value)) => AttributeValue::N(value.to_string()),
@@ -742,7 +745,7 @@ fn json_into_attribute_value(value: OwnedValue) -> AttributeValue {
         // instead of a value the API would reject.
         OwnedValue::Static(StaticNode::F64(value)) => {
             if value.is_finite() {
-                AttributeValue::N(value.to_string())
+                number_attribute(value)?
             } else {
                 AttributeValue::Null(true)
             }
@@ -752,15 +755,29 @@ fn json_into_attribute_value(value: OwnedValue) -> AttributeValue {
             values
                 .into_iter()
                 .map(json_into_attribute_value)
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>, Error>>()?,
         ),
         OwnedValue::Object(values) => AttributeValue::M(
             values
                 .into_iter()
-                .map(|(key, value)| (key, json_into_attribute_value(value)))
-                .collect(),
+                .map(|(key, value)| json_into_attribute_value(value).map(|value| (key, value)))
+                .collect::<Result<HashMap<_, _>, Error>>()?,
         ),
+    })
+}
+
+/// A number outside the DynamoDB range fails the whole batch write with a
+/// validation error, so the message carrying it is skipped instead. Rust prints
+/// a float without an exponent, so a value such as `1e300` also reaches the API
+/// as 301 digits.
+fn number_attribute(value: f64) -> Result<AttributeValue, Error> {
+    let magnitude = value.abs();
+    if magnitude != 0.0 && !(MIN_NUMBER_MAGNITUDE..MAX_NUMBER_MAGNITUDE).contains(&magnitude) {
+        return Err(Error::InvalidRecordValue(format!(
+            "number {value} is outside the DynamoDB range of 1E-130 to 1E+126"
+        )));
     }
+    Ok(AttributeValue::N(value.to_string()))
 }
 
 /// The primary key of one item, compared as typed values so that two different
@@ -1324,7 +1341,10 @@ mod tests {
     #[test]
     fn given_non_finite_json_number_when_converted_should_become_null() {
         let value = OwnedValue::Static(StaticNode::F64(f64::NAN));
-        assert_eq!(json_into_attribute_value(value), AttributeValue::Null(true));
+        assert_eq!(
+            json_into_attribute_value(value).expect("convert value"),
+            AttributeValue::Null(true)
+        );
     }
 
     #[test]
@@ -1749,5 +1769,45 @@ mod tests {
             "http://localhost:8000"
         );
         assert_eq!(redact_endpoint("localhost:8000/path"), "localhost:8000");
+    }
+
+    #[test]
+    fn given_a_number_outside_the_dynamodb_range_when_built_should_skip_message() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(given_json_payload(r#"{"value":1e300}"#));
+
+        let result = sink.build_item(
+            &given_topic_metadata(),
+            &given_messages_metadata(),
+            &mut message,
+        );
+
+        assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
+    }
+
+    #[test]
+    fn given_a_nested_number_outside_the_dynamodb_range_when_built_should_skip_message() {
+        let sink = DynamoDbSink::new(1, given_default_config());
+        let mut message = given_message(given_json_payload(r#"{"nested":{"values":[1e-300]}}"#));
+
+        let result = sink.build_item(
+            &given_topic_metadata(),
+            &given_messages_metadata(),
+            &mut message,
+        );
+
+        assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
+    }
+
+    #[test]
+    fn given_numbers_within_the_dynamodb_range_when_converted_should_be_kept() {
+        for raw in ["0.0", "1.5", "-1e-130", "9.9e125"] {
+            let mut bytes = raw.as_bytes().to_vec();
+            let value = simd_json::to_owned_value(&mut bytes).expect("parse JSON");
+
+            let attribute = json_into_attribute_value(value).expect("convert value");
+
+            assert!(matches!(attribute, AttributeValue::N(_)), "{raw}");
+        }
     }
 }
