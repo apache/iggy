@@ -139,17 +139,19 @@ waits for it to become ready. The chart therefore switches the server to the
 for the length of the restart. Roll **one release at a time** and let the
 cluster regain quorum before starting the next.
 
-Turning `hostNetwork` on for a release that already exists is rejected by the
-API server, because a Deployment cannot move from `RollingUpdate` to `Recreate`
-in place:
+Turning `hostNetwork` on for a release that already exists moves the Deployment
+from `RollingUpdate` to `Recreate`. Under Helm 4's server-side apply that is
+rejected, because the patch cannot drop the `rollingUpdate` block the API server
+defaulted in:
 
 ```text
 Deployment.apps "iggy-n0" is invalid: spec.strategy.rollingUpdate: Forbidden:
   may not be specified when strategy `type` is 'Recreate'
 ```
 
-Uninstall that release and install it again. Set `server.strategy` explicitly if
-you want a different strategy.
+Run that one upgrade with `helm upgrade --server-side=false`, which replaces the
+strategy in place. Set `server.strategy` explicitly if you want a different
+strategy.
 
 ### Roster rules
 
@@ -167,25 +169,31 @@ you want a different strategy.
 
 ### Secrets
 
-Three settings have to carry the byte-identical value on every node, so they
+Four settings have to carry the byte-identical value on every node, so they
 belong in one Secret that all releases reference rather than in each release's
 values. Create it in the release namespace before the first install:
 
 ```bash
 JWT="$(head -c 32 /dev/urandom | base64)"
 kubectl create secret generic iggy-cluster-secrets \
+  --from-literal=username=iggy \
+  --from-literal=password="$(head -c 24 /dev/urandom | base64)" \
   --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
   --from-literal=jwtEncodingSecret="$JWT" \
   --from-literal=jwtDecodingSecret="$JWT" \
   --from-literal=encryptionKey="$(head -c 32 /dev/urandom | base64)"
 ```
 
-`examples/cluster-3-node.yaml` points `server.encryption`, `server.jwt` and
-`server.cluster.auth` at that one Secret. Each of the three also accepts an
-inline value, which the chart turns into its own Secret; that is convenient for
-a single node and a poor fit for a cluster, since the value then lives in every
-release's stored values.
+`examples/cluster-3-node.yaml` points `server.users.root`, `server.encryption`,
+`server.jwt` and `server.cluster.auth` at that one Secret. The last three also
+accept an inline value, which the chart turns into its own Secret; that is
+convenient for a single node and a poor fit for a cluster, since the value then
+lives in every release's stored values.
 
+* **`server.users.root`** seeds the root user. Every node creates it locally
+  from its own `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD`, so a password that
+  differs on one release logs in on that node only, and a first cluster boot
+  refuses to start without both.
 * **`server.cluster.auth`** makes every replica connection complete an
   authenticated handshake or be rejected. The key is at least 32 bytes of
   CSPRNG output. Turning it on or off is a coordinated restart of the whole
@@ -199,8 +207,8 @@ release's stored values.
   rather than an addition; setting them anyway keeps tokens working if auth is
   later turned off.
 
-None of the three values is written to the data directory, and each is masked as
-`******` in the startup log.
+None of the encryption, JWT and replica-auth values is written to the data
+directory, and each is masked as `******` in the startup log.
 
 ### Storage
 
@@ -208,16 +216,19 @@ A replica cannot move between nodes without invalidating its roster entry, so
 give each release storage that stays on its node, and size
 `server.persistence` per node rather than for the cluster. A replica that starts
 on an empty volume rejoins by state transfer, which is correct but re-reads the
-whole dataset from its peers.
+whole dataset from its peers. `server.persistence.enabled: false` puts the
+replica on `emptyDir` and forces exactly that on every pod replacement, so the
+cluster example enables persistence and leaves `storageClass` for you to point
+at a node-local provisioner.
 
 ### What the chart refuses
 
-`server.replicaCount > 1` and `autoscaling.enabled` both fail at render time.
-Scaling the server Deployment produces N independent servers behind one Service,
-all writing the same PVC subpath with no lock between them, which corrupts the
-data directory while `helm --wait` still reports success. Cluster size is a
-roster decision, so add a node to `server.cluster.nodes` and install another
-release instead.
+`server.replicaCount > 1` fails at render time. Scaling the server Deployment
+produces N independent servers behind one Service, all writing the same PVC
+subpath with no lock between them, which corrupts the data directory while
+`helm --wait` still reports success. The chart ships no HorizontalPodAutoscaler
+for the same reason. Cluster size is a roster decision, so add a node to
+`server.cluster.nodes` and install another release instead.
 
 ## Uninstallation
 
@@ -355,12 +366,18 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 
 A wildcard bind says which interfaces accept connections, not where clients
 reach the pod, so the server also needs the address to publish in cluster
-metadata. Server builds that carry the setting refuse to start without it;
-older ones, including the `0.7.0` this chart pins by default, have no such
-refusal and log the variable as unknown and ignored. Either way the chart
-sets `IGGY_NODE_ADVERTISED_ADDRESS` to the in-cluster Service DNS name;
-override it with `server.advertisedAddress` when clients arrive through a
-LoadBalancer or an Ingress.
+metadata. Server builds that carry the setting refuse to start without it.
+`0.9.0-edge.6`, the image this chart pins, predates it:
+that build logs `IGGY_NODE_ADVERTISED_ADDRESS` as an unknown variable and
+publishes the bind address, so the chart's default stays inert until the pinned
+image moves past it. Either way the chart sets `IGGY_NODE_ADVERTISED_ADDRESS` to
+the in-cluster Service DNS name; override it with `server.advertisedAddress`
+when clients arrive through a LoadBalancer or an Ingress.
+
+In cluster mode the server ignores the variable altogether and publishes each
+node's roster `ip`, or its `advertisedAddress` when the entry carries one, so
+the chart leaves the variable out there and refuses a render that sets
+`server.advertisedAddress` alongside `server.cluster.enabled`.
 
 Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` yourself works too:
 the chart then leaves its own default out, so the variable is declared once.
@@ -461,10 +478,6 @@ pre-commit install
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | additionalLabels | object | `{}` | Additional labels for all resources |
-| autoscaling.enabled | bool | `false` | Enable horizontal pod autoscaling |
-| autoscaling.maxReplicas | int | `100` | Maximum replicas for autoscaling |
-| autoscaling.minReplicas | int | `1` | Minimum replicas for autoscaling |
-| autoscaling.targetCPUUtilizationPercentage | int | `80` | Target CPU utilization for autoscaling |
 | fullnameOverride | string | `""` | Override full release name |
 | imagePullSecrets | list | `[]` | Image pull secrets for private registries |
 | nameOverride | string | `""` | Override chart name |
@@ -472,8 +485,8 @@ pre-commit install
 | podSecurityContext | object | `{"seccompProfile":{"type":"Unconfined"}}` | Pod security context (server uses io_uring, requires unconfined seccomp) |
 | resources | object | `{}` | Resource limits and requests for server |
 | securityContext | object | `{"capabilities":{"add":["IPC_LOCK"]}}` | Container security context (server requires IPC_LOCK for io_uring) |
-| server | object | `{"advertisedAddress":"","affinity":{},"cluster":{"auth":{"enabled":false,"existingSecret":{"name":"","previousSharedSecretKey":"clusterPreviousSharedSecret","sharedSecretKey":"clusterSharedSecret"},"previousSharedSecret":"","sharedSecret":""},"enabled":false,"name":"iggy-cluster","nodes":[],"selfReplicaId":0},"enabled":true,"encryption":{"enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""},"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"extraArgs":[],"hostNetwork":false,"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":"0.9.0-edge.6"},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"jwt":{"decodingSecret":"","encodingSecret":"","existingSecret":{"decodingSecretKey":"jwtDecodingSecret","encodingSecretKey":"jwtEncodingSecret","name":""}},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090,"tcpReplica":9090,"websocket":8092},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"strategy":{},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
-| server.advertisedAddress | string | `""` | Client-facing address published in cluster metadata. Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but setting both is refused at render time. Empty falls back to the in-cluster Service DNS name. |
+| server | object | `{"advertisedAddress":"","affinity":{},"cluster":{"auth":{"enabled":false,"existingSecret":{"name":"","previousSharedSecretKey":"clusterPreviousSharedSecret","sharedSecretKey":"clusterSharedSecret"},"previousSharedSecret":"","sharedSecret":""},"enabled":false,"name":"iggy-cluster","nodes":[],"requireHostNetwork":true,"selfReplicaId":0},"enabled":true,"encryption":{"enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""},"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"extraArgs":[],"hostNetwork":false,"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":""},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"jwt":{"decodingSecret":"","encodingSecret":"","existingSecret":{"decodingSecretKey":"jwtDecodingSecret","encodingSecretKey":"jwtEncodingSecret","name":""}},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090,"tcpReplica":9090,"websocket":8092},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"strategy":{},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
+| server.advertisedAddress | string | `""` | Client-facing address published in cluster metadata. Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but setting both is refused at render time. Empty falls back to the in-cluster Service DNS name. Ignored in cluster mode, where the address comes from the node's roster entry, so setting both is refused there too. |
 | server.affinity | object | `{}` | Affinity rules for server pods |
 | server.cluster.auth | object | `{"enabled":false,"existingSecret":{"name":"","previousSharedSecretKey":"clusterPreviousSharedSecret","sharedSecretKey":"clusterSharedSecret"},"previousSharedSecret":"","sharedSecret":""}` | Replica-to-replica authentication on the consensus port. When enabled every peer must complete an authenticated handshake or be rejected, and a shared secret becomes mandatory. Enabling it on a running cluster is a coordinated-restart change, not a rolling one. |
 | server.cluster.auth.enabled | bool | `false` | Require the authenticated replica handshake |
@@ -485,6 +498,7 @@ pre-commit install
 | server.cluster.enabled | bool | `false` | Enable cluster (VSR consensus) mode. One Helm release per node: every release shares the same `nodes` roster and overrides only `selfReplicaId`. See the Cluster Mode section of the chart README. |
 | server.cluster.name | string | `"iggy-cluster"` | Cluster name, byte-identical on every node. Hashed into the on-disk cluster id on first boot, so changing it later means starting from an empty data directory. |
 | server.cluster.nodes | list | `[]` | Cluster roster, mirroring the server's `[[cluster.nodes]]` config. Every node runs the identical list. `ip` is the replica-plane address: this node's consensus listener binds it verbatim and every peer dials it verbatim, so it must be a literal IP that the pod itself owns. With `server.hostNetwork` that is the node IP. `ports.tcpReplica` is required on every entry; the remaining ports default to `server.ports`. |
+| server.cluster.requireHostNetwork | bool | `true` | Refuse to render a cluster node without `server.hostNetwork`. The replica listener binds the roster `ip` verbatim, which no pod owns on the cluster network, so the pod would die at boot with `CannotBindToSocket`. Set this to false only when the roster `ip` is an address the pod itself holds. |
 | server.cluster.selfReplicaId | int | `0` | Which `nodes` entry this release runs, matched against `replicaId`. |
 | server.enabled | bool | `true` | Enable the Iggy server deployment |
 | server.encryption | object | `{"enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""}` | Server-side encryption of message payloads and state commands, using AES-256-GCM. Every node of a cluster must hold the identical key, or it cannot read data another node wrote. |
@@ -493,11 +507,11 @@ pre-commit install
 | server.encryption.existingSecret.name | string | `""` | Name of an existing Secret holding the encryption key |
 | server.encryption.key | string | `""` | 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set. Prefer `existingSecret` outside development: a value here is stored in the Helm release and readable by anyone who can read it. |
 | server.env | list | `[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}]` | Environment variables for the server container |
-| server.extraArgs | list | `[]` | Extra command-line arguments appended to the server entrypoint, e.g. `["--replica-id", "0"]` when running a cluster node. |
+| server.extraArgs | list | `[]` | Extra command-line arguments appended to the server entrypoint, e.g. `["--with-default-root-credentials"]` for a throwaway development install. `--replica-id` is not one of them: the chart passes it already whenever `cluster.enabled` is set. |
 | server.hostNetwork | bool | `false` | Run the server pod in the host network namespace. Required for cluster mode, where the replica listener binds the roster IP verbatim. |
 | server.image.pullPolicy | string | `"Always"` | Image pull policy |
 | server.image.repository | string | `"apache/iggy"` | Server image repository |
-| server.image.tag | string | `"0.9.0-edge.6"` | Server image tag (overrides chart appVersion) |
+| server.image.tag | string | `""` | Server image tag. Empty uses the chart appVersion. |
 | server.ingress.annotations | object | `{}` | Ingress annotations (controller-specific) |
 | server.ingress.className | string | `""` | Ingress class name (controller-neutral) |
 | server.ingress.enabled | bool | `false` | Enable ingress for the server |

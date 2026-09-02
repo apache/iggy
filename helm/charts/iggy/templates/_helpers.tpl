@@ -108,6 +108,13 @@ the pod is already scheduled.
   {{- if not $cluster.nodes }}
     {{- fail "server.cluster.enabled is true but server.cluster.nodes is empty. Every node runs the identical roster; see the Cluster Mode section of the chart README." }}
   {{- end }}
+  {{- if and $cluster.requireHostNetwork (not .Values.server.hostNetwork) }}
+    {{- fail "server.cluster.enabled is true but server.hostNetwork is false. The replica listener binds the roster ip verbatim, which is not an address a pod owns on the cluster network, so the pod dies at boot with CannotBindToSocket. Set server.hostNetwork to true, or server.cluster.requireHostNetwork to false if the roster ip really is one this pod owns." }}
+  {{- end }}
+  {{- $root := .Values.server.users.root }}
+  {{- if and (not $root.createSecret) (not $root.existingSecret.name) }}
+    {{- fail "server.users.root has neither createSecret nor existingSecret.name, so the container receives no IGGY_ROOT_USERNAME or IGGY_ROOT_PASSWORD. A first cluster boot refuses to start without both, because every node creates root locally and the credentials have to come out identical on all of them." }}
+  {{- end }}
   {{- $count := len $cluster.nodes }}
   {{- $seen := dict }}
   {{- range $cluster.nodes }}
@@ -116,6 +123,12 @@ the pod is already scheduled.
     {{- end }}
     {{- if not .ip }}
       {{- fail (printf "server.cluster.nodes entry %q has no ip. The replica listener binds this address verbatim, so it must be a literal IP the pod owns." .name) }}
+    {{- end }}
+    {{- if not (regexMatch "^[0-9a-fA-F.:]+$" .ip) }}
+      {{- fail (printf "server.cluster.nodes entry %q has ip %q, which the server parses as an IP address and rejects. Use server.cluster.nodes[*].advertisedAddress for the hostname clients dial." .name .ip) }}
+    {{- end }}
+    {{- if or (eq .ip "0.0.0.0") (eq .ip "::") }}
+      {{- fail (printf "server.cluster.nodes entry %q has the wildcard ip %q. Every peer dials this address verbatim, so it has to name one interface." .name .ip) }}
     {{- end }}
     {{- if kindIs "invalid" .replicaId }}
       {{- fail (printf "server.cluster.nodes entry %q has no replicaId" .name) }}
@@ -135,6 +148,31 @@ the pod is already scheduled.
   {{- if not (hasKey $seen (printf "%d" (int $cluster.selfReplicaId))) }}
     {{- fail (printf "server.cluster.selfReplicaId is %d but no server.cluster.nodes entry declares that replicaId. Each release picks its own identity out of the shared roster." (int $cluster.selfReplicaId)) }}
   {{- end }}
+{{- end }}
+
+{{/*
+The ports this release's server binds, as a JSON object. In cluster mode the
+server takes every listener port from its own roster entry and never falls back
+to the top-level ones, so a node whose entry names other ports has to reach the
+container ports, the probes and the Service targets as well. `server.ports`
+supplies the per-field default there and the whole answer outside cluster mode.
+*/}}
+{{- define "iggy.serverPorts" -}}
+  {{- $ports := .Values.server.ports }}
+  {{- $resolved := dict "http" $ports.http "quic" $ports.quic "tcp" $ports.tcp "websocket" $ports.websocket "tcpReplica" $ports.tcpReplica }}
+  {{- if .Values.server.cluster.enabled }}
+    {{- $selfReplicaId := int .Values.server.cluster.selfReplicaId }}
+    {{- range .Values.server.cluster.nodes }}
+      {{- if eq (int .replicaId) $selfReplicaId }}
+        {{- range $name, $port := (default (dict) .ports) }}
+          {{- if $port }}
+            {{- $_ := set $resolved $name $port }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+  {{- $resolved | toJson }}
 {{- end }}
 
 {{/*
@@ -214,6 +252,11 @@ anything that names the cause.
     {{- if and (not $server.encryption.key) (not $server.encryption.existingSecret.name) }}
       {{- fail "server.encryption.enabled is true but no key was given. Set server.encryption.key to a base64-encoded 32-byte key, or point server.encryption.existingSecret.name at a Secret holding one." }}
     {{- end }}
+    {{- if and $server.encryption.key (not $server.encryption.existingSecret.name) }}
+      {{- if ne (len (b64dec $server.encryption.key)) 32 }}
+        {{- fail (printf "server.encryption.key decodes to %d bytes. AES-256-GCM takes a base64-encoded 32-byte key, and the server fails the boot with 'Invalid encryption key' on anything else." (len (b64dec $server.encryption.key))) }}
+      {{- end }}
+    {{- end }}
   {{- end }}
   {{- if $server.cluster.auth.enabled }}
     {{- if not $server.cluster.enabled }}
@@ -224,6 +267,14 @@ anything that names the cause.
     {{- end }}
     {{- if and $server.cluster.auth.sharedSecret (lt (len $server.cluster.auth.sharedSecret) 32) }}
       {{- fail (printf "server.cluster.auth.sharedSecret is %d bytes; the server requires at least 32 bytes of CSPRNG output." (len $server.cluster.auth.sharedSecret)) }}
+    {{- end }}
+    {{- if $server.cluster.auth.previousSharedSecret }}
+      {{- if lt (len $server.cluster.auth.previousSharedSecret) 32 }}
+        {{- fail (printf "server.cluster.auth.previousSharedSecret is %d bytes; the server requires at least 32 bytes of CSPRNG output." (len $server.cluster.auth.previousSharedSecret)) }}
+      {{- end }}
+      {{- if eq $server.cluster.auth.previousSharedSecret $server.cluster.auth.sharedSecret }}
+        {{- fail "server.cluster.auth.previousSharedSecret equals server.cluster.auth.sharedSecret, which the server rejects as a no-op rotation window. Leave it empty outside a rotation." }}
+      {{- end }}
     {{- end }}
   {{- end }}
 {{- end }}
@@ -257,6 +308,7 @@ Secret owns it.
     secretKeyRef:
       name: {{ default $generated $server.jwt.existingSecret.name }}
       key: {{ ternary $server.jwt.existingSecret.decodingSecretKey "jwtDecodingSecret" (ne $server.jwt.existingSecret.name "") }}
+      optional: true
   {{- end }}
   {{- if $server.cluster.auth.enabled }}
 - name: IGGY_CLUSTER_AUTH_ENABLED

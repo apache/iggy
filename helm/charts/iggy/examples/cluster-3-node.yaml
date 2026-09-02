@@ -33,20 +33,44 @@
 # Secret that all three releases reference rather than in this file. Create it
 # once, in the release namespace, before the first install:
 #
+#   JWT="$(head -c 32 /dev/urandom | base64)"
 #   kubectl create secret generic iggy-cluster-secrets \
+#     --from-literal=username=iggy \
+#     --from-literal=password="$(head -c 24 /dev/urandom | base64)" \
 #     --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
-#     --from-literal=jwtEncodingSecret="$(head -c 32 /dev/urandom | base64)" \
-#     --from-literal=jwtDecodingSecret="$(head -c 32 /dev/urandom | base64)" \
+#     --from-literal=jwtEncodingSecret="$JWT" \
+#     --from-literal=jwtDecodingSecret="$JWT" \
 #     --from-literal=encryptionKey="$(head -c 32 /dev/urandom | base64)"
 #
-# The JWT encoding and decoding secrets are an HMAC key pair, so they hold the
-# same value; generate them once and reuse it if you set them by hand.
+# The JWT encoding and decoding secrets are one HMAC key, which is why both
+# entries carry the same value. Two different values make every token from
+# /users/login fail with 401, and the server only warns about the mismatch.
 
 ui:
   enabled: false
 
 server:
   hostNetwork: true
+
+  # The root user is created locally on each node out of that node's own
+  # IGGY_ROOT_* environment, so the credentials have to match across the
+  # releases the same way the keys below do.
+  users:
+    root:
+      createSecret: false
+      existingSecret:
+        name: iggy-cluster-secrets
+
+  # A release is pinned to one node, so its storage has to stay on that node.
+  # On emptyDir every pod replacement wipes the replica, which then refetches
+  # the whole dataset from its peers.
+  persistence:
+    enabled: true
+    # Name a node-local class here (local-path, topolvm, a local volume
+    # provisioner). Empty takes the default provisioner, which may hand out
+    # storage that does not stay on the pinned node.
+    storageClass: ""
+    size: 8Gi
 
   # Encrypts message payloads and state commands at rest with AES-256-GCM. The
   # key is cluster-wide: a node that holds a different one cannot read what its

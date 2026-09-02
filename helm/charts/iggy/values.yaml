@@ -20,7 +20,8 @@ server:
   # -- Client-facing address published in cluster metadata. Declaring
   # `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but
   # setting both is refused at render time. Empty falls back to the in-cluster
-  # Service DNS name.
+  # Service DNS name. Ignored in cluster mode, where the address comes from the
+  # node's roster entry, so setting both is refused there too.
   advertisedAddress: ""
   # -- Enable the Iggy server deployment
   enabled: true
@@ -31,8 +32,8 @@ server:
     repository: apache/iggy
     # -- Image pull policy
     pullPolicy: Always
-    # -- Server image tag (overrides chart appVersion)
-    tag: "0.9.0-edge.6"
+    # -- Server image tag. Empty uses the chart appVersion.
+    tag: ""
   ports:
     # -- HTTP API port
     http: 3000
@@ -151,6 +152,12 @@ server:
     name: iggy-cluster
     # -- Which `nodes` entry this release runs, matched against `replicaId`.
     selfReplicaId: 0
+    # -- Refuse to render a cluster node without `server.hostNetwork`. The
+    # replica listener binds the roster `ip` verbatim, which no pod owns on the
+    # cluster network, so the pod would die at boot with `CannotBindToSocket`.
+    # Set this to false only when the roster `ip` is an address the pod itself
+    # holds.
+    requireHostNetwork: true
     # -- Replica-to-replica authentication on the consensus port. When enabled
     # every peer must complete an authenticated handshake or be rejected, and a
     # shared secret becomes mandatory. Enabling it on a running cluster is a
@@ -203,7 +210,9 @@ server:
   strategy: {}
 
   # -- Extra command-line arguments appended to the server entrypoint, e.g.
-  # `["--replica-id", "0"]` when running a cluster node.
+  # `["--with-default-root-credentials"]` for a throwaway development install.
+  # `--replica-id` is not one of them: the chart passes it already whenever
+  # `cluster.enabled` is set.
   extraArgs: []
 
   # -- Environment variables for the server container
@@ -338,15 +347,3 @@ securityContext:
 
 # -- Resource limits and requests for server
 resources: {}
-
-autoscaling:
-  # -- Enable horizontal pod autoscaling
-  enabled: false
-  # -- Minimum replicas for autoscaling
-  minReplicas: 1
-  # -- Maximum replicas for autoscaling
-  maxReplicas: 100
-  # -- Target CPU utilization for autoscaling
-  targetCPUUtilizationPercentage: 80
-  # -- Target memory utilization for autoscaling (optional)
-  # targetMemoryUtilizationPercentage: 80

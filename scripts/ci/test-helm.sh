@@ -53,6 +53,9 @@ HELM_SMOKE_GATEWAY_NAME="${HELM_SMOKE_GATEWAY_NAME:-iggy-smoke-gateway}"
 HELM_SMOKE_GATEWAY_PF_PORT="${HELM_SMOKE_GATEWAY_PF_PORT:-8080}"
 HELM_SMOKE_KIND_NAME="${HELM_SMOKE_KIND_NAME:-iggy-helm-smoke}"
 HELM_SMOKE_SERVER_CPU_ALLOCATION="${HELM_SMOKE_SERVER_CPU_ALLOCATION:-1}"
+# A well-formed 32-byte AES-256-GCM key, base64 encoded. Render-only: it never
+# reaches a running server.
+HELM_TEST_ENCRYPTION_KEY="AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 
 # HELM_SMOKE_GATEWAY_NAMESPACE and HELM_SMOKE_GATEWAY_NAME must match the
 # defaults in scripts/ci/setup-helm-smoke-cluster.sh - the HTTPRoute
@@ -197,12 +200,10 @@ validate() {
 
   local chart_version
   local chart_app_version
-  local server_image_tag
   local ui_image_tag
 
   chart_version="$(extract_chart_field version)"
   chart_app_version="$(extract_chart_field appVersion)"
-  server_image_tag="$(extract_values_tag server)"
   ui_image_tag="$(extract_values_tag ui)"
 
   prepare_render_dir
@@ -217,7 +218,7 @@ validate() {
   grep -q "helm.sh/chart: iggy-${chart_version}" "$HELM_RENDER_DIR/default.yaml"
   grep -q "helm.sh/chart: iggy-ui-${chart_version}" "$HELM_RENDER_DIR/default.yaml"
   grep -q "app.kubernetes.io/version: \"${chart_app_version}\"" "$HELM_RENDER_DIR/default.yaml"
-  grep -q "image: \"apache/iggy:${server_image_tag}\"" "$HELM_RENDER_DIR/default.yaml"
+  grep -q "image: \"apache/iggy:${chart_app_version}\"" "$HELM_RENDER_DIR/default.yaml"
   grep -q "image: \"apache/iggy-web-ui:${ui_image_tag}\"" "$HELM_RENDER_DIR/default.yaml"
 
   helm template iggy "$CHART_DIR" \
@@ -277,8 +278,21 @@ validate() {
     exit 1
   fi
 
+  helm template iggy "$CHART_DIR" \
+    --set server.encryption.enabled=true \
+    --set-string server.encryption.key="$HELM_TEST_ENCRYPTION_KEY" \
+    > "$HELM_RENDER_DIR/generated-secret.yaml"
+  grep -q "^  encryptionKey: \"${HELM_TEST_ENCRYPTION_KEY}\"$" "$HELM_RENDER_DIR/generated-secret.yaml"
+  grep -q '^  name: iggy-secrets$' "$HELM_RENDER_DIR/generated-secret.yaml"
+  grep -q '^                  name: iggy-secrets$' "$HELM_RENDER_DIR/generated-secret.yaml"
+  grep -q '^                  key: encryptionKey$' "$HELM_RENDER_DIR/generated-secret.yaml"
+  test "$(grep -c '^kind: Secret$' "$HELM_RENDER_DIR/generated-secret.yaml")" -eq 2
+
   assert_render_rejected "server.replicaCount=3" --set server.replicaCount=3
   assert_render_rejected "encryption without a key" --set server.encryption.enabled=true
+  assert_render_rejected "an encryption key that is not 32 bytes" \
+    --set server.encryption.enabled=true \
+    --set-string server.encryption.key=bm90LTMyLWJ5dGVz
   assert_render_rejected "replica auth without a secret" \
     -f "$CHART_DIR/examples/cluster-3-node.yaml" \
     --set server.cluster.auth.existingSecret.name="" \
@@ -288,7 +302,6 @@ validate() {
     --set server.cluster.auth.existingSecret.name="" \
     --set-string server.cluster.auth.sharedSecret=tooshort \
     --set server.cluster.selfReplicaId=0
-  assert_render_rejected "autoscaling.enabled=true" --set autoscaling.enabled=true
   assert_render_rejected "cluster without a roster" --set server.cluster.enabled=true
   assert_render_rejected "selfReplicaId outside the roster" \
     -f "$CHART_DIR/examples/cluster-3-node.yaml" --set server.cluster.selfReplicaId=9
