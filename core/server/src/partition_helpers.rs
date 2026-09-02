@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Helpers shared between the recovery path in [`crate::bootstrap`] and
+//! Helpers shared between the recovery path in [`crate::boot`] and
 //! the runtime partition reconciliation loop.
 //!
 //! Recovery hydrates an [`IggyPartition`] from on-disk state; the

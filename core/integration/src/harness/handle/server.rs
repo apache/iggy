@@ -42,6 +42,10 @@ use toml::Value;
 const SLEEP_INTERVAL_MS: u64 = 20;
 const MAX_PORT_WAIT_DURATION_S: u64 = 60;
 const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
+/// The server truncates the dump and then writes it in one go, so a read in
+/// between parses as valid TOML with sections or keys missing; readiness
+/// retries on this message.
+const INCOMPLETE_DUMP_MESSAGE: &str = "Failed to parse server config: the dump is incomplete";
 
 #[derive(Debug, Clone)]
 struct ServerProtocolAddr {
@@ -410,6 +414,30 @@ impl ServerHandle {
             return Ok(());
         }
 
+        // Ephemeral ports: every enabled transport binds `:0` and
+        // `verify_bound_ports` adopts what the OS chose from the dumped runtime
+        // config. Ahead of the restart branch so a restart discovers afresh
+        // instead of pinning a port the OS may have handed out elsewhere since.
+        if self.config.ephemeral_ports {
+            self.addrs = ServerProtocolAddr::empty();
+            let unbound = SocketAddr::new(self.config.ip_kind.loopback(), 0).to_string();
+            self.envs
+                .insert("IGGY_TCP_ADDRESS".to_string(), unbound.clone());
+            if self.config.http_enabled {
+                self.envs
+                    .insert("IGGY_HTTP_ADDRESS".to_string(), unbound.clone());
+            }
+            if self.config.quic_enabled {
+                self.envs
+                    .insert("IGGY_QUIC_ADDRESS".to_string(), unbound.clone());
+            }
+            if self.config.websocket_enabled {
+                self.envs
+                    .insert("IGGY_WEBSOCKET_ADDRESS".to_string(), unbound);
+            }
+            return Ok(());
+        }
+
         // Restart case: reuse existing addresses to maintain consistency
         if self.addrs.tcp.is_some()
             || self.addrs.http.is_some()
@@ -509,7 +537,11 @@ impl ServerHandle {
         })
     }
 
-    fn verify_bound_ports(&self, config_path: &Path) -> Result<(), TestBinaryError> {
+    /// Reconcile the dumped runtime config with the addresses this handle
+    /// holds: a pre-reserved address must be the one the server bound, and an
+    /// address the handle does not know yet (`ephemeral_ports`) is adopted
+    /// from the dump.
+    fn verify_bound_ports(&mut self, config_path: &Path) -> Result<(), TestBinaryError> {
         let content =
             fs::read_to_string(config_path).map_err(|e| TestBinaryError::InvalidState {
                 message: format!(
@@ -523,32 +555,21 @@ impl ServerHandle {
                 message: format!("Failed to parse server config: {e}"),
             })?;
 
-        let bound_tcp = Self::extract_address(&config, "tcp");
-        let bound_http = Self::extract_address(&config, "http");
-        let bound_quic = Self::extract_address(&config, "quic");
-        let bound_websocket = Self::extract_address(&config, "websocket");
-
+        let transports = [
+            ("TCP", "tcp", &mut self.addrs.tcp),
+            ("HTTP", "http", &mut self.addrs.http),
+            ("QUIC", "quic", &mut self.addrs.quic),
+            ("WebSocket", "websocket", &mut self.addrs.websocket),
+        ];
         let mut mismatches = Vec::new();
-
-        if let (Some(expected), Some(bound)) = (self.addrs.tcp, bound_tcp)
-            && expected != bound
-        {
-            mismatches.push(format!("TCP: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.http, bound_http)
-            && expected != bound
-        {
-            mismatches.push(format!("HTTP: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.quic, bound_quic)
-            && expected != bound
-        {
-            mismatches.push(format!("QUIC: expected {expected}, got {bound}"));
-        }
-        if let (Some(expected), Some(bound)) = (self.addrs.websocket, bound_websocket)
-            && expected != bound
-        {
-            mismatches.push(format!("WebSocket: expected {expected}, got {bound}"));
+        for (label, section, expected) in transports {
+            match (*expected, Self::extract_address(&config, section)?) {
+                (Some(expected), Some(bound)) if expected != bound => {
+                    mismatches.push(format!("{label}: expected {expected}, got {bound}"));
+                }
+                (None, Some(bound)) => *expected = Some(bound),
+                _ => {}
+            }
         }
 
         if !mismatches.is_empty() {
@@ -563,8 +584,38 @@ impl ServerHandle {
         Ok(())
     }
 
-    fn extract_address(config: &Value, protocol: &str) -> Option<SocketAddr> {
-        config.get(protocol)?.get("address")?.as_str()?.parse().ok()
+    /// The address a transport section reports, when it marks the transport
+    /// enabled: a disabled transport keeps its configured address in the dump
+    /// without ever binding it. Every section is serialized with both keys
+    /// whether or not the transport is enabled, so a section or key still
+    /// absent is a dump being written, not a disabled transport.
+    fn extract_address(
+        config: &Value,
+        protocol: &str,
+    ) -> Result<Option<SocketAddr>, TestBinaryError> {
+        let incomplete = || TestBinaryError::InvalidState {
+            message: INCOMPLETE_DUMP_MESSAGE.to_string(),
+        };
+        let section = config.get(protocol).ok_or_else(incomplete)?;
+        let enabled = section
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(incomplete)?;
+        if !enabled {
+            return Ok(None);
+        }
+        let address = section
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(incomplete)?;
+        address
+            .parse()
+            .map(Some)
+            .map_err(|error| TestBinaryError::InvalidState {
+                message: format!(
+                    "Server config {protocol}.address {address:?} is not a socket address: {error}"
+                ),
+            })
     }
 
     fn start_watchdog(&mut self) {

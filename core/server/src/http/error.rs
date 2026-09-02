@@ -617,7 +617,8 @@ mod tests {
                 .map(|node| ResolvedClusterNode::try_from(node).expect("valid roster node"))
                 .collect(),
             self_advertised: "127.0.0.1".to_owned(),
-            self_ports: TransportPorts::default(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: std::sync::Arc::default(),
             metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
             )),
