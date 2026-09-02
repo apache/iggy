@@ -184,174 +184,21 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let partition = match load_partition(
+        let Some(partition) = load_partition_or_fence(
             config,
             namespace,
-            Arc::clone(&partition_stats),
+            partition_stats,
             &partition_metadata,
             topic_runtime,
             topology.cluster_id,
             topology.self_replica_id,
             topology.replica_count,
             Rc::clone(&bus),
+            &partitions,
         )
-        .await
-        {
-            Ok(partition) => partition,
-            // ONE damaged local chain must not take the node down. The shapes
-            // this refuses are structural -- what a failed state-transfer
-            // quarantine leaves behind, or damage the recovery walk proved
-            // inside a segment. What follows depends on whether a peer can
-            // restore the data. With peers, the segment files are fenced
-            // aside (keeping the superblock so the group cannot re-enter
-            // view 0), the group is materialised fresh, and the ordinary
-            // rejoin path (repair, then state transfer on a refused floor)
-            // refills it. Single-replica, only a chain-shape refusal whose
-            // planned chain provably holds ZERO recoverable bytes still
-            // fences and rebuilds: nothing servable is at stake, so an empty
-            // rebuild hides no loss. The verdict variant alone is not that
-            // evidence -- a hole and an orphan empty segment both fire over
-            // fully populated chains -- which is why the gate reads the byte
-            // total the refusal carries. Every other refusal tombstones,
-            // leaving its files exactly where they are: a rebuilt empty
-            // partition answers polls exactly like a healthy empty one and
-            // hides the loss, while an unrouted namespace is a failure an
-            // operator can see.
-            Err(ServerError::PartitionRecoveryRefused { dir, reason, .. }) => {
-                let partition_dir = dir.to_string_lossy().into_owned();
-                let rebuild_for_rejoin = topology.replica_count > 1
-                    || matches!(
-                        reason,
-                        PartitionRecoveryRefusal::Hole {
-                            recoverable_bytes: 0,
-                            ..
-                        } | PartitionRecoveryRefusal::EmptyNonTailSegment {
-                            recoverable_bytes: 0,
-                            ..
-                        }
-                    );
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id = partition_metadata.id,
-                    partition_dir,
-                    %reason,
-                    "refusing the recovered segment chain"
-                );
-                // A pass-A refusal folded nothing into the stats (recovery
-                // counts only accepted chains), but the hydrate-reopen refusal
-                // arrives after a fully counted load, so clear them either way.
-                partition_stats.zero_out_all();
-                if !rebuild_for_rejoin {
-                    // No quarantine here, mirroring the superblock arm below:
-                    // a tombstone is only durable if its cause is. Fencing the
-                    // chain aside would leave the next boot zero segments to
-                    // walk, so it would re-seed from the surviving superblock,
-                    // plant a fresh segment, and serve the partition empty
-                    // with no refusal logged. Left at their real paths, the
-                    // same files re-derive this verdict (and this log line)
-                    // every boot, and the reconciler's tombstone gate keeps
-                    // the namespace away from a fresh build, whose
-                    // initial-segment open would truncate the oldest refused
-                    // segment in place. The one refusal whose cause is NOT
-                    // durable is `StorageSizeMismatch`: it fires from the
-                    // reopen right after recovery truncated the same file, so
-                    // the next boot re-walks the already-truncated bytes and,
-                    // unless the length diverges again, accepts the chain
-                    // instead of re-tombstoning -- acceptable for an
-                    // assertion that the filesystem lied about a length.
-                    // `%reason` repeated on purpose: this is the line an
-                    // operator greps to enumerate dark partitions, so it has
-                    // to carry the verdict on its own.
-                    error!(
-                        stream_id,
-                        topic_id,
-                        partition_id = partition_metadata.id,
-                        partition_dir,
-                        %reason,
-                        "no peer replica holds this partition's data; leaving the refused \
-                         segment files in place and tombstoning it instead of serving it \
-                         empty"
-                    );
-                    partitions.tombstone(namespace);
-                    continue;
-                }
-                match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
-                    Ok(fenced_dir) => error!(
-                        stream_id,
-                        topic_id,
-                        partition_id = partition_metadata.id,
-                        fenced_dir,
-                        "quarantined the refused segment files; they are kept for inspection"
-                    ),
-                    Err(error) => {
-                        // NOT rebuilt: `build_partition_fresh` reaches
-                        // `ensure_initial_segment`, which opens segment 0 with
-                        // `file_exists = false` and TRUNCATES whatever the
-                        // failed quarantine left behind. The likeliest failures
-                        // (suffix cap exhausted, `create_dir_all`) move zero
-                        // files, so rebuilding would destroy the oldest segment
-                        // on the first attempt while the higher-offset survivors
-                        // keep refusing every boot -- a loop that never
-                        // terminates and eats the chain one segment at a time.
-                        // Tombstone instead: the namespace stays unmaterialised
-                        // and unrouted, the reconciler backs off, and an
-                        // operator still has every byte.
-                        error!(
-                            stream_id,
-                            topic_id,
-                            partition_id = partition_metadata.id,
-                            partition_dir,
-                            %error,
-                            "failed to quarantine the refused segment files; leaving this \
-                             partition tombstoned rather than rebuilding over them"
-                        );
-                        partitions.tombstone(namespace);
-                        continue;
-                    }
-                }
-                build_partition_fresh(
-                    config,
-                    namespace,
-                    partition_stats,
-                    partition_metadata.created_revision,
-                    topic_runtime,
-                    topology.cluster_id,
-                    topology.self_replica_id,
-                    topology.replica_count,
-                    partition_metadata.created_view,
-                    Rc::clone(&bus),
-                )
-                .await?
-            }
-            // An untrustworthy superblock fences ONE group, not the node. The
-            // segment files stay exactly where they are -- unlike a refused
-            // chain, the data on disk is not the thing in doubt -- so there is
-            // nothing to quarantine and nothing to rebuild: rebuilding fresh
-            // would hand this replica a view-0 identity while a record it
-            // cannot read says otherwise. Tombstoned, the namespace stays
-            // unmaterialised and unrouted, the reconciler backs off, and an
-            // operator has every byte plus a message naming the directory.
-            Err(
-                error @ (ServerError::PartitionSuperblockIo { .. }
-                | ServerError::PartitionSuperblockVersionUnknown { .. }
-                | ServerError::PartitionSuperblockUnverifiable { .. }
-                | ServerError::PartitionSuperblockUndecodable { .. }
-                | ServerError::PartitionSuperblockIdentityMismatch { .. }),
-            ) => {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id = partition_metadata.id,
-                    %error,
-                    "cannot trust this partition's durable consensus state; tombstoning the \
-                     partition and continuing to boot the rest of the shard"
-                );
-                partition_stats.zero_out_all();
-                partitions.tombstone(namespace);
-                continue;
-            }
-            Err(error) => return Err(error),
+        .await?
+        else {
+            continue;
         };
         partitions.insert(namespace, partition);
         shards_table.insert(
@@ -783,6 +630,202 @@ async fn recover_partition_segments(
         );
         source
     })
+}
+
+/// Recover an owned partition from its on-disk state.
+///
+/// Shared by boot and the reconciler so a partition this replica committed
+/// before a crash but re-learns only after restart (its WAL watermark trails
+/// the commit by one op) is hydrated from its segments like any other, not
+/// rebuilt over them. `Ok(None)` means the namespace was tombstoned here; the
+/// arms below say when. Errors are transient I/O, left to the caller.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn load_partition_or_fence(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    partition_stats: Arc<PartitionStats>,
+    partition_metadata: &Partition,
+    topic_runtime: TopicRuntimeOptions,
+    cluster_id: u128,
+    self_replica_id: u8,
+    replica_count: u8,
+    bus: Rc<IggyMessageBus>,
+    partitions: &IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
+) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    // Heap-pinned: the loader's and the rebuilder's futures side by side
+    // outgrow clippy's `large_futures` cap, and this runs once per partition.
+    match Box::pin(load_partition(
+        config,
+        namespace,
+        Arc::clone(&partition_stats),
+        partition_metadata,
+        topic_runtime,
+        cluster_id,
+        self_replica_id,
+        replica_count,
+        Rc::clone(&bus),
+    ))
+    .await
+    {
+        Ok(partition) => Ok(Some(partition)),
+        // ONE damaged local chain must not take the node down. The shapes
+        // this refuses are structural -- what a failed state-transfer
+        // quarantine leaves behind, or damage the recovery walk proved
+        // inside a segment. What follows depends on whether a peer can
+        // restore the data. With peers, the segment files are fenced
+        // aside (keeping the superblock so the group cannot re-enter
+        // view 0), the group is materialised fresh, and the ordinary
+        // rejoin path (repair, then state transfer on a refused floor)
+        // refills it. Single-replica, only a chain-shape refusal whose
+        // planned chain provably holds ZERO recoverable bytes still
+        // fences and rebuilds: nothing servable is at stake, so an empty
+        // rebuild hides no loss. The verdict variant alone is not that
+        // evidence -- a hole and an orphan empty segment both fire over
+        // fully populated chains -- which is why the gate reads the byte
+        // total the refusal carries. Every other refusal tombstones,
+        // leaving its files exactly where they are: a rebuilt empty
+        // partition answers polls exactly like a healthy empty one and
+        // hides the loss, while an unrouted namespace is a failure an
+        // operator can see.
+        Err(ServerError::PartitionRecoveryRefused { dir, reason, .. }) => {
+            let partition_dir = dir.to_string_lossy().into_owned();
+            let rebuild_for_rejoin = replica_count > 1
+                || matches!(
+                    reason,
+                    PartitionRecoveryRefusal::Hole {
+                        recoverable_bytes: 0,
+                        ..
+                    } | PartitionRecoveryRefusal::EmptyNonTailSegment {
+                        recoverable_bytes: 0,
+                        ..
+                    }
+                );
+            error!(
+                stream_id,
+                topic_id,
+                partition_id = partition_metadata.id,
+                partition_dir,
+                %reason,
+                "refusing the recovered segment chain"
+            );
+            // A pass-A refusal folded nothing into the stats (recovery
+            // counts only accepted chains), but the hydrate-reopen refusal
+            // arrives after a fully counted load, so clear them either way.
+            partition_stats.zero_out_all();
+            if !rebuild_for_rejoin {
+                // No quarantine here, mirroring the superblock arm below:
+                // a tombstone is only durable if its cause is. Fencing the
+                // chain aside would leave the next boot zero segments to
+                // walk, so it would re-seed from the surviving superblock,
+                // plant a fresh segment, and serve the partition empty
+                // with no refusal logged. Left at their real paths, the
+                // same files re-derive this verdict (and this log line)
+                // every boot, and the reconciler's tombstone gate keeps
+                // the namespace away from a fresh build, whose
+                // initial-segment open would truncate the oldest refused
+                // segment in place. The one refusal whose cause is NOT
+                // durable is `StorageSizeMismatch`: it fires from the
+                // reopen right after recovery truncated the same file, so
+                // the next boot re-walks the already-truncated bytes and,
+                // unless the length diverges again, accepts the chain
+                // instead of re-tombstoning -- acceptable for an
+                // assertion that the filesystem lied about a length.
+                // `%reason` repeated on purpose: this is the line an
+                // operator greps to enumerate dark partitions, so it has
+                // to carry the verdict on its own.
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    partition_dir,
+                    %reason,
+                    "no peer replica holds this partition's data; leaving the refused \
+                     segment files in place and tombstoning it instead of serving it \
+                     empty"
+                );
+                partitions.tombstone(namespace);
+                return Ok(None);
+            }
+            match partitions::state_transfer::quarantine_segment_files(&partition_dir).await {
+                Ok(fenced_dir) => error!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    fenced_dir,
+                    "quarantined the refused segment files; they are kept for inspection"
+                ),
+                Err(error) => {
+                    // NOT rebuilt: `build_partition_fresh` reaches
+                    // `ensure_initial_segment`, which opens segment 0 with
+                    // `file_exists = false` and TRUNCATES whatever the
+                    // failed quarantine left behind. The likeliest failures
+                    // (suffix cap exhausted, `create_dir_all`) move zero
+                    // files, so rebuilding would destroy the oldest segment
+                    // on the first attempt while the higher-offset survivors
+                    // keep refusing every boot -- a loop that never
+                    // terminates and eats the chain one segment at a time.
+                    // Tombstone instead: the namespace stays unmaterialised
+                    // and unrouted, the reconciler backs off, and an
+                    // operator still has every byte.
+                    error!(
+                        stream_id,
+                        topic_id,
+                        partition_id = partition_metadata.id,
+                        partition_dir,
+                        %error,
+                        "failed to quarantine the refused segment files; leaving this \
+                         partition tombstoned rather than rebuilding over them"
+                    );
+                    partitions.tombstone(namespace);
+                    return Ok(None);
+                }
+            }
+            Box::pin(build_partition_fresh(
+                config,
+                namespace,
+                partition_stats,
+                partition_metadata.created_revision,
+                topic_runtime,
+                cluster_id,
+                self_replica_id,
+                replica_count,
+                partition_metadata.created_view,
+                Rc::clone(&bus),
+            ))
+            .await
+            .map(Some)
+        }
+        // An untrustworthy superblock fences ONE group, not the node. The
+        // segment files stay exactly where they are -- unlike a refused
+        // chain, the data on disk is not the thing in doubt -- so there is
+        // nothing to quarantine and nothing to rebuild: rebuilding fresh
+        // would hand this replica a view-0 identity while a record it
+        // cannot read says otherwise. Tombstoned, the namespace stays
+        // unmaterialised and unrouted, the reconciler backs off, and an
+        // operator has every byte plus a message naming the directory.
+        Err(
+            error @ (ServerError::PartitionSuperblockIo { .. }
+            | ServerError::PartitionSuperblockVersionUnknown { .. }
+            | ServerError::PartitionSuperblockUnverifiable { .. }
+            | ServerError::PartitionSuperblockUndecodable { .. }
+            | ServerError::PartitionSuperblockIdentityMismatch { .. }),
+        ) => {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id = partition_metadata.id,
+                %error,
+                "cannot trust this partition's durable consensus state; tombstoning the \
+                 partition instead of serving it"
+            );
+            partition_stats.zero_out_all();
+            partitions.tombstone(namespace);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

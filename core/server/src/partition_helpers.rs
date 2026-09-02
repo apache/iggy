@@ -507,7 +507,10 @@ pub async fn open_partition_superblock(
 /// on-disk state during recovery; this builder is the runtime path
 /// invoked by the reconciliation loop when a committed
 /// `CreateTopic` / `CreatePartitions` metadata event names a partition
-/// the local shard has not yet materialised.
+/// the local shard has not yet materialised and has no directory for. A
+/// directory already on disk is routed through boot's loader
+/// (`load_partition_or_fence`) instead, so a prior life's segments are
+/// hydrated rather than built over.
 ///
 /// Steps performed (all idempotent on retry after a partial failure):
 /// 1. Create directory hierarchy on disk.
@@ -590,9 +593,12 @@ pub async fn build_partition_fresh(
     )
     .await?;
 
-    // A partition directory that already holds segment bytes is a RESTART
-    // materialization, not a fresh create: this replica's group state died
-    // with the process, so claiming view-0 primaryship would heartbeat
+    // A partition directory that already exists here is a rebuild over a
+    // fenced chain (`load_partition_or_fence` quarantined the refused segment
+    // files and kept the superblock; every other prior life is hydrated by
+    // that loader before reaching this builder), not a fresh create: this
+    // replica's group state died with the process, so claiming view-0
+    // primaryship would heartbeat
     // commit_min=0 at peers that hold the committed log (racing their
     // election). Join as a quorum-invisible backup and probe for the
     // current view instead; journal repair re-materializes the data from a
