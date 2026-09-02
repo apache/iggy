@@ -501,8 +501,13 @@ async fn given_eager_flush_topic_when_the_whole_cluster_is_killed_should_recover
     let acked = produce_acked(&client, "flushed", 30).await;
     let payloads: Vec<String> = acked.iter().map(|(_, payload)| payload.clone()).collect();
     wait_until_payloads_installed(harness, &payloads, FLUSH_INSTALL_TIMEOUT).await;
-    drop(client);
 
+    // The producer's connection stays open across the kill on purpose.
+    // Closing it first replicates a Logout, and journaling that op is what
+    // tells a backup the topic create before it committed: a backup recovers
+    // its commit point from the watermark stamped on the NEXT entry. With the
+    // create as the last journaled op, the backups boot without the partition
+    // and must recover it from disk once the metadata election re-commits it.
     harness.kill_cluster().expect("SIGKILL every node");
     harness
         .restart_cluster()

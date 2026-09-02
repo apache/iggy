@@ -8553,8 +8553,12 @@ mod purge_floor_tests {
             .expect("purge partition");
         assert_eq!(partition.applied_purge_generation(), 4);
 
+        // Boxed: all four rebuilt partitions live across awaits. Five inline
+        // partitions make this future large enough that unoptimized builds,
+        // which keep a copy of it in every compio `block_on` wrapper frame,
+        // overflow the 2 MiB test thread stack.
         let rebuild = |created_revision: u64| {
-            let mut rebuilt = test_partition();
+            let mut rebuilt = Box::new(test_partition());
             rebuilt.set_partition_dir(dir.to_string_lossy().into_owned());
             rebuilt.set_created_revision(created_revision);
             rebuilt
