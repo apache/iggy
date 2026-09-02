@@ -788,7 +788,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the partitions are created.
     ///
     /// Raises:
-    ///     RuntimeError: If an identifier is invalid or the request fails.
+    ///     ValueError: If an identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_partitions<'a>(
         &self,
@@ -821,7 +822,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the partitions are deleted.
     ///
     /// Raises:
-    ///     RuntimeError: If an identifier is invalid or the request fails.
+    ///     ValueError: If an identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_partitions<'a>(
         &self,

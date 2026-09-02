@@ -34,8 +34,10 @@ async def test_create_and_delete_partitions(iggy_client: IggyClient, unique_name
     topic = await iggy_client.get_topic(stream_name, topic_name)
     assert topic is not None
     assert topic.partitions_count == 4
+    assert [partition.id for partition in topic.partitions] == [0, 1, 2, 3]
 
     await iggy_client.delete_partitions(stream_name, topic_name, 2)
     topic = await iggy_client.get_topic(stream_name, topic_name)
     assert topic is not None
     assert topic.partitions_count == 2
+    assert [partition.id for partition in topic.partitions] == [0, 1]

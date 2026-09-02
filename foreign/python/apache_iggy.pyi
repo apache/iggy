@@ -1212,7 +1212,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the partitions are created.
 
         Raises:
-            RuntimeError: If an identifier is invalid or the request fails.
+            ValueError: If an identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def delete_partitions(
         self,
@@ -1232,7 +1233,8 @@ class IggyClient:
             An awaitable that resolves to `None` when the partitions are deleted.
 
         Raises:
-            RuntimeError: If an identifier is invalid or the request fails.
+            ValueError: If an identifier is invalid.
+            RuntimeError: If the request fails.
         """
     def create_consumer_group(
         self,
