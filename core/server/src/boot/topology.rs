@@ -69,12 +69,12 @@ impl Default for RosterCells {
 
 /// Copy the configured cluster roster plus this node's own client ports into
 /// the shared [`ClusterRoster`] so the binary `GetClusterMetadata` read serves
-/// the real topology. `self_*` back only the cluster-disabled self-synthesis
-/// and carry the configured listener ports from the resolved topology until
-/// shard 0 publishes the bound ones through `bound_ports` (a `:0` wildcard
-/// resolves once its listener is up). The self address resolves through
-/// [`self_advertised_address`], which boot validation has already guaranteed
-/// names somewhere a client can dial.
+/// the real topology. `self_advertised` and `configured_ports` back only the
+/// cluster-disabled self-synthesis. The latter carries the configured listener
+/// ports from the resolved topology until shard 0 publishes the bound ones
+/// through `bound_ports` (a `:0` wildcard resolves once its listener is up).
+/// The self address resolves through [`self_advertised_address`], which boot
+/// validation has already guaranteed names somewhere a client can dial.
 pub(in crate::boot) fn build_cluster_roster(
     shard_id: u16,
     config: &ServerConfig,

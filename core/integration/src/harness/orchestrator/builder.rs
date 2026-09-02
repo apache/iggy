@@ -327,10 +327,7 @@ fn build_cluster_envs(
 ) -> HashMap<String, String> {
     let mut envs = HashMap::new();
 
-    let loopback = match ip_kind {
-        IpAddrKind::V4 => "127.0.0.1",
-        IpAddrKind::V6 => "::1",
-    };
+    let loopback = ip_kind.loopback();
 
     envs.insert("IGGY_CLUSTER_ENABLED".to_string(), "true".to_string());
     envs.insert("IGGY_CLUSTER_NAME".to_string(), cluster_name.to_string());

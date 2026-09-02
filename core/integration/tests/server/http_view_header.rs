@@ -170,18 +170,23 @@ async fn given_a_follower_when_it_redirects_a_linearizable_read_should_carry_the
     let (leader, follower) = leader_and_follower(harness).await;
     let primary = HttpClient::login_root_no_redirect(node_url(harness, leader)).await;
     let http = HttpClient::login_root_no_redirect(node_url(harness, follower)).await;
+    // Views only grow, so bracketing the request lets a view change in flight
+    // widen the accepted range instead of failing the test.
+    let view_before = primary_view(&primary).await;
 
     let response = until_primary_resolved(|| http.get("/streams?consistency=linearizable")).await;
+    let view_after = primary_view(&primary).await;
 
     assert_eq!(
         response.status(),
         StatusCode::TEMPORARY_REDIRECT,
         "a keyless follower must redirect a linearizable read to the primary"
     );
-    assert_eq!(
-        view_number(&response),
-        Some(primary_view(&primary).await),
-        "the primary redirect must carry the cluster's current view in {VIEW_HEADER}"
+    let view = view_number(&response);
+    assert!(
+        view.is_some_and(|view| (view_before..=view_after).contains(&view)),
+        "the primary redirect must carry the cluster's current view in {VIEW_HEADER}: \
+         got {view:?}, expected within {view_before}..={view_after}"
     );
 }
 
@@ -204,17 +209,20 @@ async fn given_a_follower_when_it_relays_a_forwarded_write_should_carry_the_iggy
     let primary = HttpClient::login_root_no_redirect(node_url(harness, leader)).await;
     let http = HttpClient::login_root_no_redirect(node_url(harness, follower)).await;
     let body = json!({ "name": "forwarded-stream" });
+    let view_before = primary_view(&primary).await;
 
     let response = until_primary_resolved(|| http.post_json("/streams", &body)).await;
+    let view_after = primary_view(&primary).await;
 
     assert_eq!(
         response.status(),
         StatusCode::OK,
         "the follower must relay the primary's answer to a control-plane write"
     );
-    assert_eq!(
-        view_number(&response),
-        Some(primary_view(&primary).await),
-        "a relayed response must carry the view the primary stamped in {VIEW_HEADER}"
+    let view = view_number(&response);
+    assert!(
+        view.is_some_and(|view| (view_before..=view_after).contains(&view)),
+        "a relayed response must carry the view the primary stamped in {VIEW_HEADER}: \
+         got {view:?}, expected within {view_before}..={view_after}"
     );
 }

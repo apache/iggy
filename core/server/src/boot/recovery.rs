@@ -786,7 +786,7 @@ async fn recover_partition_segments(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::boot) async fn load_partition(
+async fn load_partition(
     config: &ServerConfig,
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,

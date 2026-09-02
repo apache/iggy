@@ -47,15 +47,6 @@ const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
 /// retries on this message.
 const INCOMPLETE_DUMP_MESSAGE: &str = "Failed to parse server config: the dump is incomplete";
 
-/// Client transports as `(label, section)` of the runtime config dump, in
-/// the order [`ServerProtocolAddr`] lists them.
-const TRANSPORT_SECTIONS: [(&str, &str); 4] = [
-    ("TCP", "tcp"),
-    ("HTTP", "http"),
-    ("QUIC", "quic"),
-    ("WebSocket", "websocket"),
-];
-
 #[derive(Debug, Clone)]
 struct ServerProtocolAddr {
     tcp: Option<SocketAddr>,
@@ -564,14 +555,14 @@ impl ServerHandle {
                 message: format!("Failed to parse server config: {e}"),
             })?;
 
-        let expected = [
-            &mut self.addrs.tcp,
-            &mut self.addrs.http,
-            &mut self.addrs.quic,
-            &mut self.addrs.websocket,
+        let transports = [
+            ("TCP", "tcp", &mut self.addrs.tcp),
+            ("HTTP", "http", &mut self.addrs.http),
+            ("QUIC", "quic", &mut self.addrs.quic),
+            ("WebSocket", "websocket", &mut self.addrs.websocket),
         ];
         let mut mismatches = Vec::new();
-        for ((label, section), expected) in TRANSPORT_SECTIONS.iter().zip(expected) {
+        for (label, section, expected) in transports {
             match (*expected, Self::extract_address(&config, section)?) {
                 (Some(expected), Some(bound)) if expected != bound => {
                     mismatches.push(format!("{label}: expected {expected}, got {bound}"));
