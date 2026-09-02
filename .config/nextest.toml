@@ -15,6 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Floor for the flags CI and scripts/ci/storage-compat.sh pass: --no-tests
+# (0.9.75), --run-ignored only (0.9.76) and --ignore-default-filter (0.9.77).
+# nextest refuses to run below it, and setup-rust-with-cache replaces a
+# cache-restored binary that fails `cargo nextest show-config version`.
+nextest-version = { required = "0.9.77" }
+
 [[profile.default.overrides]]
 # This is a solution (or actually a workaround) for the problem that nextest does not support
 # #[serial] macro which shall enforce sequential execution of the test case.

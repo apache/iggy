@@ -187,7 +187,7 @@ pub enum ServerError {
     //
     // The Display text deliberately claims nothing about what happens to the
     // refused files: disposition (quarantine into `.fenced.N` vs tombstone
-    // with files left in place) is decided by the `bootstrap.rs` arms that
+    // with files left in place) is decided by the `boot/recovery.rs` arms that
     // catch this error, and only they log it -- a claim here would render
     // beside theirs and contradict one branch or the other.
     #[error(
@@ -220,6 +220,8 @@ pub enum ServerError {
     },
     #[error("cluster enabled but no node is configured for replica {replica_id}")]
     ClusterNodeNotFound { replica_id: u8 },
+    #[error("server listeners start on shard 0 only, not on shard {shard_id}")]
+    ListenersOffShardZero { shard_id: u16 },
     #[error("cluster node count {count} exceeds supported u8 replica count")]
     ClusterReplicaCountTooLarge { count: usize },
     #[error("cluster mode requires --replica-id to identify the current node")]
@@ -290,6 +292,13 @@ pub enum ServerError {
     ShardConstruction(#[source] ShardCtorError),
     #[error("{} shard thread(s) failed: {}", failures.len(), format_shard_failures(failures))]
     ShardJoinFailures { failures: Vec<ShardJoinFailure> },
+    /// A panic no shard thread could surface: compio's `spawn` catches task
+    /// panics, so a dead listener or connection task leaves every thread
+    /// exiting `Ok`. The panic hook records the first one and the join path
+    /// fails the exit on it, so an orchestrator does not read the shutdown
+    /// as clean.
+    #[error("server shut down after a panic: {description}")]
+    Panicked { description: String },
 }
 
 /// Why a partition's recovered segments cannot be served.
@@ -547,7 +556,7 @@ impl std::fmt::Display for PartitionRecoveryRefusal {
     }
 }
 
-/// Per-shard outcome captured by [`crate::bootstrap::ShardHandles::join_all`]
+/// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]
 /// when a shard either returned `Err` or panicked.
 ///
 /// Bundled into [`ServerError::ShardJoinFailures`] so the operator sees

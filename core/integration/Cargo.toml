@@ -60,7 +60,7 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 # Path-dep only so the Doris integration test can reuse the connector's pure
 # `build_label` function — keeping the test and production label format in lock-step.
-iggy_connector_doris_sink = { path = "../connectors/sinks/doris_sink" }
+iggy_connector_doris_sink = { workspace = true }
 iggy_connector_sdk = { workspace = true, features = ["api"] }
 # Locates and decodes the on-disk superblock slot files in the recovery test
 # (`SLOT_FILE_NAMES`, `decode_slots`).
