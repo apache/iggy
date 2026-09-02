@@ -205,6 +205,9 @@ pub async fn when_try_purge_non_existing_topic(world: &mut PurgeContext, stream_
 #[when(
     regex = r#"^I poll messages from stream "([^"]*)", topic "([^"]*)", partition (\d+) starting from offset (\d+)$"#
 )]
+#[then(
+    regex = r#"^I poll messages from stream "([^"]*)", topic "([^"]*)", partition (\d+) starting from offset (\d+)$"#
+)]
 pub async fn when_poll_messages(
     world: &mut PurgeContext,
     stream_name: String,
