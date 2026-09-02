@@ -139,8 +139,17 @@ fi
 
 # The remote side of a fetch takes a branch or tag name (or a reachable SHA),
 # never a remote-tracking name, so drop the remote prefix before asking origin.
+#
+# --depth=1 only where the clone is already shallow (the CI checkout). On a
+# full clone that flag does not save anything, it WRITES a shallow boundary at
+# the fetched tip and grafts every older commit off the developer's history,
+# for every worktree sharing the repository.
+FETCH_DEPTH=()
+if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+  FETCH_DEPTH=(--depth=1)
+fi
 FETCHED=0
-if git fetch --no-tags --depth=1 origin "${BASELINE_REF#origin/}" 2>/dev/null; then
+if git fetch --no-tags "${FETCH_DEPTH[@]}" origin "${BASELINE_REF#origin/}" 2>/dev/null; then
   FETCHED=1
 fi
 
