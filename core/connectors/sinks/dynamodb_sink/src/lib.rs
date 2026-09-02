@@ -916,6 +916,7 @@ fn is_transient_code(code: &str) -> bool {
             | "InternalServerError"
             | "ServiceUnavailable"
             | "TransactionInProgressException"
+            | "ReplicatedWriteConflictException"
     )
 }
 
@@ -1576,6 +1577,7 @@ mod tests {
         assert!(is_transient_code("ThrottlingException"));
         assert!(is_transient_code("ProvisionedThroughputExceededException"));
         assert!(is_transient_code("InternalServerError"));
+        assert!(is_transient_code("ReplicatedWriteConflictException"));
         assert!(!is_transient_code("ValidationException"));
         assert!(!is_transient_code("ResourceNotFoundException"));
         assert!(!is_transient_code(""));

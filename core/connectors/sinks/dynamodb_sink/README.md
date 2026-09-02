@@ -102,9 +102,10 @@ DynamoDB rejects a request that writes the same key twice, so within one
 Unprocessed items returned by `BatchWriteItem` are retried with exponential
 backoff, so a partially throttled batch is not silently dropped. Throttling and
 server errors such as `ProvisionedThroughputExceededException`,
-`ThrottlingException`, and `InternalServerError` are retried the same way, which
-covers both provisioned and on-demand capacity modes. Validation and access
-errors are permanent and returned without a retry.
+`ThrottlingException`, `InternalServerError`, and
+`ReplicatedWriteConflictException` are retried the same way, which covers both
+provisioned and on-demand capacity modes as well as multi-Region tables.
+Validation and access errors are permanent and returned without a retry.
 
 Items larger than `max_item_size` are logged and skipped instead of failing the
 whole batch.
