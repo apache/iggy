@@ -294,13 +294,10 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    /// Queued request on the network reply path: no in-process subscriber.
     #[must_use]
     pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
-        Self {
-            message,
-            received_at: 0,
-            reply_sender: None,
-        }
+        Self::with_sender(message, None)
     }
 
     /// Queued request paired with a fresh receiver that resolves when the
@@ -313,18 +310,12 @@ impl RequestEntry {
         message: Message<RoutedRequestHeader>,
     ) -> (Self, Receiver<Message<ReplyHeader>>) {
         let (sender, receiver) = oneshot::channel();
-        let entry = Self {
-            message,
-            received_at: 0,
-            reply_sender: Some(sender),
-        };
-        (entry, receiver)
+        (Self::with_sender(message, Some(sender)), receiver)
     }
 
     /// Queued request carrying a sender the caller already owns, for a submit
-    /// that parked before reaching a prepare slot. Mirrors
-    /// [`Self::with_subscriber`], except the receiver half lives with the
-    /// caller rather than being minted here.
+    /// that parked before reaching a prepare slot. `None` is the network reply
+    /// path; the other two constructors are this one with a fixed sender.
     #[must_use]
     pub const fn with_sender(
         message: Message<RoutedRequestHeader>,

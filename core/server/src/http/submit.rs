@@ -33,8 +33,8 @@ use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
 use crate::dispatch::{
-    PartitionReplyMode, dispatch_partition_request, resolve_delete_segments_truncate,
-    submit_client_request_on_owner, submit_logout_on_owner,
+    dispatch_partition_request, resolve_delete_segments_truncate, submit_client_request_on_owner,
+    submit_logout_on_owner,
 };
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
@@ -378,7 +378,13 @@ pub(in crate::http) async fn partition_write_replicated(
     // timeout. Held across every exit below; released by `Drop`.
     let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
     ensure_in_process_reply_target(state, session);
-    let request_id = session.next_data_request_id();
+    // Held from the mint until `dispatch_partition_request` returns, which is
+    // past the owning shard's inbox: the ids of this session's writes must
+    // reach the partition in mint order or the watermark absorbs the overtaken
+    // one. Released before the commit wait so writes still overlap there.
+    let mut next_data_request_id = session.data_gate.lock().await;
+    let request_id = *next_data_request_id;
+    *next_data_request_id += 1;
     let message = build_request_message(
         operation,
         session.client_id,
@@ -406,9 +412,9 @@ pub(in crate::http) async fn partition_write_replicated(
         session.session,
         session.client_id,
         Some(session.user_id),
-        PartitionReplyMode::Awaited,
     )
     .await;
+    drop(next_data_request_id);
     let outcome = compio::time::timeout(PARTITION_WRITE_REPLY_TIMEOUT, receiver).await;
     // Removes the slot unless the reply already fired, so a late commit
     // reply after a timeout sheds at the bus instead of leaking a waiter.
@@ -444,7 +450,10 @@ pub(in crate::http) async fn produce_unacked(
     body: &[u8],
 ) -> Result<(), PartitionWriteError> {
     let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
-    let request_id = session.next_data_request_id();
+    // Same gate as the acked path, for the same ordering reason.
+    let mut next_data_request_id = session.data_gate.lock().await;
+    let request_id = *next_data_request_id;
+    *next_data_request_id += 1;
     let message = build_request_message(
         Operation::SendMessages,
         session.client_id,
@@ -459,9 +468,9 @@ pub(in crate::http) async fn produce_unacked(
         session.session,
         session.client_id,
         Some(session.user_id),
-        PartitionReplyMode::FireAndForget,
     )
     .await;
+    drop(next_data_request_id);
     Ok(())
 }
 

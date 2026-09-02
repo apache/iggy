@@ -2501,29 +2501,27 @@ mod tests {
 
         let client = SimClient::new(CLIENT_ID);
         sim.shell_login(&client);
+        // Both sends in flight at once. The simulated link delays each packet
+        // independently, so the lower request id can reach the primary after
+        // the higher one committed; the dedup slice's committed-id window is
+        // what keeps that reordered arrival a new write rather than an absorbed
+        // duplicate, and this loop is the check that both payloads commit.
+        for payload in [
+            Bytes::from_static(b"parked-redispatch-0"),
+            Bytes::from_static(b"parked-redispatch-1"),
+        ] {
+            let request = client.send_messages(namespace, std::slice::from_ref(&payload));
+            sim.submit_request(CLIENT_ID, 0, request.into_generic());
+        }
+
         let lagging_shard = Rc::clone(&sim.replicas[1].shards[0]);
         let mut successful_replies = 0usize;
         let mut parked = 0usize;
-        // One send in flight at a time. The partition dedup slice keys on a
-        // per-client watermark, so if the network reordered two concurrent sends
-        // the lower request id would arrive after the higher one committed and
-        // read as already applied. Every real transport is lockstep per
-        // connection, which is what makes the watermark sufficient there.
-        for (sent, payload) in [
-            Bytes::from_static(b"parked-redispatch-0"),
-            Bytes::from_static(b"parked-redispatch-1"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let request = client.send_messages(namespace, std::slice::from_ref(&payload));
-            sim.submit_request(CLIENT_ID, 0, request.into_generic());
-            for _ in 0..500 {
-                successful_replies += successful_send_reply_count(&sim.step());
-                parked = lagging_shard.parked_frame_count(namespace);
-                if successful_replies > sent && parked > sent {
-                    break;
-                }
+        for _ in 0..500 {
+            successful_replies += successful_send_reply_count(&sim.step());
+            parked = lagging_shard.parked_frame_count(namespace);
+            if successful_replies >= 2 && parked >= 2 {
+                break;
             }
         }
         assert!(

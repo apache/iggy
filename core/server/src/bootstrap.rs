@@ -2144,8 +2144,7 @@ const _: () = assert!(
         == consensus::PIPELINE_PREPARE_QUEUE_MAX
 );
 const _: () = assert!(
-    configs::partition::DEFAULT_PARTITION_DEDUP_CLIENTS_MAX
-        == consensus::PARTITION_DEDUP_CLIENTS_MAX
+    configs::partition::PARTITION_DEDUP_CLIENTS_DEFAULT == consensus::PARTITION_DEDUP_CLIENTS_MAX
 );
 const _: () =
     assert!(configs::metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX);

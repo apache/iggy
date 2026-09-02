@@ -113,15 +113,16 @@ pub const DEFAULT_EVICTED_RING_BYTES_MAX: u64 = 16 * 1024 * 1024;
 /// trips first evicts; this byte ceiling is the second typo guard.
 pub const MAX_EVICTED_RING_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Capacity tunables for the per-partition consensus plane.
 /// Shipped default for [`PartitionConfig::dedup_clients_max`]; pinned against
 /// the runtime constant by a bootstrap assert.
-pub const DEFAULT_PARTITION_DEDUP_CLIENTS_MAX: usize = 4096;
+pub const PARTITION_DEDUP_CLIENTS_DEFAULT: usize = 4096;
 
 /// Ceiling for [`PartitionConfig::dedup_clients_max`]. A per-group budget, so
-/// the ceiling bounds worst-case memory at `partitions * this * ~40 bytes`.
-pub const MAX_PARTITION_DEDUP_CLIENTS: usize = 1 << 16;
+/// the ceiling bounds worst-case memory at roughly `partitions * this * 130
+/// bytes`: a 96-byte slot entry plus its index-map slot.
+pub const PARTITION_DEDUP_CLIENTS_CEILING: usize = 1 << 16;
 
+/// Capacity tunables for the per-partition consensus plane.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct PartitionConfig {
     /// Depth of a partition's prepare queue: how many uncommitted produce /
@@ -136,7 +137,7 @@ pub struct PartitionConfig {
     /// the entry whose newest commit is oldest is evicted, which costs dedup
     /// coverage for that client (its next replay re-executes, exactly as it
     /// would have before dedup existed) and never correctness. Must be > 0 and
-    /// <= [`MAX_PARTITION_DEDUP_CLIENTS`].
+    /// <= [`PARTITION_DEDUP_CLIENTS_CEILING`].
     ///
     /// Unlike `[metadata] clients_table_max`, this budget is PER GROUP, so the
     /// worst case scales with partition count: size it to the producers a
@@ -197,10 +198,10 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
-        if self.dedup_clients_max == 0 || self.dedup_clients_max > MAX_PARTITION_DEDUP_CLIENTS {
+        if self.dedup_clients_max == 0 || self.dedup_clients_max > PARTITION_DEDUP_CLIENTS_CEILING {
             eprintln!(
                 "{COMPONENT} partition.dedup_clients_max ({}) must be > 0 and <= \
-                 {MAX_PARTITION_DEDUP_CLIENTS}",
+                 {PARTITION_DEDUP_CLIENTS_CEILING}",
                 self.dedup_clients_max
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -285,14 +286,14 @@ mod tests {
     fn shipped_dedup_default_matches_the_runtime_constant() {
         assert_eq!(
             PartitionConfig::default().dedup_clients_max,
-            DEFAULT_PARTITION_DEDUP_CLIENTS_MAX,
+            PARTITION_DEDUP_CLIENTS_DEFAULT,
             "config.toml dedup_clients_max drifted from the runtime default"
         );
     }
 
     #[test]
     fn rejects_out_of_range_dedup_clients_max() {
-        for value in [0, MAX_PARTITION_DEDUP_CLIENTS + 1] {
+        for value in [0, PARTITION_DEDUP_CLIENTS_CEILING + 1] {
             let config = PartitionConfig {
                 dedup_clients_max: value,
                 ..PartitionConfig::default()

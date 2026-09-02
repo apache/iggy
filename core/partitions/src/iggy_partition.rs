@@ -92,14 +92,17 @@ where
 {
     consensus: VsrConsensus<B>,
     /// This group's slice of the VSR client table, run in
-    /// [`ClientTableMode::PARTITION_SLICE`]: per-client request watermarks
-    /// folded in at commit, so every replica derives the same slice from the
-    /// same log. The mode turns off what this plane cannot use -- no reply ring
-    /// (`SendMessages` has no result section, so a duplicate is answered by
-    /// synthesizing the empty success its original earned), no epoch fence (a
-    /// partition group never observes a `Register`), and no preallocated slot
-    /// array (one table per group, where preallocating the cap would reserve
-    /// hundreds of KiB per partition before a client connects).
+    /// [`ClientTableMode::PartitionSlice`]: per-client request watermarks
+    /// folded in at commit. Replica-local and memory-only: boot lifts the commit
+    /// frontier without re-applying the log, so a restarted replica comes back
+    /// with an empty slice while its peers keep theirs, and only commits folded
+    /// in after boot, or a state-transfer install, rebuild it. The mode turns
+    /// off what this plane cannot use -- no reply ring (`SendMessages` has no
+    /// result section, so a duplicate is answered by synthesizing the empty
+    /// success its original earned), no epoch fence (a partition group never
+    /// observes a `Register`), and no preallocated slot array (one table per
+    /// group, where preallocating the cap would reserve hundreds of KiB per
+    /// partition before a client connects).
     dedup: ClientTable,
     pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>,
     /// Highest durably persisted offset.
@@ -467,7 +470,7 @@ where
             consensus,
             dedup: ClientTable::with_mode(
                 consensus::PARTITION_DEDUP_CLIENTS_MAX,
-                ClientTableMode::PARTITION_SLICE,
+                ClientTableMode::PartitionSlice,
             ),
             log: SegmentedLog::default(),
             offset: Arc::new(AtomicU64::new(0)),
@@ -567,7 +570,7 @@ where
     /// This group's dedup slice. Read at admission to classify a request,
     /// written only from the commit path.
     #[must_use]
-    pub const fn dedup(&self) -> &ClientTable {
+    pub(crate) const fn dedup(&self) -> &ClientTable {
         &self.dedup
     }
 
@@ -576,11 +579,12 @@ where
         &mut self.dedup
     }
 
-    /// Size the dedup slice to `[partition] dedup_clients_max`. Boot-time:
-    /// shrinking a live slice evicts its oldest-committed entries, which costs
-    /// dedup coverage for those clients rather than correctness.
+    /// Size the dedup slice to `[partition] dedup_clients_max`. Boot-only:
+    /// `set_capacity` replaces the table rather than evicting into the new
+    /// bound, and panics if the slice already holds an entry. Config
+    /// validation rejects a zero cap before it can reach here.
     pub fn set_dedup_clients_max(&mut self, clients_max: usize) {
-        self.dedup.set_capacity(clients_max.max(1));
+        self.dedup.set_capacity(clients_max);
     }
 
     #[must_use]
@@ -1991,15 +1995,16 @@ where
     /// dedup slice; anything above the watermark projects into a prepare.
     /// Session lifecycle + eviction live on the metadata plane.
     ///
-    /// # Panics
-    /// Panics if called when this partition's consensus instance is not the
-    /// primary, is not in normal status, or is currently syncing.
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     /// `reply` is the in-process channel a `PartitionSubmit` carried in. When
     /// present the committed reply fires on it instead of going to the bus:
     /// the connection-owning shard writes it to the socket it holds, because
     /// `header.client` is the VSR consensus id and carries no home-shard
     /// routing. `None` keeps the bus path (auto-commit ops, tests).
+    ///
+    /// # Panics
+    /// Panics if called when this partition's consensus instance is not the
+    /// primary, is not in normal status, or is currently syncing.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn on_request(
         &mut self,
         message: Message<RoutedRequestHeader>,
@@ -2109,9 +2114,18 @@ where
             //
             // A replay racing its own in-flight original is absorbed here: the
             // slice only knows committed ops, so it cannot yet see the copy
-            // still in the pipeline. Keyed on the exact `(client, request)` --
-            // matching any request from the client would serialize its
-            // pipeline depth to one in-flight write per group.
+            // still in the pipeline. Keyed on the exact `(client, request)`
+            // for the transports that keep several writes in flight per
+            // client (HTTP handlers on one session, the pipelining SDKs):
+            // matching any request from the client would serialize them to
+            // one in-flight write per group. A lockstep TCP connection never
+            // has a second request here to begin with.
+            //
+            // Those same transports can deliver a client's ids out of order:
+            // a write refused transiently here is replayed after its
+            // successors committed. The slice therefore keeps a committed-id
+            // window under the watermark (`consensus::COMMITTED_WINDOW_BITS`)
+            // and admits an unmarked id inside it instead of absorbing it.
             if !is_auto_commit_client(client_id) {
                 if consensus.pipeline_has_message_from_client_request(client_id, request) {
                     Self::send_partition_deny_or_log(
@@ -2124,17 +2138,26 @@ where
                     .await;
                     return;
                 }
-                if self.dedup.is_duplicate(client_id, request) {
+                // An absorbed duplicate answers the operation's empty success.
+                // For `SendMessages` that is LESS than the original reply
+                // carried: the offset confirmations are not retained (no reply
+                // ring in this mode), so a retried produce learns it committed
+                // but not where.
+                if self
+                    .dedup
+                    .is_duplicate(client_id, message.header().user_id, request)
+                {
                     let committed = build_reply_from_request(
                         &self.consensus,
                         message.header(),
                         committed_reply_body(message.header().operation),
                     );
-                    Self::answer_duplicate_or_log(
+                    Self::deliver_reply_or_log(
                         &self.consensus,
                         message.header(),
                         committed,
                         reply.take(),
+                        "duplicate reply send failed",
                     )
                     .await;
                     return;
@@ -2228,7 +2251,7 @@ where
                     let push_result = consensus.push_queued_request(
                         consensus::RequestEntry::with_sender(message, reply.take()),
                     );
-                    if push_result.is_err() {
+                    if let Err(mut refused) = push_result {
                         emit_partition_diag(
                             tracing::Level::WARN,
                             &PartitionDiagEvent::new(
@@ -2236,6 +2259,18 @@ where
                                 "on_request: prepare and request queues both full, dropping",
                             ),
                         );
+                        // The request provably never entered either queue, so a
+                        // waiter can be told so instead of waiting out its
+                        // timeout.
+                        let waiter = refused.take_reply_sender();
+                        Self::send_partition_deny_or_log(
+                            consensus,
+                            refused.message.header(),
+                            IggyError::TransientNotAccepted.as_code(),
+                            "queues-full transient reply send failed",
+                            waiter,
+                        )
+                        .await;
                     }
                     return;
                 }
@@ -2295,7 +2330,7 @@ where
     pub async fn drain_request_queue_into_prepares(&mut self, slots_freed: usize) {
         for _ in 0..slots_freed {
             let req = self.consensus().pop_queued_request();
-            let Some(req) = req else { break };
+            let Some(mut req) = req else { break };
 
             let prepare = {
                 let consensus = self.consensus();
@@ -2311,9 +2346,19 @@ where
                     !consensus.is_transferring(),
                     "drain_request_queue_into_prepares: must not be transferring state"
                 );
+                // The waiter parked with the request; it must travel into the
+                // prepare slot or the commit has nobody to answer.
+                let reply_sender = req.take_reply_sender();
                 let prepare = req.message.project(consensus);
                 consensus.verify_pipeline();
-                consensus.pipeline_message(PlaneKind::Partitions, &prepare);
+                match reply_sender {
+                    Some(sender) => consensus.pipeline_message_with_sender(
+                        PlaneKind::Partitions,
+                        &prepare,
+                        sender,
+                    ),
+                    None => consensus.pipeline_message(PlaneKind::Partitions, &prepare),
+                }
                 prepare
             };
             self.on_replicate(prepare).await;
@@ -3423,6 +3468,7 @@ where
             if !is_auto_commit_client(prepare_header.client) {
                 self.dedup.commit_request(
                     prepare_header.client,
+                    prepare_header.user_id,
                     prepare_header.request,
                     prepare_header.op,
                 );
@@ -3471,6 +3517,13 @@ where
                 // consensus id and carries no home-shard routing. The awaiting
                 // shard owns the socket. A dropped receiver is ignored -- the
                 // client recovers on its own read-timeout.
+                //
+                // Without a waiter the bus is tried, and for a TCP client it
+                // cannot route the VSR id. That is the expected shape of every
+                // op re-committed after a view change (the rebuilt pipeline
+                // entries carry no sender), so it logs at debug: the original
+                // waiter was cancelled by the view change and the client is
+                // already on its read-timeout.
                 if let Some(sender) = entry.take_reply_sender() {
                     let _ = sender.send(reply);
                 } else if let Err(error) = self
@@ -3479,14 +3532,14 @@ where
                     .send_to_client(prepare_header.client, reply.into_generic().into_frozen())
                     .await
                 {
-                    tracing::error!(
+                    tracing::debug!(
                         target: "iggy.partitions.diag",
                         plane = "partitions",
                         client = prepare_header.client,
                         op = prepare_header.op,
                         namespace_raw,
                         %error,
-                        "client reply forward failed, no retransmit path; client will time out",
+                        "client reply not routable by the bus; client will time out",
                     );
                 }
             }
@@ -3694,40 +3747,8 @@ where
     /// Send `header`'s deny reply with `status` on `ReplyHeader.status` (empty
     /// body, op=0), logging a WARN under `send_fail_label` if the reply send
     /// fails. Callers deny on the primary, before the op enters the pipeline,
-    /// so nothing replicates.
-    /// Answer an absorbed duplicate with the reply its original earned. Same
-    /// delivery split as [`Self::send_partition_deny_or_log`]: the submit's
-    /// channel when one is waiting, the bus otherwise.
-    async fn answer_duplicate_or_log(
-        consensus: &VsrConsensus<B>,
-        header: &RoutedRequestHeader,
-        reply: Message<ReplyHeader>,
-        waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
-    ) {
-        if let Some(waiter) = waiter {
-            let _ = waiter.send(reply);
-            return;
-        }
-        if let Err(send_error) = consensus
-            .message_bus()
-            .send_to_client(header.client, reply.into_generic().into_frozen())
-            .await
-        {
-            emit_partition_diag(
-                tracing::Level::WARN,
-                &PartitionDiagEvent::new(
-                    ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                    "duplicate reply send failed",
-                )
-                .with_operation(header.operation)
-                .with_error(send_error.to_string()),
-            );
-        }
-    }
-
-    /// `waiter` is the submit's in-process channel, taken by the caller. When
-    /// present the deny goes there: `header.client` is then the VSR consensus
-    /// id, which the bus cannot route.
+    /// so nothing replicates. `waiter` is the submit's in-process channel,
+    /// taken by the caller.
     async fn send_partition_deny_or_log(
         consensus: &VsrConsensus<B>,
         header: &RoutedRequestHeader,
@@ -3736,6 +3757,20 @@ where
         waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
         let reply = build_deny_reply_from_request(consensus, header, status);
+        Self::deliver_reply_or_log(consensus, header, reply, waiter, send_fail_label).await;
+    }
+
+    /// Deliver an admission-time reply (a deny, or an absorbed duplicate's
+    /// success). When `waiter` is present the reply goes there: `header.client`
+    /// is then the VSR consensus id, which the bus cannot route. Otherwise the
+    /// bus carries it, and a failed send logs a WARN under `send_fail_label`.
+    async fn deliver_reply_or_log(
+        consensus: &VsrConsensus<B>,
+        header: &RoutedRequestHeader,
+        reply: Message<ReplyHeader>,
+        waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
+        send_fail_label: &'static str,
+    ) {
         if let Some(waiter) = waiter {
             let _ = waiter.send(reply);
             return;

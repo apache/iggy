@@ -408,6 +408,21 @@ const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// new primary. Expiry leaves the client to its own read-timeout.
 const PARTITION_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A partition write admitted onto its owning shard's inbox, awaiting the
+/// committed reply. Redeem with [`IggyShard::await_partition_submit`].
+pub struct PartitionSubmitTicket {
+    receiver: Receiver<Option<Message<GenericHeader>>>,
+    target: u16,
+}
+
+/// The write never reached the owning shard.
+///
+/// No sender existed for the target, or its inbox refused the frame. Either
+/// way the outcome is known, unlike a reply that fails to arrive, so the caller
+/// may deny the client outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionSubmitRefused;
+
 /// Race `future` against a bus timer.
 ///
 /// `Some` if it finishes within `budget`, `None` if the timer fires first.
@@ -1446,6 +1461,11 @@ where
     /// from. Cleared when the park map empties, so one episode warns once.
     shard_park_shedding: Cell<bool>,
 
+    /// Set once a partition submit has waited out its budget and warned;
+    /// cleared by the next reply that arrives. Gates the timeout warning to
+    /// one line per stall episode (see [`Self::await_partition_submit`]).
+    partition_submit_stalled: Cell<bool>,
+
     /// Live ceiling on prepares served per `RequestPrepares` round. Defaults
     /// to [`REPAIR_CHUNK_MAX`]; the server overrides it from
     /// `[cluster] repair_chunk_max` at bootstrap.
@@ -1624,6 +1644,7 @@ where
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
             shard_park_shedding: Cell::new(false),
+            partition_submit_stalled: Cell::new(false),
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
             state_transfer_offers: RefCell::new(HashMap::new()),
@@ -1889,22 +1910,25 @@ where
         }
     }
 
-    /// Admit a partition write on the shard owning `namespace` and await its
-    /// committed reply. Routes through the shards table exactly like
-    /// [`Self::partition_read`], self-sends included, so a locally-owned
-    /// partition takes the same path.
+    /// Admit a partition write on the shard owning `namespace`. Routes through
+    /// the shards table exactly like [`Self::partition_read`], self-sends
+    /// included, so a locally-owned partition takes the same path.
     ///
-    /// `None` = unroutable namespace, full owning-shard inbox, dropped reply
-    /// sender (view-change reset, park eviction), or budget expiry. The caller
-    /// stays silent on `None`: the client's own response read-timeout is the
-    /// recovery, and a synthesized failure reply could contradict a write that
-    /// commits moments later.
-    #[allow(clippy::future_not_send)]
-    pub async fn partition_submit(
+    /// Synchronous up to the inbox `try_send`, so two writes a caller admits
+    /// back to back reach the owning shard in that order; the committed reply
+    /// is awaited separately through [`Self::await_partition_submit`], which a
+    /// connection's drain loop spawns rather than blocks on.
+    ///
+    /// # Errors
+    /// [`PartitionSubmitRefused`] when the frame provably never reached the
+    /// owning shard (no sender for the target, or a full inbox), so the caller
+    /// can deny the client outright instead of leaving it to a read-timeout
+    /// for an outcome that is already known.
+    pub fn partition_submit(
         &self,
         namespace: IggyNamespace,
         request: Message<RoutedRequestHeader>,
-    ) -> Option<Message<GenericHeader>> {
+    ) -> Result<PartitionSubmitTicket, PartitionSubmitRefused> {
         let target = self.shards_table.shard_for(namespace).unwrap_or_else(|| {
             // Same fallback as `route_typed`: a miss means "not seeded yet",
             // not "unroutable", and the owning shard parks what arrives early.
@@ -1918,7 +1942,13 @@ where
             request,
             reply: reply_tx,
         });
-        let sender = self.senders.get(target as usize)?;
+        let Some(sender) = self.senders.get(target as usize) else {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::metrics::frame_drop_reason::UNROUTABLE,
+            );
+            return Err(PartitionSubmitRefused);
+        };
         if let Err(error) = sender.try_send(frame) {
             self.metrics.record_frame_drop(
                 crate::metrics::frame_drop_variant::PARTITION,
@@ -1929,24 +1959,67 @@ where
                 target,
                 "partition_submit: inbox rejected PartitionSubmit frame: {error:?}"
             );
-            return None;
+            return Err(PartitionSubmitRefused);
         }
-        match bus_timeout(&self.bus, PARTITION_SUBMIT_TIMEOUT, reply_rx.recv()).await {
-            Some(Ok(reply)) => reply,
-            Some(Err(_)) => {
+        Ok(PartitionSubmitTicket {
+            receiver: reply_rx,
+            target,
+        })
+    }
+
+    /// Wait out a submitted write's committed reply.
+    ///
+    /// `None` = reply channel dropped before a reply (view-change reset, park
+    /// eviction, shutdown) or budget expiry. The caller stays silent on `None`:
+    /// the outcome is unknown, so a synthesized failure could contradict a
+    /// write that commits moments later, and the client's own read-timeout is
+    /// the recovery. Both exits count under
+    /// `frame_drops_total{variant=partition}` with their own reasons. The
+    /// timeout warning fires once per stall episode, reset by the next reply
+    /// that does arrive: one wedged group would otherwise log a line per
+    /// request, and the counter carries the volume.
+    #[allow(clippy::future_not_send)]
+    pub async fn await_partition_submit(
+        &self,
+        ticket: PartitionSubmitTicket,
+    ) -> Option<Message<GenericHeader>> {
+        let PartitionSubmitTicket { receiver, target } = ticket;
+        match bus_timeout(&self.bus, PARTITION_SUBMIT_TIMEOUT, receiver.recv()).await {
+            Some(Ok(Some(reply))) => {
+                self.partition_submit_stalled.set(false);
+                Some(reply)
+            }
+            Some(Ok(None) | Err(_)) => {
+                self.metrics.record_frame_drop(
+                    crate::metrics::frame_drop_variant::PARTITION,
+                    crate::metrics::frame_drop_reason::SUBMIT_ABANDONED,
+                );
                 tracing::debug!(
                     shard = self.id,
                     target,
-                    "partition_submit: reply sender dropped before commit"
+                    "partition_submit: reply channel dropped before commit"
                 );
                 None
             }
             None => {
-                tracing::warn!(
-                    shard = self.id,
-                    target,
-                    "partition_submit: owning shard did not reply within budget"
+                self.metrics.record_frame_drop(
+                    crate::metrics::frame_drop_variant::PARTITION,
+                    crate::metrics::frame_drop_reason::SUBMIT_TIMEOUT,
                 );
+                if self.partition_submit_stalled.replace(true) {
+                    tracing::debug!(
+                        shard = self.id,
+                        target,
+                        "partition_submit: owning shard did not reply within budget"
+                    );
+                } else {
+                    tracing::warn!(
+                        shard = self.id,
+                        target,
+                        "partition_submit: owning shard did not reply within budget; \
+                         further expiries log at debug until a reply arrives"
+                    );
+                }
                 None
             }
         }
@@ -2017,6 +2090,7 @@ where
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
             shard_park_shedding: Cell::new(false),
+            partition_submit_stalled: Cell::new(false),
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
             state_transfer_offers: RefCell::new(HashMap::new()),
@@ -3610,18 +3684,21 @@ where
             let header = request.header();
             (header.operation, header.group)
         };
-        let mut parked_reply = Some(reply);
+        // The frame takes a clone of the sender only when it parks; every other
+        // outcome answers on the original below, so no arm can lose the waiter
+        // to a `None` it would have to guard against. The clone is an `Rc`
+        // bump, and whichever half is not used drops with this scope.
         match self.park_if_unmaterialised(
             request,
             routing.0,
             routing.1,
             provenance,
-            &mut parked_reply,
+            &mut Some(reply.clone()),
         ) {
             ParkOutcome::Deliver(request)
                 if !self.serves_committed_incarnation(routing.0, routing.1) =>
             {
-                Self::answer_partition_submit_transient(request.header(), parked_reply);
+                Self::answer_partition_submit_transient(request.header(), Some(reply));
             }
             ParkOutcome::Deliver(request) => {
                 let (sender, receiver) = consensus::oneshot_channel();
@@ -3633,7 +3710,7 @@ where
                 // the pump to keep draining acks, so blocking here would
                 // deadlock the very reply being waited on. The task holds only
                 // owned channel halves, never a partitions borrow.
-                let Some(reply) = parked_reply else { return };
+                //
                 // Through the bus, not the runtime directly: the simulator
                 // supplies its own executor and virtual clock.
                 self.bus.spawn(async move {
@@ -3642,10 +3719,10 @@ where
                 });
             }
             ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {
-                Self::answer_partition_submit_transient(request.header(), parked_reply);
+                Self::answer_partition_submit_transient(request.header(), Some(reply));
             }
-            // Sender moved into the parked frame; it answers on drain or wakes
-            // the awaiter with a receive error when the frame expires.
+            // The clone travelled with the parked frame; it answers on drain
+            // or wakes the awaiter with a receive error when the frame expires.
             ParkOutcome::Parked => {}
         }
     }

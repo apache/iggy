@@ -29,6 +29,7 @@
 //! for reading the log back, where it is the more honest observer.
 
 use bytes::{Bytes, BytesMut};
+use futures::future::join_all;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::consensus::{
@@ -195,6 +196,72 @@ async fn given_committed_consumer_offset_when_replayed_should_absorb(harness: &m
     );
 }
 
+/// More connections than the prepare queue holds, each with one write in
+/// flight at the same instant, so the surplus parks in the request queue and is
+/// promoted into a prepare slot at a later commit. Every one of them must be
+/// answered: a write promoted without the reply sender it parked with commits
+/// but leaves its connection waiting out a timeout, and the count is the
+/// second discriminator (each writer's single id must commit exactly once).
+const CONCURRENT_WRITERS: u64 = 40;
+
+/// Distinct identity per writer, so each connection's watermark is its own and
+/// the request ids can all be 1.
+const WRITER_CLIENT_BASE: u128 = 0x0DED_C0DE_0000;
+
+#[iggy_harness(
+    cluster_nodes = 3,
+    server(
+        system.sharding.cpu_allocation = "0..1",
+        partition.prepare_queue_depth = "4"
+    )
+)]
+async fn given_more_writers_than_prepare_slots_when_all_send_at_once_should_answer_every_one(
+    harness: &mut TestHarness,
+) {
+    // Three nodes so a prepare needs a replication round trip to commit and the
+    // pipeline actually fills; a solo primary self-acks per frame and never
+    // exposes the request queue. The queue depth is pinned low so forty writers
+    // overflow it deterministically rather than by timing luck.
+    let client = harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client");
+    seed_topic(&client).await;
+
+    let addr = harness.node(0).tcp_addr().expect("node tcp address");
+    // Register every connection first so the writes race each other, not the
+    // logins.
+    let mut connections = Vec::with_capacity(CONCURRENT_WRITERS as usize);
+    for writer in 0..CONCURRENT_WRITERS {
+        let client_id = WRITER_CLIENT_BASE + u128::from(writer);
+        let (stream, session) = register_client_with_budget(addr, client_id, COMMIT_BUDGET).await;
+        connections.push((client_id, stream, session));
+    }
+
+    let sends = connections
+        .iter_mut()
+        .map(|(client_id, stream, session)| async move {
+            let body = send_messages_body(format!("writer-{client_id:x}").as_bytes());
+            let header =
+                request_header_for(*client_id, Operation::SendMessages, *session, 1, body.len());
+            exchange_with_budget(stream, &header, &body, COMMIT_BUDGET).await
+        });
+    let statuses = join_all(sends).await;
+    for (writer, status) in statuses.into_iter().enumerate() {
+        assert_eq!(
+            status, 0,
+            "writer {writer} must be answered with its commit (got status {status})"
+        );
+    }
+
+    let polled = poll_all(&client).await;
+    assert_eq!(
+        u64::from(polled),
+        CONCURRENT_WRITERS,
+        "every writer's single request must commit exactly once"
+    );
+}
+
 /// `StoreConsumerOffset` body for the raw connection's own consumer id.
 fn store_offset_body(offset: u64) -> Bytes {
     StoreConsumerOffsetRequest {
@@ -239,6 +306,11 @@ const FILLER_CLIENT_ID: u128 = 0x0DED_F111_E400;
 /// Sentinel status for an Eviction frame: the connection's session is gone and
 /// the caller must reconnect and re-register before retrying.
 const EVICTED: u32 = u32::MAX;
+
+/// Sentinel status for a socket the server closed mid-exchange (a node stopped
+/// under the connection). Same contract as [`EVICTED`]: reconnect, re-register,
+/// retry the identical frame.
+const DISCONNECTED: u32 = u32::MAX - 1;
 
 #[iggy_harness(
     cluster_nodes = 3,
@@ -354,7 +426,7 @@ async fn send_reconnecting(addr: SocketAddr, client: u128, request: u64, budget:
             body.len(),
         );
         let status = exchange_with_budget(&mut stream, &header, &body, remaining).await;
-        if status != EVICTED {
+        if status != EVICTED && status != DISCONNECTED {
             return status;
         }
         sleep(RETRY_PAUSE).await;
@@ -389,6 +461,10 @@ async fn raw_produce_for(
             body.len(),
         );
         let status = exchange_with_budget(stream, &header, &body, budget).await;
+        assert_ne!(
+            status, DISCONNECTED,
+            "server closed the lockstep connection under request {request}"
+        );
         assert_eq!(status, 0, "request {request} must commit");
     }
 }
@@ -506,7 +582,13 @@ async fn exchange_until_committed(
     header: &RequestHeader,
     body: &Bytes,
 ) -> u32 {
-    exchange_with_budget(stream, header, body, COMMIT_BUDGET).await
+    let status = exchange_with_budget(stream, header, body, COMMIT_BUDGET).await;
+    assert_ne!(
+        status, DISCONNECTED,
+        "server closed the lockstep connection under request {}",
+        header.request
+    );
+    status
 }
 
 async fn exchange_with_budget(
@@ -531,18 +613,24 @@ async fn exchange_with_budget(
 }
 
 /// Write one frame, read one frame, return the reply status. The connection is
-/// lockstep, so the reply that comes back is this request's.
+/// lockstep, so the reply that comes back is this request's. A socket the
+/// server closed (a node stopping under the connection) answers
+/// [`DISCONNECTED`] rather than panicking, so the reconnecting callers can
+/// treat it like an eviction; a reply that never comes is still a failure.
 async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) -> u32 {
-    stream.write_all(bytemuck::bytes_of(header)).await.unwrap();
-    if !body.is_empty() {
-        stream.write_all(body).await.unwrap();
+    if stream.write_all(bytemuck::bytes_of(header)).await.is_err() {
+        return DISCONNECTED;
+    }
+    if !body.is_empty() && stream.write_all(body).await.is_err() {
+        return DISCONNECTED;
     }
 
     let mut reply_header = [0u8; HEADER_SIZE];
-    timeout(REPLY_WAIT, stream.read_exact(&mut reply_header))
-        .await
-        .expect("reply header timed out")
-        .expect("reply header read failed");
+    match timeout(REPLY_WAIT, stream.read_exact(&mut reply_header)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => return DISCONNECTED,
+        Err(_) => panic!("reply header timed out"),
+    }
 
     let command_offset = offset_of!(RequestHeader, command);
     if reply_header[command_offset] == Command::Eviction as u8 {
@@ -566,10 +654,11 @@ async fn exchange(stream: &mut TcpStream, header: &RequestHeader, body: &Bytes) 
     let total_size = read_size_field(&reply_header).expect("reply size field") as usize;
     if total_size > HEADER_SIZE {
         let mut discard = vec![0u8; total_size - HEADER_SIZE];
-        timeout(REPLY_WAIT, stream.read_exact(&mut discard))
-            .await
-            .expect("reply body timed out")
-            .expect("reply body read failed");
+        match timeout(REPLY_WAIT, stream.read_exact(&mut discard)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => return DISCONNECTED,
+            Err(_) => panic!("reply body timed out"),
+        }
     }
     status
 }
