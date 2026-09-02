@@ -104,6 +104,17 @@ public sealed class ConsumerGroupClientStateTests
     }
 
     [Fact]
+    public void HasAssignment_ExpiresAfterTheRefreshInterval()
+    {
+        var state = new ConsumerGroupClientState();
+        state.SetAssignment(Key, 1, []);
+        var now = Environment.TickCount64;
+
+        Assert.True(state.HasAssignment(Key, now));
+        Assert.False(state.HasAssignment(Key, now + ConsumerGroupClientState.AssignmentRefreshMs));
+    }
+
+    [Fact]
     public void RegisteredGroups_ReturnsJoinedIdentifiers()
     {
         var state = new ConsumerGroupClientState();

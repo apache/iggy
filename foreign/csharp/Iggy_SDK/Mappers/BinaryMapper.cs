@@ -821,6 +821,19 @@ internal static class BinaryMapper
                 continue;
             }
 
+            if (!ValueLengthMatchesKind(keyKind, key.Length))
+            {
+                throw new MalformedResponseException(
+                    $"Malformed options block at byte {position}: key of kind {keyKind} has {key.Length} bytes.");
+            }
+
+            if (!ValueLengthMatchesKind(valueKind, value.Length))
+            {
+                throw new MalformedResponseException(
+                    $"Malformed options block at byte {position}: value of kind {valueKind} has {value.Length} " +
+                    "bytes.");
+            }
+
             options[new HeaderKey
             {
                 Kind = keyKind,

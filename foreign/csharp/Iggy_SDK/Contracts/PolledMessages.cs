@@ -27,7 +27,7 @@ public sealed class PolledMessages
     ///     for example mid-rebalance or when the group has more members than partitions. Matches the Go and
     ///     Node SDKs. Consumers should back off before polling again rather than spin.
     /// </summary>
-    public const uint NO_ASSIGNED_PARTITION = 0xFFFF_FFFE;
+    public static readonly uint NoAssignedPartition = 0xFFFF_FFFE;
 
     /// <summary>
     ///     Partition identifier for the messages.

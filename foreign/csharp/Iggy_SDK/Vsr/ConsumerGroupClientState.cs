@@ -39,14 +39,28 @@ internal sealed class ConsumerGroupClientState
     private const long PartitionCountTtlMs = 30_000;
 
     /// <summary>
-    ///     True when an assignment is cached for the group, even one holding zero partitions. Treating an empty
-    ///     assignment as missing would re-sync on every poll of a member that owns nothing.
+    ///     How long a cached assignment is trusted before the next poll asks the coordinator again. A rebalance
+    ///     that took a partition away shows up as a fenced poll long before this expires; the periodic re-sync
+    ///     catches what fencing cannot, such as a member holding zero partitions being handed one, which no poll
+    ///     of its own would ever reveal. Matches the Go SDK's <c>assignmentRefreshInterval</c>.
+    /// </summary>
+    internal static readonly long AssignmentRefreshMs = 5_000;
+
+    /// <summary>
+    ///     True when a fresh assignment is cached for the group, even one holding zero partitions. Treating an
+    ///     empty assignment as missing would re-sync on every poll of a member that owns nothing; treating it as
+    ///     fresh forever would leave that member polling nothing until an unrelated heartbeat refreshed it.
     /// </summary>
     internal bool HasAssignment(GroupKey key)
     {
+        return HasAssignment(key, Environment.TickCount64);
+    }
+
+    internal bool HasAssignment(GroupKey key, long now)
+    {
         lock (_gate)
         {
-            return _assignments.ContainsKey(key);
+            return _assignments.TryGetValue(key, out var assignment) && now < assignment.RefreshAt;
         }
     }
 
@@ -71,6 +85,7 @@ internal sealed class ConsumerGroupClientState
 
             assignment.Generation = generation;
             assignment.Partitions = partitions;
+            assignment.RefreshAt = Environment.TickCount64 + AssignmentRefreshMs;
         }
     }
 
@@ -182,7 +197,7 @@ internal sealed class ConsumerGroupClientState
     /// <summary>
     ///     True when the last assignment sync saw this client as a member. A member mid-rebalance, or one holding
     ///     zero partitions, is still registered, so this asks a different question than
-    ///     <see cref="HasAssignment" />.
+    ///     <see cref="HasAssignment(GroupKey)" />.
     /// </summary>
     internal bool IsRegistered(GroupKey key)
     {
@@ -225,6 +240,7 @@ internal sealed class ConsumerGroupClientState
         internal IReadOnlyList<uint> Partitions { get; set; } = [];
         internal ulong Generation { get; set; }
         internal int Cursor { get; set; }
+        internal long RefreshAt { get; set; }
     }
 }
 

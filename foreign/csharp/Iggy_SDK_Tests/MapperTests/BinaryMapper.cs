@@ -297,6 +297,22 @@ public sealed class BinaryMapper
     }
 
     [Fact]
+    public void MapTopic_WithAnOptionValueOfTheWrongWidth_Throws()
+    {
+        // Arrange: a Uint64 value carrying three bytes, which the Rust decoder rejects too.
+        const byte stringKind = 2;
+        const byte uint64Kind = 12;
+        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
+            maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var options = BinaryFactory.CreateOptionEntry(stringKind, "segment_size", uint64Kind, [1, 2, 3]);
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
+            sizeBytes, messagesCount, createdAt, maxTopicSize, 1, options);
+
+        // Act + Assert
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(topicPayload));
+    }
+
+    [Fact]
     public void MapOptionSpecs_ReturnsTheCatalogWithKindsAndDefaults()
     {
         // Arrange: [count][key_len][key][kind][default_len][default][description_len][description]

@@ -128,7 +128,7 @@ public partial class IggyConsumer
 
             if (rental.Messages.Count == 0)
             {
-                if (rental.PartitionId == PolledMessages.NO_ASSIGNED_PARTITION)
+                if (rental.PartitionId == PolledMessages.NoAssignedPartition)
                 {
                     LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
                     await Task.Delay(NoAssignedPartitionBackoffMs, ct);

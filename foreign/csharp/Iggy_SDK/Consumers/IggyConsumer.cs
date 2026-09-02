@@ -43,7 +43,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private const int GroupRejoinRetryDelayMs = 1_000;
 
     /// <summary>
-    ///     Backoff after a group poll reported <see cref="PolledMessages.NO_ASSIGNED_PARTITION" />. Without it a
+    ///     Backoff after a group poll reported <see cref="PolledMessages.NoAssignedPartition" />. Without it a
     ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
     /// </summary>
     private const int NoAssignedPartitionBackoffMs = 100;
@@ -416,7 +416,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (messages.Messages.Count == 0)
             {
-                if (messages.PartitionId == PolledMessages.NO_ASSIGNED_PARTITION)
+                if (messages.PartitionId == PolledMessages.NoAssignedPartition)
                 {
                     LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
                     await Task.Delay(NoAssignedPartitionBackoffMs, ct);
@@ -469,6 +469,10 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 _config.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (MessageDecryptionException ex)
         {
