@@ -21,7 +21,7 @@
 //! [`ShellBus`] bound, the [`ShellHandlers`] slot struct, and the
 //! `[cluster]` timer-to-tick translation every consensus group boots with.
 //! Everything here is type- and config-level; construction (wiring the
-//! handlers against a live bus) stays in [`crate::bootstrap`].
+//! handlers against a live bus) stays in [`crate::boot`].
 
 use crate::session_manager::SessionManager;
 use configs::server::ServerConfig;
@@ -82,7 +82,7 @@ impl<B: MessageBus + ConnectionInstaller + Clone + 'static> ShellBus for B {}
 /// [`SessionManager`] the request-plane pair shares.
 ///
 /// Both production (`build_shard_for_thread`) and the simulator's shell
-/// mode construct these through [`crate::bootstrap::wire_shell_handlers`],
+/// mode construct these through [`crate::boot::wire_shell_handlers`],
 /// so the request plane is wired one way. The simulator's shell-off fast
 /// path uses [`ShellHandlers::noop`] instead.
 pub struct ShellHandlers {

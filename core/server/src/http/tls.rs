@@ -52,9 +52,7 @@ use hyper::rt::Executor;
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
 use message_bus::ShutdownToken;
-use message_bus::transports::tls::{
-    TlsServerCredentials, install_default_crypto_provider, load_pem,
-};
+use message_bus::transports::tls::{TlsServerCredentials, load_pem};
 use tower_http::add_extension::AddExtension;
 use tracing::{debug, error};
 
@@ -200,7 +198,6 @@ impl<F: Future<Output = ()> + 'static> Executor<F> for LocalExecutor {
 fn build_server_config(
     credentials: TlsServerCredentials,
 ) -> Result<Arc<rustls::ServerConfig>, ServerError> {
-    install_default_crypto_provider();
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(credentials.cert_chain, credentials.key_der)
@@ -272,10 +269,13 @@ fn spawn_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use message_bus::transports::tls::self_signed_for_loopback;
+    use message_bus::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
 
     #[test]
     fn server_config_advertises_h2_and_http11_alpn() {
+        // The server installs the provider once at bootstrap; a unit test
+        // has no bootstrap.
+        install_default_crypto_provider();
         let config =
             build_server_config(self_signed_for_loopback()).expect("self-signed cert builds");
         assert_eq!(

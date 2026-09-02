@@ -1279,7 +1279,8 @@ mod tests {
                 })
                 .to_vec(),
             self_advertised: "127.0.0.1".to_owned(),
-            self_ports: TransportPorts::default(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: Arc::default(),
             metadata_view: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
             )),
