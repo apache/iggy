@@ -135,18 +135,19 @@ components:
       - "core/message_bus/**"
       - "core/partitions/**"
 
-  # On-disk format backwards compatibility. Boots a server built from
-  # origin/master, seeds a data directory, then swaps in a HEAD-built binary
-  # and asserts it reads everything back. Paths are the crates that own the
-  # on-disk representation plus the boot path that reads it back; a change to
-  # any of them can silently break rollforward for existing deployments, which
-  # no other check covers. Matching is literal glob with no crate-graph
-  # expansion, so every crate has to be spelled out: `core/server/**` does not
-  # cover `core/server_common/**`.
+  # On-disk format backwards compatibility. Boots a server built from the
+  # master tip the PR merges onto, seeds a data directory, then swaps in a
+  # HEAD-built binary and asserts it reads everything back. Paths are the
+  # crates that own the on-disk representation plus the boot path that reads
+  # it back; a change to any of them can silently break rollforward for
+  # existing deployments, which no other check covers. Matching is literal
+  # glob with no crate-graph expansion, so every crate has to be spelled out:
+  # `core/server/**` does not cover `core/server_common/**`.
   # `breaking:storage` on the PR skips it (see .github/workflows/_test.yml).
   rust-storage-compat:
     depends_on:
       - "rust-workspace"
+      - "rust-configs" # partition/metadata on-disk schema knobs and their defaults
       - "ci-infrastructure" # action.yml/workflow edits should re-run the check
     paths:
       - "core/server/**"
@@ -159,9 +160,13 @@ components:
       - "core/partitions/**"
       - "core/shard/**" # drives the shutdown flush and boot-time partition recovery
       - "scripts/ci/storage-compat.sh"
-      # The check itself, so weakening it re-runs it. Scoped to the test and
-      # the harness it drives rather than `core/integration/**`, which would
-      # fire this lane on every unrelated integration test change.
+      # The check itself, so weakening it re-runs it. Scoped to the test, the
+      # module wiring that keeps it compiled in, the crate manifest and the
+      # harness it drives rather than `core/integration/**`, which would fire
+      # this lane on every unrelated integration test change.
+      - "core/integration/Cargo.toml"
+      - "core/integration/tests/mod.rs"
+      - "core/integration/tests/data_integrity/mod.rs"
       - "core/integration/tests/data_integrity/storage_compat.rs"
       - "core/integration/src/harness/**"
     tasks:

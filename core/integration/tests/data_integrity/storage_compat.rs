@@ -17,13 +17,13 @@
 
 //! On-disk format backwards compatibility.
 //!
-//! A server built from the merge base (the BASELINE) writes a rich data
-//! directory: a checkpointed metadata snapshot plus an uncheckpointed WAL
-//! tail, sealed and active segments, a partial segment deletion, individual
-//! and group consumer offsets, a purge generation, users, permissions,
-//! personal access tokens and consumer groups. The same directory is then
-//! restarted under the build under test, and everything must read back
-//! unchanged.
+//! A server built from the master tip the change merges onto (the BASELINE)
+//! writes a rich data directory: a checkpointed metadata snapshot plus an
+//! uncheckpointed WAL tail, sealed and active segments, a partial segment
+//! deletion, individual and group consumer offsets, a purge generation with
+//! messages appended past it, users, permissions, personal access tokens and
+//! consumer groups. The same directory is then restarted under the build under
+//! test, and everything must read back unchanged.
 //!
 //! The swap works because `ServerHandle::start` re-reads
 //! `config.executable_path` on every call while the data directory, the
@@ -68,7 +68,7 @@
 use bytes::Bytes;
 use iggy::prelude::*;
 use integration::harness::{
-    TestHarness, TestServerConfig, create_user, disk, resolve_config_paths,
+    TestHarness, TestServerConfig, USER_PASSWORD, disk, resolve_config_paths,
 };
 use serial_test::parallel;
 use std::collections::{BTreeMap, HashMap};
@@ -162,6 +162,20 @@ const MIN_SEGMENTS_BEFORE_DELETE: usize = 4;
 /// Messages produced into the topic that is purged afterwards.
 const PURGED_MESSAGES: u64 = 8;
 
+/// Messages appended to the purged topic AFTER the purge, at generation 1.
+///
+/// Without them the purge check is vacuous. An unreadable `purge.gen` reads
+/// as 0 on purpose (the absent-or-torn sentinel), the reconciler then
+/// re-purges the partition, and an empty topic passes a `messages_count == 0`
+/// assertion whether or not the generation decoded. Only messages that must
+/// SURVIVE the swap can tell the two apart.
+const POST_PURGE_MESSAGES: u64 = 8;
+
+/// Seeded personal access token expiry. Non-default (the default is
+/// `NeverExpire`, which reads back as `None`) so a dropped or misread field
+/// cannot pass as the default.
+const PAT_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Contiguous messages re-polled after the swap.
 const READBACK_COUNT: u32 = 16;
 
@@ -212,7 +226,7 @@ const GRACEFUL_SHUTDOWN_MARKER: &str = "server shutdown complete";
 
 #[tokio::test]
 #[parallel]
-#[ignore = "needs a baseline iggy-server built from the merge base; run via scripts/ci/storage-compat.sh"]
+#[ignore = "needs a baseline iggy-server built from master; run via scripts/ci/storage-compat.sh"]
 async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     let baseline = baseline_server_binary();
     let envs = resolve_config_paths(&HashMap::from([(
@@ -481,13 +495,64 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     })
     .await;
 
-    // 7. Users, permissions, tokens and group membership, then a short stream
-    //    tail that stays above the checkpoint.
-    create_user(&client, COMPAT_USER).await;
+    // Appended once the generation is durable, so they sit at offset 0 of the
+    // reset chain and only survive a boot that decodes `purge.gen`.
+    let mut post_purge_batch: Vec<IggyMessage> = (0..POST_PURGE_MESSAGES)
+        .map(|index| {
+            IggyMessage::builder()
+                .payload(Bytes::from(post_purge_payload(index)))
+                .build()
+                .unwrap()
+        })
+        .collect();
     client
-        .create_personal_access_token(COMPAT_PAT, PersonalAccessTokenExpiry::NeverExpire)
+        .send_messages(
+            &purge_stream,
+            &purge_topic,
+            &Partitioning::partition_id(0),
+            &mut post_purge_batch,
+        )
         .await
         .unwrap();
+
+    // 7. Users, permissions, tokens and group membership, then a short stream
+    //    tail that stays above the checkpoint.
+    let permissions = seeded_permissions(data_stream_details.id, data_topic_details.id);
+    client
+        .create_user(
+            COMPAT_USER,
+            USER_PASSWORD,
+            UserStatus::Active,
+            Some(permissions.clone()),
+        )
+        .await
+        .unwrap();
+    let seeded_user = client
+        .get_user(&Identifier::named(COMPAT_USER).unwrap())
+        .await
+        .unwrap()
+        .expect("the baseline lists the user it just created");
+    assert_eq!(
+        seeded_user.permissions,
+        Some(permissions.clone()),
+        "the baseline must report the permissions exactly as seeded, or a post-swap mismatch \
+         could not be attributed to the swap"
+    );
+    let pat = client
+        .create_personal_access_token(
+            COMPAT_PAT,
+            PersonalAccessTokenExpiry::ExpireDuration(IggyDuration::new_from_secs(PAT_EXPIRY_SECS)),
+        )
+        .await
+        .unwrap();
+    let pat_expiry_at = client
+        .get_personal_access_tokens()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|token| token.name == COMPAT_PAT)
+        .and_then(|token| token.expiry_at)
+        .expect("the baseline lists the seeded token with its expiry");
     client
         .create_consumer_group(&data_stream, &data_topic, TRANSIENT_GROUP)
         .await
@@ -509,10 +574,10 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
             .unwrap_or_else(|error| panic!("create tail stream {index}: {error}"));
     }
 
-    let expected_streams = (SEED_STREAMS + WAL_TAIL_STREAMS + 2) as usize;
+    let expected_streams = stream_catalog(&client).await;
     assert_eq!(
-        client.get_streams().await.unwrap().len(),
-        expected_streams,
+        expected_streams.len(),
+        (SEED_STREAMS + WAL_TAIL_STREAMS + 2) as usize,
         "the seed must have created every stream before the swap"
     );
 
@@ -563,12 +628,13 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
     // reconnect loop inside `restart_server` never touched it. Take a fresh one.
     let client = harness.tcp_root_client().await.unwrap();
 
-    let streams = client.get_streams().await.unwrap();
+    // Ids AND names: later reads resolve by numeric id, so a corrupted name
+    // would pass a bare count.
     assert_eq!(
-        streams.len(),
+        stream_catalog(&client).await,
         expected_streams,
-        "streams written by the baseline must all recover, both the checkpointed prefix and \
-         the WAL tail"
+        "streams written by the baseline must all recover with their ids and names, both the \
+         checkpointed prefix and the WAL tail"
     );
 
     // Per-key option degradation is silent, so re-read every seeded value.
@@ -663,12 +729,13 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         "the segment chain must recover exactly as the baseline left it"
     );
 
+    let readback = Consumer::new(Identifier::named("compat-readback").unwrap());
     let polled = client
         .poll_messages(
             &data_stream,
             &data_topic,
             Some(0),
-            &Consumer::new(Identifier::named("compat-readback").unwrap()),
+            &readback,
             &PollingStrategy::offset(first_retained_offset),
             READBACK_COUNT,
             false,
@@ -697,7 +764,7 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
             &data_stream,
             &data_topic,
             Some(0),
-            &Consumer::new(Identifier::named("compat-readback").unwrap()),
+            &readback,
             &PollingStrategy::offset(last_offset),
             1,
             false,
@@ -743,8 +810,33 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         .unwrap()
         .expect("the purged topic survives the swap");
     assert_eq!(
-        purged.messages_count, 0,
-        "the purge generation must still fence the purged messages"
+        purged.messages_count, POST_PURGE_MESSAGES,
+        "the purged topic must hold exactly the messages appended after the purge: fewer means \
+         `purge.gen` read back as 0 and the partition was purged again, more means the purge \
+         itself was lost"
+    );
+    let post_purge = client
+        .poll_messages(
+            &purge_stream,
+            &purge_topic,
+            Some(0),
+            &readback,
+            &PollingStrategy::offset(0),
+            READBACK_COUNT,
+            false,
+        )
+        .await
+        .unwrap();
+    let post_purge_payloads: Vec<String> = post_purge
+        .messages
+        .iter()
+        .map(|message| String::from_utf8_lossy(&message.payload).into_owned())
+        .collect();
+    let expected_post_purge: Vec<String> =
+        (0..POST_PURGE_MESSAGES).map(post_purge_payload).collect();
+    assert_eq!(
+        post_purge_payloads, expected_post_purge,
+        "offset 0 of the purged topic must start the post-purge messages, not a pre-purge one"
     );
     assert_eq!(
         purged.compression_algorithm,
@@ -758,19 +850,44 @@ async fn should_read_back_a_data_directory_written_by_the_baseline_server() {
         .unwrap()
         .expect("the user survives the swap");
     assert_eq!(user.status, UserStatus::Active, "user status");
-    let permissions = user.permissions.expect("the user keeps its permissions");
-    assert!(
-        permissions.global.manage_streams && permissions.global.poll_messages,
-        "permissions must survive the swap, got {:?}",
-        permissions.global
+    assert_eq!(
+        user.permissions,
+        Some(permissions),
+        "permissions must survive the swap bit for bit at the global, stream and topic level"
     );
 
     let tokens = client.get_personal_access_tokens().await.unwrap();
-    assert!(
-        tokens.iter().any(|token| token.name == COMPAT_PAT),
-        "the personal access token must survive the swap, got {:?}",
-        tokens.iter().map(|token| &token.name).collect::<Vec<_>>()
+    let token = tokens
+        .iter()
+        .find(|token| token.name == COMPAT_PAT)
+        .unwrap_or_else(|| {
+            panic!(
+                "the personal access token must survive the swap, got {:?}",
+                tokens.iter().map(|token| &token.name).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        token.expiry_at,
+        Some(pat_expiry_at),
+        "personal access token expiry"
     );
+
+    // Listing proves the metadata; the password hash and the token hash are
+    // separate fields, and a user that lists fine but cannot log in is still
+    // locked out. Fresh, unauthenticated connections, so the root session
+    // above vouches for neither.
+    let by_password = harness.tcp_new_client().await.unwrap();
+    by_password
+        .login_user(COMPAT_USER, USER_PASSWORD)
+        .await
+        .expect("the seeded password must still authenticate after the swap");
+    let by_token = harness.tcp_new_client().await.unwrap();
+    by_token
+        .login_with_personal_access_token(&pat.token)
+        .await
+        .expect("the seeded personal access token must still authenticate after the swap");
+    drop(by_password);
+    drop(by_token);
 
     let groups = client
         .get_consumer_groups(&data_stream, &data_topic)
@@ -819,9 +936,9 @@ fn baseline_server_binary() -> String {
     let raw = std::env::var(BASELINE_SERVER_ENV).unwrap_or_else(|_| {
         panic!(
             "{BASELINE_SERVER_ENV} is unset. It must be an ABSOLUTE path to the iggy-server \
-             binary built from the merge base. Without it this test would boot the build under \
-             test twice and prove nothing, so it refuses to run. Use \
-             scripts/ci/storage-compat.sh, which builds the baseline and exports the variable."
+             binary built from master. Without it this test would boot the build under test \
+             twice and prove nothing, so it refuses to run. Use scripts/ci/storage-compat.sh, \
+             which builds the baseline and exports the variable."
         )
     });
 
@@ -835,7 +952,7 @@ fn baseline_server_binary() -> String {
     let resolved = fs::canonicalize(&path).unwrap_or_else(|error| {
         panic!(
             "{BASELINE_SERVER_ENV}={raw:?} does not resolve: {error}. It must point at an \
-             iggy-server binary built from the merge base."
+             iggy-server binary built from master."
         )
     });
     assert!(
@@ -856,6 +973,61 @@ fn payload_for(offset: u64) -> Bytes {
 
 fn payload_prefix(offset: u64) -> String {
     format!("compat-message-{offset:06}")
+}
+
+fn post_purge_payload(index: u64) -> String {
+    format!("compat-post-purge-{index}")
+}
+
+/// Alternating bits at every level. All-true (the harness default) reads back
+/// identical under any field permutation, and a level left `None` cannot tell
+/// a dropped map from one never seeded.
+fn seeded_permissions(stream_id: u32, topic_id: u32) -> Permissions {
+    Permissions {
+        global: GlobalPermissions {
+            manage_servers: false,
+            read_servers: true,
+            manage_users: false,
+            read_users: true,
+            manage_streams: false,
+            read_streams: true,
+            manage_topics: false,
+            read_topics: true,
+            poll_messages: false,
+            send_messages: true,
+        },
+        streams: Some(BTreeMap::from([(
+            stream_id as usize,
+            StreamPermissions {
+                manage_stream: true,
+                read_stream: false,
+                manage_topics: true,
+                read_topics: false,
+                poll_messages: true,
+                send_messages: false,
+                topics: Some(BTreeMap::from([(
+                    topic_id as usize,
+                    TopicPermissions {
+                        manage_topic: false,
+                        read_topic: true,
+                        poll_messages: false,
+                        send_messages: true,
+                    },
+                )])),
+            },
+        )])),
+    }
+}
+
+/// Stream id to name, the identity the metadata plane must recover.
+async fn stream_catalog(client: &impl StreamClient) -> BTreeMap<u32, String> {
+    client
+        .get_streams()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|stream| (stream.id, stream.name))
+        .collect()
 }
 
 fn partition_dir(data_path: &Path, stream_id: u32, topic_id: u32, partition_id: u32) -> PathBuf {

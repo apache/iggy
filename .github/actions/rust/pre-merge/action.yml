@@ -84,19 +84,22 @@ runs:
     # a subset of crates changed.
     # Safety: cargo check/clippy run on the full workspace separately, catching all
     # compilation errors. This only scopes test BUILD and EXECUTION.
+    # test-storage-compat is excluded from the DAG and coverage setup below:
+    # storage-compat.sh builds two explicit binaries and drives its own nextest
+    # run, and reads none of the /tmp plan files or the llvm-cov environment.
     - name: Fetch base branch for DAG analysis
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: git fetch origin master --depth=1 2>/dev/null || true
       shell: bash
 
     - name: Install cargo-rail
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-rail
 
     - name: Compute affected crates (cargo-rail)
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: |
         METADATA_JSON=$(cargo metadata --format-version 1 --no-deps 2>/dev/null || echo "{}")
         TOTAL_CRATES=$(echo "$METADATA_JSON" | jq '.workspace_members | length' 2>/dev/null || echo "?")
@@ -202,7 +205,7 @@ runs:
       shell: bash
 
     - name: Install cargo-llvm-cov
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-llvm-cov
@@ -391,10 +394,11 @@ runs:
       shell: bash
 
     # On-disk format backwards compatibility. The script builds an iggy-server
-    # from origin/master and one from HEAD, seeds a data directory with the
+    # from the master tip under the checked-out merge ref (origin/master off a
+    # pull_request run) and one from HEAD, seeds a data directory with the
     # former and reads it back with the latter. It does its own shallow fetch
-    # of the baseline ref and exits non-zero if it cannot resolve one, so the
-    # default depth-1 checkout is sufficient here.
+    # of the baseline commit and exits non-zero if it cannot resolve one, so
+    # the default depth-1 checkout is sufficient here.
     - name: Storage format backwards compatibility
       if: inputs.task == 'test-storage-compat'
       run: ./scripts/ci/storage-compat.sh

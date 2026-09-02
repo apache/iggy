@@ -24,7 +24,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 # storage-compat.sh -- Prove HEAD still reads a data directory written by master.
 #
 # Builds two iggy-server binaries and hands both to one integration test:
-#   baseline  built from --baseline-ref (default origin/master), copied aside
+#   baseline  built from --baseline-ref, copied aside. Default: on a
+#             pull_request run, the master tip under the checked-out merge ref;
+#             anywhere else, origin/master.
 #   HEAD      built from the working tree, left at target/debug/iggy-server
 # The test boots the baseline, seeds a data directory, swaps the binary to HEAD
 # and restarts against that same directory.
@@ -39,7 +41,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 #
 # Exit codes: 0 = compatible, non-zero = build failure or format regression.
 
-BASELINE_REF="origin/master"
+# Empty selects the default described above once HEAD is known.
+BASELINE_REF=""
 REBUILD_BASELINE=0
 
 # The single #[ignore]d test this script exists to drive. The integration crate
@@ -64,7 +67,8 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $0 [--baseline-ref <ref>] [--rebuild-baseline]"
       echo ""
       echo "Options:"
-      echo "  --baseline-ref <ref>  Ref to build the baseline server from (default: origin/master)"
+      echo "  --baseline-ref <ref>  Ref to build the baseline server from (default: the merge ref's"
+      echo "                        first parent on a pull_request run, origin/master otherwise)"
       echo "  --rebuild-baseline    Rebuild the baseline even when its binary is already on disk"
       exit 0
       ;;
@@ -77,6 +81,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# Absolute before any cd: cargo resolves a relative CARGO_TARGET_DIR against
+# its own CWD, and the baseline below builds from a worktree elsewhere on
+# disk, so a relative value would scatter the two builds and the lookup of
+# either binary across three directories. Exported so every cargo call here,
+# nextest included, lands in the same place.
+TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
+mkdir -p "${TARGET_DIR}"
+TARGET_DIR="$(cd "${TARGET_DIR}" && pwd)"
+export CARGO_TARGET_DIR="${TARGET_DIR}"
+
 cd "${REPO_ROOT}"
 
 if ! command -v cargo-nextest &>/dev/null; then
@@ -87,7 +102,6 @@ if ! command -v cargo-nextest &>/dev/null; then
   exit 1
 fi
 
-TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 HEAD_SERVER="${TARGET_DIR}/debug/iggy-server"
 
 WORKTREE_DIR=""
@@ -102,8 +116,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The remote side of a fetch takes a branch or tag name, never a
-# remote-tracking name, so drop the remote prefix before asking origin for it.
+HEAD_SHA="$(git rev-parse --verify HEAD)"
+
+# On a pull_request run actions/checkout leaves HEAD at the synthetic
+# refs/pull/N/merge commit, whose first parent is the exact master tip GitHub
+# merged the PR onto: an ancestor of HEAD by construction. Live origin/master
+# can already be newer by the time this step runs, and a baseline HEAD does
+# not contain would blame the PR for master's own changes. Read from the raw
+# object: in the depth-1 checkout the parent is a shallow boundary, so
+# `HEAD^1` does not resolve. Two parents required, so a checkout pinned to the
+# PR head instead of the merge ref falls through rather than picking the PR's
+# own parent.
+if [ -z "${BASELINE_REF}" ]; then
+  if [[ "${GITHUB_REF:-}" =~ ^refs/pull/[0-9]+/merge$ ]] \
+    && [ "$(git cat-file -p HEAD | grep -c '^parent ')" -eq 2 ]; then
+    BASELINE_REF="$(git cat-file -p HEAD | awk '/^parent /{print $2; exit}')"
+    echo "Pull request run: baseline is the master tip under the merge ref"
+  else
+    BASELINE_REF="origin/master"
+  fi
+fi
+
+# The remote side of a fetch takes a branch or tag name (or a reachable SHA),
+# never a remote-tracking name, so drop the remote prefix before asking origin.
 FETCHED=0
 if git fetch --no-tags --depth=1 origin "${BASELINE_REF#origin/}" 2>/dev/null; then
   FETCHED=1
@@ -124,16 +159,21 @@ if [ -z "${BASELINE_SHA}" ]; then
   exit 1
 fi
 
-HEAD_SHA="$(git rev-parse --verify HEAD)"
 echo "Baseline: ${BASELINE_SHA} (${BASELINE_REF})"
 echo "HEAD:     ${HEAD_SHA}"
 if [ "${BASELINE_SHA}" = "${HEAD_SHA}" ]; then
   echo "WARNING: baseline and HEAD are the same commit, this run proves nothing"
 fi
+# Only decidable with history: a shallow clone answers "no" for every pair.
+if [ "$(git rev-parse --is-shallow-repository)" = "false" ] \
+  && ! git merge-base --is-ancestor "${BASELINE_SHA}" "${HEAD_SHA}"; then
+  echo "WARNING: baseline is not an ancestor of HEAD; a failure below may be master's change, not HEAD's"
+fi
 
 # Keyed by baseline commit, which also pins that commit's Cargo.lock and
-# rust-toolchain.toml. Drop a cache restore/save around this path to skip the
-# per-PR baseline build.
+# rust-toolchain.toml. Only a developer machine ever hits this: hosted runners
+# start empty and nothing publishes a baseline binary, so CI rebuilds it on
+# every run.
 BASELINE_SERVER="${TARGET_DIR}/storage-compat/${BASELINE_SHA}/iggy-server"
 
 if [ "${REBUILD_BASELINE}" -eq 1 ]; then
@@ -159,7 +199,8 @@ else
 
   echo "Building baseline iggy-server from ${BASELINE_SHA}..."
   # Built from the worktree as CWD so the baseline's own rust-toolchain.toml
-  # applies, into the shared target dir so the registry graph compiles once.
+  # applies, into the shared CARGO_TARGET_DIR so the registry graph compiles
+  # once.
   #
   # Debug profile on both sides, and no --all-features: release would compile
   # debug_assert! out of the baseline while HEAD still panics on it, and
@@ -167,7 +208,7 @@ else
   # would differ in ways the storage format never changed.
   (
     cd "${WORKTREE_DIR}"
-    cargo build --locked --target-dir "${TARGET_DIR}" -p server --bin iggy-server
+    cargo build --locked -p server --bin iggy-server
   )
 
   if [ ! -x "${HEAD_SERVER}" ]; then
@@ -187,7 +228,7 @@ fi
 rm -f "${HEAD_SERVER}"
 
 echo "Building HEAD iggy-server from ${HEAD_SHA}..."
-cargo build --locked --target-dir "${TARGET_DIR}" -p server --bin iggy-server
+cargo build --locked -p server --bin iggy-server
 
 if [ ! -x "${HEAD_SERVER}" ]; then
   echo "HEAD build did not produce ${HEAD_SERVER}"
