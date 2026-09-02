@@ -118,8 +118,8 @@ pub const MAX_EVICTED_RING_BYTES: u64 = 256 * 1024 * 1024;
 pub const PARTITION_DEDUP_CLIENTS_DEFAULT: usize = 4096;
 
 /// Ceiling for [`PartitionConfig::dedup_clients_max`]. A per-group budget, so
-/// the ceiling bounds worst-case memory at roughly `partitions * this * 130
-/// bytes`: a 96-byte slot entry plus its index-map slot.
+/// the ceiling bounds worst-case memory at roughly `partitions * this * 146
+/// bytes`: a 112-byte slot entry plus its index-map slot.
 pub const PARTITION_DEDUP_CLIENTS_CEILING: usize = 1 << 16;
 
 /// Capacity tunables for the per-partition consensus plane.

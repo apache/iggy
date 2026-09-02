@@ -585,10 +585,17 @@ pub struct DedupWatermark {
 /// replay it after later ids have committed, so "at or below the watermark"
 /// alone would absorb that replay as a duplicate and lose the write. The window
 /// records which ids under the watermark actually committed; an unmarked one
-/// inside it executes. Sized above the default in-flight ceiling per group
-/// (`PIPELINE_PREPARE_QUEUE_MAX + PIPELINE_REQUEST_QUEUE_MAX` = 96): a client
-/// with more than this many writes outstanding on one partition can still have
-/// a replay absorbed once its id ages out of the window.
+/// inside it executes, while one that has aged out below it reads as committed
+/// and is absorbed with the operation's empty success.
+///
+/// The width is in the CLIENT's request-id space, not in this group's writes:
+/// `ConsensusSession` mints from one counter across every partition, stream and
+/// metadata op, so a slice only ever sees the subset of those ids routed to it.
+/// Coverage in a client's own writes to one group is this width divided by the
+/// number of groups it interleaves, so 128 ids is around 16 writes per group
+/// across 8 partitions, and a replay held back longer than that is absorbed and
+/// lost. A wider bitmap divides by the same fanout: closing the gap needs
+/// per-group request numbering, which waits on the clients-table follow-up.
 pub const COMMITTED_WINDOW_BITS: u64 = 128;
 
 /// VSR client table: per-session fence epoch + request-watermark dedup.
@@ -1288,8 +1295,8 @@ impl ClientTable {
     }
 
     /// Replace every entry, as a state-transfer install does. An empty iterator
-    /// is the clear: there is no separate `clear`, and both callers that need
-    /// one (a failed install converging to empty, a purge) come through here.
+    /// is the clear: there is no separate `clear`, and the one caller that
+    /// needs one (a failed install converging to empty) comes through here.
     ///
     /// The peer's cap may exceed this node's, so when the input is longer than
     /// `clients_max` the entries with the newest commits survive, which is what

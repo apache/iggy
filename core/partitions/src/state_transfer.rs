@@ -490,9 +490,12 @@ impl ConsumerOffsetsWire {
         // The count is peer input and the reservation is 12 bytes per element
         // after alignment, so it is checked against the bytes actually present
         // before allocating: a ~30 byte artifact could otherwise ask for tens of
-        // megabytes across the two sections. 12 is the wire stride below -- the
-        // groups call sees exactly `12 * count` bytes remaining, so a wider
-        // guard would reject every non-empty artifact.
+        // megabytes across the two sections. 12 is the wire stride below, and
+        // the guard is a lower bound on purpose: what trails a section varies
+        // (groups trails consumers, the dedup section trails groups and is
+        // absent from a v1 artifact), so only "at least this many bytes
+        // present" holds for both calls. Demanding that `12 * count` be all
+        // that remains would reject valid input.
         if count as usize * (size_of::<u32>() + size_of::<u64>()) > cursor.remaining().len() {
             return Err(ConsumerOffsetsWireError::Truncated);
         }
