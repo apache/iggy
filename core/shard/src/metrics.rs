@@ -406,6 +406,12 @@ impl ShardMetrics {
     /// asserts it stays at zero on runs with no injected loss. A gap drop is a
     /// protocol-ordering drop that any real loss produces, and the sweep repairs
     /// it, so folding the two would turn a routing-fault alert into noise.
+    ///
+    /// Shard-scoped, with no namespace label: a server runs hundreds of groups
+    /// per shard, so labelling by namespace is unbounded cardinality, and every
+    /// other partition counter in this file is shard-scoped for the same
+    /// reason. The per-group detail is in the arm's log line. The metadata
+    /// plane's own gap drop is NOT counted here - it has its own recovery path.
     pub fn record_partition_prepare_gap_drops(&self, drops: u64) {
         self.partition_prepare_gap_drops_total.inc_by(drops);
     }

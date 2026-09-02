@@ -646,6 +646,12 @@ view_probe_attempts_max = 5
 # fire-and-forget over the lossy bus, so a session with no retry wedges forever
 # on a single dropped frame. Paces both the metadata and partition repair loops;
 # must be nonzero.
+#
+# Also how long a gap-stopped partition backup waits before OPENING a repair
+# session, so shortening this makes the shard react to a replication hole
+# sooner as well. That second use carries its own floor
+# (PARTITION_GAP_DEBOUNCE_TICKS_MIN), because a value near the tick interval
+# would otherwise arm repair against ordinary pipelining.
 repair_retry_interval = "1s"
 
 # Prepares a peer serves per repair round before the requester walks to the next

@@ -4723,6 +4723,36 @@ mod partition_repair_driver_tests {
     /// commits just collects transient rejections and the group goes quiet.
     const TICKS_PER_SEND: usize = 4;
 
+    /// What the healthy run saw of the backup's commit lag, sampled per tick.
+    ///
+    /// Lag alone is what a naive detector reads as a gap, so the run has to
+    /// record how much of it there was AND whether the op past the frontier was
+    /// resident each time, rather than assert the lag away.
+    #[derive(Default)]
+    struct LagObservations {
+        samples: u32,
+        resident_samples: u32,
+        longest_run: u32,
+        current_run: u32,
+    }
+
+    impl LagObservations {
+        /// Fold one tick's view of `replica`'s commit frontier.
+        fn observe(&mut self, sim: &Simulator, replica: u8, namespace: IggyNamespace) {
+            let (_, _, commit_min, commit_max) = group_state(sim, replica, namespace);
+            if commit_min >= commit_max {
+                self.current_run = 0;
+                return;
+            }
+            self.current_run += 1;
+            self.longest_run = self.longest_run.max(self.current_run);
+            self.samples += 1;
+            if journal_holds(sim, replica, namespace, commit_min + 1) {
+                self.resident_samples += 1;
+            }
+        }
+    }
+
     /// Ops the healthy run must have committed for its verdict to mean anything.
     /// A produce's round trip is four one-way hops plus tick granularity, so this
     /// network commits on the order of one op per fifteen ticks however hard the
@@ -5122,17 +5152,7 @@ mod partition_repair_driver_tests {
         // pipelining. The backup's lag is sampled per tick, and the run asserts
         // it went somewhere, so a green result cannot come from a workload that
         // never loaded the group.
-        let mut lag_run = 0u32;
-        let mut longest_lag_run = 0u32;
-        let sample = |sim: &Simulator, lag_run: &mut u32, longest: &mut u32| {
-            let (_, _, commit_min, commit_max) = group_state(sim, 1, namespace);
-            if commit_min < commit_max {
-                *lag_run += 1;
-                *longest = (*longest).max(*lag_run);
-            } else {
-                *lag_run = 0;
-            }
-        };
+        let mut observed = LagObservations::default();
         for tick in 0..LOAD_TICKS {
             if tick % TICKS_PER_SEND == 0 {
                 let msg =
@@ -5140,11 +5160,11 @@ mod partition_repair_driver_tests {
                 sim.submit_request(client.client_id(), 0, msg.into_generic());
             }
             sim.step();
-            sample(&sim, &mut lag_run, &mut longest_lag_run);
+            observed.observe(&sim, 1, namespace);
         }
         for _ in 0..QUIET_STEPS {
             sim.step();
-            sample(&sim, &mut lag_run, &mut longest_lag_run);
+            observed.observe(&sim, 1, namespace);
         }
 
         let committed = group_state(&sim, 1, namespace).2;
@@ -5154,18 +5174,27 @@ mod partition_repair_driver_tests {
             "the backup committed only {committed} ops across {sends} sends, so the \
              sweep was never driven over a loaded group"
         );
-        // Recorded, not asserted: a two-replica group's backup keeps pace tick for
-        // tick, so the lag a naive `commit_min < commit_max` detector would read
-        // as a gap does not arise from healthy partition traffic at all. What that
-        // detector actually mistakes for a gap is a walk BLOCKED over resident ops
-        // (a deferred purge, a transfer install), which no healthy workload
-        // reaches; `gap_detector_tests` pins the predicate directly instead.
+        // Lag is RECORDED, not forbidden. Asserting it away would make the
+        // repair-request assertion below unfalsifiable, since
+        // `partition_is_gap_stopped` needs `commit_min < commit_max` to fire at
+        // all. What must hold is that every lag this run saw was backed by a
+        // RESIDENT next op -- a walk waiting to run, not a hole -- which is the
+        // distinction a naive detector would miss.
+        //
+        // On a two-replica group the backup keeps pace and the tick's own
+        // walk-stalled backstop drains what little lag a step leaves, so this
+        // usually samples none and the check costs nothing. It is the guard for
+        // when that stops being true, not the proof: the predicate itself is
+        // pinned exhaustively by `gap_detector_tests`, and what this run adds is
+        // that the DRIVER sends no repair over a live, loaded group.
         assert_eq!(
-            longest_lag_run, 0,
-            "healthy two-replica traffic left the backup lagging for \
-             {longest_lag_run} consecutive ticks; if this ever becomes non-zero \
-             the predicate's journal-hole half is load-bearing HERE too and this \
-             test should assert against it rather than record it"
+            observed.samples,
+            observed.resident_samples,
+            "the backup lagged with a MISSING next op on {} of {} sampled ticks, so a \
+             no-loss two-replica run produced a real hole and the repair assertion \
+             below would be testing loss recovery instead of false positives",
+            observed.samples - observed.resident_samples,
+            observed.samples
         );
         for replica in 0..replica_count {
             let (status, view, commit_min, commit_max) = group_state(&sim, replica, namespace);
@@ -5193,7 +5222,10 @@ mod partition_repair_driver_tests {
             REPAIR_REQUESTS.load(Ordering::Relaxed),
             0,
             "the tick driver requested repair on a healthy group; its gap predicate \
-             is reading ordinary commit lag as a journal hole"
+             is reading ordinary commit lag as a journal hole (backup lagged on {} of \
+             the sampled ticks, longest run {})",
+            observed.samples,
+            observed.longest_run
         );
     }
 

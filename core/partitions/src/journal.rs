@@ -762,6 +762,20 @@ where
         headers.iter().find(|header| header.op == op).copied()
     }
 
+    /// Whether `op` is resident, without reading its header.
+    ///
+    /// Equivalent to `header_by_op(op).is_some()` and answers in O(log n)
+    /// instead of scanning: `append` writes `headers` and
+    /// `op_to_storage_offset` together and every clear site
+    /// ([`Self::commit`], [`Self::evict_prefix`], the restore path) clears
+    /// both, so the two populations cannot diverge. Callers that only need
+    /// presence must use this - a miss is the common case on the residency
+    /// checks, and a miss is exactly when the scan walks the whole vec.
+    pub fn holds_op(&self, op: u64) -> bool {
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        op_to_storage_offset.contains_key(&op)
+    }
+
     /// Presence and message-carrying shape of the repair window `(floor, to_op]`
     /// in ONE pass over the header vec.
     ///

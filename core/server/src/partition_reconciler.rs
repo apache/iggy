@@ -50,9 +50,11 @@
 //!   cannot be re-stamped with the incarnation that replaced its own. A frame
 //!   parked with NO stamp is served; see `redispatch_parked_frames` for why a
 //!   missing committed revision is not evidence of a prior incarnation. Delivery
-//!   is the pump's: `drain_redispatched_frames` runs before it reads the inbox
-//!   again, so a parked op is not ordered behind a later op of the same
-//!   partition already queued there, which the plane's gap check would drop.
+//!   is the pump's: staged frames get their own `select` arm, ranked above the
+//!   inbox, so the inbox is not read while any is outstanding and a parked op is
+//!   never ordered behind a later op of the same partition already queued there,
+//!   which the plane's gap check would drop. One frame per poll, so the
+//!   consensus tick still preempts between them.
 //! - `IggyShard::serves_committed_incarnation` refuses a namespace whose
 //!   committed `created_revision` disagrees with the epoch on the local row, so
 //!   a request arriving mid-teardown cannot be acked against the incarnation
@@ -3609,10 +3611,11 @@ mod tests {
         drop(inbox);
     }
 
-    /// The replicated-prepare shape, which no other test covers and where both
-    /// park critical are worst: a prepare has no client, so `deny_parked_frame`
-    /// no-ops on it and anything that discards it loses committed data silently,
-    /// with no normal-status repair driver to refetch it.
+    /// The replicated-prepare shape, which no other test covers and where the
+    /// park path's stakes are highest: a prepare has no client, so
+    /// `deny_parked_client_request` no-ops on it and anything that discards it
+    /// loses committed data silently, recoverable only once `tick_partitions`'
+    /// repair driver notices the gap it left.
     ///
     /// A backup receives the prepare before its own metadata commits (so the frame
     /// parks unstamped), then applies the commit and materialises. The prepare must

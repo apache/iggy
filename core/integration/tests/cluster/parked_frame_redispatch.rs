@@ -23,8 +23,9 @@
 //! that parked. This test pins the park path positively, and on the replica
 //! where getting it wrong is unrecoverable: a client request that never reaches
 //! the plane is answered with a retriable status and the SDK replays it, while a
-//! replicated PREPARE has no client behind it, and the partition plane has no
-//! normal-status repair driver to refetch one it dropped.
+//! replicated PREPARE has no client behind it: nothing re-sends it once its op
+//! has quorum, so the backup gap-stops and waits out `tick_partitions`' repair
+//! debounce before anything refetches it.
 //!
 //! What makes the window wide on a backup is the commit broadcast. A backup
 //! learns a metadata commit from the `commit` field of the next prepare on that
@@ -101,7 +102,16 @@ const DEGRADED_MARKERS: [&str; 3] = [
 /// refetched by `tick_partitions`' level-triggered repair driver, but only after
 /// its debounce interval, so a re-dispatch that trips this has already stalled
 /// the replica for ~1s and the marker still means the ordering broke.
-const GAP_MARKER: &str = "dropping out-of-order prepare (gap)";
+///
+/// Names its plane: `stdout_occurrences` counts SUBSTRINGS, and the metadata
+/// plane logs its own gap drop at `warn`, which passes this test's `info`
+/// filter. A shared wording would fail a partition-plane assertion on a
+/// metadata-plane event.
+///
+/// Deliberately not scoped to one namespace or node. Chain replication is
+/// ordered per connection, so on a healthy three-node cluster with no injected
+/// loss no partition-plane gap drop is expected anywhere.
+const GAP_MARKER: &str = "dropping out-of-order partition prepare (gap)";
 
 fn topic_name(index: u32) -> String {
     format!("parked-redispatch-topic-{index}")
@@ -344,7 +354,8 @@ fn assert_no_degraded_park_paths(harness: &TestHarness) {
             server.stdout_occurrences(GAP_MARKER),
             0,
             "node {node} logged {GAP_MARKER:?}: a re-dispatched prepare lost its arrival \
-             position, and the partition plane has no normal-status repair driver to refetch it"
+             position, and the op it displaced is recoverable only by waiting out the \
+             repair driver's debounce"
         );
     }
 }

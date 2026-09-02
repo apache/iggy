@@ -1014,7 +1014,7 @@ where
     /// shard sweep into `partition_prepare_gap_drops_total`; the counter is the
     /// only production signal that the level-triggered repair driver has work
     /// to do, since the drop itself answers nobody.
-    pub const fn note_prepare_gap_drop(&mut self) {
+    const fn note_prepare_gap_drop(&mut self) {
         self.prepare_gap_drops = self.prepare_gap_drops.saturating_add(1);
     }
 
@@ -2305,7 +2305,7 @@ where
             return;
         }
 
-        let journal_holds_op = self.log.journal().inner.header_by_op(header.op).is_some();
+        let journal_holds_op = self.log.journal().inner.holds_op(header.op);
         if journal_holds_op {
             // Retransmit after downstream flap: durable here but commit
             // hasn't caught up. Re-forward + re-ACK so primary's view of
@@ -2401,7 +2401,7 @@ where
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
                         self.diag_ctx(),
-                        "dropping out-of-order prepare (gap)",
+                        "dropping out-of-order partition prepare (gap)",
                     )
                     .with_operation(header.operation)
                     .with_op(header.op),

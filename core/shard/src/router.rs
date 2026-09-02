@@ -301,6 +301,17 @@ where
         // simulator (see `MessageBus::sleep`).
         let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
+        // Ready only while a materialisation has staged parked frames, so the
+        // arm it feeds is skipped entirely in the steady state. Rebuilt per
+        // iteration, like `inbox.recv()`, because readiness is a snapshot of
+        // the queue rather than a durable waker.
+        let staged_frames_ready = || {
+            if self.has_redispatched_frames() {
+                futures::future::ready(()).left_future()
+            } else {
+                futures::future::pending::<()>().right_future()
+            }
+        };
         let mut fatal: Option<FatalCommit> = None;
         loop {
             // `select_biased!`, not `select!`: the unbiased macro draws its
@@ -346,12 +357,17 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
-                    // Before the next `inbox.recv()`, always: a materialisation
-                    // hands its parked frames back here, and the inbox may
-                    // already hold a LATER op of the same partition, which the
-                    // plane's gap check drops unless the parked one lands first.
-                    self.drain_redispatched_frames().await;
                     consensus_tick.set(rearm_tick());
+                }
+                () = staged_frames_ready() => {
+                    // Ranked below the tick and ABOVE the inbox, so nothing is
+                    // read off the inbox while a materialisation's parked
+                    // frames are still staged: the inbox may already hold a
+                    // LATER op of the same partition, which the plane's gap
+                    // check drops unless the parked one lands first. One frame
+                    // per poll, so the tick still preempts between them.
+                    self.serve_staged_partition_frame(&mut loopback_buf, &mut namespace_scratch)
+                        .await;
                 }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
@@ -360,8 +376,9 @@ where
                                 self.process_frame(frame).await;
                                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
                                 // Tail drain catches reconcile ops whose marker was dropped.
+                                // Anything it stages is served by the arm above
+                                // on the next pass, before this arm can run again.
                                 self.apply_reconcile_ops();
-                                self.drain_redispatched_frames().await;
                             }
                             // Guaranteed reply-lane service: `select_biased!`
                             // polls the main lane first, so a saturated main
@@ -403,43 +420,9 @@ where
             fatal = self.first_partition_commit_fault();
         }
 
-        // Drain remaining frames so in-flight requests get a response, and
-        // the reply lane so already-forwarded replies still reach their
-        // clients before the bus tears down. Skipped on a commit fault: a
-        // queued Ack or Commit frame for the fenced partition would re-enter
-        // the commit path that just failed, and `advance_commit_min` asserts
-        // on the gap the fault left. Those requests go unanswered and their
-        // clients time out, which is what a node stopping on a durability
-        // fault owes them.
-        if fatal.is_none() {
-            while let Ok(frame) = self.inbox.try_recv() {
-                if self.accept_frame_for_self(&frame) {
-                    self.process_frame(frame).await;
-                    self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
-                        .await;
-                    self.apply_reconcile_ops();
-                    if let Some(fault) = self.first_partition_commit_fault() {
-                        fatal = Some(fault);
-                        break;
-                    }
-                }
-            }
-            // Retired, not delivered: the pump is going away, so a staged frame
-            // has no later drain to reach the plane through. Runs before the
-            // reply-lane drain below, which is what carries the denies out.
-            self.retire_redispatched_frames();
-        }
-        if fatal.is_none() {
-            while let Ok(frame) = self.reply_inbox.try_recv() {
-                if self.accept_frame_for_self(&frame) {
-                    self.process_frame(frame).await;
-                    if let Some(fault) = self.first_partition_commit_fault() {
-                        fatal = Some(fault);
-                        break;
-                    }
-                }
-            }
-        }
+        fatal = self
+            .drain_pump_on_exit(fatal, &mut loopback_buf, &mut namespace_scratch)
+            .await;
 
         if fatal.is_some() {
             // Flipped BEFORE the final flush, not after the pump returns: the
@@ -533,14 +516,102 @@ where
         }
     }
 
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
-    async fn process_lifecycle(&self, payload: LifecycleFrame)
+    /// Drain remaining frames so in-flight requests get a response, and the
+    /// reply lane so already-forwarded replies still reach their clients before
+    /// the bus tears down. Returns the fault to exit with.
+    ///
+    /// All of it is skipped on a commit fault: a queued Ack or Commit frame for
+    /// the fenced partition would re-enter the commit path that just failed,
+    /// and `advance_commit_min` asserts on the gap the fault left. Those
+    /// requests go unanswered and their clients time out, which is what a node
+    /// stopping on a durability fault owes them.
+    #[allow(clippy::future_not_send)]
+    async fn drain_pump_on_exit(
+        &self,
+        mut fatal: Option<FatalCommit>,
+        loopback_buf: &mut Vec<Message<GenericHeader>>,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) -> Option<FatalCommit>
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
+    {
+        if fatal.is_none() {
+            while let Ok(frame) = self.inbox.try_recv() {
+                if self.accept_frame_for_self(&frame) {
+                    self.process_frame(frame).await;
+                    self.apply_reconcile_ops();
+                    // Here, not after the loop: the select arm that normally
+                    // serves staged frames is gone, and staging without
+                    // delivering would leave a parked op behind a later op
+                    // still on the inbox -- the ordering that arm exists to
+                    // keep. Draining to empty is right once there is no tick
+                    // left to preempt for.
+                    self.drain_redispatched_frames().await;
+                    self.process_loopback(loopback_buf, namespace_scratch).await;
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        fatal = Some(fault);
+                        break;
+                    }
+                }
+            }
+            // Whatever the loop above could not deliver: it breaks on a commit
+            // fault, and a frame can park again on a namespace this node no
+            // longer owns. Client requests get a transient deny; a prepare is
+            // counted, which is the only record it existed. Runs before the
+            // reply-lane drain below, which is what carries the denies out.
+            self.retire_redispatched_frames();
+        }
+        if fatal.is_none() {
+            while let Ok(frame) = self.reply_inbox.try_recv() {
+                if self.accept_frame_for_self(&frame) {
+                    self.process_frame(frame).await;
+                    if let Some(fault) = self.first_partition_commit_fault() {
+                        fatal = Some(fault);
+                        break;
+                    }
+                }
+            }
+        }
+        fatal
+    }
+
+    /// One staged parked frame, plus the follow-up work delivering it owes.
+    ///
+    /// Split out of the pump's select arm only to keep that function readable;
+    /// the ordering guarantee lives in where the arm sits, not here.
+    #[allow(clippy::future_not_send)]
+    async fn serve_staged_partition_frame(
+        &self,
+        loopback_buf: &mut Vec<Message<GenericHeader>>,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        self.dispatch_one_redispatched_frame().await;
+        // The delivery above can produce a self-addressed `PrepareOk`, which on
+        // a solo group is the whole quorum and reaches the plane only here.
+        self.process_loopback(loopback_buf, namespace_scratch).await;
+        // Same guaranteed reply-lane service the inbox arm owes: without it a
+        // long staged run starves forwarded replies for its whole duration.
+        if let Ok(reply) = self.reply_inbox.try_recv()
+            && self.accept_frame_for_self(&reply)
+        {
+            self.process_frame(reply).await;
+        }
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn process_lifecycle(&self, payload: LifecycleFrame)
+    where
+        B: MessageBus + 'static,
     {
         match payload {
             LifecycleFrame::ReplicaInboundSetup { fd, slot } => {
@@ -690,7 +761,6 @@ where
             }
             LifecycleFrame::ReconcileApply => {
                 self.apply_reconcile_ops();
-                self.drain_redispatched_frames().await;
             }
             LifecycleFrame::CleanPartition {
                 namespace,
