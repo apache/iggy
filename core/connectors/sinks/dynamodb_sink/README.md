@@ -43,7 +43,9 @@ verbose_logging = false
 - `include_checksum`: Add `iggy_checksum`. Defaults to `true`.
 - `include_origin_timestamp`: Add `iggy_origin_timestamp`. Defaults to `true`.
 - `max_item_size`: Maximum item size in bytes. Defaults to `409600` (400 KB),
-  which is also the DynamoDB limit, so larger values are clamped.
+  which is also the DynamoDB limit, so larger values are clamped. The size
+  follows the DynamoDB rules, including the fixed per-item overhead and the
+  overhead of nested lists and maps, and rounds every estimate up.
 - `max_retries`: Retries after the first attempt. Defaults to `3`.
 - `retry_delay`: First retry delay as a humantime string. Defaults to `500ms`.
 - `max_retry_delay`: Upper bound of the exponential backoff. Defaults to `5s`.

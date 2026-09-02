@@ -45,6 +45,14 @@ sink_connector!(DynamoDbSink);
 const MAX_BATCH_WRITE_ITEMS: usize = 25;
 /// DynamoDB rejects items larger than 400 KB.
 const MAX_ITEM_SIZE: usize = 400 * 1024;
+/// DynamoDB charges every item a fixed storage overhead that no API response
+/// reports, so the size check adds it before comparing against the limit.
+const ITEM_BASE_OVERHEAD: usize = 100;
+/// A List or a Map costs 3 bytes plus 1 byte per element it holds.
+const NESTED_CONTAINER_OVERHEAD: usize = 3;
+const NESTED_ELEMENT_OVERHEAD: usize = 1;
+/// DynamoDB stores a number in at most 21 bytes.
+const MAX_NUMBER_SIZE: usize = 21;
 /// DynamoDB rejects a partition key value longer than 2,048 bytes.
 const MAX_PARTITION_KEY_SIZE: usize = 2048;
 /// DynamoDB rejects a sort key value longer than 1,024 bytes.
@@ -828,8 +836,16 @@ fn validate_key_attribute(
     Ok(())
 }
 
+/// Follows the DynamoDB item size rules, rounding every unknown up, so an item
+/// that passes this check is never rejected by the service for its size.
+/// <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/CapacityUnitCalculations.html>
 fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> usize {
-    item.iter()
+    ITEM_BASE_OVERHEAD + attributes_size(item)
+}
+
+fn attributes_size(values: &HashMap<String, AttributeValue>) -> usize {
+    values
+        .iter()
         .map(|(name, value)| name.len() + attribute_value_size(value))
         .sum()
 }
@@ -837,16 +853,38 @@ fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> usize {
 fn attribute_value_size(value: &AttributeValue) -> usize {
     match value {
         AttributeValue::S(text) => text.len(),
-        AttributeValue::N(number) => number.len(),
+        AttributeValue::N(number) => number_size(number),
         AttributeValue::B(blob) => blob.as_ref().len(),
         AttributeValue::Bool(_) | AttributeValue::Null(_) => 1,
-        AttributeValue::Ss(values) => values.iter().map(String::len).sum(),
-        AttributeValue::Ns(values) => values.iter().map(String::len).sum(),
-        AttributeValue::Bs(values) => values.iter().map(|blob| blob.as_ref().len()).sum(),
-        AttributeValue::L(values) => values.iter().map(attribute_value_size).sum(),
-        AttributeValue::M(values) => estimate_item_size(values),
+        AttributeValue::Ss(values) => container_size(values.iter().map(String::len)),
+        AttributeValue::Ns(values) => {
+            container_size(values.iter().map(|number| number_size(number)))
+        }
+        AttributeValue::Bs(values) => container_size(values.iter().map(|blob| blob.as_ref().len())),
+        AttributeValue::L(values) => container_size(values.iter().map(attribute_value_size)),
+        AttributeValue::M(values) => container_size(
+            values
+                .iter()
+                .map(|(name, value)| name.len() + attribute_value_size(value)),
+        ),
         _ => 0,
     }
+}
+
+fn container_size(elements: impl Iterator<Item = usize>) -> usize {
+    NESTED_CONTAINER_OVERHEAD
+        + elements
+            .map(|size| NESTED_ELEMENT_OVERHEAD + size)
+            .sum::<usize>()
+}
+
+/// DynamoDB stores a number as one byte per two significant digits plus one
+/// byte, and one more byte for a negative value. Digits that carry no value are
+/// counted too, which only overestimates the size.
+fn number_size(number: &str) -> usize {
+    let digits = number.chars().filter(char::is_ascii_digit).count();
+    let sign = usize::from(number.starts_with('-'));
+    (digits.div_ceil(2) + 1 + sign).min(MAX_NUMBER_SIZE)
 }
 
 fn is_transient_error<E, R>(error: &SdkError<E, R>) -> bool
@@ -1139,17 +1177,27 @@ mod tests {
     #[test]
     fn given_oversized_payload_when_built_should_skip_message() {
         let mut config = given_default_config();
-        config.max_item_size = Some(64);
+        config.max_item_size = Some(ITEM_BASE_OVERHEAD + 512);
         let sink = DynamoDbSink::new(1, config);
-        let mut message = given_message(Payload::Text("x".repeat(1024)));
+        let mut small = given_message(Payload::Text("x".to_owned()));
+        let mut oversized = given_message(Payload::Text("x".repeat(1024)));
 
-        let result = sink.build_item(
-            &given_topic_metadata(),
-            &given_messages_metadata(),
-            &mut message,
+        assert!(
+            sink.build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut small,
+            )
+            .is_ok()
         );
-
-        assert!(result.is_err());
+        assert!(
+            sink.build_item(
+                &given_topic_metadata(),
+                &given_messages_metadata(),
+                &mut oversized,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1596,5 +1644,35 @@ mod tests {
         );
 
         assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
+    }
+
+    #[test]
+    fn given_an_item_when_sized_should_count_the_base_overhead() {
+        let item = HashMap::from([("ab".to_owned(), AttributeValue::Bool(true))]);
+
+        assert_eq!(estimate_item_size(&item), ITEM_BASE_OVERHEAD + 2 + 1);
+    }
+
+    #[test]
+    fn given_nested_attributes_when_sized_should_count_the_container_overhead() {
+        let nested = HashMap::from([("b".to_owned(), AttributeValue::Bool(true))]);
+        let item = HashMap::from([
+            ("a".to_owned(), AttributeValue::M(nested)),
+            (
+                "c".to_owned(),
+                AttributeValue::L(vec![AttributeValue::Null(true)]),
+            ),
+        ]);
+
+        // Each container costs 3 bytes plus 1 byte per element, and a nested
+        // map element also carries its own name.
+        assert_eq!(estimate_item_size(&item), ITEM_BASE_OVERHEAD + 7 + 6);
+    }
+
+    #[test]
+    fn given_numbers_when_sized_should_follow_the_dynamodb_rules() {
+        assert_eq!(number_size("1"), 2);
+        assert_eq!(number_size("-12345"), 5);
+        assert_eq!(number_size(&"9".repeat(100)), MAX_NUMBER_SIZE);
     }
 }
