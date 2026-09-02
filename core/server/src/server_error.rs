@@ -292,6 +292,13 @@ pub enum ServerError {
     ShardConstruction(#[source] ShardCtorError),
     #[error("{} shard thread(s) failed: {}", failures.len(), format_shard_failures(failures))]
     ShardJoinFailures { failures: Vec<ShardJoinFailure> },
+    /// A panic no shard thread could surface: compio's `spawn` catches task
+    /// panics, so a dead listener or connection task leaves every thread
+    /// exiting `Ok`. The panic hook records the first one and the join path
+    /// fails the exit on it, so an orchestrator does not read the shutdown
+    /// as clean.
+    #[error("server shut down after a panic: {description}")]
+    Panicked { description: String },
 }
 
 /// Why a partition's recovered segments cannot be served.

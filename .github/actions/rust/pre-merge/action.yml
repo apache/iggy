@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, test-3, miri)"
+    description: "Task to run (check, check-msrv, fmt, clippy, sort, machete, doctest, verify-publish, test-1, test-2, test-3, test-storage-compat, miri)"
     required: true
   component:
     description: "Component name (for context)"
@@ -84,19 +84,25 @@ runs:
     # a subset of crates changed.
     # Safety: cargo check/clippy run on the full workspace separately, catching all
     # compilation errors. This only scopes test BUILD and EXECUTION.
+    # test-storage-compat is excluded from the DAG and coverage setup below:
+    # storage-compat.sh builds two explicit binaries and drives its own nextest
+    # run, and reads none of the /tmp plan files or the llvm-cov environment.
     - name: Fetch base branch for DAG analysis
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: git fetch origin master --depth=1 2>/dev/null || true
       shell: bash
 
+    # Pinned: 0.24 dropped `-f json` and 0.25 retired `[change-detection]` in
+    # rail.toml. Either failure falls back to the full test suite on every PR,
+    # so bump on purpose together with `cargo rail config migrate`.
     - name: Install cargo-rail
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       uses: taiki-e/install-action@v2
       with:
-        tool: cargo-rail
+        tool: cargo-rail@0.23.0
 
     - name: Compute affected crates (cargo-rail)
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: |
         METADATA_JSON=$(cargo metadata --format-version 1 --no-deps 2>/dev/null || echo "{}")
         TOTAL_CRATES=$(echo "$METADATA_JSON" | jq '.workspace_members | length' 2>/dev/null || echo "?")
@@ -202,18 +208,25 @@ runs:
       shell: bash
 
     - name: Install cargo-llvm-cov
-      if: startsWith(inputs.task, 'test-')
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-llvm-cov
 
     - name: Build and test with coverage
-      if: startsWith(inputs.task, 'test-')
+      # test-storage-compat drives its own nextest invocation from
+      # scripts/ci/storage-compat.sh. Without this exclusion it would also run
+      # here with an empty PARTITION_FLAG, i.e. a fourth *unpartitioned* copy
+      # of the whole suite on top of test-1/2/3.
+      if: startsWith(inputs.task, 'test-') && inputs.task != 'test-storage-compat'
       run: |
         # Parse partition index from task name (test-1 -> hash:1/3, test-2 -> hash:2/3, ...).
         # TEST_PARTITIONS must match the number of test-N tasks in
         # .github/config/components.yml. Cluster bootstrap makes each test
         # CPU-heavy, so partitions stay small.
+        # The regex is numeric-only on purpose: non-numeric test-* tasks
+        # (test-storage-compat) opt out of partitioning rather than producing
+        # an out-of-range hash:N/3.
         TEST_PARTITIONS=3
         TASK="${{ inputs.task }}"
         PARTITION_FLAG=""
@@ -283,32 +296,45 @@ runs:
 
         # api_handler_tests, version_firewall_tests, and server_e2e_tests need gitignored
         # wire fixtures. Generate when iggy-gateway-kafka is in the DAG test scope, or (on
-        # a full-workspace run) when gateways/** changed vs origin/master — avoid building
+        # a full-workspace run) when gateways/** changed vs the PR base — avoid building
         # kafka-message-gen / kafka-protocol when the gateway was not touched.
         NEEDS_KAFKA_FIXTURES=false
         if grep -q 'package(iggy-gateway-kafka)' <<< "$NEXTEST_FILTER"; then
           NEEDS_KAFKA_FIXTURES=true
         elif [[ -z "$NEXTEST_FILTER" ]]; then
+          # HEAD on a pull_request run is the synthetic merge commit; its first parent is
+          # the base tip GitHub merged against. The depth-1 checkout holds that parent only
+          # as a shallow boundary: `HEAD^1` does not resolve and `origin/master...HEAD` has
+          # no merge base (so it failed on every full-workspace lane). Read the parent from
+          # the raw object and fetch that one commit before diffing. A HEAD with one parent
+          # (workflow_dispatch on a branch tip) has no PR base, so it takes the fail-safe.
+          #
           # `2>&1` into a variable, not `2>/dev/null` piped straight to grep: the old form
-          # silenced *any* git failure (e.g. a shallow checkout with no merge-base history for
-          # origin/master) into empty output, which `grep -q` then reads identically to "diff
-          # succeeded, no gateways/ changes" - so a broken diff and a clean diff produced the
-          # same "skip fixtures" outcome. Confirmed in CI run 32256598833: gateways/-only PR,
-          # full-workspace lane, fixtures silently skipped, KAFKA_FIXTURES_REQUIRED never set -
-          # every fixture-backed test quietly passed by skipping all its assertions instead of
-          # running them (0.005s for a test meant to decode 9 real fixtures).
-          if DIFF_OUTPUT=$(git diff --name-only origin/master...HEAD 2>&1); then
+          # silenced *any* git failure into empty output, which `grep -q` then reads
+          # identically to "diff succeeded, no gateways/ changes" - so a broken diff and a
+          # clean diff produced the same "skip fixtures" outcome. Confirmed in CI run
+          # 32256598833: gateways/-only PR, full-workspace lane, fixtures silently skipped,
+          # KAFKA_FIXTURES_REQUIRED never set - every fixture-backed test quietly passed by
+          # skipping all its assertions instead of running them (0.005s for a test meant to
+          # decode 9 real fixtures).
+          BASE_SHA=""
+          if [[ "$(git cat-file -p HEAD | grep -c '^parent ')" -eq 2 ]]; then
+            BASE_SHA=$(git cat-file -p HEAD | awk '/^parent /{print $2; exit}')
+          fi
+          if [[ -n "$BASE_SHA" ]] \
+            && DIFF_OUTPUT=$(git fetch -q --no-tags --depth=1 origin "$BASE_SHA" 2>&1 \
+              && git diff --name-only "$BASE_SHA" HEAD 2>&1); then
             if grep -qE '^gateways/' <<< "$DIFF_OUTPUT"; then
               NEEDS_KAFKA_FIXTURES=true
             else
               echo "::notice::Skipping Kafka wire fixtures (full suite, gateways/** unchanged)"
             fi
           else
-            # Diff itself failed - NOT the same as "no gateways/ changes". Generate
-            # unconditionally as the fail-safe default; this is the case the bug above collapsed
-            # into a silent skip.
+            # No PR base, or fetch/diff failed - NOT the same as "no gateways/ changes".
+            # Generate unconditionally as the fail-safe default; this is the case the bug
+            # above collapsed into a silent skip.
             NEEDS_KAFKA_FIXTURES=true
-            echo "::warning::git diff origin/master...HEAD failed (${DIFF_OUTPUT}); generating Kafka fixtures unconditionally as a fail-safe"
+            echo "::warning::git diff against the PR base failed (base: ${BASE_SHA:-none, HEAD is not a merge commit}; ${DIFF_OUTPUT:-}); generating Kafka fixtures unconditionally as a fail-safe"
           fi
         fi
         if [[ "$NEEDS_KAFKA_FIXTURES" == true ]]; then
@@ -381,6 +407,17 @@ runs:
         cargo llvm-cov report --codecov --output-path codecov.json
         echo "Coverage report generated: codecov.json"
         ls -la codecov.json
+      shell: bash
+
+    # On-disk format backwards compatibility. The script builds an iggy-server
+    # from the master tip under the checked-out merge ref (origin/master off a
+    # pull_request run) and one from HEAD, seeds a data directory with the
+    # former and reads it back with the latter. It does its own shallow fetch
+    # of the baseline commit and exits non-zero if it cannot resolve one, so
+    # the default depth-1 checkout is sufficient here.
+    - name: Storage format backwards compatibility
+      if: inputs.task == 'test-storage-compat'
+      run: ./scripts/ci/storage-compat.sh
       shell: bash
 
     # Miri (UB detector) on the unsafe-heavy crates that don't pull tokio /

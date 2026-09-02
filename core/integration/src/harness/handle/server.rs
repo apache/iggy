@@ -726,6 +726,17 @@ impl ServerHandle {
         self.test_transport = Some(transport);
     }
 
+    /// Point the next `start()` at a different server binary.
+    ///
+    /// `start()` re-reads `config.executable_path` on every call, so a test
+    /// can boot one build, then restart the SAME data directory under another
+    /// one. `None` restores the cargo-built binary of the crate under test,
+    /// which is why this takes an explicit `Option` rather than
+    /// `impl Into<String>`.
+    pub fn set_executable_path(&mut self, path: Option<String>) {
+        self.config.executable_path = path;
+    }
+
     /// Configure MCP server for this iggy server.
     pub fn set_mcp_config(&mut self, config: McpConfig) {
         self.mcp = Some(McpHandle::with_server_id(
@@ -1126,6 +1137,16 @@ impl ServerHandle {
         }
         Ok(())
     }
+
+    /// Names this node in the log dumps. A cluster failure prints every
+    /// node's logs back to back and the server never logs its own identity,
+    /// so without this the reader cannot tell which replica wrote what.
+    fn log_label(&self) -> String {
+        match self.addrs.tcp {
+            Some(tcp) => format!("Iggy server replica {} (tcp {tcp})", self.server_id),
+            None => format!("Iggy server replica {}", self.server_id),
+        }
+    }
 }
 
 impl Drop for ServerHandle {
@@ -1134,11 +1155,12 @@ impl Drop for ServerHandle {
         // without waiting, so the freed slot could be reused while this server
         // still holds its ports.
         let _ = self.stop();
+        let label = self.log_label();
         if let Some(report) = super::common::stderr_panic_report(&self.stderr_path) {
             if std::thread::panicking() {
                 // Ahead of the full dump, which buries these lines under the
                 // complete stdout of every node.
-                eprintln!("Iggy server panicked:\n{report}");
+                eprintln!("{label} panicked:\n{report}");
             } else {
                 // A dead task leaves the process alive and the test green;
                 // failing here is the only thing that surfaces it. The panic
@@ -1146,12 +1168,12 @@ impl Drop for ServerHandle {
                 // print this node's logs first.
                 let (stdout, stderr) =
                     super::common::collect_logs(&self.stdout_path, &self.stderr_path);
-                eprintln!("Iggy server stdout:\n{stdout}");
-                eprintln!("Iggy server stderr:\n{stderr}");
-                panic!("Iggy server panicked:\n{report}");
+                eprintln!("{label} stdout:\n{stdout}");
+                eprintln!("{label} stderr:\n{stderr}");
+                panic!("{label} panicked:\n{report}");
             }
         }
-        super::common::dump_logs_on_panic("Iggy server", &self.stdout_path, &self.stderr_path);
+        super::common::dump_logs_on_panic(&label, &self.stdout_path, &self.stderr_path);
     }
 }
 
