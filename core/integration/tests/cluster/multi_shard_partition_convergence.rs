@@ -67,11 +67,11 @@ async fn create_topic(client: &IggyClient, stream: &Identifier, name: &str) {
         .create_topic(
             stream,
             name,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap_or_else(|error| panic!("create_topic {name}: {error}"));

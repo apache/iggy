@@ -41,6 +41,67 @@ format = "text" # Options: "text" (default), "json"
 
 The path to the configuration can be overridden by `IGGY_CONNECTORS_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
 
+## State storage
+
+Source connectors checkpoint their progress (an opaque byte blob) through the runtime's state storage. The backend is selected via `state.storage`:
+
+- `file` (default): one file per source at `{state.path}/source_{key}.state`, written crash-atomically. Ties the cursor to the local disk.
+- `http`: one resource per source at `{state.http.url}/source_{key}` on any HTTP-speaking store (a sidecar in front of a database, an object-store gateway, a coordination service). Cursors survive node replacement and failover to another runtime instance.
+
+```toml
+[state]
+path = "local_state"      # used by storage = "file"
+storage = "http"          # "file" | "http"
+
+[state.http]
+url = "http://127.0.0.1:8080/connectors/state"  # base URL, no trailing slash
+load_method = "get"       # "get" (default) | "post"
+save_method = "put"       # "put" (default) | "post" | "patch"
+timeout = "5s"
+
+# Static headers attached verbatim to every request. Carries authentication
+# (e.g. a bearer token) and any deployment-specific metadata the server
+# wants. The runtime never interprets them and never logs their values.
+[state.http.request_headers]
+authorization = "Bearer ..."
+
+[state.http.retry]
+enabled = true
+max_attempts = 4          # retries per logical operation, after the first try
+initial_backoff = "200ms"
+max_backoff = "2s"
+backoff_multiplier = 2
+```
+
+Everything except `request_headers` is also env-addressable: `IGGY_CONNECTORS_STATE_STORAGE`, `IGGY_CONNECTORS_STATE_HTTP_URL`, `IGGY_CONNECTORS_STATE_HTTP_TIMEOUT`, `IGGY_CONNECTORS_STATE_HTTP_RETRY_MAX_ATTEMPTS`, and so on.
+
+The configured base URL may contain a query string, which is preserved when `source_{key}` is appended to the path. Custom request headers are accepted except for `If-Match`, `If-None-Match`, `Idempotency-Key`, and `Content-Type`, which are owned by the state protocol.
+
+`storage = "http"` with a missing or invalid `url` is a fatal startup error. With the HTTP backend, any state-load failure other than a clean `404` while starting an enabled source also fails startup: the store is unhealthy, and treating the failure as "no state" would silently rewind the source.
+
+### HTTP backend semantics
+
+- Every read uses the configured `load_method` and remembers the returned `ETag`. Every write uses the configured `save_method` and is conditional: `If-Match: <etag>` when a version is tracked, `If-None-Match: *` for the first-ever write. There is no unconditional overwrite path.
+- Every write carries an `Idempotency-Key` header, minted once per logical save and reused byte-identically across that save's retries, so a server that committed a write but lost the response can replay the original outcome instead of failing the retry with a spurious `412`.
+- State is sent and returned as opaque MessagePack bytes with `Content-Type: application/octet-stream`. The runtime never converts connector state to JSON, so each source retains its own compact state schema.
+- `425`/`429`/`503`/`5xx`, timeouts and connect failures are retried with exponential backoff (honoring `Retry-After`, capped at `max_backoff`) and classified transient when exhausted: the batch is Nacked and the plugin re-polls.
+- `412`/`409` (version conflict), `401`/`403` (authorization lost) and protocol violations are permanent: the provider latches and every later save fails fast without touching the network, until the connector is restarted. A permanent error means another writer took over or this writer's authority was revoked - retrying cannot help and would mask the original error.
+- Durability is the server's durability. The runtime guarantees only that the checkpoint is not advanced (the batch is not Acked) unless the server confirmed the write.
+
+### Implementing a state server
+
+Any HTTP server can back the state endpoint if it meets this contract:
+
+1. The configured load method, `GET` by default, at `{url}/source_{key}` returns `200` + strong `ETag` + the stored bytes, or `404` if the key has never been written. If the value exists but cannot be served consistently yet, return `425` or `503` (optionally with `Retry-After`) - never `404`.
+2. The configured save method, `PUT` by default, at `{url}/source_{key}` must enforce `If-Match`/`If-None-Match` atomically against the stored version and return `412` on mismatch. Success responses (`200`/`201`/`204`) carry the new `ETag`. Requests without a conditional header may be rejected with `428 Precondition Required`.
+3. `Idempotency-Key`: remember each key's outcome for at least the client's retry horizon and replay it on repeats. Replays must not re-apply the write.
+4. ETags are strong and change on every committed write. The runtime treats them as opaque strings: stored verbatim, sent back verbatim.
+5. Authentication is the server's business, transported via the configured static headers; failures are `401`/`403`. Treat `403` as authoritative revocation, not a transient state.
+
+This contract lets a deployment back the endpoint with a replicated store and revoke a stale writer's authority mid-flight: the stale writer's next conditional PUT fails `403`/`412`, its provider latches, and its pipeline stops advancing state - no backend-specific knowledge in the runtime.
+
+The runtime does not delete remote state. Disabling, removing, or restarting a source preserves its checkpoint. Deletion is an explicit administrative action on the backing store because automatic deletion would make a connector lifecycle operation silently rewind the source.
+
 ## Logging
 
 By default, the runtime emits human-readable text logs via the `tracing` crate. Switching `logging.format` to `json` produces structured JSON lines (one event per line, machine-parseable). When telemetry is enabled, the chosen format applies to the local stdout layer; OpenTelemetry export is unaffected.

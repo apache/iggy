@@ -45,7 +45,27 @@ enabled = false
 ca_file = "core/certs/iggy_ca_cert.pem"
 
 [state]
-path = "local_state"
+path = "local_state" # Used by storage = "file"
+storage = "file" # "file" | "http"
+
+# HTTP state storage backend, used when storage = "http". Source state is
+# stored at {url}/source_{key} with optimistic concurrency (ETag/If-Match)
+# and idempotent retries (Idempotency-Key).
+# [state.http]
+# url = "http://127.0.0.1:8080/connectors/state"
+# load_method = "get"
+# save_method = "put"
+# timeout = "5s"
+#
+# [state.http.request_headers]
+# authorization = "Bearer ..."
+#
+# [state.http.retry]
+# enabled = true
+# max_attempts = 4
+# initial_backoff = "200ms"
+# max_backoff = "2s"
+# backoff_multiplier = 2
 
 [connectors]
 config_type = "local"

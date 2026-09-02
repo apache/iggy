@@ -24,7 +24,8 @@ use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::ClientConnMeta;
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{
-    ClientConnectionLostFn, ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn, SendError,
+    BusMessage, ClientConnectionLostFn, ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn,
+    SendError,
 };
 use server_common::{
     MESSAGE_ALIGN, Message,
@@ -65,7 +66,7 @@ pub struct Envelope {
 ///
 /// Consensus code calls `send_to_replica()` / `send_to_client()` which stage
 /// messages here. The simulator's tick loop drains each replica's outbox and
-/// feeds the messages into the [`Network`] for simulated delivery.
+/// feeds the messages into the [`Network`](crate::network::Network) for simulated delivery.
 pub struct SimOutbox {
     /// Replica id that owns this outbox. Populated as `from_replica` on every envelope.
     self_id: u8,
@@ -189,7 +190,7 @@ impl MessageBus for SimOutbox {
     async fn send_to_client(
         &self,
         client_id: u128,
-        data: Frozen<MESSAGE_ALIGN>,
+        data: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
         if !self.clients.borrow().contains(&client_id) {
             return Err(SendError::ClientNotFound(client_id));
@@ -199,7 +200,7 @@ impl MessageBus for SimOutbox {
             from_replica: Some(self.self_id),
             to_replica: None,
             to_client: Some(client_id),
-            payload: EnvelopePayload::Client(frozen_to_message(&data)),
+            payload: EnvelopePayload::Client(frozen_to_message(&data.into().into_contiguous())),
         });
 
         Ok(())
@@ -264,7 +265,7 @@ impl MessageBus for SharedSimOutbox {
     async fn send_to_client(
         &self,
         client_id: u128,
-        data: Frozen<MESSAGE_ALIGN>,
+        data: impl Into<BusMessage>,
     ) -> Result<(), SendError> {
         self.0.send_to_client(client_id, data).await
     }

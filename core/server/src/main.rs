@@ -44,6 +44,10 @@ fn main() -> Result<(), ServerError> {
     let mut logging = Logging::new(server::VERSION);
     logging.early_init();
     server_common::print_build_info!(server::VERSION);
+    #[cfg(all(feature = "mimalloc", not(feature = "disable-mimalloc")))]
+    info!("Using mimalloc allocator");
+    #[cfg(not(all(feature = "mimalloc", not(feature = "disable-mimalloc"))))]
+    tracing::warn!("Using the default system allocator");
     if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
         let _ = dotenvy::from_path(&env_path);
     } else {
@@ -71,7 +75,9 @@ fn main() -> Result<(), ServerError> {
     let bootstrap_result: Result<ServerConfig, ServerError> = bootstrap_runtime.block_on(async {
         let config = load_config().await?;
         prepare_runtime_dirs(&config, &mut logging, args.fresh).await?;
-        server_common::MemoryPool::init_pool(&config.system.memory_pool.into_other());
+        let memory_pool_settings =
+            server_common::MemoryPoolSettings::from(&config.system.memory_pool);
+        server_common::MemoryPool::init_pool(&memory_pool_settings);
 
         Ok(config)
     });

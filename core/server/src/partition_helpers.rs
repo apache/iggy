@@ -28,9 +28,12 @@ use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets}
 use crate::server_error::ServerError;
 use compio::fs::create_dir_all;
 use configs::server::ServerConfig;
-use consensus::{LocalPipeline, VsrConsensus, VsrState};
+use consensus::{
+    FreshGroupStart, LocalPipeline, VsrConsensus, VsrRestore, VsrState, fresh_group_start,
+};
 use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyError, IggyTimestamp, PartitionStats,
+    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
+    TopicRuntimeOptions,
 };
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
@@ -43,43 +46,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::{error, info, warn};
-
-/// Validate that a namespace fits within the static caps declared in
-/// `config.extra.namespace`.
-///
-/// Bootstrap calls this for every recovered namespace; the reconciler
-/// calls this before materialising a freshly committed partition. Same
-/// error variant either way so operators see one root cause label.
-///
-/// # Errors
-///
-/// Returns [`ServerError::RecoveredNamespaceOutOfBounds`] if any of
-/// `stream_id`, `topic_id`, or `partition_id` exceed the configured
-/// maxima.
-pub const fn validate_namespace_bounds(
-    config: &ServerConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
-) -> Result<(), ServerError> {
-    let namespace = &config.extra.namespace;
-    if stream_id < namespace.max_streams
-        && topic_id < namespace.max_topics
-        && partition_id < namespace.max_partitions
-    {
-        return Ok(());
-    }
-
-    Err(ServerError::RecoveredNamespaceOutOfBounds {
-        stream_id,
-        topic_id,
-        partition_id,
-        max_streams: namespace.max_streams,
-        max_topics: namespace.max_topics,
-        max_partitions: namespace.max_partitions,
-    })
-}
+use tracing::{error, warn};
 
 /// Create the on-disk directory hierarchy for a partition.
 ///
@@ -254,12 +221,19 @@ pub fn configure_consumer_offsets(
         }
     }
 
+    // Offset files follow the topic's own `enforce_fsync`: they are part of the
+    // same partition's durability story, and the global knob they used to read
+    // is gone.
+    let enforce_fsync = partition
+        .runtime_options()
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     partition.configure_consumer_offset_storage(
         consumer_offsets_path,
         consumer_group_offsets_path,
         consumer_offsets,
         consumer_group_offsets,
-        config.system.partition.enforce_fsync,
+        enforce_fsync,
     );
     Ok(())
 }
@@ -354,34 +328,36 @@ pub async fn ensure_initial_segment(
     let index_path = config
         .system
         .get_index_path(stream_id, topic_id, partition_id, start_offset);
-    let enforce_fsync = config.system.partition.enforce_fsync;
+    let runtime = partition.runtime_options();
+    let segment_size = runtime
+        .segment_size
+        .unwrap_or_else(|| IggyByteSize::from(iggy_common::DEFAULT_SEGMENT_SIZE));
+    let enforce_fsync = runtime
+        .enforce_fsync
+        .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
+    let preallocate_segments = runtime
+        .preallocate_segments
+        .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS);
     // `file_exists = false` TRUNCATES both files, which is load-bearing here: a
     // fenced-and-rebuilt partition (or one whose quarantine failed) can reach
     // this with a stale `.index` at offset 0 on disk. The `partitions`-side
     // writers with the same names do NOT truncate, so opening them directly
     // instead would read index entries from a previous generation.
-    let storage = SegmentStorage::new(
-        &messages_path,
-        &index_path,
-        0,
-        0,
-        enforce_fsync,
-        enforce_fsync,
-        false,
-    )
-    .await
-    .map_err(|source| {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            error = %source,
-            "failed to create initial segment storage"
-        );
-        source
-    })?;
-    // Share the storage's size counters so reads observe persisted bytes;
-    // a writer with a private counter grows the file invisibly to readers.
+    let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+        .await
+        .map_err(|source| {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                error = %source,
+                "failed to create initial segment storage"
+            );
+            source
+        })?;
+    // Share the storage's size counters: they are the write cursors. A private
+    // counter would let the append position diverge from the segment
+    // bookkeeping that index entries and poll bounds rely on.
     let messages_size_counter = storage
         .messages_writer
         .as_ref()
@@ -393,19 +369,15 @@ pub async fn ensure_initial_segment(
         .map(|writer| writer.size_counter())
         .unwrap_or_default();
     partition.log.add_persisted_segment(
-        Segment::new(start_offset, config.system.segment.size),
+        Segment::new(start_offset, segment_size),
         storage,
         Some(Rc::new(
             MessagesWriter::new(
                 &messages_path,
                 messages_size_counter,
-                config.system.partition.enforce_fsync,
+                enforce_fsync,
                 false,
-                config
-                    .system
-                    .segment
-                    .preallocate
-                    .then_some(config.system.segment.size),
+                preallocate_segments.then_some(segment_size),
             )
             .await
             .map_err(|source| {
@@ -421,24 +393,19 @@ pub async fn ensure_initial_segment(
             })?,
         )),
         Some(Rc::new(
-            IggyIndexWriter::new(
-                &index_path,
-                index_size_counter,
-                config.system.partition.enforce_fsync,
-                false,
-            )
-            .await
-            .map_err(|source| {
-                error!(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    path = %index_path,
-                    error = %source,
-                    "failed to initialize initial sparse index writer"
-                );
-                source
-            })?,
+            IggyIndexWriter::new(&index_path, index_size_counter, enforce_fsync, false)
+                .await
+                .map_err(|source| {
+                    error!(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        path = %index_path,
+                        error = %source,
+                        "failed to initialize initial sparse index writer"
+                    );
+                    source
+                })?,
         )),
     );
     partition.stats.increment_segments_count(1);
@@ -465,7 +432,7 @@ pub async fn ensure_initial_segment(
 /// [`ServerError::PartitionSuperblockIo`] when the directory or a slot
 /// cannot be read; the `VersionUnknown` / `Unverifiable` / `Undecodable` /
 /// `IdentityMismatch` variants when a record exists but cannot be trusted.
-pub(crate) async fn open_partition_superblock(
+pub async fn open_partition_superblock(
     partition_dir: &str,
     identity: ReplicaIdentity,
 ) -> Result<(Rc<PingPongSuperblock>, Option<VsrState>), ServerError> {
@@ -534,29 +501,6 @@ pub(crate) async fn open_partition_superblock(
     Ok((Rc::new(superblock), recovered_state))
 }
 
-/// Restore `(view, log_view)` from a recovered superblock record and mark
-/// them durable (read back from disk, durable by definition). Runs BEFORE
-/// `init` / `init_as_backup` so the join path never advertises a view older
-/// than the recorded one.
-pub(crate) fn restore_partition_view(
-    consensus: &mut VsrConsensus<Rc<IggyMessageBus>>,
-    state: &VsrState,
-) {
-    // The one line proving the durable record was READ BACK, not merely written:
-    // the group's whole anti-regression guarantee rests on this call running, and
-    // a replica that came back at view 0 is otherwise indistinguishable from one
-    // that resumed correctly until it votes.
-    info!(
-        namespace_raw = consensus.group(),
-        view = state.view,
-        log_view = state.log_view,
-        "restored partition view from its superblock"
-    );
-    consensus.set_view(state.view);
-    consensus.set_log_view(state.log_view);
-    consensus.mark_superblock_durable(state.view, state.log_view);
-}
-
 /// Materialise a brand-new [`IggyPartition`] for a namespace that has no on-disk state yet.
 ///
 /// Counterpart to bootstrap's `load_partition`, which hydrates from
@@ -566,11 +510,19 @@ pub(crate) fn restore_partition_view(
 /// the local shard has not yet materialised.
 ///
 /// Steps performed (all idempotent on retry after a partial failure):
-/// 1. Validate namespace fits within the configured caps.
-/// 2. Create directory hierarchy on disk.
-/// 3. Build per-partition VSR consensus group, resuming any superblock-recorded view.
-/// 4. Configure empty consumer-offset storage with the on-disk paths set.
-/// 5. Provision the initial segment + writers (offset 0).
+/// 1. Create directory hierarchy on disk.
+/// 2. Build per-partition VSR consensus group, resuming any superblock-recorded view.
+/// 3. Configure empty consumer-offset storage with the on-disk paths set.
+/// 4. Provision the initial segment + writers (offset 0).
+///
+/// The namespace arrives packed, so its components are in range by
+/// construction. Metadata admission is what bounds them.
+///
+/// `created_view` is the view a group with no durable record of its own starts
+/// in: the metadata plane's view when it committed the create, recorded on
+/// the committed partition so every replica seeds the same value. See the
+/// `seed_view` comment below for why a group left at view 0 is unreachable. A
+/// restart materialization ignores it and probes for the live view instead.
 ///
 /// The returned partition's `offset` / `dirty_offset` are `0` and
 /// `should_increment_offset` is `false`, mirroring a clean append starting
@@ -578,24 +530,25 @@ pub(crate) fn restore_partition_view(
 ///
 /// # Errors
 ///
-/// Returns [`ServerError`] when bounds validation, directory creation,
-/// superblock recovery, or segment provisioning fails.
+/// Returns [`ServerError`] when directory creation, superblock recovery, or
+/// segment provisioning fails.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_partition_fresh(
     config: &ServerConfig,
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
     created_revision: u64,
+    runtime_options: TopicRuntimeOptions,
     cluster_id: u128,
     self_replica_id: u8,
     replica_count: u8,
+    created_view: u32,
     bus: Rc<IggyMessageBus>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
     let partition_id = namespace.partition_id();
 
-    validate_namespace_bounds(config, stream_id, topic_id, partition_id)?;
     // Sampled BEFORE the hierarchy create: a pre-existing partition directory
     // is the marker of a prior life (the .log inside may legitimately be
     // empty -- committed-but-unflushed data dies with the journal), while a
@@ -620,26 +573,6 @@ pub async fn build_partition_fresh(
             source
         })?;
 
-    // Request queue holds 2x the prepare depth (buffered requests drain as
-    // prepares commit); depth is the per-partition `[partition]` knob.
-    let prepare_queue_depth = config.partition.prepare_queue_depth;
-    let mut consensus = VsrConsensus::new(
-        cluster_id,
-        self_replica_id,
-        replica_count,
-        namespace.inner(),
-        bus,
-        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
-    );
-    consensus.set_normal_heartbeat_ticks(crate::bootstrap::cluster_heartbeat_ticks(config));
-    consensus.set_commit_message_ticks(crate::bootstrap::commit_broadcast_ticks(config));
-    consensus.set_prepare_ticks(crate::bootstrap::prepare_retransmit_ticks(config));
-    consensus
-        .set_view_change_retransmit_ticks(crate::bootstrap::view_change_retransmit_ticks(config));
-    consensus.set_view_change_status_ticks(crate::bootstrap::view_change_status_ticks(config));
-    consensus.set_request_start_view_ticks(crate::bootstrap::request_start_view_ticks(config));
-    consensus.set_probe_attempts_max(config.cluster.view_probe_attempts_max);
-
     // The hierarchy create above guarantees the directory exists; recover this
     // group's durable (view, log_view) before choosing how to join, so a
     // restart materialization resumes from the view it last recorded instead
@@ -656,9 +589,6 @@ pub async fn build_partition_fresh(
         },
     )
     .await?;
-    if let Some(state) = recovered_state.as_ref() {
-        restore_partition_view(&mut consensus, state);
-    }
 
     // A partition directory that already holds segment bytes is a RESTART
     // materialization, not a fresh create: this replica's group state died
@@ -669,14 +599,52 @@ pub async fn build_partition_fresh(
     // peer, byte-identical by the deterministic-roll/replicated-ciphertext
     // design. A truly fresh create keeps the plain init: every group needs
     // its view-0 primary to exist.
-    if restarted {
-        consensus.init_as_backup();
-        consensus.begin_view_probe();
-    } else {
-        consensus.init();
-    }
+    let durable_view = recovered_state
+        .as_ref()
+        .map(|state| (state.view, state.log_view));
+    // Shared with the simulator's `init_partition`, which cannot call this
+    // builder; see `fresh_group_start`.
+    let FreshGroupStart { join, seed_view } =
+        fresh_group_start(restarted, durable_view, created_view);
+    // Request queue holds 2x the prepare depth (buffered requests drain as
+    // prepares commit); depth is the per-partition `[partition]` knob.
+    let prepare_queue_depth = config.partition.prepare_queue_depth;
+    let timers = crate::shell::consensus_timers(config);
+    let consensus = VsrConsensus::restored(
+        cluster_id,
+        self_replica_id,
+        replica_count,
+        namespace.inner(),
+        bus,
+        LocalPipeline::with_capacities(prepare_queue_depth, prepare_queue_depth * 2),
+        VsrRestore {
+            timers: &timers,
+            durable_view,
+            view_fallback: None,
+            // Both planes pick their primary as `view % replica_count` from
+            // their OWN view counter. A group left at view 0 while the
+            // metadata plane sits elsewhere therefore names a different node
+            // than the roster advertises as leader, and nothing routes a
+            // partition write across that gap: the client is sent to the
+            // metadata leader and refused there for the whole budget. Seeding
+            // from the view the create was admitted in keeps the two congruent
+            // for a group born after a metadata election.
+            //
+            // The seed comes off the committed partition, not this replica's
+            // live metadata view: the two differ once the metadata plane
+            // elects again, and a seed above the group's real view is an
+            // empty log that outranks committed history in the next DVC
+            // merge. The value rides the create's request body (a header view
+            // is restamped per delivery), so every replica commits the same
+            // one and a late materialiser lands at or below its peers.
+            seed_view,
+            incarnation: None,
+            join,
+        },
+    );
 
     let mut partition = IggyPartition::new(stats, consensus);
+    partition.set_runtime_options(runtime_options);
     partition.set_superblock(superblock, recovered_state.as_ref());
     // Surface the evicted-ring ceilings from config onto the fresh journal.
     // IggyPartition::new has already disabled retention for single-replica

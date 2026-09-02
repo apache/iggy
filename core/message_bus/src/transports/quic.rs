@@ -49,7 +49,7 @@
 //! connection share ONE request id (only metadata ops advance the dedup
 //! counter), so a stranded reply would be consumed by the NEXT partition
 //! op's bidi and shift the connection's data-plane stream off by one,
-//! permanently. Instead, [`REPLY_WAIT_BACKSTOP`] (longer than the SDK's
+//! permanently. Instead, `REPLY_WAIT_BACKSTOP` (longer than the SDK's
 //! whole-request deadline, so the client always gives up first and
 //! reconnects) closes the CONNECTION, which drops the mailbox and every
 //! pending reply with it -- nothing can strand or cross request ids. A
@@ -90,7 +90,7 @@ use compio_quic::{
     crypto::rustls::QuicServerConfig,
 };
 use futures::FutureExt;
-use iggy_binary_protocol::{Command2, HEADER_SIZE, ReplyHeader, RequestHeader};
+use iggy_binary_protocol::{Command, HEADER_SIZE, ReplyHeader, RequestHeader};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -119,9 +119,9 @@ const DEFAULT_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 /// schema (so a misconfigured operator config cannot break the
 /// SDK-client plane):
 ///
-/// - Exactly one bidirectional stream per peer carries every consensus
-///   frame; `tuning.max_concurrent_bidi_streams` clamps to a `u32`
-///   `VarInt` at conversion time but the bus opens only one stream.
+/// - Each SDK request opens a fresh bidirectional stream;
+///   `tuning.max_concurrent_bidi_streams` caps how many a client
+///   connection may hold open at once (clamped to a `u32` `VarInt`).
 /// - Zero unidirectional streams (no datagram traffic on this plane).
 /// - CUBIC congestion controller (no scheme-level switch yet exposed
 ///   to operators).
@@ -133,19 +133,18 @@ const DEFAULT_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 /// # Panics
 ///
 /// Panics if `tuning.max_idle_timeout` is non-zero but outside
-/// quinn-proto's `IdleTimeout` range (`TryFrom<Duration>` rejects
-/// values above `VarInt::MAX_U64` ms, i.e. ~292 years). Schema
-/// validation rejects values that large.
+/// quinn-proto's `IdleTimeout` range: `TryFrom<Duration>` counts the
+/// duration in milliseconds and rejects anything above `VarInt::MAX`
+/// (`2^62 - 1`). `QuicConfig::validate` rejects those values at boot.
 #[must_use]
 pub fn transport_config_from(tuning: &QuicTuning) -> compio_quic::TransportConfig {
     let mut cfg = compio_quic::TransportConfig::default();
     cfg.max_concurrent_bidi_streams(VarInt::from_u32(tuning.max_concurrent_bidi_streams))
         .max_concurrent_uni_streams(VarInt::from_u32(0))
-        .stream_receive_window(VarInt::from_u32(tuning.receive_window))
+        .stream_receive_window(VarInt::from_u32(tuning.stream_receive_window))
         .receive_window(VarInt::from_u32(tuning.receive_window))
         .send_window(tuning.send_window)
         .initial_mtu(tuning.initial_mtu)
-        .datagram_send_buffer_size(tuning.datagram_send_buffer_size)
         .congestion_controller_factory(Arc::new(congestion::CubicConfig::default()));
 
     if !tuning.max_idle_timeout.is_zero() {
@@ -301,7 +300,7 @@ pub(crate) const DEFAULT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// Closing the connection drops the mailbox and any late reply with it.
 const REPLY_WAIT_BACKSTOP: Duration = Duration::from_mins(1);
 
-/// `Command2` byte offset shared by every consensus header (after the
+/// `Command` byte offset shared by every consensus header (after the
 /// fixed checksum/cluster/size/view/release prefix).
 const COMMAND_OFFSET: usize = 60;
 
@@ -317,13 +316,13 @@ enum ReplyRoute {
     Unkeyed,
 }
 
-/// Decide how to route an outbound frame. Only `Command2::Reply` carries a
+/// Decide how to route an outbound frame. Only `Command::Reply` carries a
 /// `request` id; everything else must pass through unfiltered.
 fn reply_route(frame: &BusMessage) -> ReplyRoute {
-    let bytes = frame.as_slice();
+    let bytes = frame.first().as_slice();
     let is_reply = bytes
         .get(COMMAND_OFFSET)
-        .is_some_and(|&command| command == Command2::Reply as u8);
+        .is_some_and(|&command| command == Command::Reply as u8);
     if !is_reply {
         return ReplyRoute::Unkeyed;
     }
@@ -504,11 +503,19 @@ impl TransportConn for QuicTransportConn {
                 continue;
             };
 
-            // Write the reply, then `finish()` so quinn-proto flushes pending
-            // data + a FIN, signalling the SDK that the reply is complete.
-            let BufResult(result, _frozen) = send.write_all(first).await;
-            if let Err(e) = result {
-                debug!(%label, %peer, error = ?e, "quic: write failed");
+            // Write the reply fragment by fragment, then `finish()` so
+            // quinn-proto flushes pending data + a FIN, signalling the SDK
+            // that the reply is complete.
+            let mut write_failed = false;
+            for fragment in first.into_fragments() {
+                let BufResult(result, _frozen) = send.write_all(fragment).await;
+                if let Err(e) = result {
+                    debug!(%label, %peer, error = ?e, "quic: write failed");
+                    write_failed = true;
+                    break;
+                }
+            }
+            if write_failed {
                 continue;
             }
             if let Err(e) = send.finish() {
@@ -555,7 +562,7 @@ mod tests {
     use async_channel::bounded;
     use compio::io::AsyncWrite;
     use compio_quic::ClientBuilder;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE, SIZE_FIELD_OFFSET};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use server_common::iobuf::Frozen;
     use server_common::{MESSAGE_ALIGN, Message};
@@ -567,7 +574,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    fn header_only(command: Command2) -> Frozen<MESSAGE_ALIGN> {
+    fn header_only(command: Command) -> Frozen<MESSAGE_ALIGN> {
         #[allow(clippy::cast_possible_truncation)]
         Message::<GenericHeader>::new(HEADER_SIZE)
             .transmute_header(|_, h: &mut GenericHeader| {
@@ -612,12 +619,12 @@ mod tests {
     fn drive(
         conn: QuicTransportConn,
     ) -> (
-        async_channel::Sender<Frozen<MESSAGE_ALIGN>>,
+        async_channel::Sender<BusMessage>,
         async_channel::Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
     ) {
-        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (out_tx, out_rx) = bounded::<BusMessage>(16);
         let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
         let (shutdown, token) = Shutdown::new();
         let ctx = ActorContext {
@@ -655,11 +662,20 @@ mod tests {
             // and then awaits exactly one reply on `rx` before
             // accepting the next bidi. Feed three replies in step.
             let a = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command2::Reply)).await.unwrap();
+            out_tx
+                .send(header_only(Command::Reply).into())
+                .await
+                .unwrap();
             let b = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command2::Reply)).await.unwrap();
+            out_tx
+                .send(header_only(Command::Reply).into())
+                .await
+                .unwrap();
             let c = in_rx.recv().await.unwrap();
-            out_tx.send(header_only(Command2::Reply)).await.unwrap();
+            out_tx
+                .send(header_only(Command::Reply).into())
+                .await
+                .unwrap();
             shutdown.trigger();
             let _ = handle.await;
             (a.header().command, b.header().command, c.header().command)
@@ -672,7 +688,7 @@ mod tests {
         let connection = connecting.await.expect("client handshake");
 
         // Three sequential bidis, one frame each.
-        for command in [Command2::Ping, Command2::Prepare, Command2::Request] {
+        for command in [Command::Ping, Command::Prepare, Command::Request] {
             let (mut send, _recv) = connection.open_bi_wait().await.expect("open_bi");
             let BufResult(result, _) = send.write_all(header_only(command)).await;
             result.expect("write");
@@ -683,9 +699,9 @@ mod tests {
             .await
             .expect("server task within 5s")
             .unwrap();
-        assert_eq!(a, Command2::Ping);
-        assert_eq!(b, Command2::Prepare);
-        assert_eq!(c, Command2::Request);
+        assert_eq!(a, Command::Ping);
+        assert_eq!(b, Command::Prepare);
+        assert_eq!(c, Command::Request);
     }
 
     /// An oversize size field in the request header makes

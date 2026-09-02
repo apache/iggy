@@ -21,7 +21,7 @@
 
 use iggy_binary_protocol::RoutedRequestHeader;
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -47,7 +47,7 @@ pub const OUTCOMES: &[Outcome] = &[
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
@@ -80,6 +80,14 @@ pub fn sample(
                 partitions_count,
             })
         }
+        // Not targeted (absent from `OUTCOMES`): the sim client sends only valid
+        // catalog keys, the slab ceiling needs `MAX_TOPICS` creates under one
+        // stream, and the primary mints dense 0-based partition ids, so neither
+        // partition guard is reachable from the wire.
+        Outcome::InvalidOptionValue
+        | Outcome::TooManyTopics
+        | Outcome::InvalidPartitionsCount
+        | Outcome::PartitionIdSpaceExhausted => None,
     }
 }
 

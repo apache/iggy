@@ -17,13 +17,14 @@
 
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
-use crate::prelude::{IggyDuration, IggyError};
+use crate::prelude::{IggyError, NonZeroIggyDuration};
 use async_trait::async_trait;
 use iggy_common::Snapshot;
 use iggy_common::Stats;
 use iggy_common::SystemClient;
 use iggy_common::get_snapshot::GetSnapshot;
 use iggy_common::{ClientInfo, ClientInfoDetails};
+use iggy_common::{OptionSpec, OptionsScope};
 use iggy_common::{SnapshotCompression, SystemSnapshotType};
 
 const PING: &str = "/ping";
@@ -72,12 +73,20 @@ impl SystemClient for HttpClient {
         Ok(clients)
     }
 
+    async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
+        let response = self.get(&format!("/options/{scope}")).await?;
+        response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)
+    }
+
     async fn ping(&self) -> Result<(), IggyError> {
         self.get(PING).await?;
         Ok(())
     }
 
-    async fn heartbeat_interval(&self) -> IggyDuration {
+    async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.heartbeat_interval
     }
 

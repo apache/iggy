@@ -17,7 +17,8 @@
 
 use async_trait::async_trait;
 use iggy_connector_sdk::{
-    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source,
+    source::SourceBatchResult, source_connector,
 };
 use rand::{
     RngExt,
@@ -41,6 +42,7 @@ pub struct RandomSource {
     messages_range: (u32, u32),
     payload_size: u32,
     state: Mutex<State>,
+    pending_state: Mutex<Option<State>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,7 +53,7 @@ pub struct RandomSourceConfig {
     payload_size: Option<u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct State {
     messages_produced: usize,
 }
@@ -81,6 +83,7 @@ impl RandomSource {
             state: Mutex::new(restored_state.unwrap_or(State {
                 messages_produced: 0,
             })),
+            pending_state: Mutex::new(None),
         }
     }
 
@@ -88,11 +91,14 @@ impl RandomSource {
         ConnectorState::serialize(state, CONNECTOR_NAME, self.id)
     }
 
-    fn generate_messages(&self) -> Vec<ProducedMessage> {
+    fn generate_messages(&self, remaining: Option<usize>) -> Vec<ProducedMessage> {
         let mut messages = Vec::new();
         let mut rng = rand::rng();
+        let messages_count = rng
+            .sample(Uniform::new(self.messages_range.0, self.messages_range.1).unwrap())
+            as usize;
         let messages_count =
-            rng.sample(Uniform::new(self.messages_range.0, self.messages_range.1).unwrap());
+            remaining.map_or(messages_count, |remaining| messages_count.min(remaining));
         for _ in 0..messages_count {
             let record = Record {
                 id: Uuid::new_v4(),
@@ -147,9 +153,9 @@ impl Source for RandomSource {
 
     async fn poll(&self) -> Result<ProducedMessages, iggy_connector_sdk::Error> {
         sleep(self.interval).await;
-        let mut state = self.state.lock().await;
+        let messages_produced = self.state.lock().await.messages_produced;
         if let Some(max_count) = self.max_count
-            && state.messages_produced >= max_count
+            && messages_produced >= max_count
         {
             info!(
                 "Reached max number of {max_count} messages for {CONNECTOR_NAME} connector with ID: {}",
@@ -158,26 +164,43 @@ impl Source for RandomSource {
             return Ok(ProducedMessages {
                 schema: Schema::Json,
                 messages: vec![],
-                state: self.serialize_state(&state),
+                state: None,
             });
         }
 
-        let messages = self.generate_messages();
-        state.messages_produced += messages.len();
+        let remaining = self
+            .max_count
+            .map(|max_count| max_count.saturating_sub(messages_produced));
+        let messages = self.generate_messages(remaining);
+        let candidate_state = State {
+            messages_produced: messages_produced + messages.len(),
+        };
+        let persisted_state = self.serialize_state(&candidate_state).ok_or_else(|| {
+            Error::Serialization("failed to serialize random source state".to_string())
+        })?;
+        *self.pending_state.lock().await = Some(candidate_state.clone());
         info!(
             "{CONNECTOR_NAME} connector with ID: {} generated {} messages. Total produced: {}",
             self.id,
             messages.len(),
-            state.messages_produced
+            candidate_state.messages_produced
         );
-
-        let persisted_state = self.serialize_state(&state);
 
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
-            state: persisted_state,
+            state: Some(persisted_state),
         })
+    }
+
+    async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
+        let candidate_state = self.pending_state.lock().await.take();
+        if result == SourceBatchResult::Ack
+            && let Some(candidate_state) = candidate_state
+        {
+            *self.state.lock().await = candidate_state;
+        }
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), Error> {
@@ -272,11 +295,45 @@ mod tests {
             messages_produced: 42,
         };
 
-        let connector_state = src.serialize_state(&state);
-        assert!(connector_state.is_some());
-
-        let bytes = connector_state.unwrap().0;
+        let bytes = src
+            .serialize_state(&state)
+            .expect("state should be serializable")
+            .0;
         let restored: State = rmp_serde::from_slice(&bytes).expect("Failed to deserialize state");
         assert_eq!(restored.messages_produced, 42);
+    }
+
+    #[test]
+    fn given_nack_when_batch_is_staged_should_keep_committed_state() {
+        let src = RandomSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let produced = src.poll().await.expect("poll should succeed");
+            assert!(!produced.messages.is_empty());
+
+            src.on_batch_result(SourceBatchResult::Nack)
+                .await
+                .expect("NACK should be applied");
+
+            assert_eq!(src.state.lock().await.messages_produced, 0);
+            assert!(src.pending_state.lock().await.is_none());
+        });
+    }
+
+    #[test]
+    fn given_ack_when_batch_is_staged_should_commit_candidate_state() {
+        let src = RandomSource::new(1, test_config(), None);
+        let runtime = tokio::runtime::Runtime::new().expect("failed to create test runtime");
+        runtime.block_on(async {
+            let produced = src.poll().await.expect("poll should succeed");
+            let count = produced.messages.len();
+
+            src.on_batch_result(SourceBatchResult::Ack)
+                .await
+                .expect("ACK should be applied");
+
+            assert_eq!(src.state.lock().await.messages_produced, count);
+            assert!(src.pending_state.lock().await.is_none());
+        });
     }
 }

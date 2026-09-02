@@ -75,6 +75,12 @@ public class IggyPublisherConfig
     public string Password { get; set; } = string.Empty;
 
     /// <summary>
+    ///     Personal access token used instead of <see cref="Login" /> and <see cref="Password" /> when creating
+    ///     the client. Takes precedence over them when set.
+    /// </summary>
+    public string PersonalAccessToken { get; set; } = string.Empty;
+
+    /// <summary>
     ///     Gets or sets the identifier of the target stream.
     ///     Can be either a numeric ID or a string name.
     /// </summary>
@@ -87,16 +93,18 @@ public class IggyPublisherConfig
     public Identifier TopicId { get; set; }
 
     /// <summary>
-    ///     Gets or sets the size of the receive buffer in bytes.
-    ///     Default is 4096 bytes (4 KB).
+    ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_rmem</c>.
     /// </summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public int? ReceiveBufferSize { get; set; } = null;
 
     /// <summary>
-    ///     Gets or sets the size of the send buffer in bytes.
-    ///     Default is 4096 bytes (4 KB).
+    ///     The size of the send buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_wmem</c>.
     /// </summary>
-    public int SendBufferSize { get; set; } = 4096;
+    public int? SendBufferSize { get; set; } = null;
 
     /// <summary>
     ///     Gets or sets the partitioning strategy for messages.
@@ -146,13 +154,6 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="CreateTopic" /> is true.
     /// </summary>
     public CompressionAlgorithm TopicCompressionAlgorithm { get; set; }
-
-    /// <summary>
-    ///     Gets or sets the replication factor for the topic.
-    ///     Determines how many replicas of each partition are maintained.
-    ///     Only used when <see cref="CreateTopic" /> is true.
-    /// </summary>
-    public byte? TopicReplicationFactor { get; set; }
 
     /// <summary>
     ///     Gets or sets the message expiry time (0 for server default, TimeSpan.MaxValue for no expiry).
@@ -259,7 +260,14 @@ public class IggyPublisherConfig
     /// <summary>
     ///     Gets or sets the reconnection settings to control the behavior of the iggy client
     ///     in case of a disconnect or network failure.
-    ///     This property is optional and can be null. If null, reconnection will be disabled.
+    ///     This property is optional and can be null. If null, the default <see cref="Configuration.ReconnectionSettings" />
+    ///     apply.
     /// </summary>
     public ReconnectionSettings? ReconnectionSettings { get; set; }
+
+    /// <summary>
+    ///     Interval between the pings the created client sends to keep an idle session alive.
+    ///     See <see cref="IggyClientConfigurator.HeartbeatInterval" />.
+    /// </summary>
+    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(5);
 }

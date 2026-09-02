@@ -21,10 +21,10 @@ use futures::StreamExt;
 use iggy::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
 use iggy::prelude::{
     AutoCommit as RustAutoCommit, AutoCommitAfter as RustAutoCommitAfter,
-    AutoCommitWhen as RustAutoCommitWhen, ConsumerGroup as RustConsumerGroup,
-    ConsumerGroupDetails as RustConsumerGroupDetails,
-    ConsumerGroupMember as RustConsumerGroupMember, IggyConsumer as RustIggyConsumer, IggyDuration,
-    IggyError, ReceivedMessage,
+    AutoCommitWhen as RustAutoCommitWhen, Consumer as RustConsumer,
+    ConsumerGroup as RustConsumerGroup, ConsumerGroupDetails as RustConsumerGroupDetails,
+    ConsumerGroupMember as RustConsumerGroupMember, Identifier, IggyConsumer as RustIggyConsumer,
+    IggyConsumerState as RustIggyConsumerState, IggyError, NonZeroIggyDuration, ReceivedMessage,
 };
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::types::PyDelta;
@@ -44,51 +44,55 @@ use crate::receive_message::ReceiveMessage;
 
 /// A Python class representing the Iggy consumer.
 /// It provides asynchronous functionality through the contained runtime.
+// `inner` stays locked for the whole duration of a consumption run, so everything that can
+// be served from `state` or from a snapshot must not touch it.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct IggyConsumer {
     pub(crate) inner: Arc<Mutex<RustIggyConsumer>>,
+    pub(crate) state: RustIggyConsumerState,
+    pub(crate) name: String,
+    pub(crate) stream: PyIdentifier,
+    pub(crate) topic: PyIdentifier,
 }
 
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyConsumer {
-    /// Get the last consumed offset or `None` if no offset has been consumed yet.
+    /// Get the last consumed offset for the given partition, or `None` while that partition
+    /// is untracked. Polling starts tracking a partition at `0`, so `0` also means
+    /// "seen, nothing consumed yet".
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
-        self.inner
-            .blocking_lock()
-            .get_last_consumed_offset(partition_id)
+        self.state.get_last_consumed_offset(partition_id)
     }
 
-    /// Get the last stored offset or `None` if no offset has been stored yet.
+    /// Get the last stored offset for the given partition, or `None` while that partition is
+    /// untracked. Polling starts tracking a partition at `0`, so `0` also means
+    /// "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
     #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
-        self.inner
-            .blocking_lock()
-            .get_last_stored_offset(partition_id)
+        self.state.get_last_stored_offset(partition_id)
     }
 
     /// Gets the name of the consumer group.
-    fn name(&self) -> String {
-        self.inner.blocking_lock().name().to_string()
+    fn name(&self) -> &str {
+        &self.name
     }
 
     /// Gets the current partition id or `0` if no messages have been polled yet.
     fn partition_id(&self) -> u32 {
-        self.inner.blocking_lock().partition_id()
+        self.state.partition_id()
     }
 
-    /// Gets the name of the stream this consumer group is configured for.
-    fn stream(&self) -> PyResult<PyIdentifier> {
-        let guard = self.inner.blocking_lock();
-        PyIdentifier::try_from(guard.stream())
+    /// Gets the identifier of the stream this consumer group is configured for.
+    fn stream(&self) -> PyIdentifier {
+        self.stream.clone()
     }
 
-    /// Gets the name of the topic this consumer group is configured for.
-    fn topic(&self) -> PyResult<PyIdentifier> {
-        let guard = self.inner.blocking_lock();
-        PyIdentifier::try_from(guard.topic())
+    /// Gets the identifier of the topic this consumer group is configured for.
+    fn topic(&self) -> PyIdentifier {
+        self.topic.clone()
     }
 
     /// Stores the provided offset for the provided partition id or if none is specified
@@ -101,11 +105,9 @@ impl IggyConsumer {
         offset: u64,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let inner = self.inner.clone();
+        let state = self.state.clone();
         future_into_py(py, async move {
-            inner
-                .lock()
-                .await
+            state
                 .store_offset(offset, partition_id)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
@@ -121,11 +123,9 @@ impl IggyConsumer {
         py: Python<'a>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] partition_id: Option<u32>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let inner = self.inner.clone();
+        let state = self.state.clone();
         future_into_py(py, async move {
-            inner
-                .lock()
-                .await
+            state
                 .delete_offset(partition_id)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
@@ -175,42 +175,70 @@ impl IggyConsumer {
                     let mut inner = inner.lock().await;
                     Ok(inner.consume_messages(&consumer, shutdown_rx).await)
                 }));
-            let consume_result;
+            let handle_shutdown = shutdown_event
+                .map(|shutdown_event| -> PyResult<JoinHandle<PyResult<()>>> {
+                    let task_locals =
+                        Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
+                    Ok(get_runtime().spawn(scope(
+                        task_locals,
+                        wait_for_shutdown(shutdown_event, shutdown_tx),
+                    )))
+                })
+                .transpose()?;
 
-            if let Some(shutdown_event) = shutdown_event {
-                let task_locals = Python::attach(pyo3_async_runtimes::tokio::get_current_locals)?;
-                async fn shutdown_impl(
-                    shutdown_event: Py<PyAny>,
-                    shutdown_tx: Sender<()>,
-                ) -> PyResult<()> {
-                    Python::attach(|py| {
-                        into_future(shutdown_event.bind(py).as_any().call_method0("wait")?)
-                    })?
-                    .await?;
-                    shutdown_tx.send(()).map_err(|_| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            "Failed to signal shutdown",
-                        )
-                    })?;
-                    Ok(())
+            let consume_result = handle_consume.await;
+
+            if let Some(handle_shutdown) = handle_shutdown {
+                // Consuming can also end on its own, and the shutdown task would then park on
+                // `Event.wait()` forever.
+                handle_shutdown.abort();
+                match handle_shutdown.await {
+                    Ok(shutdown_result) => shutdown_result?,
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            error.to_string(),
+                        ));
+                    }
                 }
-                let handle_shutdown: JoinHandle<Result<(), PyErr>> = get_runtime().spawn(scope(
-                    task_locals,
-                    shutdown_impl(shutdown_event, shutdown_tx),
-                ));
-                let shutdown_result;
-                (consume_result, shutdown_result) = tokio::join!(handle_consume, handle_shutdown);
-                shutdown_result.map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                })??;
-            } else {
-                consume_result = handle_consume.await;
             }
 
             consume_result
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))??
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
+        })
+    }
+}
+
+async fn wait_for_shutdown(shutdown_event: Py<PyAny>, shutdown_tx: Sender<()>) -> PyResult<()> {
+    Python::attach(|py| into_future(shutdown_event.bind(py).as_any().call_method0("wait")?))?
+        .await?;
+    // A closed receiver only means consuming has already stopped, so there is nothing left
+    // to signal and the result of the run is the one worth reporting.
+    let _ = shutdown_tx.send(());
+    Ok(())
+}
+
+/// The consumer polling the messages. It selects both the consumer kind and the
+/// identifier the server keys the stored offset on.
+#[derive(Clone)]
+#[gen_stub_pyclass_complex_enum]
+#[pyclass(from_py_object)]
+pub enum Consumer {
+    /// A regular consumer, owning its offset on the polled partition.
+    Single { id: PyIdentifier },
+    /// A member of the consumer group, sharing the group's offset.
+    Group { id: PyIdentifier },
+}
+
+impl TryFrom<&Consumer> for RustConsumer {
+    type Error = PyErr;
+
+    fn try_from(value: &Consumer) -> PyResult<RustConsumer> {
+        Ok(match value {
+            Consumer::Single { id } => RustConsumer::new(Identifier::try_from(id)?),
+            Consumer::Group { id } => RustConsumer::group(Identifier::try_from(id)?),
         })
     }
 }
@@ -384,8 +412,7 @@ struct PyCallbackConsumer {
 impl MessageConsumer for PyCallbackConsumer {
     async fn consume(&self, received: ReceivedMessage) -> Result<(), IggyError> {
         let callback = self.callback.clone();
-        let task_locals = self.task_locals.clone().lock_owned().await;
-        let task_locals = task_locals.clone();
+        let task_locals = self.task_locals.lock().await.clone();
         let message = ReceiveMessage {
             inner: received.message,
             partition_id: received.partition_id,
@@ -445,8 +472,8 @@ impl TryFrom<&AutoCommit> for RustAutoCommit {
     }
 }
 
-fn auto_commit_interval(delta: &Py<PyDelta>) -> PyResult<IggyDuration> {
-    reject_zero(py_delta_to_iggy_duration(delta)?, "AutoCommit interval")
+fn auto_commit_interval(delta: &Py<PyDelta>) -> PyResult<NonZeroIggyDuration> {
+    reject_zero(py_delta_to_iggy_duration(delta)?, "interval")
 }
 
 /// The auto-commit mode for storing the offset on the server.

@@ -19,10 +19,10 @@ use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(
-    author = "Apache Iggy (Incubating)",
+    author = "Apache Iggy",
     version,
     about = "Apache Iggy: Hyper-Efficient Message Streaming at Laser Speed",
-    long_about = r#"Apache Iggy (Incubating) - a persistent message streaming platform written in Rust
+    long_about = r#"Apache Iggy - a persistent message streaming platform written in Rust
 
 Iggy stores every stream in a replicated log kept consistent by Viewstamped
 Replication. One binary serves both the single-node and the clustered
@@ -54,8 +54,10 @@ ENVIRONMENT VARIABLES:
 
     Common examples:
         IGGY_SYSTEM_PATH=/data/iggy                    # Data directory
-        IGGY_TCP_ADDRESS=0.0.0.0:8090                  # TCP listener address
+        IGGY_TCP_ADDRESS=127.0.0.1:8090                # TCP listener address
         IGGY_HTTP_ADDRESS=0.0.0.0:3000                 # HTTP listener address
+        IGGY_NODE_ADVERTISED_ADDRESS=localhost         # Address clients dial, required
+                                                       # when a listener binds a wildcard
         IGGY_SYSTEM_LOGGING_LEVEL=debug                # Log level
         IGGY_ROOT_USERNAME=iggy                        # Root user, set with the password
         IGGY_ROOT_PASSWORD=secret                      # Root password, set with the username

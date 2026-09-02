@@ -105,7 +105,18 @@ impl std::fmt::Debug for TlsServerCredentials {
 /// certificate file contains no certificates, or the key file
 /// contains no recognized private key.
 pub fn load_pem(cert_path: &Path, key_path: &Path) -> io::Result<TlsServerCredentials> {
-    let cert_file = std::fs::File::open(cert_path)?;
+    // Name the path in the message: callers wrap this in an error that only
+    // says which listener failed, so a bare NotFound leaves an operator who
+    // left the path empty with nothing to act on.
+    let cert_file = std::fs::File::open(cert_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot open certificate file '{}': {error}",
+                cert_path.display()
+            ),
+        )
+    })?;
     let mut cert_reader = BufReader::new(cert_file);
     let cert_chain: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_reader).collect::<Result<_, _>>()?;
@@ -116,7 +127,15 @@ pub fn load_pem(cert_path: &Path, key_path: &Path) -> io::Result<TlsServerCreden
         ));
     }
 
-    let key_file = std::fs::File::open(key_path)?;
+    let key_file = std::fs::File::open(key_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot open private key file '{}': {error}",
+                key_path.display()
+            ),
+        )
+    })?;
     let mut key_reader = BufReader::new(key_file);
     let key_der = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
         io::Error::new(
@@ -334,6 +353,16 @@ mod tests {
         // Both files exist but are empty.
         let err = load_pem(cert_file.path(), key_file.path()).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_pem_names_an_empty_certificate_path() {
+        let err = load_pem(Path::new(""), Path::new("")).expect_err("must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("certificate file ''"),
+            "an unset path must be visible in the message, got: {err}"
+        );
     }
 
     #[test]

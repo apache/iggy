@@ -26,6 +26,8 @@ import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.serde.CommandCode;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.apache.iggy.system.OptionSpec;
+import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.Stats;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,6 +64,23 @@ public class SystemTcpClient implements SystemClient {
                 .thenApply(response -> {
                     try {
                         return BytesDeserializer.readStats(response);
+                    } finally {
+                        response.release();
+                    }
+                });
+    }
+
+    @Override
+    public CompletableFuture<List<OptionSpec>> describeOptions(OptionsScope scope) {
+        var payload = Unpooled.buffer(1).writeByte(scope.asCode());
+
+        log.debug("Describing {} options", scope);
+
+        return connection()
+                .send(CommandCode.System.DESCRIBE_OPTIONS.getValue(), payload)
+                .thenApply(response -> {
+                    try {
+                        return BytesDeserializer.readOptionSpecs(response);
                     } finally {
                         response.release();
                     }

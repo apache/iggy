@@ -161,6 +161,7 @@ components:
       - "rust-connectors"
       - "rust-mcp"
       - "rust-integration"
+      - "rust-gateway"
       - "ci-infrastructure"
     paths:
       - "Dockerfile*"
@@ -231,7 +232,7 @@ components:
       - "ci-infrastructure" # CI changes trigger full regression
     paths:
       - "foreign/python/**"
-    tasks: ["lint", "test", "build"]
+    tasks: ["lint", "test"]
 
   sdk-php:
     depends_on:
@@ -285,7 +286,7 @@ components:
     paths:
       - "foreign/csharp/**"
       - "examples/csharp/**"
-    tasks: ["lint", "test", "build", "e2e"]
+    tasks: ["lint", "test", "build", "e2e-net8.0", "e2e-net10.0"]
 
   sdk-cpp:
     depends_on:
@@ -294,7 +295,7 @@ components:
       - "ci-infrastructure"
     paths:
       - "foreign/cpp/**"
-    tasks: ["lint", "build", "test", "e2e"]
+    tasks: ["lint", "build", "test"]
 
   # Shared BDD infrastructure that affects all BDD tests
   bdd-infrastructure:
@@ -519,3 +520,12 @@ components:
       - ".github/actions/**/*.yml"
       - ".github/ci/**/*.yml"
     tasks: ["validate"] # Could run workflow validation
+
+  # gateways are not Rust components, but we want to run them in CI
+  rust-gateway:
+    depends_on:
+      - "rust-sdk"
+      - "rust-workspace"
+      - "ci-infrastructure"
+    paths:
+      - "gateways/**"

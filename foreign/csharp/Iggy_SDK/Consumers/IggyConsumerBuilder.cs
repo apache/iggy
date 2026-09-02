@@ -90,17 +90,56 @@ public class IggyConsumerBuilder
     /// <param name="address">The address of the server to connect to.</param>
     /// <param name="login">The login username for authentication.</param>
     /// <param name="password">The password for authentication.</param>
-    /// <param name="receiveBufferSize">The size of the receive buffer.</param>
-    /// <param name="sendBufferSize">The size of the send buffer.</param>
+    /// <param name="receiveBufferSize">
+    ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_rmem</c>.
+    /// </param>
+    /// <param name="sendBufferSize">
+    ///     The size of the send buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_wmem</c>.
+    /// </param>
     /// <param name="reconnectionSettings">Reconnection settings for the client.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithConnection(Protocol protocol, string address, string login, string password,
-        int receiveBufferSize = 4096, int sendBufferSize = 4096, ReconnectionSettings? reconnectionSettings = null)
+        int? receiveBufferSize = null, int? sendBufferSize = null, ReconnectionSettings? reconnectionSettings = null)
     {
         Config.Protocol = protocol;
         Config.Address = address;
         Config.Login = login;
         Config.Password = password;
+        Config.ReceiveBufferSize = receiveBufferSize;
+        Config.SendBufferSize = sendBufferSize;
+        Config.ReconnectionSettings = reconnectionSettings;
+
+        return this;
+    }
+
+    /// <summary>
+    ///     Configures the connection settings using a personal access token instead of a username and password.
+    /// </summary>
+    /// <param name="protocol">The protocol to use for the connection (e.g., TCP, UDP).</param>
+    /// <param name="address">The address of the server to connect to.</param>
+    /// <param name="personalAccessToken">The personal access token to authenticate with.</param>
+    /// <param name="receiveBufferSize">
+    ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_rmem</c>.
+    /// </param>
+    /// <param name="sendBufferSize">
+    ///     The size of the send buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_wmem</c>.
+    /// </param>
+    /// <param name="reconnectionSettings">Reconnection settings for the client.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
+    public IggyConsumerBuilder WithConnection(Protocol protocol, string address, string personalAccessToken,
+        int? receiveBufferSize = null, int? sendBufferSize = null, ReconnectionSettings? reconnectionSettings = null)
+    {
+        Config.Protocol = protocol;
+        Config.Address = address;
+        Config.PersonalAccessToken = personalAccessToken;
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
         Config.ReconnectionSettings = reconnectionSettings;
@@ -245,7 +284,8 @@ public class IggyConsumerBuilder
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize,
                 ReconnectionSettings = Config.ReconnectionSettings ?? new ReconnectionSettings(),
-                AutoLoginSettings = AutoLoginSettings.For(Config.Login, Config.Password),
+                HeartbeatInterval = Config.HeartbeatInterval,
+                AutoLoginSettings = AutoLogin(),
                 LoggerFactory = Config.LoggerFactory ?? NullLoggerFactory.Instance,
                 MessageEncryptor = _encryptor
             });
@@ -263,6 +303,18 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
+    ///     The credentials given to WithConnection must reach the client and not only the explicit login
+    ///     performed at startup: a reconnect or a leader redirect drops the session, and without them the
+    ///     client would come back unauthenticated.
+    /// </summary>
+    private protected AutoLoginSettings AutoLogin()
+    {
+        return string.IsNullOrEmpty(Config.PersonalAccessToken)
+            ? AutoLoginSettings.For(Config.Login, Config.Password)
+            : AutoLoginSettings.ForPersonalAccessToken(Config.PersonalAccessToken);
+    }
+
+    /// <summary>
     ///     Validates the consumer configuration and throws if invalid.
     /// </summary>
     /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
@@ -275,14 +327,18 @@ public class IggyConsumerBuilder
                 throw new InvalidOperationException("Address must be provided when CreateIggyClient is true.");
             }
 
-            if (string.IsNullOrWhiteSpace(Config.Login))
+            if (string.IsNullOrWhiteSpace(Config.PersonalAccessToken))
             {
-                throw new InvalidOperationException("Login must be provided when CreateIggyClient is true.");
-            }
+                if (string.IsNullOrWhiteSpace(Config.Login))
+                {
+                    throw new InvalidOperationException(
+                        "Login or PersonalAccessToken must be provided when CreateIggyClient is true.");
+                }
 
-            if (string.IsNullOrWhiteSpace(Config.Password))
-            {
-                throw new InvalidOperationException("Password must be provided when CreateIggyClient is true.");
+                if (string.IsNullOrWhiteSpace(Config.Password))
+                {
+                    throw new InvalidOperationException("Password must be provided when CreateIggyClient is true.");
+                }
             }
         }
         else
@@ -307,14 +363,14 @@ public class IggyConsumerBuilder
                 "AutoCommitMode.Auto with a message encryptor risks silent message loss: the offset is committed before decryption. Use AutoCommitMode.AfterReceive or AutoCommitMode.Disabled.");
         }
 
-        if (Config.ReceiveBufferSize <= 0)
+        if (Config.ReceiveBufferSize is <= 0)
         {
-            throw new InvalidOperationException("ReceiveBufferSize must be greater than 0.");
+            throw new InvalidOperationException("ReceiveBufferSize must be greater than 0 when set.");
         }
 
-        if (Config.SendBufferSize <= 0)
+        if (Config.SendBufferSize is <= 0)
         {
-            throw new InvalidOperationException("SendBufferSize must be greater than 0.");
+            throw new InvalidOperationException("SendBufferSize must be greater than 0 when set.");
         }
 
         if (Config.BatchSize == 0)

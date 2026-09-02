@@ -15,23 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
+use crate::iggy_index::IggyIndexCache;
 use crate::iggy_index_writer::IggyIndexWriter;
 use crate::messages_writer::MessagesWriter;
 use crate::poll_plan::SealedSegmentHandle;
 use crate::segment::Segment;
-use iggy_common::{IggyByteSize, IggyMessagesBatch};
-use journal::{Journal, Storage};
+use iggy_common::IggyByteSize;
+use journal::Journal;
 use ringbuffer::AllocRingBuffer;
-use server_common::{IggyMessagesBatchSetInFlight, SegmentStorage};
+use server_common::SegmentStorage;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::rc::Rc;
 
 const SEGMENTS_CAPACITY: usize = 1024;
 const ACCESS_MAP_CAPACITY: usize = 8;
-const SIZE_16MB: usize = 16 * 1024 * 1024;
-
 /// Max sealed segments per partition that keep a resident read handle (fd +
 /// sparse index). Without a cap every sealed segment a reader ever touched pins
 /// one fd for the partition's lifetime; the server-wide budget is this cap times
@@ -65,10 +63,9 @@ pub struct JournalState<J> {
     pub info: JournalInfo,
 }
 
-impl<J, S> Journal<S> for JournalState<J>
+impl<J> Journal for JournalState<J>
 where
-    S: Storage,
-    J: Journal<S>,
+    J: Journal,
 {
     type Header = J::Header;
     type Entry = J::Entry;
@@ -135,18 +132,12 @@ impl<J: Default> Default for JournalState<J> {
     }
 }
 
-// TODO: Structure this better, the segmented log does not need to be generic over S, the Journal needs.
-
-// This struct aliases in terms of the code contained the `SegmentedLog` from `core/server/src/streaming/partitions/log.rs`.
-// The only difference is the `Journal` generic, we use different trait.
 #[derive(Debug)]
-pub struct SegmentedLog<J, S>
+pub struct SegmentedLog<J>
 where
-    S: Storage,
-    J: Debug + Journal<S>,
+    J: Debug + Journal,
 {
     journal: JournalState<J>,
-    _pd: std::marker::PhantomData<S>,
     // Ring buffer tracking recently accessed segment indices for cleanup optimization.
     // A background task uses this to identify and close file descriptors for unused segments.
     _access_map: AllocRingBuffer<usize>,
@@ -157,27 +148,24 @@ where
     messages_writers: Vec<Option<Rc<MessagesWriter>>>,
     index_writers: Vec<Option<Rc<IggyIndexWriter>>>,
     // Parallel to `segments`: a shared read-state handle (fd + sparse index)
-    // per segment, filled lazily on the first sealed-segment poll and cloned
-    // into the off-borrow poll plan. Maintained in lockstep with `segments`
-    // (push/remove together).
+    // per segment, filled lazily on the first poll that reads the segment and
+    // cloned into the off-borrow poll plan. Maintained in lockstep with
+    // `segments` (push/remove together).
     sealed_read_state: Vec<SealedSegmentHandle>,
     // LRU of sealed-segment `start_offset`s (most-recently-used at the front)
     // bounding how many `sealed_read_state` handles stay resident, capped at
     // `SEALED_READ_STATE_CAP`. Keyed by offset (stable), not slot index (which
     // shifts on retire). See `touch_sealed_read_state`.
     sealed_lru: VecDeque<u64>,
-    in_flight: IggyMessagesBatchSetInFlight,
 }
 
-impl<J, S> Default for SegmentedLog<J, S>
+impl<J> Default for SegmentedLog<J>
 where
-    S: Storage,
-    J: Debug + Default + Journal<S>,
+    J: Debug + Default + Journal,
 {
     fn default() -> Self {
         Self {
             journal: JournalState::default(),
-            _pd: std::marker::PhantomData,
             _access_map: AllocRingBuffer::with_capacity_power_of_2(ACCESS_MAP_CAPACITY),
             _cache: (),
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
@@ -187,15 +175,13 @@ where
             index_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
             sealed_read_state: Vec::with_capacity(SEGMENTS_CAPACITY),
             sealed_lru: VecDeque::with_capacity(SEALED_READ_STATE_CAP + 1),
-            in_flight: IggyMessagesBatchSetInFlight::default(),
         }
     }
 }
 
-impl<J, S> SegmentedLog<J, S>
+impl<J> SegmentedLog<J>
 where
-    S: Storage,
-    J: Debug + Journal<S>,
+    J: Debug + Journal,
 {
     pub const fn has_segments(&self) -> bool {
         !self.segments.is_empty()
@@ -213,7 +199,7 @@ where
     }
 
     /// Shared read-state handles, parallel to [`Self::segments`]. Cloned into
-    /// the poll plan for sealed segments (see [`SealedSegmentHandle`]).
+    /// the poll plan (see [`SealedSegmentHandle`]).
     pub fn sealed_read_state(&self) -> &[SealedSegmentHandle] {
         &self.sealed_read_state
     }
@@ -221,15 +207,18 @@ where
     /// Record a sealed-segment access and enforce [`SEALED_READ_STATE_CAP`]
     /// (LRU). `slot` indexes [`Self::segments`]; an out-of-range slot or an
     /// unsealed (active) segment is a no-op, so the poll path passes its start
-    /// segment unconditionally. The LRU is keyed by `start_offset` - stable
-    /// across retire, unlike the slot index. The touched segment moves to the
-    /// most-recently-used front and its handle is marked tracked (eligible to
-    /// cache a read fd, see `SealedSegmentReadState::tracked`); once more than
-    /// the cap distinct sealed segments are tracked, the least-recently-used
-    /// one's handle is untracked and dropped (replaced with a fresh empty
-    /// handle) so its fd + sparse index free. An in-flight poll holding a clone
-    /// of the dropped handle keeps it alive until it finishes (see
-    /// [`SealedSegmentHandle`]).
+    /// segment unconditionally. Keeping the active segment out is deliberate:
+    /// its read fd must not be evictable by unrelated sealed traffic, and its
+    /// `start_offset` is not a stable LRU key across rotation. Its slot is
+    /// bounded by [`Self::reset_read_state`] instead. The LRU is keyed by
+    /// `start_offset` - stable across retire, unlike the slot index. The
+    /// touched segment moves to the most-recently-used front and its handle is
+    /// marked tracked (eligible to cache a read fd, see
+    /// `SealedSegmentReadState::tracked`); once more than the cap distinct
+    /// sealed segments are tracked, the least-recently-used one's handle is
+    /// untracked and dropped (replaced with a fresh empty handle) so its fd +
+    /// sparse index free. An in-flight poll holding a clone of the dropped
+    /// handle keeps it alive until it finishes (see [`SealedSegmentHandle`]).
     pub fn touch_sealed_read_state(&mut self, slot: usize) {
         let Some(touched) = self.segments.get(slot) else {
             return;
@@ -264,6 +253,25 @@ where
         }
     }
 
+    /// Orphan `slot`'s read-state handle (replaced with a fresh empty one) and
+    /// purge its sealed-LRU entry. Called wherever a segment changes
+    /// sealed-ness, because the two states cache under different rules: the
+    /// active segment's fd lives outside the LRU budget and must not carry into
+    /// sealed tracking, and a sealed handle must not carry into active use
+    /// while an LRU entry survives that could evict the now-active fd.
+    /// Replacing (rather than clearing in place) also detaches an in-flight
+    /// poll that snapshotted the old sealed-ness, so its store-back lands in
+    /// the orphan and frees when the poll finishes.
+    pub fn reset_read_state(&mut self, slot: usize) {
+        let Some(segment) = self.segments.get(slot) else {
+            return;
+        };
+        let start_offset = segment.start_offset;
+        self.sealed_read_state[slot].tracked.set(false);
+        self.sealed_read_state[slot] = SealedSegmentHandle::default();
+        self.sealed_lru.retain(|&offset| offset != start_offset);
+    }
+
     /// Wipe every shared read-state handle in place (cached fd + sparse index
     /// cleared, handle untracked) and reset the sealed LRU. In-flight polls
     /// hold `Rc` clones of these handles, so clearing the slots (not just
@@ -279,6 +287,7 @@ where
             handle.tracked.set(false);
             *handle.fd.borrow_mut() = None;
             *handle.index.borrow_mut() = None;
+            handle.offset_cursor.set(None);
         }
         self.sealed_lru.clear();
     }
@@ -405,8 +414,7 @@ where
             .last_mut()
             .expect("active indexes called on empty log");
         if indexes.is_none() {
-            let capacity = SIZE_16MB / IGGY_INDEX_SIZE;
-            *indexes = Some(IggyIndexCache::with_capacity(capacity));
+            *indexes = Some(IggyIndexCache::empty());
         }
     }
 
@@ -431,28 +439,11 @@ where
             *segment_indexes = Some(indexes);
         }
     }
-
-    pub const fn in_flight(&self) -> &IggyMessagesBatchSetInFlight {
-        &self.in_flight
-    }
-
-    pub const fn in_flight_mut(&mut self) -> &mut IggyMessagesBatchSetInFlight {
-        &mut self.in_flight
-    }
-
-    pub fn set_in_flight(&mut self, batches: Vec<IggyMessagesBatch>) {
-        self.in_flight.set(batches);
-    }
-
-    pub fn clear_in_flight(&mut self) {
-        self.in_flight.clear();
-    }
 }
 
-impl<J, S> SegmentedLog<J, S>
+impl<J> SegmentedLog<J>
 where
-    S: Storage,
-    J: Debug + Journal<S>,
+    J: Debug + Journal,
 {
     pub const fn journal_mut(&mut self) -> &mut JournalState<J> {
         &mut self.journal
@@ -468,8 +459,7 @@ mod tests {
     use super::*;
     use crate::journal::{PartitionJournal, PartitionJournalMemStorage};
 
-    type TestLog =
-        SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>;
+    type TestLog = SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>;
 
     /// Push a sealed segment with a resident (index-filled) read handle and
     /// return a clone of that handle, standing in for an in-flight poll's clone.
@@ -607,6 +597,32 @@ mod tests {
         // awaits): must be a no-op, not a panic.
         log.touch_sealed_read_state(1);
         assert!(log.sealed_lru.is_empty());
+    }
+
+    #[test]
+    fn reset_read_state_orphans_the_handle_and_purges_its_lru_entry() {
+        let mut log = TestLog::default();
+        let handle = push_resident_sealed(&mut log, 0);
+        push_resident_sealed(&mut log, 5);
+        log.touch_sealed_read_state(0);
+        log.touch_sealed_read_state(1);
+
+        // Un-sealing slot 0 back into the active segment: its handle must not
+        // stay in the LRU, which could evict it while it is the active fd.
+        log.reset_read_state(0);
+
+        assert!(
+            !Rc::ptr_eq(&handle, &log.sealed_read_state()[0]),
+            "an in-flight poll's clone must not keep filling the live slot",
+        );
+        assert!(!handle.tracked.get());
+        assert!(!log.sealed_lru.contains(&0));
+        assert!(log.sealed_lru.contains(&5), "other slots are untouched");
+        assert!(log.sealed_read_state()[0].index.borrow().is_none());
+
+        // Out-of-range slot (the purge drain window empties the vec across
+        // awaits): a no-op, not a panic.
+        log.reset_read_state(2);
     }
 
     #[test]

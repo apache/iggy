@@ -30,16 +30,18 @@ __all__ = [
     "AutoCommitAfter",
     "AutoCommitWhen",
     "AutoLogin",
+    "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
     "ConsumerGroupMember",
+    "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
-    "GlobalPermissions",
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
     "MaxTopicSize",
+    "OptionSpec",
     "Partition",
     "Permissions",
     "PollingStrategy",
@@ -54,10 +56,10 @@ __all__ = [
     "Topic",
     "TopicDetails",
     "TopicPermissions",
+    "UserHeaders",
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
-    "UserHeaders",
 ]
 
 class AutoCommit:
@@ -288,6 +290,35 @@ class AutoLogin:
         """
     def __repr__(self) -> builtins.str: ...
 
+class Consumer:
+    r"""
+    The consumer polling the messages. It selects both the consumer kind and the
+    identifier the server keys the stored offset on.
+    """
+    @typing.final
+    class Single(Consumer):
+        r"""
+        A regular consumer, owning its offset on the polled partition.
+        """
+
+        __match_args__ = ("id",)
+        @property
+        def id(self) -> builtins.str | builtins.int: ...
+        def __new__(cls, id: builtins.str | builtins.int) -> Consumer.Single: ...
+
+    @typing.final
+    class Group(Consumer):
+        r"""
+        A member of the consumer group, sharing the group's offset.
+        """
+
+        __match_args__ = ("id",)
+        @property
+        def id(self) -> builtins.str | builtins.int: ...
+        def __new__(cls, id: builtins.str | builtins.int) -> Consumer.Group: ...
+
+    ...
+
 @typing.final
 class ConsumerGroup:
     @property
@@ -355,6 +386,105 @@ class ConsumerGroupMember:
     def partitions(self) -> builtins.list[builtins.int]:
         r"""
         Gets the collection of partitions the consumer group member is consuming.
+        """
+
+@typing.final
+class GlobalPermissions:
+    r"""
+    Global permissions, applied to all streams without specifying them one by one.
+    """
+    @property
+    def manage_servers(self) -> builtins.bool:
+        r"""
+        Whether managing servers is allowed; includes `read_servers`.
+        """
+    @property
+    def read_servers(self) -> builtins.bool:
+        r"""
+        Whether reading server info (stats, clients) is allowed.
+        """
+    @property
+    def manage_users(self) -> builtins.bool:
+        r"""
+        Whether managing users is allowed; includes `read_users`.
+        """
+    @property
+    def read_users(self) -> builtins.bool:
+        r"""
+        Whether reading user info is allowed.
+        """
+    @property
+    def manage_streams(self) -> builtins.bool:
+        r"""
+        Whether managing all streams is allowed; includes `read_streams` and
+        `manage_topics`.
+        """
+    @property
+    def read_streams(self) -> builtins.bool:
+        r"""
+        Whether reading all streams is allowed; includes `read_topics`.
+        """
+    @property
+    def manage_topics(self) -> builtins.bool:
+        r"""
+        Whether managing all topics is allowed; includes `read_topics` and
+        `send_messages`.
+        """
+    @property
+    def read_topics(self) -> builtins.bool:
+        r"""
+        Whether reading all topics and managing consumer groups is allowed;
+        includes `poll_messages`.
+        """
+    @property
+    def poll_messages(self) -> builtins.bool:
+        r"""
+        Whether polling messages from all streams and managing consumer
+        offsets is allowed.
+        """
+    @property
+    def send_messages(self) -> builtins.bool:
+        r"""
+        Whether sending messages to all streams is allowed.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        manage_servers: builtins.bool = False,
+        read_servers: builtins.bool = False,
+        manage_users: builtins.bool = False,
+        read_users: builtins.bool = False,
+        manage_streams: builtins.bool = False,
+        read_streams: builtins.bool = False,
+        manage_topics: builtins.bool = False,
+        read_topics: builtins.bool = False,
+        poll_messages: builtins.bool = False,
+        send_messages: builtins.bool = False,
+    ) -> GlobalPermissions:
+        r"""
+        Create global permissions. Every flag defaults to `False`.
+
+        The `includes` notes below are transitive: a flag also grants everything
+        its included flags grant. For example `manage_streams` includes
+        `manage_topics`, and through it `read_topics`, `poll_messages`, and
+        `send_messages`.
+
+        Args:
+            manage_servers: Allow managing servers; includes `read_servers`.
+            read_servers: Allow reading server info (stats, clients).
+            manage_users: Allow managing users; includes `read_users`.
+            read_users: Allow reading user info.
+            manage_streams: Allow managing all streams; includes `read_streams`
+                and `manage_topics`.
+            read_streams: Allow reading all streams; includes `read_topics`.
+            manage_topics: Allow managing all topics; includes `read_topics`
+                and `send_messages`.
+            read_topics: Allow reading all topics and managing consumer groups
+                (including create and delete); includes `poll_messages`.
+            poll_messages: Allow polling messages from all streams and managing
+                consumer offsets.
+            send_messages: Allow sending messages to all streams.
         """
 
 class HeaderKey:
@@ -708,105 +838,6 @@ class HeaderValue:
         def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
 
 @typing.final
-class GlobalPermissions:
-    r"""
-    Global permissions, applied to all streams without specifying them one by one.
-    """
-    @property
-    def manage_servers(self) -> builtins.bool:
-        r"""
-        Whether managing servers is allowed; includes `read_servers`.
-        """
-    @property
-    def read_servers(self) -> builtins.bool:
-        r"""
-        Whether reading server info (stats, clients) is allowed.
-        """
-    @property
-    def manage_users(self) -> builtins.bool:
-        r"""
-        Whether managing users is allowed; includes `read_users`.
-        """
-    @property
-    def read_users(self) -> builtins.bool:
-        r"""
-        Whether reading user info is allowed.
-        """
-    @property
-    def manage_streams(self) -> builtins.bool:
-        r"""
-        Whether managing all streams is allowed; includes `read_streams` and
-        `manage_topics`.
-        """
-    @property
-    def read_streams(self) -> builtins.bool:
-        r"""
-        Whether reading all streams is allowed; includes `read_topics`.
-        """
-    @property
-    def manage_topics(self) -> builtins.bool:
-        r"""
-        Whether managing all topics is allowed; includes `read_topics` and
-        `send_messages`.
-        """
-    @property
-    def read_topics(self) -> builtins.bool:
-        r"""
-        Whether reading all topics and managing consumer groups is allowed;
-        includes `poll_messages`.
-        """
-    @property
-    def poll_messages(self) -> builtins.bool:
-        r"""
-        Whether polling messages from all streams and managing consumer
-        offsets is allowed.
-        """
-    @property
-    def send_messages(self) -> builtins.bool:
-        r"""
-        Whether sending messages to all streams is allowed.
-        """
-    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
-    def __new__(
-        cls,
-        *,
-        manage_servers: builtins.bool = False,
-        read_servers: builtins.bool = False,
-        manage_users: builtins.bool = False,
-        read_users: builtins.bool = False,
-        manage_streams: builtins.bool = False,
-        read_streams: builtins.bool = False,
-        manage_topics: builtins.bool = False,
-        read_topics: builtins.bool = False,
-        poll_messages: builtins.bool = False,
-        send_messages: builtins.bool = False,
-    ) -> GlobalPermissions:
-        r"""
-        Create global permissions. Every flag defaults to `False`.
-
-        The `includes` notes below are transitive: a flag also grants everything
-        its included flags grant. For example `manage_streams` includes
-        `manage_topics`, and through it `read_topics`, `poll_messages`, and
-        `send_messages`.
-
-        Args:
-            manage_servers: Allow managing servers; includes `read_servers`.
-            read_servers: Allow reading server info (stats, clients).
-            manage_users: Allow managing users; includes `read_users`.
-            read_users: Allow reading user info.
-            manage_streams: Allow managing all streams; includes `read_streams`
-                and `manage_topics`.
-            read_streams: Allow reading all streams; includes `read_topics`.
-            manage_topics: Allow managing all topics; includes `read_topics`
-                and `send_messages`.
-            read_topics: Allow reading all topics and managing consumer groups
-                (including create and delete); includes `poll_messages`.
-            poll_messages: Allow polling messages from all streams and managing
-                consumer offsets.
-            send_messages: Allow sending messages to all streams.
-        """
-
-@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
@@ -840,6 +871,27 @@ class IggyClient:
         r"""
         Sends a ping request to the server to check connectivity.
         Raises `RuntimeError` if the connection fails.
+        """
+    def describe_options(
+        self, scope: builtins.str
+    ) -> collections.abc.Awaitable[list[OptionSpec]]:
+        r"""
+        Describe the option catalog for a resource scope.
+
+        This is the discovery surface for the `options` argument on
+        `create_topic`/`update_topic`: a key outside the catalog is refused at
+        create, and the binary transports carry only the error code back.
+
+        Args:
+            scope: One of `"topic"`, `"stream"`, `"user"`.
+
+        Returns:
+            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+            with no keys yet.
+
+        Raises:
+            ValueError: If the scope name is not one of the three above.
+            RuntimeError: If the request fails.
         """
     def login_user(
         self, username: builtins.str, password: builtins.str
@@ -1009,9 +1061,14 @@ class IggyClient:
         name: builtins.str,
         partitions_count: builtins.int,
         compression_algorithm: builtins.str | None = None,
-        replication_factor: builtins.int | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
+        segment_size: builtins.int | None = None,
+        enforce_fsync: builtins.bool | None = None,
+        messages_required_to_save: builtins.int | None = None,
+        size_of_messages_required_to_save: builtins.int | None = None,
+        preallocate_segments: builtins.bool | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
@@ -1021,9 +1078,18 @@ class IggyClient:
             name: Topic name as `str`.
             partitions_count: Number of partitions as `int`.
             compression_algorithm: Compression algorithm as `str | None`.
-            replication_factor: Replication factor as `int | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            segment_size: Per-topic segment size in bytes as `int | None`.
+            enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+            messages_required_to_save: Message-count flush threshold as `int | None`.
+            size_of_messages_required_to_save: Byte flush threshold as `int | None`.
+            preallocate_segments: Reserve segment bytes on open as `bool | None`.
+            options: Additional option keys as `dict[str, str] | None`, sent
+                verbatim so a newer server key can be set from this build.
+
+        Every option left as `None` resolves against the server default at
+        admission.
 
         Returns:
             An awaitable that resolves to `None` when the topic is created.
@@ -1063,24 +1129,27 @@ class IggyClient:
         topic_id: builtins.str | builtins.int,
         name: builtins.str,
         compression_algorithm: builtins.str | None = None,
-        replication_factor: builtins.int | None = None,
         message_expiry: IggyExpiry | None = None,
         max_topic_size: MaxTopicSize | None = None,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
 
-        This is a full replacement: any optional parameter left unset is reset to
-        its server default rather than preserved.
+        A patch, not a replacement: every setting rides the options block, so a
+        field left unset keeps the topic's current value rather than resetting
+        it to a server default.
 
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
             name: New topic name as `str`.
             compression_algorithm: Compression algorithm as `str | None`.
-            replication_factor: Replication factor as `int | None`.
             message_expiry: Message expiry as `IggyExpiry | None`.
             max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+            options: Additional option keys as `dict[str, str] | None`, sent
+                verbatim so an updatable server key can be set from this build.
+                A create-only key is refused by name.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
@@ -1276,13 +1345,17 @@ class IggyClient:
         self,
         stream: builtins.str | builtins.int,
         topic: builtins.str | builtins.int,
-        partition_id: builtins.int,
+        *,
+        consumer: Consumer,
         polling_strategy: PollingStrategy,
         count: builtins.int,
         auto_commit: builtins.bool,
+        partition_id: builtins.int | None = None,
     ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
-        Polls for messages from the specified topic and partition.
+        Polls for messages from the specified topic on behalf of the given consumer.
+        Omitting `partition_id` reads partition 0 for a regular consumer, and
+        polls the member's assigned partitions for a consumer group.
         Returns a list of received messages or a RuntimeError on failure.
         """
     def consumer_group(
@@ -1339,11 +1412,15 @@ class IggyConsumer:
         self, partition_id: builtins.int
     ) -> builtins.int | None:
         r"""
-        Get the last consumed offset or `None` if no offset has been consumed yet.
+        Get the last consumed offset for the given partition, or `None` while that partition
+        is untracked. Polling starts tracking a partition at `0`, so `0` also means
+        "seen, nothing consumed yet".
         """
     def get_last_stored_offset(self, partition_id: builtins.int) -> builtins.int | None:
         r"""
-        Get the last stored offset or `None` if no offset has been stored yet.
+        Get the last stored offset for the given partition, or `None` while that partition is
+        untracked. Polling starts tracking a partition at `0`, so `0` also means
+        "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
         """
     def name(self) -> builtins.str:
         r"""
@@ -1355,11 +1432,11 @@ class IggyConsumer:
         """
     def stream(self) -> builtins.str | builtins.int:
         r"""
-        Gets the name of the stream this consumer group is configured for.
+        Gets the identifier of the stream this consumer group is configured for.
         """
     def topic(self) -> builtins.str | builtins.int:
         r"""
-        Gets the name of the topic this consumer group is configured for.
+        Gets the identifier of the topic this consumer group is configured for.
         """
     def store_offset(
         self, offset: builtins.int, partition_id: builtins.int | None
@@ -1493,6 +1570,41 @@ class MaxTopicSize:
         def __getitem__(self, key: builtins.int, /) -> typing.Any: ...
 
     ...
+
+@typing.final
+class OptionSpec:
+    r"""
+    One entry of a resource's option catalog, as served by `describe_options`.
+    """
+    @property
+    def key(self) -> builtins.str:
+        r"""
+        The option key a create command accepts.
+        """
+    @property
+    def kind(self) -> builtins.str:
+        r"""
+        Name of this key's canonical kind: what the server encodes its default
+        under, and what a value set by `create_topic` is stored as whatever kind
+        it was sent in, since create admission re-encodes the block from its own
+        parse. `update_topic` stores what the client sent verbatim and is the
+        exception.
+        """
+    @property
+    def default_value(self) -> HeaderValue | None:
+        r"""
+        The key's default as a `HeaderValue`, or `None` when the key has no
+        default.
+
+        The same type message user headers use, so the usual accessors read it;
+        options ride that codec.
+        """
+    @property
+    def description(self) -> builtins.str:
+        r"""
+        What the option does, including the bounds its value is checked against.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class Partition:
@@ -1640,6 +1752,10 @@ class ReceiveMessage:
     def user_headers(self) -> UserHeaders | None:
         r"""
         Retrieves user headers attached to the received message.
+
+        Returns `None` when no headers are present or when the headers
+        on the wire are structurally malformed (those errors are logged
+        internally). Only known semantic decode errors raise `ValueError`.
         """
 
 @typing.final
@@ -1904,19 +2020,25 @@ class TcpReconnectionConfig:
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
-            max_retries: Attempts before giving up, or `None` for unlimited.
-                Defaults to unlimited, which means a call awaited while the server
-                is down never returns: `connect()`, `send_messages()` and
+            max_retries: Passes over the known endpoints after the first, or
+                `None` for unlimited; `0` still makes that first pass. One pass
+                tries the endpoint the client is on, the address it was
+                configured with, and every node the roster named, so this counts
+                passes rather than dials. Defaults
+                to unlimited, which means a call awaited while the server is
+                down never returns: `connect()`, `send_messages()` and
                 `poll_messages()` all wait inside the retry loop. Set a finite
                 number for request/reply style usage, so a call fails instead.
-            interval: Delay between attempts. Defaults to 1 second.
-            reestablish_after: Cooldown before reconnecting after a previously
-                successful connection. Defaults to 5 seconds.
+            interval: Delay between passes. Defaults to 1 second. The first pass
+                runs at once when more than one endpoint is known.
+            reestablish_after: Cooldown before redialing the endpoint of the last
+                successful connection, measured from when it was established, so
+                a session that outlived the interval is redialed at once. Owed to
+                that endpoint alone. Defaults to 5 seconds.
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
-                range of an unsigned 32-bit integer, or if `interval` is zero while
-                reconnection is enabled and `max_retries` is unlimited.
+                range of an unsigned 32-bit integer, or if `interval` is zero.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -1968,9 +2090,21 @@ class Topic:
         The maximum size of the topic.
         """
     @property
-    def replication_factor(self) -> builtins.int:
+    def options(self) -> UserHeaders:
         r"""
-        Replication factor for the topic.
+        Options the creating client set explicitly.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec; call `to_scalar_dict()` for the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options admission resolved for the keys the client did not send.
+
+        Same shape as `options`. These would have resolved differently
+        under another server configuration.
         """
 
 @typing.final
@@ -2021,9 +2155,21 @@ class TopicDetails:
         The maximum size of the topic.
         """
     @property
-    def replication_factor(self) -> builtins.int:
+    def options(self) -> UserHeaders:
         r"""
-        Replication factor for the topic.
+        Options the creating client set explicitly.
+
+        The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
+        returns, since options ride that codec; call `to_scalar_dict()` for the
+        plain-scalar form.
+        """
+    @property
+    def derived_options(self) -> UserHeaders:
+        r"""
+        Options admission resolved for the keys the client did not send.
+
+        Same shape as `options`. These would have resolved differently
+        under another server configuration.
         """
     @property
     def partitions(self) -> builtins.list[Partition]:
@@ -2091,6 +2237,36 @@ class TopicPermissions:
         """
 
 @typing.final
+class UserHeaders(dict):
+    r"""
+    User headers dictionary returned by `ReceiveMessage.user_headers`.
+
+    This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
+    operations work) that additionally exposes `to_scalar_dict` for the convenient
+    scalar form.
+    """
+    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
+        r"""
+        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
+
+        Accepts a dict whose keys and values can each independently be
+        `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
+        int | float`). The inherited `dict` initializer copies the provided
+        mapping.
+        """
+    def __setitem__(self, key: typing.Any, value: typing.Any) -> None: ...
+    def to_scalar_dict(
+        self,
+    ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
+        r"""
+        Converts these headers into the convenient plain dictionary form.
+
+        Returns an error if two distinct typed keys map to the same plain
+        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
+        become `int(1)`), or if a stored field cannot be decoded.
+        """
+
+@typing.final
 class UserInfo:
     @property
     def id(self) -> builtins.int:
@@ -2155,31 +2331,3 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
-
-class UserHeaders(dict):
-    r"""
-    User headers dictionary returned by `ReceiveMessage.user_headers`.
-
-    This is a regular `dict[HeaderKey, HeaderValue]` (so all mapping
-    operations work) that additionally exposes `to_scalar_dict` for the convenient
-    scalar form.
-    """
-    def __new__(cls, mapping: dict | None = None) -> UserHeaders:
-        r"""
-        Wraps a mapping so its entries gain the `to_scalar_dict` helper.
-
-        Accepts a dict whose keys and values can each independently be
-        `HeaderKey`/`HeaderValue` or a plain scalar (`str | bytes | bool |
-        int | float`). The inherited `dict` initializer copies the provided
-        mapping.
-        """
-    def to_scalar_dict(
-        self,
-    ) -> dict[str | bytes | bool | int | float, str | bytes | bool | int | float]:
-        r"""
-        Converts these headers into the convenient plain dictionary form.
-
-        Returns an error if two distinct typed keys map to the same plain
-        Python scalar (e.g., `UnsignedInt8(1)` and `UnsignedInt16(1)` both
-        become `int(1)`), or if a stored field cannot be decoded.
-        """

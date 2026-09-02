@@ -102,11 +102,7 @@ where
 {
     // In-flight dedup: a live prepare from this client absorbs the retry.
     // Pump delivers the reply at commit.
-    if consensus
-        .pipeline()
-        .borrow()
-        .has_message_from_client(client_id)
-    {
+    if consensus.pipeline_has_message_from_client(client_id) {
         tracing::debug!(
             client_id,
             request,
@@ -262,11 +258,7 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     // In-flight dedup.
-    if consensus
-        .pipeline()
-        .borrow()
-        .has_message_from_client(client_id)
-    {
+    if consensus.pipeline_has_message_from_client(client_id) {
         tracing::debug!(client_id, "register_preflight: in-flight prepare, drop");
         return false;
     }
@@ -476,10 +468,10 @@ pub async fn send_eviction_to_client<B, P>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client_table::REGISTER_REQUEST_ID;
+    use crate::client_table::{REGISTER_REQUEST_ID, REPLY_RING_RETENTION_BYTES};
     use crate::{CLIENTS_TABLE_MAX, LocalPipeline};
-    use iggy_binary_protocol::{Command2, Operation, ReplyHeader};
-    use message_bus::SendError;
+    use iggy_binary_protocol::{Command, Operation, ReplyHeader};
+    use message_bus::{BusMessage, SendError};
 
     /// Acting user for register fixtures; these tests exercise preflight /
     /// replay, not user resolution, so the exact value is immaterial.
@@ -510,9 +502,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            data: Frozen<MESSAGE_ALIGN>,
+            data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
-            self.client_sends.borrow_mut().push((client_id, data));
+            self.client_sends
+                .borrow_mut()
+                .push((client_id, data.into().into_contiguous()));
             Ok(())
         }
 
@@ -546,7 +540,9 @@ mod tests {
             .commit_register(client_id, ACTING_USER_ID, initial_reply);
         // Progress past registration; a rebind must dispatch regardless.
         let app_reply = synthesize_send_messages_reply(&consensus, client_id, 1, 18);
-        client_table.borrow_mut().commit_reply(client_id, app_reply);
+        client_table
+            .borrow_mut()
+            .commit_reply(client_id, ACTING_USER_ID, app_reply);
 
         assert!(
             register_preflight(&consensus, &client_table, client_id, ACTING_USER_ID),
@@ -587,7 +583,7 @@ mod tests {
         let header =
             bytemuck::checked::try_from_bytes::<EvictionHeader>(&frozen.as_slice()[..HEADER_SIZE])
                 .expect("valid EvictionHeader");
-        assert_eq!(header.command, Command2::Eviction);
+        assert_eq!(header.command, Command::Eviction);
         assert_eq!(header.reason, EvictionReason::NoSession);
         assert_eq!(header.client, client_id);
     }
@@ -711,7 +707,9 @@ mod tests {
             .commit_register(client_id, ACTING_USER_ID, initial_reply);
         for (request, commit) in [(3u64, 98u64), (5, 100)] {
             let reply = synthesize_send_messages_reply(&consensus, client_id, request, commit);
-            client_table.borrow_mut().commit_reply(client_id, reply);
+            client_table
+                .borrow_mut()
+                .commit_reply(client_id, ACTING_USER_ID, reply);
         }
 
         let result = futures::executor::block_on(apply_preflight_consensus_plane(
@@ -744,11 +742,15 @@ mod tests {
         client_table
             .borrow_mut()
             .commit_register(client_id, ACTING_USER_ID, initial_reply);
-        // Ring capacity is 5, so request 1's reply is displaced once 6 commits.
-        for request in 1..=6u64 {
+        // Enough replies to exhaust the retention budget, so request 1's is
+        // certain to have been dropped.
+        let requests = (REPLY_RING_RETENTION_BYTES / size_of::<ReplyHeader>() + 8) as u64;
+        for request in 1..=requests {
             let reply =
                 synthesize_send_messages_reply(&consensus, client_id, request, 100 + request);
-            client_table.borrow_mut().commit_reply(client_id, reply);
+            client_table
+                .borrow_mut()
+                .commit_reply(client_id, ACTING_USER_ID, reply);
         }
 
         let outcome = request_preflight(&consensus, &client_table, client_id, epoch, 1, 0);
@@ -813,7 +815,9 @@ mod tests {
             .borrow_mut()
             .commit_register(client_id, ACTING_USER_ID, initial_reply);
         let advanced = synthesize_send_messages_reply(&consensus, client_id, 2, 99);
-        client_table.borrow_mut().commit_reply(client_id, advanced);
+        client_table
+            .borrow_mut()
+            .commit_reply(client_id, ACTING_USER_ID, advanced);
 
         let outcome = request_preflight(&consensus, &client_table, client_id, epoch, 9, 0);
         assert!(
@@ -916,7 +920,7 @@ mod tests {
             cluster: consensus.cluster(),
             size: header_size as u32,
             view: consensus.view(),
-            command: Command2::Reply,
+            command: Command::Reply,
             replica: consensus.replica(),
             client: client_id,
             op: register_commit,
@@ -950,7 +954,7 @@ mod tests {
             cluster: consensus.cluster(),
             size: header_size as u32,
             view: consensus.view(),
-            command: Command2::Reply,
+            command: Command::Reply,
             replica: consensus.replica(),
             client: client_id,
             op: commit,

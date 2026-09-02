@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::write_batch_frozen;
 use compio::fs::{File, OpenOptions};
 use err_trail::ErrContext;
-use iggy_common::{IggyByteSize, IggyError, IggyMessagesBatch};
+use iggy_common::IggyError;
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
 };
-use tracing::trace;
+use tracing::{error, trace};
 
 /// A dedicated struct for writing to the messages file.
 #[derive(Debug)]
@@ -31,7 +30,6 @@ pub struct MessagesWriter {
     file_path: String,
     file: File,
     messages_size_bytes: Rc<AtomicU64>,
-    fsync: bool,
 }
 
 // Safety: We are guaranteeing that MessagesWriter will never be used from multiple threads
@@ -46,7 +44,6 @@ impl MessagesWriter {
     pub async fn new(
         file_path: &str,
         messages_size_bytes: Rc<AtomicU64>,
-        fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let mut opts = OpenOptions::new();
@@ -65,10 +62,6 @@ impl MessagesWriter {
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
-            let _ = file.sync_all().await.error(|e: &std::io::Error| {
-                format!("Failed to fsync messages file after creation: {file_path}, error: {e}")
-            });
-
             let actual_messages_size = file
                 .metadata()
                 .await
@@ -78,7 +71,20 @@ impl MessagesWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            messages_size_bytes.store(actual_messages_size, Ordering::Relaxed);
+            // The caller seeds the size counter from recovered, validated bounds
+            // and recovery truncates the file to them. A divergent on-disk length
+            // means appending would resurrect or shear bytes those bounds
+            // exclude, so refuse the open.
+            let expected_messages_size = messages_size_bytes.load(Ordering::Relaxed);
+            if actual_messages_size != expected_messages_size {
+                error!(
+                    "Messages file size on disk: {actual_messages_size} does not match expected size: {expected_messages_size}, file: {file_path}"
+                );
+                return Err(IggyError::SegmentSizeMismatchAtOpen(
+                    actual_messages_size,
+                    expected_messages_size,
+                ));
+            }
         }
 
         trace!(
@@ -90,38 +96,9 @@ impl MessagesWriter {
             file_path: file_path.to_string(),
             file,
             messages_size_bytes,
-            fsync,
         })
     }
 
-    /// Append frozen (immutable) batches to the messages file.
-    /// The caller retains the batches (for use in in-flight buffer) while disk I/O proceeds.
-    pub async fn save_frozen_batches(
-        &self,
-        batches: &[IggyMessagesBatch],
-    ) -> Result<IggyByteSize, IggyError> {
-        let messages_size: u64 = batches.iter().map(|b| b.size() as u64).sum();
-
-        let position = self.messages_size_bytes.load(Ordering::Relaxed);
-        let file = &self.file;
-        write_batch_frozen(file, position, batches)
-            .await
-            .error(|e: &IggyError| {
-                format!(
-                    "Failed to write frozen batch to messages file: {}. {e}",
-                    self.file_path
-                )
-            })?;
-
-        if self.fsync {
-            let _ = self.fsync().await;
-        }
-
-        self.messages_size_bytes
-            .fetch_add(messages_size, Ordering::Release);
-
-        Ok(IggyByteSize::from(messages_size))
-    }
     pub fn path(&self) -> String {
         self.file_path.clone()
     }

@@ -21,8 +21,10 @@ namespace Apache.Iggy.Vsr;
 
 /// <summary>
 ///     The 256-byte consensus header, read and written by wire offset. Offsets mirror
-///     <c>core/binary_protocol/src/consensus/header.rs</c>. Checksums stay zero: the server does not verify
-///     them for client frames.
+///     <c>core/binary_protocol/src/consensus/header.rs</c>. Checksums stay zero: the frame and body checksums
+///     are not read on the client request path, and <c>request_checksum</c> treats zero as unstamped, which
+///     opts out of the server's payload comparison. Stamping it is optional -- the Rust SDK does so for
+///     deduped operations, this SDK does not yet.
 /// </summary>
 internal static class VsrHeader
 {
@@ -81,7 +83,7 @@ internal static class VsrHeader
         var totalSize = HEADER_SIZE + payload.Length;
 
         BinaryPrimitives.WriteUInt32LittleEndian(header[SIZE_OFFSET..], (uint)totalSize);
-        header[COMMAND_OFFSET] = (byte)Command2.Request;
+        header[COMMAND_OFFSET] = (byte)Command.Request;
         WriteUInt128(header[REQUEST_CLIENT_OFFSET..], frame.ClientId);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_TIMESTAMP_OFFSET..], 0);
         BinaryPrimitives.WriteUInt64LittleEndian(header[REQUEST_ID_OFFSET..], frame.RequestId);
@@ -96,13 +98,13 @@ internal static class VsrHeader
         return totalSize;
     }
 
-    internal static Command2 PeekCommand(ReadOnlySpan<byte> header)
+    internal static Command PeekCommand(ReadOnlySpan<byte> header)
     {
         return header[COMMAND_OFFSET] switch
         {
-            (byte)Command2.Reply => Command2.Reply,
-            (byte)Command2.Eviction => Command2.Eviction,
-            _ => Command2.Reserved
+            (byte)Command.Reply => Command.Reply,
+            (byte)Command.Eviction => Command.Eviction,
+            _ => Command.Reserved
         };
     }
 

@@ -23,7 +23,7 @@ mod common;
 
 use common::{header_only, install_clients_locally, loopback};
 use compio::net::TcpStream;
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use message_bus::client_listener::RequestHandler;
 use message_bus::client_listener::tcp::{bind, run};
 use message_bus::framing;
@@ -38,10 +38,10 @@ async fn request_reply_round_trip() {
     // Handler echoes a Reply back via send_to_client.
     let bus_for_handler = bus.clone();
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
-        assert_eq!(msg.header().command, Command2::Request);
+        assert_eq!(msg.header().command, Command::Request);
         let bus = bus_for_handler.clone();
         compio::runtime::spawn(async move {
-            let reply = header_only(Command2::Reply, 42, 0);
+            let reply = header_only(Command::Reply, 42, 0);
             bus.send_to_client(client_id, reply.into_frozen())
                 .await
                 .expect("send_to_client should succeed");
@@ -49,7 +49,7 @@ async fn request_reply_round_trip() {
         .detach();
     });
 
-    let (listener, addr) = bind(loopback()).await.expect("bind");
+    let (listener, addr) = bind(loopback()).expect("bind");
     let token = bus.token();
     let accept_delegate = install_clients_locally(bus.clone(), on_request);
     let accept_handle = compio::runtime::spawn(async move {
@@ -60,7 +60,7 @@ async fn request_reply_round_trip() {
     // Dial as a raw TCP client.
     let mut client = TcpStream::connect(addr).await.expect("connect");
 
-    let request = header_only(Command2::Request, 42, 0);
+    let request = header_only(Command::Request, 42, 0);
     framing::write_message(&mut client, request)
         .await
         .expect("client write");
@@ -68,7 +68,7 @@ async fn request_reply_round_trip() {
     let reply = framing::read_message(&mut client, framing::MAX_MESSAGE_SIZE)
         .await
         .expect("client read");
-    assert_eq!(reply.header().command, Command2::Reply);
+    assert_eq!(reply.header().command, Command::Reply);
     assert_eq!(reply.header().cluster, 42);
 
     let outcome = bus.shutdown(Duration::from_secs(2)).await;
@@ -88,7 +88,7 @@ async fn unexpected_command_is_ignored() {
         let _ = tx.try_send(());
     });
 
-    let (listener, addr) = bind(loopback()).await.unwrap();
+    let (listener, addr) = bind(loopback()).unwrap();
     let token = bus.token();
     let accept_delegate = install_clients_locally(bus.clone(), on_request);
     let accept_handle = compio::runtime::spawn(async move {
@@ -97,7 +97,7 @@ async fn unexpected_command_is_ignored() {
     bus.track_background(accept_handle);
 
     let mut client = TcpStream::connect(addr).await.unwrap();
-    let bogus = header_only(Command2::Ping, 0, 0);
+    let bogus = header_only(Command::Ping, 0, 0);
     framing::write_message(&mut client, bogus).await.unwrap();
 
     // Give the read loop a chance to observe + ignore it.

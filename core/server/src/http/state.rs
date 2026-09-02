@@ -37,17 +37,17 @@ use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::bootstrap::ServerShard;
 use crate::cluster_meta::ClusterRoster;
-use crate::dispatch::submit_register_on_owner;
+use crate::dispatch::session_ops::submit_register_on_owner;
 use crate::http::error::{AuthError, ReadError, primary_redirect_location};
-use crate::http::forward::ForwardState;
+
 use crate::http::jwt::JwtManager;
 use crate::http::metrics::HttpMetrics;
 use crate::http::session::{
     BarrierEntry, FIRST_REQUEST_ID, FRESH_ENTRY_WATERMARK, HttpSession, RegistrationBarrier,
     forget_if_same, live_entry, sweep_expired,
 };
+use crate::shell::ServerShard;
 
 /// Response header carrying the current VSR view number. Stamped by
 /// `insert_view_header` on success and redirect responses only (never on
@@ -62,6 +62,25 @@ pub(in crate::http) const VIEW_HEADER: HeaderName = HeaderName::from_static("igg
 /// because the listener and every handler run on shard 0's compio thread - the
 /// same thread that builds this state. Never touch it off that thread.
 pub(in crate::http) type HttpState = SendWrapper<Rc<HttpInner>>;
+
+/// Per-node forwarding context hung off `HttpInner`: the outbound client
+/// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
+/// request-body buffer bound, and the in-flight budget. Built by
+/// `http::forward::build_forward_state`; lives here so the state hub never
+/// imports the forwarding middleware.
+pub(in crate::http) struct ForwardState {
+    /// False when no cluster-wide bearer key material exists (no configured
+    /// JWT secret, no cluster PSK): a forwarded bearer would 401 on the
+    /// primary, so the middleware passes through and followers answer with
+    /// the transient 503 instead.
+    pub(in crate::http) active: bool,
+    pub(in crate::http) client: cyper::Client,
+    /// Also read by the 307 redirect builder: the primary is assumed to serve
+    /// the same scheme as this node (uniform cluster HTTP config).
+    pub(in crate::http) scheme: &'static str,
+    pub(in crate::http) body_limit: usize,
+    pub(in crate::http) in_flight: Cell<u32>,
+}
 
 /// Shared shard-0 HTTP state.
 ///

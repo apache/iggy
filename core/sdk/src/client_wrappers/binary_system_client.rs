@@ -19,8 +19,8 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use async_trait::async_trait;
 use iggy_common::SystemClient;
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot, SnapshotCompression, Stats,
-    SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec, OptionsScope,
+    Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
 };
 
 #[async_trait]
@@ -65,6 +65,16 @@ impl SystemClient for ClientWrapper {
         }
     }
 
+    async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
+        match self {
+            ClientWrapper::Iggy(client) => client.describe_options(scope).await,
+            ClientWrapper::Http(client) => client.describe_options(scope).await,
+            ClientWrapper::Tcp(client) => client.describe_options(scope).await,
+            ClientWrapper::Quic(client) => client.describe_options(scope).await,
+            ClientWrapper::WebSocket(client) => client.describe_options(scope).await,
+        }
+    }
+
     async fn ping(&self) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.ping().await,
@@ -75,7 +85,7 @@ impl SystemClient for ClientWrapper {
         }
     }
 
-    async fn heartbeat_interval(&self) -> IggyDuration {
+    async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         match self {
             ClientWrapper::Iggy(client) => client.heartbeat_interval().await,
             ClientWrapper::Http(client) => client.heartbeat_interval().await,

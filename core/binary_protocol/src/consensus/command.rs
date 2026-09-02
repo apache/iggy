@@ -21,7 +21,7 @@ use enumset::EnumSetType;
 /// VSR message type discriminant.
 #[derive(Default, Debug, EnumSetType)]
 #[repr(u8)]
-pub enum Command2 {
+pub enum Command {
     #[default]
     Reserved = 0,
 
@@ -85,11 +85,11 @@ pub enum Command2 {
     ForwardLogoutResult = 29,
 }
 
-// SAFETY: Command2 is #[repr(u8)] with no padding bytes.
-unsafe impl NoUninit for Command2 {}
+// SAFETY: Command is #[repr(u8)] with no padding bytes.
+unsafe impl NoUninit for Command {}
 
-// SAFETY: Command2 is #[repr(u8)]; is_valid_bit_pattern matches all defined discriminants.
-unsafe impl CheckedBitPattern for Command2 {
+// SAFETY: Command is #[repr(u8)]; is_valid_bit_pattern matches all defined discriminants.
+unsafe impl CheckedBitPattern for Command {
     type Bits = u8;
 
     fn is_valid_bit_pattern(bits: &u8) -> bool {

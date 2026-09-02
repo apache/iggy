@@ -22,7 +22,7 @@
 //! targeted, but the server still classifies it on a race.
 
 use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -43,7 +43,7 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::StreamNotFound];
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
@@ -58,6 +58,9 @@ pub fn sample(
         }),
         Outcome::NameAlreadyExists => {
             unreachable!("update_stream does not target NameAlreadyExists")
+        }
+        Outcome::InvalidOptionValue => {
+            unreachable!("the simulator only sends an empty update options block")
         }
     }
 }

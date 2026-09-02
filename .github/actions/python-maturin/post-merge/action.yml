@@ -52,6 +52,21 @@ runs:
         echo "✅ Version format valid: $VERSION"
       shell: bash
 
+    - name: Validate package metadata
+      run: |
+        PACKAGE=$(python3 -c 'import tomllib; print(tomllib.load(open("foreign/python/pyproject.toml", "rb"))["project"]["name"])')
+        VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("foreign/python/pyproject.toml", "rb"))["project"]["version"])')
+
+        if [ "$PACKAGE" != "apache-iggy" ]; then
+          echo "❌ pyproject.toml project name must be apache-iggy, got: $PACKAGE"
+          exit 1
+        fi
+        if [ "$VERSION" != "${{ inputs.version }}" ]; then
+          echo "❌ pyproject.toml version ($VERSION) does not match ${{ inputs.version }}"
+          exit 1
+        fi
+      shell: bash
+
     - name: Download pre-built wheels
       uses: actions/download-artifact@v8
       with:
@@ -150,14 +165,3 @@ runs:
         echo ""
         echo "View on PyPI: https://pypi.org/project/apache-iggy/$VERSION/"
       shell: bash
-
-    - name: Install uv
-      if: inputs.dry_run == 'false'
-      uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
-
-    - name: Publish to PyPI
-      if: inputs.dry_run == 'false'
-      run: uv publish --check-url https://pypi.org/simple/ --token "$PYPI_API_TOKEN" ${{ inputs.wheels_path }}/*
-      shell: bash
-      env:
-        PYPI_API_TOKEN: ${{ env.PYPI_API_TOKEN }}

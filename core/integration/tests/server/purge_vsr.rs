@@ -30,23 +30,16 @@ use integration::iggy_harness;
 // route polls to whichever node leads after the restart. Default fsync
 // config on purpose: the restart is graceful, so segment bytes survive
 // without fsync, and `purge.gen` is unconditionally synced by the purge.
-#[iggy_harness(
-    cluster_nodes = 1,
-    server(partition.messages_required_to_save = "1")
-)]
+// The flush thresholds each scenario needs are topic creation options, set
+// inside the scenario itself.
+#[iggy_harness(cluster_nodes = 1)]
 async fn given_post_purge_messages_when_server_restarts_should_retain_them(
     harness: &mut TestHarness,
 ) {
     purge_delete_scenario::run_purge_survives_restart(harness).await;
 }
 
-// The huge threshold keeps every batch journal-resident: nothing is ever
-// flushed before the purge, so the purged bytes exist ONLY as consensus
-// history the shutdown flush re-walks.
-#[iggy_harness(
-    cluster_nodes = 1,
-    server(partition.messages_required_to_save = "10000")
-)]
+#[iggy_harness(cluster_nodes = 1)]
 async fn given_journal_resident_messages_when_purged_should_not_resurface(
     harness: &mut TestHarness,
 ) {
@@ -58,8 +51,7 @@ async fn given_journal_resident_messages_when_purged_should_not_resurface(
 // read has to happen in the replicated apply. A retry loop here would pass
 // against the pre-apply behavior too.
 #[iggy_harness(
-    test_client_transport = [Tcp],
-    server(tcp.socket.override_defaults = true, tcp.socket.nodelay = true)
+    test_client_transport = [Tcp]
 )]
 async fn given_purged_topic_when_getting_topic_immediately_should_report_zero_stats(
     harness: &TestHarness,
@@ -75,11 +67,11 @@ async fn given_purged_topic_when_getting_topic_immediately_should_report_zero_st
         .create_topic(
             &stream_id,
             TOPIC,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .expect("create topic");

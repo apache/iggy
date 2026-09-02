@@ -337,6 +337,14 @@ impl<B: BinaryClient> MessageClient for B {
         let wire_stream_id = identifier_to_wire(stream_id)?;
         let wire_topic_id = identifier_to_wire(topic_id)?;
         let wire_partitioning = partitioning_to_wire(partitioning)?;
+        // The producer owns message ids now that batches ride the wire
+        // verbatim: a zero id is minted here, before the frame checksum
+        // covers it.
+        for message in messages.iter_mut() {
+            if message.header.id == 0 {
+                message.header.id = crate::utils::random_id::get_uuid();
+            }
+        }
         let raw_messages: Vec<RawMessage<'_>> = messages
             .iter()
             .map(|m| RawMessage {
@@ -359,7 +367,13 @@ impl<B: BinaryClient> MessageClient for B {
             &wire_topic_id,
             &wire_partitioning,
             &raw_messages,
-        );
+        )
+        .map_err(|error| match error {
+            iggy_binary_protocol::WireError::InvalidMessageTimestampDelta(delta) => {
+                IggyError::InvalidMessageTimestampDelta(delta)
+            }
+            _ => IggyError::InvalidCommand,
+        })?;
         let response = self
             .send_raw_with_response(SEND_MESSAGES_CODE, buf.freeze())
             .await?;

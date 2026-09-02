@@ -18,20 +18,21 @@
 use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::clients_from_wire;
 use crate::{
-    BinaryClient, ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot,
-    SnapshotCompression, Stats, SystemClient, SystemSnapshotType,
+    BinaryClient, ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec,
+    OptionsScope, Snapshot, SnapshotCompression, Stats, SystemClient, SystemSnapshotType,
 };
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::{
-    GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE,
-    PING_CODE,
+    DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_ME_CODE, GET_SNAPSHOT_FILE_CODE,
+    GET_STATS_CODE, PING_CODE,
 };
 use iggy_binary_protocol::requests::system::{
-    GetClientRequest, GetClientsRequest, GetMeRequest, GetSnapshotRequest, GetStatsRequest,
-    PingRequest,
+    DescribeOptionsRequest, GetClientRequest, GetClientsRequest, GetMeRequest, GetSnapshotRequest,
+    GetStatsRequest, PingRequest,
 };
 use iggy_binary_protocol::responses::clients::get_client::ClientDetailsResponse;
 use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
+use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
 
 #[async_trait::async_trait]
@@ -42,6 +43,21 @@ impl<B: BinaryClient> SystemClient for B {
             .await?;
         let wire_resp = super::decode_response::<StatsResponse>(&response)?;
         Ok(Stats::from(wire_resp))
+    }
+
+    async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
+        fail_if_not_authenticated(self).await?;
+        let response = self
+            .send_raw_with_response(
+                DESCRIBE_OPTIONS_CODE,
+                DescribeOptionsRequest {
+                    scope: scope.as_code(),
+                }
+                .to_bytes(),
+            )
+            .await?;
+        let wire_resp = super::decode_response::<DescribeOptionsResponse>(&response)?;
+        crate::wire_conversions::option_specs_from_wire(wire_resp)
     }
 
     async fn get_me(&self) -> Result<ClientInfoDetails, IggyError> {
@@ -83,7 +99,7 @@ impl<B: BinaryClient> SystemClient for B {
         Ok(())
     }
 
-    async fn heartbeat_interval(&self) -> IggyDuration {
+    async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.get_heartbeat_interval()
     }
 

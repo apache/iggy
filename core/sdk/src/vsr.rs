@@ -21,27 +21,26 @@ use iggy_binary_protocol::codes::{
     LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, LOGOUT_USER_CODE,
 };
 use iggy_binary_protocol::consensus::{
-    Command2, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, ReplyHeader,
+    Command, EvictionHeader, EvictionReason, GenericHeader, HEADER_SIZE, Operation, ReplyHeader,
     RequestHeader, read_size_field, result_code, result_section_len,
 };
 use iggy_common::{IggyError, calculate_checksum, eviction_reason_to_error};
 
 const NON_REPLICATED_CODE_RANGE: std::ops::Range<usize> = 0..4;
 
-// TODO(vsr): transparent retry-after-disconnect can weaken at-most-once semantics
-// for replicated writes. The transports currently disconnect, reconnect, and encode
-// the retry from the current ConsensusSession. If disconnect created a fresh VSR
-// client/session, the retried request gets a new (client_id, request_id) tuple, so
-// server-side deduplication cannot match a mutation that may already have committed
-// before the transport failure.
+// A reconnect creates a fresh VSR client and session. A replicated request
+// retried there gets a new (client_id, request_id) tuple, so server-side
+// deduplication cannot match a mutation that may already have committed before
+// the transport failure. `replay_after_session_reset_is_safe` therefore keeps
+// ambiguous replicated outcomes with the caller instead of replaying them.
 //
-// The fix is to keep the ConsensusSession's client_id and request counter across
-// reconnects and retry replicated writes under the same (client_id, request_id)
-// instead of re-registering fresh. Resume happens through the LOGIN path: the
+// A future transparent replay path can keep the ConsensusSession's client id
+// and request counter across reconnects and retry under the same identity.
+// Resume would happen through the LOGIN path: the
 // reconnecting client re-authenticates presenting its previous client_id, the
 // server verifies the authenticated user owns that entry, and the rebind commits
 // a Register that adopts the entry with its watermark and reply ring intact. Note
-// the epoch changes -- the rebind moves the fence to the new register's op -- so
+// the epoch changes because the rebind moves the fence to the new register's op, so
 // the session field must be taken from the new login reply, not carried over.
 //
 // There is deliberately no credential-free rebind: presenting (client, session)
@@ -95,26 +94,22 @@ pub(crate) fn encode_request_header(
                     session.current_request_id(),
                     session.session().unwrap_or(0),
                 )
-            } else if operation.is_partition() {
-                // Partition ops replicate in their own per-partition group,
-                // which is at-least-once with no `ClientTable` dedup -- the
-                // metadata table never records their request ids, so there
-                // is nothing for a consumed id to deduplicate against. Every
-                // partition request on a session therefore carries the id
-                // the next metadata op will claim, and a partition-plane
-                // replay is at-least-once.
-                let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
-                (operation, session.current_request_id(), session_id)
             } else {
+                // Partition ops consume an id too, even though nothing dedups
+                // them yet: dedup needs each send to carry a distinct number,
+                // and the metadata watermark tolerates the resulting gaps
+                // (`client_table.rs`: "There is no `RequestGap`").
                 let session_id = session.session().ok_or(IggyError::Unauthenticated)?;
                 (operation, session.next_request_id(), session_id)
             }
         }
     };
-    // Stamped only for ops the server's `ClientTable` dedups. Partition ops are
-    // at-least-once with no reply cache to poison, and theirs are the large payloads,
-    // already covered client-side by `batch_checksum` over the same bytes.
-    // NonReplicated ops bypass dedup too.
+    // Stamped only for the ops the server's `ClientTable` dedups, and only by this
+    // SDK: the others leave the field zero, which the server reads as unstamped.
+    // Partition ops are the large payloads and already carry `batch_checksum` over
+    // the same bytes, and nothing dedups them, so hashing here would only buy the
+    // server a second full-payload pass in `verify_request_checksum`. NonReplicated
+    // ops bypass dedup too.
     let request_checksum = if operation.is_partition() || operation == Operation::NonReplicated {
         0
     } else {
@@ -129,7 +124,7 @@ pub(crate) fn encode_request_header(
         reserved[NON_REPLICATED_CODE_RANGE].copy_from_slice(&code.to_le_bytes());
     }
     let header = RequestHeader {
-        command: Command2::Request,
+        command: Command::Request,
         operation,
         size,
         client: session.client_id(),
@@ -159,12 +154,28 @@ pub(crate) fn encode_request_header(
 /// the authority: an unmapped code is forwarded as non-replicated (the code
 /// rides `RequestHeader.reserved`, which that path already stamps) and the
 /// server answers with a proper error if it does not know it.
-fn operation_for_code(code: u32) -> Operation {
+pub(crate) fn operation_for_code(code: u32) -> Operation {
     if code == LOGOUT_USER_CODE {
         return Operation::Logout;
     }
 
     Operation::from_command_code(code).unwrap_or(Operation::NonReplicated)
+}
+
+/// Whether replaying `code` after reconnecting with a new session cannot
+/// apply it twice.
+pub(crate) fn replay_after_session_reset_is_safe(code: u32, error: &IggyError) -> bool {
+    matches!(code, LOGIN_REGISTER_CODE | LOGIN_REGISTER_WITH_PAT_CODE)
+        || matches!(
+            error,
+            IggyError::NotConnected
+                | IggyError::CannotEstablishConnection
+                | IggyError::Unauthenticated
+        )
+        || matches!(
+            operation_for_code(code),
+            Operation::NonReplicated | Operation::Logout
+        )
 }
 
 pub(crate) fn response_size(header: &[u8]) -> Result<usize, IggyError> {
@@ -184,8 +195,8 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
         .try_into()
         .map_err(|_| IggyError::InvalidCommand)?;
     match peek_command(header_bytes) {
-        Command2::Eviction => Err(decode_eviction(header_bytes)),
-        Command2::Reply => {
+        Command::Eviction => Err(decode_eviction(header_bytes)),
+        Command::Reply => {
             let total_size = response_size(header_bytes)?;
             if response.len() < total_size {
                 return Err(IggyError::InvalidCommand);
@@ -204,18 +215,18 @@ pub(crate) fn decode_response(response: Bytes) -> Result<Bytes, IggyError> {
 /// buffers. Saves the 64B header `put_slice` that `decode_response` would
 /// otherwise perform when callers concatenate header + body before decoding.
 ///
-/// Also surfaces session-terminal `Command2::Eviction` frames as typed
+/// Also surfaces session-terminal `Command::Eviction` frames as typed
 /// errors: callers waiting on a Reply for an unbound session would otherwise
 /// hit a read-timeout because the SDK previously only accepted
-/// `Command2::Reply`. Returns the body slice on a normal Reply, or maps the
+/// `Command::Reply`. Returns the body slice on a normal Reply, or maps the
 /// eviction reason to an `IggyError` so the request fails fast.
 pub(crate) fn decode_response_split(
     header_bytes: &[u8; HEADER_SIZE],
     body: Bytes,
 ) -> Result<Bytes, IggyError> {
     match peek_command(header_bytes) {
-        Command2::Eviction => Err(decode_eviction(header_bytes)),
-        Command2::Reply => {
+        Command::Eviction => Err(decode_eviction(header_bytes)),
+        Command::Reply => {
             let expected_body = response_size(header_bytes)? - HEADER_SIZE;
             if body.len() < expected_body {
                 return Err(IggyError::InvalidCommand);
@@ -301,15 +312,15 @@ fn split_metadata_result(operation: Operation, body: Bytes) -> Result<Bytes, Igg
     }
 }
 
-/// `Command2` lives at a fixed offset shared by every consensus header
+/// `Command` lives at a fixed offset shared by every consensus header
 /// (Reply, Eviction, Prepare, ...), so a byte read is enough to discriminate
 /// the frame.
-fn peek_command(header_bytes: &[u8; HEADER_SIZE]) -> Command2 {
+fn peek_command(header_bytes: &[u8; HEADER_SIZE]) -> Command {
     const COMMAND_OFFSET: usize = std::mem::offset_of!(GenericHeader, command);
     match header_bytes[COMMAND_OFFSET] {
-        x if x == Command2::Reply as u8 => Command2::Reply,
-        x if x == Command2::Eviction as u8 => Command2::Eviction,
-        _ => Command2::Reserved,
+        x if x == Command::Reply as u8 => Command::Reply,
+        x if x == Command::Eviction as u8 => Command::Eviction,
+        _ => Command::Reserved,
     }
 }
 
@@ -347,11 +358,13 @@ fn read_window_field(header_bytes: &[u8; HEADER_SIZE], offset: usize) -> u32 {
 mod tests {
     use super::*;
     use crate::session::ConsensusSession;
-    use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STREAM_CODE, PING_CODE};
+    use iggy_binary_protocol::codes::{
+        CREATE_STREAM_CODE, GET_STREAM_CODE, PING_CODE, SEND_MESSAGES_CODE,
+    };
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::LoginRegisterRequest;
     use iggy_binary_protocol::version::IGGY_PROTOCOL_VERSION;
-    use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName};
+    use iggy_binary_protocol::{ClientVersionInfo, WireEncode, WireName, WireOptions};
     use secrecy::SecretString;
 
     fn decode_request_header(bytes: &Bytes) -> RequestHeader {
@@ -441,7 +454,7 @@ mod tests {
         // decode funnel surfaces it as the typed error before any body decode,
         // even though the deny body is empty.
         let header = ReplyHeader {
-            command: Command2::Reply,
+            command: Command::Reply,
             size: HEADER_SIZE as u32,
             status: IggyError::Unauthorized.as_code(),
             ..Default::default()
@@ -456,7 +469,7 @@ mod tests {
     fn reply_with_zero_status_passes_body_through() {
         // status 0 is the ok channel: a non-metadata reply returns its body.
         let header = ReplyHeader {
-            command: Command2::Reply,
+            command: Command::Reply,
             operation: Operation::NonReplicated,
             size: (HEADER_SIZE + 3) as u32,
             ..Default::default()
@@ -474,6 +487,7 @@ mod tests {
         session.bind(99);
         let payload = CreateStreamRequest {
             name: WireName::new("stream").unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes();
 
@@ -487,23 +501,55 @@ mod tests {
 
     #[test]
     fn request_checksum_is_stamped_only_for_deduped_operations() {
-        // The stamp exists to stop a reused `request` number returning the wrong
-        // cached reply, so it is worth its hashing pass only where `ClientTable`
-        // dedups. Partition payloads are the large ones and carry `batch_checksum`
-        // over the same bytes already; hashing them again is pure cost.
+        // The stamp exists to stop a reused `request` number matching a dedup
+        // entry recorded for different bytes, so it is worth its hashing pass only
+        // where `ClientTable` dedups. Partition ops are the large payloads and
+        // already carry `batch_checksum` over the same bytes; NonReplicated ops
+        // bypass dedup. Neither stamps.
         let mut session = ConsensusSession::with_client_id(42);
         session.bind(99);
         let payload = Bytes::from_static(b"payload");
 
-        let deduped =
+        let metadata =
             encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &payload).unwrap();
+        // Hashed against the framed body rather than the `payload` the encoder was
+        // handed, so a slice mistake between what is stamped and what is sent fails
+        // here instead of reaching the server's `verify_request_checksum`.
         assert_eq!(
-            decode_request_header(&deduped).request_checksum,
-            u128::from(calculate_checksum(&payload)),
+            decode_request_header(&metadata).request_checksum,
+            u128::from(calculate_checksum(&metadata[HEADER_SIZE..])),
         );
+
+        let partition =
+            encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload).unwrap();
+        assert_eq!(decode_request_header(&partition).request_checksum, 0);
 
         let ping = encode_contiguous_request(&mut session, PING_CODE, &Bytes::new()).unwrap();
         assert_eq!(decode_request_header(&ping).request_checksum, 0);
+    }
+
+    #[test]
+    fn partition_request_consumes_the_request_counter() {
+        // Dedup identity requires each send to carry a distinct id, so
+        // partition ops advance the counter exactly like metadata ops and
+        // the two planes interleave on one sequence.
+        let mut session = ConsensusSession::with_client_id(42);
+        session.bind(99);
+        let payload = Bytes::from_static(b"batch");
+
+        let first = encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload).unwrap();
+        let second = encode_contiguous_request(&mut session, SEND_MESSAGES_CODE, &payload).unwrap();
+        assert_eq!(decode_request_header(&first).request, 1);
+        assert_eq!(decode_request_header(&second).request, 2);
+
+        let metadata_payload = CreateStreamRequest {
+            name: WireName::new("stream").unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let metadata =
+            encode_contiguous_request(&mut session, CREATE_STREAM_CODE, &metadata_payload).unwrap();
+        assert_eq!(decode_request_header(&metadata).request, 3);
     }
 
     #[test]
@@ -678,7 +724,7 @@ mod tests {
     #[test]
     fn store_consumer_offset_rejection_decodes_to_terminal_error() {
         let code = IggyError::InvalidOffset(42).as_code();
-        let result = split_metadata_result(Operation::StoreConsumerOffset2, rejection_body(code));
+        let result = split_metadata_result(Operation::StoreConsumerOffset, rejection_body(code));
         assert_eq!(result.unwrap_err().as_code(), code);
     }
 
@@ -687,7 +733,7 @@ mod tests {
         let out = split_metadata_result(Operation::StoreConsumerOffset, success_body(b"")).unwrap();
         assert!(out.is_empty());
         let out =
-            split_metadata_result(Operation::DeleteConsumerOffset2, success_body(b"")).unwrap();
+            split_metadata_result(Operation::DeleteConsumerOffset, success_body(b"")).unwrap();
         assert!(out.is_empty());
     }
 

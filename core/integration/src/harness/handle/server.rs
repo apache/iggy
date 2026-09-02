@@ -18,7 +18,7 @@
 use super::client_builder::{ClientBuilder, ServerConnection};
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
-use crate::harness::config::{ConnectorsRuntimeConfig, IpAddrKind, McpConfig, TestServerConfig};
+use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
 use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
@@ -187,35 +187,46 @@ impl ServerHandle {
         self.stdout_occurrences(marker) > 0
     }
 
-    /// Number of times `marker` appears in this node's stdout log. The log
-    /// file is TRUNCATED on every (re)start (it captures one process run),
-    /// so counts never carry across a restart; a marker seen after
-    /// `restart_server` was logged by the new process.
+    /// Number of times `marker` appears in this node's captured stdout, or in
+    /// its own logs when verbose mode makes the child inherit stdout. Captured
+    /// stdout is truncated on restart. The server log may span restarts, so
+    /// restart-sensitive callers must compare against a pre-restart baseline.
     ///
     /// ANSI escape sequences are stripped before matching: the server colors
     /// its tracing fields, so a `key=value` marker never matches the raw
     /// bytes (`key\x1b[0m\x1b[2m=\x1b[0m value`).
     #[must_use]
     pub fn stdout_occurrences(&self, marker: &str) -> usize {
-        self.stdout_path
-            .as_ref()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .map_or(0, |log| strip_ansi(&log).matches(marker).count())
+        self.stdout_plain().matches(marker).count()
     }
 
-    /// This node's stdout log with ANSI escapes stripped, the same text
-    /// [`Self::stdout_occurrences`] matches against. Empty when the log is
-    /// missing or unreadable.
+    /// This node's captured stdout with ANSI escapes stripped, or its own logs
+    /// when verbose mode disables the capture. Empty when neither source is
+    /// readable.
     ///
     /// For callers that need to PARSE a marker's fields (`checkpoint_op=193`
     /// reaches the file as `checkpoint_op\x1b[0m\x1b[2m=\x1b[0m193`) rather
     /// than just count occurrences of it.
     #[must_use]
     pub fn stdout_plain(&self) -> String {
-        self.stdout_path
+        let captured = self
+            .stdout_path
             .as_ref()
             .and_then(|path| fs::read_to_string(path).ok())
-            .map_or_else(String::new, |log| strip_ansi(&log))
+            .map(|log| strip_ansi(&log));
+        captured.unwrap_or_else(|| {
+            let own_logs = self.data_path().join("logs");
+            let Ok(entries) = fs::read_dir(own_logs) else {
+                return String::new();
+            };
+            let mut log = String::new();
+            for entry in entries.flatten() {
+                if let Ok(contents) = fs::read_to_string(entry.path()) {
+                    log.push_str(&contents);
+                }
+            }
+            log
+        })
     }
 
     /// Returns a `ClientBuilder` using the test transport.
@@ -296,12 +307,12 @@ impl ServerHandle {
         self.envs
             .entry("IGGY_SYSTEM_SHARDING_CPU_ALLOCATION".to_string())
             .or_insert(cpu_allocation);
-
-        if self.config.ip_kind == IpAddrKind::V6 {
-            self.envs
-                .entry("IGGY_TCP_IPV6".to_string())
-                .or_insert_with(|| "true".to_string());
-        }
+        // On a 4-core CI runner every server computes the same `0..4` range, so
+        // pinned shards of concurrently running tests pile onto the same cores
+        // and starve each other. Leave thread placement to the scheduler.
+        self.envs
+            .entry("IGGY_SYSTEM_SHARDING_PIN_CORES".to_string())
+            .or_insert_with(|| "false".to_string());
 
         self.envs
             .entry("IGGY_ROOT_USERNAME".to_string())
@@ -350,7 +361,14 @@ impl ServerHandle {
             self.set_tls_envs("WEBSOCKET", &tls);
         }
 
-        // Extra envs from config (includes resolved config paths from macro)
+        // Extra envs from config (includes resolved config paths from macro).
+        // Validated first: a name no config leaf reads is a silent no-op, and
+        // a test that believes it configured the server but did not is worse
+        // than one that fails to start.
+        if let Err(report) = crate::harness::config::validate_env_var_names(&self.config.extra_envs)
+        {
+            panic!("invalid extra_envs for the test server:\n{report}");
+        }
         for (k, v) in &self.config.extra_envs {
             self.envs.insert(k.clone(), v.clone());
         }
@@ -881,6 +899,18 @@ impl TestBinary for ServerHandle {
         {
             command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
         }
+        // An explicit config-level override must be the test's logging
+        // contract. The server gives `RUST_LOG` precedence, so inheriting an
+        // ambient value could silently filter out markers the test asserts.
+        // A caller that explicitly puts `RUST_LOG` in `extra_envs` adds it back
+        // through `command.envs` below.
+        if self
+            .config
+            .extra_envs
+            .contains_key("IGGY_SYSTEM_LOGGING_LEVEL")
+        {
+            command.env_remove("RUST_LOG");
+        }
         command.envs(&self.envs);
 
         // `--replica-id` is the single identity input expected by the
@@ -1018,6 +1048,32 @@ impl ServerHandle {
         }
 
         self.start()
+    }
+
+    /// Kill the server with SIGKILL: no shutdown hook runs, nothing buffered
+    /// in process memory is flushed. Models a real crash, unlike
+    /// [`TestBinary::stop`] whose graceful shutdown flushes state before exit.
+    ///
+    /// Restart afterwards with [`TestBinary::start`]. Taking `child_handle`
+    /// makes the eventual `Drop -> stop()` a no-op.
+    pub fn kill(&mut self) -> Result<(), TestBinaryError> {
+        // Watchdog must stop BEFORE the signal lands: it polls liveness every
+        // 100ms and panics on unexpected process death.
+        self.stop_watchdog();
+        if let Some(mut child) = self.child_handle.take() {
+            // SAFETY: plain syscall. The watchdog is already joined, so its
+            // unexpected-death path (a raw waitpid) can no longer reap this
+            // pid, and `Child` has not waited yet; the worst case is a signal
+            // to an already-dead but unreaped zombie, which is harmless. The
+            // result is deliberately discarded for the same reason.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+            // Reap via the owned Child, not reap_exit_status: a raw waitpid
+            // would race Child's own bookkeeping.
+            let _ = child.wait();
+        }
+        Ok(())
     }
 }
 

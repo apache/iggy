@@ -33,9 +33,9 @@
 //! replicated prepare/WAL. A mismatch is committed as a rejecting no-op
 //! (signalled by an empty new password) rather than denied pre-consensus, so
 //! the caller's request sequence stays contiguous; see
-//! [`verify_and_rewrite_change_password`].
+//! `verify_and_rewrite_change_password`.
 
-use crate::bootstrap::{ShellBus, ShellShard};
+use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
 use bytes::Bytes;
 use consensus::MetadataHandle;
@@ -58,14 +58,14 @@ use std::rc::Rc;
 /// rejection (see [`verify_and_rewrite_change_password`]). Every other operation
 /// passes through unchanged. Returns [`IggyError::InvalidCommand`] only on an
 /// undecodable password body.
-pub(crate) fn maybe_rewrite_user_password_request<B, MJ, S, SB>(
+pub fn maybe_rewrite_user_password_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
 ) -> Result<Message<RoutedRequestHeader>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {

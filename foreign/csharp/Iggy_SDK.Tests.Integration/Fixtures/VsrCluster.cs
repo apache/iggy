@@ -226,7 +226,6 @@ internal sealed class VsrCluster : IAsyncDisposable
             .WithName($"iggy-vsr-{_name}-{node}-{_idSuffix}")
             .WithEnvironment("IGGY_ROOT_USERNAME", "iggy")
             .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
-            .WithEnvironment("IGGY_SYSTEM_TOPIC_MESSAGE_EXPIRY", "10m")
             .WithEnvironment("IGGY_SYSTEM_PATH", $"local_data_vsr_{node}")
             .WithEnvironment("IGGY_TCP_ADDRESS", $"0.0.0.0:{ports.Tcp}")
             .WithEnvironment("IGGY_HTTP_ADDRESS", $"0.0.0.0:{ports.Http}")
@@ -292,6 +291,7 @@ internal sealed class VsrCluster : IAsyncDisposable
 
         if (!ClusterEnabled)
         {
+            environment["IGGY_NODE_ADVERTISED_ADDRESS"] = "127.0.0.1";
             return environment;
         }
 

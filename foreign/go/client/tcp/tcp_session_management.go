@@ -33,7 +33,12 @@ func (c *IggyTcpClient) LoginUser(ctx context.Context, username string, password
 	if err != nil {
 		return nil, err
 	}
-	return c.register(ctx, uint32(command.LoginRegisterCode), body)
+	return c.register(
+		ctx,
+		uint32(command.LoginRegisterCode),
+		body,
+		NewUsernamePasswordCredentials(username, password),
+	)
 }
 
 func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token string) (*iggcon.IdentityInfo, error) {
@@ -41,12 +46,28 @@ func (c *IggyTcpClient) LoginWithPersonalAccessToken(ctx context.Context, token 
 	if err != nil {
 		return nil, err
 	}
-	return c.register(ctx, uint32(command.LoginRegisterWithPATCode), body)
+	return c.register(
+		ctx,
+		uint32(command.LoginRegisterWithPATCode),
+		body,
+		NewPersonalAccessTokenCredentials(token),
+	)
 }
 
 // register runs the sign-in handshake, binds the session the server assigned,
-// and settles the connection on the cluster leader.
-func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+// settles the connection on the cluster leader, and remembers the credentials
+// it succeeded with so a reconnect can re-establish the session.
+//
+// The credentials are remembered here rather than by the callers because this
+// is what holds registerMtx: remembered outside it, two concurrent sign-ins
+// could leave A remembered while the session is B, and the next reconnect
+// would sign in as A.
+func (c *IggyTcpClient) register(
+	ctx context.Context,
+	code uint32,
+	body []byte,
+	credentials Credentials,
+) (*iggcon.IdentityInfo, error) {
 	// One sign-in at a time. BeginRegister runs inside the exchange lock but
 	// Bind runs after it, so two interleaved sign-ins would let the second
 	// BeginRegister reset the identity the first is about to bind: one
@@ -55,7 +76,10 @@ func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) 
 	c.registerMtx.Lock()
 	defer c.registerMtx.Unlock()
 
-	c.logger.Info("Iggy client is signing in...", slog.String("client_address", c.clientAddress))
+	c.mtx.Lock()
+	clientAddress := c.clientAddress
+	c.mtx.Unlock()
+	c.logger.Info("Iggy client is signing in...", slog.String("client_address", clientAddress))
 
 	if err := c.endBoundSession(ctx); err != nil {
 		return nil, err
@@ -70,6 +94,7 @@ func (c *IggyTcpClient) register(ctx context.Context, code uint32, body []byte) 
 	if err != nil {
 		return nil, err
 	}
+	c.rememberLogin(credentials)
 	if settled != nil {
 		return settled, nil
 	}
@@ -114,8 +139,11 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 		return nil, err
 	}
 
+	c.mtx.Lock()
+	signedInAddress := c.clientAddress
+	c.mtx.Unlock()
 	c.logger.Info("Iggy client has signed in successfully.",
-		slog.String("client_address", c.clientAddress),
+		slog.String("client_address", signedInAddress),
 		slog.String("server_version", registered.ServerVersion))
 	return &iggcon.IdentityInfo{UserId: registered.UserID}, nil
 }
@@ -134,26 +162,32 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 //
 // Returns nil when the client stays where it is.
 func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+	// A roster walk stays on the endpoint it dialed: the settlement below
+	// would put the connection straight back on the node whose partition
+	// replica keeps refusing the walked request. The marker is scoped to the
+	// Connect that owns this sign-in, so a failed walk cannot leak into another.
+	if ctx.Value(skipLeaderSettlement{}) != nil {
+		c.logger.Info("Staying on the dialed node for a partition failover.")
+		return nil, nil
+	}
+
 	var settled *iggcon.IdentityInfo
 	for {
 		// The roster read runs while register holds the sign-in lock, so it must
 		// not enter the reconnect path: the reconnect's automatic sign-in would
 		// deadlock on that lock. The connect scope fails it fast instead.
-		redirect, err := c.HandleLeaderRedirection(
-			context.WithValue(ctx, connectScoped{}, struct{}{}))
+		c.mtx.Lock()
+		generation := c.connGeneration
+		c.mtx.Unlock()
+		redirect, err := c.redirectToLeader(
+			context.WithValue(ctx, connectScoped{}, struct{}{}), generation)
 		if err != nil || !redirect {
 			return settled, err
 		}
 
 		// The replayed sign-in below owns the session; the redirected Connect
 		// must not sign in on its own, or the replay commits a second Register.
-		c.mtx.Lock()
-		c.skipAutoLoginOnce = true
-		c.mtx.Unlock()
-		if err := c.Connect(ctx); err != nil {
-			c.mtx.Lock()
-			c.skipAutoLoginOnce = false
-			c.mtx.Unlock()
+		if err := c.Connect(suppressAutoLogin(ctx)); err != nil {
 			return nil, err
 		}
 		settled, err = c.signIn(ctx, code, body)
@@ -165,6 +199,14 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 
 // endBoundSession logs out a live session before a re-login, so the server
 // drops its client-table entry instead of leaving it to be fenced.
+//
+// The logout runs connect-scoped, and a failure it could recover from is
+// swallowed. Both because this call holds registerMtx: a logout that entered
+// the reconnect path would reconnect, sign in with the remembered credentials,
+// and deadlock on that lock. There is nothing to salvage either way -- a
+// session whose logout cannot be delivered died with its socket, and the
+// server fences what it left behind -- and the sign-in that follows replays
+// through its own reconnect.
 func (c *IggyTcpClient) endBoundSession(ctx context.Context) error {
 	c.mtx.Lock()
 	bound := c.session.Bound()
@@ -172,7 +214,29 @@ func (c *IggyTcpClient) endBoundSession(ctx context.Context) error {
 	if !bound {
 		return nil
 	}
-	return c.LogoutUser(ctx)
+
+	err := c.LogoutUser(context.WithValue(ctx, connectScoped{}, struct{}{}))
+	if err == nil {
+		return nil
+	}
+	if !isReconnectable(err) {
+		return err
+	}
+
+	c.logger.Debug("The bound session's logout was not delivered; its socket ended it.",
+		slog.Any("error", err))
+	c.mtx.Lock()
+	c.sessionState = iggcon.SessionStateUnauthenticated
+	c.session.Reset()
+	c.groups.clear()
+	c.topics.clearCounts()
+	c.mtx.Unlock()
+	// The session this sign-in belonged to is over either way, so the
+	// credentials that established it go with it. Kept, a sign-in that then
+	// fails would leave them behind for the next dropped request to replay --
+	// signing the old user back in after the caller asked for another one.
+	c.forgetLogin()
+	return nil
 }
 
 func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
@@ -188,10 +252,28 @@ func (c *IggyTcpClient) LogoutUser(ctx context.Context) error {
 	c.groups.clear()
 	c.topics.clearCounts()
 	c.mtx.Unlock()
+	c.forgetLogin()
 	return nil
 }
 
+// HandleLeaderRedirection moves the client to the leader the cluster roster
+// names, tearing down whichever connection it is on.
 func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, error) {
+	c.mtx.Lock()
+	generation := c.connGeneration
+	c.mtx.Unlock()
+	return c.redirectToLeader(ctx, generation)
+}
+
+// redirectToLeader moves the client to the leader, tearing down the
+// connection generation the redirect was decided on.
+//
+// A caller whose connection was replaced while the roster was being read has
+// nothing left to redirect: closing the replacement would strand the requests
+// running on it, and reporting a redirect would have the caller replay on a
+// node it never chose. It is told no redirect happened, and its re-attempt
+// reads the roster over the connection it now has.
+func (c *IggyTcpClient) redirectToLeader(ctx context.Context, generation uint64) (bool, error) {
 	// Clone current address
 	c.mtx.Lock()
 	currentAddress := c.currentServerAddress
@@ -230,8 +312,13 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 	}
 	c.mtx.Unlock()
 
-	if err = c.disconnect(); err != nil {
+	torn, err := c.disconnectGeneration(generation)
+	if err != nil {
 		return false, err
+	}
+	if !torn {
+		c.logger.Debug("Dropping a redirect decided on a replaced connection.")
+		return false, nil
 	}
 
 	c.mtx.Lock()
@@ -242,4 +329,65 @@ func (c *IggyTcpClient) HandleLeaderRedirection(ctx context.Context) (bool, erro
 	c.mtx.Unlock()
 
 	return true, nil
+}
+
+// settleOnNextEndpoint moves the connection to the roster endpoint after the
+// current one, for a request the current node keeps refusing to admit.
+// Metadata and partition consensus groups elect independently, so the
+// metadata leader can hold a follower replica of the partition a request
+// targets, and only walking the roster reaches that group's primary. The
+// refusal marks the request as never admitted and safe to re-issue anywhere;
+// the caller's request budget bounds the walk.
+func (c *IggyTcpClient) settleOnNextEndpoint(visited map[string]struct{}) (bool, error) {
+	c.mtx.Lock()
+	current := c.currentServerAddress
+	roster := append([]string(nil), c.knownServerAddresses...)
+	c.mtx.Unlock()
+
+	next := nextRosterEndpoint(current, roster, visited)
+	if next == "" {
+		return false, nil
+	}
+
+	c.logger.Info(
+		"The request keeps being refused while the roster names this node the metadata leader; trying the next cluster node.",
+		slog.String("current", current),
+		slog.String("next", next),
+	)
+	if err := c.disconnect(); err != nil {
+		return false, err
+	}
+
+	c.mtx.Lock()
+	c.connectedAt = time.Time{}
+	c.currentServerAddress = next
+	c.mtx.Unlock()
+	return true, nil
+}
+
+func nextRosterEndpoint(current string, roster []string, visited map[string]struct{}) string {
+	currentIndex := -1
+	for index, endpoint := range roster {
+		if endpoint == current {
+			currentIndex = index
+			visited[endpoint] = struct{}{}
+			break
+		}
+	}
+
+	next := ""
+	for offset := 1; offset <= len(roster); offset++ {
+		index := (currentIndex + offset) % len(roster)
+		candidate := roster[index]
+		if _, seen := visited[candidate]; seen || candidate == current {
+			continue
+		}
+		next = candidate
+		break
+	}
+	if next == "" || next == current {
+		return ""
+	}
+	visited[next] = struct{}{}
+	return next
 }

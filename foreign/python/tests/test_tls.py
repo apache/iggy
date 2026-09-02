@@ -40,7 +40,7 @@ import pytest
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
-from apache_iggy import IggyClient, PollingStrategy
+from apache_iggy import Consumer, IggyClient, PollingStrategy
 from apache_iggy import SendMessage as Message
 
 from .utils import wait_for_ping, wait_for_server
@@ -66,6 +66,7 @@ def tls_container():
         .with_env("IGGY_TCP_TLS_CERT_FILE", "/app/certs/iggy_cert.pem")
         .with_env("IGGY_TCP_TLS_KEY_FILE", "/app/certs/iggy_key.pem")
         .with_env("IGGY_TCP_ADDRESS", f"0.0.0.0:{CONTAINER_TCP_PORT}")
+        .with_env("IGGY_NODE_ADVERTISED_ADDRESS", "127.0.0.1")
         .with_volume_mapping(CERTS_DIR, "/app/certs", "ro")
         .with_kwargs(privileged=True)
     )
@@ -143,6 +144,7 @@ class TestTlsConnectivity:
         polled = await tls_client.poll_messages(
             stream=stream_name,
             topic=topic_name,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,

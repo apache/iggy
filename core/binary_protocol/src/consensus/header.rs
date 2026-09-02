@@ -42,7 +42,7 @@
 //! `checksum` as their view-independent identity, and the three client-facing
 //! headers are sealed on neither side, so SDKs are untouched.
 
-use super::{Command2, ConsensusError, Operation};
+use super::{Command, ConsensusError, Operation};
 use bytemuck::{CheckedBitPattern, NoUninit};
 use std::mem::offset_of;
 
@@ -101,13 +101,28 @@ pub fn frame_checksum_bytes(header: &[u8; HEADER_SIZE]) -> u128 {
 /// strict allocators (Miri, jemalloc, arenas). Use
 /// `aligned_vec::AVec<u8, ConstAlign<16>>` for explicit alignment.
 pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
-    const COMMAND: Command2;
+    const COMMAND: Command;
+    /// Whether `checksum` carries the prepare identity, which covers the
+    /// operation byte: an unknown operation on such a frame can be
+    /// authenticated from the raw bytes even though the typed view refuses to
+    /// cast. False wherever `checksum` seals the frame or crosses the client
+    /// boundary.
+    const IDENTITY_CHECKSUMMED: bool = false;
+
+    /// Byte offset of this header's `operation` field, `None` when it carries
+    /// none.
+    ///
+    /// The typed decode reads the raw byte here after a failed checked cast,
+    /// so an operation a newer release added is reported as version skew
+    /// rather than corruption. An offset rather than a getter because the cast
+    /// has already failed by then, so no typed view of the header exists.
+    const OPERATION_OFFSET: Option<usize> = None;
 
     /// Whether a frame carrying `command` may be typed as this header.
     /// Defaults to an exact match; a header that serves several commands
     /// with one layout (e.g. `RepairDone` / `RangeEvicted`) widens it.
     #[must_use]
-    fn accepts(command: Command2) -> bool {
+    fn accepts(command: Command) -> bool {
         command == Self::COMMAND
     }
 
@@ -135,7 +150,7 @@ pub trait ConsensusHeader: Sized + CheckedBitPattern + NoUninit {
     /// Returns `ConsensusError` if the header fields are inconsistent.
     fn validate(&self) -> Result<(), ConsensusError>;
     fn operation(&self) -> Operation;
-    fn command(&self) -> Command2;
+    fn command(&self) -> Command;
     fn size(&self) -> u32;
 
     /// The `checksum` field, whatever this header spends it on.
@@ -205,7 +220,7 @@ pub struct GenericHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
     pub reserved_command: [u8; RESERVED_COMMAND_LEN],
@@ -227,7 +242,7 @@ const _: () = {
 };
 
 impl ConsensusHeader for GenericHeader {
-    const COMMAND: Command2 = Command2::Reserved;
+    const COMMAND: Command = Command::Reserved;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -240,7 +255,7 @@ impl ConsensusHeader for GenericHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn validate(&self) -> Result<(), ConsensusError> {
@@ -263,7 +278,7 @@ pub struct RequestHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -272,7 +287,9 @@ pub struct RequestHeader {
     /// catch a `request` number reused for a different operation: a retry that
     /// disagrees with the stamp of the cached reply is refused rather than
     /// answered with the wrong reply. Zero means unstamped, which disables the
-    /// comparison; the wire currently sends zero.
+    /// comparison. The Rust SDK stamps the ops the table dedups; partition and
+    /// non-replicated ops, and the other SDKs, leave it zero. The server
+    /// verifies any nonzero stamp before routing.
     pub request_checksum: u128,
     pub timestamp: u64,
     pub request: u64,
@@ -333,7 +350,7 @@ pub struct RoutedRequestHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -374,7 +391,7 @@ impl Default for RoutedRequestHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -400,7 +417,7 @@ impl Default for RequestHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -477,7 +494,8 @@ fn validate_request_fields(
 }
 
 impl ConsensusHeader for RoutedRequestHeader {
-    const COMMAND: Command2 = Command2::Request;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
+    const COMMAND: Command = Command::Request;
     /// The client-wire [`RequestHeader`] this is promoted from is unsealed, and the
     /// promotion copies `checksum` verbatim, so there is nothing here to verify.
     const FRAME_SEALED: bool = false;
@@ -492,7 +510,7 @@ impl ConsensusHeader for RoutedRequestHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -500,9 +518,9 @@ impl ConsensusHeader for RoutedRequestHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Request {
+        if self.command != Command::Request {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::Request,
+                expected: Command::Request,
                 found: self.command,
             });
         }
@@ -511,7 +529,8 @@ impl ConsensusHeader for RoutedRequestHeader {
 }
 
 impl ConsensusHeader for RequestHeader {
-    const COMMAND: Command2 = Command2::Request;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
+    const COMMAND: Command = Command::Request;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -524,7 +543,7 @@ impl ConsensusHeader for RequestHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -532,9 +551,9 @@ impl ConsensusHeader for RequestHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Request {
+        if self.command != Command::Request {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::Request,
+                expected: Command::Request,
                 found: self.command,
             });
         }
@@ -554,7 +573,7 @@ pub struct ReplyHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -602,7 +621,7 @@ impl Default for ReplyHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             request_checksum: 0,
@@ -621,7 +640,8 @@ impl Default for ReplyHeader {
 }
 
 impl ConsensusHeader for ReplyHeader {
-    const COMMAND: Command2 = Command2::Reply;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
+    const COMMAND: Command = Command::Reply;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -634,7 +654,7 @@ impl ConsensusHeader for ReplyHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -642,8 +662,8 @@ impl ConsensusHeader for ReplyHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Reply {
-            return Err(ConsensusError::ReplyInvalidCommand2);
+        if self.command != Command::Reply {
+            return Err(ConsensusError::ReplyInvalidCommand);
         }
         Ok(())
     }
@@ -713,7 +733,7 @@ pub struct EvictionHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -781,7 +801,7 @@ impl EvictionHeader {
             size: HEADER_SIZE as u32,
             view,
             release: 0,
-            command: Command2::Eviction,
+            command: Command::Eviction,
             replica,
             reserved_frame: [0; 66],
             client,
@@ -812,7 +832,7 @@ impl EvictionHeader {
 }
 
 impl ConsensusHeader for EvictionHeader {
-    const COMMAND: Command2 = Command2::Eviction;
+    const COMMAND: Command = Command::Eviction;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -826,7 +846,7 @@ impl ConsensusHeader for EvictionHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -835,9 +855,9 @@ impl ConsensusHeader for EvictionHeader {
 
     #[allow(clippy::cast_possible_truncation)]
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Eviction {
+        if self.command != Command::Eviction {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::Eviction,
+                expected: Command::Eviction,
                 found: self.command,
             });
         }
@@ -905,7 +925,7 @@ pub struct PrepareHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -951,7 +971,7 @@ impl Default for PrepareHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             client: 0,
@@ -971,7 +991,9 @@ impl Default for PrepareHeader {
 }
 
 impl ConsensusHeader for PrepareHeader {
-    const COMMAND: Command2 = Command2::Prepare;
+    const IDENTITY_CHECKSUMMED: bool = true;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
+    const COMMAND: Command = Command::Prepare;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -984,7 +1006,7 @@ impl ConsensusHeader for PrepareHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -992,9 +1014,9 @@ impl ConsensusHeader for PrepareHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Prepare {
+        if self.command != Command::Prepare {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::Prepare,
+                expected: Command::Prepare,
                 found: self.command,
             });
         }
@@ -1037,6 +1059,23 @@ pub fn frame_body(frame: &[u8], size: u32) -> &[u8] {
     &frame[HEADER_SIZE..end]
 }
 
+/// Byte-level twin of [`PrepareHeader::identity_checksum`].
+///
+/// For a frame whose operation byte does not cast: an unknown discriminant
+/// blocks the typed view, but the identity covers the operation byte, so
+/// recomputing it over the raw bytes authenticates that byte before anything
+/// is claimed about it. Must agree with the typed method byte for byte; a unit
+/// test pins the equality.
+#[must_use]
+pub fn prepare_identity_checksum_bytes(header: &[u8; HEADER_SIZE]) -> u128 {
+    let mut covered = *header;
+    let checksum_at = core::mem::offset_of!(PrepareHeader, checksum);
+    covered[checksum_at..checksum_at + size_of::<u128>()].fill(0);
+    let view_at = core::mem::offset_of!(PrepareHeader, view);
+    covered[view_at..view_at + size_of::<u32>()].fill(0);
+    u128::from(twox_hash::XxHash3_64::oneshot(&covered))
+}
+
 impl PrepareHeader {
     /// Which prepare this is, independent of which view re-sent it.
     ///
@@ -1069,7 +1108,13 @@ impl PrepareHeader {
 pub struct RepairPrepareHeader(pub PrepareHeader);
 
 impl ConsensusHeader for RepairPrepareHeader {
-    const COMMAND: Command2 = Command2::RepairPrepare;
+    // Transparent over `PrepareHeader`, so the operation sits at the same
+    // offset and its checksum field carries the same identity. Without these a
+    // repaired prepare carrying a newer release's operation is classified as a
+    // corrupt header instead of version skew.
+    const IDENTITY_CHECKSUMMED: bool = true;
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(PrepareHeader, operation));
+    const COMMAND: Command = Command::RepairPrepare;
     const FRAME_SEALED: bool = false;
 
     fn checksum(&self) -> u128 {
@@ -1082,7 +1127,7 @@ impl ConsensusHeader for RepairPrepareHeader {
     fn operation(&self) -> Operation {
         self.0.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.0.command
     }
     fn size(&self) -> u32 {
@@ -1090,9 +1135,9 @@ impl ConsensusHeader for RepairPrepareHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.0.command != Command2::RepairPrepare {
+        if self.0.command != Command::RepairPrepare {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RepairPrepare,
+                expected: Command::RepairPrepare,
                 found: self.0.command,
             });
         }
@@ -1127,7 +1172,7 @@ pub struct PrepareOkHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1160,7 +1205,7 @@ impl Default for PrepareOkHeader {
             size: 0,
             view: 0,
             release: 0,
-            command: Command2::Reserved,
+            command: Command::Reserved,
             replica: 0,
             reserved_frame: [0; 66],
             parent: 0,
@@ -1178,9 +1223,10 @@ impl Default for PrepareOkHeader {
 }
 
 impl ConsensusHeader for PrepareOkHeader {
+    const OPERATION_OFFSET: Option<usize> = Some(core::mem::offset_of!(Self, operation));
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::PrepareOk;
+    const COMMAND: Command = Command::PrepareOk;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1192,7 +1238,7 @@ impl ConsensusHeader for PrepareOkHeader {
     fn operation(&self) -> Operation {
         self.operation
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1200,9 +1246,9 @@ impl ConsensusHeader for PrepareOkHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::PrepareOk {
+        if self.command != Command::PrepareOk {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::PrepareOk,
+                expected: Command::PrepareOk,
                 found: self.command,
             });
         }
@@ -1222,7 +1268,7 @@ pub struct CommitHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1245,7 +1291,7 @@ const _: () = {
 impl ConsensusHeader for CommitHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::Commit;
+    const COMMAND: Command = Command::Commit;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1257,7 +1303,7 @@ impl ConsensusHeader for CommitHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1265,8 +1311,8 @@ impl ConsensusHeader for CommitHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::Commit {
-            return Err(ConsensusError::CommitInvalidCommand2);
+        if self.command != Command::Commit {
+            return Err(ConsensusError::CommitInvalidCommand);
         }
         if self.size != 256 {
             return Err(ConsensusError::CommitInvalidSize(self.size));
@@ -1287,7 +1333,7 @@ pub struct StartViewChangeHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1306,7 +1352,7 @@ const _: () = {
 impl ConsensusHeader for StartViewChangeHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::StartViewChange;
+    const COMMAND: Command = Command::StartViewChange;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1318,7 +1364,7 @@ impl ConsensusHeader for StartViewChangeHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1326,9 +1372,9 @@ impl ConsensusHeader for StartViewChangeHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::StartViewChange {
+        if self.command != Command::StartViewChange {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::StartViewChange,
+                expected: Command::StartViewChange,
                 found: self.command,
             });
         }
@@ -1351,7 +1397,7 @@ pub struct DoViewChangeHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1414,7 +1460,7 @@ pub const DVC_HEADERS_MAX: usize = 128;
 impl ConsensusHeader for DoViewChangeHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::DoViewChange;
+    const COMMAND: Command = Command::DoViewChange;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1426,7 +1472,7 @@ impl ConsensusHeader for DoViewChangeHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1434,9 +1480,9 @@ impl ConsensusHeader for DoViewChangeHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::DoViewChange {
+        if self.command != Command::DoViewChange {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::DoViewChange,
+                expected: Command::DoViewChange,
                 found: self.command,
             });
         }
@@ -1525,7 +1571,7 @@ pub struct StartViewHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1562,7 +1608,7 @@ const _: () = {
 impl ConsensusHeader for StartViewHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::StartView;
+    const COMMAND: Command = Command::StartView;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1574,7 +1620,7 @@ impl ConsensusHeader for StartViewHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1582,9 +1628,9 @@ impl ConsensusHeader for StartViewHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::StartView {
+        if self.command != Command::StartView {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::StartView,
+                expected: Command::StartView,
                 found: self.command,
             });
         }
@@ -1637,7 +1683,7 @@ pub struct RequestStartViewHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1667,7 +1713,7 @@ const _: () = {
 impl ConsensusHeader for RequestStartViewHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RequestStartView;
+    const COMMAND: Command = Command::RequestStartView;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1679,7 +1725,7 @@ impl ConsensusHeader for RequestStartViewHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1687,9 +1733,9 @@ impl ConsensusHeader for RequestStartViewHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RequestStartView {
+        if self.command != Command::RequestStartView {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RequestStartView,
+                expected: Command::RequestStartView,
                 found: self.command,
             });
         }
@@ -1719,7 +1765,7 @@ pub struct RequestPreparesHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1741,7 +1787,7 @@ const _: () = {
 impl ConsensusHeader for RequestPreparesHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RequestPrepares;
+    const COMMAND: Command = Command::RequestPrepares;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1753,7 +1799,7 @@ impl ConsensusHeader for RequestPreparesHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1761,9 +1807,9 @@ impl ConsensusHeader for RequestPreparesHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RequestPrepares {
+        if self.command != Command::RequestPrepares {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RequestPrepares,
+                expected: Command::RequestPrepares,
                 found: self.command,
             });
         }
@@ -1792,7 +1838,7 @@ pub struct RepairRangeReplyHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1814,7 +1860,7 @@ const _: () = {
 impl ConsensusHeader for RepairRangeReplyHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RepairDone;
+    const COMMAND: Command = Command::RepairDone;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1826,13 +1872,13 @@ impl ConsensusHeader for RepairRangeReplyHeader {
     // One layout, two commands: `RepairDone` terminates a stream,
     // `RangeEvicted` prefixes it. Without this widening, `try_into_typed`
     // rejects `RangeEvicted` frames before `validate` ever sees them.
-    fn accepts(command: Command2) -> bool {
-        command == Command2::RepairDone || command == Command2::RangeEvicted
+    fn accepts(command: Command) -> bool {
+        command == Command::RepairDone || command == Command::RangeEvicted
     }
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1840,9 +1886,9 @@ impl ConsensusHeader for RepairRangeReplyHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RepairDone && self.command != Command2::RangeEvicted {
+        if self.command != Command::RepairDone && self.command != Command::RangeEvicted {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RepairDone,
+                expected: Command::RepairDone,
                 found: self.command,
             });
         }
@@ -1874,7 +1920,7 @@ pub struct RequestStateTransferHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -1896,7 +1942,7 @@ const _: () = {
 impl ConsensusHeader for RequestStateTransferHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RequestStateTransfer;
+    const COMMAND: Command = Command::RequestStateTransfer;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -1908,7 +1954,7 @@ impl ConsensusHeader for RequestStateTransferHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -1917,9 +1963,9 @@ impl ConsensusHeader for RequestStateTransferHeader {
 
     #[allow(clippy::cast_possible_truncation)]
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RequestStateTransfer {
+        if self.command != Command::RequestStateTransfer {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RequestStateTransfer,
+                expected: Command::RequestStateTransfer,
                 found: self.command,
             });
         }
@@ -1956,7 +2002,7 @@ pub struct StateTransferTargetHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2020,7 +2066,7 @@ const _: () = {
 impl ConsensusHeader for StateTransferTargetHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::StateTransferTarget;
+    const COMMAND: Command = Command::StateTransferTarget;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2032,7 +2078,7 @@ impl ConsensusHeader for StateTransferTargetHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -2040,9 +2086,9 @@ impl ConsensusHeader for StateTransferTargetHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::StateTransferTarget {
+        if self.command != Command::StateTransferTarget {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::StateTransferTarget,
+                expected: Command::StateTransferTarget,
                 found: self.command,
             });
         }
@@ -2096,7 +2142,7 @@ pub struct RequestStateChunkHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2121,7 +2167,7 @@ const _: () = {
 impl ConsensusHeader for RequestStateChunkHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::RequestStateChunk;
+    const COMMAND: Command = Command::RequestStateChunk;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2133,7 +2179,7 @@ impl ConsensusHeader for RequestStateChunkHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -2142,9 +2188,9 @@ impl ConsensusHeader for RequestStateChunkHeader {
 
     #[allow(clippy::cast_possible_truncation)]
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::RequestStateChunk {
+        if self.command != Command::RequestStateChunk {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::RequestStateChunk,
+                expected: Command::RequestStateChunk,
                 found: self.command,
             });
         }
@@ -2181,7 +2227,7 @@ pub struct StateChunkHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2205,7 +2251,7 @@ const _: () = {
 impl ConsensusHeader for StateChunkHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::StateChunk;
+    const COMMAND: Command = Command::StateChunk;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2217,7 +2263,7 @@ impl ConsensusHeader for StateChunkHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -2225,9 +2271,9 @@ impl ConsensusHeader for StateChunkHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::StateChunk {
+        if self.command != Command::StateChunk {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::StateChunk,
+                expected: Command::StateChunk,
                 found: self.command,
             });
         }
@@ -2257,7 +2303,7 @@ impl ConsensusHeader for StateChunkHeader {
 /// peer could inject a `Request` + `Register` directly. Clients cannot
 /// reach this command, because every client frame is typed through
 /// [`RequestHeader`], whose `validate` rejects any command but
-/// [`Command2::Request`].
+/// [`Command::Request`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, CheckedBitPattern, NoUninit)]
 #[repr(C)]
 pub struct ForwardRegisterHeader {
@@ -2267,7 +2313,7 @@ pub struct ForwardRegisterHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2299,7 +2345,7 @@ impl ConsensusHeader for ForwardRegisterHeader {
     // believed: a flipped bit there would commit a register under another user.
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::ForwardRegister;
+    const COMMAND: Command = Command::ForwardRegister;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2311,7 +2357,7 @@ impl ConsensusHeader for ForwardRegisterHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -2319,9 +2365,9 @@ impl ConsensusHeader for ForwardRegisterHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::ForwardRegister {
+        if self.command != Command::ForwardRegister {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::ForwardRegister,
+                expected: Command::ForwardRegister,
                 found: self.command,
             });
         }
@@ -2345,7 +2391,7 @@ pub struct ForwardRegisterResultHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2409,7 +2455,7 @@ pub enum ForwardRegisterOutcome {
 impl ConsensusHeader for ForwardRegisterResultHeader {
     const FRAME_SEALED: bool = true;
 
-    const COMMAND: Command2 = Command2::ForwardRegisterResult;
+    const COMMAND: Command = Command::ForwardRegisterResult;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2421,7 +2467,7 @@ impl ConsensusHeader for ForwardRegisterResultHeader {
     fn operation(&self) -> Operation {
         Operation::Reserved
     }
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
     fn size(&self) -> u32 {
@@ -2429,9 +2475,9 @@ impl ConsensusHeader for ForwardRegisterResultHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::ForwardRegisterResult {
+        if self.command != Command::ForwardRegisterResult {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::ForwardRegisterResult,
+                expected: Command::ForwardRegisterResult,
                 found: self.command,
             });
         }
@@ -2476,7 +2522,7 @@ pub struct ForwardLogoutHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2504,7 +2550,7 @@ const _: () = {
 
 impl ConsensusHeader for ForwardLogoutHeader {
     const FRAME_SEALED: bool = true;
-    const COMMAND: Command2 = Command2::ForwardLogout;
+    const COMMAND: Command = Command::ForwardLogout;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2518,7 +2564,7 @@ impl ConsensusHeader for ForwardLogoutHeader {
         Operation::Reserved
     }
 
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
 
@@ -2527,9 +2573,9 @@ impl ConsensusHeader for ForwardLogoutHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::ForwardLogout {
+        if self.command != Command::ForwardLogout {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::ForwardLogout,
+                expected: Command::ForwardLogout,
                 found: self.command,
             });
         }
@@ -2556,7 +2602,7 @@ pub struct ForwardLogoutResultHeader {
     pub size: u32,
     pub view: u32,
     pub release: u32,
-    pub command: Command2,
+    pub command: Command,
     pub replica: u8,
     pub reserved_frame: [u8; 66],
 
@@ -2597,7 +2643,7 @@ pub enum ForwardLogoutOutcome {
 
 impl ConsensusHeader for ForwardLogoutResultHeader {
     const FRAME_SEALED: bool = true;
-    const COMMAND: Command2 = Command2::ForwardLogoutResult;
+    const COMMAND: Command = Command::ForwardLogoutResult;
 
     fn checksum(&self) -> u128 {
         self.checksum
@@ -2611,7 +2657,7 @@ impl ConsensusHeader for ForwardLogoutResultHeader {
         Operation::Reserved
     }
 
-    fn command(&self) -> Command2 {
+    fn command(&self) -> Command {
         self.command
     }
 
@@ -2620,9 +2666,9 @@ impl ConsensusHeader for ForwardLogoutResultHeader {
     }
 
     fn validate(&self) -> Result<(), ConsensusError> {
-        if self.command != Command2::ForwardLogoutResult {
+        if self.command != Command::ForwardLogoutResult {
             return Err(ConsensusError::InvalidCommand {
-                expected: Command2::ForwardLogoutResult,
+                expected: Command::ForwardLogoutResult,
                 found: self.command,
             });
         }
@@ -2693,15 +2739,41 @@ fn validate_forward_frame(
 
 #[cfg(test)]
 mod tests {
+
+    // The byte-level twin exists for frames whose operation byte does not
+    // cast; if it ever disagrees with the typed method, a genuine
+    // newer-release prepare would be reported as corruption.
+    #[test]
+    fn byte_level_identity_checksum_matches_the_typed_method() {
+        let mut header = PrepareHeader {
+            command: Command::Prepare,
+            view: 42,
+            op: 7,
+            client: 0xCAFE,
+            operation: Operation::CreateStream,
+            size: u32::try_from(HEADER_SIZE).expect("header size fits in u32"),
+            ..Default::default()
+        };
+        header.checksum = header.identity_checksum();
+
+        let bytes: &[u8; HEADER_SIZE] = bytemuck::bytes_of(&header)
+            .try_into()
+            .expect("a consensus header is HEADER_SIZE bytes");
+        assert_eq!(
+            prepare_identity_checksum_bytes(bytes),
+            header.identity_checksum()
+        );
+    }
+    use super::prepare_identity_checksum_bytes;
     use super::{
-        Command2, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
-        EvictionHeader, EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome,
-        ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
-        ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, Operation, PrepareHeader,
-        PrepareOkHeader, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
-        RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
-        RequestStateTransferHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
-        StateChunkHeader, StateTransferTargetHeader,
+        Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader, EvictionHeader,
+        EvictionReason, ForwardLogoutHeader, ForwardLogoutOutcome, ForwardLogoutResultHeader,
+        ForwardRegisterHeader, ForwardRegisterOutcome, ForwardRegisterResultHeader, GenericHeader,
+        HEADER_SIZE, Operation, PrepareHeader, PrepareOkHeader, RepairPrepareHeader,
+        RepairRangeReplyHeader, ReplyHeader, RequestHeader, RequestPreparesHeader,
+        RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+        RoutedRequestHeader, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+        StateTransferTargetHeader,
     };
     use aligned_vec::{AVec, ConstAlign};
 
@@ -2832,7 +2904,7 @@ mod tests {
         }
 
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             checksum: 0xdead_beef,
             ..Default::default()
         };
@@ -2856,14 +2928,14 @@ mod tests {
     fn generic_header_zero_copy() {
         let buf = aligned_zeroed(256);
         let header: &GenericHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
-        assert_eq!(header.command, Command2::Reserved);
+        assert_eq!(header.command, Command::Reserved);
         assert_eq!(header.size, 0);
     }
 
     #[test]
     fn request_header_zero_copy() {
         let mut buf = aligned_zeroed(256);
-        buf[60] = Command2::Request as u8;
+        buf[60] = Command::Request as u8;
         // client offset = 60 + 1 (replica) + 66 (reserved_frame) = 128.
         // validate rejects client == 0.
         buf[128] = 1;
@@ -2871,7 +2943,7 @@ mod tests {
         // operation is `Reserved`, which validate rejects.
         buf[std::mem::offset_of!(RequestHeader, operation)] = Operation::Register as u8;
         let header: &RequestHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
-        assert_eq!(header.command, Command2::Request);
+        assert_eq!(header.command, Command::Request);
         assert!(header.validate().is_ok());
     }
 
@@ -2888,7 +2960,7 @@ mod tests {
     #[test]
     fn request_reserved_operation_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             client: 1,
             operation: Operation::Reserved,
             session: 1,
@@ -2901,7 +2973,7 @@ mod tests {
     #[test]
     fn request_register_nonzero_session_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::Register,
             session: 5,
             request: 0,
@@ -2913,7 +2985,7 @@ mod tests {
     #[test]
     fn request_register_nonzero_request_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::Register,
             session: 0,
             request: 1,
@@ -2925,7 +2997,7 @@ mod tests {
     #[test]
     fn request_non_register_valid() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             client: 0xCAFE,
             session: 10,
@@ -2938,7 +3010,7 @@ mod tests {
     #[test]
     fn request_non_register_zero_session_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             session: 0,
             request: 1,
@@ -2950,7 +3022,7 @@ mod tests {
     #[test]
     fn request_non_register_zero_request_rejected() {
         let header = RequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             session: 10,
             request: 0,
@@ -2962,9 +3034,9 @@ mod tests {
     #[test]
     fn reply_header_zero_copy() {
         let mut buf = aligned_zeroed(256);
-        buf[60] = Command2::Reply as u8;
+        buf[60] = Command::Reply as u8;
         let header: &ReplyHeader = bytemuck::checked::try_from_bytes(&buf).unwrap();
-        assert_eq!(header.command, Command2::Reply);
+        assert_eq!(header.command, Command::Reply);
         assert!(header.validate().is_ok());
     }
 
@@ -3011,7 +3083,7 @@ mod tests {
     #[test]
     fn routed_request_zero_client_rejected() {
         let header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             session: 10,
             request: 1,
@@ -3023,7 +3095,7 @@ mod tests {
     #[test]
     fn routed_request_reserved_operation_rejected() {
         let header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             client: 0xCAFE,
             session: 10,
             request: 1,
@@ -3040,7 +3112,7 @@ mod tests {
     #[test]
     fn routed_request_valid_fields_accepted() {
         let header = RoutedRequestHeader {
-            command: Command2::Request,
+            command: Command::Request,
             operation: Operation::SendMessages,
             client: 0xCAFE,
             session: 10,
@@ -3056,7 +3128,7 @@ mod tests {
     #[test]
     fn reply_header_nonzero_status_still_validates() {
         let header = ReplyHeader {
-            command: Command2::Reply,
+            command: Command::Reply,
             status: 41,
             ..ReplyHeader::default()
         };
@@ -3154,7 +3226,7 @@ mod tests {
             size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
             view: 3,
             release: 0,
-            command: Command2::ForwardRegister,
+            command: Command::ForwardRegister,
             replica: 2,
             reserved_frame: [0; 66],
             client: 0xCAFE,
@@ -3175,7 +3247,7 @@ mod tests {
             size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
             view: 3,
             release: 0,
-            command: Command2::ForwardRegisterResult,
+            command: Command::ForwardRegisterResult,
             replica: 0,
             reserved_frame: [0; 66],
             nonce: 0xF00D,
@@ -3193,11 +3265,11 @@ mod tests {
     fn forward_register_round_trips_through_generic_bytes() {
         for (command, bytes) in [
             (
-                Command2::ForwardRegister,
+                Command::ForwardRegister,
                 bytemuck::bytes_of(&forward_register()).to_vec(),
             ),
             (
-                Command2::ForwardRegisterResult,
+                Command::ForwardRegisterResult,
                 bytemuck::bytes_of(&forward_register_result(ForwardRegisterOutcome::Ok)).to_vec(),
             ),
         ] {
@@ -3335,7 +3407,7 @@ mod tests {
             size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
             view: 3,
             release: 0,
-            command: Command2::ForwardLogout,
+            command: Command::ForwardLogout,
             replica: 2,
             reserved_frame: [0; 66],
             client: 0xCAFE,
@@ -3356,7 +3428,7 @@ mod tests {
             size: u32::try_from(HEADER_SIZE).expect("HEADER_SIZE fits u32"),
             view: 3,
             release: 0,
-            command: Command2::ForwardLogoutResult,
+            command: Command::ForwardLogoutResult,
             replica: 0,
             reserved_frame: [0; 66],
             nonce: 0xF00D,
@@ -3393,7 +3465,7 @@ mod tests {
             bytes.copy_from_slice(bytemuck::bytes_of(&result));
             let generic = bytemuck::checked::try_from_bytes::<GenericHeader>(&bytes)
                 .expect("forward logout result is a valid generic header");
-            assert_eq!(generic.command, Command2::ForwardLogoutResult);
+            assert_eq!(generic.command, Command::ForwardLogoutResult);
         }
     }
 

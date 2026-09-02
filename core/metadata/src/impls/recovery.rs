@@ -20,7 +20,7 @@ use crate::stm::StateMachine;
 use crate::stm::authz::GatedApply;
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use consensus::{
-    ClientTable, ClientTableDecodeError, VsrState, VsrStateError, build_reply_message,
+    ClientTable, ClientTableDecodeError, SessionEnd, VsrState, VsrStateError, build_reply_message,
     build_reply_message_with,
 };
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
@@ -358,6 +358,7 @@ pub async fn recover<M>(
     journal_slots: usize,
     clients_table_max: usize,
     seed_baseline: impl FnOnce(&M),
+    on_replayed_logout: impl Fn(&M, u128, iggy_common::IggyTimestamp),
 ) -> Result<RecoveredMetadata<M>, RecoveryError>
 where
     M: StateMachine<Input = Message<PrepareHeader>, Error = IggyError>
@@ -617,11 +618,20 @@ where
             continue;
         }
         if header.operation == Operation::Logout {
-            client_table.remove_client(header.client);
-            // TODO: the commit paths also run `remove_consumer_group_member`
-            // here; recovery has no `StreamsFrontend` bound, so replayed
-            // logouts leave stale group members (pre-existing, harmless for
-            // dead connections but a divergence from the live apply).
+            client_table.remove_client(
+                header.client,
+                header.user_id,
+                SessionEnd::from_logout_request(header.request),
+            );
+            // Logout's only state-machine effect, mirrored from the live
+            // commit path: the caller drops the client from its consumer
+            // groups (`remove_consumer_group_member`) so replay and live
+            // apply converge on the same group membership.
+            on_replayed_logout(
+                &mux_stm,
+                header.client,
+                iggy_common::IggyTimestamp::from(header.timestamp),
+            );
             last_applied_op = Some(header.op);
             continue;
         }
@@ -647,7 +657,7 @@ where
             // eviction is replica-local and unlogged, so a WAL can legitimately
             // replay a lower request id onto a preserved watermark. Recovery
             // must boot from such a WAL, not refuse it.
-            let _ = client_table.commit_reply(header.client, cached);
+            let _ = client_table.commit_reply(header.client, header.user_id, cached);
         }
         tracing::debug!(
             target: "iggy.metadata.diag",
@@ -794,8 +804,9 @@ fn verify_checkpoint_pairing(
 mod tests {
     use super::*;
     use crate::impls::metadata::checkpoint_checksum;
+    use crate::stm::snapshot::SNAPSHOT_FORMAT_VERSION;
     use consensus::CLIENTS_TABLE_MAX;
-    use iggy_binary_protocol::consensus::{Command2, Operation};
+    use iggy_binary_protocol::consensus::{Command, Operation};
     use journal::Journal;
     use server_common::iobuf::Owned;
     use tempfile::tempdir;
@@ -909,7 +920,7 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.commit = commit;
         header.operation = Operation::CreateStream;
@@ -935,7 +946,7 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.commit = op.saturating_sub(1);
         header.operation = operation;
@@ -955,6 +966,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -980,6 +992,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1015,6 +1028,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1072,6 +1086,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1131,6 +1146,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await;
 
@@ -1181,6 +1197,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1218,6 +1235,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1287,6 +1305,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1332,6 +1351,7 @@ mod tests {
         let app = make_client_prepare(2, Operation::CreateStream, CLIENT, USER, 1);
         at_checkpoint.commit_reply(
             CLIENT,
+            USER,
             build_reply_message(app.header(), &bytes::Bytes::new()),
         );
 
@@ -1362,6 +1382,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1427,6 +1448,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1476,12 +1498,14 @@ mod tests {
             journal.storage_ref().fsync().await.unwrap();
         }
 
+        let replayed_logouts = std::cell::RefCell::new(Vec::new());
         let recovered = recover::<TestStm>(
             dir.path(),
             SOLO,
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, client, _| replayed_logouts.borrow_mut().push(client),
         )
         .await
         .unwrap();
@@ -1489,6 +1513,11 @@ mod tests {
             recovered.client_table.get_epoch(CLIENT),
             None,
             "logged-out session must not be resurrected"
+        );
+        assert_eq!(
+            replayed_logouts.into_inner(),
+            vec![CLIENT],
+            "replay must hand the logged-out client to the group-removal hook"
         );
         assert_eq!(recovered.last_applied_op, Some(2));
     }
@@ -1544,6 +1573,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await;
         assert!(matches!(
@@ -1576,6 +1606,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await;
         assert!(matches!(
@@ -1607,6 +1638,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
@@ -1659,6 +1691,7 @@ mod tests {
                 journal::prepare_journal::DEFAULT_SLOT_COUNT,
                 CLIENTS_TABLE_MAX,
                 |_| {},
+                |_, _, _| {},
             )
             .await;
             match result {
@@ -1672,47 +1705,87 @@ mod tests {
     }
 
     #[compio::test]
-    async fn recover_accepts_snapshot_written_before_a_trailing_default_field() {
-        // Appending a `#[serde(default)]` field is this repo's forward-compatible
-        // snapshot migration, and msgpack encodes structs positionally: a file the
-        // previous build wrote decodes fine (the default fills the missing element)
-        // but re-encodes with one MORE element. A pairing checksum recomputed by
-        // re-encoding the decoded snapshot would therefore diverge on the FIRST boot
-        // of the new build and refuse every checkpointed node, with the WAL prefix
-        // already drained. Hashing the bytes on disk is what makes that upgrade boot.
-        //
-        // Emulated in the direction the migration runs: strip the trailing element off
-        // a current-shape file, which is what the pre-`client_table` build wrote.
+    async fn recover_refuses_a_snapshot_from_another_format_version() {
+        // A snapshot shape is only as trustworthy as the version stamped on it, so a
+        // foreign one refuses boot rather than restoring whatever msgpack happens to
+        // make of the bytes. Everything else about the directory is healthy: the
+        // superblock pairs with the file on disk, so the refusal can only be the
+        // version.
         const CHECKPOINT_OP: u64 = 42;
-        let encoded = IggySnapshot::new(CHECKPOINT_OP).encode().unwrap();
-        assert_eq!(
-            encoded[0] & 0xf0,
-            0x90,
-            "snapshot must encode as a msgpack fixarray for this emulation"
-        );
-        assert_eq!(
-            *encoded.last().unwrap(),
-            0xC0,
-            "the trailing snapshot field must encode as nil here; adjust the emulation \
-             if the last field stops being an Option"
-        );
-        let mut legacy = vec![0x90 | ((encoded[0] & 0x0f) - 1)];
-        legacy.extend_from_slice(&encoded[1..encoded.len() - 1]);
+        let mut snapshot = IggySnapshot::new(CHECKPOINT_OP);
+        snapshot.snapshot_mut().version = SNAPSHOT_FORMAT_VERSION + 1;
+        let foreign = snapshot.encode().unwrap();
 
-        let decoded = IggySnapshot::decode(&legacy).unwrap();
-        assert_eq!(decoded.sequence_number(), CHECKPOINT_OP);
+        let dir = tempdir().unwrap();
+        let metadata_dir = dir.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        std::fs::write(metadata_dir.join("snapshot.bin"), &foreign).unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&foreign));
+        {
+            let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
+            superblock.write(&state.to_bytes()).await.unwrap();
+        }
+
+        match recover::<TestStm>(
+            dir.path(),
+            CLUSTERED,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            |_, _, _| {},
+        )
+        .await
+        {
+            Err(RecoveryError::Snapshot(SnapshotError::UnsupportedFormatVersion {
+                found,
+                expected,
+            })) => {
+                assert_eq!(found, SNAPSHOT_FORMAT_VERSION + 1);
+                assert_eq!(expected, SNAPSHOT_FORMAT_VERSION);
+            }
+            Err(other) => panic!("expected a format-version refusal, got {other}"),
+            Ok(_) => panic!("expected a foreign format version to refuse boot"),
+        }
+    }
+
+    #[compio::test]
+    async fn recover_pairs_the_checkpoint_against_the_bytes_on_disk() {
+        // The pairing checksum is taken over the file's bytes, never over a re-encode
+        // of the decoded snapshot. Re-encoding would tie recovery to
+        // decode-then-encode staying byte-identical across every serde and rmp
+        // release, and a divergence there would refuse boot on every checkpointed node
+        // with its WAL prefix already drained.
+        //
+        // Canonical bytes cannot show that: they re-encode byte-identically (pinned by
+        // `populated_snapshot_reencode_and_checksum_are_stable`), so both candidate
+        // checksums agree and the assertion holds either way. This file is instead
+        // noncanonical but decodable, carrying the version in a `u32` marker that
+        // `read_int` accepts and a re-encode collapses back to a fixint, so hashing a
+        // re-encode gives a different checksum and the test can fail.
+        const CHECKPOINT_OP: u64 = 42;
+        let canonical = IggySnapshot::new(CHECKPOINT_OP).encode().unwrap();
+        let on_disk = with_wide_version_marker(&canonical);
+
+        // Both halves of "noncanonical but decodable", so this cannot pass vacuously.
         assert_ne!(
-            decoded.encode().unwrap(),
-            legacy,
-            "the emulated legacy file must NOT round-trip byte-identically, else this \
-             test cannot distinguish the two checksum sources"
+            on_disk, canonical,
+            "the file must not be byte-identical to the canonical encoding"
+        );
+        let round_tripped = MetadataSnapshot::decode(&on_disk)
+            .expect("a wide version marker must still decode")
+            .encode()
+            .unwrap();
+        assert_ne!(
+            checkpoint_checksum(&on_disk),
+            checkpoint_checksum(&round_tripped),
+            "the two candidate checksums must differ, or this proves nothing"
         );
 
         let dir = tempdir().unwrap();
         let metadata_dir = dir.path().join("metadata");
         std::fs::create_dir_all(&metadata_dir).unwrap();
-        std::fs::write(metadata_dir.join("snapshot.bin"), &legacy).unwrap();
-        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&legacy));
+        std::fs::write(metadata_dir.join("snapshot.bin"), &on_disk).unwrap();
+        let state = vsr_state_with_checkpoint(CHECKPOINT_OP, checkpoint_checksum(&on_disk));
         {
             let superblock = PingPongSuperblock::open(&metadata_dir).await.unwrap();
             superblock.write(&state.to_bytes()).await.unwrap();
@@ -1724,15 +1797,37 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();
         assert_eq!(recovered.snapshot_checkpoint.0, CHECKPOINT_OP);
         assert_eq!(
             recovered.snapshot_checkpoint.1,
-            checkpoint_checksum(&legacy),
+            checkpoint_checksum(&on_disk),
             "the verified pairing must be the checksum of the bytes on disk"
         );
+    }
+
+    /// Re-encode a snapshot's leading `version` as an explicit msgpack `u32` marker
+    /// instead of the canonical fixint: same value, five bytes instead of one.
+    ///
+    /// `rmp` reads it back through the same `read_int` the peek uses, and a re-encode
+    /// canonicalizes it away, which is what makes it a probe for "did recovery hash
+    /// the file or its own re-encode".
+    fn with_wide_version_marker(canonical: &[u8]) -> Vec<u8> {
+        let mut cursor = canonical;
+        rmp::decode::read_array_len(&mut cursor).expect("a snapshot encodes as an array");
+        let array_header = canonical.len() - cursor.len();
+        let version: u32 =
+            rmp::decode::read_int(&mut cursor).expect("version is the first element");
+        let version_len = canonical.len() - cursor.len() - array_header;
+
+        let mut wide = Vec::with_capacity(canonical.len() + 4);
+        wide.extend_from_slice(&canonical[..array_header]);
+        rmp::encode::write_u32(&mut wide, version).expect("writing to a Vec cannot fail");
+        wide.extend_from_slice(&canonical[array_header + version_len..]);
+        wide
     }
 
     #[compio::test]
@@ -1755,6 +1850,7 @@ mod tests {
             journal::prepare_journal::DEFAULT_SLOT_COUNT,
             CLIENTS_TABLE_MAX,
             |_| {},
+            |_, _, _| {},
         )
         .await
         .unwrap();

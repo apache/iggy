@@ -22,7 +22,7 @@ Basic messaging BDD test implementation for Python SDK
 import asyncio
 import socket
 
-from apache_iggy import IggyClient, PollingStrategy, SendMessage
+from apache_iggy import Consumer, IggyClient, PollingStrategy, SendMessage
 from pytest_bdd import given, parsers, scenarios, then, when
 
 # Load scenarios from the shared feature file
@@ -52,11 +52,11 @@ def running_server(context):
 
 
 @given("I am authenticated as the root user")
-def authenticated_root_user(context):
+def authenticated_root_user(context, root_credentials):
     """Authenticate as root user"""
 
     async def _login():
-        await context.client.login_user("iggy", "iggy")
+        await context.client.login_user(*root_credentials)
 
     asyncio.run(_login())
 
@@ -221,6 +221,7 @@ def poll_messages(context, stream_id, topic_id, partition_id, start_offset):
         context.last_polled_messages = await context.client.poll_messages(
             stream=stream_id,
             topic=topic_id,
+            consumer=Consumer.Single(1),
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Offset(value=start_offset),
             count=100,  # Poll up to 100 messages

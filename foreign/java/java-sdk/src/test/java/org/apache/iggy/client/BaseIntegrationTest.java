@@ -58,11 +58,18 @@ public abstract class BaseIntegrationTest {
     private static final boolean USE_EXTERNAL_SERVER = System.getenv("USE_EXTERNAL_SERVER") != null;
 
     public static int serverTcpPort() {
-        return USE_EXTERNAL_SERVER ? TCP_PORT : iggyServer.getMappedPort(TCP_PORT);
+        return USE_EXTERNAL_SERVER ? externalPort("EXTERNAL_TCP_PORT", TCP_PORT) : iggyServer.getMappedPort(TCP_PORT);
     }
 
     public static int serverHttpPort() {
-        return USE_EXTERNAL_SERVER ? HTTP_PORT : iggyServer.getMappedPort(HTTP_PORT);
+        return USE_EXTERNAL_SERVER
+                ? externalPort("EXTERNAL_HTTP_PORT", HTTP_PORT)
+                : iggyServer.getMappedPort(HTTP_PORT);
+    }
+
+    private static int externalPort(String variable, int defaultPort) {
+        var configured = System.getenv(variable);
+        return configured != null ? Integer.parseInt(configured) : defaultPort;
     }
 
     public static String serverHost() {
@@ -84,6 +91,7 @@ public abstract class BaseIntegrationTest {
                     .withEnv("IGGY_ROOT_PASSWORD", "iggy")
                     .withEnv("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
                     .withEnv("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
+                    .withEnv("IGGY_NODE_ADVERTISED_ADDRESS", "127.0.0.1")
                     .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
                             .withCapAdd(Capability.SYS_NICE)
                             .withSecurityOpts(List.of("seccomp:unconfined"))

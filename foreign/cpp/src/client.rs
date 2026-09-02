@@ -18,15 +18,20 @@
 use crate::{RUNTIME, ffi};
 use bytes::Bytes;
 use iggy::prelude::{
-    Client as IggyConnectionClient, ClusterClient,
+    AutoLogin as RustAutoLogin, Client as IggyConnectionClient, ClusterClient,
     CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
     ConsumerOffsetClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
-    IggyClientBuilder as RustIggyClientBuilder, IggyExpiry as RustIggyExpiry, IggyMessage,
-    IggyTimestamp, MaxTopicSize as RustMaxTopicSize, MessageClient, PartitionClient, Partitioning,
+    IggyClientBuilder as RustIggyClientBuilder, IggyDuration as RustIggyDuration,
+    IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
+    MessageClient, NonZeroIggyDuration as RustNonZeroIggyDuration,
+    OptionsScope as RustOptionsScope, PartitionClient, Partitioning,
     Permissions as RustPermissions, PollingStrategy, SegmentClient,
-    SnapshotCompression as RustSnapshotCompression, StreamClient, SystemClient as RustSystemClient,
-    SystemSnapshotType as RustSystemSnapshotType, TopicClient, UserClient,
+    SnapshotCompression as RustSnapshotCompression, StreamClient, StreamUpdateOptions,
+    SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
+    TopicCreateOptions, TopicUpdateOptions, UserClient, UserStatus as RustUserStatus,
+    UserUpdateOptions,
 };
+use iggy_common::Credentials as RustCredentials;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -73,23 +78,73 @@ pub struct Client {
 ///   (use-after-free).
 /// - This function does not provide synchronisation. The pointer must not be used concurrently
 ///   from multiple threads unless the caller serialises access externally.
-pub fn new_connection(connection_string: String) -> Result<*mut Client, String> {
-    let connection_str = connection_string.as_str();
-    let client = match connection_str {
-        "" => RustIggyClientBuilder::new()
-            .with_tcp()
-            .build()
-            .map_err(|error| format!("Could not build default connection: {error}"))?,
-        s if s.starts_with("iggy://") || s.starts_with("iggy+") => {
-            RustIggyClient::from_connection_string(s)
-                .map_err(|error| format!("Could not parse connection string '{s}': {error}"))?
+pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, String> {
+    let mut builder = RustIggyClientBuilder::new().with_tcp();
+    if !config.server_address.is_empty() {
+        builder = builder.with_server_address(config.server_address);
+    }
+    match config.auto_login_kind {
+        ffi::AutoLoginKind::Disabled => {}
+        ffi::AutoLoginKind::UsernamePassword => {
+            builder = builder.with_auto_sign_in(RustAutoLogin::Enabled(
+                RustCredentials::UsernamePassword(config.username, config.password.into()),
+            ));
         }
-        s => RustIggyClientBuilder::new()
-            .with_tcp()
-            .with_server_address(connection_string.clone())
-            .build()
-            .map_err(|error| format!("Could not build connection for address '{s}': {error}"))?,
-    };
+        ffi::AutoLoginKind::PersonalAccessToken => {
+            builder = builder.with_auto_sign_in(RustAutoLogin::Enabled(
+                RustCredentials::PersonalAccessToken(config.personal_access_token.into()),
+            ));
+        }
+        _ => return Err("Unsupported automatic login kind".to_owned()),
+    }
+    builder = builder.with_reconnection_max_retries(
+        config
+            .has_reconnection_max_retries
+            .then_some(config.reconnection_max_retries),
+    );
+    if config.has_reconnection_interval {
+        let reconnection_interval =
+            RustNonZeroIggyDuration::try_from(config.reconnection_interval_micros).map_err(
+                |error| format!("Invalid reconnection interval: {error}"),
+            )?;
+        builder = builder.with_reconnection_interval(reconnection_interval);
+    }
+    if config.has_reestablish_after {
+        builder =
+            builder.with_reestablish_after(RustIggyDuration::from(config.reestablish_after_micros));
+    }
+    if !config.tls_enabled
+        && (!config.tls_domain.is_empty()
+            || !config.tls_ca_file.is_empty()
+            || config.has_tls_validate_certificate)
+    {
+        return Err("TLS settings require TLS to be enabled".to_owned());
+    }
+    builder = builder.with_tls_enabled(config.tls_enabled);
+    if !config.tls_domain.is_empty() {
+        builder = builder.with_tls_domain(config.tls_domain);
+    }
+    if !config.tls_ca_file.is_empty() {
+        builder = builder.with_tls_ca_file(config.tls_ca_file);
+    }
+    if config.has_tls_validate_certificate {
+        builder = builder.with_tls_validate_certificate(config.tls_validate_certificate);
+    }
+    if config.no_delay {
+        builder = builder.with_no_delay();
+    }
+    let client = builder
+        .build()
+        .map_err(|error| format!("Could not build configured connection: {error}"))?;
+
+    Ok(Box::into_raw(Box::new(Client {
+        inner: Arc::new(client),
+    })))
+}
+
+pub fn from_connection_string(connection_string: String) -> Result<*mut Client, String> {
+    let client = RustIggyClient::from_connection_string(&connection_string)
+        .map_err(|error| format!("Could not parse connection string: {error}"))?;
 
     Ok(Box::into_raw(Box::new(Client {
         inner: Arc::new(client),
@@ -97,13 +152,14 @@ pub fn new_connection(connection_string: String) -> Result<*mut Client, String> 
 }
 
 impl Client {
-    pub fn login_user(&self, username: String, password: String) -> Result<(), String> {
+    pub fn login_user(&self, username: String, password: String) -> Result<ffi::LoginInfo, String> {
         RUNTIME.block_on(async {
-            self.inner
+            let identity = self
+                .inner
                 .login_user(&username, &password)
                 .await
                 .map_err(|error| format!("Could not login user '{username}': {error}"))?;
-            Ok(())
+            Ok(ffi::LoginInfo::from(identity))
         })
     }
 
@@ -179,7 +235,12 @@ impl Client {
 
         RUNTIME.block_on(async {
             self.inner
-                .update_stream(&rust_stream_id, &stream_name)
+                // Streams have no option keys yet.
+                .update_stream(
+                    &rust_stream_id,
+                    &stream_name,
+                    &StreamUpdateOptions::default(),
+                )
                 .await
                 .map_err(|error| {
                     format!(
@@ -384,10 +445,10 @@ impl Client {
         topic_name: String,
         partitions_count: u32,
         compression_algorithm: String,
-        replication_factor: u8,
         message_expiry_kind: String,
         message_expiry_value: u64,
         max_topic_size: String,
+        options: Vec<ffi::HeaderEntry>,
     ) -> Result<ffi::TopicDetails, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
@@ -399,7 +460,6 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -421,18 +481,28 @@ impl Client {
             })?,
         };
 
+        let raw = crate::type_conversion::ffi_options_to_raw(options)
+            .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
+
+        // `None` is what tells admission to resolve the server default, so the
+        // sentinels the string parsers produce must collapse back to it.
+        let options = TopicCreateOptions {
+            partitions_count: Some(partitions_count),
+            compression_algorithm: (rust_compression_algorithm
+                != RustCompressionAlgorithm::default())
+            .then_some(rust_compression_algorithm),
+            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
+                .then_some(rust_message_expiry),
+            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
+                .then_some(rust_max_topic_size),
+            raw,
+            ..TopicCreateOptions::default()
+        };
+
         RUNTIME.block_on(async {
             let topic_details = self
                 .inner
-                .create_topic(
-                    &rust_stream_id,
-                    &topic_name,
-                    partitions_count,
-                    rust_compression_algorithm,
-                    rust_replication_factor,
-                    rust_message_expiry,
-                    rust_max_topic_size,
-                )
+                .create_topic(&rust_stream_id, &topic_name, &options)
                 .await
                 .map_err(|error| {
                     format!(
@@ -495,10 +565,10 @@ impl Client {
         topic_id: ffi::Identifier,
         topic_name: String,
         compression_algorithm: String,
-        replication_factor: u8,
         message_expiry_kind: String,
         message_expiry_value: u64,
         max_topic_size: String,
+        options: Vec<ffi::HeaderEntry>,
     ) -> Result<(), String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
@@ -512,7 +582,6 @@ impl Client {
                 )
             })?,
         };
-        let rust_replication_factor = Some(replication_factor.max(1));
         let rust_message_expiry = match message_expiry_kind.as_str() {
             "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
             "never_expire" => RustIggyExpiry::NeverExpire,
@@ -534,17 +603,25 @@ impl Client {
             })?,
         };
 
+        let raw = crate::type_conversion::ffi_options_to_raw(options)
+            .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
+
+        // Settings ride the options block; a server-default sentinel means the
+        // caller did not set the key, so the topic keeps its current value.
+        let update_options = TopicUpdateOptions {
+            compression_algorithm: (rust_compression_algorithm
+                != RustCompressionAlgorithm::default())
+            .then_some(rust_compression_algorithm),
+            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
+                .then_some(rust_message_expiry),
+            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
+                .then_some(rust_max_topic_size),
+            raw,
+        };
+
         RUNTIME.block_on(async {
             self.inner
-                .update_topic(
-                    &rust_stream_id,
-                    &rust_topic_id,
-                    &topic_name,
-                    rust_compression_algorithm,
-                    rust_replication_factor,
-                    rust_message_expiry,
-                    rust_max_topic_size,
-                )
+                .update_topic(&rust_stream_id, &rust_topic_id, &topic_name, &update_options)
                 .await
                 .map_err(|error| {
                     format!(
@@ -986,6 +1063,34 @@ impl Client {
         })
     }
 
+    /// Serves the option catalog of one scope: "topic", "stream" or "user".
+    ///
+    /// A caller learns the keys `create_topic` accepts from here and nowhere
+    /// else. A key outside the catalog is refused at create, and the binary
+    /// transports answer that refusal with an error code alone, so the
+    /// rejection never names the keys that would have worked.
+    ///
+    /// A scope whose catalog is still empty answers with an empty vector, so an
+    /// empty result means the scope takes no keys yet, not that the call failed.
+    pub fn describe_options(&self, scope: String) -> Result<Vec<ffi::OptionSpec>, String> {
+        let rust_scope = RustOptionsScope::from_str(&scope).map_err(|_| {
+            format!(
+                "Could not describe options: invalid scope '{scope}'. Expected 'topic', 'stream' or 'user'."
+            )
+        })?;
+
+        RUNTIME.block_on(async {
+            let specs = self
+                .inner
+                .describe_options(rust_scope)
+                .await
+                .map_err(|error| {
+                    format!("Could not describe options for scope '{rust_scope}': {error}")
+                })?;
+            Ok(specs.into_iter().map(ffi::OptionSpec::from).collect())
+        })
+    }
+
     pub fn ping(&self) -> Result<(), String> {
         RUNTIME.block_on(async {
             self.inner
@@ -1086,6 +1191,99 @@ impl Client {
         })
     }
 
+    pub fn get_user(&self, user_id: ffi::Identifier) -> Result<ffi::UserInfoDetails, String> {
+        let rust_user_id = RustIdentifier::try_from(user_id)
+            .map_err(|error| format!("Could not get user: invalid user identifier: {error}"))?;
+
+        RUNTIME.block_on(async {
+            let user = self
+                .inner
+                .get_user(&rust_user_id)
+                .await
+                .map_err(|error| format!("Could not get user '{rust_user_id}': {error}"))?;
+            ffi::UserInfoDetails::try_from(user)
+                .map_err(|error| format!("Could not get user '{rust_user_id}': {error}"))
+        })
+    }
+
+    pub fn get_users(&self) -> Result<Vec<ffi::UserInfo>, String> {
+        RUNTIME.block_on(async {
+            let users = self
+                .inner
+                .get_users()
+                .await
+                .map_err(|error| format!("Could not get users: {error}"))?;
+            Ok(users.into_iter().map(ffi::UserInfo::from).collect())
+        })
+    }
+
+    pub fn create_user(
+        &self,
+        username: String,
+        password: String,
+        status: ffi::UserStatus,
+        has_permissions: bool,
+        permissions: ffi::Permissions,
+    ) -> Result<ffi::UserInfoDetails, String> {
+        let rust_status = RustUserStatus::try_from(status)
+            .map_err(|error| format!("Could not create user '{username}': {error}"))?;
+        let rust_permissions = has_permissions
+            .then(|| RustPermissions::try_from(permissions))
+            .transpose()
+            .map_err(|error| format!("Could not create user '{username}': {error}"))?;
+
+        RUNTIME.block_on(async {
+            let user = self
+                .inner
+                .create_user(&username, &password, rust_status, rust_permissions)
+                .await
+                .map_err(|error| format!("Could not create user '{username}': {error}"))?;
+            Ok(ffi::UserInfoDetails::from(user))
+        })
+    }
+
+    pub fn delete_user(&self, user_id: ffi::Identifier) -> Result<(), String> {
+        let rust_user_id = RustIdentifier::try_from(user_id)
+            .map_err(|error| format!("Could not delete user: invalid user identifier: {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .delete_user(&rust_user_id)
+                .await
+                .map_err(|error| format!("Could not delete user '{rust_user_id}': {error}"))?;
+            Ok(())
+        })
+    }
+
+    pub fn update_user(
+        &self,
+        user_id: ffi::Identifier,
+        has_username: bool,
+        username: String,
+        has_status: bool,
+        status: ffi::UserStatus,
+    ) -> Result<(), String> {
+        let rust_user_id = RustIdentifier::try_from(user_id)
+            .map_err(|error| format!("Could not update user: invalid user identifier: {error}"))?;
+        let rust_status = has_status
+            .then(|| RustUserStatus::try_from(status))
+            .transpose()
+            .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
+
+        RUNTIME.block_on(async {
+            self.inner
+                .update_user(
+                    &rust_user_id,
+                    has_username.then_some(username.as_str()),
+                    rust_status,
+                    &UserUpdateOptions::default(),
+                )
+                .await
+                .map_err(|error| format!("Could not update user '{rust_user_id}': {error}"))?;
+            Ok(())
+        })
+    }
+
     pub fn update_permissions(
         &self,
         user_id: ffi::Identifier,
@@ -1146,12 +1344,10 @@ impl Client {
     }
 }
 
-pub unsafe fn delete_connection(client: *mut Client) -> Result<(), String> {
+pub unsafe fn delete_connection(client: *mut Client) {
     if !client.is_null() {
         unsafe {
             drop(Box::from_raw(client));
         }
     }
-
-    Ok(())
 }

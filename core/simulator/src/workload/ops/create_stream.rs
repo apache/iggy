@@ -19,7 +19,7 @@
 //! by reusing a live stream name from the shadow.
 
 use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -39,7 +39,7 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::NameAlreadyExists];
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
@@ -49,6 +49,10 @@ pub fn sample(
         Outcome::NameAlreadyExists => Some(Input {
             name: shadow.pick_stream_name(prng)?,
         }),
+        // Not targeted (absent from `OUTCOMES`): the sim client sends no options
+        // block, and the slab ceiling needs `MAX_STREAMS` surviving creates in
+        // one run, far past any workload length.
+        Outcome::InvalidOptionValue | Outcome::TooManyStreams => None,
     }
 }
 
@@ -72,6 +76,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::AddStream {
             name: input.name.clone(),
         },
-        Outcome::NameAlreadyExists => Effect::None,
+        Outcome::NameAlreadyExists | Outcome::InvalidOptionValue | Outcome::TooManyStreams => {
+            Effect::None
+        }
     }
 }

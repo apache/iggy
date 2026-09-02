@@ -49,11 +49,11 @@ async fn init_system(client: &IggyClient) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -157,7 +157,7 @@ async fn create_consumer(client: &IggyClient, consumer_group_name: &str) -> Iggy
         .polling_strategy(PollingStrategy::next())
         .auto_join_consumer_group()
         .auto_commit(AutoCommit::IntervalOrAfter(
-            IggyDuration::from_str("100ms").unwrap(),
+            NonZeroIggyDuration::from_str("100ms").unwrap(),
             AutoCommitAfter::ConsumingEachMessage,
         ))
         .build();

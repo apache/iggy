@@ -18,6 +18,6 @@
 mod container;
 
 pub use container::{
-    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
-    DorisSinkPreCreatedFixture,
+    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkCsvFixture, DorisSinkFixture,
+    DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
 };

@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use iggy_common::SystemClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, IggyDuration, IggyError, Snapshot, SnapshotCompression, Stats,
-    SystemSnapshotType,
+    ClientInfo, ClientInfoDetails, IggyError, NonZeroIggyDuration, OptionSpec, OptionsScope,
+    Snapshot, SnapshotCompression, Stats, SystemSnapshotType,
 };
 
 #[async_trait]
@@ -42,11 +42,15 @@ impl SystemClient for IggyClient {
         self.client.read().await.get_clients().await
     }
 
+    async fn describe_options(&self, scope: OptionsScope) -> Result<Vec<OptionSpec>, IggyError> {
+        self.client.read().await.describe_options(scope).await
+    }
+
     async fn ping(&self) -> Result<(), IggyError> {
         self.client.read().await.ping().await
     }
 
-    async fn heartbeat_interval(&self) -> IggyDuration {
+    async fn heartbeat_interval(&self) -> NonZeroIggyDuration {
         self.client.read().await.heartbeat_interval().await
     }
 

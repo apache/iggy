@@ -20,21 +20,21 @@
 //! Assemble `get_me` / `get_clients` / `get_stream(s)` / `get_topic(s)` /
 //! `get_user(s)` / `get_personal_access_tokens` / stats / cluster-metadata
 //! responses from per-shard session state and the metadata state machine, plus the
-//! [`NonReplicatedResponse`] dispatch shim and the partition-namespace
+//! `NonReplicatedResponse` dispatch shim and the partition-namespace
 //! resolvers.
 
-use crate::bootstrap::{ShellBus, ShellShard};
 use crate::cluster_meta::ClusterRoster;
 use crate::session_manager::SessionManager;
+use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{transport_kind_to_wire, usize_to_u32};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use consensus::{MetadataHandle, VsrConsensus};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
-    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-    GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE,
+    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
+    GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE,
+    GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, result_code};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
@@ -42,13 +42,15 @@ use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::SendMessagesHeader;
 use iggy_binary_protocol::requests::personal_access_tokens::GetPersonalAccessTokensRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{GetStreamRequest, GetStreamsRequest};
+use iggy_binary_protocol::requests::system::{
+    DescribeOptionsRequest, OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC, OPTIONS_SCOPE_USER,
+};
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::responses::clients::client_response::ClientResponse;
@@ -68,6 +70,7 @@ use iggy_binary_protocol::responses::system::get_cluster_metadata::{
     ClusterMetadataResponse, ClusterNodeResponse,
 };
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
+use iggy_binary_protocol::responses::system::{DescribeOptionsResponse, OptionDescriptor};
 use iggy_binary_protocol::responses::topics::get_topic::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::topics::get_topics::GetTopicsResponse;
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
@@ -75,17 +78,23 @@ use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::get_users::GetUsersResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
 use iggy_binary_protocol::{
-    Command2, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
+    Command, GenericHeader, IGGY_PROTOCOL_VERSION, KIND_CONSUMER_GROUP, Operation, ReplyHeader,
     RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier, WireName, WirePartitioning,
 };
-use iggy_common::{EncryptorKind, Identifier, IggyError, IggyTimestamp};
+use iggy_common::wire_conversions::{resource_options_to_wire, resource_options_to_wire_split};
+use iggy_common::{
+    EncryptorKind, HeaderKind, Identifier, IggyError, IggyTimestamp, OptionsProvenance,
+    topic_option_keys,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
+use message_bus::BusMessage;
 use metadata::impls::metadata::StreamsFrontend;
-use partitions::PollFragments;
-use server_common::Message;
-use server_common::send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Header};
+use partitions::{Fragment, PollFragments};
+use server_common::iobuf::{Frozen, Owned};
+use server_common::send_messages;
 use server_common::sharding::IggyNamespace;
+use server_common::{MESSAGE_ALIGN, Message, ResponseBacking, ResponseFragments};
 use shard::ConnectedClientInfo;
 use std::cell::RefCell;
 use std::net::IpAddr;
@@ -99,7 +108,7 @@ use system_stats::SystemProbe;
 /// (`user_id`, transport kind, peer address) comes from the per-shard
 /// [`SessionManager`]; the `consumer_groups` list is read from the
 /// (replicated) consumer-group STM by the connection's bound VSR client id.
-pub(crate) fn build_get_personal_access_tokens_response<B, MJ, S, SB>(
+pub fn build_get_personal_access_tokens_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
@@ -107,7 +116,7 @@ pub(crate) fn build_get_personal_access_tokens_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -136,7 +145,7 @@ where
     })
 }
 
-pub(crate) fn build_get_me_response<B, MJ, S, SB>(
+pub fn build_get_me_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
@@ -144,7 +153,7 @@ pub(crate) fn build_get_me_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -211,14 +220,14 @@ where
 /// `consumer_groups_count` is resolved from the connection's bound VSR client
 /// id against the replicated `Streams` STM (memberships are keyed by VSR id, not
 /// transport id). Connections that never bound (pre-register) count 0.
-pub(crate) fn connected_client_to_response<B, MJ, S, SB>(
+pub fn connected_client_to_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     info: &ConnectedClientInfo,
 ) -> ClientResponse
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -260,7 +269,7 @@ fn fence_group_offset<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -304,7 +313,7 @@ fn fence_and_resolve_offset_namespace<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -319,7 +328,7 @@ where
     resolve_partition_namespace(shard, stream_id, topic_id, partition_id)
 }
 
-pub(crate) fn resolve_partition_request_namespace<B, MJ, S, SB>(
+pub fn resolve_partition_request_namespace<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     operation: Operation,
     body: &[u8],
@@ -328,7 +337,7 @@ pub(crate) fn resolve_partition_request_namespace<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -373,30 +382,6 @@ where
                 client_id,
             )?
         }
-        Operation::StoreConsumerOffset2 => {
-            let request = StoreConsumerOffset2Request::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            fence_and_resolve_offset_namespace(
-                shard,
-                &request.consumer,
-                &request.stream_id,
-                &request.topic_id,
-                request.partition_id,
-                client_id,
-            )?
-        }
-        Operation::DeleteConsumerOffset2 => {
-            let request = DeleteConsumerOffset2Request::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            fence_and_resolve_offset_namespace(
-                shard,
-                &request.consumer,
-                &request.stream_id,
-                &request.topic_id,
-                request.partition_id,
-                client_id,
-            )?
-        }
         Operation::DeleteSegments => {
             let request =
                 DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
@@ -419,7 +404,7 @@ fn resolve_send_messages_namespace<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -448,7 +433,7 @@ where
     )
 }
 
-pub(crate) fn resolve_partition_namespace<B, MJ, S, SB>(
+pub fn resolve_partition_namespace<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
@@ -457,7 +442,7 @@ pub(crate) fn resolve_partition_namespace<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -511,7 +496,7 @@ fn wire_identifier_for_display(id: &WireIdentifier) -> Identifier {
 /// connected-client total, used only by the stats read: it comes from the async
 /// `ListClients` scatter-gather, which this sync builder cannot run, so both
 /// transport callers gather it up front (0 for every other opcode).
-pub(crate) fn build_non_replicated_response<B, MJ, S, SB>(
+pub fn build_non_replicated_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
     body: &[u8],
@@ -523,11 +508,14 @@ pub(crate) fn build_non_replicated_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
     match code {
+        DESCRIBE_OPTIONS_CODE => Ok(NonReplicatedResponse::Bytes(
+            build_describe_options_response(body)?.to_bytes(),
+        )),
         GET_CLUSTER_METADATA_CODE => Ok(NonReplicatedResponse::Bytes(
             build_cluster_metadata_response(roster, shard, client_ip).to_bytes(),
         )),
@@ -594,34 +582,8 @@ where
                 personal_access_tokens_response(tokens)?.to_bytes(),
             ))
         }
-        GET_CONSUMER_GROUP_CODE => {
-            let request = GetConsumerGroupRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
-            let response = shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .consumer_group_details(&request.stream_id, &request.topic_id, &request.group_id);
-            Ok(response.map_or(NonReplicatedResponse::Empty, |response| {
-                NonReplicatedResponse::Bytes(response.to_bytes())
-            }))
-        }
-        GET_CONSUMER_GROUPS_CODE => {
-            let request = GetConsumerGroupsRequest::decode_from(body)
-                .map_err(|_| IggyError::InvalidCommand)?;
-            ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
-            let groups = shard
-                .plane
-                .metadata()
-                .mux_stm
-                .streams()
-                .consumer_group_list(&request.stream_id, &request.topic_id);
-            Ok(groups.map_or(NonReplicatedResponse::Empty, |groups| {
-                NonReplicatedResponse::Bytes(GetConsumerGroupsResponse { groups }.to_bytes())
-            }))
-        }
+        GET_CONSUMER_GROUP_CODE => build_consumer_group_response(shard, body),
+        GET_CONSUMER_GROUPS_CODE => build_consumer_groups_response(shard, body),
         // The server has no on-demand flush primitive, so it denies honestly.
         // The non-replicated catch-all's empty-ok would otherwise attest a
         // durability guarantee the server never gave.
@@ -640,6 +602,56 @@ where
     }
 }
 
+fn build_consumer_group_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    body: &[u8],
+) -> Result<NonReplicatedResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let request =
+        GetConsumerGroupRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
+    let response = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .consumer_group_details(&request.stream_id, &request.topic_id, &request.group_id);
+    Ok(response.map_or(NonReplicatedResponse::Empty, |response| {
+        NonReplicatedResponse::Bytes(response.to_bytes())
+    }))
+}
+
+fn build_consumer_groups_response<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    body: &[u8],
+) -> Result<NonReplicatedResponse, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let request =
+        GetConsumerGroupsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    ensure_topic_exists(shard, &request.stream_id, &request.topic_id)?;
+    let groups = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .consumer_group_list(&request.stream_id, &request.topic_id);
+    Ok(groups.map_or(NonReplicatedResponse::Empty, |groups| {
+        NonReplicatedResponse::Bytes(GetConsumerGroupsResponse { groups }.to_bytes())
+    }))
+}
+
 /// Build the binary `GetClusterMetadata` reply from the shared roster assembly.
 /// The leader marking comes from this shard's consensus view; a shard without
 /// consensus (any shard but 0) still serves the full roster, only with no node
@@ -652,7 +664,7 @@ fn build_cluster_metadata_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -672,7 +684,7 @@ where
             (!(consensus.has_ceded_primaryship() && primary_index == consensus.replica()))
                 .then_some(primary_index)
         })
-        .or_else(|| roster.current_primary_index());
+        .or_else(|| roster.current_primary_replica_id());
     let metadata = roster.cluster_metadata(primary_index, client_ip);
     ClusterMetadataResponse {
         name: metadata.name,
@@ -693,6 +705,51 @@ where
     }
 }
 
+/// `(streams, topics, partitions, segments, message bytes, messages)` for the
+/// whole node, from committed metadata plus the shared stats registry.
+///
+/// Segments are summed PER PARTITION through the same floor the detail
+/// responses apply (see [`partition_response`]), not from the stream's rolled-up
+/// counter: that counter only advances once a partition materialises, which
+/// trails its commit by a reconciler pass. Summing it made `[stats]` report
+/// fewer segments than `get_topic` did for the same partitions, and let the
+/// total climb between two reads with no write in between.
+fn aggregate_stats_totals(
+    streams: &metadata::stm::stream::StreamsInner,
+) -> Result<(u32, u32, u32, u32, u64, u64), IggyError> {
+    let mut topics_count = 0u32;
+    let mut partitions_count = 0u32;
+    let mut segments_count = 0u32;
+    let mut messages_size_bytes = 0u64;
+    let mut messages_count = 0u64;
+    for (_, stream) in &streams.items {
+        topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
+        messages_size_bytes =
+            messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
+        messages_count = messages_count.saturating_add(stream.stats.messages_count_inconsistent());
+        for (_, topic) in &stream.topics {
+            partitions_count =
+                partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
+            for partition in &topic.partitions {
+                segments_count = segments_count.saturating_add(partition_segments_count(
+                    streams,
+                    stream.id,
+                    topic.id,
+                    partition.id,
+                ));
+            }
+        }
+    }
+    Ok((
+        usize_to_u32(streams.items.len())?,
+        topics_count,
+        partitions_count,
+        segments_count,
+        messages_size_bytes,
+        messages_count,
+    ))
+}
+
 fn build_stats_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     clients_count: u32,
@@ -700,7 +757,7 @@ fn build_stats_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -716,36 +773,7 @@ where
         .metadata()
         .mux_stm
         .streams()
-        .read(|streams| -> Result<_, IggyError> {
-            let mut topics_count = 0u32;
-            let mut partitions_count = 0u32;
-            let mut segments_count = 0u32;
-            let mut messages_size_bytes = 0u64;
-            let mut messages_count = 0u64;
-            for (_, stream) in &streams.items {
-                topics_count = topics_count.saturating_add(usize_to_u32(stream.topics.len())?);
-                messages_size_bytes =
-                    messages_size_bytes.saturating_add(stream.stats.size_bytes_inconsistent());
-                messages_count =
-                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                // Segment counts roll up from the partition plane through
-                // the shared stats registry (partition -> topic -> stream).
-                segments_count =
-                    segments_count.saturating_add(stream.stats.segments_count_inconsistent());
-                for (_, topic) in &stream.topics {
-                    partitions_count =
-                        partitions_count.saturating_add(usize_to_u32(topic.partitions.len())?);
-                }
-            }
-            Ok((
-                usize_to_u32(streams.items.len())?,
-                topics_count,
-                partitions_count,
-                segments_count,
-                messages_size_bytes,
-                messages_count,
-            ))
-        })?;
+        .read(aggregate_stats_totals)?;
     let consumer_groups_count = usize_to_u32(
         shard
             .plane
@@ -860,7 +888,7 @@ static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Capture the configured data directory for `GetStats` disk reporting.
 /// Idempotent: only the first call (process bootstrap) takes effect.
-pub(crate) fn init_stats_data_path(path: PathBuf) {
+pub fn init_stats_data_path(path: PathBuf) {
     let _ = STATS_DATA_PATH.set(path);
 }
 
@@ -900,7 +928,7 @@ fn build_get_stream_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -929,7 +957,7 @@ fn build_get_streams_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -943,6 +971,126 @@ where
     })
 }
 
+/// Every key `CreateTopic` accepts, with the kind, default and bounds of each.
+///
+/// Split out of [`build_describe_options_response`] so the descriptions have room
+/// to state the bounds each value is checked against: this catalog is the only
+/// place an operator learns them.
+///
+/// Every default is a build constant: these knobs stopped being config-derived
+/// when the `[system.*]` keys became topic options, so the catalog reads them
+/// straight from `iggy_common`.
+fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
+    Ok(vec![
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::COMPRESSION_ALGORITHM)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::String.as_code(),
+            default_value: Bytes::from_static(b"none"),
+            description: "Compression algorithm (none, gzip)".to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MESSAGE_EXPIRY)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MESSAGE_EXPIRY.to_le_bytes(),
+            ),
+            description: "Message expiry in microseconds, or a humantime string \
+                              (e.g. 7 days)"
+                .to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MAX_TOPIC_SIZE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MAX_TOPIC_SIZE.to_le_bytes(),
+            ),
+            description: "Topic size cap in bytes, or a byte-size string (e.g. 1 GiB); \
+                              must be at least the segment size"
+                .to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::SEGMENT_SIZE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(&iggy_common::DEFAULT_SEGMENT_SIZE.to_le_bytes()),
+            description: format!(
+                "Segment size in bytes, or a byte-size string (e.g. 128 MiB); a 512-byte \
+                     multiple within {}..={}",
+                iggy_common::MIN_TOPIC_SEGMENT_SIZE,
+                iggy_common::MAX_TOPIC_SEGMENT_SIZE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::ENFORCE_FSYNC)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Bool.as_code(),
+            default_value: Bytes::copy_from_slice(&[u8::from(iggy_common::DEFAULT_ENFORCE_FSYNC)]),
+            description: "Whether writes to this topic's partitions fsync".to_string(),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::MESSAGES_REQUIRED_TO_SAVE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint32.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
+            ),
+            description: format!(
+                "Flush the journal once it holds this many messages; \
+                     1..={}. A threshold no segment can reach leaves committed \
+                     messages in the journal, which a crash does not preserve",
+                iggy_common::MAX_MESSAGES_REQUIRED_TO_SAVE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::SIZE_OF_MESSAGES_REQUIRED_TO_SAVE)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(
+                &iggy_common::DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE.to_le_bytes(),
+            ),
+            description: format!(
+                "Flush the journal once it holds this many bytes, or a byte-size \
+                     string; whichever threshold trips first flushes. At most {}",
+                iggy_common::MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::PREALLOCATE_SEGMENTS)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Bool.as_code(),
+            default_value: Bytes::copy_from_slice(&[u8::from(
+                iggy_common::DEFAULT_PREALLOCATE_SEGMENTS,
+            )]),
+            description: format!(
+                "Reserve each segment's bytes up front where the filesystem supports \
+                     it; pairs with segment_size. The reservation is real disk and runs \
+                     inline on the owning shard, at every rotation and once per owned \
+                     partition at boot, so segment_size * partitions_count is capped at \
+                     {} bytes",
+                iggy_common::MAX_PREALLOCATED_TOPIC_BYTES
+            ),
+        },
+    ])
+}
+
+/// Serve the option catalog for one resource scope.
+///
+/// Streams and users have no catalog keys yet, so their scopes return empty
+/// (every key is rejected at create until one lands).
+fn build_describe_options_response(body: &[u8]) -> Result<DescribeOptionsResponse, IggyError> {
+    let request =
+        DescribeOptionsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+    let entries = match request.scope {
+        OPTIONS_SCOPE_TOPIC => topic_option_descriptors()?,
+        OPTIONS_SCOPE_STREAM | OPTIONS_SCOPE_USER => Vec::new(),
+        _ => return Err(IggyError::InvalidCommand),
+    };
+    Ok(DescribeOptionsResponse { entries })
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyError> {
     Ok(UserResponse {
@@ -950,6 +1098,7 @@ fn user_response(user: &metadata::stm::user::User) -> Result<UserResponse, IggyE
         created_at: user.created_at.as_micros(),
         status: user.status.as_code(),
         username: WireName::new(user.username.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+        options: resource_options_to_wire(&user.options, OptionsProvenance::Explicit)?,
     })
 }
 
@@ -959,7 +1108,7 @@ fn build_get_users_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -980,19 +1129,12 @@ fn build_get_user_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
     shard.plane.metadata().mux_stm.users().read(|users| {
-        let resolved = match user_id {
-            WireIdentifier::Numeric(id) => {
-                let id = *id as usize;
-                users.items.contains(id).then_some(id)
-            }
-            WireIdentifier::String(name) => users.index.get(name.as_str()).map(|&id| id as usize),
-        };
-        let Some(id) = resolved else {
+        let Some(id) = users.resolve_user_id(user_id) else {
             return Ok(None);
         };
         let user = users.items.get(id).ok_or(IggyError::InvalidIdentifier)?;
@@ -1031,7 +1173,7 @@ fn build_get_topic_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1068,7 +1210,7 @@ fn build_get_topics_response<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1101,7 +1243,7 @@ fn ensure_topic_exists<B, MJ, S, SB>(
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1139,7 +1281,7 @@ fn topic_not_found(stream_id: &WireIdentifier, topic_id: &WireIdentifier) -> Igg
     )
 }
 
-pub(crate) fn resolve_stream_id(
+pub fn resolve_stream_id(
     streams: &metadata::stm::stream::StreamsInner,
     identifier: &WireIdentifier,
 ) -> Option<usize> {
@@ -1152,7 +1294,7 @@ pub(crate) fn resolve_stream_id(
     }
 }
 
-pub(crate) fn resolve_topic_id(
+pub fn resolve_topic_id(
     streams: &metadata::stm::stream::StreamsInner,
     stream_id: usize,
     identifier: &WireIdentifier,
@@ -1175,6 +1317,7 @@ fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamRespo
         size_bytes: stream.stats.size_bytes_inconsistent(),
         messages_count: stream.stats.messages_count_inconsistent(),
         name: WireName::new(stream.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+        options: resource_options_to_wire(&stream.options, OptionsProvenance::Explicit)?,
     })
 }
 
@@ -1184,6 +1327,7 @@ fn stream_response(stream: &metadata::stm::stream::Stream) -> Result<StreamRespo
 /// came from an update and must read back as `ServerDefault`, not as the node
 /// default frozen at read time.
 fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeader, IggyError> {
+    let (options, derived_options) = resource_options_to_wire_split(&topic.options)?;
     Ok(StreamTopicHeader {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),
@@ -1191,11 +1335,35 @@ fn topic_header(topic: &metadata::stm::stream::Topic) -> Result<StreamTopicHeade
         message_expiry: u64::from(topic.message_expiry),
         compression_algorithm: topic.compression_algorithm.as_code(),
         max_topic_size: topic.max_topic_size.as_bytes_u64(),
-        replication_factor: topic.replication_factor,
         size_bytes: topic.stats.size_bytes_inconsistent(),
         messages_count: topic.stats.messages_count_inconsistent(),
         name: WireName::new(topic.name.as_ref()).map_err(|_| IggyError::InvalidFormat)?,
+        options,
+        derived_options,
     })
+}
+
+/// Segments a committed partition reports before its storage exists.
+/// [`partition_response`] carries the reasoning.
+const MATERIALIZED_SEGMENTS_FLOOR: u32 = 1;
+
+/// Segments one committed partition reports. The single source for every
+/// client-facing segment count, so the `[stats]` total and the per-partition
+/// detail cannot disagree about the same partition.
+fn partition_segments_count(
+    streams: &metadata::stm::stream::StreamsInner,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+) -> u32 {
+    streams
+        .stats_registry
+        .partition_get(stream_id, topic_id, partition_id)
+        .map_or(MATERIALIZED_SEGMENTS_FLOOR, |stats| {
+            stats
+                .segments_count_inconsistent()
+                .max(MATERIALIZED_SEGMENTS_FLOOR)
+        })
 }
 
 fn partition_response(
@@ -1226,26 +1394,24 @@ fn partition_response(
     let stats = streams
         .stats_registry
         .partition_get(stream_id, topic_id, partition.id);
-    let (segments_count, current_offset, size_bytes, messages_count) =
-        stats.map_or((1, 0, 0, 0), |stats| {
-            (
-                stats.segments_count_inconsistent().max(1),
-                stats.current_offset(),
-                stats.size_bytes_inconsistent(),
-                stats.messages_count_inconsistent(),
-            )
-        });
+    let (current_offset, size_bytes, messages_count) = stats.map_or((0, 0, 0), |stats| {
+        (
+            stats.current_offset(),
+            stats.size_bytes_inconsistent(),
+            stats.messages_count_inconsistent(),
+        )
+    });
     Ok(PartitionResponse {
         id: usize_to_u32(partition.id)?,
         created_at: partition.created_at.as_micros(),
-        segments_count,
+        segments_count: partition_segments_count(streams, stream_id, topic_id, partition.id),
         current_offset,
         size_bytes,
         messages_count,
     })
 }
 
-pub(crate) enum NonReplicatedResponse {
+pub enum NonReplicatedResponse {
     Empty,
     Bytes(Bytes),
 }
@@ -1267,7 +1433,7 @@ impl NonReplicatedResponse {
     }
 }
 
-pub(crate) fn build_empty_reply(
+pub fn build_empty_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1283,7 +1449,7 @@ pub(crate) fn build_empty_reply(
 /// body, nonzero status); op carries the builder's session argument like every
 /// reply, and only the partition primary's pre-pipeline deny pins it to 0,
 /// stamped through `consensus::build_deny_reply_from_request`.
-pub(crate) fn build_deny_reply(
+pub fn build_deny_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1303,38 +1469,63 @@ pub(crate) fn build_deny_reply(
 /// Server build version advertised in the login-register response.
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub(crate) fn build_login_register_reply(
+/// Build a metadata reply carrying `payload` behind a success result section.
+///
+/// The SDK strips a result section off exactly the replies whose operation is
+/// [`iggy_binary_protocol::Operation::is_result_framed`] (every metadata op plus the
+/// four consumer-offset ops), and a non-empty `Register`, which it handles on its
+/// own. For those, a payload missing the leading zero count has its first four bytes
+/// eaten as a result count, and the decode fails or, worse, succeeds on the shifted
+/// remainder: the raw-PAT reply shipped once without the prefix and broke the SDK.
+///
+/// The only way to BUILD a result-framed success body, though not the only path to a
+/// success reply with one: [`build_reply_from_bytes`] passes a committed body
+/// through, framed or not according to the operation. Framing a reply whose operation
+/// is not result-framed breaks decoding just as badly, so the choice belongs with the
+/// operation rather than here.
+fn build_result_framed_reply(
+    request_header: &RoutedRequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+    payload: &impl WireEncode,
+) -> Message<ReplyHeader> {
+    let mut encoded = BytesMut::with_capacity(payload.encoded_size());
+    payload.encode(&mut encoded);
+    build_reply_with_body(
+        request_header,
+        client_id,
+        session,
+        commit,
+        RESULT_COUNT_LEN + encoded.len(),
+        |out| {
+            let (count, body) = out.split_at_mut(RESULT_COUNT_LEN);
+            count.copy_from_slice(&0u32.to_le_bytes());
+            body.copy_from_slice(&encoded);
+        },
+    )
+}
+
+pub fn build_login_register_reply(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
     commit: u64,
     user_id: u32,
 ) -> Message<ReplyHeader> {
-    // Result-framed like every metadata reply: a zero result-count (success)
-    // followed by the `LoginRegisterResponse` payload. A transient Register
-    // instead ships a `[count=1][index=0][TransientNotCommitted]` frame
-    // (`build_transient_reply`), which the SDK decodes and replays. The matching
-    // strip is in the SDK `split_metadata_result` (Register is result-framed).
+    // A transient Register instead ships a `[count=1][index=0]
+    // [TransientNotCommitted]` frame (`build_transient_reply`), which the SDK
+    // decodes and replays.
     let payload = LoginRegisterResponse {
         user_id,
         session,
         server_protocol_version: IGGY_PROTOCOL_VERSION,
         server_version: WireName::new(SERVER_VERSION).expect("SERVER_VERSION is 1-255 bytes"),
-    }
-    .to_bytes();
-    let mut body = Vec::with_capacity(RESULT_COUNT_LEN + payload.len());
-    body.extend_from_slice(&[0u8; RESULT_COUNT_LEN]);
-    body.extend_from_slice(&payload);
-    build_reply_from_bytes(
-        request_header,
-        client_id,
-        session,
-        commit,
-        &Bytes::from(body),
-    )
+    };
+    build_result_framed_reply(request_header, client_id, session, commit, &payload)
 }
 
-pub(crate) fn build_reply_from_bytes(
+pub fn build_reply_from_bytes(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1357,7 +1548,7 @@ pub(crate) fn build_reply_from_bytes(
 /// reusing the confirmed commit position from the committed reply. Otherwise
 /// (no token, a committed business rejection, or an eviction frame) the
 /// committed reply passes through unchanged.
-pub(crate) fn build_raw_pat_reply(
+pub fn build_raw_pat_reply(
     request_header: &RoutedRequestHeader,
     committed: Message<GenericHeader>,
     raw_token: Option<String>,
@@ -1372,7 +1563,7 @@ pub(crate) fn build_raw_pat_reply(
     // both swallow the eviction and ship a raw token whose hash never
     // committed. Only rewrite a genuine committed `Reply`; pass anything else
     // (the eviction) through untouched so the client learns its session died.
-    if committed.header().command != Command2::Reply {
+    if committed.header().command != Command::Reply {
         return Ok(committed);
     }
     let header_len = std::mem::size_of::<ReplyHeader>();
@@ -1401,24 +1592,17 @@ pub(crate) fn build_raw_pat_reply(
     }
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
     let response = RawPersonalAccessTokenResponse { token };
-    // The SDK strips a leading result section from every metadata reply
-    // (`split_metadata_result`), so the spliced body must carry the success
-    // section like any committed metadata reply; a bare token body would be
-    // read as a garbage result code.
-    let mut body = BytesMut::with_capacity(RESULT_COUNT_LEN + response.encoded_size());
-    body.put_u32_le(0);
-    response.encode(&mut body);
-    let reply = build_reply_from_bytes(
+    let reply = build_result_framed_reply(
         request_header,
         request_header.client,
         request_header.session,
         commit,
-        &body.freeze(),
+        &response,
     );
     Ok(reply.into_generic())
 }
 
-pub(crate) fn build_reply_with_body(
+pub fn build_reply_with_body(
     request_header: &RoutedRequestHeader,
     client_id: u128,
     session: u64,
@@ -1428,18 +1612,28 @@ pub(crate) fn build_reply_with_body(
 ) -> Message<ReplyHeader> {
     let header_len = std::mem::size_of::<ReplyHeader>();
     let total_size = header_len + body_len;
+    let size = u32::try_from(total_size).expect("reply size must fit into u32");
     let mut reply = Message::<ReplyHeader>::new(total_size);
-    let header_size = u32::try_from(total_size).expect("reply size must fit into u32");
-    let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
-        &mut reply.as_mut_slice()[..header_len],
-    )
-    .expect("zeroed bytes are valid");
-    *header = ReplyHeader {
+    let header = reply_header(request_header, client_id, session, commit, size);
+    reply.as_mut_slice()[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
+    write_body(&mut reply.as_mut_slice()[header_len..total_size]);
+    reply
+}
+
+/// The header of a `size`-byte reply frame answering `request_header`.
+fn reply_header(
+    request_header: &RoutedRequestHeader,
+    client_id: u128,
+    session: u64,
+    commit: u64,
+    size: u32,
+) -> ReplyHeader {
+    ReplyHeader {
         cluster: request_header.cluster,
-        size: header_size,
+        size,
         view: request_header.view,
         release: request_header.release,
-        command: Command2::Reply,
+        command: Command::Reply,
         replica: request_header.replica,
         request_checksum: request_header.request_checksum,
         client: client_id,
@@ -1449,16 +1643,14 @@ pub(crate) fn build_reply_with_body(
         request: request_header.request,
         operation: request_header.operation,
         ..Default::default()
-    };
-    write_body(&mut reply.as_mut_slice()[header_len..total_size]);
-    reply
+    }
 }
 
-pub(crate) fn current_metadata_commit<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> u64
+pub fn current_metadata_commit<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>) -> u64
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
-    MJ::Target: Journal<MJ::Storage, Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     S: 'static,
     SB: SuperblockStore + 'static,
 {
@@ -1470,25 +1662,162 @@ where
         .map_or(0, VsrConsensus::commit_max)
 }
 
-/// Size of the in-storage (`IggyMessage2`) per-message header inside a
-/// `SendMessages2` batch blob: `checksum`(8) + `id`(16) + `offset_delta`(4)
-/// + `timestamp_delta`(4) + `user_headers_length`(4) + `payload_length`(4)
-/// + reserved(8). See `server_common::send_messages2::SendMessages2Owned::from_messages`.
-const STORED_MESSAGE_HEADER_SIZE: usize = 48;
+/// Body head of a `PolledMessages` reply:
+/// `[partition_id:4][current_offset:8][count:4]`, before the batch records.
+const POLLED_HEAD_LEN: usize = 16;
+
+/// Build the `PolledMessages` reply for the wire as a vectored frame: one
+/// buffer holding the reply header and the body head, then the poll
+/// fragments as they are. The record bytes are never copied or gathered;
+/// their reply encoding IS the storage encoding (see
+/// [`build_polled_messages_body`]), so `count` comes from walking the batch
+/// headers in place. At-rest decryption is the one case that must rewrite
+/// records, and it takes the flattening builder instead.
+pub fn build_polled_messages_reply(
+    request_header: &RoutedRequestHeader,
+    commit: u64,
+    partition_id: u32,
+    current_offset: u64,
+    fragments: PollFragments,
+    encryptor: Option<&EncryptorKind>,
+) -> Result<BusMessage, IggyError> {
+    let client_id = request_header.client;
+    let session = request_header.session;
+    if encryptor.is_some() {
+        let body = build_polled_messages_body(partition_id, current_offset, fragments, encryptor)?;
+        let reply = build_reply_from_bytes(request_header, client_id, session, commit, &body);
+        return Ok(reply.into_generic().into_frozen().into());
+    }
+
+    let mut frames = ResponseFragments::with_capacity(fragments.len() + 1);
+    frames.extend(fragments.into_iter().map(Fragment::into_frozen));
+    let count = polled_message_count(&frames)?;
+    let records_len: usize = frames.iter().map(Frozen::len).sum();
+
+    let header_len = std::mem::size_of::<ReplyHeader>();
+    let size = u32::try_from(header_len + POLLED_HEAD_LEN + records_len)
+        .map_err(|_| IggyError::InvalidCommand)?;
+    let header = reply_header(request_header, client_id, session, commit, size);
+    let mut head = Owned::<MESSAGE_ALIGN>::zeroed(header_len + POLLED_HEAD_LEN);
+    let (header_bytes, body_head) = head.as_mut_slice().split_at_mut(header_len);
+    header_bytes.copy_from_slice(bytemuck::bytes_of(&header));
+    body_head[..4].copy_from_slice(&partition_id.to_le_bytes());
+    body_head[4..12].copy_from_slice(&current_offset.to_le_bytes());
+    body_head[12..].copy_from_slice(&count.to_le_bytes());
+    frames.insert(0, head.into());
+
+    // Re-checks the header and that the fragments cover `size`.
+    Message::<ReplyHeader, ResponseBacking>::try_from(frames)
+        .map(Message::into_inner)
+        .map_err(|_| IggyError::InvalidCommand)
+}
+
+/// Sum of `message_count` over the batch records spanning `fragments`, read
+/// from each batch header in place. Rejects a stream that is not a whole
+/// number of batches, as [`build_polled_messages_body`] does.
+fn polled_message_count(fragments: &[Frozen<MESSAGE_ALIGN>]) -> Result<u32, IggyError> {
+    let mut cursor = FragmentCursor::new(fragments);
+    let mut count = 0u32;
+    let mut header = [0u8; send_messages::COMMAND_HEADER_SIZE];
+    while !cursor.is_exhausted() {
+        cursor.read_exact(&mut header)?;
+        let batch =
+            send_messages::BatchHeader::decode(&header).map_err(|_| IggyError::InvalidCommand)?;
+        cursor.skip(batch.blob_len().map_err(|_| IggyError::InvalidCommand)?)?;
+        count = count
+            .checked_add(batch.message_count)
+            .ok_or(IggyError::InvalidCommand)?;
+    }
+    Ok(count)
+}
+
+/// Byte cursor over the virtual concatenation of `fragments`. Rests on an
+/// unread byte or at the end of the stream, never inside an exhausted
+/// fragment, so a batch header split across fragments reads the same as one
+/// stored whole.
+struct FragmentCursor<'a> {
+    fragments: &'a [Frozen<MESSAGE_ALIGN>],
+    index: usize,
+    offset: usize,
+}
+
+impl<'a> FragmentCursor<'a> {
+    fn new(fragments: &'a [Frozen<MESSAGE_ALIGN>]) -> Self {
+        let mut cursor = Self {
+            fragments,
+            index: 0,
+            offset: 0,
+        };
+        cursor.settle();
+        cursor
+    }
+
+    const fn is_exhausted(&self) -> bool {
+        self.index == self.fragments.len()
+    }
+
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<(), IggyError> {
+        let mut filled = 0;
+        while filled < out.len() {
+            let available = self.available()?;
+            let take = available.len().min(out.len() - filled);
+            out[filled..filled + take].copy_from_slice(&available[..take]);
+            filled += take;
+            self.advance(take);
+        }
+        Ok(())
+    }
+
+    fn skip(&mut self, mut len: usize) -> Result<(), IggyError> {
+        while len > 0 {
+            let take = self.available()?.len().min(len);
+            len -= take;
+            self.advance(take);
+        }
+        Ok(())
+    }
+
+    /// Unread bytes of the current fragment; `Err` past the end of the stream.
+    fn available(&self) -> Result<&'a [u8], IggyError> {
+        self.fragments
+            .get(self.index)
+            .map(|fragment| &fragment.as_slice()[self.offset..])
+            .ok_or(IggyError::InvalidCommand)
+    }
+
+    fn advance(&mut self, len: usize) {
+        self.offset += len;
+        self.settle();
+    }
+
+    /// Step past the current fragment once it is used up, and past empty ones.
+    fn settle(&mut self) {
+        while let Some(fragment) = self.fragments.get(self.index) {
+            if self.offset < fragment.len() {
+                break;
+            }
+            self.offset = 0;
+            self.index += 1;
+        }
+    }
+}
 
 /// Build the `PolledMessages` reply body from the owning shard's poll
-/// fragments.
+/// fragments, gathered into one buffer.
 ///
-/// Fragments carry the stored `SendMessages2` batches: a 256-byte command
-/// header followed by `IggyMessage2`-format messages
-/// (`[48B header][payload][user_headers]`, offsets/timestamps delta-encoded
-/// against the batch). The SDK decodes the legacy wire format
-/// (`[64B header][payload][user_headers]`, absolute offsets); the message
-/// sections share the legacy order, so only the header is re-encoded here
-/// and the section bytes copy through contiguously.
+/// Fragments carry the stored batch records (a 256-byte batch header plus
+/// `[48B header][payload][user_headers]` frames, deltas resolved against the
+/// stamped bases) and are served to the client as they are - the reply's
+/// message encoding IS the storage encoding. The one rewrite left is at-rest
+/// decryption: stored sections are ciphertext, and this reply is the single
+/// decrypt point, so encrypted records are rebuilt over the plaintext.
 ///
-/// Body layout: `[partition_id:4][current_offset:8][count:4][messages...]`.
-pub(crate) fn build_polled_messages_body(
+/// The binary transports reply through [`build_polled_messages_reply`], which
+/// ships the fragments without gathering them; this builder serves the
+/// decrypt path and the HTTP handler, which decodes the body into JSON.
+///
+/// Body layout: `[partition_id:4][current_offset:8][count:4][batch records...]`.
+pub fn build_polled_messages_body(
     partition_id: u32,
     current_offset: u64,
     fragments: PollFragments,
@@ -1498,17 +1827,14 @@ pub(crate) fn build_polled_messages_body(
     // COUNT_OFFSET and is backpatched once the walk below knows it.
     const HEAD_LEN: usize = 16;
     const COUNT_OFFSET: usize = 12;
-    // Batches may arrive split across fragments (rewritten command header +
-    // sliced blob); concatenate into one stream before walking batches.
+    // Batches may arrive split across fragments (rewritten batch header +
+    // sliced blob); concatenate into one stream before walking records.
     let mut stream: Vec<u8> = Vec::new();
     for fragment in fragments {
         let frozen = fragment.into_frozen();
         stream.extend_from_slice(frozen.as_slice());
     }
 
-    // Reserve the head and encode the messages straight into `body`; encoding
-    // directly avoids a separate messages buffer and its copy-through into the
-    // head.
     let mut body: Vec<u8> = Vec::with_capacity(HEAD_LEN + stream.len());
     body.extend_from_slice(&partition_id.to_le_bytes());
     body.extend_from_slice(&current_offset.to_le_bytes());
@@ -1516,104 +1842,24 @@ pub(crate) fn build_polled_messages_body(
     let mut count: u32 = 0;
     let mut position = 0usize;
     while position < stream.len() {
-        let batch = SendMessages2Header::decode(&stream[position..])?;
+        let batch = send_messages::BatchHeader::decode(&stream[position..])
+            .map_err(|_| IggyError::InvalidCommand)?;
         let batch_end = position
-            .checked_add(
-                usize::try_from(batch.batch_length).map_err(|_| IggyError::InvalidCommand)?,
-            )
+            .checked_add(batch.total_size())
             .ok_or(IggyError::InvalidCommand)?;
         if batch_end > stream.len() {
             return Err(IggyError::InvalidCommand);
         }
-        let mut cursor = position + COMMAND_HEADER_SIZE;
-        while cursor < batch_end {
-            if cursor + STORED_MESSAGE_HEADER_SIZE > batch_end {
-                return Err(IggyError::InvalidCommand);
-            }
-            let header = &stream[cursor..cursor + STORED_MESSAGE_HEADER_SIZE];
-            let checksum = &header[0..8];
-            let id = &header[8..24];
-            let offset_delta = u32::from_le_bytes(header[24..28].try_into().expect("4-byte slice"));
-            let timestamp_delta =
-                u32::from_le_bytes(header[28..32].try_into().expect("4-byte slice"));
-            let user_headers_length =
-                u32::from_le_bytes(header[32..36].try_into().expect("4-byte slice")) as usize;
-            let payload_length =
-                u32::from_le_bytes(header[36..40].try_into().expect("4-byte slice")) as usize;
-
-            let sections_start = cursor + STORED_MESSAGE_HEADER_SIZE;
-            let sections_end = sections_start + payload_length + user_headers_length;
-            if sections_end > batch_end {
-                return Err(IggyError::InvalidCommand);
-            }
-
-            let offset = batch.base_offset + u64::from(offset_delta);
-            // `base_timestamp` is the flat broker append time stamped once per
-            // batch; `timestamp_delta` is a per-message delta against the
-            // producer origin, so it only applies to `origin_timestamp`. Adding
-            // it to the broker base would mix two clocks.
-            let timestamp = batch.base_timestamp;
-            let origin_timestamp = batch.origin_timestamp + u64::from(timestamp_delta);
-
-            body.extend_from_slice(checksum);
-            body.extend_from_slice(id);
-            body.extend_from_slice(&offset.to_le_bytes());
-            body.extend_from_slice(&timestamp.to_le_bytes());
-            body.extend_from_slice(&origin_timestamp.to_le_bytes());
-            if let Some(encryptor) = encryptor {
-                // At-rest encryption: stored sections are ciphertext (encrypted
-                // once at ingestion, replicated verbatim); this reply is the
-                // single decrypt point, so lengths are rewritten to the
-                // plaintext sizes. The stored per-message checksum still covers
-                // the ciphertext and is passed through untouched (the SDK does
-                // not re-validate it against the reply layout).
-                let payload_end = sections_start + payload_length;
-                let payload = encryptor
-                    .decrypt(&stream[sections_start..payload_end])
-                    .map_err(|_| IggyError::CannotDecryptData)?;
-                let user_headers = if user_headers_length > 0 {
-                    Some(
-                        encryptor
-                            .decrypt(&stream[payload_end..sections_end])
-                            .map_err(|_| IggyError::CannotDecryptData)?,
-                    )
-                } else {
-                    None
-                };
-                let user_headers_bytes: &[u8] = user_headers.as_deref().unwrap_or_default();
-                body.extend_from_slice(
-                    &u32::try_from(user_headers_bytes.len())
-                        .map_err(|_| IggyError::InvalidCommand)?
-                        .to_le_bytes(),
-                );
-                body.extend_from_slice(
-                    &u32::try_from(payload.len())
-                        .map_err(|_| IggyError::InvalidCommand)?
-                        .to_le_bytes(),
-                );
-                body.extend_from_slice(&0u64.to_le_bytes()); // reserved
-                body.extend_from_slice(&payload);
-                body.extend_from_slice(user_headers_bytes);
-            } else {
-                body.extend_from_slice(
-                    &u32::try_from(user_headers_length)
-                        .expect("length came from u32")
-                        .to_le_bytes(),
-                );
-                body.extend_from_slice(
-                    &u32::try_from(payload_length)
-                        .expect("length came from u32")
-                        .to_le_bytes(),
-                );
-                body.extend_from_slice(&0u64.to_le_bytes()); // reserved
-                // Stored sections are already in legacy order
-                // (`[payload][user_headers]`): copy through contiguously.
-                body.extend_from_slice(&stream[sections_start..sections_end]);
-            }
-
-            count += 1;
-            cursor = sections_end;
+        let record = &stream[position..batch_end];
+        if let Some(encryptor) = encryptor {
+            let decrypted = send_messages::decrypt_batch_record(record, encryptor)?;
+            body.extend_from_slice(&decrypted);
+        } else {
+            body.extend_from_slice(record);
         }
+        count = count
+            .checked_add(batch.message_count)
+            .ok_or(IggyError::InvalidCommand)?;
         position = batch_end;
     }
 
@@ -1623,7 +1869,7 @@ pub(crate) fn build_polled_messages_body(
 
 /// Build the `ConsumerOffsetResponse` reply body:
 /// `[partition_id:4][current_offset:8][stored_offset:8]`.
-pub(crate) fn build_consumer_offset_body(
+pub fn build_consumer_offset_body(
     partition_id: u32,
     current_offset: u64,
     stored_offset: u64,
@@ -1643,12 +1889,33 @@ mod tests {
         let zeroed = [0u8; std::mem::size_of::<RoutedRequestHeader>()];
         let mut header = *bytemuck::checked::try_from_bytes::<RoutedRequestHeader>(&zeroed)
             .expect("zeroed bytes form a valid RoutedRequestHeader");
-        header.command = Command2::Request;
+        header.command = Command::Request;
         header.operation = Operation::CreatePersonalAccessToken;
         header.client = 42;
         header.session = 7;
         header.request = 3;
         header
+    }
+
+    #[test]
+    fn login_register_reply_carries_the_success_result_prefix() {
+        // The other `build_result_framed_reply` caller. The SDK strips the result
+        // section off every metadata reply, so a payload emitted without the prefix
+        // loses its first four bytes to a phantom result count -- the decode break
+        // the raw-PAT reply shipped once. Pin it on both callers, not just the one
+        // that regressed.
+        let mut header = pat_request_header();
+        header.operation = Operation::Register;
+        let reply = build_login_register_reply(&header, 42, 7, 9, 5);
+
+        let header_len = std::mem::size_of::<ReplyHeader>();
+        let body = &reply.as_slice()[header_len..reply.header().size as usize];
+        assert_eq!(result_code(body), Some(0));
+
+        let payload = LoginRegisterResponse::decode_from(&body[RESULT_COUNT_LEN..])
+            .expect("login-register payload decodes past the result section");
+        assert_eq!(payload.user_id, 5);
+        assert_eq!(payload.session, 7);
     }
 
     /// A committed metadata reply whose body is the given result section
@@ -1756,7 +2023,7 @@ mod tests {
         use metadata::stm::stream::{Partition, StreamsInner};
 
         let streams = StreamsInner::new();
-        let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0);
+        let partition = Partition::new(0, 1, IggyTimestamp::from(1u64), 0, 0);
 
         // Registry miss: the owning shard has not started building.
         let predicted = partition_response(&streams, 0, 0, &partition).expect("response builds");
@@ -1782,9 +2049,69 @@ mod tests {
     }
 
     #[test]
+    fn stats_totals_count_every_committed_partition_before_it_materialises() {
+        use iggy_common::{StreamStats, TopicStats};
+        use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
+        use std::sync::atomic::AtomicUsize;
+
+        let created_at = IggyTimestamp::from(1u64);
+        let mut streams = StreamsInner::new();
+        let mut stream = Stream::new(Arc::from("stream"), created_at);
+        let topic_stats = Arc::new(TopicStats::new(stream.stats.clone()));
+        stream.topics.insert(Topic {
+            id: 0,
+            name: Arc::from("topic"),
+            created_at,
+            message_expiry: iggy_common::IggyExpiry::NeverExpire,
+            compression_algorithm: iggy_common::CompressionAlgorithm::None,
+            max_topic_size: iggy_common::MaxTopicSize::Unlimited,
+            options: iggy_common::ResourceOptions::default(),
+            stats: topic_stats.clone(),
+            partitions: vec![
+                Partition::new(0, 1, created_at, 0, 0),
+                Partition::new(1, 1, created_at, 0, 0),
+            ],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+            consumer_groups: ahash::AHashMap::default(),
+            consumer_group_index: ahash::AHashMap::default(),
+            next_consumer_group_id: 0,
+        });
+        streams.items.insert(stream);
+
+        // Only partition 0 has materialised. Counting the stream's rolled-up
+        // counter reported 1 here, so a caller polling `[stats]` twice saw the
+        // total climb to 2 with no write in between (and `get_topic` already
+        // reported 2 for the same partitions).
+        let stats = streams.stats_registry.partition(0, 0, 0, topic_stats);
+        stats.increment_segments_count(1);
+
+        let (_, _, partitions, segments, _, _) =
+            aggregate_stats_totals(&streams).expect("totals aggregate");
+        assert_eq!(partitions, 2);
+        assert_eq!(
+            segments, 2,
+            "an unmaterialised partition must contribute the same floor the detail response reports"
+        );
+
+        // Materialising the second partition changes nothing: the total was
+        // already the steady-state answer.
+        let late = streams.stats_registry.partition(
+            0,
+            0,
+            1,
+            Arc::new(TopicStats::new(Arc::new(StreamStats::default()))),
+        );
+        late.increment_segments_count(1);
+        let (_, _, _, segments_after, _, _) =
+            aggregate_stats_totals(&streams).expect("totals aggregate");
+        assert_eq!(segments_after, 2);
+    }
+
+    #[test]
     fn topic_header_echoes_stored_size_and_expiry_verbatim() {
         use iggy_common::{
-            CompressionAlgorithm, IggyDuration, IggyExpiry, MaxTopicSize, StreamStats, TopicStats,
+            CompressionAlgorithm, IggyDuration, IggyExpiry, MaxTopicSize, ResourceOptions,
+            StreamStats, TopicStats,
         };
         use std::sync::atomic::AtomicUsize;
 
@@ -1793,10 +2120,10 @@ mod tests {
             id: 0,
             name: Arc::from("topic"),
             created_at: IggyTimestamp::from(1u64),
-            replication_factor: 1,
             message_expiry,
             compression_algorithm: CompressionAlgorithm::None,
             max_topic_size,
+            options: ResourceOptions::default(),
             stats: Arc::new(TopicStats::new(parent.clone())),
             partitions: Vec::new(),
             round_robin_counter: Arc::new(AtomicUsize::new(0)),
@@ -1831,5 +2158,233 @@ mod tests {
         .expect("topic header builds");
         assert_eq!(unlimited.max_topic_size, u64::MAX);
         assert_eq!(unlimited.message_expiry, u64::MAX);
+    }
+
+    // Vectored `PolledMessages` replies against the flattening builder as the
+    // byte-for-byte oracle.
+
+    use iggy_common::Aes256GcmEncryptor;
+    use server_common::send_messages::{
+        BatchHeader, COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages,
+        PREPARE_SPLIT_POINT, SendMessagesOwned, encrypt_batch_request, frozen_batch_header,
+    };
+    use server_common::sharding::IggyNamespace;
+
+    const POLL_PARTITION_ID: u32 = 9;
+    const POLL_CURRENT_OFFSET: u64 = 1_234;
+    const POLL_COMMIT: u64 = 17;
+
+    fn poll_request_header() -> RoutedRequestHeader {
+        pat_request_header()
+    }
+
+    /// A stored batch record over an opaque blob. Both builders decode only
+    /// the 256-byte batch header, so the blob needs no message framing.
+    fn batch_record(base_offset: u64, message_count: u32, blob: &[u8]) -> Frozen<MESSAGE_ALIGN> {
+        let batch_length = u64::try_from(COMMAND_HEADER_SIZE + blob.len()).expect("fits u64");
+        let mut header =
+            BatchHeader::new(u64::from(POLL_PARTITION_ID), 5, batch_length, message_count);
+        header.base_offset = base_offset;
+        let mut bytes = vec![0u8; COMMAND_HEADER_SIZE + blob.len()];
+        header.encode_into(&mut bytes[..COMMAND_HEADER_SIZE]);
+        bytes[COMMAND_HEADER_SIZE..].copy_from_slice(blob);
+        Owned::<MESSAGE_ALIGN>::copy_from_slice(&bytes).into()
+    }
+
+    /// The wire bytes the flattening builder ships for `fragments`.
+    fn flattened_reply(fragments: PollFragments, encryptor: Option<&EncryptorKind>) -> Vec<u8> {
+        let header = poll_request_header();
+        let body = build_polled_messages_body(
+            POLL_PARTITION_ID,
+            POLL_CURRENT_OFFSET,
+            fragments,
+            encryptor,
+        )
+        .expect("flattening builder accepts the fragments");
+        build_reply_from_bytes(&header, header.client, header.session, POLL_COMMIT, &body)
+            .into_generic()
+            .into_frozen()
+            .as_slice()
+            .to_vec()
+    }
+
+    fn vectored_reply(
+        fragments: PollFragments,
+        encryptor: Option<&EncryptorKind>,
+    ) -> Result<BusMessage, IggyError> {
+        build_polled_messages_reply(
+            &poll_request_header(),
+            POLL_COMMIT,
+            POLL_PARTITION_ID,
+            POLL_CURRENT_OFFSET,
+            fragments,
+            encryptor,
+        )
+    }
+
+    /// The vectored reply must be byte-identical to the flattened one and
+    /// ship exactly `fragment_count` buffers.
+    fn assert_vectored_matches_flattened(fragments: PollFragments, fragment_count: usize) {
+        let expected = flattened_reply(fragments.clone(), None);
+        let reply =
+            vectored_reply(fragments, None).expect("vectored builder accepts the fragments");
+        assert_eq!(reply.fragments().len(), fragment_count);
+        assert_eq!(reply.total_len(), expected.len());
+        assert_eq!(reply.into_contiguous().as_slice(), expected.as_slice());
+    }
+
+    fn polled_count(reply: &[u8]) -> u32 {
+        let count_at = std::mem::size_of::<ReplyHeader>() + 12;
+        u32::from_le_bytes(reply[count_at..count_at + 4].try_into().expect("4 bytes"))
+    }
+
+    #[test]
+    fn polled_reply_single_fragment_matches_flattened_builder() {
+        let record = batch_record(0, 3, &[0xAB; 100]);
+        let fragments = PollFragments::from_iter([Fragment::whole(record)]);
+        assert_vectored_matches_flattened(fragments.clone(), 2);
+
+        let reply = vectored_reply(fragments, None)
+            .expect("reply")
+            .into_contiguous();
+        let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
+            &reply.as_slice()[..std::mem::size_of::<ReplyHeader>()],
+        )
+        .expect("reply header decodes");
+        assert_eq!(header.size as usize, reply.len());
+        assert_eq!(header.client, 42);
+        assert_eq!(header.op, 7);
+        assert_eq!(header.commit, POLL_COMMIT);
+        assert_eq!(polled_count(reply.as_slice()), 3);
+    }
+
+    #[test]
+    fn polled_reply_split_batch_matches_flattened_builder() {
+        // The journal slices a partially selected batch into a rewritten header
+        // plus a blob slice, exactly how `push_selected_batch_fragments` does.
+        let source = batch_record(10, 4, &[0x11; 400]);
+        let (start, end) = (100, 300);
+        let batch_length = u64::try_from(COMMAND_HEADER_SIZE + (end - start)).expect("fits u64");
+        let mut rewritten = BatchHeader::new(u64::from(POLL_PARTITION_ID), 5, batch_length, 2);
+        rewritten.base_offset = 10;
+        let fragments = PollFragments::from_iter([
+            Fragment::whole(frozen_batch_header(&rewritten)),
+            Fragment::slice(
+                source,
+                COMMAND_HEADER_SIZE + start,
+                COMMAND_HEADER_SIZE + end,
+            ),
+        ]);
+        assert_vectored_matches_flattened(fragments.clone(), 3);
+        let reply = vectored_reply(fragments, None)
+            .expect("reply")
+            .into_contiguous();
+        assert_eq!(polled_count(reply.as_slice()), 2);
+    }
+
+    #[test]
+    fn polled_reply_multiple_batches_counts_every_header() {
+        let first = batch_record(0, 1, &[0x01; 50]);
+        let second = batch_record(1, 4, &[0x02; 700]);
+        let third = batch_record(5, 7, &[0x03; 20]);
+        // `second` arrives cut mid-header so the count walk has to read a batch
+        // header spanning two fragments.
+        let fragments = PollFragments::from_iter([
+            Fragment::whole(first),
+            Fragment::slice(second.clone(), 0, 100),
+            Fragment::slice(second.clone(), 100, second.len()),
+            Fragment::whole(third),
+        ]);
+        assert_vectored_matches_flattened(fragments.clone(), 5);
+        let reply = vectored_reply(fragments, None)
+            .expect("reply")
+            .into_contiguous();
+        assert_eq!(polled_count(reply.as_slice()), 12);
+    }
+
+    #[test]
+    fn polled_reply_empty_poll_is_the_head_alone() {
+        assert_vectored_matches_flattened(PollFragments::new(), 1);
+        let reply = vectored_reply(PollFragments::new(), None)
+            .expect("reply")
+            .into_contiguous();
+        assert_eq!(
+            reply.len(),
+            std::mem::size_of::<ReplyHeader>() + POLLED_HEAD_LEN
+        );
+        assert_eq!(polled_count(reply.as_slice()), 0);
+    }
+
+    #[test]
+    fn polled_reply_rejects_a_truncated_record() {
+        let record = batch_record(0, 3, &[0xAB; 100]);
+        let truncated =
+            PollFragments::from_iter([Fragment::slice(record, 0, COMMAND_HEADER_SIZE + 99)]);
+        assert!(matches!(
+            build_polled_messages_body(
+                POLL_PARTITION_ID,
+                POLL_CURRENT_OFFSET,
+                truncated.clone(),
+                None
+            ),
+            Err(IggyError::InvalidCommand)
+        ));
+        assert!(matches!(
+            vectored_reply(truncated, None),
+            Err(IggyError::InvalidCommand)
+        ));
+    }
+
+    /// A stored record encrypted the way the primary encrypts at ingestion.
+    fn encrypted_record(encryptor: &EncryptorKind) -> Frozen<MESSAGE_ALIGN> {
+        let namespace = IggyNamespace::new(1, 1, 3);
+        let mut messages = IggyMessages::with_capacity(2);
+        for (id, payload) in [(7u128, &b"first-payload"[..]), (8, &b"second-payload"[..])] {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
+                    id,
+                    origin_timestamp: 1_000,
+                    ..Default::default()
+                },
+                payload: Bytes::copy_from_slice(payload),
+                user_headers: None,
+            });
+        }
+        let owned = SendMessagesOwned::from_messages(namespace, &messages).expect("build batch");
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let total = header_size + owned.header.total_size();
+        let mut buffer = Owned::<MESSAGE_ALIGN>::zeroed(total);
+        {
+            let header: &mut RoutedRequestHeader =
+                bytemuck::checked::try_from_bytes_mut(&mut buffer.as_mut_slice()[..header_size])
+                    .expect("zeroed bytes form a valid RoutedRequestHeader");
+            header.command = Command::Request;
+            header.operation = Operation::SendMessages;
+            header.client = 1;
+            header.session = 1;
+            header.request = 1;
+            header.size = u32::try_from(total).expect("size fits u32");
+        }
+        let bytes = buffer.as_mut_slice();
+        owned
+            .header
+            .encode_into(&mut bytes[header_size..header_size + COMMAND_HEADER_SIZE]);
+        bytes[PREPARE_SPLIT_POINT..].copy_from_slice(&owned.blob);
+        let canonical = Message::try_from(buffer).expect("request message is valid");
+        let encrypted = encrypt_batch_request(canonical, encryptor).expect("encrypt batch");
+        let record = &encrypted.as_slice()[header_size..encrypted.header().size as usize];
+        Owned::<MESSAGE_ALIGN>::copy_from_slice(record).into()
+    }
+
+    #[test]
+    fn polled_reply_encrypted_records_take_the_flattening_path() {
+        let encryptor =
+            EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[7u8; 32]).expect("valid 32B key"));
+        let fragments = PollFragments::from_iter([Fragment::whole(encrypted_record(&encryptor))]);
+        let expected = flattened_reply(fragments.clone(), Some(&encryptor));
+        let reply = vectored_reply(fragments, Some(&encryptor)).expect("decrypting reply");
+        assert_eq!(reply.fragments().len(), 1);
+        assert_eq!(reply.into_contiguous().as_slice(), expected.as_slice());
+        assert_eq!(polled_count(&expected), 2);
     }
 }

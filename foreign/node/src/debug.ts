@@ -14,10 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import assert from 'node:assert/strict';
-import { Client } from './client/index.js';
+import { Client, DEFAULT_HEARTBEAT_INTERVAL } from './client/index.js';
 import { uuidv7, uuidv4 } from 'uuidv7'
 import { groupConsumerStream } from './stream/consumer-stream.js';
 import { PollingStrategy, type PollMessagesResponse } from './wire/index.js';
@@ -46,7 +45,7 @@ const opt = {
     interval: 10 * 1000,
     maxRetries: 10
   },
-  heartbeatInterval: 5 * 1000
+  heartbeatInterval: DEFAULT_HEARTBEAT_INTERVAL
 };
 
 const c = new Client(opt);

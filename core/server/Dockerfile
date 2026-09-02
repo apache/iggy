@@ -15,19 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Apache Iggy (Incubating) is an effort undergoing incubation at the Apache
-# Software Foundation (ASF), sponsored by the Apache Incubator PMC.
-#
-# Incubation is required of all newly accepted projects until a further review
-# indicates that the infrastructure, communications, and decision making
-# process have stabilized in a manner consistent with other successful ASF
-# projects.
-#
-# While incubation status is not necessarily a reflection of the completeness
-# or stability of the code, it does indicate that the project has yet to be
-# fully endorsed by the ASF.
-
-ARG RUST_VERSION=1.97.1
+ARG RUST_VERSION=1.98
 ARG ALPINE_VERSION=3.23
 
 # ── from-source path ─────────────────────────────────────────────────────────
@@ -47,7 +35,7 @@ ARG IGGY_CI_BUILD
 ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
 RUN apk add --no-cache bash curl tar zig make autoconf automake libtool pkgconfig hwloc-dev xz-dev xz-static nodejs npm && \
-    cargo install cargo-zigbuild --version '=0.22.1' --locked
+    cargo install cargo-zigbuild --version '=0.23.2' --locked
 
 COPY rust-toolchain.toml rust-toolchain.toml
 

@@ -31,9 +31,18 @@
 ///
 /// Timeouts count down from an initial duration (`after`) and fire when
 /// reaching zero. They support exponential backoff with jitter for retries.
+use std::time::Duration;
+
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
+
+/// Wall-clock length of one consensus tick.
+///
+/// Every tick count in this module is a multiple of this unit: a timeout of N
+/// ticks fires after N * `TICK_INTERVAL`, provided the owner drives
+/// [`TimeoutManager::tick`] at this cadence.
+pub const TICK_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone)]
 #[allow(unused)]
@@ -69,7 +78,18 @@ impl Timeout {
         self.attempts = 0;
     }
 
+    /// Restart a running timer's interval, clearing any accumulated backoff.
+    ///
+    /// # Panics
+    /// In debug builds, if the timer is not ticking. `reset` leaves `ticking` alone,
+    /// so on a stopped timer it yields an armed-but-dead state that never fires and
+    /// reads as healthy. Callers that cannot prove the timer is running want
+    /// [`Self::start`], identical to this on a running one.
     pub const fn reset(&mut self) {
+        debug_assert!(
+            self.ticking,
+            "reset on a stopped timeout leaves it armed-but-dead; use start"
+        );
         self.ticks_remaining = self.after;
         self.attempts = 0;
     }
@@ -126,8 +146,7 @@ pub struct TimeoutManager {
 
 #[allow(unused)]
 impl TimeoutManager {
-    // Timeout durations in ticks (10ms per tick).
-    // TODO define 10ms per tick in a separate constant.
+    // Timeout durations in ticks of [`TICK_INTERVAL`].
     /// Public so the runtime can pin its `[cluster] prepare_retransmit_interval`
     /// config default against this built-in.
     pub const PREPARE_TICKS: u64 = 25;

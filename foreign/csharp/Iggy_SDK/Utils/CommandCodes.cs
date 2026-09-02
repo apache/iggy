@@ -23,6 +23,7 @@ internal static class CommandCodes
     internal const int GET_STATS_CODE = 10;
     internal const int GET_SNAPSHOT_CODE = 11;
     internal const int GET_CLUSTER_METADATA_CODE = 12;
+    internal const int DESCRIBE_OPTIONS_CODE = 13;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;
@@ -47,8 +48,6 @@ internal static class CommandCodes
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int DELETE_CONSUMER_OFFSET_CODE = 122;
-    internal const int STORE_CONSUMER_OFFSET_2_CODE = 123;
-    internal const int DELETE_CONSUMER_OFFSET_2_CODE = 124;
     internal const int GET_STREAM_CODE = 200;
     internal const int GET_STREAMS_CODE = 201;
     internal const int CREATE_STREAM_CODE = 202;

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy_connector_clickhouse_sink"
-version = "0.2.0-edge.2"
+version = "0.2.0-edge.4"
 description = "Iggy ClickHouse sink connector for streaming messages into ClickHouse"
 edition = "2024"
 license = "Apache-2.0"
@@ -27,6 +27,7 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
+publish = false
 
 [lib]
 crate-type = ["cdylib", "lib"]
@@ -46,3 +47,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
+
+[lints]
+workspace = true

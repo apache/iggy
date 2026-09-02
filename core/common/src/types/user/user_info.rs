@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::Permissions;
+use crate::ResourceOptions;
 use crate::types::user::user_status::UserStatus;
 use crate::utils::timestamp::IggyTimestamp;
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,9 @@ pub struct UserInfo {
     pub status: UserStatus,
     /// The username of the user.
     pub username: String,
+    /// Creation options, all client-explicit (users have no derived keys).
+    #[serde(default, with = "crate::resource_options_json")]
+    pub options: ResourceOptions,
 }
 
 /// `UserInfoDetails` represents the detailed information about the user.
@@ -64,4 +68,7 @@ pub struct UserInfoDetails {
     pub username: String,
     /// The optional permissions of the user.
     pub permissions: Option<Permissions>,
+    /// Creation options, all client-explicit (users have no derived keys).
+    #[serde(default, with = "crate::resource_options_json")]
+    pub options: ResourceOptions,
 }

@@ -37,7 +37,6 @@ import org.slf4j.LoggerFactory;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -162,7 +161,6 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        Optional.empty(),
                         "test-topic")
                 .get(5, TimeUnit.SECONDS);
 
@@ -203,7 +201,6 @@ class AsyncConnectionPoolAuthTest extends BaseIntegrationTest {
                         CompressionAlgorithm.None,
                         BigInteger.ZERO,
                         BigInteger.ZERO,
-                        Optional.empty(),
                         "test-topic")
                 .get(5, TimeUnit.SECONDS);
 

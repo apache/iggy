@@ -381,8 +381,12 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                 // preserving the Vec's allocation for the next
                 // iteration; `into_iter()` would move the buffer out.
                 #[allow(clippy::iter_with_drain)]
+                // One WS frame per message: tungstenite takes a single payload
+                // buffer, so a multi-fragment frame is joined here (the only
+                // record copy left on this plane; single-fragment frames move).
                 for msg in batch.drain(..) {
-                    if let Err(e) = ws.send(WsMessage::Binary(Bytes::from_owner(msg))).await {
+                    let payload = Bytes::from_owner(msg.into_contiguous());
+                    if let Err(e) = ws.send(WsMessage::Binary(payload)).await {
                         warn!(%label, %peer, error = ?e, batch_len = drained, "wss writer: send failed");
                         return;
                     }
@@ -476,7 +480,7 @@ mod tests {
     use crate::transports::tls::{install_default_crypto_provider, self_signed_for_loopback};
     use async_channel::{Receiver, Sender, bounded};
     use compio::net::TcpListener;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
     use rustls::RootCertStore;
     use server_common::MESSAGE_ALIGN;
     use server_common::Message;
@@ -531,7 +535,7 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn header_only(command: Command2) -> Frozen<MESSAGE_ALIGN> {
+    fn header_only(command: Command) -> Frozen<MESSAGE_ALIGN> {
         Message::<GenericHeader>::new(HEADER_SIZE)
             .transmute_header(|_, h: &mut GenericHeader| {
                 h.command = command;
@@ -541,7 +545,7 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn padded(command: Command2, total_size: usize) -> Frozen<MESSAGE_ALIGN> {
+    fn padded(command: Command, total_size: usize) -> Frozen<MESSAGE_ALIGN> {
         Message::<GenericHeader>::new(total_size)
             .transmute_header(|_, h: &mut GenericHeader| {
                 h.command = command;
@@ -554,7 +558,7 @@ mod tests {
     fn drive(
         conn: WssTransportConn,
     ) -> (
-        Sender<Frozen<MESSAGE_ALIGN>>,
+        Sender<BusMessage>,
         Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
@@ -567,12 +571,12 @@ mod tests {
         conn: WssTransportConn,
         max_message_size: usize,
     ) -> (
-        Sender<Frozen<MESSAGE_ALIGN>>,
+        Sender<BusMessage>,
         Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
     ) {
-        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (out_tx, out_rx) = bounded::<BusMessage>(16);
         let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
         let (shutdown, token) = Shutdown::new();
         let ctx = ActorContext {
@@ -604,24 +608,24 @@ mod tests {
         let (client_out, client_in, client_shutdown, client_handle) = drive(client_conn);
 
         client_out
-            .send(header_only(Command2::Request))
+            .send(header_only(Command::Request).into())
             .await
             .expect("client send");
         let received = compio::time::timeout(Duration::from_secs(5), server_in.recv())
             .await
             .expect("server recv within 5 s")
             .expect("server frame");
-        assert_eq!(received.header().command, Command2::Request);
+        assert_eq!(received.header().command, Command::Request);
 
         server_out
-            .send(header_only(Command2::Reply))
+            .send(header_only(Command::Reply).into())
             .await
             .expect("server send");
         let reply = compio::time::timeout(Duration::from_secs(5), client_in.recv())
             .await
             .expect("client recv within 5 s")
             .expect("client frame");
-        assert_eq!(reply.header().command, Command2::Reply);
+        assert_eq!(reply.header().command, Command::Reply);
 
         server_shutdown.trigger();
         client_shutdown.trigger();
@@ -647,14 +651,14 @@ mod tests {
         let (client_out, _client_in, client_shutdown, client_handle) = drive(client_conn);
 
         client_out
-            .send(padded(Command2::Request, total))
+            .send(padded(Command::Request, total).into())
             .await
             .expect("client send 1 MiB");
         let received = compio::time::timeout(Duration::from_secs(15), server_in.recv())
             .await
             .expect("server recv within 15 s")
             .expect("server frame");
-        assert_eq!(received.header().command, Command2::Request);
+        assert_eq!(received.header().command, Command::Request);
         assert_eq!(received.header().size as usize, total);
 
         server_shutdown.trigger();
@@ -683,7 +687,7 @@ mod tests {
             drive_with_cap(client_conn, framing::MAX_MESSAGE_SIZE);
 
         client_out
-            .send(padded(Command2::Request, OVER_CAP))
+            .send(padded(Command::Request, OVER_CAP).into())
             .await
             .expect("client send oversize");
 

@@ -10,12 +10,6 @@
 
 Apache Iggy Node.js client written in typescript, it currently only supports tcp & tls transports.
 
-> Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
->
-> Incubation is required of all newly accepted projects until a further review indicates that the infrastructure, communications, and decision making process have stabilized in a manner consistent with other successful ASF projects.
->
-> While incubation status is not necessarily a reflection of the completeness or stability of the code, it does indicate that the project has yet to be fully endorsed by the ASF.
-
 diclaimer: although all iggy commands & basic client/stream are implemented this is still a WIP, provided as is, and has still a long way to go to be considered "battle tested".
 
 note: This lib started as _iggy-bin_ ( [github](https://github.com/T1B0/iggy-bin) / [npm](https://www.npmjs.com/package/iggy-bin)) before migrating under iggy-rs org. package iggy-bin@v1.3.4 is equivalent to @iggy.rs/sdk@v1.0.3 and migrating again under apache iggy monorepo ( [github](https://github.com/apache/iggy/tree/master/foreign/node) and is now published on npmjs as apache-iggy
@@ -71,7 +65,15 @@ new session. Transient not-committed responses retry the exact encoded request
 within one bounded deadline. A disconnected mutation is never replayed under a
 new session.
 
-When the server's `[heartbeat]` eviction is enabled, configure the client's `heartbeatInterval` below the server heartbeat interval. Client heartbeats are disabled when `heartbeatInterval` is unset.
+The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
+keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
+`heartbeatInterval` also accepts a duration expression such as `"10s"` or
+`"1h 30m"`, like the Rust SDK.
+The server evicts a connection silent for 36 s, which is 1.2 x its 30 s
+heartbeat interval. Raising the client interval past that window, or setting it
+to 0 to disable client heartbeats, exposes an idle consumer-group member to
+eviction; a connection holding no group membership is left alone. Any other
+unusable value is rejected instead of silently disabling the heartbeat.
 
 `sendBinaryRequest(code, payload)` sends an arbitrary command code. Known replicated commands use their registered operation, while unknown codes reach the server as non-replicated requests and are rejected by servers that do not register them.
 
@@ -105,6 +107,43 @@ const client = new Client({
 const stats = await client.system.getStats();
 ```
 
+### Connection strings
+
+Every client constructor (except `SimpleClient` see note) also accepts a
+connection string instead of a config object:
+
+```ts
+import { Client } from "apache-iggy";
+
+const client = new Client("iggy://iggy:iggy@127.0.0.1:8090");
+const stats = await client.system.getStats();
+```
+
+Supported schemes are `iggy://` (TCP, default) and `iggy+tcp://`. Credentials
+are `username:password` or a single personal access token. Options mirror the
+other SDKs: `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries`,
+`reconnection_interval`, `heartbeat_interval` and `nodelay`. `reestablish_after`
+is accepted for format compatibility but has no Node equivalent.
+
+note: `SimpleClient` does not accept a connection string: it wraps an existing
+`RawClient` instance rather than building one from configuration. Pass the
+connection string to `Client`, `SingleClient` or `getRawClient` and hand the
+resulting raw client to `SimpleClient` if needed.
+
+### option limits
+
+| option | limit |
+| --- | --- |
+| `reconnection_retries` | integer up to `4294967295` (u32 max); larger values are rejected like Rust's u32 overflow, and `unlimited` maps to this ceiling. Defaults to unlimited |
+| `heartbeat_interval` | duration up to `2147483647ms` (Node's largest timer delay); `0` disables heartbeats |
+| `reconnection_interval` | positive duration (`ms`, `s`, `m`, `h`) up to `2147483647ms` (Node's largest timer delay); zero spellings are rejected. Defaults to `1s` |
+| port in the authority | decimal up to `65535` |
+
+Durations accept the same expressions as the Rust SDK, for example `500ms`,
+`10s`, `1h 30m`, `5d`, `2w`, `1y`; matching is case-insensitive and
+`0`, `unlimited`, `disabled` and `none` map to zero. Unit-less numbers such as
+`5` are rejected.
+
 ## use sources
 
 ### Install
@@ -122,7 +161,7 @@ npm run build
 ### test
 
 note: use env var `IGGY_TCP_ADDRESS="host:port"` to set the server
-address for bdd and e2e tests.
+address for e2e tests. bdd tests need more variables, see below.
 
 #### unit tests
 
@@ -140,15 +179,27 @@ npm run test:e2e
 
 #### bdd tests
 
-bdd test expect an iggy-server at tcp://127.0.0.1:8090
+the bdd suite has no defaults and fails when `IGGY_TCP_ADDRESS`,
+`IGGY_ROOT_USERNAME` or `IGGY_ROOT_PASSWORD` is missing. from the repository
+root run
 
 ```bash
-npm run test:bdd
+./scripts/run-bdd-tests.sh node
 ```
+
+the script starts the server and sets every variable, so none of them have to be
+exported by hand. to iterate against a server you started yourself, see
+[src/bdd/README.md](./src/bdd/README.md).
 
 #### run all test
 
-`npm run test` runs unit, bdd and e2e tests suite (expect an iggy-server at tcp://127.0.0.1:8090)
+`npm run test` runs unit, bdd and e2e tests suite against an iggy-server at
+tcp://127.0.0.1:8090, started with the same root credentials
+
+```bash
+IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+  npm run test
+```
 
 ### lint
 

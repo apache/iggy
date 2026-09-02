@@ -14,12 +14,6 @@ The Apache Iggy C# SDK provides a comprehensive client library for interacting w
 offers a modern, async-first API with support for multiple transport protocols and comprehensive message streaming
 capabilities.
 
-> Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), sponsored by the Apache Incubator PMC.
->
-> Incubation is required of all newly accepted projects until a further review indicates that the infrastructure, communications, and decision making process have stabilized in a manner consistent with other successful ASF projects.
->
-> While incubation status is not necessarily a reflection of the completeness or stability of the code, it does indicate that the project has yet to be fully endorsed by the ASF.
-
 ## Getting Started
 
 ### Installation
@@ -55,7 +49,8 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 await client.ConnectAsync();
 ```
 
-Optionally, you can provide an `ILoggerFactory` for diagnostics and debugging (defaults to `NullLoggerFactory.Instance`):
+Optionally, you can provide an `ILoggerFactory` for diagnostics and debugging (defaults to
+`NullLoggerFactory.Instance`):
 
 ```c#
 var loggerFactory = LoggerFactory.Create(builder =>
@@ -85,9 +80,9 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
     BaseAddress = "127.0.0.1:8090",
     Protocol = Protocol.Tcp,
 
-    // Buffer sizes (optional, default: 4096)
-    ReceiveBufferSize = 4096,
-    SendBufferSize = 4096,
+    // Socket buffer sizes in bytes (optional, null = OS default)
+    ReceiveBufferSize = null,
+    SendBufferSize = null,
 
     // TLS/SSL configuration
     TlsSettings = new TlsSettings
@@ -97,11 +92,15 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         CertificatePath = "/path/to/cert"
     },
 
-    // Automatic reconnection with exponential backoff
+    // Idle ping keeping the session alive under server-side heartbeat verification (TCP only).
+    // Default 5 seconds, must be between 1 millisecond and about 49 days. Init-only.
+    HeartbeatInterval = TimeSpan.FromSeconds(5),
+
+    // Automatic reconnection with exponential backoff (enabled by default, infinite retries)
     ReconnectionSettings = new ReconnectionSettings
     {
         Enabled = true,
-        MaxRetries = 3,              // 0 = infinite retries
+        MaxRetries = 0,              // 0 = infinite retries
         InitialDelay = TimeSpan.FromSeconds(5),
         MaxDelay = TimeSpan.FromSeconds(30),
         WaitAfterReconnect = TimeSpan.FromSeconds(1),
@@ -109,13 +108,11 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         BackoffMultiplier = 2.0
     },
 
-    // Auto-login after connection
-    AutoLoginSettings = new AutoLoginSettings
-    {
-        Enabled = true,
-        Username = "your_username",
-        Password = "your_password"
-    },
+    // Auto-login after connection. Optional for reconnection: a client that signs in with
+    // LoginUserAsync has that sign-in replayed on a reconnect too. Without either, a reconnect
+    // cannot restore the session and a lost connection fails the request
+    AutoLoginSettings = AutoLoginSettings.For("your_username", "your_password"),
+    // or AutoLoginSettings.ForPersonalAccessToken("your_token")
 
     // Optional: logging
     LoggerFactory = loggerFactory
@@ -139,12 +136,7 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
     // Upper bound on a reply frame the server announces, 64 MiB by default.
     MaxResponseFrameSize = 64 * 1024 * 1024,
 
-    AutoLoginSettings = new AutoLoginSettings
-    {
-        Enabled = true,
-        Username = "iggy",
-        Password = "iggy"
-    }
+    AutoLoginSettings = AutoLoginSettings.For("iggy", "iggy")
 });
 
 await client.ConnectAsync();
@@ -166,8 +158,10 @@ await client.ConnectAsync();
 - **Credentials are bounds-checked locally.** A username outside 3-50 bytes, a password outside 3-100 bytes or a
   personal access token outside 1-255 bytes is rejected before the register body is framed.
 - **`PingAsync` costs more than a ping.** Besides the ping it re-syncs the assignment of every consumer group
-  this client has joined, so it makes one extra round trip per joined group. The SDK runs no background
-  heartbeat: an application that wants assignments refreshed calls `PingAsync` on its own cadence.
+  this client has joined, so it makes one extra round trip per joined group. The TCP client pings on its own
+  every `HeartbeatInterval` (5 seconds by default) while connected, so an idle session survives the server's
+  heartbeat verification and assignments stay fresh; a lost session is repaired by the regular reconnect and
+  auto login.
 
 ### Retries and failed requests
 
@@ -202,6 +196,27 @@ The SDK replays a request whenever the server says it never admitted it. Two cas
 - Clients built with `IggyConsumerBuilder` / `IggyPublisherBuilder` now auto-login with the credentials passed
   to `WithConnection`. Before, a builder-created client came back from a
   reconnect unauthenticated; now the credentials are held for the lifetime of the connection and replayed.
+- The TCP client now pings the server every `HeartbeatInterval` (5 seconds, always on) on its own, and
+  reconnection is on by default (it was off before) with unlimited retries, like the Rust client. Bringing an
+  endpoint up is what gets another attempt, and one retry is a full pass over every endpoint the client knows -
+  where it is, the configured address, and every node the roster named - rather than one dial of the first.
+  Bad credentials or a missing leader is thrown right away, and so is a TLS fault no retry can fix (an
+  unreadable CA file, a certificate this client will never accept), once the pass has given the other
+  endpoints their turn. A dropped connection fails every in-flight request at once; they share a single
+  reconnect and are replayed on the connection it establishes. With the default `MaxRetries = 0` an
+  unreachable server is retried forever, so a request that passes no `CancellationToken` waits for as long as
+  the server stays down - set `MaxRetries` or pass a token to bound it. A reconnect restores the session from
+  `AutoLoginSettings` or from the sign-in a `LoginUserAsync` call succeeded with, so a client that logged in by
+  hand reconnects too; without either there is nothing to restore and the request fails. A server-side
+  eviction (the heartbeat verifier reacting to silence) is recovered from the same way; only `LogoutUserAsync`
+  or `Dispose` ends a session for good. Set `ReconnectionSettings.Enabled = false` to opt out of
+  reconnection.
+- `AutoLoginSettings` properties are now `init`-only, as is `IggyClientConfigurator.HeartbeatInterval`. Build
+  them with an object initializer or the `AutoLoginSettings.For` / `AutoLoginSettings.ForPersonalAccessToken`
+  factories instead of assigning after construction.
+- `IggyConsumerBuilder` / `IggyPublisherBuilder` accept a personal access token through the
+  `WithConnection(protocol, address, personalAccessToken, ...)` overload, as an alternative to a username and
+  password.
 - The SDK now ships a dependency on `System.IO.Hashing`, used for the client-side message-key partitioner.
 - TCP sockets are opened with `NoDelay`. The protocol is request/reply, so a write is
   always the last one before the client waits for the answer and Nagle has nothing to coalesce it with - it
@@ -284,7 +299,6 @@ await client.CreateTopicAsync(
     name: "my-topic",
     partitionsCount: 3,
     compressionAlgorithm: CompressionAlgorithm.None,
-    replicationFactor: 1,
     messageExpiry: 0,  // 0 = never expire
     maxTopicSize: 0    // 0 = unlimited
 );
@@ -560,7 +574,8 @@ var fullSnapshot = await client.GetSnapshotAsync(
 
 Available compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `Xz`.
 
-Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`, `All`.
+Available snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`,
+`All`.
 
 ### Segment Management
 

@@ -20,7 +20,8 @@ use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
+    EncryptorKind, Identifier, IggyExpiry, MaxTopicSize, NonZeroIggyDuration, Partitioner,
+    Partitioning,
 };
 use std::sync::Arc;
 
@@ -46,9 +47,8 @@ pub struct IggyProducerBuilder {
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
-    topic_replication_factor: Option<u8>,
     send_retries_count: Option<u32>,
-    send_retries_interval: Option<IggyDuration>,
+    send_retries_interval: Option<NonZeroIggyDuration>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
     partitioning: Option<Partitioning>,
@@ -78,11 +78,10 @@ impl IggyProducerBuilder {
             create_stream_if_not_exists: true,
             create_topic_if_not_exists: true,
             topic_partitions_count: 1,
-            topic_replication_factor: None,
             topic_message_expiry: IggyExpiry::ServerDefault,
             topic_max_size: MaxTopicSize::ServerDefault,
             send_retries_count: Some(3),
-            send_retries_interval: Some(IggyDuration::ONE_SECOND),
+            send_retries_interval: Some(NonZeroIggyDuration::ONE_SECOND),
             mode: SendMode::default(),
         }
     }
@@ -92,7 +91,7 @@ impl IggyProducerBuilder {
         Self { stream, ..self }
     }
 
-    /// Sets the stream name.
+    /// Sets the topic identifier.
     pub fn topic(self, topic: Identifier) -> Self {
         Self { topic, ..self }
     }
@@ -165,14 +164,12 @@ impl IggyProducerBuilder {
     pub fn create_topic_if_not_exists(
         self,
         partitions_count: u32,
-        replication_factor: Option<u8>,
         message_expiry: IggyExpiry,
         max_size: MaxTopicSize,
     ) -> Self {
         Self {
             create_topic_if_not_exists: true,
             topic_partitions_count: partitions_count,
-            topic_replication_factor: replication_factor,
             topic_message_expiry: message_expiry,
             topic_max_size: max_size,
             ..self
@@ -190,7 +187,7 @@ impl IggyProducerBuilder {
     /// Sets the retry policy (maximum number of retries and interval between them) in case of messages sending failure.
     /// The error can be related either to disconnecting from the server or to the server rejecting the messages.
     /// Default is 3 retries with 1 second interval between them.
-    pub fn send_retries(self, retries: Option<u32>, interval: Option<IggyDuration>) -> Self {
+    pub fn send_retries(self, retries: Option<u32>, interval: Option<NonZeroIggyDuration>) -> Self {
         Self {
             send_retries_count: retries,
             send_retries_interval: interval,
@@ -226,7 +223,6 @@ impl IggyProducerBuilder {
             self.create_stream_if_not_exists,
             self.create_topic_if_not_exists,
             self.topic_partitions_count,
-            self.topic_replication_factor,
             self.topic_message_expiry,
             self.topic_max_size,
             self.send_retries_count,

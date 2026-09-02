@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 /**
  * VSR consensus header layout, ported from
@@ -64,8 +63,8 @@ export const EVICTION_OFFSET = {
   reason: 255
 } as const;
 
-/** `Command2` frame discriminants a client encounters. */
-export const Command2 = {
+/** `Command` frame discriminants a client encounters. */
+export const Command = {
   Request: 5,
   Reply: 8,
   Eviction: 13
@@ -114,13 +113,15 @@ const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
 
 /**
  * Encodes a 256-byte request header. Only the six fields the server reads
- * are written; the checksums stay zero, matching the Rust SDK's contract
- * with the VSR server.
+ * are written. The checksums stay zero: the frame and body checksums are not
+ * read on the client request path, and `request_checksum` treats zero as
+ * unstamped, which opts out of the server's payload comparison. Stamping it is
+ * optional -- the Rust SDK does for deduped ops, this SDK does not yet.
  */
 export const encodeRequestHeader = (fields: RequestHeaderFields): Buffer => {
   const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32LE(fields.size, REQUEST_OFFSET.size);
-  header.writeUInt8(Command2.Request, REQUEST_OFFSET.command);
+  header.writeUInt8(Command.Request, REQUEST_OFFSET.command);
   // u128 client id: two little-endian u64 halves, low half first.
   header.writeBigUInt64LE(fields.client & U64_MASK, REQUEST_OFFSET.client);
   header.writeBigUInt64LE(fields.client >> 64n, REQUEST_OFFSET.client + 8);

@@ -23,7 +23,7 @@
 //! - Automatic network partitioning with configurable lifecycle
 //! - Automatic path clogging with exponential duration
 //! - Link capacity limits with random eviction
-//! - Per-command link filtering via `LinkFilter` (`EnumSet<Command2>`)
+//! - Per-command link filtering via `LinkFilter` (`EnumSet<Command>`)
 //!
 //! Partitions are implemented via per-link `LinkFilter`s. When a link's
 //! filter is empty, all packets are silently dropped. When specific commands
@@ -39,19 +39,21 @@
 //! the same tick cannot trigger chain reactions within that tick.
 
 use crate::ready_queue::{Ready, ReadyQueue};
+use crate::seeds::SimSeeds;
 use enumset::EnumSet;
-use iggy_binary_protocol::{Command2, GenericHeader};
+use iggy_binary_protocol::{Command, GenericHeader};
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
 use server_common::Message;
 use std::collections::HashMap;
+use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
-/// Per-link command filter. An `EnumSet<Command2>` where:
+/// Per-link command filter. An `EnumSet<Command>` where:
 /// - [`ALLOW_ALL`] = all commands pass (link fully enabled)
 /// - [`BLOCK_ALL`] = all commands blocked (link fully disabled/partitioned)
 /// - Custom sets = only matching commands pass through
-pub type LinkFilter = EnumSet<Command2>;
+pub type LinkFilter = EnumSet<Command>;
 
 /// Link filter that allows all commands through (link fully enabled).
 pub const ALLOW_ALL: LinkFilter = EnumSet::all();
@@ -153,6 +155,76 @@ impl Default for PacketSimulatorOptions {
     }
 }
 
+impl PacketSimulatorOptions {
+    /// Every network parameter drawn from `seed`, so the seed picks the weather as
+    /// well as the traffic.
+    ///
+    /// A fixed profile explores ONE point in parameter space however many seeds are
+    /// thrown at it, so `--faults heavy` run a thousand times is the same network a
+    /// thousand times.
+    ///
+    /// `node_count` and `client_count` are left at their defaults for the caller to
+    /// fill, as [`Self::default`] leaves them; `seed` is stamped here so a value
+    /// used as-is still replays.
+    ///
+    /// The ceilings sit roughly 1.5x above the hand-calibrated `heavy` profile,
+    /// which already costs an order of magnitude of throughput: far enough to reach
+    /// past what a fixed profile could, near enough that a healthy cluster still
+    /// drains and a failure to converge is worth reading. A tick here runs every
+    /// shard's pump to quiescence rather than one IO step, so the same percentages
+    /// describe a more hostile network than they would in a per-IO model. Forcing a
+    /// single axis past its ceiling is what the individual `--packet-loss-prob`
+    /// overrides are for.
+    #[must_use]
+    pub fn swarm(seed: u64) -> Self {
+        // The swarm stream, not the network one: [`PacketSimulator`] draws its
+        // delays and drops from the same `seed`, so sharing would correlate the loss
+        // probability with the loss events it produces.
+        let mut prng = Xoshiro256PlusPlus::seed_from_u64(SimSeeds::derive(seed).swarm);
+        // `PacketSimulator::new` asserts `min >= 1` (zero causes unbounded replay
+        // loops) and `mean >= min`, so both are drawn to satisfy it rather than
+        // clamped afterwards.
+        let one_way_delay_min = prng.random_range(1..=3u64);
+        let one_way_delay_mean = prng.random_range(one_way_delay_min..=10u64);
+        Self {
+            one_way_delay_min,
+            one_way_delay_mean,
+            packet_loss_probability: f64::from(prng.random_range(0..=15u32)) / 100.0,
+            replay_probability: f64::from(prng.random_range(0..=5u32)) / 100.0,
+            // Floored well above 2, deliberately. A tiny queue drops packets by
+            // eviction, the same fault class as `packet_loss_probability` above, so
+            // the two compound into a network that never converges without covering
+            // anything the loss draw does not. `--link-capacity` forces it lower.
+            link_capacity: prng.random_range(8..=64u8),
+            partition_probability: f64::from(prng.random_range(0..=30u32)) / 1_000.0,
+            // Never zero: a partition that cannot heal is a permanently split
+            // cluster, and every run drawing it reports a liveness failure that
+            // says nothing.
+            unpartition_probability: f64::from(prng.random_range(1..=10u32)) / 100.0,
+            partition_stability: prng.random_range(20..=80u32),
+            unpartition_stability: prng.random_range(0..=60u32),
+            partition_mode: draw_variant(&mut prng),
+            partition_symmetry: draw_variant(&mut prng),
+            path_clog_probability: f64::from(prng.random_range(0..=15u32)) / 1_000.0,
+            path_clog_duration_mean: prng.random_range(0..=40u64),
+            seed,
+            ..Self::default()
+        }
+    }
+}
+
+/// Uniform draw over an enum's variants.
+///
+/// Generic rather than a `match` on a drawn index: a match would silently keep
+/// drawing the old variant set after one is added to [`PartitionMode`], and a
+/// fault mode the swarm never reaches looks like one that never finds anything.
+fn draw_variant<T: IntoEnumIterator + EnumCount>(prng: &mut Xoshiro256PlusPlus) -> T {
+    let index = prng.random_range(0..T::COUNT);
+    T::iter()
+        .nth(index)
+        .expect("an index drawn below the variant count always names a variant")
+}
+
 /// Per-path link: holds packets in a [`ReadyQueue`] sorted by `ready_at`.
 struct Link {
     /// Packets waiting to be delivered, ordered by `ready_at` (min-heap).
@@ -192,7 +264,11 @@ impl Link {
 
 /// Determines how automatic partitions are created.
 /// Only nodes (replicas) are partitioned. There will always be exactly two partitions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `EnumCount` + `EnumIter` so [`PacketSimulatorOptions::swarm`] can draw a
+/// variant uniformly; adding one here puts it in the swarm's reach with no
+/// second edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, EnumCount, EnumIter)]
 pub enum PartitionMode {
     /// Disable automatic partitioning.
     #[default]
@@ -207,8 +283,9 @@ pub enum PartitionMode {
     IsolateSingle,
 }
 
-/// Whether partitions are symmetric or asymmetric.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Whether partitions are symmetric or asymmetric. See [`PartitionMode`] for
+/// why the strum derives are here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, EnumCount, EnumIter)]
 pub enum PartitionSymmetry {
     #[default]
     Symmetric,
@@ -220,6 +297,12 @@ pub struct PacketSimulator {
     options: PacketSimulatorOptions,
     /// Flat array of links. Index = `from_idx` * `max_processes` + `to_idx`.
     links: Vec<Link>,
+    /// Whether each process is running, indexed by flat process index.
+    ///
+    /// A layer ABOVE the link filters, never written into them, so a crash and a
+    /// partition compose. Folding availability into `Link::filter` meant restarting a
+    /// process wrote `ALLOW_ALL` over whatever the partition had set.
+    process_up: Vec<bool>,
     /// Maximum number of processes (determines link array size).
     max_processes: usize,
     /// Mapping from [`ProcessId`] to flat index.
@@ -230,7 +313,7 @@ pub struct PacketSimulator {
     /// Current tick (network global time).
     current_tick: u64,
     /// PRNG for deterministic randomness.
-    prng: Xoshiro256Plus,
+    prng: Xoshiro256PlusPlus,
     /// Whether an automatic partition is currently active.
     auto_partition_active: bool,
     /// Per-node partition assignment (true = partition A, false = partition B).
@@ -241,7 +324,64 @@ pub struct PacketSimulator {
     auto_partition_nodes: Vec<usize>,
     /// Reusable buffer for delivered packets.
     delivered: Vec<Packet>,
+    /// Packets actually delivered, per [`Command`] discriminant.
+    ///
+    /// Counted at delivery, past every drop path, so a command appears only if a
+    /// process really received one. This is how a run answers which parts of the
+    /// protocol it exercised, which is the difference between covering a path and
+    /// merely compiling it.
+    command_counts: [u64; COMMAND_COUNT_MAX],
 }
+
+/// One past the highest [`Command`] discriminant, sizing [`COMMAND_LABELS`] and
+/// the delivery counters. Raising it is part of adding a command.
+pub const COMMAND_COUNT_MAX: usize = 30;
+
+/// Names for each [`Command`] discriminant, so a coverage report reads as
+/// protocol rather than as integers. Indexed by discriminant; the trailing
+/// assert keeps it aligned with the enum.
+pub const COMMAND_LABELS: [&str; COMMAND_COUNT_MAX] = [
+    "Reserved",
+    "Ping",
+    "Pong",
+    "PingClient",
+    "PongClient",
+    "Request",
+    "Prepare",
+    "PrepareOk",
+    "Reply",
+    "Commit",
+    "StartViewChange",
+    "DoViewChange",
+    "StartView",
+    "Eviction",
+    "ReplicaHello",
+    "ReplicaChallenge",
+    "ReplicaFinish",
+    "RequestStartView",
+    "RequestPrepares",
+    "RepairPrepare",
+    "RepairDone",
+    "RangeEvicted",
+    "RequestStateTransfer",
+    "StateTransferTarget",
+    "RequestStateChunk",
+    "StateChunk",
+    "ForwardRegister",
+    "ForwardRegisterResult",
+    "ForwardLogout",
+    "ForwardLogoutResult",
+];
+
+const _: () = {
+    // Adding a command without extending the table would report it under the wrong
+    // name or index past the end of `command_counts`. Asserts the TABLE's length
+    // rather than pinning one variant to the end: `ForwardLogoutResult ==
+    // COMMAND_COUNT_MAX - 1` still holds after a `NewThing = 30` is appended past
+    // it, so that form passed exactly when it needed to fire.
+    assert!(COMMAND_LABELS.len() == COMMAND_COUNT_MAX);
+    assert!(enumset::EnumSet::<Command>::variant_count() as usize == COMMAND_COUNT_MAX);
+};
 
 impl PacketSimulator {
     /// Create a new packet simulator.
@@ -312,16 +452,18 @@ impl PacketSimulator {
         Self {
             options,
             links,
+            process_up: vec![true; max_processes],
             max_processes,
             process_indices,
             next_index: node_count,
             current_tick: 0,
-            prng: Xoshiro256Plus::seed_from_u64(seed),
+            prng: Xoshiro256PlusPlus::seed_from_u64(SimSeeds::derive(seed).network),
             auto_partition_active: false,
             auto_partition: vec![false; node_count],
             auto_partition_stability: initial_stability,
             auto_partition_nodes: (0..node_count).collect(),
             delivered: Vec::new(),
+            command_counts: [0; COMMAND_COUNT_MAX],
         }
     }
 
@@ -402,7 +544,7 @@ impl PacketSimulator {
 
     /// Calculate a random delay using exponential distribution.
     /// Returns max(min, exponential(mean)).
-    fn calculate_delay(prng: &mut Xoshiro256Plus, options: &PacketSimulatorOptions) -> u64 {
+    fn calculate_delay(prng: &mut Xoshiro256PlusPlus, options: &PacketSimulatorOptions) -> u64 {
         let min = options.one_way_delay_min;
         let mean = options.one_way_delay_mean;
         let exp = Self::random_exponential(prng, mean);
@@ -416,7 +558,7 @@ impl PacketSimulator {
         clippy::cast_sign_loss,
         clippy::cast_possible_truncation
     )]
-    fn random_exponential(prng: &mut Xoshiro256Plus, mean: u64) -> u64 {
+    fn random_exponential(prng: &mut Xoshiro256PlusPlus, mean: u64) -> u64 {
         let u: f64 = prng.random::<f64>();
         if u > 0.0 {
             (-(mean as f64) * u.ln()) as u64
@@ -432,7 +574,7 @@ impl PacketSimulator {
     }
 
     /// Returns a mutable reference to the link's filter.
-    /// This is the per-link command filter — `EnumSet<Command2>`.
+    /// This is the per-link command filter — `EnumSet<Command>`.
     /// Set to [`BLOCK_ALL`] to block all packets (partition).
     /// Set to [`ALLOW_ALL`] to allow all packets (default).
     /// Remove specific commands to selectively filter.
@@ -467,31 +609,39 @@ impl PacketSimulator {
         &mut self.links[idx].drop_packet_fn
     }
 
-    /// Disable a process by blocking all links to and from it.
+    /// Mark a process down. Anything addressed to it is dropped at delivery.
     ///
-    /// Packets already queued on those links remain but will be dropped at
-    /// delivery time because the link filter is [`BLOCK_ALL`].
+    /// Link filters are untouched, so a partition or command filter standing at crash
+    /// time still stands at restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `process` was never registered with this simulator.
     pub fn process_disable(&mut self, process: ProcessId) {
-        let all_processes: Vec<ProcessId> = self.process_indices.keys().copied().collect();
-        for other in all_processes {
-            if other == process {
-                continue;
-            }
-            *self.link_filter(process, other) = BLOCK_ALL;
-            *self.link_filter(other, process) = BLOCK_ALL;
-        }
+        let idx = self
+            .process_index(process)
+            .expect("process_disable: unregistered process");
+        self.process_up[idx] = false;
     }
 
-    /// Re-enable a process by allowing all links to and from it.
+    /// Mark a process up again. Restores nothing else: whatever the link layer was
+    /// applying before the crash still applies after the restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `process` was never registered with this simulator.
     pub fn process_enable(&mut self, process: ProcessId) {
-        let all_processes: Vec<ProcessId> = self.process_indices.keys().copied().collect();
-        for other in all_processes {
-            if other == process {
-                continue;
-            }
-            *self.link_filter(process, other) = ALLOW_ALL;
-            *self.link_filter(other, process) = ALLOW_ALL;
-        }
+        let idx = self
+            .process_index(process)
+            .expect("process_enable: unregistered process");
+        self.process_up[idx] = true;
+    }
+
+    /// Whether a process is currently running.
+    #[must_use]
+    pub fn is_process_up(&self, process: ProcessId) -> bool {
+        self.process_index(process)
+            .is_some_and(|idx| self.process_up[idx])
     }
 
     // TODO: implement record/replay_recorded for deterministic replay support.
@@ -518,19 +668,21 @@ impl PacketSimulator {
 
         let Self {
             links,
+            process_up,
             prng,
             options,
             current_tick,
             delivered,
             max_processes,
             next_index,
+            command_counts,
             ..
         } = self;
 
         let process_count = *next_index;
 
         for from in 0..process_count {
-            for to in 0..process_count {
+            for (to, &target_up) in process_up.iter().enumerate().take(process_count) {
                 let idx = from * *max_processes + to;
                 let link = &mut links[idx];
 
@@ -543,6 +695,14 @@ impl PacketSimulator {
                     let Some(packet) = link.packets.remove_ready(prng, *current_tick) else {
                         break;
                     };
+
+                    // Discarded on arrival rather than by blocking the link, which is
+                    // what lets a crash and a partition stand at once. Target only,
+                    // a packet sent before the sender died still lands.
+                    if !target_up {
+                        tracing::trace!(to, "packet dropped (target process is down)");
+                        continue;
+                    }
 
                     // Per-command link filter check: drop if command not in filter
                     let command = packet.message.header().command;
@@ -580,12 +740,27 @@ impl PacketSimulator {
                         tracing::trace!("packet replayed");
                     }
 
+                    command_counts[command as usize] += 1;
                     delivered.push(packet);
                 }
             }
         }
 
         std::mem::take(&mut self.delivered)
+    }
+
+    /// Packets delivered so far, per [`Command`] discriminant. See
+    /// [`Self::command_counts`]'s field docs for why this counts at delivery.
+    #[must_use]
+    pub const fn command_counts(&self) -> &[u64; COMMAND_COUNT_MAX] {
+        &self.command_counts
+    }
+
+    /// Whether any packet of this command has been delivered. The question a
+    /// coverage assertion actually asks.
+    #[must_use]
+    pub const fn delivered_any(&self, command: Command) -> bool {
+        self.command_counts[command as usize] > 0
     }
 
     /// Return a previously taken buffer for reuse.
@@ -714,6 +889,22 @@ impl PacketSimulator {
         self.current_tick
     }
 
+    /// End fault injection: heal what is broken and stop drawing new faults.
+    ///
+    /// A drain cannot prove convergence while the generator that broke connectivity
+    /// keeps breaking it. Delays
+    /// stay: they slow a drain, they do not prevent it.
+    pub fn heal(&mut self) {
+        self.options.packet_loss_probability = 0.0;
+        self.options.replay_probability = 0.0;
+        self.options.partition_probability = 0.0;
+        self.options.path_clog_probability = 0.0;
+        self.clear_partition();
+        for link in &mut self.links {
+            link.clogged_till = 0;
+        }
+    }
+
     /// Clear all partitions, restoring full connectivity.
     ///
     /// Resets auto partition state and sets **all** link filters to `ALLOW_ALL`,
@@ -787,7 +978,7 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn create_test_message_with_command(command: Command2) -> Message<GenericHeader> {
+    fn create_test_message_with_command(command: Command) -> Message<GenericHeader> {
         let size = std::mem::size_of::<GenericHeader>();
         let mut buf = vec![0u8; size];
         let header: &mut GenericHeader =
@@ -922,6 +1113,125 @@ mod tests {
         assert_eq!(delivered.len(), 1);
     }
 
+    /// A partition standing when a process crashes still stands when it restarts.
+    ///
+    /// `process_enable` used to write `ALLOW_ALL` over every link touching the
+    /// restarted process, clearing its share of a partition still reported active.
+    /// Both symmetries, because a blanket re-enable erases either.
+    #[test]
+    fn a_restart_leaves_a_standing_partition_intact() {
+        for symmetry in [PartitionSymmetry::Symmetric, PartitionSymmetry::Asymmetric] {
+            let mut sim = PacketSimulator::new(PacketSimulatorOptions {
+                one_way_delay_min: 1,
+                one_way_delay_mean: 1,
+                partition_probability: 1.0,
+                unpartition_probability: 0.0,
+                partition_stability: 1_000,
+                unpartition_stability: 0,
+                partition_mode: PartitionMode::UniformSize,
+                partition_symmetry: symmetry,
+                node_count: 3,
+                client_count: 0,
+                seed: 0x9A11,
+                ..Default::default()
+            });
+
+            sim.tick();
+            assert!(
+                sim.auto_partition_active,
+                "{symmetry:?}: expected a partition"
+            );
+            let filters_while_partitioned: Vec<LinkFilter> =
+                sim.links.iter().map(|link| link.filter).collect();
+            assert!(
+                filters_while_partitioned.iter().any(EnumSet::is_empty),
+                "{symmetry:?}: the partition blocked no link, so this proves nothing"
+            );
+
+            sim.process_disable(ProcessId::Replica(0));
+            assert!(!sim.is_process_up(ProcessId::Replica(0)));
+            sim.process_enable(ProcessId::Replica(0));
+            assert!(sim.is_process_up(ProcessId::Replica(0)));
+
+            let filters_after_restart: Vec<LinkFilter> =
+                sim.links.iter().map(|link| link.filter).collect();
+            assert_eq!(
+                filters_after_restart, filters_while_partitioned,
+                "{symmetry:?}: restarting a replica changed the partition's link state"
+            );
+            assert!(
+                sim.auto_partition_active,
+                "{symmetry:?}: the partition must still be active after the restart"
+            );
+        }
+    }
+
+    /// A hand-set per-command filter survives a crash and restart.
+    ///
+    /// A restart restoring it turns a scenario test's targeted fault into no fault at
+    /// all, with the test still green.
+    #[test]
+    fn a_restart_leaves_a_manual_command_filter_intact() {
+        let mut sim = PacketSimulator::new(PacketSimulatorOptions {
+            one_way_delay_min: 1,
+            one_way_delay_mean: 1,
+            node_count: 2,
+            client_count: 0,
+            seed: 0x9A12,
+            ..Default::default()
+        });
+
+        let from = ProcessId::Replica(0);
+        let to = ProcessId::Replica(1);
+        let filter = ALLOW_ALL - Command::Prepare;
+        *sim.link_filter(from, to) = filter;
+
+        sim.process_disable(to);
+        sim.process_enable(to);
+
+        assert_eq!(
+            *sim.link_filter(from, to),
+            filter,
+            "the restart restored a command the filter was dropping"
+        );
+    }
+
+    /// Packets addressed to a crashed process are dropped on arrival; the process
+    /// receives again the moment it is back. What the availability layer owes now that
+    /// link filters no longer carry it.
+    #[test]
+    fn a_down_process_receives_nothing_and_recovers_on_restart() {
+        let mut sim = PacketSimulator::new(PacketSimulatorOptions {
+            one_way_delay_min: 1,
+            one_way_delay_mean: 1,
+            node_count: 2,
+            client_count: 0,
+            seed: 0x9A13,
+            ..Default::default()
+        });
+
+        let from = ProcessId::Replica(0);
+        let to = ProcessId::Replica(1);
+
+        // Exponential delays, so drain over a window rather than a single tick.
+        let drain = |sim: &mut PacketSimulator| {
+            let mut delivered = 0;
+            for _ in 0..50 {
+                sim.tick();
+                delivered += sim.step().len();
+            }
+            delivered
+        };
+
+        sim.process_disable(to);
+        sim.submit(from, to, create_test_message_with_command(Command::Prepare));
+        assert_eq!(drain(&mut sim), 0, "a crashed replica must receive nothing");
+
+        sim.process_enable(to);
+        sim.submit(from, to, create_test_message_with_command(Command::Prepare));
+        assert_eq!(drain(&mut sim), 1, "a restarted replica must receive again");
+    }
+
     #[test]
     fn test_auto_partition_lifecycle() {
         let options = PacketSimulatorOptions {
@@ -1030,11 +1340,11 @@ mod tests {
 
         // Set filter to only allow Ping on link 0->1
         let filter = sim.link_filter(ProcessId::Replica(0), ProcessId::Replica(1));
-        *filter = EnumSet::only(Command2::Ping);
+        *filter = EnumSet::only(Command::Ping);
 
         // Submit a Ping message and a Prepare message
-        let ping_msg = create_test_message_with_command(Command2::Ping);
-        let prepare_msg = create_test_message_with_command(Command2::Prepare);
+        let ping_msg = create_test_message_with_command(Command::Ping);
+        let prepare_msg = create_test_message_with_command(Command::Prepare);
 
         sim.submit(ProcessId::Replica(0), ProcessId::Replica(1), ping_msg);
         sim.submit(ProcessId::Replica(0), ProcessId::Replica(1), prepare_msg);
@@ -1048,7 +1358,7 @@ mod tests {
 
         // Only the Ping should be delivered
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].message.header().command, Command2::Ping);
+        assert_eq!(delivered[0].message.header().command, Command::Ping);
 
         // Nothing left in flight
         assert_eq!(sim.packets_in_flight(), 0);

@@ -31,12 +31,22 @@ const PARTITION_ID: u32 = 0;
 const LOG_EXTENSION: &str = "log";
 const INDEX_EXTENSION: &str = "index";
 
-/// The server persists the actual `SendMessages2` batch framing: a 256-byte
+/// Smallest segment a topic may declare (`iggy_common::MIN_TOPIC_SEGMENT_SIZE`).
+/// The layout below is built around it: a segment size is a per-topic creation
+/// option now, and sub-MiB values are refused at admission, so the message
+/// volume carries what a 5 KiB segment used to.
+const SEGMENT_SIZE: u64 = 1024 * 1024;
+
+/// The server persists the actual `SendMessages` batch framing: a 256-byte
 /// command header per append (each send below is a single-message batch) plus
 /// a 48-byte per-message header, and a 24-byte sparse index entry per flush
 /// (one per message with messages_required_to_save = 1). See
-/// `server_common::send_messages2` and `stream_size_validation_scenario`.
-const PAYLOAD_SIZE: usize = 936;
+/// `server_common::send_messages` and `stream_size_validation_scenario`.
+///
+/// Sized so five messages seal a [`SEGMENT_SIZE`] segment and four do not:
+/// 4 * 220304 = 881216 < 1 MiB <= 5 * 220304 = 1101520. Must stay a multiple
+/// of 4, since `send_messages` fills the payload with a 4-byte pattern.
+const PAYLOAD_SIZE: usize = 220_000;
 const NG_BATCH_HEADER_SIZE: u64 = 256;
 const NG_MESSAGE_HEADER_SIZE: u64 = 48;
 const MESSAGE_ON_DISK_SIZE: u64 =
@@ -44,10 +54,50 @@ const MESSAGE_ON_DISK_SIZE: u64 =
 const INDEX_SIZE_PER_MSG: u64 = 24;
 const TOTAL_MESSAGES: u32 = 25;
 
-/// 5 sealed segments (5 msgs each at 1240B on disk; the post-append size
-/// check seals at 6200B >= 5KiB) + 1 empty active segment at offset 25.
+/// 5 sealed segments (5 msgs each at 220304B on disk; the post-append size
+/// check seals at 1101520B >= 1MiB) + 1 empty active segment at offset 25.
 const EXPECTED_SEGMENT_OFFSETS: &[u64] = &[0, 5, 10, 15, 20, 25];
 const MSGS_PER_SEALED_SEGMENT: u64 = 5;
+
+/// Topic knobs the on-disk layout assertions depend on: segments that roll
+/// every five messages, and a flush per message so an append is in the
+/// segment (and its 24-byte index entry) before the next assertion reads it.
+fn layout_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        segment_size: Some(IggyByteSize::from(SEGMENT_SIZE)),
+        enforce_fsync: Some(true),
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    }
+}
+
+/// Topic knobs for the purge-durability scenario: a flush per message so both
+/// the pre- and post-purge appends reach a segment, and the default segment
+/// size so the handful of messages never rotates.
+fn flushing_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    }
+}
+
+/// Topic knobs that keep every append journal-resident: both flush thresholds
+/// sit far past what the scenario sends, so nothing ever reaches a segment.
+/// The byte threshold has to move too -- it defaults to 1 MiB and would flush
+/// on its own long before the message count threshold trips.
+fn journal_resident_topic_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        messages_required_to_save: Some(10_000),
+        size_of_messages_required_to_save: Some(IggyByteSize::from(1024 * 1024 * 1024u64)),
+        ..TopicCreateOptions::default()
+    }
+}
 
 /// Single consumer barrier: oldest-first deletion, barrier advancement, and edge cases.
 ///
@@ -65,11 +115,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -96,14 +142,14 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
 
     // --- Consumer offset barrier ---
     //
-    // stored_offset = 7 (start of segment 1). Segment 0 end_offset = 6 <= 7 → deletable.
-    // Segment 1 end_offset = 13 > 7 → protected by barrier.
+    // stored_offset = 5 (start of segment 1). Segment 0 end_offset = 4 <= 5 → deletable.
+    // Segment 1 end_offset = 9 > 5 → protected by barrier.
     let consumer = Consumer {
         kind: ConsumerKind::Consumer,
         id: Identifier::numeric(1).unwrap(),
     };
-    let stored_offset = EXPECTED_SEGMENT_OFFSETS[1]; // 7
-    let seg1_end_offset = EXPECTED_SEGMENT_OFFSETS[2] - 1; // 13
+    let stored_offset = EXPECTED_SEGMENT_OFFSETS[1]; // 5
+    let seg1_end_offset = EXPECTED_SEGMENT_OFFSETS[2] - 1; // 9
     client
         .store_consumer_offset(
             &consumer,
@@ -120,7 +166,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
     assert_segment_file_sizes(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]);
@@ -133,8 +179,8 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
     )
     .await;
 
-    // After deleting segment 0 (7 messages removed): current_offset must still
-    // reflect the true partition max (24), not messages_count - 1 (17).
+    // After deleting segment 0 (5 messages removed): current_offset must still
+    // reflect the true partition max (24), not messages_count - 1 (19).
     {
         let max_offset = (TOTAL_MESSAGES - 1) as u64;
         // Short poll, not a one-shot read: the restart cells reconnect, and a
@@ -176,7 +222,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     assert_layout_stable(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
     assert_segment_file_sizes(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]);
@@ -197,7 +243,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[2..]).await;
     assert_segment_file_sizes(&partition_path, &EXPECTED_SEGMENT_OFFSETS[2..]);
@@ -206,12 +252,12 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         &stream_ident,
         &topic_ident,
         (2 * MSGS_PER_SEALED_SEGMENT..TOTAL_MESSAGES as u64).collect::<Vec<_>>(),
-        "Messages 14..25 survive",
+        "Messages 10..25 survive",
     )
     .await;
 
-    // After deleting segments 0 and 1 (14 messages removed): current_offset
-    // must still be 24, not messages_count - 1 (10).
+    // After deleting segments 0 and 1 (10 messages removed): current_offset
+    // must still be 24, not messages_count - 1 (14).
     {
         let max_offset = (TOTAL_MESSAGES - 1) as u64;
         let offset_info = client
@@ -245,7 +291,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .unwrap();
     assert_eq!(
         polled_next.messages[0].header.offset, EXPECTED_SEGMENT_OFFSETS[2],
-        "Next poll resumes at offset 14 (first message after stored_offset 13)"
+        "Next poll resumes at offset 10 (first message after stored_offset 9)"
     );
 
     // --- delete(0) is a no-op ---
@@ -272,7 +318,7 @@ pub async fn run(harness: &mut TestHarness, restart_server: bool) {
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     let active_segment_offset = *EXPECTED_SEGMENT_OFFSETS.last().unwrap();
     await_segment_layout(
@@ -353,11 +399,7 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -389,7 +431,7 @@ pub async fn run_no_consumers(harness: &mut TestHarness, restart_server: bool) {
             .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, 1)
             .await
             .unwrap();
-        maybe_restart(harness, restart_server).await;
+        maybe_restart(harness, &client, restart_server).await;
 
         let first_surviving = layout[i + 1];
         // Deletion is asynchronous (metadata commit -> reconciler), so
@@ -448,11 +490,7 @@ pub async fn run_consumer_group_barrier(client: &IggyClient, data_path: &Path) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -593,11 +631,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -692,7 +726,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     assert_layout_stable(&partition_path, EXPECTED_SEGMENT_OFFSETS).await;
 
     // Phase 2: slow→seg0_end, barrier=seg0_end → seg0 released
@@ -719,7 +753,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
 
     // Phase 3: slow→mid-seg1, barrier below seg1_end → seg1 protected
@@ -746,7 +780,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     assert_layout_stable(&partition_path, &EXPECTED_SEGMENT_OFFSETS[1..]).await;
 
     // Phase 4: slow→seg1_end, barrier=seg1_end → seg1 released
@@ -773,7 +807,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     await_segment_layout(&partition_path, &EXPECTED_SEGMENT_OFFSETS[2..]).await;
 
     // Phase 5: slow→last sealed end → every sealed segment released
@@ -800,7 +834,7 @@ pub async fn run_multi_consumer_barrier(harness: &mut TestHarness, restart_serve
         .delete_segments(&stream_ident, &topic_ident, PARTITION_ID, u32::MAX)
         .await
         .unwrap();
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
     await_segment_layout(&partition_path, &active_only).await;
     assert_no_orphaned_segment_files(&partition_path, 1).await;
 
@@ -831,11 +865,7 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &layout_topic_options(),
         )
         .await
         .unwrap();
@@ -954,7 +984,7 @@ pub async fn run_purge_topic(harness: &mut TestHarness, restart_server: bool) {
     // instant even in the restart cells. Only the kill-lands-mid-purge case
     // earns a tolerance.
     let drained_before_restart = is_dir_empty(&consumers_dir) && is_dir_empty(&groups_dir);
-    maybe_restart(harness, restart_server).await;
+    maybe_restart(harness, &client, restart_server).await;
 
     // Purge is asynchronous (metadata commit -> reconciler -> pump). The
     // pump's purge resets the partition to a single segment at offset 0 and
@@ -1084,15 +1114,7 @@ pub async fn run_purge_survives_restart(harness: &mut TestHarness) {
     client.create_stream(STREAM_NAME).await.unwrap();
     let stream_ident = Identifier::named(STREAM_NAME).unwrap();
     client
-        .create_topic(
-            &stream_ident,
-            TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
+        .create_topic(&stream_ident, TOPIC_NAME, &flushing_topic_options())
         .await
         .unwrap();
     let topic_ident = Identifier::named(TOPIC_NAME).unwrap();
@@ -1115,7 +1137,7 @@ pub async fn run_purge_survives_restart(harness: &mut TestHarness) {
     send_messages(&client, &stream_ident, &topic_ident, 3).await;
     poll_exactly(&client, &stream_ident, &topic_ident, 3).await;
 
-    maybe_restart(harness, true).await;
+    maybe_restart(harness, &client, true).await;
 
     // Ride out the boot reconcile pass: an un-hydrated applied generation
     // would re-purge asynchronously, so an immediate poll could still see
@@ -1142,15 +1164,7 @@ pub async fn run_resident_purge_no_resurface(harness: &mut TestHarness) {
     client.create_stream(STREAM_NAME).await.unwrap();
     let stream_ident = Identifier::named(STREAM_NAME).unwrap();
     client
-        .create_topic(
-            &stream_ident,
-            TOPIC_NAME,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
-        )
+        .create_topic(&stream_ident, TOPIC_NAME, &journal_resident_topic_options())
         .await
         .unwrap();
     let topic_ident = Identifier::named(TOPIC_NAME).unwrap();
@@ -1174,7 +1188,7 @@ pub async fn run_resident_purge_no_resurface(harness: &mut TestHarness) {
 
     // Graceful restart: shutdown force-flushes the committed journal, whose
     // front still holds the five fenced pre-purge batches.
-    maybe_restart(harness, true).await;
+    maybe_restart(harness, &client, true).await;
 
     let polled = poll_exactly(&client, &stream_ident, &topic_ident, 3).await;
     let offsets: Vec<u64> = polled.messages.iter().map(|m| m.header.offset).collect();
@@ -1280,11 +1294,46 @@ async fn assert_layout_stable(partition_path: &str, expected: &[u64]) {
     );
 }
 
-async fn maybe_restart(harness: &mut TestHarness, restart_server: bool) {
-    if restart_server {
-        harness.restart_server().await.unwrap();
+/// Bounce the server and hand back a client that is connected to the new
+/// process.
+///
+/// `TestHarness::restart_server` cycles the clients it owns (disconnect, then
+/// connect once the process is back); this scenario builds its own, so it has to
+/// be cycled explicitly. The disconnect is the part that matters: the client
+/// cannot notice the socket died on its own, so it still reports
+/// `Authenticated`, `connect` short-circuits as a no-op, and the first real call
+/// fails. `TcpClient::send_raw` deliberately does not retry that -- it drops the
+/// connection and returns `Disconnected` for the caller to handle, because a
+/// late reply would desync framing.
+///
+/// Reconnecting is retried rather than attempted once: `ServerHandle::start`
+/// only spawns the process, so the listener is not up yet, and a boot replaying
+/// this scenario's WAL takes longer than any fixed sleep worth hard-coding.
+async fn maybe_restart(harness: &mut TestHarness, client: &IggyClient, restart_server: bool) {
+    if !restart_server {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        return;
     }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let _ = client.disconnect().await;
+    harness.restart_server().await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + POLL_CONVERGENCE_TIMEOUT;
+    loop {
+        // `connect` re-authenticates from the embedded credentials, so a
+        // successful ping means the shards are serving, not merely listening.
+        if client.connect().await.is_ok() && client.ping().await.is_ok() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server did not serve again within {POLL_CONVERGENCE_TIMEOUT:?} of restart"
+        );
+        // Back to Disconnected, else the next `connect` no-ops on a half-open
+        // connection and the ping keeps failing until the deadline.
+        let _ = client.disconnect().await;
+        tokio::time::sleep(POLL_RETRY_INTERVAL).await;
+    }
 }
 
 /// Build a root client with SDK-level auto-reconnect and auto-sign-in.
@@ -1293,7 +1342,7 @@ async fn maybe_restart(harness: &mut TestHarness, restart_server: bool) {
 /// credentials in the transport config so the SDK re-authenticates on reconnect.
 fn build_root_client(harness: &TestHarness) -> IggyClient {
     let addr = harness.server().tcp_addr().unwrap();
-    let interval = IggyDuration::from_str("200ms").unwrap();
+    let interval = NonZeroIggyDuration::from_str("200ms").unwrap();
     IggyClient::builder()
         .with_tcp()
         .with_server_address(addr.to_string())
@@ -1303,7 +1352,7 @@ fn build_root_client(harness: &TestHarness) -> IggyClient {
         )))
         .with_reconnection_max_retries(Some(10))
         .with_reconnection_interval(interval)
-        .with_reestablish_after(interval)
+        .with_reestablish_after(interval.get())
         .build()
         .unwrap()
 }

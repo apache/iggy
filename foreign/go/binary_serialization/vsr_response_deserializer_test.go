@@ -19,10 +19,12 @@ package binaryserialization
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/internal/batch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -167,22 +169,53 @@ func TestDeserializeConsumerGroupAssignment_DoesNotAllocateOnABogusCount(t *test
 	assert.Error(t, err)
 }
 
-// pollPayload builds a poll reply body carrying the given messages.
+// batchFrame is one message frame of a fabricated batch record. Frame
+// checksums stay zero: a poll decode passes them through unverified.
+type batchFrame struct {
+	offsetDelta    uint32
+	timestampDelta uint32
+	payload        []byte
+	userHeaders    []byte
+}
+
+// appendBatchRecord appends one batch record carrying the given frames.
+func appendBatchRecord(body []byte, baseOffset, baseTimestamp, originTimestamp uint64, frames ...batchFrame) []byte {
+	recordStart := len(body)
+	body = append(body, make([]byte, batch.HeaderSize)...)
+	for _, frame := range frames {
+		frameStart := len(body)
+		body = append(body, make([]byte, batch.MessageHeaderSize)...)
+		binary.LittleEndian.PutUint32(body[frameStart+24:], frame.offsetDelta)
+		binary.LittleEndian.PutUint32(body[frameStart+28:], frame.timestampDelta)
+		binary.LittleEndian.PutUint32(body[frameStart+32:], uint32(len(frame.userHeaders)))
+		binary.LittleEndian.PutUint32(body[frameStart+36:], uint32(len(frame.payload)))
+		body = append(body, frame.payload...)
+		body = append(body, frame.userHeaders...)
+	}
+	header := batch.Header{
+		BaseOffset:      baseOffset,
+		BaseTimestamp:   baseTimestamp,
+		OriginTimestamp: originTimestamp,
+		BatchLength:     uint64(len(body) - recordStart),
+		MessageCount:    uint32(len(frames)),
+	}
+	header.EncodeInto(body[recordStart:])
+	return body
+}
+
+// pollPayload builds a poll reply body carrying the given messages in one
+// batch record.
 func pollPayload(t *testing.T, partitionId uint32, payloads ...[]byte) []byte {
 	t.Helper()
 
 	body := binary.LittleEndian.AppendUint32(nil, partitionId)
 	body = binary.LittleEndian.AppendUint64(body, 42)
 	body = binary.LittleEndian.AppendUint32(body, uint32(len(payloads)))
-	for _, payload := range payloads {
-		message, err := iggcon.NewIggyMessage(payload)
-		require.NoError(t, err)
-		headerBytes, err := message.Header.AppendBinary(nil)
-		require.NoError(t, err)
-		body = append(body, headerBytes...)
-		body = append(body, message.Payload...)
+	frames := make([]batchFrame, 0, len(payloads))
+	for index, payload := range payloads {
+		frames = append(frames, batchFrame{offsetDelta: uint32(index), payload: payload})
 	}
-	return body
+	return appendBatchRecord(body, 0, 0, 0, frames...)
 }
 
 func TestDeserializeFetchMessagesResponse_DecodesABatch(t *testing.T) {
@@ -224,37 +257,103 @@ func TestDeserializeFetchMessagesResponse_RejectsACountAboveTheDecodedMessages(t
 }
 
 func TestDeserializeFetchMessagesResponse_RejectsOverrunningUserHeaders(t *testing.T) {
-	message, err := iggcon.NewIggyMessage([]byte("payload"))
-	require.NoError(t, err)
-	message.Header.UserHeaderLength = 64
+	body := pollPayload(t, 1, []byte("payload"))
+	// Claim 64 user-header bytes the batch record does not carry.
+	binary.LittleEndian.PutUint32(body[pollPrefixLength+batch.HeaderSize+32:], 64)
 
+	_, err := DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	assert.Error(t, err, "user headers past the batch record must not panic or pass")
+}
+
+func TestDeserializeFetchMessagesResponse_RejectsNonzeroReservedFrameBytes(t *testing.T) {
+	body := pollPayload(t, 1, []byte("payload"))
+	body[pollPrefixLength+batch.HeaderSize+40] = 1
+
+	_, err := DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	assert.Error(t, err, "a frame with nonzero reserved bytes must not decode")
+}
+
+func TestDeserializeFetchMessagesResponse_ResolvesASlicedRecordsLeadingDelta(t *testing.T) {
+	// A server-sliced record keeps the stored base offset; the first frame's
+	// delta positions it inside the original batch.
 	body := binary.LittleEndian.AppendUint32(nil, 1)
-	body = binary.LittleEndian.AppendUint64(body, 0)
+	body = binary.LittleEndian.AppendUint64(body, 53)
 	body = binary.LittleEndian.AppendUint32(body, 1)
-	headerBytes, err := message.Header.AppendBinary(nil)
-	require.NoError(t, err)
-	body = append(body, headerBytes...)
-	body = append(body, message.Payload...)
+	body = appendBatchRecord(body, 50, 9000, 0,
+		batchFrame{offsetDelta: 3, payload: []byte("tail")})
 
-	_, err = DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
-	assert.Error(t, err, "user headers past the body must not panic or pass")
+	polled, err := DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	require.NoError(t, err)
+	require.Len(t, polled.Messages, 1)
+	assert.Equal(t, uint64(53), polled.Messages[0].Header.Offset)
+	assert.Equal(t, uint64(9000), polled.Messages[0].Header.Timestamp)
+}
+
+// goldenPollBody is a poll reply generated by the Rust encoder: partition 3,
+// current offset 101, and one batch record stamped with base offset 100 and
+// base timestamp 5000 carrying two messages.
+const goldenPollBody = "03000000650000000000000002000000030000000000000064000000000000008813000000000000e8030000000000008c01000000000000c96826b38a8feed202000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bfd2b9205a759675070000000000000000000000000000000000000000000000000000000d000000000000000000000066697273742d7061796c6f6164d66b7e1c758eb7c0080000000000000000000000000000000100000032000000110000000e00000000000000000000007365636f6e642d7061796c6f6164757365722d6865616465722d6279746573"
+
+func TestDeserializeFetchMessagesResponse_DecodesTheGoldenVector(t *testing.T) {
+	body, err := hex.DecodeString(goldenPollBody)
+	require.NoError(t, err)
+
+	polled, err := DeserializeFetchMessagesResponse(body, iggcon.MESSAGE_COMPRESSION_NONE)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(3), polled.PartitionId)
+	assert.Equal(t, uint64(101), polled.CurrentOffset)
+	assert.Equal(t, uint32(2), polled.MessageCount)
+	require.Len(t, polled.Messages, 2)
+
+	first := polled.Messages[0]
+	assert.Equal(t, iggcon.MessageID{7}, first.Header.Id)
+	assert.Equal(t, uint64(100), first.Header.Offset)
+	assert.Equal(t, uint64(5000), first.Header.Timestamp)
+	assert.Equal(t, uint64(1000), first.Header.OriginTimestamp)
+	assert.Equal(t, uint64(0x7596755a20b9d2bf), first.Header.Checksum)
+	assert.Equal(t, []byte("first-payload"), first.Payload)
+	assert.Empty(t, first.UserHeaders)
+
+	second := polled.Messages[1]
+	assert.Equal(t, iggcon.MessageID{8}, second.Header.Id)
+	assert.Equal(t, uint64(101), second.Header.Offset)
+	assert.Equal(t, uint64(5000), second.Header.Timestamp)
+	assert.Equal(t, uint64(1050), second.Header.OriginTimestamp)
+	assert.Equal(t, uint64(0xc0b78e751c7e6bd6), second.Header.Checksum)
+	assert.Equal(t, []byte("second-payload"), second.Payload)
+	assert.Equal(t, []byte("user-header-bytes"), second.UserHeaders)
 }
 
 func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {
-	const nameOffset = 50
+	const nameLenOffset = 49
 	name := "orders"
-	payload := make([]byte, nameOffset+1+len(name))
+
+	partitionsValue := binary.LittleEndian.AppendUint32(nil, 3)
+	explicitOptions := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("partitions_count")},
+		Value: iggcon.HeaderValue{Kind: iggcon.Uint32, Value: partitionsValue},
+	}})
+	derivedOptions := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("compression_algorithm")},
+		Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte("none")},
+	}})
+
+	payload := make([]byte, nameLenOffset+1+len(name))
 	binary.LittleEndian.PutUint32(payload[0:4], 11)
 	binary.LittleEndian.PutUint64(payload[4:12], 1700000000)
 	binary.LittleEndian.PutUint32(payload[12:16], 3)
 	binary.LittleEndian.PutUint64(payload[16:24], 60_000_000)
 	payload[24] = 2
 	binary.LittleEndian.PutUint64(payload[25:33], 1<<30)
-	payload[33] = 1
-	binary.LittleEndian.PutUint64(payload[34:42], 4096)
-	binary.LittleEndian.PutUint64(payload[42:50], 12)
-	payload[nameOffset] = byte(len(name))
-	copy(payload[nameOffset+1:], name)
+	binary.LittleEndian.PutUint64(payload[33:41], 4096)
+	binary.LittleEndian.PutUint64(payload[41:49], 12)
+	payload[nameLenOffset] = byte(len(name))
+	copy(payload[nameLenOffset+1:], name)
+	payload = binary.LittleEndian.AppendUint32(payload, uint32(len(explicitOptions)))
+	payload = append(payload, explicitOptions...)
+	payload = binary.LittleEndian.AppendUint32(payload, uint32(len(derivedOptions)))
+	payload = append(payload, derivedOptions...)
 
 	topic, readBytes, err := DeserializeToTopic(payload, 0)
 	require.NoError(t, err)
@@ -267,9 +366,59 @@ func TestDeserializeToTopic_PinsTheFieldOrderOfTheWireLayout(t *testing.T) {
 	assert.Equal(t, uint8(2), topic.CompressionAlgorithm,
 		"compression is the u8 at +24")
 	assert.Equal(t, uint64(1<<30), topic.MaxTopicSize)
-	assert.Equal(t, uint8(1), topic.ReplicationFactor)
 	assert.Equal(t, uint64(4096), topic.Size)
 	assert.Equal(t, uint64(12), topic.MessagesCount)
 	assert.Equal(t, name, topic.Name)
+	assert.Equal(t, map[string]iggcon.HeaderValue{
+		"partitions_count": {Kind: iggcon.Uint32, Value: partitionsValue},
+	}, topic.Options)
+	assert.Equal(t, map[string]iggcon.HeaderValue{
+		"compression_algorithm": {Kind: iggcon.String, Value: []byte("none")},
+	}, topic.DerivedOptions)
 	assert.Equal(t, len(payload), readBytes)
+}
+
+func TestDeserializeToTopic_RejectsEveryTruncationOfTheOptionsBlocks(t *testing.T) {
+	const nameLenOffset = 49
+	name := "t"
+	fixed := make([]byte, nameLenOffset+1+len(name))
+	fixed[nameLenOffset] = byte(len(name))
+	copy(fixed[nameLenOffset+1:], name)
+
+	options := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{{
+		Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte("max_topic_size")},
+		Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: binary.LittleEndian.AppendUint64(nil, 1<<30)},
+	}})
+	payload := binary.LittleEndian.AppendUint32(fixed, uint32(len(options)))
+	payload = append(payload, options...)
+	payload = binary.LittleEndian.AppendUint32(payload, 0)
+
+	_, readBytes, err := DeserializeToTopic(payload, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(payload), readBytes)
+
+	for i := len(fixed); i < len(payload); i++ {
+		_, _, err := DeserializeToTopic(payload[:i], 0)
+		assert.Error(t, err, "expected error for truncation at byte %d", i)
+	}
+}
+
+func TestDeserializeToTopic_RejectsAnOptionsLengthPastTheBuffer(t *testing.T) {
+	const nameLenOffset = 49
+	name := "t"
+	fixed := make([]byte, nameLenOffset+1+len(name))
+	fixed[nameLenOffset] = byte(len(name))
+	copy(fixed[nameLenOffset+1:], name)
+
+	// Both blocks, because the derived one is read at a position the explicit
+	// one computed. Where int is 32 bits, 0xFFFFFFFF converts to -1 and an
+	// unguarded decode slices with high < low instead of erroring.
+	explicitLies := binary.LittleEndian.AppendUint32(fixed, 0xFFFFFFFF)
+	_, _, err := DeserializeToTopic(explicitLies, 0)
+	assert.Error(t, err, "an explicit options length of 0xFFFFFFFF must not panic or pass")
+
+	derivedLies := binary.LittleEndian.AppendUint32(fixed, 0)
+	derivedLies = binary.LittleEndian.AppendUint32(derivedLies, 0xFFFFFFFF)
+	_, _, err = DeserializeToTopic(derivedLies, 0)
+	assert.Error(t, err, "a derived options length of 0xFFFFFFFF must not panic or pass")
 }

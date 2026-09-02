@@ -36,6 +36,8 @@ mod session;
 mod state;
 mod submit;
 mod tls;
+#[cfg(feature = "iggy-web")]
+mod web;
 mod wire;
 
 use std::cell::{Cell, RefCell};
@@ -64,14 +66,13 @@ use send_wrapper::SendWrapper;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
-use crate::bootstrap::ServerShard;
-use crate::cluster_meta::ClusterRoster;
+use crate::cluster_meta::{ClusterRoster, resolved_roster_nodes};
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
     create_user, delete_cg, delete_consumer_offset, delete_partitions, delete_pat, delete_segments,
-    delete_stream, delete_topic, delete_user, get_cg, get_cgs, get_client, get_clients,
-    get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats, get_stream,
-    get_streams, get_topic, get_topics, get_user, get_users, login_user,
+    delete_stream, delete_topic, delete_user, describe_options, get_cg, get_cgs, get_client,
+    get_clients, get_cluster_metadata, get_consumer_offset, get_pats, get_snapshot, get_stats,
+    get_stream, get_streams, get_topic, get_topics, get_user, get_users, login_user,
     login_with_personal_access_token, logout_user, ping, poll_messages, purge_stream, purge_topic,
     refresh_token, send_messages, store_consumer_offset, update_permissions, update_stream,
     update_topic, update_user,
@@ -80,6 +81,7 @@ use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
 use crate::http::state::{HttpInner, HttpState, insert_view_header};
 use crate::server_error::ServerError;
+use crate::shell::ServerShard;
 
 /// Bind the shard-0 HTTP listener and spawn the `cyper-axum` serve loop as a
 /// background task on shard 0's compio runtime. Serves HTTPS when
@@ -95,7 +97,7 @@ use crate::server_error::ServerError;
 /// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
 /// credentials cannot be loaded, or the listener cannot bind to `addr`.
 #[allow(clippy::too_many_arguments)]
-pub async fn start(
+pub fn start(
     shard: &Rc<ServerShard>,
     addr: SocketAddr,
     http_config: &HttpConfig,
@@ -103,7 +105,9 @@ pub async fn start(
     max_tokens_per_user: u32,
     cluster: &ClusterConfig,
     system_config: Arc<ServerSystemConfig>,
-    self_ports: TransportPorts,
+    self_advertised: &str,
+    self_ports: &TransportPorts,
+    shard_metrics_all: &[shard::metrics::ShardMetrics],
 ) -> Result<(), ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
     // from the cluster PSK, so a bearer minted on any node verifies on every
@@ -137,7 +141,7 @@ pub async fn start(
     // Same early-fail rule for the scrape path: axum panics on a route
     // without a leading '/', so reject it as a config error instead.
     let metrics_endpoint = metrics::validated_endpoint(&http_config.metrics)?;
-    let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
+    let (listener, bound_addr) = client_listener::tcp::bind(addr)?;
 
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
@@ -148,13 +152,13 @@ pub async fn start(
         roster: ClusterRoster {
             enabled: cluster.enabled,
             name: cluster.name.clone(),
-            nodes: cluster.nodes.iter().cloned().map(Into::into).collect(),
-            self_ip: bound_addr.ip().to_string(),
+            nodes: resolved_roster_nodes(cluster).map_err(ServerError::Config)?,
+            self_advertised: self_advertised.to_owned(),
             // The self node reports the live bound HTTP port; the other client
             // ports arrive resolved from the caller.
             self_ports: TransportPorts {
                 http: Some(bound_addr.port()),
-                ..self_ports
+                ..self_ports.clone()
             },
             // The HTTP listener is shard-0-only, where the live consensus
             // handle supplies the leader; the published-view fallback is
@@ -165,13 +169,13 @@ pub async fn start(
         max_tokens_per_user,
         in_flight_writes: Cell::new(0),
         forward,
-        metrics: metrics::HttpMetrics::init(),
+        metrics: metrics::HttpMetrics::init(shard_metrics_all),
     }));
     let router = router(
         state,
         max_request_size,
         cors,
-        metrics_endpoint,
+        metrics_endpoint.as_deref(),
         http_config.web_ui,
     );
 
@@ -255,14 +259,14 @@ const PING_PATH: &str = "/ping";
 /// the inner layer's `iggy-view`.
 ///
 /// `metrics_endpoint`, present only when `[http.metrics]` is enabled, mounts
-/// the public scrape route among the local routes (a scrape must describe the
-/// serving node, never a forwarded primary) and switches on the
+/// the auth-only scrape route among the local routes (a scrape must describe
+/// the serving node, never a forwarded primary) and switches on the
 /// request-counting layer.
 fn router(
     state: HttpState,
     max_request_size: usize,
     cors: Option<CorsLayer>,
-    metrics_endpoint: Option<String>,
+    metrics_endpoint: Option<&str>,
     web_ui: bool,
 ) -> Router {
     // Cloned for the response layer so `Iggy-View` reads the live view per
@@ -274,13 +278,7 @@ fn router(
         .is_some()
         .then(|| state.metrics.request_counter());
     let forwardable = forwardable_routes(state.clone());
-    // The partition-plane routes (produce, consumer-offset writes) stay local:
-    // each partition is its own consensus group whose primary can diverge from
-    // the metadata primary, so forwarding them to the metadata primary would
-    // livelock whenever the two disagree.
-    // TODO: forward partition-plane writes to their own partition group's
-    // primary (requires resolving the target partition from the request before
-    // dispatch, and rewriting balanced partitioning to an explicit partition).
+    let partition_writes = partition_write_routes(state.clone());
     let local = Router::new()
         .route(PING_PATH, get(ping))
         .route("/users/login", post(login_user))
@@ -291,40 +289,37 @@ fn router(
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/messages",
-            get(poll_messages).post(send_messages),
+            get(poll_messages),
         )
         .route(
             "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
-            get(get_consumer_offset).put(store_consumer_offset),
-        )
-        .route(
-            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
-            delete(delete_consumer_offset),
+            get(get_consumer_offset),
         )
         .route("/stats", get(get_stats))
+        .route("/options/{scope}", get(describe_options))
         .route("/snapshot", post(get_snapshot))
         .route("/cluster/metadata", get(get_cluster_metadata))
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client));
-    let local = match &metrics_endpoint {
-        Some(endpoint) => local.route(endpoint, get(metrics::get_metrics)),
+    let local = match metrics_endpoint {
+        Some(endpoint) => local.route(endpoint, get(handlers::get_metrics)),
         None => local,
     };
     let router = Router::new()
         .merge(forwardable)
+        .merge(partition_writes)
         .merge(local)
         .with_state(state)
         .layer(DefaultBodyLimit::max(max_request_size))
         .layer(from_fn(move |request: Request, next: Next| {
             let view_source = view_source.clone();
-            // `/ping` and the metrics scrape are the success routes reached
-            // without proving a credential, so they must not leak the
-            // cluster-internal view number (the anon-leak gate). Every other
-            // route authenticates before its handler, so a success/redirect
-            // there is an authed flow that may carry the header; the login
-            // routes prove credentials on success.
-            let suppress_view = request.uri().path() == PING_PATH
-                || metrics_endpoint.as_deref() == Some(request.uri().path());
+            // `/ping` is the one success route reached without proving a
+            // credential, so it must not leak the cluster-internal view number
+            // (the anon-leak gate). Every other route - the metrics scrape
+            // included - authenticates before its handler, so a success or
+            // redirect there is an authed flow that may carry the header; the
+            // login routes prove credentials on success.
+            let suppress_view = request.uri().path() == PING_PATH;
             async move {
                 let response = next.run(request).await;
                 if suppress_view {
@@ -355,6 +350,26 @@ fn router(
     // axum rebuilds per request. Identity on already-finalized routes, so
     // both the plain and the TLS serve paths share the finalized form.
     merge_web_ui(router, web_ui).with_state(())
+}
+
+/// Acknowledged partition writes use a bounded HTTP roster fallback. This is
+/// a correctness path for the existing stateless HTTP transport. Direct
+/// partition-primary routing remains the scalable long-term design.
+fn partition_write_routes(state: HttpState) -> Router<HttpState> {
+    Router::new()
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/messages",
+            post(send_messages),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets",
+            put(store_consumer_offset),
+        )
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-offsets/{consumer_id}",
+            delete(delete_consumer_offset),
+        )
+        .route_layer(from_fn_with_state(state, forward::forward_partition_write))
 }
 
 /// The control-plane route table: every write here commits through the
@@ -445,7 +460,7 @@ fn merge_web_ui(router: Router, web_ui: bool) -> Router {
     #[cfg(feature = "iggy-web")]
     let router = if web_ui {
         info!("Web UI enabled at /ui");
-        router.merge(crate::web::router())
+        router.merge(web::router())
     } else {
         router
     };

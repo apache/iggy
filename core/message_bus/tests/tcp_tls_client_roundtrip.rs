@@ -23,8 +23,9 @@ use common::{
     install_replicas_locally, install_tls_clients_locally, loopback, set_replica_ctx,
 };
 use compio::net::TcpStream;
-use iggy_binary_protocol::Command2;
+use iggy_binary_protocol::Command;
 use iggy_binary_protocol::GenericHeader;
+use message_bus::BusMessage;
 use message_bus::client_listener::RequestHandler;
 use message_bus::connector::DEFAULT_RECONNECT_PERIOD;
 use message_bus::replica::io::start_on_shard_zero;
@@ -35,7 +36,7 @@ use message_bus::transports::{ActorContext, TransportConn};
 use message_bus::{FusedShutdown, IggyMessageBus, MessageBus, Shutdown, framing};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
-use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
+use server_common::Message;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,10 +52,10 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
     let on_message: MessageHandler = Rc::new(|_, _| {});
     let bus_for_handler = Rc::clone(&bus);
     let on_request: RequestHandler = Rc::new(move |client_id, msg| {
-        assert_eq!(msg.header().command, Command2::Request);
+        assert_eq!(msg.header().command, Command::Request);
         let bus = Rc::clone(&bus_for_handler);
         compio::runtime::spawn(async move {
-            let reply = header_only(Command2::Reply, CLUSTER, 0).into_frozen();
+            let reply = header_only(Command::Reply, CLUSTER, 0).into_frozen();
             bus.send_to_client(client_id, reply)
                 .await
                 .expect("server send_to_client");
@@ -116,7 +117,7 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
     let client_tcp = TcpStream::connect(server_addr).await.expect("client dial");
     let conn = TcpTlsTransportConn::new_client(client_tcp, client_cfg, server_name);
 
-    let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(8);
+    let (out_tx, out_rx) = bounded::<BusMessage>(8);
     let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(8);
     let (client_shutdown, client_token) = Shutdown::new();
     let ctx = ActorContext {
@@ -131,14 +132,14 @@ async fn start_on_shard_zero_tcp_tls_round_trip() {
     };
     let client_handle = compio::runtime::spawn(async move { conn.run(ctx).await });
 
-    let request = header_only(Command2::Request, CLUSTER, 0).into_frozen();
-    out_tx.send(request).await.expect("client send");
+    let request = header_only(Command::Request, CLUSTER, 0).into_frozen();
+    out_tx.send(request.into()).await.expect("client send");
 
     let reply = compio::time::timeout(Duration::from_secs(5), in_rx.recv())
         .await
         .expect("client must receive reply within 5 s")
         .expect("reply frame");
-    assert_eq!(reply.header().command, Command2::Reply);
+    assert_eq!(reply.header().command, Command::Reply);
     assert_eq!(reply.header().cluster, CLUSTER);
 
     client_shutdown.trigger();

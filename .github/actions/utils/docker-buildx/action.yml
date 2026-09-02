@@ -130,12 +130,12 @@ runs:
     - name: Set up QEMU
       # Skip QEMU when building single platform on native runner (no emulation needed)
       if: inputs.platform == ''
-      uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+      uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       with:
         platforms: all
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       with:
         driver-opts: |
           network=host
@@ -167,7 +167,7 @@ runs:
 
     - name: Docker meta
       id: meta
-      uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+      uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
       with:
         images: ${{ steps.config.outputs.image }}
         # Tags are only used for local builds (dry-run). Push mode always uses digest.

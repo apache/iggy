@@ -27,6 +27,7 @@ use metadata::stm::user::Users;
 use server_common::{Message, iobuf::Owned};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::ops::RangeInclusive;
 
 /// Fixed synthetic epoch for [`SimClock`]: 2026-01-01T00:00:00Z in micros.
 ///
@@ -104,6 +105,14 @@ pub struct SimJournal<S: Storage> {
     /// retained head in O(1) without scanning `headers` (see
     /// [`SimJournal::last_op`]).
     last_op: Cell<Option<u64>>,
+    /// Snapshot watermark. A real value here is what makes `RangeEvicted`
+    /// reachable; see the `Journal::snapshot_op` impl.
+    snapshot_op: Cell<u64>,
+    /// Slots this journal pretends to have, or `None` for unbounded.
+    ///
+    /// `SnapshotCoordinator::should_checkpoint` gates on `remaining_capacity`, so
+    /// unbounded means no checkpoint ever. A test wanting one sets a small count.
+    slot_count: Cell<Option<usize>>,
     /// Debug-only single-accessor tripwire. `entry` / `append` hold a
     /// [`JournalAccessGuard`] across their whole body, including the storage
     /// `.await`, so if a suspending storage tier ever let a second task touch
@@ -121,6 +130,8 @@ impl<S: Storage + Default> Default for SimJournal<S> {
             offsets: UnsafeCell::new(HashMap::new()),
             write_offset: Cell::new(0),
             last_op: Cell::new(None),
+            snapshot_op: Cell::new(0),
+            slot_count: Cell::new(None),
             #[cfg(debug_assertions)]
             accessing: Cell::new(false),
         }
@@ -168,7 +179,7 @@ impl Drop for JournalAccessGuard<'_> {
 }
 
 #[allow(clippy::future_not_send)]
-impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
+impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     type Header = PrepareHeader;
     type Entry = Message<PrepareHeader>;
     type HeaderRef<'a>
@@ -178,6 +189,23 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
 
     fn last_op(&self) -> Option<u64> {
         self.last_op.get()
+    }
+
+    /// Slots left before a checkpoint is forced, mirroring
+    /// `PrepareJournal::remaining_capacity`: the ring holds `slot_count`, everything
+    /// at or below the watermark is reclaimable, so `last_op - snapshot_op` is
+    /// occupied. `None` while unbounded, which `should_checkpoint` reads as never.
+    fn remaining_capacity(&self) -> Option<usize> {
+        let slot_count = self.slot_count.get()?;
+        let Some(last) = self.last_op.get() else {
+            return Some(slot_count);
+        };
+        let snapshot = self.snapshot_op.get();
+        if last <= snapshot {
+            return Some(slot_count);
+        }
+        let used = usize::try_from(last - snapshot).unwrap_or(usize::MAX);
+        Some(slot_count.saturating_sub(used))
     }
 
     /// Drop the suffix, so a simulated backup whose entries disagree with a started
@@ -207,15 +235,31 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         Ok(doomed.len())
     }
 
-    /// The simulated journal retains everything for the run, so nothing is
-    /// ever superseded by a snapshot. Answered explicitly (the trait has no
-    /// default) so a simulated state transfer has to opt into a watermark
-    /// rather than silently inherit one that never moves.
+    /// The snapshot watermark: entries at or below it are evictable.
+    ///
+    /// Load-bearing even though this journal retains every entry. The repair server
+    /// floors what it serves at `snapshot_op + 1` and announces the skipped prefix
+    /// as `RangeEvicted`, the only route into state transfer, so a constant 0 left
+    /// every state-transfer frame unreachable however the harness was driven.
     fn snapshot_op(&self) -> u64 {
-        0
+        self.snapshot_op.get()
     }
 
-    fn set_snapshot_op(&self, _op: u64) {}
+    /// Advance the watermark. Production only moves it forward, on a checkpoint or a
+    /// transfer install; a retreating floor would re-offer ops the serving side has
+    /// told a peer are gone.
+    ///
+    /// # Panics
+    /// If `op` is below the current watermark, as `PrepareJournal` asserts. Maxing
+    /// silently would leave the simulator the one place a retreat survives.
+    fn set_snapshot_op(&self, op: u64) {
+        let current = self.snapshot_op.get();
+        assert!(
+            op >= current,
+            "snapshot_op must be monotonically increasing: {current} -> {op}"
+        );
+        self.snapshot_op.set(op);
+    }
 
     // TODO(hubcio): validate that the caller's checksum matches the stored
     // header - currently this looks up by op only, ignoring the checksum.
@@ -280,10 +324,77 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         let headers = unsafe { &*self.headers.get() };
         headers.get(&(idx as u64))
     }
+
+    /// Reclaim the prefix a checkpoint superseded, advancing the watermark to the
+    /// end of the drained range.
+    ///
+    /// Required, not inherited: the trait's default drains nothing, so a simulated
+    /// checkpoint left the whole WAL in place, a peer's repair found every op it
+    /// asked for, and arming the coordinator alone still produced no `RangeEvicted`.
+    ///
+    /// The watermark moves last, as in `PrepareJournal::drain`: advancing it before
+    /// the entries are gone would make live entries look evictable.
+    async fn drain(&self, ops: RangeInclusive<u64>) -> std::io::Result<Vec<Self::Entry>> {
+        #[cfg(debug_assertions)]
+        let _guard = JournalAccessGuard::new(&self.accessing);
+        let end_op = *ops.end();
+        let doomed: Vec<u64> = {
+            let headers = unsafe { &*self.headers.get() };
+            let mut doomed: Vec<u64> = headers
+                .keys()
+                .copied()
+                .filter(|op| ops.contains(op))
+                .collect();
+            // Sorted: the trait promises op order, and hash order would make a
+            // replay of this drain diverge.
+            doomed.sort_unstable();
+            doomed
+        };
+
+        let mut drained = Vec::with_capacity(doomed.len());
+        for op in doomed {
+            // Read before removing, through `Storage` rather than the
+            // `MemStorage`-only sync path, so this stays generic. The borrow does
+            // NOT span the read, unlike `entry`'s: the block ends it and yields only
+            // `Copy` data, so the `.await` holds no reference into the `UnsafeCell`.
+            // Deliberate, since `drain` invalidates every outstanding
+            // `header`/`previous_header` reference too.
+            let located = {
+                let headers = unsafe { &*self.headers.get() };
+                let offsets = unsafe { &*self.offsets.get() };
+                headers
+                    .get(&op)
+                    .and_then(|header| offsets.get(&op).map(|offset| (header.size, *offset)))
+            };
+            // Propagated, not swallowed. Dropping the entry loses a WAL record while
+            // reporting a successful drain; `PrepareJournal` returns the error and
+            // poisons itself, and a harness surviving what production refuses to
+            // cannot find the bug this path exists to catch.
+            if let Some((size, offset)) = located {
+                let buffer = self.storage.read_at(offset, vec![0; size as usize]).await?;
+                let message =
+                    Message::try_from(Owned::<4096>::copy_from_slice(&buffer)).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("drain: op {op} does not decode as a prepare"),
+                        )
+                    })?;
+                drained.push(message);
+            }
+            let headers = unsafe { &mut *self.headers.get() };
+            let offsets = unsafe { &mut *self.offsets.get() };
+            headers.remove(&op);
+            offsets.remove(&op);
+        }
+
+        if end_op > self.snapshot_op.get() {
+            self.snapshot_op.set(end_op);
+        }
+        Ok(drained)
+    }
 }
 
 impl JournalHandle for SimJournal<MemStorage> {
-    type Storage = MemStorage;
     type Target = Self;
 
     fn handle(&self) -> &Self::Target {
@@ -297,6 +408,13 @@ impl SimJournal<MemStorage> {
     #[must_use]
     pub const fn last_op(&self) -> Option<u64> {
         self.last_op.get()
+    }
+
+    /// Bound this journal to `slots`, so running low forces a checkpoint. Unbounded
+    /// by default (see `slot_count`), and then nothing produces the snapshot a state
+    /// transfer serves.
+    pub fn set_slot_count(&self, slots: usize) {
+        self.slot_count.set(Some(slots));
     }
 
     /// Forget one op, leaving a hole exactly where a lost prepare would.
@@ -323,17 +441,29 @@ impl SimJournal<MemStorage> {
     /// `commit` any journaled prepare stamped, a lower bound, since a prepare
     /// records the primary's commit point at send time, so the true point may be one
     /// op higher and re-commits on rejoin.
+    ///
+    /// Floored at the snapshot watermark and clamped at the first gap above it, as
+    /// `metadata::recover` folds from `snapshot_floor` and stops at `chain_break_op`.
+    /// The fold only sees surviving headers, so a backup missing one prepare would
+    /// otherwise claim a commit point ABOVE the hole, telling the cluster there is
+    /// nothing to repair.
     #[must_use]
     pub fn recovery_commit_watermark(&self, solo: bool) -> u64 {
-        if solo {
-            return self.last_op.get().unwrap_or(0);
-        }
+        let floor = self.snapshot_op.get();
         let headers = unsafe { &*self.headers.get() };
-        headers
-            .values()
-            .map(|header| header.commit)
-            .max()
-            .unwrap_or(0)
+        let claimed = if solo {
+            self.last_op.get().unwrap_or(0).max(floor)
+        } else {
+            headers
+                .values()
+                .map(|header| header.commit)
+                .fold(floor, u64::max)
+        };
+        let mut watermark = floor;
+        while watermark < claimed && headers.contains_key(&(watermark + 1)) {
+            watermark += 1;
+        }
+        watermark
     }
 
     /// The head prepare's header, `None` when empty. Restores the last-prepare
@@ -348,7 +478,7 @@ impl SimJournal<MemStorage> {
 
     /// Read the entry at `op` synchronously, for off-executor WAL replay at restart.
     /// Mirrors [`Journal::entry`] without the never-suspending `MemStorage` await, so
-    /// it needs no [`JournalAccessGuard`]: a synchronous read offers no suspension
+    /// it needs no `JournalAccessGuard`: a synchronous read offers no suspension
     /// point for another task to interleave on.
     ///
     /// # Panics
@@ -402,13 +532,13 @@ impl SimSuperblock {
     }
 
     /// Make every subsequent write fail, a persistent write fault, so the durability
-    /// gate withholds view-scoped sends. See [`Self::fail_writes`].
+    /// gate withholds view-scoped sends. See `Self::fail_writes`.
     pub fn set_fail_writes(&self) {
         self.fail_writes.set(true);
     }
 
     /// Make every subsequent write suspend once before completing, so tasks that
-    /// are ready at persist time interleave with it. See [`Self::yield_writes`].
+    /// are ready at persist time interleave with it. See `Self::yield_writes`.
     pub fn set_yield_writes(&self) {
         self.yield_writes.set(true);
     }

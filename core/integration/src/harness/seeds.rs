@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use iggy::prelude::{IggyClient, StreamClient, TopicClient};
+use iggy::prelude::{IggyClient, StreamClient, TopicClient, TopicCreateOptions};
 use iggy_common::{
-    CompressionAlgorithm, Consumer, Identifier, IggyExpiry, IggyMessage, MaxTopicSize,
-    Partitioning, PersonalAccessTokenExpiry, UserStatus,
+    Consumer, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
+    PersonalAccessTokenExpiry, UserStatus,
 };
 use iggy_common::{
     ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PersonalAccessTokenClient, UserClient,
@@ -55,11 +55,12 @@ pub async fn stream_with_topic(client: &IggyClient) -> Result<(), SeedError> {
         .create_topic(
             &"test_stream".try_into()?,
             "test_topic",
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::Unlimited,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::Unlimited),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
     Ok(())
@@ -75,11 +76,10 @@ pub async fn connector_stream(client: &IggyClient) -> Result<(), SeedError> {
         .create_topic(
             &stream_id,
             names::TOPIC,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
 
@@ -98,11 +98,10 @@ pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), See
         .create_topic(
             &stream_id,
             names::TOPIC,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
 
@@ -110,11 +109,10 @@ pub async fn connector_multi_topic_stream(client: &IggyClient) -> Result<(), See
         .create_topic(
             &stream_id,
             names::TOPIC_2,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
 
@@ -132,11 +130,10 @@ pub async fn mcp_standard(client: &IggyClient) -> Result<(), SeedError> {
         .create_topic(
             &stream_id,
             names::TOPIC,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
         )
         .await?;
 

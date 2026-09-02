@@ -32,7 +32,7 @@ use std::time::Duration;
 async fn drains_all_clients_within_timeout() {
     let bus = Rc::new(IggyMessageBus::new(0));
     let on_request: RequestHandler = Rc::new(|_, _| {});
-    let (listener, addr) = bind(loopback()).await.unwrap();
+    let (listener, addr) = bind(loopback()).unwrap();
 
     let token = bus.token();
     let accept_delegate = install_clients_locally(bus.clone(), on_request);
@@ -71,7 +71,7 @@ async fn drains_all_clients_within_timeout() {
     assert!(bus.is_shutting_down());
 
     // Sends after shutdown must fail with the right variant.
-    let dummy = common::header_only(iggy_binary_protocol::Command2::Reply, 0, 0);
+    let dummy = common::header_only(iggy_binary_protocol::Command::Reply, 0, 0);
     let err = bus
         .send_to_client(1u128 << 112, dummy.into_frozen())
         .await
@@ -87,7 +87,7 @@ async fn drains_all_clients_within_timeout() {
 async fn connection_drain_precedes_slow_background() {
     let bus = Rc::new(IggyMessageBus::new(0));
     let on_request: RequestHandler = Rc::new(|_, _| {});
-    let (listener, addr) = bind(loopback()).await.unwrap();
+    let (listener, addr) = bind(loopback()).unwrap();
 
     let token = bus.token();
     let accept_delegate = install_clients_locally(bus.clone(), on_request);

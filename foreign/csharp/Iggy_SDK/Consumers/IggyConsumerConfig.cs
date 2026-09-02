@@ -70,14 +70,24 @@ public class IggyConsumerConfig
     public string Password { get; set; } = string.Empty;
 
     /// <summary>
-    ///     The size of the receive buffer in bytes. Default is 4096.
+    ///     Personal access token used instead of <see cref="Login" /> and <see cref="Password" /> when creating
+    ///     the client. Takes precedence over them when set.
     /// </summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public string PersonalAccessToken { get; set; } = string.Empty;
 
     /// <summary>
-    ///     The size of the send buffer in bytes. Default is 4096.
+    ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_rmem</c>.
     /// </summary>
-    public int SendBufferSize { get; set; } = 4096;
+    public int? ReceiveBufferSize { get; set; } = null;
+
+    /// <summary>
+    ///     The size of the send buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_wmem</c>.
+    /// </summary>
+    public int? SendBufferSize { get; set; } = null;
 
     /// <summary>
     ///     The identifier of the stream to consume from
@@ -148,7 +158,14 @@ public class IggyConsumerConfig
     /// <summary>
     ///     Gets or sets the reconnection settings to control the behavior of the iggy client
     ///     in case of a disconnect or network failure.
-    ///     This property is optional and can be null. If null, reconnection will be disabled.
+    ///     This property is optional and can be null. If null, the default <see cref="Configuration.ReconnectionSettings" />
+    ///     apply.
     /// </summary>
     public ReconnectionSettings? ReconnectionSettings { get; set; }
+
+    /// <summary>
+    ///     Interval between the pings the created client sends to keep an idle session alive.
+    ///     See <see cref="IggyClientConfigurator.HeartbeatInterval" />.
+    /// </summary>
+    public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(5);
 }

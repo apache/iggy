@@ -33,13 +33,15 @@
 use crate::PollFragments;
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
-use crate::journal::{MessageLookup, push_selected_batch_fragments, select_batch_slice};
+use crate::journal::{
+    MessageLookup, push_selected_batch_fragments, select_batch_slice, unpin_sparse_source,
+};
 use compio::io::AsyncReadAtExt;
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
 };
 use server_common::iobuf::{Frozen, Owned};
-use server_common::send_messages2::{BatchIntegrity, COMMAND_HEADER_SIZE, decode_batch_slice_with};
+use server_common::send_messages::{BatchIntegrity, COMMAND_HEADER_SIZE, decode_batch_slice_with};
 use std::cell::{Cell, RefCell};
 use std::hash::Hash;
 use std::rc::Rc;
@@ -48,11 +50,12 @@ use std::sync::atomic::Ordering;
 use tracing::{error, warn};
 
 /// Byte cap for materializing a sealed segment's sparse index into its shared
-/// read-state handle. Index density is one entry per flush: at the default
-/// cadence a 1 GiB segment yields ~24 KiB of index, but
-/// `messages_required_to_save = 1` tracks every message and the same segment
-/// yields hundreds of MB, which a single poll must never read (or pin
-/// resident) in one go. At or under the cap the whole file loads once and is
+/// read-state handle. Index density is one entry per flush, never per message:
+/// at the default cadence a 1 GiB segment yields ~24 KiB of index, but
+/// `messages_required_to_save = 1` flushes once per produced batch and the same
+/// segment yields tens of MB (hundreds only when producers send one message per
+/// batch), which a single poll must never read (or pin resident) in one go.
+/// At or under the cap the whole file loads once and is
 /// cached; above it every poll binary-searches the file with single-entry
 /// preads instead, so resident index bytes per partition stay bounded by the
 /// sealed-LRU capacity times this cap.
@@ -85,12 +88,15 @@ pub enum PartitionDirResolution {
 /// wipes the slots in place (`SegmentedLog::invalidate_sealed_read_state`):
 /// it recreates the same paths, so a clone surviving in a suspended walk must
 /// re-open by path and observe the fresh files rather than serve purged data.
-/// The active segment is never cached.
+/// The active segment uses the [`Self::fd`] slot only: it grows under the
+/// reader, so a size-derived memo on it would go stale, and its slot sits
+/// outside the sealed LRU (`SegmentedLog::reset_read_state` drops it wherever
+/// a segment changes sealed-ness).
 #[derive(Debug, Default)]
 pub struct SealedSegmentReadState {
     /// Read-only descriptor; compio `File` clones share the kernel fd, so a hit
     /// avoids the per-poll `openat` (an `io_uring` op prone to io-wq punts) and
-    /// preserves kernel readahead. `None` until the first sealed poll opens it.
+    /// preserves kernel readahead. `None` until the first poll opens it.
     pub(crate) fd: RefCell<Option<compio::fs::File>>,
     /// Sparse offset/timestamp index reloaded from the `.index` file the
     /// segment dropped at rotation, so a poll resolves the start byte in
@@ -98,20 +104,43 @@ pub struct SealedSegmentReadState {
     /// `None` until the first sealed poll loads it.
     pub(crate) index: RefCell<Option<IggyIndexCache>>,
     /// Whether the owning partition's sealed LRU currently tracks this handle.
-    /// Gates the fd store-back in `resolve_segment_file`: a walk crosses every
+    /// Gates the fd store-back in `resolve_segment_file` for a SEALED segment
+    /// (the active segment's slot is outside the LRU, so it always fills): a
+    /// walk crosses every
     /// sealed segment from the poll's start onward, but only the start segment
     /// is LRU-touched, so an untracked fill would retain a descriptor the
     /// `SEALED_READ_STATE_CAP` budget never counts. Set on touch, cleared on
     /// evict; plain `Cell`, all access is same-thread (`Rc` handle).
     pub(crate) tracked: Cell<bool>,
+    /// One-slot memo of the last file-backed offset resolution, so a
+    /// sequentially advancing consumer re-polling the same segment resolves
+    /// inside `[offset, valid_until)` with zero index-file reads. Only the
+    /// too-large-to-materialize index path consults it (a resident
+    /// [`Self::index`] already resolves in memory). Sealed segments are
+    /// immutable, so the memo cannot go stale; the one exception is a purge
+    /// recreating the same paths, which wipes this slot with the others.
+    /// Timestamp polls bypass it.
+    pub(crate) offset_cursor: Cell<Option<SealedOffsetCursor>>,
+}
+
+/// See [`SealedSegmentReadState::offset_cursor`].
+#[derive(Debug, Clone, Copy)]
+pub struct SealedOffsetCursor {
+    /// Offset of the resolved index entry (interval floor, inclusive).
+    pub(crate) offset: u64,
+    /// The successor index entry's offset (interval ceiling, exclusive);
+    /// `u64::MAX` when the resolved entry is the segment's last.
+    pub(crate) valid_until: u64,
+    /// Start byte the whole interval resolves to.
+    pub(crate) position: u64,
 }
 
 pub type SealedSegmentHandle = Rc<SealedSegmentReadState>;
 
 /// Owned, borrow-free inputs for the disk tier of a poll (see module docs). A
 /// sealed segment reuses its cached [`SealedSegmentReadState`] (read fd + sparse
-/// index); the active segment (and any cache miss) opens by path and resolves
-/// from its resident index, because sealed segments drop both at rotation.
+/// index); the active segment reuses the cached fd but resolves from its
+/// resident index, because sealed segments drop that index at rotation.
 pub struct DiskReadPlan {
     pub(crate) partition_dir: PartitionDirResolution,
     /// Segments to walk, snapshotted from the poll's starting segment onward
@@ -128,16 +157,19 @@ pub struct DiskReadPlan {
 pub struct DiskSegment {
     pub(crate) start_offset: u64,
     pub(crate) persisted: u64,
-    /// Shared read state, cloned from the owning partition at plan time for a
-    /// SEALED segment; `None` for the active segment, which always opens fresh
-    /// and resolves from its resident index. See [`SealedSegmentReadState`].
-    pub(crate) read_state: Option<SealedSegmentHandle>,
+    /// Shared read state, cloned from the owning partition at plan time. See
+    /// [`SealedSegmentReadState`].
+    pub(crate) read_state: SealedSegmentHandle,
+    /// Whether the segment was sealed when the plan was built. Only a sealed
+    /// segment resolves its start byte from the shared sparse index; the active
+    /// one grows under the reader and uses its resident index instead.
+    pub(crate) sealed: bool,
 }
 
 /// Owned auto-commit input, applied off the partition borrow after a poll (see
 /// module docs). Only the in-memory apply happens here; durability is the
 /// replicated [`crate::iggy_partition::IggyPartition::apply_staged_consumer_offset_commit`]
-/// path's job on every node, driven by the `StoreConsumerOffset2` op the serving
+/// path's job on every node, driven by the `StoreConsumerOffset` op the serving
 /// shard submits from [`AutoCommitApplied`]. A poll-local disk write would be
 /// node-local only and diverge on failover.
 pub struct AutoCommitCtx {
@@ -148,7 +180,7 @@ pub struct AutoCommitCtx {
 ///
 /// The serving shard replicates it through the partition consensus (the only
 /// cross-node durable path); `kind` + `consumer_id` are the offset key the
-/// submitted `StoreConsumerOffset2` op must carry.
+/// submitted `StoreConsumerOffset` op must carry.
 pub struct AutoCommitApplied {
     pub kind: ConsumerKind,
     pub consumer_id: u32,
@@ -455,7 +487,7 @@ pub enum DiskReadOutcome {
 impl DiskReadPlan {
     /// Serve a poll from the on-disk segment files, off the partition borrow.
     /// Reads from owned descriptors so no partition reference is held across
-    /// the file IO. Walks stamped `[256B SendMessages2Header][blob]` batches in
+    /// the file IO. Walks stamped `[256B BatchHeader][blob]` batches in
     /// chunked reads, re-reading a batch split across a chunk boundary in the
     /// next chunk.
     #[allow(clippy::cast_possible_truncation)]
@@ -497,8 +529,8 @@ impl DiskReadPlan {
         // then cached) and resolve the start byte so the walk skips straight to
         // the target instead of scanning the whole segment - the poll stall. A
         // miss or load failure keeps `start_position` (the pre-existing
-        // full-scan fallback). The active segment carries no read state, so its
-        // resident-index-resolved `start_position` is left untouched.
+        // full-scan fallback). An active first segment keeps its
+        // resident-index-resolved `start_position` untouched.
         let mut position = match self.segments.first() {
             Some(first) => self
                 .resolve_sealed_start(first, query, partition_dir)
@@ -542,6 +574,7 @@ impl DiskReadPlan {
                     faulted = true;
                     break 'walk;
                 };
+                let fragments_before_chunk = fragments.len();
                 let ChunkWalk { consumed, corrupt } = walk_disk_chunk(
                     &chunk,
                     query,
@@ -556,6 +589,8 @@ impl DiskReadPlan {
                     },
                     self.namespace_raw,
                 );
+                // Detached from the pump, so the ratio alone bounds the copy.
+                unpin_sparse_source(&mut fragments, fragments_before_chunk, &chunk, usize::MAX);
                 if corrupt {
                     // A batch that does not match its own checksum. Fail closed like
                     // an IO fault: serving it hands a consumer data provably not what
@@ -598,31 +633,30 @@ impl DiskReadPlan {
         }
     }
 
-    /// Resolve the read-only descriptor for `segment`'s file. A sealed segment
-    /// clones its cached fd on a hit (sharing the kernel fd, no syscall) and, on
-    /// a miss, opens by path and stores the fd back so later polls skip the
-    /// `openat`. The active segment (no cache slot) always opens fresh. Returns
-    /// `None` only when the open exhausts its retries (the caller fails closed).
+    /// Resolve the read-only descriptor for `segment`'s file. A hit clones the
+    /// cached fd (sharing the kernel fd, no syscall); a miss opens by path and
+    /// stores the fd back so later polls skip the `openat`. Returns `None` only
+    /// when the open exhausts its retries (the caller fails closed).
     async fn resolve_segment_file(
         &self,
         segment: &DiskSegment,
         path: &str,
     ) -> Option<compio::fs::File> {
-        let Some(handle) = &segment.read_state else {
-            return self.open_segment_with_retry(path).await;
-        };
+        let handle = &segment.read_state;
         // Borrow only to clone the `Option<File>` out, never across the await.
         if let Some(cached) = handle.fd.borrow().clone() {
             return Some(cached);
         }
         let file = self.open_segment_with_retry(path).await?;
-        // Store back only while the pump tracks this handle; an untracked
-        // fill (walk-through segment, or a slot evicted mid-poll) would pin an
-        // fd outside the LRU budget, so it opens transiently instead. Benign
-        // race: a concurrent poll of the same segment may have filled the slot
-        // while this open was in flight; overwriting with an equivalent fd
-        // (same inode) is harmless.
-        if handle.tracked.get() {
+        // A sealed segment stores back only while the pump tracks its handle;
+        // an untracked fill (walk-through segment, or a slot evicted mid-poll)
+        // would pin an fd outside the LRU budget, so it opens transiently
+        // instead. The active segment's slot is not LRU-budgeted (one per
+        // partition, dropped when it seals), so it always fills. Benign race: a
+        // concurrent poll of the same segment may have filled the slot while
+        // this open was in flight; overwriting with an equivalent fd (same
+        // inode) is harmless, as is filling a slot the pump orphaned mid-poll.
+        if !segment.sealed || handle.tracked.get() {
             *handle.fd.borrow_mut() = Some(file.clone());
         }
         Some(file)
@@ -633,17 +667,20 @@ impl DiskReadPlan {
     /// whole on the first sealed poll and is cached on the shared handle; a
     /// larger one is binary-searched on file every poll and never materialized
     /// (see the constant). Returns `None` (keep the byte-0 fallback) for the
-    /// active segment (no handle), a below-range query, or an IO failure.
+    /// active segment, a below-range query, or an IO failure.
     async fn resolve_sealed_start(
         &self,
         segment: &DiskSegment,
         query: MessageLookup,
         partition_dir: &str,
     ) -> Option<u64> {
-        // TODO: a per-consumer cursor hint (the previous sealed poll's resolved
-        // position) could seed this so a sequentially advancing consumer skips
-        // the sparse-index lookup on repeated polls of the same segment.
-        let handle = segment.read_state.as_ref()?;
+        // The active segment grows under the reader, so neither the shared
+        // sparse index nor the offset memo can describe it; its own resident
+        // index already resolved `start_position`.
+        if !segment.sealed {
+            return None;
+        }
+        let handle = &segment.read_state;
         // Cache hit: resolve under a short borrow, never across the await.
         let cached = handle
             .index
@@ -652,6 +689,16 @@ impl DiskReadPlan {
             .map(|index| resolve_index_position(index, query));
         if let Some(resolved) = cached {
             return resolved;
+        }
+        // No resident index, so this is the file-backed path a sequential
+        // consumer would otherwise binary-search on disk every poll: answer
+        // from the memoized interval when the query lands inside it.
+        if let (MessageLookup::Offset { offset, .. }, Some(cursor)) =
+            (query, handle.offset_cursor.get())
+            && offset >= cursor.offset
+            && offset < cursor.valid_until
+        {
+            return Some(cursor.position);
         }
         let path = format!("{partition_dir}/{:0>20}.index", segment.start_offset);
         let reader = match IggyIndexReader::new(&path).await {
@@ -682,7 +729,20 @@ impl DiskReadPlan {
         }
         let looked_up = match query {
             MessageLookup::Offset { offset, .. } => {
-                reader.offset_lower_bound(entry_count, offset).await
+                match reader
+                    .offset_lower_bound_with_successor(entry_count, offset)
+                    .await
+                {
+                    Ok(resolved) => Ok(resolved.map(|(entry, successor_offset)| {
+                        handle.offset_cursor.set(Some(SealedOffsetCursor {
+                            offset: entry.offset,
+                            valid_until: successor_offset.unwrap_or(u64::MAX),
+                            position: entry.position,
+                        }));
+                        entry
+                    })),
+                    Err(error) => Err(error),
+                }
             }
             MessageLookup::Timestamp { timestamp, .. } => {
                 reader.timestamp_lower_bound(entry_count, timestamp).await
@@ -783,7 +843,7 @@ fn resolve_index_position(index: &IggyIndexCache, query: MessageLookup) -> Optio
 
 impl AutoCommitCtx {
     /// The offset key (kind + numeric id) this auto-commit targets, for the
-    /// replicated `StoreConsumerOffset2` op the serving shard submits.
+    /// replicated `StoreConsumerOffset` op the serving shard submits.
     pub(crate) const fn kind_and_id(&self) -> (ConsumerKind, u32) {
         match &self.target {
             AutoCommitTarget::Consumer { consumer_id, .. } => {
@@ -901,7 +961,7 @@ pub fn upsert_offset_max<K>(
     }
 }
 
-/// Walk stamped `[256B SendMessages2Header][blob]` batches in one disk
+/// Walk stamped `[256B BatchHeader][blob]` batches in one disk
 /// chunk, pushing matching fragments. Returns bytes consumed: the start
 /// of the first batch that did not fully fit in the chunk (the caller
 /// re-reads from there), or the chunk end when everything decoded.
@@ -980,7 +1040,97 @@ struct ChunkWalk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iggy_index::IggyIndex;
+    use compio::io::AsyncWriteAtExt;
     use server_common::iobuf::Owned;
+
+    /// Write a sealed-segment index file too large to materialize
+    /// (`entry_count * IGGY_INDEX_SIZE > SEALED_INDEX_RESIDENT_MAX_BYTES`), so
+    /// `resolve_sealed_start` takes the file-backed lookup path the offset
+    /// cursor memoizes. Entry `i` maps offset `i * 10` to position `i * 100`.
+    async fn write_oversized_index(dir: &std::path::Path, start_offset: u64) -> u64 {
+        let entry_count =
+            SEALED_INDEX_RESIDENT_MAX_BYTES / crate::iggy_index::IGGY_INDEX_SIZE as u64 + 1;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(entry_count).unwrap() * crate::iggy_index::IGGY_INDEX_SIZE,
+        );
+        for i in 0..entry_count {
+            bytes.extend_from_slice(&crate::iggy_index::IggyIndexCache::serialize(
+                &IggyIndex::new(i * 10, i + 1, i * 100),
+            ));
+        }
+        let path = format!("{}/{:0>20}.index", dir.display(), start_offset);
+        let mut file = compio::fs::File::create(&path).await.expect("create index");
+        let (written, _) = file.write_all_at(bytes, 0).await.into();
+        written.expect("write index");
+        file.sync_all().await.expect("sync index");
+        entry_count
+    }
+
+    fn offset_query(offset: u64) -> MessageLookup {
+        MessageLookup::Offset {
+            offset,
+            count: 1,
+            ceiling: u64::MAX,
+        }
+    }
+
+    #[compio::test]
+    async fn sealed_offset_cursor_answers_in_interval_polls_without_the_index_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "iggy-poll-cursor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos(),
+        ));
+        compio::fs::create_dir_all(&dir).await.expect("create dir");
+        write_oversized_index(&dir, 0).await;
+
+        let handle: SealedSegmentHandle = Rc::new(SealedSegmentReadState::default());
+        let segment = DiskSegment {
+            start_offset: 0,
+            persisted: u64::MAX,
+            read_state: Rc::clone(&handle),
+            sealed: true,
+        };
+        let plan = DiskReadPlan {
+            partition_dir: PartitionDirResolution::Resolved(dir.display().to_string()),
+            segments: Vec::new(),
+            start_position: 0,
+            namespace_raw: 0,
+            validate_checksum: false,
+        };
+        let partition_dir = dir.display().to_string();
+
+        // First poll pays the on-file lookup and memoizes entry 2's interval
+        // [20, 30): offset 25 resolves to entry 2 (offset 20 -> position 200).
+        let first = plan
+            .resolve_sealed_start(&segment, offset_query(25), &partition_dir)
+            .await;
+        assert_eq!(first, Some(200));
+        let cursor = handle.offset_cursor.get().expect("cursor memoized");
+        assert_eq!(
+            (cursor.offset, cursor.valid_until, cursor.position),
+            (20, 30, 200),
+        );
+
+        // Delete the index file: an in-interval re-poll must still resolve
+        // (proof the cursor answered with zero index-file reads)...
+        std::fs::remove_dir_all(&dir).expect("remove dir");
+        let in_interval = plan
+            .resolve_sealed_start(&segment, offset_query(29), &partition_dir)
+            .await;
+        assert_eq!(in_interval, Some(200));
+
+        // ...while an offset past the interval misses the cursor, reaches for
+        // the (now gone) file, and falls back to the byte-0 scan.
+        let past_interval = plan
+            .resolve_sealed_start(&segment, offset_query(30), &partition_dir)
+            .await;
+        assert_eq!(past_interval, None);
+    }
 
     fn non_empty_fragments() -> PollFragments<4096> {
         let mut fragments = PollFragments::new();

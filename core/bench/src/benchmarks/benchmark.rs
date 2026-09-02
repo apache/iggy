@@ -16,13 +16,13 @@
 // under the License.
 
 use crate::args::kind::BenchmarkKindCommand;
-use crate::utils::{ClientFactory, authenticate};
+use crate::utils::ClientFactory;
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
-use iggy::clients::client::IggyClient;
 use iggy::prelude::*;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -96,14 +96,7 @@ pub trait Benchmarkable: Send {
     async fn init_streams(&self) -> Result<(), IggyError> {
         let number_of_streams = self.args().streams();
         let partitions_count: u32 = self.args().number_of_partitions();
-        let client = self.client_factory().create_client().await;
-        let client = IggyClient::create(client, None, None);
-        authenticate(
-            &client,
-            self.client_factory().username(),
-            self.client_factory().password(),
-        )
-        .await;
+        let client = self.client_factory().create_authenticated_client().await?;
         let reuse_streams = self.args().reuse_streams();
         let streams = client.get_streams().await?;
         for i in 1..=number_of_streams {
@@ -130,21 +123,34 @@ pub trait Benchmarkable: Send {
                 .max_topic_size()
                 .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
             let message_expiry = self.args().message_expiry();
+            let enforce_fsync = self.args().enforce_fsync();
+            let messages_required_to_save =
+                self.args().messages_required_to_save().map(NonZeroU32::get);
 
             info!(
-                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}",
-                topic_name, stream_name, max_topic_size, message_expiry
+                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, enforce fsync: {}, messages required to save: {:?}",
+                topic_name,
+                stream_name,
+                max_topic_size,
+                message_expiry,
+                enforce_fsync,
+                messages_required_to_save
             );
 
             client
                 .create_topic(
                     &stream_id,
                     &topic_name,
-                    partitions_count,
-                    CompressionAlgorithm::default(),
-                    None,
-                    message_expiry,
-                    max_topic_size,
+                    &TopicCreateOptions {
+                        partitions_count: Some(partitions_count),
+                        message_expiry: (message_expiry != IggyExpiry::ServerDefault)
+                            .then_some(message_expiry),
+                        max_topic_size: (max_topic_size != MaxTopicSize::ServerDefault)
+                            .then_some(max_topic_size),
+                        enforce_fsync: enforce_fsync.then_some(true),
+                        messages_required_to_save,
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await?;
         }
@@ -153,14 +159,7 @@ pub trait Benchmarkable: Send {
 
     async fn check_streams(&self) -> Result<(), IggyError> {
         let number_of_streams = self.args().streams();
-        let client = self.client_factory().create_client().await;
-        let client = IggyClient::create(client, None, None);
-        authenticate(
-            &client,
-            self.client_factory().username(),
-            self.client_factory().password(),
-        )
-        .await;
+        let client = self.client_factory().create_authenticated_client().await?;
         let streams = client.get_streams().await?;
         for i in 1..=number_of_streams {
             let stream_name = format!("bench-stream-{i}");

@@ -15,10 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::Operation;
 use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// A local commit that failed for an op the cluster had already committed.
+///
+/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// the op, its `commit_min` never advanced, and the next
+/// `advance_commit_min` would assert on the gap. Continuing would either
+/// serve a prefix the cluster has moved past or panic somewhere less
+/// legible, so the partition fences itself on this and the shard brings the
+/// server down through the ordinary shutdown path. Recorded rather than
+/// panicked because a panic on the pump task is swallowed by the runtime,
+/// which wedges every partition on the shard while the process reports
+/// healthy.
+#[derive(Debug, Clone)]
+pub struct FatalCommit {
+    pub namespace_raw: u64,
+    pub op: u64,
+    pub operation: Operation,
+}
 
 #[derive(Debug, Clone)]
 pub struct Fragment<const ALIGN: usize = 4096> {
@@ -56,6 +75,28 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
             self.source.slice(self.start..self.end)
         }
     }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.source[self.start..self.end]
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Whether this fragment refcounts `source`'s allocation (and thus keeps
+    /// all of it alive, not just the sliced window).
+    #[must_use]
+    pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
+        self.source.shares_allocation(source)
+    }
 }
 
 /// Arguments for polling messages from a partition.
@@ -87,7 +128,6 @@ pub struct SendMessagesResult {
 }
 
 /// Consumer identification for offset operations.
-// TODO(hubcio): unify with server's `PollingConsumer` in `streaming/polling_consumer.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollingConsumer {
     /// Regular consumer with (`consumer_id`, `partition_id`)
@@ -214,10 +254,20 @@ pub const REPAIR_RETRY_TICKS: u32 = 100;
 /// One in-flight journal-repair stream for a partition group.
 #[derive(Debug, Clone, Copy)]
 pub struct RepairSession {
-    /// Fences stale repair frames from an earlier attempt.
+    /// Fences range replies from an earlier attempt. Repair bodies carry the
+    /// stored prepare header instead, so [`Self::view`] and canonical suffix
+    /// checks fence their ingest.
     pub nonce: u128,
-    /// Last op the stream is expected to serve (the frontier at request time).
-    pub to_op: u64,
+    /// Consensus view in which this session was armed. A later view discards
+    /// the session before any delayed repair body can enter its journal.
+    pub view: u32,
+    /// Committed frontier this repair must make locally walkable. Floor
+    /// completeness and session completion are bounded here.
+    pub commit_to_op: u64,
+    /// Highest op requested from the peer. This may extend above
+    /// [`Self::commit_to_op`] only for the canonical suffix carried by the
+    /// adopted `StartView`.
+    pub fetch_to_op: u64,
     /// Commit floor learned from `RangeEvicted { retained_from }`:
     /// `retained_from - 1`. `None` until (unless) the serving peer reports a
     /// truncated prefix.
@@ -257,6 +307,32 @@ pub enum RepairConclusion {
     FloorRefused { floor: u64, to_op: u64 },
 }
 
+/// Where partition directories live on disk, mirroring the server's
+/// `SystemConfig` path scheme so segment files created by the partition plane
+/// land next to the ones the server bootstrap created.
+#[derive(Debug, Clone)]
+pub struct PartitionPathLayout {
+    /// `{system.path}/{stream.path}`: the directory holding per-stream dirs.
+    pub streams_root: String,
+    /// Directory name of the per-topic level (`topic.path`).
+    pub topics_dir: String,
+    /// Directory name of the per-partition level (`partition.path`).
+    pub partitions_dir: String,
+}
+
+/// Synthetic layout for tests and the simulator, where paths only key the
+/// sim storage and never touch a real filesystem. The server always wires
+/// the real layout from its `SystemConfig`.
+impl Default for PartitionPathLayout {
+    fn default() -> Self {
+        Self {
+            streams_root: "/tmp/iggy_stub/streams".to_string(),
+            topics_dir: "topics".to_string(),
+            partitions_dir: "partitions".to_string(),
+        }
+    }
+}
+
 /// Configuration for partition operations.
 ///
 /// Mirrors the relevant fields from the server's `PartitionConfig` and
@@ -287,6 +363,8 @@ pub struct PartitionsConfig {
     /// decrypts uniformly whether a fragment came from the resident journal
     /// or from disk.
     pub encryptor: Option<Arc<EncryptorKind>>,
+    /// On-disk location scheme for partition directories.
+    pub path_layout: PartitionPathLayout,
 }
 
 impl PartitionsConfig {
@@ -297,14 +375,15 @@ impl PartitionsConfig {
         topic_id: usize,
         partition_id: usize,
     ) -> String {
-        format!("/tmp/iggy_stub/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}")
+        format!(
+            "{}/{stream_id}/{}/{topic_id}/{}/{partition_id}",
+            self.path_layout.streams_root,
+            self.path_layout.topics_dir,
+            self.path_layout.partitions_dir,
+        )
     }
 
     /// Constructs the file path for segment messages.
-    ///
-    /// TODO: This is a stub waiting for completion of issue to move server config
-    /// to shared module. Real implementation should use:
-    /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.log`
     #[must_use]
     pub fn get_messages_path(
         &self,
@@ -320,10 +399,6 @@ impl PartitionsConfig {
     }
 
     /// Constructs the file path for segment indexes.
-    ///
-    /// TODO: This is a stub waiting for completion of issue to move server config
-    /// to shared module. Real implementation should use:
-    /// `{base_path}/{streams_path}/{stream_id}/{topics_path}/{topic_id}/{partitions_path}/{partition_id}/{start_offset:0>20}.index`
     #[must_use]
     pub fn get_index_path(
         &self,
@@ -335,45 +410,6 @@ impl PartitionsConfig {
         format!(
             "{}/{start_offset:0>20}.index",
             self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    #[must_use]
-    pub fn get_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/offsets",
-            self.get_partition_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    #[must_use]
-    pub fn get_consumer_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/consumers",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
-        )
-    }
-
-    #[must_use]
-    pub fn get_consumer_group_offsets_path(
-        &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
-    ) -> String {
-        format!(
-            "{}/groups",
-            self.get_offsets_path(stream_id, topic_id, partition_id)
         )
     }
 }

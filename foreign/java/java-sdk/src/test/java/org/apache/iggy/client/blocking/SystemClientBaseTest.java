@@ -21,8 +21,13 @@ package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.cluster.ClusterNodeRole;
 import org.apache.iggy.cluster.ClusterNodeStatus;
+import org.apache.iggy.message.HeaderKind;
+import org.apache.iggy.system.OptionSpec;
+import org.apache.iggy.system.OptionsScope;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -35,6 +40,28 @@ public abstract class SystemClientBaseTest extends IntegrationTest {
         systemClient = client.system();
 
         login();
+    }
+
+    @Test
+    void shouldDescribeTheTopicOptionCatalog() {
+        // when
+        var specs = systemClient.describeOptions(OptionsScope.Topic);
+
+        // then
+        var byKey = specs.stream().collect(Collectors.toMap(OptionSpec::key, spec -> spec));
+        assertThat(byKey).containsKeys("segment_size", "enforce_fsync");
+        var segmentSize = byKey.get("segment_size");
+        assertThat(segmentSize.defaultValue().kind()).isEqualTo(HeaderKind.Uint64);
+        assertThat(segmentSize.defaultValue().value()).isNotEmpty();
+        assertThat(segmentSize.description()).isNotBlank();
+    }
+
+    @Test
+    void shouldDescribeEmptyCatalogsForScopesWithoutKeys() {
+        // Streams and users have no catalog keys yet, so the scope answers with
+        // an empty list rather than an error.
+        assertThat(systemClient.describeOptions(OptionsScope.Stream)).isEmpty();
+        assertThat(systemClient.describeOptions(OptionsScope.User)).isEmpty();
     }
 
     @Test

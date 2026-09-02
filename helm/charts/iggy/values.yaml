@@ -17,6 +17,11 @@
 
 # -- Iggy server configuration
 server:
+  # -- Client-facing address published in cluster metadata. Declaring
+  # `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but
+  # setting both is refused at render time. Empty falls back to the in-cluster
+  # Service DNS name.
+  advertisedAddress: ""
   # -- Enable the Iggy server deployment
   enabled: true
   # -- Number of server replicas
@@ -57,6 +62,13 @@ server:
     path: /metrics
     # -- Timeout for scrape metrics request
     scrapeTimeout: 10s
+    # -- Authorization for the scrape request. The metrics endpoint requires a
+    # bearer credential (e.g. a personal access token stored in a Secret):
+    # authorization:
+    #   credentials:
+    #     name: iggy-metrics-token
+    #     key: token
+    authorization: {}
 
   users:
     root:

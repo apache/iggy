@@ -100,6 +100,19 @@ pub struct IggyBenchArgs {
     /// consumers start with fresh data and accurate latency measurements.
     #[arg(long, default_value_t = false)]
     pub reuse_streams: bool,
+
+    /// Fsync each journal flush on the benchmark topic. Flush timing stays
+    /// governed by `--messages-required-to-save` (server default: 1024), so
+    /// acks are durability-gated only with `--messages-required-to-save 1`.
+    /// Topic option at creation, so it has no effect with `--reuse-streams`.
+    #[arg(long, default_value_t = false)]
+    pub enforce_fsync: bool,
+
+    /// Topic journal flush threshold in messages (server default: 1024).
+    /// With `--enforce-fsync`, `1` makes every produce ack wait for the fsync.
+    /// Topic option at creation, so it has no effect with `--reuse-streams`.
+    #[arg(long)]
+    pub messages_required_to_save: Option<NonZeroU32>,
 }
 
 impl IggyBenchArgs {
@@ -325,6 +338,14 @@ impl IggyBenchArgs {
 
     pub const fn reuse_streams(&self) -> bool {
         self.reuse_streams
+    }
+
+    pub const fn enforce_fsync(&self) -> bool {
+        self.enforce_fsync
+    }
+
+    pub const fn messages_required_to_save(&self) -> Option<NonZeroU32> {
+        self.messages_required_to_save
     }
 
     pub fn username(&self) -> &str {

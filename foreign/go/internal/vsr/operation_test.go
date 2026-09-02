@@ -41,8 +41,6 @@ func TestOperationForCode_ResolvesTheReplicatedTable(t *testing.T) {
 		{code: command.SendMessagesCode, want: OperationSendMessages},
 		{code: command.StoreOffsetCode, want: OperationStoreConsumerOffset},
 		{code: command.DeleteConsumerOffsetCode, want: OperationDeleteConsumerOffset},
-		{code: command.StoreOffset2Code, want: OperationStoreConsumerOffset2},
-		{code: command.DeleteConsumerOffset2Code, want: OperationDeleteConsumerOffset2},
 		{code: command.CreateStreamCode, want: OperationCreateStream},
 		{code: command.DeleteStreamCode, want: OperationDeleteStream},
 		{code: command.UpdateStreamCode, want: OperationUpdateStream},
@@ -114,7 +112,7 @@ func TestIsKnownOperation_RejectsUndeclaredDiscriminants(t *testing.T) {
 		assert.True(t, IsKnownOperation(operation), "operation %d", operation)
 	}
 
-	undeclared := []Operation{4, 63, 69, 127, 150, 159, 163, 166, 255}
+	undeclared := []Operation{4, 63, 69, 127, 150, 159, 163, 164, 165, 255}
 	for _, operation := range undeclared {
 		assert.False(t, IsKnownOperation(operation), "operation %d", operation)
 	}
@@ -153,19 +151,11 @@ func TestIsMetadata_ExcludesDeleteSegments(t *testing.T) {
 		OperationLogout,
 		OperationSendMessages,
 		OperationStoreConsumerOffset,
-		OperationDeleteConsumerOffset2,
+		OperationDeleteConsumerOffset,
 	}
 	for _, operation := range nonMetadata {
 		assert.False(t, IsMetadata(operation), "operation %d", operation)
 	}
-}
-
-func TestIsPartition_CoversTheDataPlaneBand(t *testing.T) {
-	assert.True(t, IsPartition(OperationSendMessages))
-	assert.True(t, IsPartition(OperationStoreConsumerOffset))
-	assert.True(t, IsPartition(OperationDeleteConsumerOffset2))
-	assert.False(t, IsPartition(OperationLeaveConsumerGroup))
-	assert.False(t, IsPartition(OperationDeleteSegments))
 }
 
 func TestIsResultFramed_ExcludesSendMessages(t *testing.T) {
@@ -177,8 +167,6 @@ func TestIsResultFramed_ExcludesSendMessages(t *testing.T) {
 		OperationLeaveConsumerGroup,
 		OperationStoreConsumerOffset,
 		OperationDeleteConsumerOffset,
-		OperationStoreConsumerOffset2,
-		OperationDeleteConsumerOffset2,
 	}
 	for _, operation := range framed {
 		assert.True(t, IsResultFramed(operation), "operation %d", operation)

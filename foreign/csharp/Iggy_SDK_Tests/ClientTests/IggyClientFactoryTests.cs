@@ -33,9 +33,29 @@ public sealed class IggyClientFactoryTests
         };
 
         Assert.Equal(64 * 1024 * 1024, options.MaxResponseFrameSize);
+        Assert.Null(options.ReceiveBufferSize);
+        Assert.Null(options.SendBufferSize);
 
         using var client = IggyClientFactory.CreateClient(options) as IDisposable;
         Assert.NotNull(client);
+    }
+
+    [Theory]
+    [InlineData(0, null)]
+    [InlineData(-1, null)]
+    [InlineData(null, 0)]
+    [InlineData(null, -1)]
+    public void CreateClient_RejectsNonPositiveSocketBufferSize(int? receiveBufferSize, int? sendBufferSize)
+    {
+        var options = new IggyClientConfigurator
+        {
+            BaseAddress = "127.0.0.1:8090",
+            Protocol = Protocol.Tcp,
+            ReceiveBufferSize = receiveBufferSize,
+            SendBufferSize = sendBufferSize
+        };
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => IggyClientFactory.CreateClient(options));
     }
 
     [Fact]
@@ -49,6 +69,52 @@ public sealed class IggyClientFactoryTests
         };
 
         Assert.Throws<ArgumentOutOfRangeException>(() => IggyClientFactory.CreateClient(options));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1000)]
+    [InlineData(0.5)]
+    [InlineData(uint.MaxValue)]
+    public void CreateClient_RejectsHeartbeatIntervalOutsideTimerBounds(double milliseconds)
+    {
+        var options = new IggyClientConfigurator
+        {
+            BaseAddress = "127.0.0.1:8090",
+            Protocol = Protocol.Tcp,
+            HeartbeatInterval = TimeSpan.FromMilliseconds(milliseconds)
+        };
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => IggyClientFactory.CreateClient(options));
+    }
+
+    [Fact]
+    public void CreateClient_TcpClientDisposesTwice()
+    {
+        var options = new IggyClientConfigurator
+        {
+            BaseAddress = "127.0.0.1:8090",
+            Protocol = Protocol.Tcp
+        };
+
+        var client = (IDisposable)IggyClientFactory.CreateClient(options);
+
+        client.Dispose();
+        client.Dispose();
+    }
+
+    [Fact]
+    public void Defaults_KeepIdleSessionsAlive()
+    {
+        var options = new IggyClientConfigurator
+        {
+            BaseAddress = "127.0.0.1:8090",
+            Protocol = Protocol.Tcp
+        };
+
+        Assert.Equal(TimeSpan.FromSeconds(5), options.HeartbeatInterval);
+        Assert.True(options.ReconnectionSettings.Enabled);
+        Assert.Equal(0, options.ReconnectionSettings.MaxRetries);
     }
 
     [Fact]

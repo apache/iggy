@@ -22,14 +22,17 @@ use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
     PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
+};
+use iggy_binary_protocol::requests::personal_access_tokens::{
+    CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest,
+    DeletePersonalAccessTokenRequest as WireDeletePersonalAccessTokenRequest,
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
@@ -44,7 +47,7 @@ use iggy_binary_protocol::requests::users::{
 };
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, Operation, RoutedRequestHeader, WireEncode,
-    WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
+    WireIdentifier, WireName, WireOptions, WirePartitioning, WirePollingStrategy,
 };
 use metadata::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest};
 use secrecy::SecretString;
@@ -52,33 +55,34 @@ use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, iobuf::Owned};
 use std::cell::Cell;
 
-/// Partition-plane request ids are offset into the top half of the `u64` space
-/// so they never collide with the small, contiguous metadata ids in the
-/// auditor's `(client, request)` map. The metadata sequence would have to reach
-/// `2^63` to overlap, which no run approaches.
-const PARTITION_ID_BASE: u64 = 1 << 63;
-
 // TODO: Proper client which implements the full client SDK API
 pub struct SimClient {
     client_id: u128,
-    /// Contiguous `1, 2, 3, …` request ids for metadata/replicated ops, the
-    /// sequence the server's `ClientTable` dedups and requires gap-free.
+    /// Monotonic `1, 2, 3, …` request ids shared by every replicated op,
+    /// metadata and partition alike, which is what the SDKs send. One sequence
+    /// also issues each id exactly once per client, so a delayed or duplicated
+    /// partition reply can never carry the `(client, request)` key of a live
+    /// metadata entry in the auditor's map. See [`SimClient::next_request_id`].
     request_counter: Cell<u64>,
-    /// Separate id sequence for partition-plane ops, offset into a disjoint
-    /// range ([`PARTITION_ID_BASE`]). The partition plane has no client-table
-    /// dedup and treats the id as an opaque echo, so a partition id never
-    /// collides with a metadata id, even under reply duplication. See
-    /// [`SimClient::request_id_for`].
-    partition_counter: Cell<u64>,
     /// Deterministic per-message id source for produced messages. The real SDK
-    /// sends `id: 0` and lets the server mint a random UUID
-    /// (`transcode_legacy_request` -> `random_id::get_uuid`); that
-    /// mint is unseeded, so under the deterministic executor a produce's
-    /// replicated body bytes (and their checksums) would differ run to run,
-    /// silently breaking seeded replay. Stamping a deterministic id here keeps
-    /// the body a pure function of the seed. See [`SimClient::next_message_id`].
+    /// mints a random UUID for a zero message id before encoding; that mint is
+    /// unseeded, so under the deterministic executor a produce's replicated
+    /// body bytes (and their checksums) would differ run to run, silently
+    /// breaking seeded replay. Stamping a deterministic id here keeps the body
+    /// a pure function of the seed. See [`SimClient::next_message_id`].
     message_counter: Cell<u64>,
     session: Cell<u64>,
+    /// Whether this client talks to the server's real dispatch layer, which
+    /// changes what a PAT request must contain.
+    ///
+    /// A real client sends `[name][expiry]` and the server mints the token and its
+    /// hash in `maybe_rewrite_pat_request`, rewriting the request into the
+    /// replicated form before consensus sees it. The raw path has no dispatch layer
+    /// and so no rewrite, so a request submitted there must arrive already
+    /// replicated. Sessions split the same way (`register` raw, `login` shell);
+    /// this is the one op family whose BODY differs rather than its envelope. Set
+    /// by `Simulator::shell_login_via`, so it follows the path the client took.
+    shell_wire: Cell<bool>,
 }
 
 impl SimClient {
@@ -87,10 +91,33 @@ impl SimClient {
         Self {
             client_id,
             request_counter: Cell::new(0),
-            partition_counter: Cell::new(0),
             message_counter: Cell::new(0),
             session: Cell::new(0),
+            shell_wire: Cell::new(false),
         }
+    }
+
+    /// Mark this client as talking to the real dispatch layer, so PAT requests
+    /// carry the client wire shape rather than the replicated one. See
+    /// [`SimClient::shell_wire`].
+    pub fn set_shell_wire(&self) {
+        self.shell_wire.set(true);
+    }
+
+    /// Put this client back on the replicated wire shape.
+    ///
+    /// The inverse exists because the flip is otherwise permanent and silent: a
+    /// client moved to the client wire shape by mistake stops covering the
+    /// replicated PAT path for the rest of the run, with nothing failing.
+    pub fn clear_shell_wire(&self) {
+        self.shell_wire.set(false);
+    }
+
+    /// Whether this client talks the client wire shape (see
+    /// [`SimClient::set_shell_wire`]).
+    #[must_use]
+    pub const fn shell_wire(&self) -> bool {
+        self.shell_wire.get()
     }
 
     #[must_use]
@@ -120,29 +147,21 @@ impl SimClient {
         self.session.set(session);
     }
 
-    /// Assign the wire request id for `operation`, keyed by plane.
+    /// Assign the wire request id for the next replicated op.
     ///
-    /// Metadata/replicated ops advance a contiguous `1, 2, 3, …` counter: the
-    /// `ClientTable` dedups them and rejects anything but `committed + 1`, so a
-    /// gap opens a permanent `RequestGap` and wedges the client's metadata
-    /// plane. Partition ops are at-least-once with no dedup and the server
-    /// treats their id as an opaque echo, so they draw from a separate counter
-    /// offset into a disjoint range ([`PARTITION_ID_BASE`]). A partition id can
-    /// therefore never equal a metadata id, so a delayed or duplicated partition
-    /// reply is never misattributed to a metadata entry in the auditor's
-    /// `(client, request)` map (which would trip the group guard and drop a
-    /// live metadata op). This holds regardless of reply duplication, not only
-    /// while clients are one-in-flight.
-    fn request_id_for(&self, operation: Operation) -> u64 {
-        if operation.is_partition() {
-            let next = self.partition_counter.get() + 1;
-            self.partition_counter.set(next);
-            PARTITION_ID_BASE + next
-        } else {
-            let next = self.request_counter.get() + 1;
-            self.request_counter.set(next);
-            next
-        }
+    /// Every replicated op advances one counter, metadata and partition alike,
+    /// which is what the SDKs send: a partition op needs its own number for a
+    /// retry to be recognisable, and the ids it spends cost the metadata plane
+    /// nothing, because `ClientTable` admits anything above the watermark
+    /// (`client_table.rs`: "There is no `RequestGap`").
+    ///
+    /// `NonReplicated` reads never reach here — the poll path builds its own
+    /// header and reads the counter without advancing it, matching the SDK,
+    /// since the server ignores the id for ops the table never sees.
+    fn next_request_id(&self) -> u64 {
+        let next = self.request_counter.get() + 1;
+        self.request_counter.set(next);
+        next
     }
 
     fn session_id(&self) -> u64 {
@@ -165,7 +184,7 @@ impl SimClient {
     pub fn register(&self) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let header = RoutedRequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
+            command: iggy_binary_protocol::Command::Request,
             operation: Operation::Register,
             size: header_size as u32,
             client: self.client_id,
@@ -214,7 +233,7 @@ impl SimClient {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
         let total_size = header_size + body.len();
         let header = RoutedRequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
+            command: iggy_binary_protocol::Command::Request,
             operation: Operation::Register,
             size: total_size as u32,
             client: self.client_id,
@@ -231,11 +250,24 @@ impl SimClient {
             .expect("login request must be valid")
     }
 
+    /// Tear down this client's bound session.
+    ///
+    /// Replicates through the metadata plane like any other session op, so it
+    /// carries the bound session and a metadata request id and needs no body. A
+    /// logout to a BACKUP is what produces `ForwardLogout`: the backup owns the
+    /// connection but not the log, so it asks the primary to commit the teardown
+    /// and answers once `ForwardLogoutResult` returns.
+    #[must_use]
+    pub fn logout(&self) -> Message<RoutedRequestHeader> {
+        self.build_request(Operation::Logout, &[])
+    }
+
     /// # Panics
     /// Panics if the stream name is not a valid wire name.
     pub fn create_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
         let wire = CreateStreamRequest {
             name: WireName::new(name).expect("stream name must be valid"),
+            options: WireOptions::empty(),
         };
         let payload = wire.to_bytes();
 
@@ -260,6 +292,7 @@ impl SimClient {
         let wire = UpdateStreamRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             name: WireName::new(new_name).expect("stream name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateStream, &wire.to_bytes())
     }
@@ -284,11 +317,8 @@ impl SimClient {
         let wire = CreateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             partitions_count,
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
-            replication_factor: 1,
             name: WireName::new(name).expect("topic name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::CreateTopic, &wire.to_bytes())
     }
@@ -304,11 +334,8 @@ impl SimClient {
         let wire = UpdateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             topic_id: WireIdentifier::named(topic).expect("topic name must be valid"),
-            compression_algorithm: 0,
-            message_expiry: 0,
-            max_topic_size: 0,
-            replication_factor: 1,
             name: WireName::new(new_name).expect("topic name must be valid"),
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateTopic, &wire.to_bytes())
     }
@@ -428,6 +455,7 @@ impl SimClient {
             password: password.to_string(),
             status,
             permissions: None,
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::CreateUser, &wire.to_bytes())
     }
@@ -445,6 +473,7 @@ impl SimClient {
             user_id: WireIdentifier::named(user).expect("username must be valid"),
             username: new_username.map(|n| WireName::new(n).expect("username must be valid")),
             status,
+            options: WireOptions::empty(),
         };
         self.build_request(Operation::UpdateUser, &wire.to_bytes())
     }
@@ -491,14 +520,22 @@ impl SimClient {
         name: &str,
         expiry: u64,
     ) -> Message<RoutedRequestHeader> {
+        let name = WireName::new(name).expect("PAT name must be valid");
+        // Through dispatch, send what a real client sends: the server resolves the
+        // acting user from the session and mints the token and its hash in
+        // `maybe_rewrite_pat_request`, rewriting this into the replicated form
+        // before consensus sees it. A client cannot produce that form, not knowing
+        // the hash, so sending it here made every PAT request fail to decode.
+        if self.shell_wire.get() {
+            let wire = WireCreatePersonalAccessTokenRequest { name, expiry };
+            return self.build_request(Operation::CreatePersonalAccessToken, &wire.to_bytes());
+        }
+        // Raw path: no dispatch layer, so no rewrite ever happens and the request
+        // has to arrive already replicated.
         let wire = CreatePersonalAccessTokenRequest {
             user_id: 0,
-            name: WireName::new(name).expect("PAT name must be valid"),
+            name,
             expiry,
-            // Deterministic stub for the simulator. Production servers mint
-            // this in `maybe_rewrite_pat_request` on the primary; the
-            // simulator drives the wire path directly without that rewrite
-            // step.
             token_hash: [b'a'; 64],
         };
         self.build_request(Operation::CreatePersonalAccessToken, &wire.to_bytes())
@@ -507,20 +544,26 @@ impl SimClient {
     /// # Panics
     /// Panics if `name` is not a valid `WireName`.
     pub fn delete_personal_access_token(&self, name: &str) -> Message<RoutedRequestHeader> {
+        let name = WireName::new(name).expect("PAT name must be valid");
+        // See `create_personal_access_token` for why the shape depends on the path.
+        if self.shell_wire.get() {
+            let wire = WireDeletePersonalAccessTokenRequest { name };
+            return self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes());
+        }
         let wire = DeletePersonalAccessTokenRequest {
             user_id: 0,
-            name: WireName::new(name).expect("PAT name must be valid"),
+            name,
             only_if_expired: false,
         };
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())
     }
 
-    /// Build a `SendMessages` request in the legacy `SendMessagesEncoder` wire
-    /// shape, byte-compatible with what the real SDK sends (`common` binary
-    /// client). VSR clients resolve to an explicit partition before sending, so
-    /// the sim always emits `WirePartitioning::PartitionId`: that is the shape
-    /// the shell's `resolve_partition_request_namespace` decodes, and the raw
-    /// path converts it to `SendMessages2` via `transcode_legacy_request`.
+    /// Build a `SendMessages` request in the `SendMessagesEncoder` wire shape,
+    /// byte-compatible with what the real SDK sends (`common` binary client).
+    /// VSR clients resolve to an explicit partition before sending, so the sim
+    /// always emits `WirePartitioning::PartitionId`: that is the shape the
+    /// shell's `resolve_partition_request_namespace` decodes before admission
+    /// strips the metadata and stamps the batch.
     ///
     /// # Panics
     /// Panics if a group id exceeds `u32` or the request buffer is invalid.
@@ -551,7 +594,8 @@ impl SimClient {
 
         let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, &raw);
         let mut buf = BytesMut::with_capacity(size);
-        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw);
+        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw)
+            .expect("simulator send batch encodes");
 
         self.build_request_with_namespace(Operation::SendMessages, &buf, group)
     }
@@ -560,10 +604,10 @@ impl SimClient {
     /// `count` messages from offset 0 of `group`'s partition.
     ///
     /// A `NonReplicated` read: the command code sits in the header's
-    /// `reserved` prefix, and the request id ECHOES the current metadata
-    /// counter without advancing it (matching the SDK), so a read never
-    /// gaps the replicated sequence the server's `ClientTable` requires
-    /// gap-free. Requires a bound session (polls are auth-gated).
+    /// `reserved` prefix, and the request id ECHOES the current counter
+    /// without advancing it (matching the SDK). The server ignores the id for
+    /// ops its `ClientTable` never sees, so burning one would buy nothing.
+    /// Requires a bound session (polls are auth-gated).
     ///
     /// # Panics
     /// Panics if the session is unbound or the request buffer is invalid.
@@ -586,7 +630,7 @@ impl SimClient {
         let mut reserved = [0u8; 52];
         reserved[..4].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
         let header = RoutedRequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
+            command: iggy_binary_protocol::Command::Request,
             operation: Operation::NonReplicated,
             size: total_size as u32,
             client: self.client_id,
@@ -604,55 +648,13 @@ impl SimClient {
             .expect("poll request must be valid")
     }
 
-    pub fn store_consumer_offset(
-        &self,
-        group: IggyNamespace,
-        consumer_kind: u8,
-        consumer_id: u32,
-        offset: u64,
-    ) -> Message<RoutedRequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(group);
-        let request = StoreConsumerOffsetRequest {
-            consumer: namespace_consumer(consumer_kind, consumer_id),
-            stream_id,
-            topic_id,
-            partition_id,
-            offset,
-        };
-        self.build_request_with_namespace(
-            Operation::StoreConsumerOffset,
-            &request.to_bytes(),
-            group,
-        )
-    }
-
-    pub fn delete_consumer_offset(
-        &self,
-        group: IggyNamespace,
-        consumer_kind: u8,
-        consumer_id: u32,
-    ) -> Message<RoutedRequestHeader> {
-        let (stream_id, topic_id, partition_id) = namespace_ids(group);
-        let request = DeleteConsumerOffsetRequest {
-            consumer: namespace_consumer(consumer_kind, consumer_id),
-            stream_id,
-            topic_id,
-            partition_id,
-        };
-        self.build_request_with_namespace(
-            Operation::DeleteConsumerOffset,
-            &request.to_bytes(),
-            group,
-        )
-    }
-
     /// Store offset with explicit `AckLevel`. `NoAck` takes the primary's
     /// fast path (no replication); `Quorum` goes through VSR.
     ///
     /// # Panics
     /// Panics on payload too large for `Owned::<4096>` or invalid
     /// `Message<RoutedRequestHeader>` parse; both are simulator misconfig.
-    pub fn store_consumer_offset_2(
+    pub fn store_consumer_offset(
         &self,
         group: IggyNamespace,
         consumer_kind: u8,
@@ -661,7 +663,7 @@ impl SimClient {
         ack: AckLevel,
     ) -> Message<RoutedRequestHeader> {
         let (stream_id, topic_id, partition_id) = namespace_ids(group);
-        let request = StoreConsumerOffset2Request {
+        let request = StoreConsumerOffsetRequest {
             consumer: namespace_consumer(consumer_kind, consumer_id),
             stream_id,
             topic_id,
@@ -670,7 +672,7 @@ impl SimClient {
             ack,
         };
         self.build_request_with_namespace(
-            Operation::StoreConsumerOffset2,
+            Operation::StoreConsumerOffset,
             &request.to_bytes(),
             group,
         )
@@ -681,7 +683,7 @@ impl SimClient {
     /// # Panics
     /// Panics on payload too large for `Owned::<4096>` or invalid
     /// `Message<RoutedRequestHeader>` parse; both are simulator misconfig.
-    pub fn delete_consumer_offset_2(
+    pub fn delete_consumer_offset(
         &self,
         group: IggyNamespace,
         consumer_kind: u8,
@@ -689,7 +691,7 @@ impl SimClient {
         ack: AckLevel,
     ) -> Message<RoutedRequestHeader> {
         let (stream_id, topic_id, partition_id) = namespace_ids(group);
-        let request = DeleteConsumerOffset2Request {
+        let request = DeleteConsumerOffsetRequest {
             consumer: namespace_consumer(consumer_kind, consumer_id),
             stream_id,
             topic_id,
@@ -697,7 +699,7 @@ impl SimClient {
             ack,
         };
         self.build_request_with_namespace(
-            Operation::DeleteConsumerOffset2,
+            Operation::DeleteConsumerOffset,
             &request.to_bytes(),
             group,
         )
@@ -744,7 +746,7 @@ impl SimClient {
     #[allow(clippy::cast_possible_truncation)]
     fn header(&self, operation: Operation, group: u64, total_size: usize) -> RoutedRequestHeader {
         RoutedRequestHeader {
-            command: iggy_binary_protocol::Command2::Request,
+            command: iggy_binary_protocol::Command::Request,
             operation,
             size: total_size as u32,
             cluster: 0, // TODO: Get from config
@@ -758,7 +760,7 @@ impl SimClient {
             request_checksum: 0,
             timestamp: 0, // TODO: Use actual timestamp
             session: self.session_id(),
-            request: self.request_id_for(operation),
+            request: self.next_request_id(),
             group,
             ..Default::default()
         }
@@ -792,29 +794,29 @@ fn namespace_ids(ns: IggyNamespace) -> (WireIdentifier, WireIdentifier, Option<u
 mod tests {
     use super::*;
 
-    // A partition send between two metadata ops must not consume a metadata
-    // request number: the server's `ClientTable` requires the metadata sequence
-    // gap-free (`committed + 1`), else a gap permanently wedges the client's
-    // metadata plane. Partition ops draw from a separate counter in a disjoint
-    // range (`PARTITION_ID_BASE`), so the metadata sequence stays `1, 2, 3`
-    // regardless of interleaved sends and a partition id never collides with a
-    // metadata id.
+    // A partition send consumes a request id like any other replicated op, so
+    // an interleaved run numbers both planes from one sequence and the metadata
+    // ids arrive with gaps under them. That is the pattern the SDKs produce, and
+    // the server admits it: `ClientTable` compares against a watermark rather
+    // than requiring contiguity (`client_table.rs`: "There is no `RequestGap`"),
+    // so a metadata op landing above the watermark executes and moves it.
     #[test]
-    fn partition_ops_do_not_gap_the_metadata_request_sequence() {
+    fn every_replicated_op_advances_the_one_request_sequence() {
         let client = SimClient::new(7);
+        client.bind_session(1);
 
-        // Metadata ops advance (1, 2, 3); interleaved sends draw their own
-        // disjoint sequence and leave the metadata counter untouched.
-        assert_eq!(client.request_id_for(Operation::CreateStream), 1);
-        assert_eq!(
-            client.request_id_for(Operation::SendMessages),
-            PARTITION_ID_BASE + 1
-        );
-        assert_eq!(client.request_id_for(Operation::CreateStream), 2);
-        assert_eq!(
-            client.request_id_for(Operation::SendMessages),
-            PARTITION_ID_BASE + 2
-        );
-        assert_eq!(client.request_id_for(Operation::CreateStream), 3);
+        let interleaved = [
+            Operation::CreateStream,
+            Operation::SendMessages,
+            Operation::CreateStream,
+            Operation::SendMessages,
+            Operation::CreateStream,
+        ];
+        let ids: Vec<u64> = interleaved
+            .into_iter()
+            .map(|operation| client.header(operation, METADATA_GROUP, 0).request)
+            .collect();
+
+        assert_eq!(ids, vec![1, 2, 3, 4, 5], "plane must not fork the sequence");
     }
 }

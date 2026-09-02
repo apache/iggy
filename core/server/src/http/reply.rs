@@ -20,7 +20,7 @@
 //! login error mappings the write and auth paths render through.
 
 use iggy_binary_protocol::consensus::{
-    Command2, EvictionHeader, HEADER_SIZE, result_code, result_section_len,
+    Command, EvictionHeader, HEADER_SIZE, result_code, result_section_len,
 };
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use iggy_binary_protocol::responses::messages::SendMessagesResponse;
@@ -33,12 +33,11 @@ use iggy_common::{
     ConsumerGroupDetails, IggyError, StreamDetails, TopicDetails, UserInfoDetails,
     eviction_reason_to_error,
 };
-use message_bus::BusMessage;
-use server_common::Message;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
+use crate::dispatch::login_error::LoginRegisterError;
 use crate::http::error::{PartitionWriteError, WriteError};
-use crate::login_register::LoginRegisterError;
 
 /// Discriminate a partition write reply. Partition replies carry no result
 /// section - a denial is empty-bodied and a committed body, where there is one,
@@ -60,14 +59,14 @@ use crate::login_register::LoginRegisterError;
 /// keeps that a single parse whose failure mode is already decided here, rather
 /// than a second one whose fallback would have to invent a body.
 pub(in crate::http) fn classify_partition_reply(
-    reply: &BusMessage,
+    reply: &Frozen<MESSAGE_ALIGN>,
 ) -> Result<ReplyHeader, PartitionWriteError> {
     let header = reply
         .as_slice()
         .get(..HEADER_SIZE)
         .and_then(|bytes| bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok())
         .ok_or(PartitionWriteError::Rejected(IggyError::InvalidCommand))?;
-    if header.command != Command2::Reply {
+    if header.command != Command::Reply {
         return Err(PartitionWriteError::Rejected(IggyError::InvalidCommand));
     }
     if header.status != 0 {
@@ -93,7 +92,7 @@ pub(in crate::http) fn classify_partition_reply(
 /// `header` is the one [`classify_partition_reply`] graded, so this reads the
 /// body without re-deriving its extent.
 pub(in crate::http) fn send_confirmations(
-    reply: &BusMessage,
+    reply: &Frozen<MESSAGE_ALIGN>,
     header: &ReplyHeader,
 ) -> Option<SendMessagesResponse> {
     let body = partition_reply_body(reply, header);
@@ -115,7 +114,7 @@ pub(in crate::http) fn send_confirmations(
 /// A partition reply's body past the header, bounded by the header's `size`
 /// rather than by the buffer length: `size` is the frame's authoritative
 /// extent, and the typed decoders reject trailing bytes.
-fn partition_reply_body<'a>(reply: &'a BusMessage, header: &ReplyHeader) -> &'a [u8] {
+fn partition_reply_body<'a>(reply: &'a Frozen<MESSAGE_ALIGN>, header: &ReplyHeader) -> &'a [u8] {
     reply
         .as_slice()
         .get(HEADER_SIZE..header.size as usize)
@@ -296,7 +295,7 @@ mod tests {
             "status carries the deny code"
         );
         assert_ne!(status, 0, "a deny status is nonzero so the SDK peek fires");
-        assert_eq!(reply.header().command, Command2::Reply);
+        assert_eq!(reply.header().command, Command::Reply);
         // Echoes the request so the SDK routes it back to the waiting slot.
         assert_eq!(reply.header().request, request.header().request);
         assert_eq!(reply.header().operation, request.header().operation);
@@ -338,7 +337,7 @@ mod tests {
 
         // The consensus plane's committed-reply builder (plane_helpers path).
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::SendMessages,
             client: 42,
             op: 1,
@@ -362,14 +361,14 @@ mod tests {
         );
     }
 
-    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> BusMessage {
+    fn frozen(reply: Message<iggy_binary_protocol::ReplyHeader>) -> Frozen<MESSAGE_ALIGN> {
         reply.into_generic().into_frozen()
     }
 
     #[test]
     fn committed_partition_reply_classifies_as_success() {
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::SendMessages,
             client: 42,
             op: 1,
@@ -381,12 +380,12 @@ mod tests {
     }
 
     /// The 204 path of the offset write routes: a committed
-    /// `StoreConsumerOffset2` reply (op >= 1) classifies as success.
+    /// `StoreConsumerOffset` reply (op >= 1) classifies as success.
     #[test]
     fn committed_offset_write_reply_classifies_as_success() {
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
-            operation: Operation::StoreConsumerOffset2,
+            command: Command::Prepare,
+            operation: Operation::StoreConsumerOffset,
             client: 42,
             op: 3,
             request: 2,
@@ -486,9 +485,9 @@ mod tests {
         ));
     }
 
-    fn send_reply(body: &Bytes) -> BusMessage {
+    fn send_reply(body: &Bytes) -> Frozen<MESSAGE_ALIGN> {
         let prepare = PrepareHeader {
-            command: Command2::Prepare,
+            command: Command::Prepare,
             operation: Operation::SendMessages,
             client: 42,
             op: 1,
@@ -554,7 +553,7 @@ mod tests {
     /// mapped `IggyError`, not as the generic op-0 not-found.
     #[test]
     fn status_bearing_deny_reply_classifies_as_typed_rejection() {
-        let request = build_request_message(Operation::DeleteConsumerOffset2, 42, 7, 1, &[]);
+        let request = build_request_message(Operation::DeleteConsumerOffset, 42, 7, 1, &[]);
         let mut deny = build_empty_reply(request.header(), 42, 0, 9);
         let header = bytemuck::checked::try_from_bytes_mut::<ReplyHeader>(
             &mut deny.as_mut_slice()[..HEADER_SIZE],

@@ -19,7 +19,7 @@ use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::{Journal, Storage};
 use server_common::{
     iobuf::{Frozen, Owned},
-    send_messages2::{COMMAND_HEADER_SIZE, SendMessages2Ref, decode_prepare_slice_trusted},
+    send_messages::{self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice_trusted},
 };
 use std::io;
 use std::{
@@ -824,6 +824,23 @@ where
         }
     }
 
+    /// Highest `commit` any resident header stamped, in ONE pass.
+    ///
+    /// A lower bound on the group's commit point, which is what a rebuilt replica
+    /// can recover from a log alone: a prepare records the primary's commit point
+    /// at send time, so the true point may be one higher.
+    ///
+    /// Exists so callers do not walk `1..=head` through [`Self::header_by_op`],
+    /// which is a linear scan per op and so quadratic in the head.
+    pub fn max_commit_watermark(&self) -> u64 {
+        let headers = unsafe { &*self.headers.get() };
+        headers
+            .iter()
+            .map(|header| header.commit)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
     /// stopping at the first missing op. A replication gap must not be skipped:
     /// the caller advances `commit_min` strictly by one, so a hole would break
@@ -929,7 +946,7 @@ where
     }
 }
 
-impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMemStorage> {
+impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     type Header = PrepareHeader;
     type Entry = JournalBuffer;
     #[rustfmt::skip]
@@ -1023,7 +1040,7 @@ impl Journal<PartitionJournalMemStorage> for PartitionJournal<PartitionJournalMe
 }
 
 pub fn select_batch_slice(
-    batch: &SendMessages2Ref<'_>,
+    batch: &BatchRef<'_>,
     query: MessageLookup,
     already_matched: u32,
 ) -> Option<SelectedBatchSlice> {
@@ -1087,7 +1104,7 @@ pub fn select_batch_slice(
 
 /// Push the fragments for one selected batch, shared by the resident-journal
 /// walk and the disk-chunk walk. `source` holds a stamped
-/// `[256B SendMessages2Header][blob]` batch starting at byte `batch_base`
+/// `[256B BatchHeader][blob]` batch starting at byte `batch_base`
 /// (the disk walk passes the chunk cursor; the resident walk passes
 /// `size_of::<PrepareHeader>()`, the batch's offset past the prepare header).
 /// A full-body selection forwards the original batch bytes by reference; a
@@ -1099,7 +1116,7 @@ pub fn push_selected_batch_fragments(
     matched_messages: &mut u32,
     source: &Frozen<4096>,
     batch_base: usize,
-    batch: &SendMessages2Ref<'_>,
+    batch: &BatchRef<'_>,
     selection: SelectedBatchSlice,
 ) {
     let full_body_selected = selection.start == 0 && selection.end == batch.blob().len();
@@ -1122,7 +1139,9 @@ pub fn push_selected_batch_fragments(
                 .get(selection.start..selection.end)
                 .expect("selected batch slice must stay within blob bounds"),
         );
-        fragments.push(Fragment::whole(rewritten.into_frozen()));
+        fragments.push(Fragment::whole(send_messages::frozen_batch_header(
+            &rewritten,
+        )));
         fragments.push(Fragment::slice(
             source.clone(),
             batch_base + COMMAND_HEADER_SIZE + selection.start,
@@ -1132,6 +1151,68 @@ pub fn push_selected_batch_fragments(
 
     *last_matching_offset = Some(selection.last_matching_offset);
     *matched_messages += selection.matched_messages;
+}
+
+/// A fragment sliced from a storage buffer keeps the WHOLE allocation alive
+/// until the reply frame is written out, and a reply can sit in a
+/// per-connection mailbox for a while. Copy the matched bytes out when they
+/// cover less than this fraction of the source, so a sparse match (a
+/// `count=1` poll off a cold partition, a short poll into a large resident
+/// batch) cannot pin a ~1 MiB chunk or a whole prepare per queued reply; a
+/// dense match keeps the zero-copy path.
+///
+/// On the disk tier, the chunk allocations a poll reply keeps alive are
+/// bounded by `SPARSE_CHUNK_PIN_DIVISOR` times the record bytes it serves
+/// from disk, plus one page per compacted chunk. This is a ratio, not an
+/// absolute cap: a grown chunk can still retain tens of MiB, and it does not
+/// cover the reply's absolute size. The resident tier applies the same ratio
+/// per prepare entry but only copies up to [`RESIDENT_SPARSE_COPY_MAX_BYTES`];
+/// a sparse selection past that stays a slice and pins its prepare.
+const SPARSE_CHUNK_PIN_DIVISOR: usize = 4;
+
+/// Resident copies run inline on the shard pump (the disk walk is detached),
+/// and a poll selects at most two partial batches (its first and last), so
+/// this caps the pump's per-poll memcpy at about twice this many bytes.
+const RESIDENT_SPARSE_COPY_MAX_BYTES: usize = 64 * 1024;
+
+/// Rewrite the fragments pushed from index `pushed_from` on that slice
+/// `source` to slices of one compact copy when their combined length is a
+/// sparse fraction of `source` and at most `copy_max_bytes`. Fragments that
+/// own their bytes (rewritten batch headers) are left alone. See
+/// [`SPARSE_CHUNK_PIN_DIVISOR`].
+pub fn unpin_sparse_source(
+    fragments: &mut PollFragments<4096>,
+    pushed_from: usize,
+    source: &Frozen<4096>,
+    copy_max_bytes: usize,
+) {
+    let pushed = &mut fragments[pushed_from..];
+    let borrowed: usize = pushed
+        .iter()
+        .filter(|fragment| fragment.borrows_from(source))
+        .map(Fragment::len)
+        .sum();
+    if borrowed == 0
+        || borrowed >= source.len() / SPARSE_CHUNK_PIN_DIVISOR
+        || borrowed > copy_max_bytes
+    {
+        return;
+    }
+
+    let mut compact = Owned::<4096>::with_capacity(borrowed);
+    for fragment in pushed.iter().filter(|f| f.borrows_from(source)) {
+        compact.extend_from_slice(fragment.as_slice());
+    }
+    let compact = Frozen::from(compact);
+    let mut cursor = 0;
+    for fragment in pushed.iter_mut() {
+        if !fragment.borrows_from(source) {
+            continue;
+        }
+        let len = fragment.len();
+        *fragment = Fragment::slice(compact.clone(), cursor, cursor + len);
+        cursor += len;
+    }
 }
 
 /// Decode one resident `Frozen` entry and push its matching fragments. Shared by
@@ -1169,6 +1250,7 @@ fn try_push_resident_entry(
     };
     // The batch's 256B header sits right after the prepare header in a resident
     // entry (see `decode_prepare_slice`), so the batch base is `PREPARE_HEADER_SIZE`.
+    let pushed_from = fragments.len();
     push_selected_batch_fragments(
         fragments,
         last_matching_offset,
@@ -1177,6 +1259,16 @@ fn try_push_resident_entry(
         PREPARE_HEADER_SIZE,
         &batch,
         selection,
+    );
+    // `evict_prefix` drains the storage on the routine commit flush, so a
+    // queued reply that still slices this prepare becomes its sole owner.
+    // Accounted per entry here; the disk walk accounts per chunk, where many
+    // batches share one allocation.
+    unpin_sparse_source(
+        fragments,
+        pushed_from,
+        prepare,
+        RESIDENT_SPARSE_COPY_MAX_BYTES,
     );
 }
 
@@ -1228,17 +1320,18 @@ pub fn select_resident(
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use iggy_binary_protocol::{Command2, HEADER_SIZE};
+    use iggy_binary_protocol::{Command, HEADER_SIZE};
     use journal::Journal;
     use server_common::Message;
-    use server_common::send_messages2::{
-        IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned, decode_batch_slice,
+    use server_common::send_messages::{
+        BatchHeader, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+        decode_batch_slice,
     };
     use server_common::sharding::IggyNamespace;
 
     fn build_prepare(op: u64, size: usize) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size).transmute_header(|_, h: &mut PrepareHeader| {
-            h.command = Command2::Prepare;
+            h.command = Command::Prepare;
             h.op = op;
             h.size = u32::try_from(size).expect("size fits in u32");
         })
@@ -1308,6 +1401,20 @@ mod tests {
             .await
             .expect("a truncated op must be appendable again");
         assert_eq!(journal.last_op(), Some(4));
+    }
+
+    #[compio::test]
+    async fn repaired_window_shape_rejects_unbounded_sparse_window_before_allocation() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal
+            .append(build_prepare(7, HEADER_SIZE + 16).into_frozen())
+            .await
+            .expect("append");
+
+        let shape = journal.repaired_window_shape(0, u64::MAX);
+
+        assert!(!shape.complete);
+        assert!(!shape.holds_messages);
     }
 
     #[compio::test]
@@ -1468,10 +1575,10 @@ mod tests {
     /// producer). Timestamp polls filter on the broker time because that is
     /// the timestamp replies surface per message.
     fn build_timestamped_batch(base_timestamp: u64, origin_timestamp: u64) -> Vec<u8> {
-        let mut messages = IggyMessages2::with_capacity(3);
+        let mut messages = IggyMessages::with_capacity(3);
         for index in 0..3u64 {
-            messages.push(IggyMessage2 {
-                header: IggyMessage2Header {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
                     origin_timestamp: origin_timestamp + index,
                     payload_length: 8,
                     ..Default::default()
@@ -1480,15 +1587,59 @@ mod tests {
                 user_headers: None,
             });
         }
-        let mut owned = SendMessages2Owned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
+        let mut owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
             .expect("build send_messages batch");
         owned.header.base_timestamp = base_timestamp;
-        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
+        stamped_batch_record(owned)
+    }
 
+    /// Stamp `owned`'s checksum and lay it out as the `[256B batch header][blob]`
+    /// record a batch occupies in storage.
+    fn stamped_batch_record(mut owned: SendMessagesOwned) -> Vec<u8> {
+        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
         let mut record = vec![0u8; COMMAND_HEADER_SIZE + owned.blob.len()];
         owned.header.encode_into(&mut record[..COMMAND_HEADER_SIZE]);
         record[COMMAND_HEADER_SIZE..].copy_from_slice(&owned.blob);
         record
+    }
+
+    /// A resident `SendMessages` prepare entry holding one batch of
+    /// `message_count` records with distinct `payload_len`-byte payloads, in
+    /// the `[PrepareHeader][256B batch header][blob]` layout
+    /// `try_push_resident_entry` decodes.
+    fn build_resident_prepare(message_count: usize, payload_len: usize) -> Frozen<4096> {
+        let mut messages = IggyMessages::with_capacity(message_count);
+        for index in 0..message_count {
+            let fill = u8::try_from(index % usize::from(u8::MAX)).expect("bounded by u8::MAX");
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
+                    payload_length: u32::try_from(payload_len).expect("payload_len fits u32"),
+                    ..Default::default()
+                },
+                payload: Bytes::from(vec![fill; payload_len]),
+                user_headers: None,
+            });
+        }
+        let owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
+            .expect("build send_messages batch");
+        let record = stamped_batch_record(owned);
+
+        let mut prepare = build_prepare(1, PREPARE_HEADER_SIZE + record.len()).transmute_header(
+            |header: PrepareHeader, send_messages: &mut PrepareHeader| {
+                *send_messages = header;
+                send_messages.operation = Operation::SendMessages;
+            },
+        );
+        prepare.as_mut_slice()[PREPARE_HEADER_SIZE..].copy_from_slice(&record);
+        prepare.into_frozen()
+    }
+
+    fn offset_lookup(offset: u64, count: u32) -> MessageLookup {
+        MessageLookup::Offset {
+            offset,
+            count,
+            ceiling: u64::MAX,
+        }
     }
 
     #[test]
@@ -1527,6 +1678,127 @@ mod tests {
             )
             .is_none(),
             "poll past the broker timestamp must match nothing"
+        );
+    }
+
+    /// A short poll into a large resident batch ships a rewritten header plus
+    /// a body slice. Left as a slice of the prepare, that body would keep the
+    /// whole entry alive after `evict_prefix` drained it from the journal.
+    #[test]
+    fn resident_partial_selection_copies_out_of_a_large_prepare() {
+        let prepare = build_resident_prepare(1_000, 300);
+        let query = offset_lookup(500, 1);
+        let batch = decode_prepare_slice_trusted(prepare.as_slice()).expect("prepare decodes");
+        let selection = select_batch_slice(&batch, query, 0).expect("record 500 is selected");
+        let expected_body = &batch.blob()[selection.start..selection.end];
+        assert!(
+            expected_body.len() < prepare.len() / SPARSE_CHUNK_PIN_DIVISOR,
+            "fixture must select a sparse fraction of the prepare"
+        );
+
+        let (fragments, last_matching_offset) =
+            select_resident(std::slice::from_ref(&prepare), query).expect("one record matches");
+        assert_eq!(last_matching_offset, Some(500));
+        assert_eq!(fragments.len(), 2, "rewritten header plus body slice");
+        let (header, body) = (&fragments[0], &fragments[1]);
+        assert!(
+            !body.borrows_from(&prepare),
+            "sparse body must be copied out of the prepare"
+        );
+        assert_eq!(body.as_slice(), expected_body);
+        assert_eq!(header.len(), COMMAND_HEADER_SIZE);
+        assert!(
+            !header.borrows_from(&body.clone().into_frozen()),
+            "the owned header must stay out of the compact copy"
+        );
+        let rewritten = BatchHeader::decode(header.as_slice()).expect("rewritten header decodes");
+        assert_eq!(rewritten.message_count, 1);
+    }
+
+    #[test]
+    fn resident_whole_batch_selection_keeps_the_zero_copy_slice() {
+        let prepare = build_resident_prepare(1_000, 300);
+
+        let (fragments, last_matching_offset) =
+            select_resident(std::slice::from_ref(&prepare), offset_lookup(0, 1_000))
+                .expect("whole batch matches");
+        assert_eq!(last_matching_offset, Some(999));
+        assert_eq!(fragments.len(), 1, "a whole batch ships its original bytes");
+        assert!(
+            fragments[0].borrows_from(&prepare),
+            "dense selection keeps the zero-copy path"
+        );
+        assert_eq!(fragments[0].len(), prepare.len() - PREPARE_HEADER_SIZE);
+    }
+
+    /// The resident copy runs inline on the shard pump, so past the byte cap
+    /// a sparse selection stays a zero-copy slice even though it pins the
+    /// prepare.
+    #[test]
+    fn resident_sparse_copy_stops_at_the_byte_cap() {
+        let prepare = build_resident_prepare(2_000, 300);
+        let query = offset_lookup(0, 200);
+        let batch = decode_prepare_slice_trusted(prepare.as_slice()).expect("prepare decodes");
+        let selection = select_batch_slice(&batch, query, 0).expect("200 records are selected");
+        let selected = selection.end - selection.start;
+        assert!(
+            selected > RESIDENT_SPARSE_COPY_MAX_BYTES
+                && selected < prepare.len() / SPARSE_CHUNK_PIN_DIVISOR,
+            "fixture must select a sparse fraction that is over the copy cap"
+        );
+
+        let (fragments, _) =
+            select_resident(std::slice::from_ref(&prepare), query).expect("records match");
+        assert_eq!(fragments.len(), 2, "rewritten header plus body slice");
+        assert!(
+            fragments[1].borrows_from(&prepare),
+            "over the cap the body must stay a slice of the prepare"
+        );
+    }
+
+    /// A sparse match must not pin the whole disk chunk: the matched bytes
+    /// are copied out byte-for-byte and the fragments stop borrowing the
+    /// chunk allocation. A dense match keeps the zero-copy slices, and
+    /// fragments that already own their bytes (rewritten batch headers) are
+    /// never touched.
+    #[test]
+    fn unpin_sparse_source_bounds_chunk_retention() {
+        let chunk_len = 1 << 20;
+        let mut backing = Owned::<4096>::zeroed(chunk_len);
+        for (position, byte) in backing.as_mut_slice().iter_mut().enumerate() {
+            *byte = u8::try_from(position % 251).unwrap();
+        }
+        let chunk = Frozen::from(backing);
+
+        let mut fragments = PollFragments::<4096>::new();
+        fragments.push(Fragment::whole(Owned::<4096>::zeroed(256).into()));
+        fragments.push(Fragment::slice(chunk.clone(), 512, 512 + 600));
+        fragments.push(Fragment::slice(chunk.clone(), 4096, 4096 + 300));
+        let first = fragments[1].as_slice().to_vec();
+        let second = fragments[2].as_slice().to_vec();
+        unpin_sparse_source(&mut fragments, 0, &chunk, usize::MAX);
+        assert!(
+            !fragments[1].borrows_from(&chunk) && !fragments[2].borrows_from(&chunk),
+            "sparse slices must be copied out of the chunk"
+        );
+        assert_eq!(fragments[1].as_slice(), &first[..]);
+        assert_eq!(fragments[2].as_slice(), &second[..]);
+        assert!(
+            fragments[1].borrows_from(&fragments[2].clone().into_frozen()),
+            "copies pack into one compact allocation"
+        );
+        assert_eq!(fragments[0].len(), 256);
+
+        let mut fragments = PollFragments::<4096>::new();
+        fragments.push(Fragment::slice(
+            chunk.clone(),
+            0,
+            chunk_len / SPARSE_CHUNK_PIN_DIVISOR,
+        ));
+        unpin_sparse_source(&mut fragments, 0, &chunk, usize::MAX);
+        assert!(
+            fragments[0].borrows_from(&chunk),
+            "dense slice keeps the zero-copy path"
         );
     }
 }

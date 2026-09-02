@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { Client, Partitioning } from 'apache-iggy';
 import { log, sleep } from '../utils';
@@ -118,7 +117,6 @@ async function produceData(client: Client, streamName: string, topicName: string
         name: topicName,
         partitionCount: 1,
         compressionAlgorithm: 1,
-        replicationFactor: 1,
       });
     }
   } catch (error) {
@@ -128,7 +126,6 @@ async function produceData(client: Client, streamName: string, topicName: string
       name: topicName,
       partitionCount: 1,
       compressionAlgorithm: 1,
-      replicationFactor: 1,
     });
   }
 

@@ -26,7 +26,7 @@
 //! - `classify_reply`: decode reply into a declared outcome
 //! - `predicted_effect`: predicted shadow mutation on commit
 //!
-//! Dispatch via the [`op_dispatch!`] macro; missing variants are a compile
+//! Dispatch via the `op_dispatch!` macro; missing variants are a compile
 //! error.
 
 pub mod change_password;
@@ -38,7 +38,6 @@ pub mod create_topic;
 pub mod create_user;
 pub mod delete_consumer_group;
 pub mod delete_consumer_offset;
-pub mod delete_consumer_offset_2;
 pub mod delete_partitions;
 pub mod delete_personal_access_token;
 pub mod delete_segments;
@@ -49,14 +48,14 @@ pub mod purge_stream;
 pub mod purge_topic;
 pub mod send_messages;
 pub mod store_consumer_offset;
-pub mod store_consumer_offset_2;
 pub mod update_permissions;
 pub mod update_stream;
 pub mod update_topic;
 pub mod update_user;
 
-use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use iggy_binary_protocol::{KIND_CONSUMER, KIND_CONSUMER_GROUP, RoutedRequestHeader};
+use rand::RngExt;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -64,6 +63,23 @@ use crate::workload::actions::Action;
 use crate::workload::effect::Effect;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
+
+/// Draw a consumer kind for the four consumer-offset ops, as the WIRE
+/// discriminant rather than a bare boolean.
+///
+/// `WireConsumer::decode` accepts only [`KIND_CONSUMER`] (1) and
+/// [`KIND_CONSUMER_GROUP`] (2). Anything else maps to
+/// `IggyError::InvalidCommand`, which the partition plane answers by logging a
+/// WARN and dropping the frame with NO reply, so one malformed draw wedges that
+/// client's in-flight slot for the rest of the run. One bool draw either way, so
+/// the PRNG trace shape is unchanged.
+pub(crate) fn sample_consumer_kind(prng: &mut Xoshiro256PlusPlus) -> u8 {
+    if prng.random::<bool>() {
+        KIND_CONSUMER_GROUP
+    } else {
+        KIND_CONSUMER
+    }
+}
 
 /// Generates per-op enums (`InFlightInput`, `InFlightOutcome`) plus four
 /// dispatch fns over a fixed `(Action, module)` table. Missing variants
@@ -102,7 +118,7 @@ macro_rules! op_dispatch {
         pub fn sample(
             action: Action,
             shadow: &mut Shadow,
-            prng: &mut Xoshiro256Plus,
+            prng: &mut Xoshiro256PlusPlus,
             options: &WorkloadOptions,
             outcome_id: usize,
         ) -> Option<(InFlightInput, InFlightOutcome)> {
@@ -172,7 +188,7 @@ op_dispatch! {
     // First three positions lock the hash baseline (do not reorder).
     CreateStream              => create_stream,
     SendMessages              => send_messages,
-    StoreConsumerOffset2      => store_consumer_offset_2,
+    StoreConsumerOffset       => store_consumer_offset,
     // Append-only; mirrors actions::Action declaration order.
     DeleteStream              => delete_stream,
     UpdateStream              => update_stream,
@@ -193,7 +209,5 @@ op_dispatch! {
     UpdatePermissions         => update_permissions,
     CreatePersonalAccessToken => create_personal_access_token,
     DeletePersonalAccessToken => delete_personal_access_token,
-    StoreConsumerOffset       => store_consumer_offset,
     DeleteConsumerOffset      => delete_consumer_offset,
-    DeleteConsumerOffset2     => delete_consumer_offset_2,
 }

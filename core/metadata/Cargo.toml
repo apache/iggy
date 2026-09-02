@@ -48,10 +48,10 @@ journal = { workspace = true }
 left-right = { workspace = true }
 message_bus = { workspace = true }
 paste = { workspace = true }
+rmp = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 server_common = { workspace = true }
-slab = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -62,5 +62,10 @@ tempfile = { workspace = true }
 
 [lints.clippy]
 enum_glob_use = "deny"
-pedantic = "deny"
+pedantic = { level = "deny", priority = -1 }
 nursery = "warn"
+# Sync impls of async traits are deliberate (non-blocking bus, in-memory storage, test doubles).
+unused_async_trait_impl = "allow"
+
+[lints.rust]
+warnings = "deny"

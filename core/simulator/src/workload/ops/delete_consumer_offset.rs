@@ -15,16 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `DeleteConsumerOffset` op. Live namespace via shadow.
+//! `DeleteConsumerOffset` op. Namespace-routed with `AckLevel`.
 
-use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
 use rand::RngExt;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
 use crate::client::SimClient;
 use crate::workload::effect::Effect;
+use crate::workload::ops::sample_consumer_kind;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
@@ -33,6 +34,7 @@ pub struct Input {
     pub ns: IggyNamespace,
     pub consumer_kind: u8,
     pub consumer_id: u32,
+    pub ack: AckLevel,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -45,18 +47,25 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Success];
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
         Outcome::Success => {
             let ns = shadow.pick_namespace(prng)?;
-            let consumer_kind: u8 = u8::from(prng.random::<bool>());
+            let consumer_kind = sample_consumer_kind(prng);
             let consumer_id: u32 = prng.random_range(0..options.consumer_pool_size.max(1));
+            let f: f32 = prng.random();
+            let ack = if f < options.ack_quorum_ratio {
+                AckLevel::Quorum
+            } else {
+                AckLevel::NoAck
+            };
             Some(Input {
                 ns,
                 consumer_kind,
                 consumer_id,
+                ack,
             })
         }
     }
@@ -64,7 +73,7 @@ pub fn sample(
 
 #[must_use]
 pub fn build_message(client: &SimClient, input: &Input) -> Message<RoutedRequestHeader> {
-    client.delete_consumer_offset(input.ns, input.consumer_kind, input.consumer_id)
+    client.delete_consumer_offset(input.ns, input.consumer_kind, input.consumer_id, input.ack)
 }
 
 #[must_use]

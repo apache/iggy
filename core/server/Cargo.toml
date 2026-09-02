@@ -17,7 +17,7 @@
 
 [package]
 name = "server"
-version = "0.9.0-edge.3"
+version = "0.9.0-edge.6"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -45,12 +45,10 @@ ignored = [
     "figlet-rs",
     "hash32",
     "human-repr",
-    "hwlocality",
     "jsonwebtoken",
     "left-right",
     "mimalloc",
     "mime_guess",
-    "nix",
     "opentelemetry",
     "opentelemetry-appender-tracing",
     "opentelemetry-otlp",
@@ -66,7 +64,6 @@ ignored = [
     "rustls-pemfile",
     "send_wrapper",
     "serde",
-    "slab",
     "socket2",
     "strum",
     "sysinfo",
@@ -104,6 +101,7 @@ clap = { workspace = true }
 compio = { workspace = true }
 configs = { workspace = true }
 consensus = { workspace = true }
+cpu_allocation = { workspace = true }
 crossfire = { workspace = true }
 ctrlc = { workspace = true }
 cyper = { workspace = true }
@@ -152,8 +150,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 server_common = { workspace = true }
 shard = { workspace = true }
-shard_allocator = { workspace = true }
-slab = { workspace = true }
 socket2 = { workspace = true }
 strum = { workspace = true }
 sysinfo = { workspace = true }
@@ -181,6 +177,8 @@ vergen-git2 = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 bytemuck = { workspace = true }
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
 # Reconciler unit tests assert on `ShardMetrics` snapshots and
 # `IggyShard::parked_frame_count`, gated to test/simulator so they cannot grow
 # production callers. `shard`'s own `cfg(test)` is false when compiled as our
@@ -188,9 +186,15 @@ bytemuck = { workspace = true }
 # keeps a dev-dependency's features out of non-test targets, so a production
 # build still links `shard` without `simulator`.
 shard = { workspace = true, features = ["simulator"] }
+syn = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints.clippy]
 enum_glob_use = "deny"
-pedantic = "deny"
+pedantic = { level = "deny", priority = -1 }
 nursery = "warn"
+# Sync impls of async traits are deliberate (non-blocking bus, in-memory storage, test doubles).
+unused_async_trait_impl = "allow"
+
+[lints.rust]
+warnings = "deny"

@@ -234,8 +234,12 @@ async fn run_pump(ws: &mut WebSocketStream<TcpStream>, ctx: ActorContext) {
                 }
                 let drained = batch.len();
                 #[allow(clippy::iter_with_drain)]
+                // One WS frame per message: tungstenite takes a single payload
+                // buffer, so a multi-fragment frame is joined here (the only
+                // record copy left on this plane; single-fragment frames move).
                 for msg in batch.drain(..) {
-                    if let Err(e) = ws.send(WsMessage::Binary(Bytes::from_owner(msg))).await {
+                    let payload = Bytes::from_owner(msg.into_contiguous());
+                    if let Err(e) = ws.send(WsMessage::Binary(payload)).await {
                         warn!(%label, %peer, error = ?e, batch_len = drained, "ws writer: send failed");
                         return;
                     }
@@ -316,13 +320,13 @@ mod tests {
     use crate::lifecycle::Shutdown;
     use async_channel::{Receiver, Sender, bounded};
     use compio::net::TcpListener;
-    use iggy_binary_protocol::{Command2, GenericHeader, HEADER_SIZE};
+    use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
     use server_common::Message;
     use server_common::iobuf::Frozen;
     use std::time::Duration;
 
     #[allow(clippy::cast_possible_truncation)]
-    fn header_only(command: Command2) -> Frozen<MESSAGE_ALIGN> {
+    fn header_only(command: Command) -> Frozen<MESSAGE_ALIGN> {
         Message::<GenericHeader>::new(HEADER_SIZE)
             .transmute_header(|_, h: &mut GenericHeader| {
                 h.command = command;
@@ -332,7 +336,7 @@ mod tests {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn padded(command: Command2, total_size: usize) -> Frozen<MESSAGE_ALIGN> {
+    fn padded(command: Command, total_size: usize) -> Frozen<MESSAGE_ALIGN> {
         Message::<GenericHeader>::new(total_size)
             .transmute_header(|_, h: &mut GenericHeader| {
                 h.command = command;
@@ -364,7 +368,7 @@ mod tests {
     fn drive(
         conn: WsTransportConn,
     ) -> (
-        Sender<Frozen<MESSAGE_ALIGN>>,
+        Sender<BusMessage>,
         Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
@@ -377,12 +381,12 @@ mod tests {
         conn: WsTransportConn,
         max_message_size: usize,
     ) -> (
-        Sender<Frozen<MESSAGE_ALIGN>>,
+        Sender<BusMessage>,
         Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
     ) {
-        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (out_tx, out_rx) = bounded::<BusMessage>(16);
         let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
         let (shutdown, token) = Shutdown::new();
         let ctx = ActorContext {
@@ -432,23 +436,23 @@ mod tests {
         let (server_out, server_in, server_shutdown, server_handle) = drive(server_conn);
 
         // Client raw-sends a Request; the server pump reads it.
-        raw_send(&mut client_ws, header_only(Command2::Request)).await;
+        raw_send(&mut client_ws, header_only(Command::Request)).await;
         let received = compio::time::timeout(Duration::from_secs(5), server_in.recv())
             .await
             .expect("server recv within 5 s")
             .expect("server frame");
-        assert_eq!(received.header().command, Command2::Request);
+        assert_eq!(received.header().command, Command::Request);
 
         // Server replies via its outbound mailbox; the serial pump writes
         // the reply on the same bidi the request arrived on, client reads.
         server_out
-            .send(header_only(Command2::Reply))
+            .send(header_only(Command::Reply).into())
             .await
             .expect("server send");
         let reply = compio::time::timeout(Duration::from_secs(5), raw_recv(&mut client_ws))
             .await
             .expect("client recv within 5 s");
-        assert_eq!(reply.header().command, Command2::Reply);
+        assert_eq!(reply.header().command, Command::Reply);
 
         server_shutdown.trigger();
         let _ = compio::time::timeout(Duration::from_secs(5), server_handle).await;
@@ -464,12 +468,12 @@ mod tests {
         let server_conn = WsTransportConn::new_server(server_ws);
         let (_server_out, server_in, server_shutdown, server_handle) = drive(server_conn);
 
-        raw_send(&mut client_ws, padded(Command2::Request, total)).await;
+        raw_send(&mut client_ws, padded(Command::Request, total)).await;
         let received = compio::time::timeout(Duration::from_secs(15), server_in.recv())
             .await
             .expect("server recv within 15 s")
             .expect("server frame");
-        assert_eq!(received.header().command, Command2::Request);
+        assert_eq!(received.header().command, Command::Request);
         assert_eq!(received.header().size as usize, total);
 
         server_shutdown.trigger();
@@ -487,7 +491,7 @@ mod tests {
         let (_server_out, server_in, _server_shutdown, server_handle) =
             drive_with_cap(server_conn, CUSTOM_CAP);
 
-        raw_send(&mut client_ws, padded(Command2::Request, OVER_CAP)).await;
+        raw_send(&mut client_ws, padded(Command::Request, OVER_CAP)).await;
 
         // Decode rejection tears the server pump down; join must complete
         // within the grace window and no frame must surface to in_rx.

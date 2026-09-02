@@ -267,7 +267,6 @@ async fn create_producers(
                 .partitioning(Partitioning::balanced())
                 .create_topic_if_not_exists(
                     partitions_count,
-                    None,
                     IggyExpiry::ServerDefault,
                     MaxTopicSize::ServerDefault,
                 )

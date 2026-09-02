@@ -30,23 +30,22 @@ use crate::poll_plan::{
 };
 use crate::segment::Segment;
 use crate::state_transfer::{PartitionTransferSession, PendingTransferRearm};
-use crate::types::{RepairConclusion, RepairSession};
+use crate::types::{FatalCommit, RepairConclusion, RepairSession};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
     PollingConsumer,
 };
 use consensus::{
-    CommitLogEvent, Consensus, PartitionDiagEvent, Pipeline, PipelineEntry, PlaneKind, Project,
+    CommitLogEvent, Consensus, PartitionDiagEvent, PipelineEntry, PlaneKind, Project,
     ReplicaLogContext, RequestLogEvent, Sequencer, SimEventKind, VsrConsensus, ack_preflight,
     ack_quorum_reached, build_deny_reply_from_request, build_reply_from_request,
     build_reply_message, drain_committable_prefix, emit_namespace_progress_event,
-    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit,
+    emit_partition_diag, emit_sim_event, fence_old_prepare_by_commit, repaired_frontier_update,
     replicate_frozen_to_next_in_chain, replicate_preflight, restamp_prepare_view,
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffset2Request, DeleteConsumerOffsetRequest, StoreConsumerOffset2Request,
-    StoreConsumerOffsetRequest,
+    DeleteConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::responses::messages::{
     SendMessagesConfirmationResponse, SendMessagesResponse,
@@ -58,6 +57,7 @@ use iggy_binary_protocol::{PrepareOkHeader, RoutedRequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
+    TopicRuntimeOptions,
 };
 use journal::Journal as _;
 use journal::local_gate::LocalGate;
@@ -69,8 +69,8 @@ use message_bus::{IggyMessageBus, MessageBus, is_auto_commit_client};
 use server_common::{
     MESSAGE_ALIGN, Message, SegmentStorage,
     iobuf::{Frozen, Owned},
-    send_messages2::{
-        ChecksumMode, SendMessages2Header, convert_request_message, decode_prepare_slice,
+    send_messages::{
+        BatchHeader, ChecksumMode, convert_request_message, decode_prepare_slice,
         decode_prepare_slice_trusted, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
@@ -83,20 +83,20 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 // This struct aliases in terms of the code contained the `LocalPartition from `core/server/src/streaming/partitions/local_partition.rs`.
 //
 // Note: there is no per-client write dedup at the partition plane.
 // `SendMessages` retries are at-least-once and may commit multiple times.
-// Consumers handle duplicate messages via `server_common::MessageDeduplicator`
-// (message-id based) if they care.
+// Duplicate suppression is a consensus-layer concern: the VSR client table
+// dedups by request id (at-most-once), so the data plane needs no message-id set.
 pub struct IggyPartition<B = IggyMessageBus, SB = PingPongSuperblock>
 where
     B: MessageBus,
 {
     consensus: VsrConsensus<B>,
-    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
+    pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>,
     /// Highest durably persisted offset.
     pub offset: Arc<AtomicU64>,
     /// Highest offset assigned to prepares that may still only live in the in-memory journal.
@@ -123,6 +123,11 @@ where
     /// `None` only for in-memory (simulated) partitions.
     pub(crate) partition_dir: Option<String>,
     pub(crate) consumer_offset_enforce_fsync: bool,
+    /// This topic's runtime knobs, resolved at topic admission and carried
+    /// here by the builder. Every `None` field falls back to the shard-wide
+    /// `PartitionsConfig` value (simulator and tests build partitions with
+    /// no resolved options at all).
+    pub(crate) runtime_options: TopicRuntimeOptions,
     /// In-flight journal repair:
     /// set when the recovery handshake finds this replica behind the group's
     /// commit frontier, cleared when `RepairDone` completes the walk.
@@ -142,6 +147,11 @@ where
     /// also gates repaired-batch persistence -- overstating THAT field would
     /// silently drop the `(commit_op, commit_max]` replay window.
     pub installed_frontier: Option<u64>,
+    /// Set once a local commit fails for an op the cluster already committed.
+    /// Fences the partition: every path that would advance or serve it turns
+    /// into a no-op, so the shard's tick can observe the fault and shut the
+    /// server down without the partition moving again in the meantime.
+    fatal: Option<FatalCommit>,
     pub(crate) pending_consumer_offset_commits: HashMap<u64, PendingConsumerOffsetCommit>,
     /// Committed-only mirror of each consumer's persisted offset file: the
     /// last value this replica durably wrote per (kind, consumer id). Fed
@@ -319,7 +329,7 @@ pub enum PurgeError {
     /// so the reconciler's `committed > applied` gate re-issues this purge on
     /// its next pass. Retry, do not fence.
     ///
-    /// Sets [`Self::purge_deferred`], which withholds `PrepareOk` for this
+    /// Sets `purge_deferred`, which withholds `PrepareOk` for this
     /// group until the purge lands, so the replica goes quorum-invisible THERE
     /// while every other partition on the node keeps serving. Without that
     /// fence the counter would still name the pre-purge offset space and every
@@ -342,7 +352,7 @@ pub enum PurgeError {
     /// reconciler re-issues the purge. Retry, do not fence: the partition is
     /// serviceable and re-purging an already-empty chain is cheap.
     ///
-    /// Sets [`Self::purge_deferred`] for the same reason as
+    /// Sets `purge_deferred` for the same reason as
     /// [`Self::FrontierNotRecorded`]: an op acked between this failure and the
     /// retry would be wiped by that retry while every peer that recorded the
     /// generation keeps it.
@@ -465,9 +475,11 @@ where
             consumer_group_offsets_path: None,
             partition_dir: None,
             consumer_offset_enforce_fsync: false,
+            runtime_options: TopicRuntimeOptions::default(),
             repair: None,
             recovered_durable_offset: None,
             installed_frontier: None,
+            fatal: None,
             pending_consumer_offset_commits: HashMap::new(),
             persisted_offsets: RefCell::new(HashMap::new()),
             observed_view,
@@ -773,6 +785,65 @@ where
         self.should_increment_offset = true;
     }
 
+    /// Whether this partition ever stamped an offset, i.e. whether its offset
+    /// counters describe a real offset space rather than an untouched zero. The
+    /// one bit separating a partition holding one message at offset 0 from one
+    /// that never took a write: both report `(0, 0)`.
+    #[cfg(any(test, feature = "simulator"))]
+    pub const fn offset_space_used(&self) -> bool {
+        self.should_increment_offset
+    }
+
+    /// Adopt a log carried over from a previous incarnation of this partition,
+    /// standing in for what segment recovery reads off disk at boot.
+    ///
+    /// A real server loses nothing across the rebuild: its messages are in segment
+    /// files and boot recovers the offset counter from them. The simulator's
+    /// partitions are in-memory, so without this the rebuilt partition comes back
+    /// empty and its `commit_offset` regresses to zero, which reads as a consensus
+    /// regression rather than the harness having thrown the data away.
+    ///
+    /// `durable_offset` and `write_offset` are what the caller recovered, as
+    /// `segment_recovery` derives them from segments. Applied as a MAX against
+    /// whatever the superblock frontier already proved, for the same reason
+    /// [`Self::restore_offset_frontier`] maxes: a recovered value behind the
+    /// frontier must not lower it.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn adopt_retained_log(&mut self, state: crate::RetainedPartitionState) {
+        let crate::RetainedPartitionState {
+            log,
+            durable_offset,
+            write_offset,
+            offset_space_used,
+        } = state;
+        self.log = log;
+        // Empty carry-over: the previous incarnation never took a write, so there
+        // is no offset space to restore and claiming one would make the next
+        // prepare mint from a base no peer agrees on.
+        //
+        // Keyed on the RETIRED incarnation's flag, never on `(0, 0)` or on this
+        // partition's own `should_increment_offset`. One message at offset 0 reports
+        // the same two zeroes as an empty partition, and this instance is freshly
+        // built so its own flag is always false. The arithmetic test would therefore
+        // adopt the log, skip the counters, and let the next write stamp
+        // `base_offset = 0` where peers stamp 1, with `batch_checksum` over it: two
+        // logs, different bytes at the same op, silently.
+        if !offset_space_used {
+            return;
+        }
+        let durable = durable_offset.max(self.offset.load(Ordering::Acquire));
+        let dirty = write_offset
+            .max(durable)
+            .max(self.dirty_offset.load(Ordering::Relaxed));
+        self.offset.store(durable, Ordering::Release);
+        self.dirty_offset.store(dirty, Ordering::Relaxed);
+        self.should_increment_offset = true;
+        // Everything carried over is already persisted as far as this replica is
+        // concerned, so the flush and commit paths must not re-persist or re-count
+        // it, the same contract boot gives a partition recovered from segments.
+        self.recovered_durable_offset = Some(durable);
+    }
+
     /// Copy this incarnation's offset counter into the shared
     /// [`PartitionStats`], making it the value readers (offset validation,
     /// `get_topic`, `get_stats`) see.
@@ -996,6 +1067,59 @@ where
         self.transfer_attempts
     }
 
+    /// Install this topic's runtime knobs, as resolved at topic admission.
+    /// Unset fields keep the shard-wide configured values.
+    pub const fn set_runtime_options(&mut self, runtime_options: TopicRuntimeOptions) {
+        self.runtime_options = runtime_options;
+    }
+
+    #[must_use]
+    pub const fn runtime_options(&self) -> TopicRuntimeOptions {
+        self.runtime_options
+    }
+
+    /// Segment size this partition rolls at: the per-topic value when the
+    /// topic was created with one, else the shard-wide configured size.
+    #[must_use]
+    pub fn effective_segment_size(&self, config: &PartitionsConfig) -> IggyByteSize {
+        self.runtime_options
+            .segment_size
+            .unwrap_or(config.segment_size)
+    }
+
+    /// Whether this partition's writes fsync.
+    #[must_use]
+    pub fn effective_enforce_fsync(&self, config: &PartitionsConfig) -> bool {
+        self.runtime_options
+            .enforce_fsync
+            .unwrap_or(config.enforce_fsync)
+    }
+
+    /// Message-count threshold that flushes this partition's journal.
+    #[must_use]
+    pub fn effective_messages_required_to_save(&self, config: &PartitionsConfig) -> u32 {
+        self.runtime_options
+            .messages_required_to_save
+            .unwrap_or(config.messages_required_to_save)
+    }
+
+    /// Whether this partition's segments reserve their bytes on open.
+    #[must_use]
+    pub fn effective_preallocate_segments(&self, config: &PartitionsConfig) -> bool {
+        self.runtime_options
+            .preallocate_segments
+            .unwrap_or(config.preallocate_segments)
+    }
+
+    /// Byte threshold that flushes this partition's journal.
+    #[must_use]
+    pub fn effective_size_of_messages_required_to_save(&self, config: &PartitionsConfig) -> u64 {
+        self.runtime_options
+            .size_of_messages_required_to_save
+            .unwrap_or(config.size_of_messages_required_to_save)
+            .as_bytes_u64()
+    }
+
     pub fn configure_consumer_offset_storage(
         &mut self,
         consumer_offsets_path: String,
@@ -1208,7 +1332,7 @@ where
             // primary is real divergence (log corruption / out-of-order apply)
             // and must surface rather than silently mask a split state. A
             // FOLLOWER may legitimately miss the offset: `AckLevel::NoAck`
-            // (v2) stores apply on the primary only and are never replicated,
+            // stores apply on the primary only and are never replicated,
             // so a later quorum delete finds nothing on the backups -- erroring
             // there would fail the committed apply, panic the replica as
             // divergent, and crash-loop on every journal replay. The
@@ -1525,20 +1649,22 @@ where
         let (start_segment, start_position) = self.disk_poll_start(&query);
         // Cap resident sealed read handles: touch this poll's start segment so
         // the LRU keeps the hot set and drops the least-recently-used fd +
-        // index (a no-op for the active segment, whose handle never caches).
+        // index (a no-op for the active segment, whose slot is bounded by
+        // rotation instead).
         self.log.touch_sealed_read_state(start_segment);
         // Snapshot only the segments the disk walk visits (`start_segment..`),
-        // so `start_position` applies to the first snapshotted segment. A sealed
-        // segment carries its shared read-state handle (fd + sparse index) so
-        // the off-borrow read reuses (or fills) it; the active segment opens
-        // fresh and resolves from its resident index.
+        // so `start_position` applies to the first snapshotted segment. Every
+        // segment carries its shared read-state handle so the off-borrow read
+        // reuses (or fills) the cached fd; only a sealed one also resolves its
+        // start byte from the shared sparse index.
         let segments = self.log.segments()[start_segment..]
             .iter()
             .zip(self.log.sealed_read_state()[start_segment..].iter())
             .map(|(segment, read_state)| DiskSegment {
                 start_offset: segment.start_offset,
                 persisted: segment.size.as_bytes_u64(),
-                read_state: segment.sealed.then(|| Rc::clone(read_state)),
+                read_state: Rc::clone(read_state),
+                sealed: segment.sealed,
             })
             .collect();
         let disk = DiskReadPlan {
@@ -1713,6 +1839,28 @@ where
         IggyNamespace::from_raw(self.consensus.group())
     }
 
+    /// The commit fault that fenced this partition, if one has.
+    #[must_use]
+    pub const fn fatal(&self) -> Option<&FatalCommit> {
+        self.fatal.as_ref()
+    }
+
+    /// Fence this partition after the shutdown flush failed to persist its
+    /// committed journal prefix: that data is cluster-committed and now lives
+    /// only in this process's memory, so the shard must not report a clean
+    /// exit over it. A fault the commit path already recorded is kept, since
+    /// it names the op that first diverged; `commit_min` here only bounds
+    /// where the unpersisted prefix ends.
+    pub fn fence_flush_failure(&mut self) {
+        if self.fatal.is_none() {
+            self.fatal = Some(FatalCommit {
+                namespace_raw: self.namespace().inner(),
+                op: self.consensus.commit_min(),
+                operation: Operation::SendMessages,
+            });
+        }
+    }
+
     fn partition_dir(&self) -> Option<String> {
         if self.partition_dir.is_some() {
             return self.partition_dir.clone();
@@ -1834,9 +1982,9 @@ where
                 // Skip the batch-checksum pass: on the partition ingest path
                 // nothing reads it before `stamp_prepare_for_persistence`
                 // recomputes it over the stamped header. An already-canonical
-                // batch (native v2, or the plane's pre-encrypt convert output)
-                // returns early above, so Skip only affects the legacy
-                // transcode, whose output goes straight to project/stamp.
+                // batch (the plane's pre-encrypt convert output) returns early
+                // inside the convert, so Skip only affects the wire-form
+                // admission, whose output goes straight to project/stamp.
                 match convert_request_message(namespace, message, ChecksumMode::Skip) {
                     Ok(message) => message,
                     Err(error) => {
@@ -1856,12 +2004,33 @@ where
                 message
             };
 
+            // State-dependent admission belongs to the primary. A backup can
+            // lag the committed offset table or message frontier and would
+            // otherwise turn a routing artifact into a terminal 404 or 400.
+            // Reject it first with the only response that proves the request
+            // was never admitted, so the caller may safely retry elsewhere.
+            if consensus.is_follower() || !consensus.is_normal() || consensus.is_transferring() {
+                emit_partition_diag(
+                    tracing::Level::WARN,
+                    &PartitionDiagEvent::new(
+                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
+                        "rejecting client request on non-primary partition replica",
+                    )
+                    .with_operation(message.header().operation),
+                );
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "non-primary transient reply send failed",
+                )
+                .await;
+                return;
+            }
+
             // Parse once for both the delete-existence check and AckLevel dispatch.
             let consumer_offset = match message.header().operation {
-                Operation::StoreConsumerOffset
-                | Operation::StoreConsumerOffset2
-                | Operation::DeleteConsumerOffset
-                | Operation::DeleteConsumerOffset2 => {
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                     match Self::parse_consumer_offset_request(message.header().operation, &message)
                     {
                         Ok(parsed) => Some(parsed),
@@ -1885,10 +2054,8 @@ where
                 _ => None,
             };
 
-            if matches!(
-                message.header().operation,
-                Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2
-            ) && let Some((kind, consumer_id, _, _)) = consumer_offset
+            if matches!(message.header().operation, Operation::DeleteConsumerOffset)
+                && let Some((kind, consumer_id, _, _)) = consumer_offset
                 && let Err(error) = self.ensure_consumer_offset_exists(kind, consumer_id)
             {
                 emit_partition_diag(
@@ -1924,10 +2091,8 @@ where
             // `InvalidOffset` rides `ReplyHeader.status` (op=0, empty body): the
             // status-only `classify_partition_reply` would misread a result-body
             // code on this committed-shaped frame (op=commit_max) as success.
-            if matches!(
-                message.header().operation,
-                Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2
-            ) && let Some((_, _, Some(requested_offset), _)) = consumer_offset
+            if matches!(message.header().operation, Operation::StoreConsumerOffset)
+                && let Some((_, _, Some(requested_offset), _)) = consumer_offset
             {
                 let current_offset = self.stats.current_offset();
                 let partition_empty =
@@ -1953,37 +2118,11 @@ where
                 }
             }
 
-            // A client op landing on a non-primary (or mid-view-change)
-            // replica is a routing artifact -- e.g. the roster still points
-            // here while this group's primaryship moved after a restart.
-            // Answer the typed transient instead of asserting: the SDK
-            // replays and its leader recheck re-routes, whereas a panic
-            // kills the shard and a silent drop wedges the client until its
-            // read timeout.
-            if consensus.is_follower() || !consensus.is_normal() || consensus.is_transferring() {
-                emit_partition_diag(
-                    tracing::Level::WARN,
-                    &PartitionDiagEvent::new(
-                        ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                        "rejecting client request on non-primary partition replica",
-                    )
-                    .with_operation(message.header().operation),
-                );
-                Self::send_partition_deny_or_log(
-                    consensus,
-                    message.header(),
-                    IggyError::TransientNotAccepted.as_code(),
-                    "non-primary transient reply send failed",
-                )
-                .await;
-                return;
-            }
-
-            // NoAck v2 -> fast path. Quorum + v1 -> VSR pipeline.
+            // NoAck -> fast path. Quorum -> VSR pipeline.
             if let Some((kind, consumer_id, offset, AckLevel::NoAck)) = consumer_offset
                 && matches!(
                     message.header().operation,
-                    Operation::StoreConsumerOffset2 | Operation::DeleteConsumerOffset2,
+                    Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset,
                 )
             {
                 Disposition::NoAck {
@@ -1996,11 +2135,9 @@ where
                 // Two-queue: prepare slot -> project+replicate; prepare full +
                 // request room -> buffer; both full -> drop+warn (client retries
                 // via read-timeout).
-                if consensus.pipeline().borrow().is_full() {
-                    let push_result = consensus
-                        .pipeline()
-                        .borrow_mut()
-                        .push_request(consensus::RequestEntry::new(message));
+                if consensus.pipeline_is_full() {
+                    let push_result =
+                        consensus.push_queued_request(consensus::RequestEntry::new(message));
                     if push_result.is_err() {
                         emit_partition_diag(
                             tracing::Level::WARN,
@@ -2045,7 +2182,7 @@ where
     /// against view-change-reset flipping status across `on_replicate` await.
     ///
     /// View-change safety: `reset_view_change_state` calls
-    /// [`crate::Pipeline::clear_request_queue`]; resumed loop breaks via
+    /// [`consensus::Pipeline::clear_request_queue`]; resumed loop breaks via
     /// `else { break }`.
     ///
     /// # Panics
@@ -2054,7 +2191,7 @@ where
     #[allow(clippy::future_not_send)]
     pub async fn drain_request_queue_into_prepares(&mut self, slots_freed: usize) {
         for _ in 0..slots_freed {
-            let req = self.consensus().pipeline().borrow_mut().pop_request();
+            let req = self.consensus().pop_queued_request();
             let Some(req) = req else { break };
 
             let prepare = {
@@ -2219,7 +2356,16 @@ where
         }
 
         // Backup gap check; primary sequencer pre-advanced by
-        // push_prepare_entry. See metadata::on_replicate.
+        // push_prepare_entry.
+        //
+        // The sequencer, deliberately, where `metadata::on_replicate` gates on its
+        // journal. The two frontiers cannot drift apart on this plane:
+        // `install_state_transfer` rewinds the sequencer to the offer's `commit_op`
+        // (where the metadata install moves a durable snapshot floor and leaves the
+        // WAL head behind it), and the repair ingest advances it by walking the
+        // journal. Reading the journal here would answer 0 after every restart,
+        // since this plane's journal is memory-only and starts empty however much
+        // data sits on disk.
         let is_backup = self.consensus().is_follower();
         if is_backup {
             if header.op != current_op + 1 {
@@ -2353,7 +2499,7 @@ where
                 SimEventKind::NamespaceProgressUpdated,
                 &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
                 header.op,
-                consensus.pipeline().borrow().len(),
+                consensus.pipeline_len(),
             );
         }
 
@@ -2362,6 +2508,9 @@ where
 
     #[allow(clippy::future_not_send)]
     pub async fn on_ack(&mut self, message: Message<PrepareOkHeader>, config: &PartitionsConfig) {
+        if self.fatal.is_some() {
+            return;
+        }
         self.clear_pending_consumer_offset_commits_if_view_changed();
         let header = *message.header();
         {
@@ -2379,11 +2528,7 @@ where
                 return;
             }
 
-            let pipeline = consensus.pipeline().borrow();
-            if pipeline
-                .entry_by_op_and_checksum(header.op, header.prepare_checksum)
-                .is_none()
-            {
+            if !consensus.pipeline_holds_entry(header.op, header.prepare_checksum) {
                 emit_partition_diag(
                     tracing::Level::DEBUG,
                     &PartitionDiagEvent::new(
@@ -2413,13 +2558,16 @@ where
                 SimEventKind::NamespaceProgressUpdated,
                 &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
                 consensus.commit_min(),
-                consensus.pipeline().borrow().len(),
+                consensus.pipeline_len(),
             );
         }
     }
 
     #[allow(clippy::future_not_send)]
     pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
+        if self.fatal.is_some() {
+            return;
+        }
         self.clear_pending_consumer_offset_commits_if_view_changed();
 
         // The primary commits inline via `on_ack` (it drains its own pipeline).
@@ -2446,7 +2594,7 @@ where
                 SimEventKind::NamespaceProgressUpdated,
                 &ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
                 consensus.commit_min(),
-                consensus.pipeline().borrow().len(),
+                consensus.pipeline_len(),
             );
         }
     }
@@ -2492,10 +2640,7 @@ where
                 );
                 Ok(frozen)
             }
-            Operation::StoreConsumerOffset
-            | Operation::DeleteConsumerOffset
-            | Operation::StoreConsumerOffset2
-            | Operation::DeleteConsumerOffset2 => {
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 // Replicated path is Quorum-only by construction; ack ignored.
                 let (kind, consumer_id, offset, _ack) =
                     Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
@@ -2520,7 +2665,7 @@ where
                     .map_err(|_| IggyError::CannotAppendMessage)?;
 
                 match header.operation {
-                    Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+                    Operation::StoreConsumerOffset => {
                         self.stage_consumer_offset_upsert(
                             header.op,
                             kind,
@@ -2529,7 +2674,7 @@ where
                             is_auto_commit_client(header.client),
                         );
                     }
-                    Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+                    Operation::DeleteConsumerOffset => {
                         self.stage_consumer_offset_delete(header.op, kind, consumer_id);
                     }
                     _ => unreachable!(),
@@ -2609,7 +2754,7 @@ where
     async fn append_stamped_messages(
         &mut self,
         message: Message<PrepareHeader>,
-        batch: SendMessages2Header,
+        batch: BatchHeader,
     ) -> Result<JournaledMessages, IggyError> {
         let batch_messages_count = batch.message_count;
         if batch_messages_count == 0 {
@@ -2804,9 +2949,9 @@ where
         // only" - safe, since the flush still writes only committed bytes.
         let is_full = self.log.active_segment().is_full();
         let unsaved_messages_count_exceeded =
-            journal_info.messages_count >= config.messages_required_to_save;
+            journal_info.messages_count >= self.effective_messages_required_to_save(config);
         let unsaved_messages_size_exceeded = journal_info.size.as_bytes_u64()
-            >= config.size_of_messages_required_to_save.as_bytes_u64();
+            >= self.effective_size_of_messages_required_to_save(config);
         let should_persist =
             is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded;
         if !force && !should_persist {
@@ -2818,12 +2963,13 @@ where
         // commit frontier; flushing the uncommitted tail would write
         // per-replica-timing bytes to its segment (cross-replica divergence) and
         // drop the headers those ops need when their own commit later lands
-        // (commit_min wedge). Eviction is deferred until the bytes are durable:
-        // on a persist failure the prefix stays resident so the next commit
-        // re-reads it instead of losing a committed batch (a live-process I/O
-        // fault only; the in-memory journal does not survive a crash). All
-        // segment range / stats / durable-offset accounting below is computed
-        // from the committed entries, not the resident-journal snapshot above.
+        // (commit_min wedge). Eviction is deferred until the bytes are durable,
+        // so a persist failure retains the prefix rather than losing a committed
+        // batch (a live-process I/O fault only; the in-memory journal does not
+        // survive a crash). Only the transfer-offer flush survives to re-read it;
+        // the commit path panics the shard pump instead. All segment range /
+        // stats / durable-offset accounting below is computed from the committed
+        // entries, not the resident-journal snapshot above.
         let commit_max = self.consensus.commit_max();
         let committed_entries = self.log.journal().inner.committed_prefix(commit_max);
         if committed_entries.is_empty() {
@@ -2838,10 +2984,13 @@ where
             }
             return Ok(());
         }
-        // Persist the prefix in segment-sized chunks: a segment seals exactly
-        // when its committed bytes reach `max_size`, no matter how many
-        // entries this flush happens to cover. A backup commits in bursts
-        // behind the primary, so any grouping- or timing-sensitive roll rule
+        // Persist the prefix in segment-sized chunks: a segment seals on the
+        // first flush whose committed bytes reach OR EXCEED `max_size`, no
+        // matter how many entries this flush happens to cover. The batch that
+        // crosses the cap is appended whole, so a sealed segment lands
+        // anywhere in `[max_size, max_size + one maximum batch)` and never
+        // exactly at `max_size`. A backup commits in bursts behind the
+        // primary, so any grouping- or timing-sensitive roll rule
         // (like keying rotation on the journal-position `is_full` above)
         // seals segments at per-replica offsets, and the offset-keyed segment
         // GC staged by the reconciler never converges across the cluster.
@@ -2853,8 +3002,8 @@ where
         // re-appends the whole retained tail, so a per-chunk call would
         // re-walk that tail once per segment crossed, quadratic in the flush
         // span -- all under the partition write lock. On an error mid-flush
-        // the accumulated prefix is evicted before propagating, so the retry
-        // re-reads only what did not land.
+        // the accumulated prefix is evicted before propagating, so any later
+        // flush attempt re-reads only what did not land.
         let mut evictable = 0usize;
         while entries.peek().is_some() {
             // A recovered active segment can already sit at or past the cap
@@ -2977,12 +3126,21 @@ where
             };
 
             // Persist BEFORE eviction so a write failure leaves the rest of the
-            // committed prefix resident for retry. The persist is idempotent on
-            // failure: a batch write that lands but whose index save then fails
-            // rewinds the segment write cursor, so the retry overwrites those
-            // bytes instead of appending a duplicate. Chunks already durable
-            // are evicted before the error propagates, so the retry cannot
-            // re-read them (and re-write them past a rotation).
+            // committed prefix resident instead of dropping it. On the commit
+            // path a failure fences the partition and stops the shard pump; the
+            // server then shuts down non-zero after one final best-effort flush
+            // of every partition. A shutdown-flush failure warns and moves to
+            // the next namespace, while the transfer offer turns it into
+            // `FlushFailed`. Recovery reopens each writer at the on-disk length
+            // boot recovery validated.
+            //
+            // The ordering therefore buys a non-corrupting failure, not an
+            // in-process one. Write cursors advance only once both the batch and the
+            // index are durable, so a later attempt, including the final
+            // shutdown flush, rewrites the same positions instead of appending
+            // a duplicate. Chunks already durable are evicted before the error
+            // propagates, so it cannot re-read them and write them past a
+            // rotation.
             if let Err(error) = self
                 .persist_frozen_batches_to_disk(frozen_batches, index_bytes, batch_count)
                 .await
@@ -2992,9 +3150,9 @@ where
             }
             // Insert the flushed sparse-index entry into the in-mem cache only now
             // that the batch + index are durable. Inserting in the build loop (before
-            // persist) re-inserts a duplicate on a persist-failure retry, which
-            // re-reads the same prefix. The active segment has not rotated yet, so
-            // this targets the segment that received the batches.
+            // persist) re-inserts a duplicate on the next flush after a persist
+            // failure, which re-reads the same prefix. The active segment has not
+            // rotated yet, so this targets the segment that received the batches.
             if let Some(index) = flush_index {
                 self.log.ensure_indexes();
                 let indexes = self.log.active_indexes_mut().expect("indexes must exist");
@@ -3124,17 +3282,37 @@ where
                 // advanced; next advance_commit_min(op+1) would assert
                 // op+1 == commit_min + 1, panics cryptically.
                 //
-                // Fatal: better to suicide than serve stale or panic later.
-                // Operator restarts; recovery+repair re-syncs.
-                panic!(
-                    "partition local commit failed at op={} ({:?}): replica is divergent from cluster commit; restart required",
-                    prepare_header.op, prepare_header.operation
+                // Fatal, but NOT by panicking: this runs on the shard's
+                // message pump, and `compio::runtime::spawn` swallows a panic
+                // there, leaving every partition on the shard unable to
+                // commit, tick or reply while the process still reports
+                // healthy and answers on its other shards. Fence the
+                // partition and stop draining; the shard's tick picks the
+                // fault up and takes the server down through the ordinary
+                // shutdown path, so the remaining partitions flush and the
+                // exit code is non-zero. Operator restarts; recovery+repair
+                // re-syncs.
+                error!(
+                    target: "iggy.partitions.diag",
+                    plane = "partitions",
+                    replica_id,
+                    namespace_raw,
+                    op = prepare_header.op,
+                    operation = ?prepare_header.operation,
+                    "partition local commit failed for a cluster-committed op; \
+                     replica is divergent, fencing the partition and shutting down"
                 );
+                self.fatal = Some(FatalCommit {
+                    namespace_raw,
+                    op: prepare_header.op,
+                    operation: prepare_header.operation,
+                });
+                return;
             }
 
             self.consensus.advance_commit_min(prepare_header.op);
 
-            let pipeline_depth = self.consensus.pipeline().borrow().len();
+            let pipeline_depth = self.consensus.pipeline_len();
             let event = CommitLogEvent {
                 replica: ReplicaLogContext::from_consensus(&self.consensus, PlaneKind::Partitions),
                 op: prepare_header.op,
@@ -3310,10 +3488,7 @@ where
                 }
                 !*failed_commit
             }
-            Operation::StoreConsumerOffset
-            | Operation::DeleteConsumerOffset
-            | Operation::StoreConsumerOffset2
-            | Operation::DeleteConsumerOffset2 => {
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
                 self.commit_consumer_offset_entry(prepare_header, failed_commit)
                     .await
             }
@@ -3442,7 +3617,7 @@ where
         let (kind, consumer_id, offset, _ack) =
             Self::parse_staged_consumer_offset_commit(header.operation, &message)?;
         match header.operation {
-            Operation::StoreConsumerOffset | Operation::StoreConsumerOffset2 => {
+            Operation::StoreConsumerOffset => {
                 let offset = offset.ok_or(IggyError::InvalidCommand)?;
                 Ok(if is_auto_commit_client(header.client) {
                     PendingConsumerOffsetCommit::upsert_auto_commit(kind, consumer_id, offset)
@@ -3450,7 +3625,7 @@ where
                     PendingConsumerOffsetCommit::upsert(kind, consumer_id, offset)
                 })
             }
-            Operation::DeleteConsumerOffset | Operation::DeleteConsumerOffset2 => {
+            Operation::DeleteConsumerOffset => {
                 Ok(PendingConsumerOffsetCommit::delete(kind, consumer_id))
             }
             _ => Err(IggyError::InvalidCommand),
@@ -3483,20 +3658,10 @@ where
             Operation::StoreConsumerOffset => {
                 let request = StoreConsumerOffsetRequest::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
-                (request.consumer, Some(request.offset), AckLevel::Quorum)
-            }
-            Operation::StoreConsumerOffset2 => {
-                let request = StoreConsumerOffset2Request::decode_from(body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
                 (request.consumer, Some(request.offset), request.ack)
             }
             Operation::DeleteConsumerOffset => {
                 let request = DeleteConsumerOffsetRequest::decode_from(body)
-                    .map_err(|_| IggyError::InvalidCommand)?;
-                (request.consumer, None, AckLevel::Quorum)
-            }
-            Operation::DeleteConsumerOffset2 => {
-                let request = DeleteConsumerOffset2Request::decode_from(body)
                     .map_err(|_| IggyError::InvalidCommand)?;
                 (request.consumer, None, request.ack)
             }
@@ -3606,44 +3771,63 @@ where
             let segment_index = self.log.segments().len() - 1;
             let segment = &mut self.log.segments_mut()[segment_index];
             segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved_bytes as u64);
-            self.log.clear_in_flight();
             return Ok(());
         }
 
         let messages_writer = messages_writer.expect("checked above");
         let index_writer = index_writer.expect("checked above");
 
-        let saved = messages_writer
-            .save_frozen_batches(&stripped_batches)
-            .await
-            .map_err(|error| {
+        // Both writes are in flight before either completes, so under
+        // `enforce_fsync` the two fdatasync round trips overlap instead of
+        // serializing. `join` never cancels a half, so no write is dropped
+        // mid-flight when the other one fails.
+        let (log_result, index_result) = futures::future::join(
+            messages_writer.save_frozen_batches(&stripped_batches),
+            index_writer.save_indexes(index_bytes),
+        )
+        .await;
+
+        // The match below collapses to the log's error (the durable record, the
+        // index being derived from it). The halves write different files and can
+        // fail for unrelated reasons, so name the index failure here instead of
+        // letting the log's error stand for both.
+        if let (Err(log_error), Err(index_error)) = (&log_result, &index_result) {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                batch_count,
+                %log_error,
+                %index_error,
+                "failed to persist frozen batches: log and index both failed"
+            );
+        }
+
+        let (saved, saved_index_bytes) = match (log_result, index_result) {
+            (Ok(saved), Ok(saved_index_bytes)) => (saved, saved_index_bytes),
+            (Err(error), _) | (Ok(_), Err(error)) => {
                 warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
                     namespace_raw = self.namespace().inner(),
                     batch_count,
                     %error,
-                    "failed to save frozen batches"
+                    "failed to persist frozen batches"
                 );
-                error
-            })?;
+                return Err(error);
+            }
+        };
 
-        if let Err(error) = index_writer.save_indexes(index_bytes).await {
-            warn!(
-                target: "iggy.partitions.diag",
-                plane = "partitions",
-                namespace_raw = self.namespace().inner(),
-                batch_count,
-                %error,
-                "failed to save sparse indexes; rewinding segment write cursor"
-            );
-            // The batch bytes landed but the index did not, so the whole persist
-            // fails and the committed prefix stays resident for retry. Rewind the
-            // writer cursor by exactly what this call advanced so the retry
-            // overwrites those bytes instead of appending a duplicate copy.
-            messages_writer.rewind(saved.as_bytes_u64());
-            return Err(error);
-        }
+        // Advance both cursors only here, back to back with no await between.
+        // They are the writers' next-write positions, so a half whose save
+        // failed must keep its cursor: the pair then still describes one durable
+        // prefix, which is what a writer re-opened by boot recovery asserts
+        // against the length of the file it finds
+        // (`SegmentSizeMismatchAtOpen`). In-process it also keeps a later flush
+        // rewriting the same slot rather than appending a duplicate index entry
+        // or leaving a hole in the segment.
+        messages_writer.advance(saved.as_bytes_u64());
+        index_writer.advance(saved_index_bytes);
 
         debug!(
             target: "iggy.partitions.diag",
@@ -3658,7 +3842,6 @@ where
         let segment = &mut self.log.segments_mut()[segment_index];
         segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
 
-        self.log.clear_in_flight();
         Ok(())
     }
 
@@ -3669,11 +3852,14 @@ where
         active_segment.sealed = true;
         let start_offset = active_segment.end_offset + 1;
 
-        let segment = Segment::new(start_offset, config.segment_size);
-        // `PartitionsConfig::get_messages_path` is a stub (`/tmp/iggy_stub`);
-        // the partition's real directory is only known to the server config
-        // that created the initial segment, so derive the rotated paths from
-        // the active writer's location.
+        let segment_size = self.effective_segment_size(config);
+        let enforce_fsync = self.effective_enforce_fsync(config);
+        let preallocate_segments = self.effective_preallocate_segments(config);
+        let segment = Segment::new(start_offset, segment_size);
+        // Prefer the active writer's location: a per-topic path override or a
+        // config change after the initial segment was created must not scatter
+        // one partition's segments across two directories. The config layout
+        // only decides for a partition with no writer yet.
         let (messages_path, index_path) = self.partition_dir().map_or_else(
             || {
                 (
@@ -3699,17 +3885,9 @@ where
             },
         );
 
-        let storage = SegmentStorage::new(
-            &messages_path,
-            &index_path,
-            0,
-            0,
-            config.enforce_fsync,
-            config.enforce_fsync,
-            false,
-        )
-        .await
-        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
@@ -3719,9 +3897,9 @@ where
             MessagesWriter::new(
                 &messages_path,
                 messages_size_bytes,
-                config.enforce_fsync,
+                enforce_fsync,
                 false,
-                config.preallocate_segments.then_some(config.segment_size),
+                preallocate_segments.then_some(segment_size),
             )
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
@@ -3732,7 +3910,7 @@ where
             .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
             .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(&index_path, index_size_bytes, config.enforce_fsync, false)
+            IggyIndexWriter::new(&index_path, index_size_bytes, enforce_fsync, false)
                 .await
                 .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
@@ -3743,10 +3921,12 @@ where
         self.log.index_writers_mut()[old_segment_index] = None;
         // Drop the sealed segment's in-memory index cache: only the ACTIVE
         // segment's cache is ever read (the `commit_messages` flush staging),
-        // so a sealed cache is dead weight -- and `ensure_indexes` preallocates
-        // a 16 MiB-capacity `Vec` per segment, which under small-segment
-        // workloads retains hundreds of MB across thousands of sealed segments.
+        // so a sealed cache is dead weight.
         self.log.indexes_mut()[old_segment_index] = None;
+        // The read fd cached while this segment was active is not counted by
+        // the sealed LRU budget, so it must not survive the seal; the next
+        // sealed poll re-fills the fresh slot under the LRU's rules.
+        self.log.reset_read_state(old_segment_index);
 
         self.log
             .add_persisted_segment(segment, storage, Some(messages_writer), Some(index_writer));
@@ -3786,19 +3966,22 @@ where
     }
 
     /// Time-expiry plus size-retention in one pass: remove the leading sealed
-    /// segments that have expired or that push the partition past `max_bytes`.
-    /// Returns the `(segments, messages)` removed.
+    /// segments that have expired or that push the partition's SEALED bytes
+    /// past `max_bytes`. Capped per call by
+    /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
+    /// [`SegmentRemoval::budget_spent`] tells the caller whether the rest is
+    /// still waiting.
     pub async fn clean_expired_segments(
         &mut self,
         now: IggyTimestamp,
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
-    ) -> (u64, u64) {
+    ) -> SegmentRemoval {
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
             max_bytes.and_then(|max_bytes| leading_oversized_end(self.log.segments(), max_bytes));
         let Some(up_to) = expired.into_iter().chain(oversized).max() else {
-            return (0, 0);
+            return SegmentRemoval::default();
         };
         self.remove_sealed_segments_up_to(up_to).await
     }
@@ -3807,12 +3990,20 @@ where
     /// never the active segment and never past the consumer barrier (the
     /// minimum committed consumer/group offset). Unlinks the messages and
     /// index files and decrements partition stats. Idempotent: an offset below
-    /// the oldest sealed segment removes nothing. Returns the
-    /// `(segments, messages)` removed.
+    /// the oldest sealed segment removes nothing.
+    ///
+    /// NOT exhaustive: at most `SEGMENT_REMOVAL_BUDGET_PER_PASS` segments go
+    /// per call, so a caller enforcing a retention decision has to re-issue it
+    /// until the layout converges rather than assume one call finished the job.
+    /// Both callers already do: the segment cleaner re-stages on
+    /// [`SegmentRemoval::budget_spent`] and again on its
+    /// `data_maintenance.messages.interval` tick, and the partition reconciler
+    /// re-stages a committed delete watermark on every pass while the first
+    /// local segment still starts below it.
     ///
     /// Holds `write_lock` to serialize against the commit/rotate path, which
     /// runs on the separate consensus-tick loop.
-    pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> (u64, u64) {
+    pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
         let write_lock = self.write_lock.clone();
         let _guard = write_lock.lock().await;
 
@@ -3822,7 +4013,13 @@ where
             let segments = self.log.segments();
             let last_idx = segments.len().saturating_sub(1);
             let mut removable = 0usize;
-            for (idx, segment) in segments.iter().enumerate() {
+            // One past the budget: the extra slot separates a run that ends
+            // exactly on the budget from one with more still waiting.
+            for (idx, segment) in segments
+                .iter()
+                .enumerate()
+                .take(SEGMENT_REMOVAL_BUDGET_PER_PASS + 1)
+            {
                 if idx == last_idx || !segment.sealed || segment.end_offset > up_to_offset {
                     break;
                 }
@@ -3847,8 +4044,12 @@ where
             removable
         };
 
-        let mut deleted_segments = 0u64;
-        let mut deleted_messages = 0u64;
+        let budget_spent = removable > SEGMENT_REMOVAL_BUDGET_PER_PASS;
+        let removable = removable.min(SEGMENT_REMOVAL_BUDGET_PER_PASS);
+        let mut removal = SegmentRemoval {
+            budget_spent,
+            ..SegmentRemoval::default()
+        };
         for _ in 0..removable {
             // The removable run is always a prefix (oldest first), so the next
             // victim is the front once the previous one is gone.
@@ -3888,8 +4089,8 @@ where
             self.stats.decrement_segments_count(1);
             self.stats.decrement_messages_count(messages_in_segment);
 
-            deleted_segments += 1;
-            deleted_messages += messages_in_segment;
+            removal.segments += 1;
+            removal.messages += messages_in_segment;
 
             debug!(
                 target: "iggy.partitions.diag",
@@ -3901,7 +4102,7 @@ where
             );
         }
 
-        (deleted_segments, deleted_messages)
+        removal
     }
 
     /// Build and install a fresh empty segment starting at `start_offset` with
@@ -3950,18 +4151,13 @@ where
                 )
             },
         );
-        let segment = Segment::new(start_offset, config.segment_size);
-        let storage = SegmentStorage::new(
-            &messages_path,
-            &index_path,
-            0,
-            0,
-            config.enforce_fsync,
-            config.enforce_fsync,
-            false,
-        )
-        .await
-        .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
+        let segment_size = self.effective_segment_size(config);
+        let enforce_fsync = self.effective_enforce_fsync(config);
+        let preallocate_segments = self.effective_preallocate_segments(config);
+        let segment = Segment::new(start_offset, segment_size);
+        let storage = SegmentStorage::new(&messages_path, &index_path, 0, 0, false)
+            .await
+            .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?;
         let messages_size_bytes = storage
             .messages_writer
             .as_ref()
@@ -3971,9 +4167,9 @@ where
             MessagesWriter::new(
                 &messages_path,
                 messages_size_bytes,
-                config.enforce_fsync,
+                enforce_fsync,
                 false,
-                config.preallocate_segments.then_some(config.segment_size),
+                preallocate_segments.then_some(segment_size),
             )
             .await
             .map_err(|_| IggyError::CannotCreateSegmentLogFile(messages_path.clone()))?,
@@ -3984,7 +4180,7 @@ where
             .ok_or_else(|| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?
             .size_counter();
         let index_writer = Rc::new(
-            IggyIndexWriter::new(&index_path, index_size_bytes, config.enforce_fsync, false)
+            IggyIndexWriter::new(&index_path, index_size_bytes, enforce_fsync, false)
                 .await
                 .map_err(|_| IggyError::CannotCreateSegmentIndexFile(index_path.clone()))?,
         );
@@ -4357,10 +4553,29 @@ where
     /// commit walk runs at `RepairDone`, after the floor is known.
     pub async fn apply_repaired_prepare(&mut self, message: Message<PrepareHeader>) {
         let header = *message.header();
-        let Some(session) = &self.repair else {
+        let Some(session) = self.repair else {
             return;
         };
-        if header.op <= self.consensus().commit_min() || header.op > session.to_op {
+        let consensus = self.consensus();
+        if !consensus.is_normal() || consensus.view() != session.view {
+            self.repair = None;
+            return;
+        }
+        if header.op <= consensus.commit_min() || header.op > session.fetch_to_op {
+            return;
+        }
+        let canonical_checksum = consensus
+            .with_pending_view_log(|pending| {
+                pending
+                    .headers
+                    .iter()
+                    .find(|expected| expected.op == header.op)
+                    .map(|expected| expected.checksum)
+            })
+            .flatten();
+        if canonical_checksum.is_some_and(|expected| expected != header.checksum)
+            || (header.op > session.commit_to_op && canonical_checksum.is_none())
+        {
             return;
         }
         // Any in-window frame proves the stream is alive; only silence
@@ -4374,7 +4589,9 @@ where
         let applied = if header.operation == Operation::SendMessages {
             match self.append_repaired_send_messages(message).await {
                 Ok(base_offset) => {
-                    if let (Some(base_offset), Some(session)) = (base_offset, self.repair.as_mut())
+                    if header.op <= session.commit_to_op
+                        && let (Some(base_offset), Some(session)) =
+                            (base_offset, self.repair.as_mut())
                     {
                         session.first_batch_offset = Some(
                             session
@@ -4407,21 +4624,18 @@ where
         // cannot walk. A dropped frame stalls the frontier here; the stall
         // retry refills the hole and the next apply resumes the advance
         // (walking over ops that were journaled out of order meanwhile).
-        let mut frontier = self.consensus().sequencer().current_sequence();
-        while self
-            .log
-            .journal()
-            .inner
-            .header_by_op(frontier + 1)
-            .is_some()
-        {
-            frontier += 1;
-        }
-        let consensus = self.consensus();
-        if frontier > consensus.sequencer().current_sequence() {
+        // The checksum moves only with the frontier and is read from the
+        // journal header at the new head: a lower backfill must not rewind
+        // the parent the next prepare chains onto.
+        let previous_frontier = self.consensus().sequencer().current_sequence();
+        let update = repaired_frontier_update(previous_frontier, |op| {
+            self.log.journal().inner.header_by_op(op)
+        });
+        if let Some((frontier, frontier_checksum)) = update {
+            let consensus = self.consensus();
             consensus.sequencer().set_sequence(frontier);
+            consensus.set_last_prepare_checksum(frontier_checksum);
         }
-        consensus.set_last_prepare_checksum(header.checksum);
     }
 
     /// Conclude a repair stream: settle the commit floor at the serving
@@ -4432,6 +4646,10 @@ where
         let Some(session) = self.repair else {
             return RepairConclusion::Done;
         };
+        if !self.consensus().is_normal() || self.consensus().view() != session.view {
+            self.repair = None;
+            return RepairConclusion::Done;
+        }
         if let Some(floor) = session.floor {
             // A peer may have evicted past this replica's commit frontier;
             // an unclamped floor would drive commit_min above commit_max and
@@ -4452,6 +4670,11 @@ where
             let stand_in = durable_end
                 .map(|durable| durable.saturating_add(1))
                 .max(self.installed_frontier);
+            let committed_shape = self
+                .log
+                .journal()
+                .inner
+                .repaired_window_shape(floor, session.commit_to_op);
             let connected = match (session.first_batch_offset, stand_in) {
                 (Some(first), Some(bound)) => first <= bound,
                 (Some(first), None) => first == 0,
@@ -4463,7 +4686,11 @@ where
                 // a fully evicted window -- is indistinguishable from a
                 // message range below the floor that this replica does not
                 // durably own, and accepting it would serve a holed log.
-                (None, _) => self.repaired_window_is_offsets_only(floor, session.to_op),
+                (None, _) => {
+                    floor < session.commit_to_op
+                        && committed_shape.complete
+                        && !committed_shape.holds_messages
+                }
             };
             if !connected {
                 tracing::error!(
@@ -4488,11 +4715,11 @@ where
                 // Both are the state-transfer trigger; the session is
                 // dropped here so the caller's arming funnel starts clean,
                 // and a transfer-unavailable fallback re-arms repair fresh.
-                if self.repaired_window_is_complete(floor, session.to_op) {
+                if committed_shape.complete {
                     self.repair = None;
                     return RepairConclusion::FloorRefused {
                         floor,
-                        to_op: session.to_op,
+                        to_op: session.commit_to_op,
                     };
                 }
                 return RepairConclusion::InProgress;
@@ -4511,7 +4738,23 @@ where
         // that reached the requested frontier closes the session; anything
         // less keeps it armed and the stall retry re-requests the remains
         // (`commit_min + 1..`), converging over rounds.
-        let done = commit_min >= session.to_op;
+        // The residency check starts at the LIVE commit point, not the
+        // session's snapshotted one: delivering the suffix bodies is what
+        // lets the group commit past `commit_to_op`, and the `commit_journal`
+        // above then evicts exactly those headers. Judged from
+        // `commit_to_op`, a fully successful repair would report itself
+        // incomplete forever, pin the session, and block every later re-arm
+        // until a view change. Ops at or below `commit_min` are committed and
+        // applied, a monotone fact the flush cannot erase, so they need no
+        // resident header to count as fetched.
+        let fetch_complete = session.fetch_to_op <= session.commit_to_op
+            || self
+                .log
+                .journal()
+                .inner
+                .repaired_window_shape(session.commit_to_op.max(commit_min), session.fetch_to_op)
+                .complete;
+        let done = commit_min >= session.commit_to_op && fetch_complete;
         if done {
             self.repair = None;
         }
@@ -4522,7 +4765,9 @@ where
             commit_min_before = before,
             commit_min_after = commit_min,
             commit_max = self.consensus().commit_max(),
-            to_op = session.to_op,
+            commit_to_op = session.commit_to_op,
+            fetch_to_op = session.fetch_to_op,
+            fetch_complete,
             done,
             "repair window commit walk finished"
         );
@@ -4531,31 +4776,6 @@ where
         } else {
             RepairConclusion::InProgress
         }
-    }
-
-    /// Whether every op in `(floor, to_op]` is journaled. An empty window
-    /// (`floor >= to_op`) counts as complete: there is nothing left that
-    /// could arrive and change the floor verdict.
-    fn repaired_window_is_complete(&self, floor: u64, to_op: u64) -> bool {
-        self.log
-            .journal()
-            .inner
-            .repaired_window_shape(floor, to_op)
-            .complete
-    }
-
-    /// Whether the served repair window `(floor, to_op]` arrived complete and
-    /// holds no `SendMessages` op. Only then may a commit floor be accepted
-    /// without a batch anchor: the window demonstrably moved no messages, so
-    /// the consumer-offset table on disk stands in below the floor. An empty
-    /// window (`floor >= to_op`) carries no evidence at all and never
-    /// qualifies.
-    fn repaired_window_is_offsets_only(&self, floor: u64, to_op: u64) -> bool {
-        if floor >= to_op {
-            return false;
-        }
-        let shape = self.log.journal().inner.repaired_window_shape(floor, to_op);
-        shape.complete && !shape.holds_messages
     }
 
     /// Journal a repaired `SendMessages` prepare, preserving its embedded
@@ -4675,7 +4895,9 @@ where
         // consumer-offset ops (via `apply_replicated_operation`) append
         // to that journal before `send_prepare_ok` fires, so every op
         // that reaches here is journal-backed and ACKs as durable.
-        send_prepare_ok_common(self.consensus(), header, Some(true)).await;
+        // (`header_by_op` is a linear scan, so re-proving that here would
+        // put O(journal) on every ack; the call-order invariant stands in.)
+        send_prepare_ok_common(self.consensus(), header, true).await;
     }
 }
 
@@ -4790,8 +5012,8 @@ fn send_messages_reply_body(
     let namespace = IggyNamespace::from_raw(namespace);
     SendMessagesResponse {
         confirmations: vec![SendMessagesConfirmationResponse {
-            // `IggyNamespace` packs the ids into 12/12/20 bits, so each
-            // component fits a `u32` by construction.
+            // Every field is narrower than a `u32` (widths compile-asserted in
+            // `iggy_binary_protocol`), so each component fits by construction.
             stream_id: namespace.stream_id() as u32,
             topic_id: namespace.topic_id() as u32,
             partition_id: namespace.partition_id() as u32,
@@ -4849,6 +5071,41 @@ fn accumulate_committed_info(
     info.max_timestamp = info.max_timestamp.max(base_timestamp);
 }
 
+/// Sealed segments one call to [`IggyPartition::remove_sealed_segments_up_to`]
+/// may unlink before it stops and leaves the rest to the next pass.
+///
+/// The removal loop runs inside ONE frame body on the shard pump, and this
+/// shard's consensus ticks are a sibling select arm that stays unpolled while
+/// that body awaits, so the budget is really a bound on how long every OTHER
+/// group on this core goes without a heartbeat. Uncapped it is a bound on the
+/// backlog instead: the first pass after the cleaner is switched on walks
+/// however many segments retention accumulated, which on a large log silences
+/// those groups long enough to lose them to a view change.
+///
+/// A SEGMENT budget standing in for a time bound, so the margin is filesystem
+/// specific: 16 segments is at most 32 unlinks (log plus index), a few hundred
+/// milliseconds on commodity `NVMe` against the shipped 5 s
+/// `cluster.heartbeat_timeout`, and still under 2 s if each unlink costs a
+/// pathological 50 ms on a contended journal. Large enough that steady-state
+/// retention, which reclaims a handful of segments per interval, never reaches
+/// it -- only a backlog does, and that one drains over several passes.
+const SEGMENT_REMOVAL_BUDGET_PER_PASS: usize = 16;
+
+/// What one call to [`IggyPartition::remove_sealed_segments_up_to`] reclaimed.
+///
+/// `budget_spent` reports that the pass stopped on
+/// `SEGMENT_REMOVAL_BUDGET_PER_PASS` rather than on the end of the removable
+/// run, so a caller can re-stage immediately instead of leaving the rest until
+/// its next interval tick. The budget itself stays private: the signal is what
+/// callers need, and reading the number would invite them to rebuild the
+/// comparison.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentRemoval {
+    pub segments: u64,
+    pub messages: u64,
+    pub budget_spent: bool,
+}
+
 /// Highest `end_offset` among the leading run of expired sealed segments, or
 /// `None` when none are expired. The last element is the active segment and is
 /// never considered. `expiry` must be resolved; a `ServerDefault` expires
@@ -4869,14 +5126,21 @@ fn leading_expired_end(
     up_to
 }
 
-/// Highest `end_offset` to drop so the resident size falls to `max_bytes`, or
-/// `None` when already under budget. The active segment (last element) is
-/// never dropped. The budget is per-partition: the cluster has no single owner
-/// of a topic-wide total, so each replica trims its own log.
+/// Highest `end_offset` to drop so the SEALED resident size falls to
+/// `max_bytes`, or `None` when already under budget. The active segment (last
+/// element) is never dropped. The budget is per-partition: the cluster has no
+/// single owner of a topic-wide total, so each replica trims its own log.
+///
+/// The active segment's bytes are excluded from the running total, not merely
+/// from the deletions. Counting bytes that can never be reclaimed lets them
+/// evict the sealed history instead: at a budget near one segment the active
+/// one alone exceeds it, and every sealed segment is dropped no matter how
+/// small the log is.
 fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut resident: u64 = segments
         .iter()
+        .take(last_idx)
         .map(|segment| segment.size.as_bytes_u64())
         .sum();
     let mut up_to = None;
@@ -4912,15 +5176,17 @@ fn nth_oldest_sealed_end(segments: &[Segment], count: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
+    use crate::iggy_index_reader::IggyIndexReader;
     use crate::poll_plan::{DiskReadOutcome, SealedSegmentHandle};
     use bytes::Bytes;
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
-    use iggy_binary_protocol::{Command2, ReplyHeader, WireConsumer, WireEncode};
-    use message_bus::SendError;
+    use iggy_binary_protocol::{Command, ReplyHeader, WireConsumer, WireEncode};
+    use message_bus::{BusMessage, SendError};
     use server_common::MESSAGE_ALIGN;
-    use server_common::send_messages2::{
-        COMMAND_HEADER_SIZE, IggyMessage2, IggyMessage2Header, IggyMessages2, SendMessages2Owned,
+    use server_common::send_messages::{
+        COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -5228,7 +5494,7 @@ mod tests {
         let size = std::mem::size_of::<PrepareHeader>();
         let prepare = Message::<PrepareHeader>::new(size).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = 1;
                 // Current view: an older-view prepare is fenced as deposed-primary
                 // traffic and would never reach the ack send under test.
@@ -5304,9 +5570,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            data: Frozen<MESSAGE_ALIGN>,
+            data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
-            self.sent_to_clients.borrow_mut().push((client_id, data));
+            self.sent_to_clients
+                .borrow_mut()
+                .push((client_id, data.into().into_contiguous()));
             Ok(())
         }
 
@@ -5327,13 +5595,20 @@ mod tests {
     type SentFrames = Rc<RefCell<Vec<(u128, Frozen<MESSAGE_ALIGN>)>>>;
 
     fn recording_partition() -> (IggyPartition<RecordingBus>, SentFrames) {
+        recording_partition_at(0, 1)
+    }
+
+    fn recording_partition_at(
+        replica: u8,
+        replica_count: u8,
+    ) -> (IggyPartition<RecordingBus>, SentFrames) {
         let namespace = IggyNamespace::new(1, 1, 0);
         let bus = RecordingBus::default();
         let sent_to_clients = bus.sent_to_clients.clone();
         let consensus = VsrConsensus::new(
             TEST_CLUSTER,
-            0,
-            1,
+            replica,
+            replica_count,
             namespace.inner(),
             bus,
             LocalPipeline::new(),
@@ -5353,7 +5628,7 @@ mod tests {
         request_id: u64,
         consumer_id: u32,
     ) -> Message<RoutedRequestHeader> {
-        let body = DeleteConsumerOffset2Request {
+        let body = DeleteConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
             stream_id: WireIdentifier::Numeric(1),
             topic_id: WireIdentifier::Numeric(1),
@@ -5366,8 +5641,8 @@ mod tests {
         let mut message = Message::<RoutedRequestHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&body);
         message.transmute_header(|_, header: &mut RoutedRequestHeader| {
-            header.command = Command2::Request;
-            header.operation = Operation::DeleteConsumerOffset2;
+            header.command = Command::Request;
+            header.operation = Operation::DeleteConsumerOffset;
             header.client = client_id;
             header.session = 1;
             header.request = request_id;
@@ -5401,7 +5676,7 @@ mod tests {
                 &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
             )
             .expect("deny frame starts with a valid reply header");
-            assert_eq!(header.command, Command2::Reply);
+            assert_eq!(header.command, Command::Reply);
             assert_eq!(
                 header.status,
                 IggyError::ConsumerOffsetNotFound(0).as_code()
@@ -5415,7 +5690,7 @@ mod tests {
             );
         }
         assert_eq!(
-            partition.consensus().pipeline().borrow().len(),
+            partition.consensus().pipeline_len(),
             0,
             "denied delete must not replicate"
         );
@@ -5430,9 +5705,35 @@ mod tests {
             .on_request(delete_offset_request(client_id, 8, consumer_id))
             .await;
         assert_eq!(
-            partition.consensus().pipeline().borrow().len(),
+            partition.consensus().pipeline_len(),
             1,
             "existing offset delete must replicate"
+        );
+    }
+
+    #[compio::test]
+    async fn on_request_delete_on_stale_backup_replies_transient_before_not_found() {
+        let (mut partition, sent_to_clients) = recording_partition_at(1, 3);
+        let client_id = 42;
+
+        partition
+            .on_request(delete_offset_request(client_id, 7, 5))
+            .await;
+
+        let sent = sent_to_clients.borrow();
+        assert_eq!(sent.len(), 1, "exactly one routing denial");
+        let (reply_client, frame) = &sent[0];
+        assert_eq!(*reply_client, client_id);
+        let header = bytemuck::checked::try_from_bytes::<ReplyHeader>(
+            &frame.as_slice()[..std::mem::size_of::<ReplyHeader>()],
+        )
+        .expect("deny frame starts with a valid reply header");
+        assert_eq!(header.status, IggyError::TransientNotAccepted.as_code());
+        assert_eq!(header.op, 0, "the backup admitted nothing");
+        assert_eq!(
+            partition.consensus().pipeline_len(),
+            0,
+            "a backup must not replicate the delete"
         );
     }
 
@@ -5613,10 +5914,14 @@ mod tests {
     /// leaving live groups untouched. The returned `Vec<String>` is what the
     /// reconciler unlinks off-borrow, so it carries no partition reference.
     ///
-    /// TODO: a true cross-task interleave (pump reallocs the partitions vec
-    /// while the reconciler awaits the unlink) needs a two-future sim oracle
-    /// that does not exist yet; this covers the synchronous removal contract
-    /// the off-borrow split relies on.
+    /// Scope: the synchronous removal contract the off-borrow split relies on.
+    /// The cross-task interleave it enables -- a pump mutating the partitions vec
+    /// while a sibling task is parked mid-await -- is covered on the simulator's
+    /// deterministic executor, against the debug borrow tripwire, by
+    /// `simulator::tests::shell_detects_partition_borrow_held_across_await`
+    /// (`swap_remove`) and
+    /// `shell_detects_partition_borrow_held_across_a_pump_realloc` (a growing
+    /// `push`, which relocates every element).
     #[compio::test]
     async fn reclaim_dead_group_offsets_drops_dead_keeps_live() {
         let mut partition = test_partition();
@@ -5654,17 +5959,17 @@ mod tests {
     /// stamped at `base_offset`, with a valid batch checksum so it decodes
     /// through `decode_batch_slice` and matches an `Offset` poll.
     pub(super) fn build_segment_record(namespace: IggyNamespace, base_offset: u64) -> Vec<u8> {
-        let mut batch = IggyMessages2::with_capacity(1);
-        batch.push(IggyMessage2 {
-            header: IggyMessage2Header {
+        let mut batch = IggyMessages::with_capacity(1);
+        batch.push(IggyMessage {
+            header: IggyMessageHeader {
                 payload_length: 8,
                 ..Default::default()
             },
             payload: Bytes::from_static(b"abcdefgh"),
             user_headers: None,
         });
-        let mut owned = SendMessages2Owned::from_messages(namespace, &batch)
-            .expect("build send_messages batch");
+        let mut owned =
+            SendMessagesOwned::from_messages(namespace, &batch).expect("build send_messages batch");
         owned.header.base_offset = base_offset;
         owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
 
@@ -5720,12 +6025,14 @@ mod tests {
                 DiskSegment {
                     start_offset: 0,
                     persisted: 512,
-                    read_state: None,
+                    read_state: SealedSegmentHandle::default(),
+                    sealed: false,
                 },
                 DiskSegment {
                     start_offset: 5,
                     persisted: later_len,
-                    read_state: None,
+                    read_state: SealedSegmentHandle::default(),
+                    sealed: false,
                 },
             ],
             start_position: 0,
@@ -5806,12 +6113,14 @@ mod tests {
                 DiskSegment {
                     start_offset: 0,
                     persisted: corrupt_len,
-                    read_state: None,
+                    read_state: SealedSegmentHandle::default(),
+                    sealed: false,
                 },
                 DiskSegment {
                     start_offset: 5,
                     persisted: later_len,
-                    read_state: None,
+                    read_state: SealedSegmentHandle::default(),
+                    sealed: false,
                 },
             ],
             start_position: 0,
@@ -5878,7 +6187,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: None,
+                read_state: SealedSegmentHandle::default(),
+                sealed: false,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -5915,7 +6225,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
-                read_state: None,
+                read_state: SealedSegmentHandle::default(),
+                sealed: false,
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
@@ -5946,7 +6257,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: 512,
-                read_state: None,
+                read_state: SealedSegmentHandle::default(),
+                sealed: false,
             }],
             start_position: 0,
             namespace_raw: IggyNamespace::new(1, 1, 0).inner(),
@@ -6013,7 +6325,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6044,7 +6357,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6104,7 +6418,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6188,7 +6503,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: log_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             // Byte 0, exactly what disk_poll_start returns for a sealed segment
             // whose resident index was dropped.
@@ -6287,7 +6603,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: log_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6341,10 +6658,9 @@ mod tests {
         let log_path = format!("{partition_dir}/{:0>20}.log", 0u64);
         let index_path = format!("{partition_dir}/{:0>20}.index", 0u64);
         partition.log.segments_mut()[0].sealed = true;
-        partition.log.storages_mut()[0] =
-            SegmentStorage::new(&log_path, &index_path, 0, 0, false, false, false)
-                .await
-                .expect("create segment storage");
+        partition.log.storages_mut()[0] = SegmentStorage::new(&log_path, &index_path, 0, 0, false)
+            .await
+            .expect("create segment storage");
 
         let record = build_segment_record(namespace, 0);
         let record_len = record.len() as u64;
@@ -6365,7 +6681,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6413,7 +6730,8 @@ mod tests {
             segments: vec![DiskSegment {
                 start_offset: 0,
                 persisted: record_len,
-                read_state: Some(Rc::clone(&handle)),
+                read_state: Rc::clone(&handle),
+                sealed: true,
             }],
             start_position: 0,
             namespace_raw: namespace.inner(),
@@ -6442,13 +6760,25 @@ mod tests {
             segment_size: IggyByteSize::from(1024 * 1024),
             preallocate_segments: false,
             encryptor: None,
+            path_layout: crate::PartitionPathLayout::default(),
         }
     }
 
     fn armed_session(to_op: u64, floor: u64, first_batch_offset: Option<u64>) -> RepairSession {
+        armed_fetch_session(to_op, to_op, floor, first_batch_offset)
+    }
+
+    fn armed_fetch_session(
+        to_op: u64,
+        fetch_to_op: u64,
+        floor: u64,
+        first_batch_offset: Option<u64>,
+    ) -> RepairSession {
         RepairSession {
             nonce: 1,
-            to_op,
+            view: 0,
+            commit_to_op: to_op,
+            fetch_to_op,
             floor: Some(floor),
             peer: 0,
             first_batch_offset,
@@ -6464,7 +6794,7 @@ mod tests {
         let size = std::mem::size_of::<PrepareHeader>();
         let prepare = Message::<PrepareHeader>::new(size).transmute_header(
             |_, header: &mut PrepareHeader| {
-                header.command = Command2::Prepare;
+                header.command = Command::Prepare;
                 header.op = op;
                 header.operation = operation;
                 header.size = u32::try_from(size).expect("prepare header size fits in u32");
@@ -6477,6 +6807,122 @@ mod tests {
             .append(prepare.into_frozen())
             .await
             .expect("journal append");
+    }
+
+    /// A repaired `SendMessages` prepare with an explicit chain identity, as a
+    /// serving peer ships it.
+    fn repaired_send_prepare(op: u64, parent: u128, checksum: u128) -> Message<PrepareHeader> {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let record = build_segment_record(namespace, op);
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let total = header_size + record.len();
+        let mut message = Message::<PrepareHeader>::new(total);
+        message.as_mut_slice()[header_size..].copy_from_slice(&record);
+        message.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::SendMessages;
+            header.op = op;
+            header.parent = parent;
+            header.checksum = checksum;
+            header.group = namespace.inner();
+            header.size = u32::try_from(total).expect("prepare size fits u32");
+        })
+    }
+
+    #[compio::test]
+    async fn given_lower_backfill_when_applying_repaired_prepare_should_not_rewind_parent() {
+        // The call-site regression for the WAL frontier rewind: a repaired op
+        // below the DVC-adopted head must leave BOTH halves of the frontier
+        // alone. The old code left the sequencer at the head and rewound
+        // `last_prepare_checksum` to the backfilled entry, so the next prepare
+        // parented past a committed op and recovery refused the WAL.
+        const CHECKSUM_1: u128 = 0x11;
+        const CHECKSUM_2: u128 = 0x22;
+        const CHECKSUM_3: u128 = 0x33;
+        let mut partition = test_partition();
+        partition.repair = Some(armed_session(3, 0, None));
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, CHECKSUM_1))
+            .await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(3, CHECKSUM_2, CHECKSUM_3))
+            .await;
+        // The hole at op 2 stalls the frontier advance.
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
+
+        // The state a DoViewChange merge leaves: head 3, parented on its
+        // checksum, with the hole at op 2 still unfilled locally.
+        partition.consensus().sequencer().set_sequence(3);
+        partition.consensus().set_last_prepare_checksum(CHECKSUM_3);
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(2, CHECKSUM_1, CHECKSUM_2))
+            .await;
+
+        assert!(
+            partition.log.journal().inner.header_by_op(2).is_some(),
+            "the backfill must be journaled"
+        );
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 3);
+        assert_eq!(
+            partition.consensus().last_prepare_checksum(),
+            CHECKSUM_3,
+            "a lower backfill must not rewind the parent of the next prepare"
+        );
+    }
+
+    #[compio::test]
+    async fn given_gap_closure_when_applying_repaired_prepare_should_adopt_new_head_checksum() {
+        // The frame that closes a gap is not the new head: the frontier walks
+        // to the highest contiguous op and the checksum must come from THAT
+        // journal entry, not from the repair frame that happened to arrive
+        // last.
+        const CHECKSUM_1: u128 = 0x11;
+        const CHECKSUM_2: u128 = 0x22;
+        const CHECKSUM_3: u128 = 0x33;
+        let mut partition = test_partition();
+        partition.repair = Some(armed_session(3, 0, None));
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, CHECKSUM_1))
+            .await;
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(3, CHECKSUM_2, CHECKSUM_3))
+            .await;
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 1);
+        assert_eq!(partition.consensus().last_prepare_checksum(), CHECKSUM_1);
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(2, CHECKSUM_1, CHECKSUM_2))
+            .await;
+
+        assert_eq!(partition.consensus().sequencer().current_sequence(), 3);
+        assert_eq!(
+            partition.consensus().last_prepare_checksum(),
+            CHECKSUM_3,
+            "a gap closure must adopt the checksum of the new contiguous head"
+        );
+    }
+
+    #[compio::test]
+    async fn given_prior_view_repair_when_a_new_view_started_should_discard_it() {
+        let mut partition = test_partition();
+        partition.repair = Some(armed_fetch_session(0, 1, 0, None));
+        partition.consensus.set_view(1);
+
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(1, 0, 0x11))
+            .await;
+
+        assert!(
+            partition.repair.is_none(),
+            "the prior-view session is obsolete"
+        );
+        assert!(
+            partition.log.journal().inner.header_by_op(1).is_none(),
+            "a delayed prior-view body must not enter the new view's journal"
+        );
     }
 
     #[compio::test]
@@ -6598,6 +7044,89 @@ mod tests {
         );
         assert_eq!(partition.consensus().commit_min(), 0);
         assert!(partition.repair.is_none());
+    }
+
+    #[compio::test]
+    async fn given_empty_committed_window_with_a_suffix_fetch_should_escape_to_state_transfer() {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(5);
+        partition.repair = Some(armed_fetch_session(5, 9, 5, None));
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused { floor: 5, to_op: 5 },
+            "the uncommitted fetch ceiling must not postpone a definitive committed-floor refusal"
+        );
+        assert!(partition.repair.is_none());
+    }
+
+    /// A one-message `SendMessages` prepare for `op`, journaled through the
+    /// replicated-apply path (which stamps offsets and re-checksums), with the
+    /// sequencer advanced the way `on_replicate` does after a real append.
+    pub(super) async fn journal_send_batch(partition: &mut IggyPartition<IggyMessageBus>, op: u64) {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let record = build_segment_record(namespace, 0);
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let total = header_size + record.len();
+        let mut message = Message::<PrepareHeader>::new(total);
+        message.as_mut_slice()[header_size..].copy_from_slice(&record);
+        let message = message.transmute_header(|_, header: &mut PrepareHeader| {
+            header.command = Command::Prepare;
+            header.operation = Operation::SendMessages;
+            header.op = op;
+            header.timestamp = op;
+            header.group = namespace.inner();
+            header.size = u32::try_from(total).expect("prepare size fits u32");
+        });
+        partition
+            .apply_replicated_operation(message)
+            .await
+            .expect("journal send batch");
+        partition.consensus().sequencer().set_sequence(op);
+    }
+
+    #[compio::test]
+    async fn given_committed_suffix_evicted_when_completing_repair_should_close_the_session() {
+        // A successful suffix repair is what lets the group commit past
+        // `commit_to_op`, and the commit walk's flush then evicts exactly the
+        // suffix headers. The completion verdict must survive that eviction:
+        // judged from resident headers alone, the fully successful session
+        // would report itself incomplete forever, stay armed, and block every
+        // later re-arm for this partition until a view change.
+        let mut partition = test_partition();
+        for op in 1..=3 {
+            journal_send_batch(&mut partition, op).await;
+        }
+        partition.consensus().advance_commit_max(3);
+        partition.repair = Some(armed_fetch_session(2, 3, 0, Some(0)));
+        partition.commit_journal(&repair_config()).await;
+        let _ = partition.log.journal().inner.evict_prefix(3).await;
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::Done);
+        assert!(
+            partition.repair.is_none(),
+            "a fully committed suffix fetch must not stay armed after its \
+             headers are flushed out of the resident journal"
+        );
+    }
+
+    #[compio::test]
+    async fn given_suffix_fetch_when_its_view_is_discarded_should_clear_the_session() {
+        let mut partition = test_partition();
+        partition.repair = Some(armed_fetch_session(0, 3, 0, None));
+        partition.consensus.set_view(1);
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::Done);
+        assert!(
+            partition.repair.is_none(),
+            "a discarded view must not leave its suffix fetch blocking future repair"
+        );
     }
 
     #[compio::test]
@@ -6913,7 +7442,7 @@ mod tests {
     #[test]
     fn given_result_framed_operation_when_committed_should_reply_empty_result_section() {
         assert_eq!(
-            &committed_reply_body(Operation::StoreConsumerOffset2)[..],
+            &committed_reply_body(Operation::StoreConsumerOffset)[..],
             &[0, 0, 0, 0]
         );
     }
@@ -6921,6 +7450,350 @@ mod tests {
     #[test]
     fn given_unframed_operation_when_committed_should_reply_empty_body() {
         assert!(committed_reply_body(Operation::DeleteSegments).is_empty());
+    }
+
+    /// Every write to this device fails with `ENOSPC`, which is how the
+    /// persist failure cases below inject a fault into one half of the flush
+    /// without any production-side plumbing.
+    #[cfg(target_os = "linux")]
+    const DEV_FULL: &str = "/dev/full";
+
+    const FIRST_PAYLOAD: &[u8] = b"first-chunk";
+    const SECOND_PAYLOAD: &[u8] = b"second-chunk-is-longer";
+
+    /// Partition whose active segment carries real writers over the given
+    /// paths, both with fsync on. Point either path at [`DEV_FULL`] to make
+    /// that half's save fail.
+    struct PersistFixture {
+        partition: IggyPartition<IggyMessageBus>,
+        log_cursor: Rc<AtomicU64>,
+        index_cursor: Rc<AtomicU64>,
+    }
+
+    impl PersistFixture {
+        async fn new(log_path: &str, index_path: &str) -> Self {
+            let log_cursor = Rc::new(AtomicU64::new(0));
+            let index_cursor = Rc::new(AtomicU64::new(0));
+            let messages_writer =
+                MessagesWriter::new(log_path, log_cursor.clone(), true, false, None)
+                    .await
+                    .expect("open segment log writer");
+            let index_writer = IggyIndexWriter::new(index_path, index_cursor.clone(), true, false)
+                .await
+                .expect("open segment index writer");
+
+            let mut partition = test_partition();
+            partition.log.add_persisted_segment(
+                Segment::new(0, IggyByteSize::from(1024 * 1024_u64)),
+                SegmentStorage::default(),
+                Some(Rc::new(messages_writer)),
+                Some(Rc::new(index_writer)),
+            );
+
+            Self {
+                partition,
+                log_cursor,
+                index_cursor,
+            }
+        }
+
+        /// Mirrors one `commit_messages` chunk: the sparse entry addresses the
+        /// byte the batch is about to land on, taken from the segment size the
+        /// way production takes it, so a second persist can only index
+        /// correctly if the first one advanced the segment in step with the
+        /// writer's cursor.
+        async fn persist(&mut self, payload: &[u8], offset: u64) -> Result<(), IggyError> {
+            let index = IggyIndex::new(offset, offset + 1, self.segment_size());
+            self.partition
+                .persist_frozen_batches_to_disk(
+                    vec![prepare_framed(payload)],
+                    IggyIndexCache::serialize(&index),
+                    1,
+                )
+                .await
+        }
+
+        fn cursors(&self) -> (u64, u64) {
+            (
+                self.log_cursor.load(Ordering::Relaxed),
+                self.index_cursor.load(Ordering::Relaxed),
+            )
+        }
+
+        fn segment_size(&self) -> u64 {
+            self.partition.log.active_segment().size.as_bytes_u64()
+        }
+    }
+
+    /// Journaled entry in the shape the persist path expects: a `PrepareHeader`
+    /// prefix it strips, followed by the bytes that reach the segment file.
+    fn prepare_framed(payload: &[u8]) -> Frozen<4096> {
+        let mut bytes = vec![0u8; size_of::<PrepareHeader>()];
+        bytes.extend_from_slice(payload);
+        Owned::<4096>::copy_from_slice(&bytes).into()
+    }
+
+    fn file_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path).expect("stat file").len()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_index_save_failure_when_persisting_should_leave_both_cursors_and_segment_size_untouched()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let mut fixture =
+            PersistFixture::new(log_path.to_str().expect("utf-8 path"), DEV_FULL).await;
+
+        let result = fixture.persist(FIRST_PAYLOAD, 0).await;
+
+        assert!(
+            matches!(result, Err(IggyError::CannotSaveIndexToSegment)),
+            "index save over {DEV_FULL} must fail, got {result:?}"
+        );
+        assert_eq!(
+            file_len(&log_path),
+            FIRST_PAYLOAD.len() as u64,
+            "the segment bytes landed; only the cursor is withheld"
+        );
+        assert_eq!(
+            fixture.cursors(),
+            (0, 0),
+            "neither cursor may advance when the index half failed"
+        );
+        assert_eq!(fixture.segment_size(), 0, "segment size must not advance");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_log_save_failure_when_persisting_should_leave_both_cursors_and_segment_size_untouched()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let index_path = dir.path().join("segment.index");
+        let mut fixture =
+            PersistFixture::new(DEV_FULL, index_path.to_str().expect("utf-8 path")).await;
+
+        let result = fixture.persist(FIRST_PAYLOAD, 0).await;
+
+        assert!(
+            matches!(result, Err(IggyError::CannotWriteToFile)),
+            "segment save over {DEV_FULL} must fail, got {result:?}"
+        );
+        assert_eq!(
+            file_len(&index_path),
+            IGGY_INDEX_SIZE as u64,
+            "the index entry landed; only the cursor is withheld"
+        );
+        assert_eq!(
+            fixture.cursors(),
+            (0, 0),
+            "neither cursor may advance when the segment half failed"
+        );
+        assert_eq!(fixture.segment_size(), 0, "segment size must not advance");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_both_saves_failing_when_persisting_should_leave_both_cursors_untouched() {
+        let mut fixture = PersistFixture::new(DEV_FULL, DEV_FULL).await;
+
+        let result = fixture.persist(FIRST_PAYLOAD, 0).await;
+
+        assert!(
+            matches!(result, Err(IggyError::CannotWriteToFile)),
+            "a failed segment save must win over the index error, got {result:?}"
+        );
+        assert_eq!(fixture.cursors(), (0, 0), "no cursor may advance");
+        assert_eq!(fixture.segment_size(), 0, "segment size must not advance");
+    }
+
+    /// The two saves run concurrently, so each must read its own cursor
+    /// without observing the other's advance: the second chunk lands exactly
+    /// where the first one ended, and its index entry says so.
+    #[compio::test]
+    async fn given_two_successful_persists_when_reading_back_should_place_second_chunk_at_first_chunk_end()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let index_path = dir.path().join("segment.index");
+        let mut fixture = PersistFixture::new(
+            log_path.to_str().expect("utf-8 path"),
+            index_path.to_str().expect("utf-8 path"),
+        )
+        .await;
+
+        fixture
+            .persist(FIRST_PAYLOAD, 0)
+            .await
+            .expect("first persist");
+        fixture
+            .persist(SECOND_PAYLOAD, 7)
+            .await
+            .expect("second persist");
+
+        let log_bytes = (FIRST_PAYLOAD.len() + SECOND_PAYLOAD.len()) as u64;
+        let index_bytes = 2 * IGGY_INDEX_SIZE as u64;
+        assert_eq!(
+            fixture.cursors(),
+            (log_bytes, index_bytes),
+            "both cursors must cover both persists"
+        );
+        assert_eq!(file_len(&log_path), log_bytes, "segment file length");
+        assert_eq!(file_len(&index_path), index_bytes, "index file length");
+        assert_eq!(fixture.segment_size(), log_bytes, "segment size");
+
+        let reader = IggyIndexReader::new(index_path.to_str().expect("utf-8 path"))
+            .await
+            .expect("open index reader");
+        let last = reader
+            .load_last()
+            .await
+            .expect("read last index entry")
+            .expect("index entry present");
+        assert_eq!(
+            last,
+            IggyIndex::new(7, 8, FIRST_PAYLOAD.len() as u64),
+            "the second entry must address the first chunk's end"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_a_persist_failure_on_a_committed_op_should_fence_the_partition_not_panic() {
+        // The op is cluster-committed and the local write cannot be made, so
+        // the replica is divergent. This used to `panic!`, which the pump
+        // task swallows: the shard stopped serving every partition it owned
+        // while the process reported healthy. The partition must fence itself
+        // instead, so the shard's tick can see the fault and stop the server.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let log_cursor = Rc::new(AtomicU64::new(0));
+        let index_cursor = Rc::new(AtomicU64::new(0));
+        let messages_writer = MessagesWriter::new(
+            log_path.to_str().expect("utf-8 path"),
+            log_cursor,
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("open segment log writer");
+        // The index half writes to a device that is always full, so the
+        // persist fails the way a full disk fails.
+        let index_writer = IggyIndexWriter::new(DEV_FULL, index_cursor, true, false)
+            .await
+            .expect("open segment index writer");
+
+        let mut partition = test_partition();
+        partition.log.add_persisted_segment(
+            Segment::new(0, IggyByteSize::from(1024 * 1024_u64)),
+            SegmentStorage::default(),
+            Some(Rc::new(messages_writer)),
+            Some(Rc::new(index_writer)),
+        );
+
+        journal_send_batch(&mut partition, 1).await;
+        partition.consensus().advance_commit_max(1);
+
+        // Would abort the test process before the fence existed.
+        partition.commit_journal(&repair_config()).await;
+
+        let fault = partition
+            .fatal()
+            .expect("a failed commit of a cluster-committed op must fence the partition");
+        assert_eq!(fault.op, 1);
+        assert_eq!(fault.operation, Operation::SendMessages);
+
+        // The fence holds: a fenced partition must not advance again, or the
+        // pump's tail drain walks it into the `advance_commit_min` assert.
+        let commit_min = partition.consensus().commit_min();
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(
+            partition.consensus().commit_min(),
+            commit_min,
+            "a fenced partition must not advance on a later commit"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_shutdown_flush_failure_when_fencing_should_keep_an_earlier_commit_fault() {
+        let mut partition = test_partition();
+
+        // A flush failure on a healthy partition fences it, so the pump's
+        // post-flush scan turns the exit non-zero instead of reporting a
+        // clean shutdown over unpersisted cluster-committed data.
+        partition.fence_flush_failure();
+        let fault = partition
+            .fatal()
+            .expect("a failed shutdown flush must fence the partition");
+        assert_eq!(fault.op, partition.consensus().commit_min());
+        assert_eq!(fault.operation, Operation::SendMessages);
+
+        // A partition the commit path already fenced keeps that fault: it
+        // names the op that first diverged.
+        let commit_fault = FatalCommit {
+            namespace_raw: fault.namespace_raw,
+            op: 42,
+            operation: Operation::StoreConsumerOffset,
+        };
+        partition.fatal = Some(commit_fault);
+        partition.fence_flush_failure();
+        let kept = partition.fatal().expect("the fence must hold");
+        assert_eq!(kept.op, 42);
+        assert_eq!(kept.operation, Operation::StoreConsumerOffset);
+    }
+
+    /// A half that failed never advanced its cursor, so the retry rewrites
+    /// the same positions: one copy of the batch, one index entry.
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_failed_persist_when_retried_with_a_healthy_writer_should_overwrite_the_same_positions()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let index_path = dir.path().join("segment.index");
+        let mut fixture =
+            PersistFixture::new(log_path.to_str().expect("utf-8 path"), DEV_FULL).await;
+
+        assert!(
+            fixture.persist(FIRST_PAYLOAD, 0).await.is_err(),
+            "index save over {DEV_FULL} must fail"
+        );
+
+        // The committed prefix stays resident, so the retry re-persists the
+        // identical bytes; only the broken index writer is swapped out.
+        let index_writer = IggyIndexWriter::new(
+            index_path.to_str().expect("utf-8 path"),
+            fixture.index_cursor.clone(),
+            true,
+            false,
+        )
+        .await
+        .expect("open replacement index writer");
+        let active = fixture.partition.log.index_writers().len() - 1;
+        fixture.partition.log.index_writers_mut()[active] = Some(Rc::new(index_writer));
+
+        fixture
+            .persist(FIRST_PAYLOAD, 0)
+            .await
+            .expect("retry persist");
+
+        assert_eq!(
+            file_len(&log_path),
+            FIRST_PAYLOAD.len() as u64,
+            "the retry must overwrite the batch, not append a second copy"
+        );
+        assert_eq!(
+            file_len(&index_path),
+            IGGY_INDEX_SIZE as u64,
+            "the retry must write exactly one index entry"
+        );
+        assert_eq!(
+            fixture.cursors(),
+            (FIRST_PAYLOAD.len() as u64, IGGY_INDEX_SIZE as u64),
+            "both cursors must advance once the retry succeeded"
+        );
     }
 }
 
@@ -6941,6 +7814,68 @@ mod retention_tests {
 
     fn one_second() -> IggyExpiry {
         IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1)))
+    }
+
+    /// Shape of one sealed segment in the [`partition_with_sealed_run`] fixture.
+    const MESSAGES_PER_SEGMENT: u64 = 10;
+    const BYTES_PER_SEGMENT: u64 = 100;
+
+    /// A topic's configured segment size, and the largest batch that can be
+    /// appended to it.
+    const SEGMENT_SIZE: u64 = 1_000;
+    const MAX_BATCH_SIZE: u64 = 100;
+    /// The size a sealed segment actually reaches. The batch that crosses
+    /// `SEGMENT_SIZE` is appended whole, so a sealed segment closes somewhere
+    /// in `[SEGMENT_SIZE, SEGMENT_SIZE + MAX_BATCH_SIZE)`. Retention asserted
+    /// at exactly `SEGMENT_SIZE` would miss that entirely.
+    const SEALED_SIZE: u64 = SEGMENT_SIZE + 40;
+    /// What the cleaner enforces for a cap of one segment: the per-partition
+    /// share, floored at the largest a sealed segment can be.
+    const FLOORED_BUDGET: u64 = SEGMENT_SIZE + MAX_BATCH_SIZE;
+
+    fn sealed_run_segment(start_offset: u64) -> Segment {
+        let mut segment = segment(
+            start_offset + MESSAGES_PER_SEGMENT - 1,
+            1,
+            BYTES_PER_SEGMENT,
+            true,
+        );
+        segment.start_offset = start_offset;
+        segment
+    }
+
+    /// Partition whose log is `sealed_count` sealed segments followed by the
+    /// active one, with stats seeded to match. Every storage is the in-memory
+    /// default (no reader, so no path), which is what lets retirement run its
+    /// full body here without touching the filesystem.
+    fn partition_with_sealed_run(sealed_count: u64) -> IggyPartition<IggyMessageBus> {
+        let mut partition = super::tests::test_partition();
+        // The fixture ships one unsealed segment: rewrite it as the head of the
+        // run and append a fresh active segment last, where the removal walk
+        // always stops.
+        partition.log.segments_mut()[0] = sealed_run_segment(0);
+        for index in 1..sealed_count {
+            partition.log.add_persisted_segment(
+                sealed_run_segment(index * MESSAGES_PER_SEGMENT),
+                SegmentStorage::default(),
+                None,
+                None,
+            );
+        }
+        partition.log.add_persisted_segment(
+            Segment::new(
+                sealed_count * MESSAGES_PER_SEGMENT,
+                IggyByteSize::from(0u64),
+            ),
+            SegmentStorage::default(),
+            None,
+            None,
+        );
+        let stats = &partition.stats;
+        stats.increment_segments_count(u32::try_from(sealed_count).expect("run fits a u32"));
+        stats.increment_messages_count(sealed_count * MESSAGES_PER_SEGMENT);
+        stats.increment_size_bytes(sealed_count * BYTES_PER_SEGMENT);
+        partition
     }
 
     #[test]
@@ -6990,15 +7925,15 @@ mod retention_tests {
 
     #[test]
     fn leading_oversized_end_trims_oldest_until_under_budget() {
-        // 4 x 100 = 400 resident, active excluded. Budget 250: drop seg0 (300
-        // left) then seg1 (200 <= 250, stop). up_to = seg1.end_offset.
+        // 3 x 100 = 300 SEALED resident, the active segment's bytes excluded.
+        // Budget 250: drop seg0 (200 <= 250, stop). up_to = seg0.end_offset.
         let segments = vec![
             segment(9, 1, 100, true),
             segment(19, 2, 100, true),
             segment(29, 3, 100, true),
             segment(39, 0, 100, false),
         ];
-        assert_eq!(leading_oversized_end(&segments, 250), Some(19));
+        assert_eq!(leading_oversized_end(&segments, 250), Some(9));
     }
 
     #[test]
@@ -7011,6 +7946,38 @@ mod retention_tests {
     fn leading_oversized_end_never_drops_active_segment() {
         let segments = vec![segment(9, 1, 1_000, false)];
         assert_eq!(leading_oversized_end(&segments, 10), None);
+    }
+
+    #[test]
+    fn leading_oversized_end_retains_an_overshot_sealed_segment_at_the_floored_budget() {
+        // The shape admission accepts at the floor: max_topic_size == one
+        // segment. The sealed segment overshot, and the active one holds far
+        // more than the budget. Counting the active segment, or dividing the
+        // cap without a floor, deletes the only history this partition has.
+        let segments = vec![
+            segment(9, 1, SEALED_SIZE, true),
+            segment(19, 0, SEGMENT_SIZE * 5, false),
+        ];
+        assert_eq!(leading_oversized_end(&segments, FLOORED_BUDGET), None);
+        // The same segments against the UNFLOORED share, which is what a cap of
+        // one segment divides into. It is under what a sealed segment reaches,
+        // so the history goes -- which is why the budget carries a floor.
+        assert_eq!(leading_oversized_end(&segments, SEGMENT_SIZE), Some(9));
+    }
+
+    #[test]
+    fn leading_oversized_end_still_drops_the_oldest_once_two_sealed_segments_exceed_the_budget() {
+        // Same budget, one sealed segment more: the cap is real, not disabled.
+        let segments = vec![
+            segment(9, 1, SEALED_SIZE, true),
+            segment(19, 2, SEALED_SIZE, true),
+            segment(29, 0, SEGMENT_SIZE * 5, false),
+        ];
+        assert_eq!(
+            leading_oversized_end(&segments, FLOORED_BUDGET),
+            Some(9),
+            "the oldest sealed segment goes, the newest one stays"
+        );
     }
 
     #[test]
@@ -7044,13 +8011,80 @@ mod retention_tests {
         let segments = vec![segment(9, 1, 100, false)];
         assert_eq!(nth_oldest_sealed_end(&segments, 1), None);
     }
+
+    #[compio::test]
+    async fn removal_spends_the_per_pass_budget_and_resumes_on_the_next_pass() {
+        let budget = u64::try_from(SEGMENT_REMOVAL_BUDGET_PER_PASS).expect("budget fits a u64");
+        let sealed_count = budget + 3;
+        let mut partition = partition_with_sealed_run(sealed_count);
+        // The whole run qualifies: every sealed segment ends at or below
+        // `up_to`, and a partition nobody has committed against has no barrier.
+        let up_to = sealed_count * MESSAGES_PER_SEGMENT - 1;
+        let segments_len = |partition: &IggyPartition<IggyMessageBus>| {
+            u64::try_from(partition.log.segments().len()).expect("log fits a u64")
+        };
+
+        let removal = partition.remove_sealed_segments_up_to(up_to).await;
+        assert_eq!(removal.segments, budget, "one pass stops at the budget");
+        assert_eq!(removal.messages, budget * MESSAGES_PER_SEGMENT);
+        assert!(
+            removal.budget_spent,
+            "a pass that stopped on the budget must ask to be re-staged"
+        );
+        assert_eq!(segments_len(&partition), sealed_count + 1 - budget);
+        assert_eq!(
+            partition.log.segments()[0].start_offset,
+            budget * MESSAGES_PER_SEGMENT,
+            "the surviving run starts where the budget stopped"
+        );
+
+        let remainder = sealed_count - budget;
+        let removal = partition.remove_sealed_segments_up_to(up_to).await;
+        assert_eq!(
+            removal.segments, remainder,
+            "a later pass finishes the run it was handed"
+        );
+        assert_eq!(removal.messages, remainder * MESSAGES_PER_SEGMENT);
+        assert!(
+            !removal.budget_spent,
+            "a pass that drained the run must not re-stage"
+        );
+        assert_eq!(
+            segments_len(&partition),
+            1,
+            "only the active segment survives"
+        );
+
+        let stats = &partition.stats;
+        assert_eq!(stats.segments_count_inconsistent(), 1);
+        assert_eq!(stats.messages_count_inconsistent(), 0);
+        assert_eq!(stats.size_bytes_inconsistent(), 0);
+        assert_eq!(
+            partition.remove_sealed_segments_up_to(up_to).await,
+            SegmentRemoval::default(),
+            "a converged partition removes nothing"
+        );
+
+        // A run that ends exactly on the budget is finished by the pass that
+        // spends it; re-staging would hand the pump a no-op frame.
+        let mut exact = partition_with_sealed_run(budget);
+        let removal = exact
+            .remove_sealed_segments_up_to(budget * MESSAGES_PER_SEGMENT - 1)
+            .await;
+        assert_eq!(removal.segments, budget, "the whole run goes in one pass");
+        assert!(
+            !removal.budget_spent,
+            "a run that ends on the budget has nothing left to re-stage"
+        );
+        assert_eq!(segments_len(&exact), 1, "only the active segment survives");
+    }
 }
 
 #[cfg(test)]
 mod purge_floor_tests {
-    use super::tests::{build_segment_record, repair_config, test_partition};
+    use super::tests::{build_segment_record, journal_send_batch, repair_config, test_partition};
     use super::*;
-    use iggy_binary_protocol::{Command2, WireConsumer, WireEncode};
+    use iggy_binary_protocol::{Command, WireConsumer, WireEncode};
 
     /// Fresh temp dir wired as the partition dir, so `purge()` can recreate
     /// real segment files and write `purge.gen`.
@@ -7069,32 +8103,7 @@ mod purge_floor_tests {
         (partition, dir)
     }
 
-    /// A one-message `SendMessages` prepare for `op`, journaled through the
-    /// replicated-apply path (which stamps offsets and re-checksums), with the
-    /// sequencer advanced the way `on_replicate` does after a real append.
-    async fn journal_send_batch(partition: &mut IggyPartition<IggyMessageBus>, op: u64) {
-        let namespace = IggyNamespace::new(1, 1, 0);
-        let record = build_segment_record(namespace, 0);
-        let header_size = std::mem::size_of::<PrepareHeader>();
-        let total = header_size + record.len();
-        let mut message = Message::<PrepareHeader>::new(total);
-        message.as_mut_slice()[header_size..].copy_from_slice(&record);
-        let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
-            header.operation = Operation::SendMessages;
-            header.op = op;
-            header.timestamp = op;
-            header.group = namespace.inner();
-            header.size = u32::try_from(total).expect("prepare size fits u32");
-        });
-        partition
-            .apply_replicated_operation(message)
-            .await
-            .expect("journal send batch");
-        partition.consensus().sequencer().set_sequence(op);
-    }
-
-    /// A `StoreConsumerOffset2` prepare for `op`, journaled and staged through
+    /// A `StoreConsumerOffset` prepare for `op`, journaled and staged through
     /// the replicated-apply path.
     async fn journal_store_offset(
         partition: &mut IggyPartition<IggyMessageBus>,
@@ -7102,7 +8111,7 @@ mod purge_floor_tests {
         consumer_id: u32,
         offset: u64,
     ) {
-        let body = StoreConsumerOffset2Request {
+        let body = StoreConsumerOffsetRequest {
             consumer: WireConsumer::consumer(WireIdentifier::Numeric(consumer_id)),
             stream_id: WireIdentifier::Numeric(1),
             topic_id: WireIdentifier::Numeric(1),
@@ -7116,8 +8125,8 @@ mod purge_floor_tests {
         let mut message = Message::<PrepareHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&body);
         let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
-            header.operation = Operation::StoreConsumerOffset2;
+            header.command = Command::Prepare;
+            header.operation = Operation::StoreConsumerOffset;
             header.op = op;
             header.group = IggyNamespace::new(1, 1, 0).inner();
             header.size = u32::try_from(total).expect("prepare size fits u32");
@@ -7446,7 +8455,7 @@ mod purge_floor_tests {
         let mut message = Message::<PrepareHeader>::new(total);
         message.as_mut_slice()[header_size..].copy_from_slice(&record);
         let message = message.transmute_header(|_, header: &mut PrepareHeader| {
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = Operation::SendMessages;
             header.op = 1;
             header.group = namespace.inner();

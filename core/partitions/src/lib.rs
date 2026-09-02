@@ -36,7 +36,7 @@ use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, PurgeError};
+pub use iggy_partition::{IggyPartition, PurgeError, SegmentRemoval};
 pub use iggy_partitions::IggyPartitions;
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 pub use messages_writer::MessagesWriter;
@@ -44,12 +44,36 @@ pub use offset_storage::delete_persisted_offset;
 pub use poll_plan::{AutoCommitApplied, PollPlan};
 pub use segment::Segment;
 use server_common::Message;
-pub use server_common::send_messages2::{IggyMessage2, IggyMessage2Header, IggyMessages2};
+pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use types::{
-    AppendResult, Fragment, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
-    PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,
-    SendMessagesResult,
+    AppendResult, FatalCommit, Fragment, PartitionOffsets, PartitionPathLayout, PartitionsConfig,
+    PollFragments, PollQueryResult, PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS,
+    RepairConclusion, RepairSession, SendMessagesResult,
 };
+
+/// A partition's message log, named so a caller can carry one across a rebuild.
+///
+/// Exists for the simulator, which has no segment files and so must hold the log
+/// itself for a restarted replica to come back with its data (see
+/// [`IggyPartition::adopt_retained_log`]). Names the only journal
+/// `IggyPartition::log` is instantiated with rather than widening anything.
+#[cfg(any(test, feature = "simulator"))]
+pub type RetainedPartitionLog =
+    log::SegmentedLog<journal::PartitionJournal<journal::PartitionJournalMemStorage>>;
+
+/// Everything a partition hands its own next incarnation across a simulated
+/// restart.
+#[cfg(any(test, feature = "simulator"))]
+pub struct RetainedPartitionState {
+    pub log: RetainedPartitionLog,
+    /// Offset counter the previous incarnation had proved durable.
+    pub durable_offset: u64,
+    /// Highest offset it had written, durable or not.
+    pub write_offset: u64,
+    /// Whether that incarnation ever stamped an offset, i.e. whether the two
+    /// numbers above describe an offset space at all.
+    pub offset_space_used: bool,
+}
 
 /// Partition-level data plane operations.
 ///

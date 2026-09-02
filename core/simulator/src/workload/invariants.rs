@@ -24,6 +24,7 @@
 //! unchanged.
 
 use crate::Simulator;
+use crate::workload::state_checker::StateChecker;
 use crate::workload::{CLIENT_REQUEST_QUEUE_MAX, Workload};
 use server_common::sharding::IggyNamespace;
 use std::collections::HashMap;
@@ -34,6 +35,9 @@ use std::collections::HashMap;
 pub struct Invariants {
     commit_offset: HashMap<(u8, IggyNamespace), u64>,
     view: HashMap<(u8, IggyNamespace), u64>,
+    /// Cross-replica committed-log agreement. Runs every tick like the rest, so a
+    /// divergence is reported where it appears rather than at the next quiesce.
+    state_checker: StateChecker,
 }
 
 impl Invariants {
@@ -49,10 +53,15 @@ impl Invariants {
     /// - consensus `view` never regresses (a view change only advances it).
     ///
     /// Globally:
-    /// - total in-flight requests stay within the per-client queue ceiling.
+    /// - total in-flight requests stay within the per-client queue ceiling,
+    /// - live replicas agree on every committed metadata op they share, and the
+    ///   committed chain stays hash-linked (see [`StateChecker`]).
     ///
-    /// Crashed replicas are skipped: their last-seen marks are retained, which
-    /// stays correct because both quantities are monotonic across a restart.
+    /// Crashed replicas are skipped and their last-seen marks retained, which
+    /// holds across a restart for both quantities: the superblock carries `view`,
+    /// and `Simulator::retain_partition_logs` carries each partition's log so a
+    /// rebuilt partition recovers its offsets instead of reporting zero. Without
+    /// that the check trips on a discarded log and calls it a regression.
     ///
     /// # Panics
     /// On any regression or in-flight overflow. The workload seed is in the
@@ -89,14 +98,16 @@ impl Invariants {
              (client_count={}, queue_max={CLIENT_REQUEST_QUEUE_MAX}) (seed={seed:#x})",
             workload.options.client_count,
         );
+
+        self.state_checker.check(sim, seed);
     }
 
-    /// Number of `(replica, namespace)` pairs observed so far. Used by tests to
-    /// prove the checks ran over live state rather than vacuously.
-    #[cfg(test)]
+    /// The canonical committed chain built so far. Tests read it to prove the
+    /// equality check compared replicas against each other rather than passing
+    /// over an empty chain.
     #[must_use]
-    pub(crate) fn tracked_pairs(&self) -> usize {
-        self.commit_offset.len()
+    pub const fn state_checker(&self) -> &StateChecker {
+        &self.state_checker
     }
 }
 

@@ -73,6 +73,24 @@ public interface IIggySystem
     Task<StatsResponse?> GetStatsAsync(CancellationToken token = default);
 
     /// <summary>
+    ///     Retrieves the option catalog for a resource scope: every key its create
+    ///     command accepts, with the kind, default and bounds of each.
+    /// </summary>
+    /// <remarks>
+    ///     This is the discovery surface for options. A key outside the catalog is
+    ///     refused at create, and binary transports carry only the error code, so a
+    ///     client has no other way to learn which keys this server knows. Available
+    ///     only for TCP.
+    /// </remarks>
+    /// <param name="scope">The resource whose catalog to describe.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>
+    ///     A task that represents the asynchronous operation and returns the catalog
+    ///     entries, empty for a scope with no keys yet.
+    /// </returns>
+    Task<IReadOnlyList<OptionSpec>> DescribeOptionsAsync(OptionsScope scope, CancellationToken token = default);
+
+    /// <summary>
     ///     Retrieves cluster metadata including node information and connection information.
     /// </summary>
     /// <remarks>

@@ -19,7 +19,7 @@
 //! live username from the shadow). Status fixed at 1 (Active).
 
 use iggy_binary_protocol::RoutedRequestHeader;
-use rand_xoshiro::Xoshiro256Plus;
+use rand_xoshiro::Xoshiro256PlusPlus;
 use server_common::Message;
 
 use crate::client::SimClient;
@@ -41,15 +41,16 @@ pub const OUTCOMES: &[Outcome] = &[Outcome::Ok, Outcome::UserAlreadyExists];
 pub fn sample(
     shadow: &mut Shadow,
     outcome: Outcome,
-    prng: &mut Xoshiro256Plus,
+    prng: &mut Xoshiro256PlusPlus,
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     let username = match outcome {
         Outcome::Ok => shadow.fresh_name("user"),
         Outcome::UserAlreadyExists => shadow.pick_user_name(prng)?,
-        // Not a targeted outcome (absent from `OUTCOMES`); the shadow only ever
-        // mints in-bounds names, so an invalid-length username is never sampled.
-        Outcome::InvalidUsername => return None,
+        // Not targeted outcomes (absent from `OUTCOMES`); the shadow only ever
+        // mints in-bounds names, and the sim client never sends an options
+        // block.
+        Outcome::InvalidUsername | Outcome::InvalidOptionValue => return None,
     };
     Some(Input {
         password: format!("pw-{username}"),
@@ -78,6 +79,8 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::AddUser {
             name: input.username.clone(),
         },
-        Outcome::UserAlreadyExists | Outcome::InvalidUsername => Effect::None,
+        Outcome::UserAlreadyExists | Outcome::InvalidUsername | Outcome::InvalidOptionValue => {
+            Effect::None
+        }
     }
 }

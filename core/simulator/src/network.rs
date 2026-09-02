@@ -18,13 +18,14 @@
 //! Network abstraction layer for the cluster simulator.
 //!
 //! **Note:** Currently a thin passthrough over `PacketSimulator`. Once the
-//! Cluster and [`MessageBus`] layers are built, this will own
+//! Cluster and [`MessageBus`](message_bus::MessageBus) layers are built, this will own
 //! process-to-bus routing, and node enable/disable logic.
 
 use crate::packet::{
-    ALLOW_ALL, BLOCK_ALL, LinkFilter, Packet, PacketSimulator, PacketSimulatorOptions, ProcessId,
+    ALLOW_ALL, BLOCK_ALL, COMMAND_COUNT_MAX, LinkFilter, Packet, PacketSimulator,
+    PacketSimulatorOptions, ProcessId,
 };
-use iggy_binary_protocol::GenericHeader;
+use iggy_binary_protocol::{Command, GenericHeader};
 use server_common::Message;
 
 /// Network layer for the cluster simulation.
@@ -129,6 +130,11 @@ impl Network {
     ///
     /// **Warning:** resets all link filters to [`ALLOW_ALL`], including
     /// manually-set per-command filters.
+    /// End fault injection: see [`PacketSimulator::heal`].
+    pub fn heal(&mut self) {
+        self.simulator.heal();
+    }
+
     pub fn clear_partition(&mut self) {
         self.simulator.clear_partition();
     }
@@ -163,5 +169,18 @@ impl Network {
     #[must_use]
     pub fn packets_in_flight(&self) -> usize {
         self.simulator.packets_in_flight()
+    }
+
+    /// Packets delivered so far, per [`Command`] discriminant. Names come from
+    /// [`COMMAND_LABELS`](crate::packet::COMMAND_LABELS).
+    #[must_use]
+    pub const fn command_counts(&self) -> &[u64; COMMAND_COUNT_MAX] {
+        self.simulator.command_counts()
+    }
+
+    /// Whether any packet of this command reached its destination.
+    #[must_use]
+    pub const fn delivered_any(&self, command: Command) -> bool {
+        self.simulator.delivered_any(command)
     }
 }

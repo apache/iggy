@@ -23,6 +23,7 @@ from datetime import timedelta
 
 from apache_iggy import (
     AutoLogin,
+    Consumer,
     IggyClient,
     PollingStrategy,
     ReceiveMessage,
@@ -36,6 +37,7 @@ TOPIC_NAME = "sample-topic"
 STREAM_ID = 0
 TOPIC_ID = 0
 PARTITION_ID = 0
+CONSUMER_NAME = "sample-consumer"
 BATCHES_LIMIT = 5
 
 
@@ -150,6 +152,7 @@ async def consume_messages(client: IggyClient):
             polled_messages = await client.poll_messages(
                 stream=STREAM_NAME,
                 topic=TOPIC_NAME,
+                consumer=Consumer.Single(CONSUMER_NAME),
                 partition_id=PARTITION_ID,
                 polling_strategy=PollingStrategy.Next(),
                 count=messages_per_batch,

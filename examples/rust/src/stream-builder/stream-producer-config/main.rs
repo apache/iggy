@@ -37,9 +37,6 @@ async fn main() -> Result<(), IggyError> {
         // The more clients are reading concurrently, the more partitions you should create.
         // i.e. if you have 10 clients, you should create 10 partitions
         .topic_partitions_count(10)
-        // Optionally, you can set the replication factor for topic redundancy.
-        // There is a tradeoff between replication factor and performance, so you want to benchmark your setup.
-        .topic_replication_factor(2)
         // The max number of messages to send in a batch. The greater the batch size, the higher the throughput for bulk data.
         // Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
         // Note, this only applies to batch send messages. Single messages are sent immediately.
@@ -56,7 +53,7 @@ async fn main() -> Result<(), IggyError> {
         // The error can be related either to disconnecting from the server or to the server rejecting the messages.
         // Default is 3 retries with 1 second interval between them. Customize to your requirements.
         .send_retries_count(3)
-        .send_retries_interval(IggyDuration::new_from_secs(1))
+        .send_retries_interval(NonZeroIggyDuration::ONE_SECOND)
         // Optionally, set a custom client side encryptor for encrypting the messages' payloads. Currently only Aes256Gcm is supported.
         // Note, this is independent of server side encryption meaning you can add client encryption, server encryption, or both.
         // .encryptor( Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[1; 32])?)))

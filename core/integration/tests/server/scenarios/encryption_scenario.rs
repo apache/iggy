@@ -53,11 +53,11 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .create_topic(
             &Identifier::named(stream_name).unwrap(),
             topic_name,
-            partition_count,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(partition_count),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..eager_flush_options()
+            },
         )
         .await
         .unwrap();
@@ -346,11 +346,11 @@ async fn should_encrypt_and_decrypt_headers_with_client_side_encryption(
         .create_topic(
             &Identifier::named(&stream_name).unwrap(),
             topic_name,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..eager_flush_options()
+            },
         )
         .await
         .unwrap();
@@ -477,19 +477,19 @@ fn encryption_disabled() -> bool {
     false
 }
 
+/// The server flushes on the journal thresholds (there is no flush primitive),
+/// so force every committed batch straight to disk: the assertions below read
+/// the segment files directly. Both knobs are topic creation options now.
+fn eager_flush_options() -> TopicCreateOptions {
+    TopicCreateOptions {
+        enforce_fsync: Some(true),
+        messages_required_to_save: Some(1),
+        ..TopicCreateOptions::default()
+    }
+}
+
 fn build_server_config(encryption: bool) -> TestServerConfig {
     let mut extra_envs = HashMap::new();
-
-    // The server flushes on the journal thresholds (no flush primitive), so
-    // force every committed batch straight to disk for the on-disk asserts.
-    extra_envs.insert(
-        "IGGY_SYSTEM_PARTITION_MESSAGES_REQUIRED_TO_SAVE".to_string(),
-        "1".to_string(),
-    );
-    extra_envs.insert(
-        "IGGY_SYSTEM_PARTITION_ENFORCE_FSYNC".to_string(),
-        "true".to_string(),
-    );
 
     if encryption {
         extra_envs.insert(

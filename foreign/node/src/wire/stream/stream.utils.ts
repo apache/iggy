@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { toDate } from '../serialize.utils.js';
+import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
 
 /**
  * Stream information returned from the server.
@@ -33,7 +33,9 @@ export type Stream = {
   /** Total number of messages in the stream */
   messagesCount: bigint,
   /** Stream creation timestamp */
-  createdAt: Date
+  createdAt: Date,
+  /** Options the client explicitly sent at create */
+  options: ParsedOptions
 }
 
 /**
@@ -65,11 +67,13 @@ export const deserializeToStream = (r: Buffer, pos = 0): StreamDeserialized => {
   const messagesCount = r.readBigUint64LE(pos + 24);
   const nameLength = r.readUInt8(pos + 32);
   const name = r.subarray(pos + 33, pos + 33 + nameLength).toString();
+  const { bytesRead: optionsBytes, options } =
+    deserializePrefixedOptions(r, pos + 33 + nameLength);
 
   return {
-    bytesRead: 33 + nameLength,
+    bytesRead: 33 + nameLength + optionsBytes,
     data: {
-      id, name, topicsCount, messagesCount, sizeBytes, createdAt
+      id, name, topicsCount, messagesCount, sizeBytes, createdAt, options
     }
   };
 };

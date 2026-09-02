@@ -22,6 +22,8 @@ package org.apache.iggy.client.async;
 import org.apache.iggy.cluster.ClusterMetadata;
 import org.apache.iggy.system.ClientInfo;
 import org.apache.iggy.system.ClientInfoDetails;
+import org.apache.iggy.system.OptionSpec;
+import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.system.Stats;
 
 import java.util.List;
@@ -45,6 +47,18 @@ public interface SystemClient {
      * @return A CompletableFuture containing the cluster roster
      */
     CompletableFuture<ClusterMetadata> getClusterMetadata();
+
+    /**
+     * Describes the option catalog for a resource scope asynchronously.
+     *
+     * <p>This is how a client learns which option keys a create command accepts: a key outside the
+     * catalog is refused at create, and the binary transports carry only the error code back. A scope
+     * with no keys yet answers with an empty list.
+     *
+     * @param scope the resource whose catalog to describe
+     * @return A CompletableFuture containing the catalog entries
+     */
+    CompletableFuture<List<OptionSpec>> describeOptions(OptionsScope scope);
 
     /**
      * Gets information about the current client asynchronously.

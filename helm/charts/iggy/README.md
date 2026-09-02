@@ -15,8 +15,15 @@ A Helm chart for Apache Iggy server and web-ui
 
 Iggy server uses `io_uring` for high-performance async I/O. This requires:
 
-1. **IPC_LOCK capability** - For locking memory required by io_uring
-2. **Unconfined seccomp profile** - To allow io_uring syscalls
+1. **Linux kernel 5.19 or newer on the node**
+
+   * Shard rings require `IORING_SETUP_COOP_TASKRUN` and `IORING_SETUP_TASKRUN_FLAG`.
+   * Compio's asynchronous socket creation requires `IORING_OP_SOCKET`.
+   * Mainline Linux provides these features starting in 5.19.
+   * Older kernels fail during shard startup. The node kernel matters, not the container image.
+
+2. **IPC_LOCK capability** - For locking memory required by io_uring
+3. **Unconfined seccomp profile** - To allow io_uring syscalls
 
 These are configured by default for the Iggy server via the chart's root-level
 `securityContext` and `podSecurityContext`. The web UI uses `ui.securityContext`
@@ -210,6 +217,23 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 * `IGGY_TCP_ADDRESS=0.0.0.0:8090`
 * `IGGY_QUIC_ADDRESS=0.0.0.0:8080`
 
+A wildcard bind says which interfaces accept connections, not where clients
+reach the pod, so the server also needs the address to publish in cluster
+metadata. Server builds that carry the setting refuse to start without it;
+older ones, including the `0.7.0` this chart pins by default, have no such
+refusal and log the variable as unknown and ignored. Either way the chart
+sets `IGGY_NODE_ADVERTISED_ADDRESS` to the in-cluster Service DNS name;
+override it with `server.advertisedAddress` when clients arrive through a
+LoadBalancer or an Ingress.
+
+Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` yourself works too:
+the chart then leaves its own default out, so the variable is declared once.
+Give that entry a non-empty value; an empty one suppresses the chart default
+and reaches the server as unset, so the render fails instead.
+Setting it in `server.env` and in `server.advertisedAddress` at the same time
+is refused at render time rather than resolved silently, since only the
+`server.env` entry would take effect.
+
 ## Accessing the Server
 
 ### Port Forward
@@ -312,7 +336,8 @@ pre-commit install
 | podSecurityContext | object | `{"seccompProfile":{"type":"Unconfined"}}` | Pod security context (server uses io_uring, requires unconfined seccomp) |
 | resources | object | `{}` | Resource limits and requests for server |
 | securityContext | object | `{"capabilities":{"add":["IPC_LOCK"]}}` | Container security context (server requires IPC_LOCK for io_uring) |
-| server | object | `{"affinity":{},"enabled":true,"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":"0.7.0"},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
+| server | object | `{"advertisedAddress":"","affinity":{},"enabled":true,"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":"0.7.0"},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
+| server.advertisedAddress | string | `""` | Client-facing address published in cluster metadata. Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but setting both is refused at render time. Empty falls back to the in-cluster Service DNS name. |
 | server.affinity | object | `{}` | Affinity rules for server pods |
 | server.enabled | bool | `true` | Enable the Iggy server deployment |
 | server.env | list | `[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}]` | Environment variables for the server container |
@@ -338,6 +363,7 @@ pre-commit install
 | server.service.port | int | `3000` | Service port for the server |
 | server.service.type | string | `"ClusterIP"` | Service type for the server |
 | server.serviceMonitor.additionalLabels | object | `{}` | Additional labels for the ServiceMonitor |
+| server.serviceMonitor.authorization | object | `{}` | Authorization for the scrape request. The metrics endpoint requires a bearer credential (e.g. a personal access token stored in a Secret): authorization:   credentials:     name: iggy-metrics-token     key: token |
 | server.serviceMonitor.enabled | bool | `false` | Enable ServiceMonitor for Prometheus Operator |
 | server.serviceMonitor.honorLabels | bool | `false` | Honor labels from the target |
 | server.serviceMonitor.interval | string | `"30s"` | Scrape interval (fallback to Prometheus default) |

@@ -19,7 +19,7 @@ use crate::ffi;
 use bytes::Bytes;
 use iggy::prelude::{
     ConsumerGroupDetails as RustConsumerGroupDetails, IdKind, Identifier as RustIdentifier,
-    IggyMessage as RustIggyMessage, Partition as RustPartition,
+    IggyMessage as RustIggyMessage, OptionSpec as RustOptionSpec, Partition as RustPartition,
     PolledMessages as RustPolledMessages,
     SendMessagesConfirmationResponse as RustSendMessagesConfirmationResponse,
     SendMessagesResponse as RustSendMessagesResponse, Stream as RustStream,
@@ -34,9 +34,10 @@ use iggy_common::{
     ConsumerGroup as RustConsumerGroup, ConsumerGroupInfo as RustConsumerGroupInfo,
     ConsumerGroupMember as RustConsumerGroupMember, ConsumerOffsetInfo as RustConsumerOffsetInfo,
     GlobalPermissions as RustGlobalPermissions, HeaderEntry as RustHeaderEntry,
-    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, Permissions as RustPermissions,
-    Stats as RustStats, StreamPermissions as RustStreamPermissions,
+    HeaderField as RustHeaderField, HeaderKind as RustHeaderKind, IdentityInfo as RustIdentityInfo,
+    Permissions as RustPermissions, Stats as RustStats, StreamPermissions as RustStreamPermissions,
     TopicPermissions as RustTopicPermissions, TransportEndpoints as RustTransportEndpoints,
+    UserInfo as RustUserInfo, UserInfoDetails as RustUserInfoDetails, UserStatus as RustUserStatus,
 };
 use std::collections::BTreeMap;
 
@@ -124,6 +125,80 @@ impl TryFrom<Option<RustClientInfoDetails>> for ffi::ClientInfoDetails {
         match client {
             Some(client) => Ok(ffi::ClientInfoDetails::from(client)),
             None => Err("client not found".to_string()),
+        }
+    }
+}
+
+impl From<RustIdentityInfo> for ffi::LoginInfo {
+    fn from(identity: RustIdentityInfo) -> Self {
+        let has_access_token = identity.access_token.is_some();
+        let (access_token, access_token_expiry) = identity
+            .access_token
+            .map(|token| (token.token, token.expiry))
+            .unwrap_or_default();
+
+        ffi::LoginInfo {
+            user_id: identity.user_id,
+            has_access_token,
+            access_token,
+            access_token_expiry,
+        }
+    }
+}
+
+impl From<RustUserInfo> for ffi::UserInfo {
+    fn from(user: RustUserInfo) -> Self {
+        ffi::UserInfo {
+            id: user.id,
+            created_at: user.created_at.as_micros(),
+            status: ffi::UserStatus::from(user.status),
+            username: user.username,
+        }
+    }
+}
+
+impl From<RustUserInfoDetails> for ffi::UserInfoDetails {
+    fn from(user: RustUserInfoDetails) -> Self {
+        let has_permissions = user.permissions.is_some();
+        ffi::UserInfoDetails {
+            id: user.id,
+            created_at: user.created_at.as_micros(),
+            status: ffi::UserStatus::from(user.status),
+            username: user.username,
+            has_permissions,
+            permissions: ffi::Permissions::from(user.permissions.unwrap_or_default()),
+        }
+    }
+}
+
+impl From<RustUserStatus> for ffi::UserStatus {
+    fn from(status: RustUserStatus) -> Self {
+        match status {
+            RustUserStatus::Active => ffi::UserStatus::Active,
+            RustUserStatus::Inactive => ffi::UserStatus::Inactive,
+        }
+    }
+}
+
+impl TryFrom<ffi::UserStatus> for RustUserStatus {
+    type Error = String;
+
+    fn try_from(status: ffi::UserStatus) -> Result<Self, Self::Error> {
+        match status {
+            ffi::UserStatus::Active => Ok(RustUserStatus::Active),
+            ffi::UserStatus::Inactive => Ok(RustUserStatus::Inactive),
+            _ => Err("invalid user status".to_owned()),
+        }
+    }
+}
+
+impl TryFrom<Option<RustUserInfoDetails>> for ffi::UserInfoDetails {
+    type Error = String;
+
+    fn try_from(user: Option<RustUserInfoDetails>) -> Result<Self, Self::Error> {
+        match user {
+            Some(user) => Ok(ffi::UserInfoDetails::from(user)),
+            None => Err("user not found".to_string()),
         }
     }
 }
@@ -233,6 +308,73 @@ impl From<RustClusterMetadata> for ffi::ClusterMetadata {
     }
 }
 
+impl From<RustGlobalPermissions> for ffi::GlobalPermissions {
+    fn from(permissions: RustGlobalPermissions) -> Self {
+        ffi::GlobalPermissions {
+            manage_servers: permissions.manage_servers,
+            read_servers: permissions.read_servers,
+            manage_users: permissions.manage_users,
+            read_users: permissions.read_users,
+            manage_streams: permissions.manage_streams,
+            read_streams: permissions.read_streams,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<RustTopicPermissions> for ffi::TopicPermissions {
+    fn from(permissions: RustTopicPermissions) -> Self {
+        ffi::TopicPermissions {
+            manage_topic: permissions.manage_topic,
+            read_topic: permissions.read_topic,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+        }
+    }
+}
+
+impl From<RustStreamPermissions> for ffi::StreamPermissions {
+    fn from(permissions: RustStreamPermissions) -> Self {
+        ffi::StreamPermissions {
+            manage_stream: permissions.manage_stream,
+            read_stream: permissions.read_stream,
+            manage_topics: permissions.manage_topics,
+            read_topics: permissions.read_topics,
+            poll_messages: permissions.poll_messages,
+            send_messages: permissions.send_messages,
+            topics: permissions
+                .topics
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(topic_id, permissions)| ffi::TopicPermissionEntry {
+                    topic_id: topic_id as u32,
+                    permissions: ffi::TopicPermissions::from(permissions),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<RustPermissions> for ffi::Permissions {
+    fn from(permissions: RustPermissions) -> Self {
+        ffi::Permissions {
+            global: ffi::GlobalPermissions::from(permissions.global),
+            streams: permissions
+                .streams
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(stream_id, permissions)| ffi::StreamPermissionEntry {
+                    stream_id: stream_id as u32,
+                    permissions: ffi::StreamPermissions::from(permissions),
+                })
+                .collect(),
+        }
+    }
+}
+
 impl From<ffi::GlobalPermissions> for RustGlobalPermissions {
     fn from(permissions: ffi::GlobalPermissions) -> Self {
         RustGlobalPermissions {
@@ -323,6 +465,66 @@ impl From<RustPartition> for ffi::Partition {
     }
 }
 
+/// The entries of one provenance, as the `HeaderEntry` the message path uses.
+///
+/// Options ride the user-headers codec, so they cross the bridge as the type
+/// already there for `user_headers` rather than a second one meaning the same
+/// thing. Values keep the kind the server sent, so a `Uint64` stays a `Uint64`.
+fn resource_options_to_ffi(
+    options: &iggy::prelude::ResourceOptions,
+    explicit: bool,
+) -> Vec<ffi::HeaderEntry> {
+    options
+        .iter()
+        .filter(|(_, option)| option.explicit == explicit)
+        .map(|(key, option)| ffi::HeaderEntry {
+            key: ffi::HeaderField {
+                kind: key.kind().as_code(),
+                value: key.as_bytes().to_vec(),
+            },
+            value: ffi::HeaderField {
+                kind: option.value.kind().as_code(),
+                value: option.value.as_bytes().to_vec(),
+            },
+        })
+        .collect()
+}
+
+/// Render option entries into the string map `TopicCreateOptions::raw` takes.
+///
+/// The Rust SDK expresses arbitrary option keys as strings that admission
+/// parses by the same rules a config file value goes through, so a typed value
+/// handed in here is rendered rather than passed through: sending `Uint64`
+/// 134217728 for `segment_size` and sending `"134217728"` land the same stored
+/// value. A key this build cannot read at all is dropped rather than guessed.
+pub(crate) fn ffi_options_to_raw(
+    options: Vec<ffi::HeaderEntry>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut raw = std::collections::BTreeMap::new();
+    for entry in options {
+        let RustHeaderEntry { key, value } = RustHeaderEntry::try_from(entry)?;
+        let key = key
+            .as_str()
+            .map_err(|error| format!("Option key is not a string: {error}"))?
+            .to_owned();
+        if raw.insert(key.clone(), value.to_string_value()).is_some() {
+            return Err(format!("Duplicate option key: {key}"));
+        }
+    }
+    Ok(raw)
+}
+
+impl From<RustOptionSpec> for ffi::OptionSpec {
+    fn from(spec: RustOptionSpec) -> Self {
+        ffi::OptionSpec {
+            key: spec.key,
+            kind: spec.kind.as_code(),
+            default_value: spec.default_value,
+            description: spec.description,
+        }
+    }
+}
+
 impl From<RustTopic> for ffi::Topic {
     fn from(topic: RustTopic) -> Self {
         ffi::Topic {
@@ -333,9 +535,10 @@ impl From<RustTopic> for ffi::Topic {
             message_expiry: u64::from(topic.message_expiry),
             compression_algorithm: topic.compression_algorithm.to_string(),
             max_topic_size: u64::from(topic.max_topic_size),
-            replication_factor: topic.replication_factor,
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
+            options: resource_options_to_ffi(&topic.options, true),
+            derived_options: resource_options_to_ffi(&topic.options, false),
         }
     }
 }
@@ -350,7 +553,6 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
             message_expiry: u64::from(topic.message_expiry),
             compression_algorithm: topic.compression_algorithm.to_string(),
             max_topic_size: u64::from(topic.max_topic_size),
-            replication_factor: topic.replication_factor,
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             partitions: topic
@@ -358,6 +560,8 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
                 .into_iter()
                 .map(ffi::Partition::from)
                 .collect(),
+            options: resource_options_to_ffi(&topic.options, true),
+            derived_options: resource_options_to_ffi(&topic.options, false),
         }
     }
 }
@@ -371,6 +575,7 @@ impl From<RustStream> for ffi::Stream {
             size_bytes: stream.size.as_bytes_u64(),
             messages_count: stream.messages_count,
             topics_count: stream.topics_count,
+            options: resource_options_to_ffi(&stream.options, true),
         }
     }
 }
@@ -385,6 +590,7 @@ impl From<RustStreamDetails> for ffi::StreamDetails {
             messages_count: stream.messages_count,
             topics_count: stream.topics_count,
             topics: stream.topics.into_iter().map(ffi::Topic::from).collect(),
+            options: resource_options_to_ffi(&stream.options, true),
         }
     }
 }

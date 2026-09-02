@@ -23,108 +23,25 @@ use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFra
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
-use iggy_binary_protocol::{ConsensusHeader, GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
+use partitions::FatalCommit;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
+use std::future::poll_fn;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 
 /// How often the shard pump drives `VsrConsensus::tick`.
 ///
 /// Heartbeats, prepare retransmit, and view-change timeouts only advance
-/// when the tick runs ("call this periodically, e.g. every 10ms"). Public
-/// so the simulator can advance its virtual clock in whole tick intervals.
-pub const CONSENSUS_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Decompose a [`MessageBag`] into the routing-relevant tuple
-/// `(operation, namespace, generic_message)`.
-///
-/// Single source of truth used by every dispatch entry point so the
-/// operation / namespace extraction never drifts between call sites.
-fn extract_routing(bag: MessageBag) -> (Operation, u64, Message<GenericHeader>) {
-    match bag {
-        MessageBag::Request(r) => {
-            let h = *r.header();
-            (h.operation, h.group, r.into_generic())
-        }
-        MessageBag::Prepare(p) => {
-            let h = *p.header();
-            (h.operation, h.group, p.into_generic())
-        }
-        MessageBag::PrepareOk(p) => {
-            let h = *p.header();
-            (h.operation, h.group, p.into_generic())
-        }
-        MessageBag::StartViewChange(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::DoViewChange(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::StartView(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::Commit(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RequestStartView(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RequestPrepares(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RepairPrepare(m) => {
-            let h = *m.header();
-            (h.0.operation, h.0.group, m.into_generic())
-        }
-        MessageBag::RepairRangeReply(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RequestStateTransfer(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::StateTransferTarget(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::RequestStateChunk(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        MessageBag::StateChunk(m) => {
-            let h = *m.header();
-            (h.operation(), h.group, m.into_generic())
-        }
-        // Register forwarding is a metadata-plane errand, and the metadata
-        // consensus group lives on shard 0 on every node; the headers carry no
-        // group field because there is nothing else they could address.
-        MessageBag::ForwardRegister(m) => {
-            let h = *m.header();
-            (h.operation(), METADATA_GROUP, m.into_generic())
-        }
-        MessageBag::ForwardRegisterResult(m) => {
-            let h = *m.header();
-            (h.operation(), METADATA_GROUP, m.into_generic())
-        }
-        MessageBag::ForwardLogout(m) => {
-            let h = *m.header();
-            (h.operation(), METADATA_GROUP, m.into_generic())
-        }
-        MessageBag::ForwardLogoutResult(m) => {
-            let h = *m.header();
-            (h.operation(), METADATA_GROUP, m.into_generic())
-        }
-    }
-}
+/// when the tick runs. Re-exported from `consensus` so the drive cadence and
+/// the tick counts it feeds share one unit; public so the simulator can
+/// advance its virtual clock in whole tick intervals.
+pub use consensus::TICK_INTERVAL as CONSENSUS_TICK_INTERVAL;
 
 /// Inter-shard dispatch logic.
 ///
@@ -141,40 +58,61 @@ where
     /// Network-receive entry point. Classifies the raw
     /// `Message<GenericHeader>` and routes it to the owning shard via
     /// `route_typed`.
-    //
-    // TODO(hubcio): perf - this `MessageBag::try_from` is run twice per
-    // consensus frame: once here to extract (operation, namespace) for
-    // routing, and a second time on the receiving shard inside `on_message`
-    // (lib.rs ~560) to dispatch to the correct on_* handler. The second
-    // parse re-runs `bytemuck::checked::try_from_bytes` + per-header
-    // `validate()` on bytes already validated upstream. Measured ~50 ns/
-    // frame; at 1M ops/sec/shard ~ 50 ms/sec/shard of pure re-validation.
-    //
-    // Fix: thread the classified bag through `ShardFrame::Consensus` (carry
-    // `MessageBag` instead of `Message<GenericHeader>`) so the inbox path
-    // matches directly with no second parse. Consensus variant grows from
-    // ~24 B to ~32 B, but `ShardFrame` total stays at 160 B (LifecycleFrame
-    // drives the union size).
+    ///
+    /// The only classify a frame gets: the bag rides
+    /// [`ShardFrame::Consensus`] to the owning shard, whose pump matches it
+    /// directly. Reading routing off it and then handing the bytes on generic
+    /// made every frame pay `bytemuck::checked::try_from_bytes` plus the
+    /// header's `validate()` twice.
     pub fn dispatch(&self, message: Message<GenericHeader>) {
+        let command = message.header().command;
         let bag = match MessageBag::try_from(message) {
             Ok(bag) => bag,
+            Err(ConsensusError::UnsupportedOperation { operation }) => {
+                // For a replication frame this is terminal for its consensus
+                // group, not a per-frame hiccup: the op is never journaled,
+                // never acked, and every later prepare dies on the resulting
+                // gap while quorum hides the outage. Repair wraps the same
+                // typed header, so it cannot rescue this node either -- only
+                // upgrading it can. A routed request, by contrast, is dropped
+                // before journaling and stalls nothing; the consequence in the
+                // log follows the frame. Nothing fences the sending peer, so
+                // the log and the counter are the whole signal an operator
+                // gets.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNSUPPORTED_OPERATION,
+                );
+                let consequence = match command {
+                    Command::Prepare | Command::RepairPrepare | Command::PrepareOk => {
+                        "this node cannot journal or ack it, so its consensus group stops \
+                         making progress until this node is upgraded"
+                    }
+                    _ => "the frame is dropped before journaling, with no reply to the sender",
+                };
+                tracing::error!(
+                    shard = self.id,
+                    operation = format_args!("{operation:#04x}"),
+                    command = ?command,
+                    build_release = %iggy_binary_protocol::ProtocolVersion(
+                        iggy_binary_protocol::IGGY_PROTOCOL_VERSION
+                    ),
+                    "frame carries an operation this build does not know; a newer release \
+                     likely added it. {consequence}"
+                );
+                return;
+            }
             Err(e) => {
-                // TODO(hubcio): this drop is the whole story for a consensus
-                // frame carrying an Operation this build does not know: no
-                // metric, no peer error, no eviction. An old node in a mixed
-                // cluster silently gap-stops the group here (never journals
-                // the op, never PrepareOks, every later prepare dies on the
-                // gap check) while quorum hides it, and repair wraps the same
-                // typed header so it cannot rescue. Rolling upgrades across
-                // consensus-op additions need a version fence (release_min /
-                // release_max bounds on the replica plane) before this arm is
-                // safe to hit.
+                self.metrics.record_frame_drop(
+                    frame_drop_variant::CONSENSUS,
+                    frame_drop_reason::UNPARSABLE,
+                );
                 tracing::warn!(shard = self.id, error = %e, "dropping unparsable consensus frame");
                 return;
             }
         };
-        let (operation, namespace, generic) = extract_routing(bag);
-        self.route_typed(operation, namespace, generic);
+        let (operation, namespace) = bag.routing();
+        self.route_typed(operation, namespace, bag);
     }
 
     /// Invoke the client-request handler directly, exactly as the client-fd
@@ -195,7 +133,7 @@ where
     /// group is deterministic across the cluster.
     pub(crate) fn route_consensus_control(
         &self,
-        message: Message<GenericHeader>,
+        message: MessageBag,
         namespace_u64: u64,
         operation: Operation,
     ) {
@@ -217,12 +155,7 @@ where
     ///    - `METADATA_GROUP` -> shard 0.
     ///    - packable `IggyNamespace::inner()` -> the shard owning that
     ///      partition's consensus group.
-    fn route_typed(
-        &self,
-        operation: Operation,
-        namespace_u64: u64,
-        generic: Message<GenericHeader>,
-    ) {
+    fn route_typed(&self, operation: Operation, namespace_u64: u64, generic: MessageBag) {
         if operation.is_metadata() {
             self.try_send_to_target(0, generic, operation);
             return;
@@ -281,12 +214,7 @@ where
     /// a trusted index) is dropped with `reason=unroutable` rather than
     /// panicking. Metadata frames always pass `target = 0` here, since
     /// `is_metadata` operations are owned by shard 0.
-    fn try_send_to_target(
-        &self,
-        target: u16,
-        message: Message<GenericHeader>,
-        operation: Operation,
-    ) {
+    fn try_send_to_target(&self, target: u16, message: MessageBag, operation: Operation) {
         let variant = if operation.is_partition() {
             frame_drop_variant::PARTITION
         } else {
@@ -331,16 +259,30 @@ where
     /// Drain this shard's inbox and process each frame locally until the
     /// `stop` signal fires or the inbox disconnects, then drain any frames
     /// still queued so in-flight requests still get a response.
+    ///
+    /// Returns the commit fault that ended the pump, if one did. A fault
+    /// skips that queued drain: the frames in it are requests for a shard
+    /// holding a divergent partition, and answering them means re-entering
+    /// the commit path that just failed. The final flush still runs, so
+    /// every partition that CAN still reach disk does.
+    ///
+    /// `shutdown_flag` is the cross-thread server shutdown signal. The pump
+    /// flips it as soon as a commit fault is resolved, BEFORE the final
+    /// flush: the flush writes to the device whose failure raised the fault,
+    /// so it can stall indefinitely, and only the flag arms the watchdog and
+    /// the bounded pump drain that turn a stalled flush into a timed-out
+    /// non-zero exit instead of a process that reports healthy forever.
     #[allow(clippy::future_not_send)]
-    pub async fn run_message_pump(&self, stop: Receiver<()>)
+    pub async fn run_message_pump(
+        &self,
+        stop: Receiver<()>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) -> Option<FatalCommit>
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         // Reused across every pump iteration; pre-size to skip the
@@ -361,24 +303,30 @@ where
         // simulator (see `MessageBus::sleep`).
         let rearm_tick = || self.bus.sleep(CONSENSUS_TICK_INTERVAL).fuse();
         let mut consensus_tick = std::pin::pin!(rearm_tick());
+        let mut fatal: Option<FatalCommit> = None;
         loop {
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
             // deterministic simulator cannot seed. The listed order is the
-            // intended priority anyway: stop, then tick, then frames.
+            // intended priority anyway: stop, then tick, redispatch, then
+            // newly received frames.
             futures::select_biased! {
                 _ = stop.recv().fuse() => break,
                 () = consensus_tick.as_mut() => {
                     // Sharing the pump task is what keeps `tick_partitions`
-                    // borrow-safe, but it bounds the tick's worst-case delay to
-                    // one frame body's longest `.await` (replication append +
-                    // commit_journal fsync/rotate + reply).
+                    // borrow-safe, but it bounds the tick's worst-case delay
+                    // to one main frame body's longest `.await` (replication
+                    // append + commit_journal fsync/rotate + reply) plus the
+                    // one reply-lane bus send drained per main frame.
                     // TODO(hubcio): if a load test shows tick starvation,
                     // make `tick_partitions` borrow-free so the tick can be
                     // decoupled from the pump again without reintroducing the
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
-                    self.tick_partitions().await;
+                    if let Some(fault) = self.tick_partitions(&mut namespace_scratch).await {
+                        fatal = Some(fault);
+                        break;
+                    }
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -403,6 +351,27 @@ where
                     self.apply_reconcile_ops();
                     consensus_tick.set(rearm_tick());
                 }
+                (message, provenance) = poll_fn(|_| {
+                    self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
+                }).fuse() => {
+                    // One frame per select iteration. Ranking this arm above
+                    // the inbox preserves park order without making a full
+                    // queue stall ticks and commit broadcasts for other groups.
+                    self.dispatch_message(message, Some(provenance)).await;
+                    // A request handled by a solo primary self-acks here. If
+                    // loopback waited for another inbox frame, the request
+                    // would remain uncommitted indefinitely on a quiet shard.
+                    self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                    self.apply_reconcile_ops();
+                    // Same guaranteed reply-lane service as the inbox arm: this
+                    // arm outranks both lanes, so a deep drain would otherwise
+                    // starve forwarded client replies for its whole duration.
+                    if let Ok(reply) = self.reply_inbox.try_recv()
+                        && self.accept_frame_for_self(&reply)
+                    {
+                        self.process_frame(reply).await;
+                    }
+                }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
                         Ok(frame) => {
@@ -412,6 +381,32 @@ where
                                 // Tail drain catches reconcile ops whose marker was dropped.
                                 self.apply_reconcile_ops();
                             }
+                            // Guaranteed reply-lane service: `select_biased!`
+                            // polls the main lane first, so a saturated main
+                            // lane would otherwise starve the reply arm below
+                            // indefinitely. Taking at most ONE reply per main
+                            // frame makes the worst case a deterministic 1:1
+                            // interleave - replies keep flowing under a
+                            // consensus storm, and consensus keeps flowing
+                            // under a reply flood.
+                            if let Ok(reply) = self.reply_inbox.try_recv()
+                                && self.accept_frame_for_self(&reply)
+                            {
+                                self.process_frame(reply).await;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                frame = self.reply_inbox.recv().fuse() => {
+                    // Reached only while the main lane is quiet (biased order):
+                    // serve forwarded client replies without waiting for the
+                    // next main frame or tick.
+                    match frame {
+                        Ok(frame) => {
+                            if self.accept_frame_for_self(&frame) {
+                                self.process_frame(frame).await;
+                            }
                         }
                         Err(_) => break,
                     }
@@ -419,20 +414,120 @@ where
             }
         }
 
-        // Drain remaining frames so in-flight requests get a response.
-        while let Ok(frame) = self.inbox.try_recv() {
-            if self.accept_frame_for_self(&frame) {
-                self.process_frame(frame).await;
-                self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
-                    .await;
-                self.apply_reconcile_ops();
-            }
+        // A stop can win the select immediately after a frame fenced a
+        // partition, before the next tick observes it. Preserve that fault so
+        // shutdown cannot turn a durability failure into a clean pump exit.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
+        // Drain remaining frames so in-flight requests get a response, and
+        // the reply lane so already-forwarded replies still reach their
+        // clients before the bus tears down. Skipped on a commit fault: a
+        // queued Ack or Commit frame for the fenced partition would re-enter
+        // the commit path that just failed, and `advance_commit_min` asserts
+        // on the gap the fault left. Those requests go unanswered and their
+        // clients time out, which is what a node stopping on a durability
+        // fault owes them.
+        if fatal.is_none() {
+            fatal = self
+                .drain_queued_frames_for_shutdown(&mut loopback_buf, &mut namespace_scratch)
+                .await;
+        }
+
+        if fatal.is_some() {
+            // Flipped BEFORE the final flush, not after the pump returns: the
+            // flush writes to the device whose failure raised the fault and
+            // can stall there indefinitely, and the flag is what arms the
+            // watchdog and the bounded pump drain. Siblings give up at most
+            // the flush window of extra serving.
+            shutdown_flag.store(true, Ordering::Relaxed);
         }
 
         // Final flush: committed messages still resident in the in-memory
         // journal must reach segment storage before the process exits, or a
-        // graceful restart recovers consumer offsets ahead of the data.
+        // graceful restart recovers consumer offsets ahead of the data. Runs
+        // on a fault too, the fenced partition included: its resident prefix
+        // is cluster-committed data, so writing what still reaches disk is
+        // strictly better than dropping it, and a second failure of an
+        // already-fenced partition is warned rather than propagated.
         self.flush_partitions().await;
+
+        // A failed flush fences its partition: the data it could not write is
+        // cluster-committed and now lives only in this process's memory, so a
+        // clean exit here would report a durability loss as a good shutdown.
+        if fatal.is_none() {
+            fatal = self.first_partition_commit_fault();
+        }
+
+        fatal
+    }
+
+    /// Process queued work after the select loop has stopped. Redispatch keeps
+    /// its live-pump rank over the inbox, and every delivered frame gets its
+    /// loopback before another frame can run.
+    #[allow(clippy::future_not_send)]
+    async fn drain_queued_frames_for_shutdown(
+        &self,
+        loopback_buf: &mut Vec<Message<GenericHeader>>,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) -> Option<FatalCommit>
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        loop {
+            while let Some((message, provenance)) = self.pop_redispatched_frame() {
+                self.dispatch_message(message, Some(provenance)).await;
+                self.process_loopback(loopback_buf, namespace_scratch).await;
+                self.apply_reconcile_ops();
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+            let Ok(frame) = self.inbox.try_recv() else {
+                break;
+            };
+            if self.accept_frame_for_self(&frame) {
+                self.process_frame(frame).await;
+                self.process_loopback(loopback_buf, namespace_scratch).await;
+                self.apply_reconcile_ops();
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+        }
+
+        // Retired, not delivered: the pump is going away, so a staged frame has
+        // no later arm to reach the plane through. This runs before the reply
+        // lane drain, which is what carries client denies out.
+        self.retire_redispatched_frames();
+        while let Ok(frame) = self.reply_inbox.try_recv() {
+            if self.accept_frame_for_self(&frame) {
+                self.process_frame(frame).await;
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+        }
+        None
+    }
+
+    /// First partition commit fault currently fenced on this shard.
+    ///
+    /// The regular path observes faults in `tick_partitions`. This scan covers
+    /// the pump-exit edges where a stop signal wins before that tick, or a
+    /// queued frame fails while the pump is draining during shutdown.
+    fn first_partition_commit_fault(&self) -> Option<FatalCommit> {
+        let partitions = self.plane.partitions();
+        partitions.namespaces().find_map(|namespace| {
+            partitions
+                .get_by_ns(namespace)
+                .and_then(|partition| partition.fatal().cloned())
+        })
     }
 
     /// Sanity check at pump entry: every Consensus frame routed through
@@ -473,11 +568,8 @@ where
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
-        <MJ as JournalHandle>::Target: Journal<
-                <MJ as JournalHandle>::Storage,
-                Entry = Message<PrepareHeader>,
-                Header = PrepareHeader,
-            >,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
         match frame {
@@ -492,6 +584,10 @@ where
     async fn process_lifecycle(&self, payload: LifecycleFrame)
     where
         B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
     {
         match payload {
             LifecycleFrame::ReplicaInboundSetup { fd, slot } => {
@@ -652,10 +748,10 @@ where
                 // task already resolved the retention decision off-pump, so
                 // this only mutates, serialized with reads on the same loop.
                 if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    let (segments, messages) = partition
+                    let removal = partition
                         .clean_expired_segments(now, message_expiry, max_bytes)
                         .await;
-                    if segments > 0 {
+                    if removal.segments > 0 {
                         // Any unlink invalidates what this shard is SERVING:
                         // the offer names files that are gone and the payload
                         // cache can answer from RAM without touching disk, so a
@@ -667,10 +763,24 @@ where
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
-                            segments,
-                            messages,
+                            segments = removal.segments,
+                            messages = removal.messages,
                             "segment cleaner removed sealed segments"
                         );
+                    }
+                    if removal.budget_spent {
+                        // The pass stopped on its per-frame budget with more to
+                        // remove. Leaving the rest to the next interval tick
+                        // caps reclaim at one budget per interval, which a
+                        // producer outruns forever on small segments. Re-stage
+                        // as a frame rather than looping, so the pump keeps
+                        // interleaving consensus ticks between passes. This
+                        // terminates: a pass re-arms only when MORE than a full
+                        // budget was removable and it retires exactly the
+                        // budget, so the backlog strictly shrinks; a pass held
+                        // by the consumer barrier stops at or below the budget
+                        // and does not re-arm at all.
+                        self.request_clean_partition(namespace, now, message_expiry, max_bytes);
                     }
                 }
             }
@@ -682,9 +792,8 @@ where
                 // committed offset is identical on every replica, so the local
                 // deletion converges; idempotent if already trimmed past it.
                 if let Some(partition) = self.plane.partitions().get_mut_by_ns(&namespace) {
-                    let (segments, messages) =
-                        partition.remove_sealed_segments_up_to(up_to_offset).await;
-                    if segments > 0 {
+                    let removal = partition.remove_sealed_segments_up_to(up_to_offset).await;
+                    if removal.segments > 0 {
                         // See the cleaner arm: a truncate commits on the
                         // METADATA plane, so this partition's commit_op never
                         // moves and the cached offer stays a hit over unlinked
@@ -693,8 +802,8 @@ where
                         tracing::debug!(
                             shard = self.id,
                             namespace_raw = namespace.inner(),
-                            segments,
-                            messages,
+                            segments = removal.segments,
+                            messages = removal.messages,
                             up_to_offset,
                             "truncate-partition removed sealed segments"
                         );
@@ -858,4 +967,80 @@ where
 enum ReplicaHandshakeOutcome {
     ReleaseSlot(u64),
     ClearDial(u8),
+}
+
+#[cfg(test)]
+mod tests {
+    use iggy_binary_protocol::{
+        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
+        prepare_identity_checksum_bytes,
+    };
+    use server_common::iobuf::Owned;
+    use server_common::{MESSAGE_ALIGN, Message, MessageBag};
+    use std::mem::offset_of;
+
+    /// An `Operation` discriminant this build does not know, arriving on an
+    /// otherwise wire-valid consensus frame (correct command, size, checksum:
+    /// exactly what a newer release sends after an op addition), must decode to
+    /// its own error rather than the `InvalidBitPattern` that random memory
+    /// corruption produces.
+    ///
+    /// The two need different operator actions: version skew is fixed by
+    /// upgrading this node, and until it is, the frame's consensus group makes
+    /// no progress (the op is never journaled, never acked, and every later
+    /// prepare dies on the gap). `dispatch` splits its drop arms on this
+    /// distinction; the accounting half is pinned in the server crate by
+    /// `given_an_unknown_operation_when_dispatched_should_account_an_upgrade_fence_drop`.
+    #[test]
+    fn given_an_unknown_operation_when_a_consensus_frame_decodes_should_surface_an_upgrade_fence_signal()
+     {
+        // Far past every defined Operation discriminant (the highest is 162,
+        // `DeleteConsumerOffset`).
+        const OPERATION_FROM_A_NEWER_RELEASE: u8 = 0xEE;
+
+        let mut owned = Owned::<MESSAGE_ALIGN>::zeroed(HEADER_SIZE);
+        {
+            let frame = owned.as_mut_slice();
+            let size_offset = offset_of!(PrepareHeader, size);
+            let frame_size = u32::try_from(HEADER_SIZE).expect("header size fits in u32");
+            frame[size_offset..size_offset + 4].copy_from_slice(&frame_size.to_le_bytes());
+            frame[offset_of!(PrepareHeader, command)] = Command::Prepare as u8;
+            let client_offset = offset_of!(PrepareHeader, client);
+            frame[client_offset..client_offset + 16].copy_from_slice(&0xCAFE_u128.to_le_bytes());
+            frame[offset_of!(PrepareHeader, operation)] = OPERATION_FROM_A_NEWER_RELEASE;
+            // A prepare's `checksum` carries the identity checksum, computed
+            // over the operation byte among others; stamping it the way a real
+            // sender does leaves the unknown byte as the frame's only anomaly
+            // and is what lets the classifier trust that byte.
+            let header: &[u8; HEADER_SIZE] = frame[..HEADER_SIZE]
+                .try_into()
+                .expect("frame spans a full header");
+            let identity = prepare_identity_checksum_bytes(header);
+            frame[..size_of::<u128>()].copy_from_slice(&identity.to_le_bytes());
+        }
+
+        // The generic view carries no operation field, so the receive path
+        // accepts the frame; the unknown byte is first seen by the typed
+        // decode inside `MessageBag::try_from`, which is what `dispatch` runs.
+        let message = Message::<GenericHeader>::try_from(owned)
+            .expect("a sealed Prepare frame is wire-valid in the generic view");
+
+        let Err(error) = MessageBag::try_from(message) else {
+            panic!("an operation this build does not know must not decode into a bag");
+        };
+
+        assert!(
+            matches!(
+                error,
+                ConsensusError::UnsupportedOperation {
+                    operation: OPERATION_FROM_A_NEWER_RELEASE
+                }
+            ),
+            "unknown operation {OPERATION_FROM_A_NEWER_RELEASE:#x} is silently dropped: the \
+             typed decode collapses a wire-valid frame from a newer release into the same \
+             InvalidBitPattern as corruption, and dispatch drops both with only a warn log, \
+             no operator signal and no upgrade fence, so an old node in a mixed cluster \
+             gap-stops its consensus group while quorum hides it; got {error:?}"
+        );
+    }
 }

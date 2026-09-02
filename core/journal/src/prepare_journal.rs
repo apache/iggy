@@ -18,7 +18,7 @@
 use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
-use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command2, PrepareHeader};
+use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command, PrepareHeader};
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
@@ -48,7 +48,7 @@ const MAX_ENTRY_SIZE: u64 = 64 * 1024 * 1024;
 ///
 /// Never re-sealed on receipt: the producer seals once and every replica stores that
 /// verbatim, so re-sealing locally would diverge the header bytes and break the
-/// parent chain in the TODO below.
+/// parent chain.
 const CHECKSUM_BODY_UNSEALED: u128 = 0;
 
 /// Number of slots in the journal ring buffer.
@@ -243,12 +243,7 @@ async fn truncate_or_fail(
         reason,
         "truncating torn WAL tail; no complete entry follows the damage"
     );
-    storage.truncate(pos).await?;
-    // The repair must be crash-durable. `FileStorage::truncate` is a
-    // bare `set_len`; without this fsync a power loss right after the
-    // repair re-presents the torn tail on the next boot. Mirrors the
-    // write-then-fsync the `append` path already does.
-    storage.fsync().await?;
+    storage.truncate(pos)?;
     Ok(())
 }
 
@@ -287,7 +282,7 @@ async fn find_complete_entry(
 
         let last_start = want - HEADER_SIZE;
         for offset in 0..=last_start {
-            if buf[offset + COMMAND_OFFSET] != Command2::Prepare as u8 {
+            if buf[offset + COMMAND_OFFSET] != Command::Prepare as u8 {
                 continue;
             }
             let candidate = &buf[offset..offset + HEADER_SIZE];
@@ -310,7 +305,7 @@ async fn find_complete_entry(
 fn valid_entry_header(scratch: &mut Owned<16>, bytes: &[u8]) -> Option<PrepareHeader> {
     scratch.as_mut_slice().copy_from_slice(bytes);
     let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(scratch.as_slice()).ok()?;
-    if header.command != Command2::Prepare
+    if header.command != Command::Prepare
         || (header.size as usize) < HEADER_SIZE
         || u64::from(header.size) > MAX_ENTRY_SIZE
     {
@@ -454,7 +449,7 @@ impl PrepareJournal {
             let header: PrepareHeader = *header_ref;
 
             // Validate: must be a Prepare command with sane size
-            if header.command != Command2::Prepare
+            if header.command != Command::Prepare
                 || (header.size as usize) < HEADER_SIZE
                 || u64::from(header.size) > MAX_ENTRY_SIZE
             {
@@ -575,8 +570,25 @@ impl PrepareJournal {
 
             let slot = slot_for_op(header.op, slot_count);
 
-            // Note: Regarding duplicate op in WAL. We rewrite it with whichever
-            // is the latest entry.
+            // Match append's collision fence while rebuilding the index. Reopening
+            // with fewer configured slots can otherwise hide an unsnapshotted op
+            // even though its bytes remain in the WAL. A duplicate op deliberately
+            // keeps the latest entry, and a snapshotted op is safe to evict.
+            if let Some(existing) = headers[slot]
+                && existing.op != header.op
+                && existing.op > snapshot_op
+            {
+                return Err(JournalError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "journal slot collision while rebuilding the index: op {} and \
+                         unsnapshotted op {} map to slot {slot} with slot_count={slot_count} \
+                         (snapshot_op={snapshot_op}); restore the previous \
+                         metadata.journal_slots value or checkpoint before shrinking it",
+                        header.op, existing.op,
+                    ),
+                )));
+            }
             headers[slot] = Some(header);
             offsets[slot] = Some(pos);
 
@@ -629,7 +641,7 @@ impl PrepareJournal {
     }
 
     /// How many entries the opening scan replayed unverified
-    /// ([`CHECKSUM_BODY_UNSEALED`]). `0` once every producer seals; the boot path
+    /// (`CHECKSUM_BODY_UNSEALED`). `0` once every producer seals; the boot path
     /// warns while it is not, so the fail-open stretch is visible to an operator.
     pub const fn unsealed_entry_count(&self) -> u64 {
         self.unsealed_entries
@@ -741,7 +753,7 @@ impl PrepareJournal {
     clippy::cast_sign_loss,
     clippy::future_not_send
 )]
-impl Journal<FileStorage> for PrepareJournal {
+impl Journal for PrepareJournal {
     fn last_op(&self) -> Option<u64> {
         self.last_op.get()
     }
@@ -1162,7 +1174,6 @@ impl Journal<FileStorage> for PrepareJournal {
 }
 
 impl JournalHandle for PrepareJournal {
-    type Storage = FileStorage;
     type Target = Self;
 
     fn handle(&self) -> &Self::Target {
@@ -1206,7 +1217,7 @@ mod tests {
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
         header.size = total_size as u32;
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = op;
         header.operation = Operation::CreateStream;
         header.checksum_body = checksum_body;
@@ -1442,6 +1453,46 @@ mod tests {
             journal.last_op(),
             Some(1),
             "op 2 does not chain to op 1 and must be truncated as a torn tail"
+        );
+    }
+
+    #[compio::test]
+    async fn scan_refuses_boot_on_interior_parent_chain_break() {
+        // The shape a repair frontier rewind leaves behind: every entry is
+        // complete and individually well sealed, op 3 parents to op 1 instead
+        // of op 2, and a valid chain continues from op 3. Complete entries
+        // after the break can be quorum committed, so boot must refuse rather
+        // than truncate them away as a torn tail.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let op_1 = make_identity_sealed_prepare(1, BODY, 0);
+            let checksum_1 = op_1.header().checksum;
+            journal.append(op_1.deep_copy()).await.unwrap();
+            let op_2 = make_identity_sealed_prepare(2, BODY, checksum_1);
+            journal.append(op_2.deep_copy()).await.unwrap();
+            let op_3 = make_identity_sealed_prepare(3, BODY, checksum_1);
+            let checksum_3 = op_3.header().checksum;
+            journal.append(op_3.deep_copy()).await.unwrap();
+            let op_4 = make_identity_sealed_prepare(4, BODY, checksum_3);
+            journal.append(op_4.deep_copy()).await.unwrap();
+        }
+        let bytes_before = std::fs::metadata(&path).unwrap().len();
+
+        let error = PrepareJournal::open(&path, 0).await.unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("interior WAL corruption") && message.contains("does not chain"),
+            "a rewound parent with a complete suffix following must refuse \
+             boot rather than truncate, got: {message}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            bytes_before,
+            "the refusal must leave the WAL bytes untouched"
         );
     }
 
@@ -1699,7 +1750,7 @@ mod tests {
 
     #[compio::test]
     async fn corrupt_command_byte_truncates_on_reopen() {
-        // Bit-flipped `Command2` discriminant: must truncate, not panic.
+        // Bit-flipped `Command` discriminant: must truncate, not panic.
         let dir = tempdir().unwrap();
         let path = dir.path().join("journal.wal");
 
@@ -1719,7 +1770,7 @@ mod tests {
             use std::io::{Seek, SeekFrom, Write};
             let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.seek(SeekFrom::Start(command_byte_offset)).unwrap();
-            file.write_all(&[99u8]).unwrap(); // out of range for Command2
+            file.write_all(&[99u8]).unwrap(); // out of range for Command
             file.sync_all().unwrap();
         }
 
@@ -1746,8 +1797,7 @@ mod tests {
             let storage = FileStorage::open(&path).await.unwrap();
             let full_len = storage.file_len();
             // Remove the last 10 bytes (partial second entry)
-            storage.truncate(full_len - 10).await.unwrap();
-            storage.fsync().await.unwrap();
+            storage.truncate(full_len - 10).unwrap();
         }
 
         // Reopen, should recover only the first entry
@@ -1810,7 +1860,7 @@ mod tests {
         {
             use std::io::Write;
             let mut file = std::fs::File::create(&path).unwrap();
-            // All-0xFF is not a valid `Command2`/`Operation` bit pattern,
+            // All-0xFF is not a valid `Command`/`Operation` bit pattern,
             // so `try_from_bytes` rejects the header.
             file.write_all(&[0xFF_u8; HEADER_SIZE]).unwrap();
             // Sparse-extend past MAX_ENTRY_SIZE so the corruption at pos 0
@@ -1857,7 +1907,7 @@ mod tests {
             use std::io::{Seek, SeekFrom, Write};
             let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.seek(SeekFrom::Start(command_byte_offset)).unwrap();
-            file.write_all(&[99u8]).unwrap(); // out of range for Command2
+            file.write_all(&[99u8]).unwrap(); // out of range for Command
             file.sync_all().unwrap();
         }
 
@@ -1890,7 +1940,7 @@ mod tests {
         let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut buffer.as_mut_slice()[..HEADER_SIZE],
         );
-        header.command = Command2::Prepare;
+        header.command = Command::Prepare;
         header.op = 1;
         header.operation = Operation::CreateStream;
         header.size = (HEADER_SIZE + 48) as u32; // 16 bytes of slack
@@ -2058,6 +2108,70 @@ mod tests {
         drop(journal);
         let journal = PrepareJournal::open(&path, 0).await.unwrap();
         assert_eq!(journal.last_op(), Some(3));
+    }
+
+    #[compio::test]
+    async fn reopen_with_fewer_slots_rejects_unsnapshotted_collision_without_changing_wal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        drop(journal);
+        let wal_before = std::fs::read(&path).unwrap();
+
+        let error = PrepareJournal::open_with_slots(&path, 0, 2)
+            .await
+            .expect_err("shrinking the index must not hide an unsnapshotted entry");
+
+        assert!(
+            error.to_string().contains("journal slot collision"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            wal_before,
+            "a refused scan must leave the WAL intact"
+        );
+    }
+
+    #[compio::test]
+    async fn reopen_keeps_latest_duplicate_op() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.set_snapshot_op(1);
+        journal.append(make_prepare(1, 64)).await.unwrap();
+        drop(journal);
+
+        let journal = PrepareJournal::open_with_slots(&path, 0, 2).await.unwrap();
+        let header = *journal.header(1).expect("duplicate op must remain indexed");
+        assert_eq!(header.size as usize, HEADER_SIZE + 64);
+        assert_eq!(
+            journal
+                .entry_at(&header)
+                .await
+                .unwrap()
+                .unwrap()
+                .as_slice()
+                .len(),
+            HEADER_SIZE + 64
+        );
+    }
+
+    #[compio::test]
+    async fn reopen_with_fewer_slots_can_evict_snapshotted_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        let journal = PrepareJournal::open_with_slots(&path, 0, 4).await.unwrap();
+        journal.append(make_prepare(1, 32)).await.unwrap();
+        journal.append(make_prepare(3, 32)).await.unwrap();
+        drop(journal);
+
+        let journal = PrepareJournal::open_with_slots(&path, 1, 2).await.unwrap();
+        assert!(journal.header(1).is_none());
+        assert_eq!(journal.header(3).map(|header| header.op), Some(3));
     }
 
     const POISON_REASON: &str = "test: simulated post-rename failure";

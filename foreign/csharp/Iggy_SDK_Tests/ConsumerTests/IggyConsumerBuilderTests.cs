@@ -31,6 +31,33 @@ public class IggyConsumerBuilderTests
     private static readonly Identifier TopicId = Identifier.Numeric(1);
 
     [Fact]
+    public void Build_WithDefaultSocketBufferSizes_CreatesTheClient()
+    {
+        var builder = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass");
+
+        Assert.Null(builder.Config.ReceiveBufferSize);
+        Assert.Null(builder.Config.SendBufferSize);
+        Assert.NotNull(builder.Build());
+    }
+
+    [Theory]
+    [InlineData(0, null)]
+    [InlineData(-1, null)]
+    [InlineData(null, 0)]
+    [InlineData(null, -1)]
+    public void Build_WithNonPositiveSocketBufferSize_Throws(int? receiveBufferSize, int? sendBufferSize)
+    {
+        var builder = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "user", "pass",
+                receiveBufferSize: receiveBufferSize, sendBufferSize: sendBufferSize);
+
+        Assert.Throws<InvalidOperationException>(() => builder.Build());
+    }
+
+    [Fact]
     public void Build_WithEncryptorAndAutoCommit_Throws()
     {
         var builder = IggyConsumerBuilder
@@ -69,6 +96,28 @@ public class IggyConsumerBuilderTests
             .Build();
 
         Assert.NotNull(consumer);
+    }
+
+    [Fact]
+    public void Build_WithPersonalAccessToken_CreatesTheClient()
+    {
+        var consumer = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", "token")
+            .Build();
+
+        Assert.NotNull(consumer);
+    }
+
+    [Fact]
+    public void Build_WithoutCredentials_Throws()
+    {
+        var builder = IggyConsumerBuilder
+            .Create(StreamId, TopicId, Consumer.New(1))
+            .WithConnection(Protocol.Tcp, "127.0.0.1:8090", string.Empty);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => builder.Build());
+        Assert.Contains("PersonalAccessToken", ex.Message);
     }
 
     [Fact]

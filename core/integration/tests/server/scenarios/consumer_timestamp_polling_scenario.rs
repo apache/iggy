@@ -135,11 +135,11 @@ async fn init_system(client: &IggyClient) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -179,7 +179,7 @@ async fn consume_with_strategy(
         .consumer(consumer_name, STREAM_NAME, TOPIC_NAME, PARTITION_ID)
         .unwrap()
         .auto_commit(AutoCommit::IntervalOrWhen(
-            IggyDuration::from_str("2ms").unwrap(),
+            NonZeroIggyDuration::from_str("2ms").unwrap(),
             AutoCommitWhen::ConsumingAllMessages,
         ))
         .polling_strategy(strategy)

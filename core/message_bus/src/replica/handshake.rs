@@ -65,7 +65,7 @@ use crate::framing;
 use crate::replica::auth::{self, ChannelBinding, HandshakeStatus, ReplicaAuth, Transcript};
 use crate::{GenericHeader, Message};
 use compio::io::{AsyncRead, AsyncWrite};
-use iggy_binary_protocol::{Command2, HEADER_SIZE};
+use iggy_binary_protocol::{Command, HEADER_SIZE};
 use iggy_common::IggyError;
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
@@ -127,7 +127,7 @@ pub struct ReplicaTlsCtx {
 /// therefore binds `dialer_id = peer_id`, `acceptor_id = self_id`.
 ///
 /// On a rejection an authenticated, still-waiting dialer is answered
-/// with a nonzero-status [`build_challenge_message`] (see [`reject`]) so
+/// with a nonzero-status `build_challenge_message` (see `reject`) so
 /// it learns the cause from its own logs rather than seeing a bare
 /// connection close.
 ///
@@ -154,7 +154,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     // fd without reading, so a reject frame would land in its VSR reader instead.
     let nackable = auth.is_some() && has_nonce;
 
-    if header.command != Command2::ReplicaHello {
+    if header.command != Command::ReplicaHello {
         return reject(
             stream,
             our_cluster,
@@ -238,7 +238,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     // reject here is log-only (no frame).
     // Check the command before the MAC: the finish frame is identified by its
     // own discriminant, not by handshake position.
-    if finish.header().command != Command2::ReplicaFinish {
+    if finish.header().command != Command::ReplicaFinish {
         return reject(
             stream,
             our_cluster,
@@ -282,7 +282,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
 /// Returns `Err(())` on any write, read, command, status, or MAC
 /// failure (already logged).
 #[allow(clippy::future_not_send, clippy::similar_names)]
-pub async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
+pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
     stream: &mut S,
     ctx: &ReplicaHandshakeCtx,
     peer_id: u8,
@@ -320,7 +320,7 @@ pub async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
             return Err(());
         }
     };
-    if challenge.header().command != Command2::ReplicaChallenge {
+    if challenge.header().command != Command::ReplicaChallenge {
         warn!(
             replica = peer_id,
             command = ?challenge.header().command,
@@ -415,7 +415,7 @@ fn build_challenge_message(
     #[allow(clippy::cast_possible_truncation)]
     Message::<GenericHeader>::new(size_of::<GenericHeader>()).transmute_header(
         |_, h: &mut GenericHeader| {
-            h.command = Command2::ReplicaChallenge;
+            h.command = Command::ReplicaChallenge;
             h.cluster = cluster_id;
             h.replica = replica_id;
             h.size = HEADER_SIZE as u32;
@@ -441,7 +441,7 @@ fn build_hello_message(
     #[allow(clippy::cast_possible_truncation)]
     Message::<GenericHeader>::new(size_of::<GenericHeader>()).transmute_header(
         |_, h: &mut GenericHeader| {
-            h.command = Command2::ReplicaHello;
+            h.command = Command::ReplicaHello;
             h.cluster = cluster_id;
             h.replica = replica_id;
             h.size = HEADER_SIZE as u32;
@@ -462,7 +462,7 @@ fn build_finish_message(
     #[allow(clippy::cast_possible_truncation)]
     Message::<GenericHeader>::new(size_of::<GenericHeader>()).transmute_header(
         |_, h: &mut GenericHeader| {
-            h.command = Command2::ReplicaFinish;
+            h.command = Command::ReplicaFinish;
             h.cluster = cluster_id;
             h.replica = replica_id;
             h.size = HEADER_SIZE as u32;
