@@ -252,11 +252,19 @@ echo "Running storage compatibility test..."
 # --run-ignored only: the test is #[ignore]d, so the normal lanes skip it.
 # --no-tests=fail: a filter matching nothing has to be an error here, unlike the
 # main lane's --no-tests=warn, which would report a typo'd filter as green.
-# No --profile ci on purpose: its retries = 3 would re-run and hide a read-back
-# that only fails sometimes, which is exactly the signal this check exists for.
+# --retries 0: a read-back that only fails sometimes is exactly the signal this
+# check exists for, so no retry may hide it. Explicit rather than "not
+# --profile ci": a profile default or NEXTEST_RETRIES in the environment would
+# otherwise apply.
+# --ignore-default-filter: nextest intersects -E with the profile's
+# default-filter, so one that excluded this module would turn the run into a
+# --no-tests=fail abort instead of running the test.
+# The version floor for these flags lives in .config/nextest.toml.
 cargo nextest run --locked -p integration \
   --run-ignored only \
   --no-tests=fail \
+  --retries 0 \
+  --ignore-default-filter \
   -E "test(${TEST_FILTER})"
 
 echo "Storage format compatible: ${BASELINE_SHA} -> ${HEAD_SHA}"
