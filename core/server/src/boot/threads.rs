@@ -43,7 +43,7 @@ use tracing::{error, info, warn};
 /// Result of a multi-shard bootstrap.
 ///
 /// Carries the cross-thread shutdown flag, one OS-thread `JoinHandle`
-/// per shard, and the first panic [`install_panic_hook`] recorded. The
+/// per shard, and the first panic `install_panic_hook` recorded. The
 /// caller flips the flag via [`Self::install_ctrlc_handler`] and then
 /// drains every shard via [`Self::join_all`], bounded by `join_timeout`
 /// (`system.sharding.shutdown_join_timeout`).
