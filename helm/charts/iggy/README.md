@@ -165,6 +165,43 @@ you want a different strategy.
 * `ip` must be a literal IP. Hostnames are rejected. Use
   `advertisedAddress` for the name clients dial, which does accept DNS.
 
+### Secrets
+
+Three settings have to carry the byte-identical value on every node, so they
+belong in one Secret that all releases reference rather than in each release's
+values. Create it in the release namespace before the first install:
+
+```bash
+JWT="$(head -c 32 /dev/urandom | base64)"
+kubectl create secret generic iggy-cluster-secrets \
+  --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
+  --from-literal=jwtEncodingSecret="$JWT" \
+  --from-literal=jwtDecodingSecret="$JWT" \
+  --from-literal=encryptionKey="$(head -c 32 /dev/urandom | base64)"
+```
+
+`examples/cluster-3-node.yaml` points `server.encryption`, `server.jwt` and
+`server.cluster.auth` at that one Secret. Each of the three also accepts an
+inline value, which the chart turns into its own Secret; that is convenient for
+a single node and a poor fit for a cluster, since the value then lives in every
+release's stored values.
+
+* **`server.cluster.auth`** makes every replica connection complete an
+  authenticated handshake or be rejected. The key is at least 32 bytes of
+  CSPRNG output. Turning it on or off is a coordinated restart of the whole
+  cluster: a node that authenticates cannot talk to one that does not.
+* **`server.encryption`** encrypts message payloads and state commands at rest
+  with AES-256-GCM, under a 32-byte base64 key. A node holding a different key
+  cannot read what its peers wrote.
+* **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
+  restart. With `cluster.auth` enabled the server already derives a cluster-wide
+  key from the replica PSK, so setting the JWT secrets is an alternative to that
+  rather than an addition; setting them anyway keeps tokens working if auth is
+  later turned off.
+
+None of the three values is written to the data directory, and each is masked as
+`******` in the startup log.
+
 ### Storage
 
 A replica cannot move between nodes without invalidating its roster entry, so
@@ -435,14 +472,26 @@ pre-commit install
 | podSecurityContext | object | `{"seccompProfile":{"type":"Unconfined"}}` | Pod security context (server uses io_uring, requires unconfined seccomp) |
 | resources | object | `{}` | Resource limits and requests for server |
 | securityContext | object | `{"capabilities":{"add":["IPC_LOCK"]}}` | Container security context (server requires IPC_LOCK for io_uring) |
-| server | object | `{"advertisedAddress":"","affinity":{},"cluster":{"enabled":false,"name":"iggy-cluster","nodes":[],"selfReplicaId":0},"enabled":true,"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"extraArgs":[],"hostNetwork":false,"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":"0.9.0-edge.6"},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090,"tcpReplica":9090,"websocket":8092},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"strategy":{},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
+| server | object | `{"advertisedAddress":"","affinity":{},"cluster":{"auth":{"enabled":false,"existingSecret":{"name":"","previousSharedSecretKey":"clusterPreviousSharedSecret","sharedSecretKey":"clusterSharedSecret"},"previousSharedSecret":"","sharedSecret":""},"enabled":false,"name":"iggy-cluster","nodes":[],"selfReplicaId":0},"enabled":true,"encryption":{"enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""},"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"extraArgs":[],"hostNetwork":false,"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":"0.9.0-edge.6"},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"jwt":{"decodingSecret":"","encodingSecret":"","existingSecret":{"decodingSecretKey":"jwtDecodingSecret","encodingSecretKey":"jwtEncodingSecret","name":""}},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090,"tcpReplica":9090,"websocket":8092},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"strategy":{},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
 | server.advertisedAddress | string | `""` | Client-facing address published in cluster metadata. Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but setting both is refused at render time. Empty falls back to the in-cluster Service DNS name. |
 | server.affinity | object | `{}` | Affinity rules for server pods |
+| server.cluster.auth | object | `{"enabled":false,"existingSecret":{"name":"","previousSharedSecretKey":"clusterPreviousSharedSecret","sharedSecretKey":"clusterSharedSecret"},"previousSharedSecret":"","sharedSecret":""}` | Replica-to-replica authentication on the consensus port. When enabled every peer must complete an authenticated handshake or be rejected, and a shared secret becomes mandatory. Enabling it on a running cluster is a coordinated-restart change, not a rolling one. |
+| server.cluster.auth.enabled | bool | `false` | Require the authenticated replica handshake |
+| server.cluster.auth.existingSecret.name | string | `""` | Name of an existing Secret holding the pre-shared keys |
+| server.cluster.auth.existingSecret.previousSharedSecretKey | string | `"clusterPreviousSharedSecret"` | Key inside that Secret holding the retiring shared secret |
+| server.cluster.auth.existingSecret.sharedSecretKey | string | `"clusterSharedSecret"` | Key inside that Secret holding the active shared secret |
+| server.cluster.auth.previousSharedSecret | string | `""` | Retiring key, accepted for verification only while a rotation is in flight. Leave empty outside a rotation. |
+| server.cluster.auth.sharedSecret | string | `""` | Cluster-wide pre-shared key, at least 32 bytes of CSPRNG output, byte-identical on every node. Ignored when `existingSecret.name` is set. |
 | server.cluster.enabled | bool | `false` | Enable cluster (VSR consensus) mode. One Helm release per node: every release shares the same `nodes` roster and overrides only `selfReplicaId`. See the Cluster Mode section of the chart README. |
 | server.cluster.name | string | `"iggy-cluster"` | Cluster name, byte-identical on every node. Hashed into the on-disk cluster id on first boot, so changing it later means starting from an empty data directory. |
 | server.cluster.nodes | list | `[]` | Cluster roster, mirroring the server's `[[cluster.nodes]]` config. Every node runs the identical list. `ip` is the replica-plane address: this node's consensus listener binds it verbatim and every peer dials it verbatim, so it must be a literal IP that the pod itself owns. With `server.hostNetwork` that is the node IP. `ports.tcpReplica` is required on every entry; the remaining ports default to `server.ports`. |
 | server.cluster.selfReplicaId | int | `0` | Which `nodes` entry this release runs, matched against `replicaId`. |
 | server.enabled | bool | `true` | Enable the Iggy server deployment |
+| server.encryption | object | `{"enabled":false,"existingSecret":{"key":"encryptionKey","name":""},"key":""}` | Server-side encryption of message payloads and state commands, using AES-256-GCM. Every node of a cluster must hold the identical key, or it cannot read data another node wrote. |
+| server.encryption.enabled | bool | `false` | Enable encryption at rest |
+| server.encryption.existingSecret.key | string | `"encryptionKey"` | Key inside that Secret |
+| server.encryption.existingSecret.name | string | `""` | Name of an existing Secret holding the encryption key |
+| server.encryption.key | string | `""` | 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set. Prefer `existingSecret` outside development: a value here is stored in the Helm release and readable by anyone who can read it. |
 | server.env | list | `[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}]` | Environment variables for the server container |
 | server.extraArgs | list | `[]` | Extra command-line arguments appended to the server entrypoint, e.g. `["--replica-id", "0"]` when running a cluster node. |
 | server.hostNetwork | bool | `false` | Run the server pod in the host network namespace. Required for cluster mode, where the replica listener binds the roster IP verbatim. |
@@ -454,6 +503,12 @@ pre-commit install
 | server.ingress.enabled | bool | `false` | Enable ingress for the server |
 | server.ingress.hosts | list | `[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}]` | Ingress hosts configuration |
 | server.ingress.tls | list | `[]` | Ingress TLS configuration |
+| server.jwt | object | `{"decodingSecret":"","encodingSecret":"","existingSecret":{"decodingSecretKey":"jwtDecodingSecret","encodingSecretKey":"jwtEncodingSecret","name":""}}` | Secrets used to sign and validate HTTP bearer tokens. Left unset, each node generates a random secret on every start, which invalidates tokens across restarts and keeps them node-local. Setting the identical secret on every node makes bearers valid cluster-wide and activates follower to primary HTTP forwarding; `cluster.auth.enabled` derives the same thing from the replica PSK, so it is an alternative rather than an addition. |
+| server.jwt.decodingSecret | string | `""` | Decoding secret. Ignored when `existingSecret.name` is set. |
+| server.jwt.encodingSecret | string | `""` | Encoding secret. Ignored when `existingSecret.name` is set. |
+| server.jwt.existingSecret.decodingSecretKey | string | `"jwtDecodingSecret"` | Key inside that Secret holding the decoding secret |
+| server.jwt.existingSecret.encodingSecretKey | string | `"jwtEncodingSecret"` | Key inside that Secret holding the encoding secret |
+| server.jwt.existingSecret.name | string | `""` | Name of an existing Secret holding the JWT secrets |
 | server.nodeSelector | object | `{}` | Node selector for server pods |
 | server.persistence.accessMode | string | `"ReadWriteOnce"` | PVC access mode |
 | server.persistence.annotations | object | `{}` | PVC annotations |

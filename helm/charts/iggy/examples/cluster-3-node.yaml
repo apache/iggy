@@ -28,6 +28,19 @@
 # Replace the `ip` values with the IPs of the nodes you pin each release to.
 # The server binds this address verbatim for replica traffic, so with
 # hostNetwork it must be the node's own IP.
+#
+# Every secret below has to be byte-identical on every node, so they live in one
+# Secret that all three releases reference rather than in this file. Create it
+# once, in the release namespace, before the first install:
+#
+#   kubectl create secret generic iggy-cluster-secrets \
+#     --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
+#     --from-literal=jwtEncodingSecret="$(head -c 32 /dev/urandom | base64)" \
+#     --from-literal=jwtDecodingSecret="$(head -c 32 /dev/urandom | base64)" \
+#     --from-literal=encryptionKey="$(head -c 32 /dev/urandom | base64)"
+#
+# The JWT encoding and decoding secrets are an HMAC key pair, so they hold the
+# same value; generate them once and reuse it if you set them by hand.
 
 ui:
   enabled: false
@@ -35,9 +48,32 @@ ui:
 server:
   hostNetwork: true
 
+  # Encrypts message payloads and state commands at rest with AES-256-GCM. The
+  # key is cluster-wide: a node that holds a different one cannot read what its
+  # peers wrote.
+  encryption:
+    enabled: true
+    existingSecret:
+      name: iggy-cluster-secrets
+
+  # Makes bearer tokens valid on every node and survive a restart. Redundant
+  # while cluster.auth is enabled, which derives the same key from the replica
+  # PSK, but set explicitly here so tokens keep working if auth is turned off.
+  jwt:
+    existingSecret:
+      name: iggy-cluster-secrets
+
   cluster:
     enabled: true
     name: iggy-cluster
+
+    # Every replica connection completes an authenticated handshake or is
+    # rejected. Turning this on or off is a coordinated restart of the whole
+    # cluster, not a rolling one.
+    auth:
+      enabled: true
+      existingSecret:
+        name: iggy-cluster-secrets
     nodes:
       - name: iggy-node-0
         ip: 10.0.1.10

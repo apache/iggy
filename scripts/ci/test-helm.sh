@@ -269,7 +269,25 @@ validate() {
   grep -q '^      hostNetwork: true$' "$HELM_RENDER_DIR/cluster.yaml"
   grep -q 'name: tcp-replica' "$HELM_RENDER_DIR/cluster.yaml"
 
+  grep -q 'name: IGGY_CLUSTER_AUTH_SHARED_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: IGGY_SYSTEM_ENCRYPTION_KEY' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: IGGY_HTTP_JWT_ENCODING_SECRET' "$HELM_RENDER_DIR/cluster.yaml"
+  if grep -qE '^ +(encryptionKey|clusterSharedSecret|jwtEncodingSecret):' "$HELM_RENDER_DIR/cluster.yaml"; then
+    echo "Error: cluster render inlined a secret value instead of referencing the existing Secret" >&2
+    exit 1
+  fi
+
   assert_render_rejected "server.replicaCount=3" --set server.replicaCount=3
+  assert_render_rejected "encryption without a key" --set server.encryption.enabled=true
+  assert_render_rejected "replica auth without a secret" \
+    -f "$CHART_DIR/examples/cluster-3-node.yaml" \
+    --set server.cluster.auth.existingSecret.name="" \
+    --set server.cluster.selfReplicaId=0
+  assert_render_rejected "a shared secret under 32 bytes" \
+    -f "$CHART_DIR/examples/cluster-3-node.yaml" \
+    --set server.cluster.auth.existingSecret.name="" \
+    --set-string server.cluster.auth.sharedSecret=tooshort \
+    --set server.cluster.selfReplicaId=0
   assert_render_rejected "autoscaling.enabled=true" --set autoscaling.enabled=true
   assert_render_rejected "cluster without a roster" --set server.cluster.enabled=true
   assert_render_rejected "selfReplicaId outside the roster" \

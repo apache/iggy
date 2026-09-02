@@ -105,6 +105,41 @@ server:
     # -- PVC storage size
     size: 8Gi
 
+  # -- Server-side encryption of message payloads and state commands, using
+  # AES-256-GCM. Every node of a cluster must hold the identical key, or it
+  # cannot read data another node wrote.
+  encryption:
+    # -- Enable encryption at rest
+    enabled: false
+    # -- 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set.
+    # Prefer `existingSecret` outside development: a value here is stored in the
+    # Helm release and readable by anyone who can read it.
+    key: ""
+    existingSecret:
+      # -- Name of an existing Secret holding the encryption key
+      name: ""
+      # -- Key inside that Secret
+      key: encryptionKey
+
+  # -- Secrets used to sign and validate HTTP bearer tokens. Left unset, each
+  # node generates a random secret on every start, which invalidates tokens
+  # across restarts and keeps them node-local. Setting the identical secret on
+  # every node makes bearers valid cluster-wide and activates follower to
+  # primary HTTP forwarding; `cluster.auth.enabled` derives the same thing from
+  # the replica PSK, so it is an alternative rather than an addition.
+  jwt:
+    # -- Encoding secret. Ignored when `existingSecret.name` is set.
+    encodingSecret: ""
+    # -- Decoding secret. Ignored when `existingSecret.name` is set.
+    decodingSecret: ""
+    existingSecret:
+      # -- Name of an existing Secret holding the JWT secrets
+      name: ""
+      # -- Key inside that Secret holding the encoding secret
+      encodingSecretKey: jwtEncodingSecret
+      # -- Key inside that Secret holding the decoding secret
+      decodingSecretKey: jwtDecodingSecret
+
   cluster:
     # -- Enable cluster (VSR consensus) mode. One Helm release per node: every
     # release shares the same `nodes` roster and overrides only `selfReplicaId`.
@@ -116,6 +151,27 @@ server:
     name: iggy-cluster
     # -- Which `nodes` entry this release runs, matched against `replicaId`.
     selfReplicaId: 0
+    # -- Replica-to-replica authentication on the consensus port. When enabled
+    # every peer must complete an authenticated handshake or be rejected, and a
+    # shared secret becomes mandatory. Enabling it on a running cluster is a
+    # coordinated-restart change, not a rolling one.
+    auth:
+      # -- Require the authenticated replica handshake
+      enabled: false
+      # -- Cluster-wide pre-shared key, at least 32 bytes of CSPRNG output,
+      # byte-identical on every node. Ignored when `existingSecret.name` is set.
+      sharedSecret: ""
+      # -- Retiring key, accepted for verification only while a rotation is in
+      # flight. Leave empty outside a rotation.
+      previousSharedSecret: ""
+      existingSecret:
+        # -- Name of an existing Secret holding the pre-shared keys
+        name: ""
+        # -- Key inside that Secret holding the active shared secret
+        sharedSecretKey: clusterSharedSecret
+        # -- Key inside that Secret holding the retiring shared secret
+        previousSharedSecretKey: clusterPreviousSharedSecret
+
     # -- Cluster roster, mirroring the server's `[[cluster.nodes]]` config.
     # Every node runs the identical list. `ip` is the replica-plane address:
     # this node's consensus listener binds it verbatim and every peer dials it

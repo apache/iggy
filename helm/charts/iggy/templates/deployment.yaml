@@ -28,6 +28,7 @@
   {{- if .Values.server.cluster.enabled }}
     {{- include "iggy.validateCluster" . }}
   {{- end }}
+  {{- include "iggy.validateSecrets" . }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -146,6 +147,9 @@ spec:
   {{- end }}
   {{- if .Values.server.cluster.enabled }}
             {{- include "iggy.clusterEnv" . | nindent 12 }}
+  {{- end }}
+  {{- with (include "iggy.secretEnv" . | trim) }}
+            {{- . | nindent 12 }}
   {{- end }}
   {{- if .Values.server.env }}
     {{- range .Values.server.env }}
