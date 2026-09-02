@@ -101,6 +101,105 @@ If Prometheus Operator is installed and you want monitoring, set
 `server.serviceMonitor.enabled=true` in `custom-values.yaml` or pass it on the
 command line with `--set server.serviceMonitor.enabled=true`.
 
+## Cluster Mode
+
+The server runs a Viewstamped Replication cluster when `cluster.enabled` is set
+and each node is told which roster entry it is. The chart models this as **one
+release per node**: every release is handed the same roster and overrides only
+its own identity.
+
+`helm/charts/iggy/examples/cluster-3-node.yaml` is a ready three-node roster.
+Point the `ip` values at the nodes you will pin the releases to, then:
+
+```bash
+for i in 0 1 2; do
+  helm upgrade --install "iggy-n$i" ./helm/charts/iggy \
+    -f ./helm/charts/iggy/examples/cluster-3-node.yaml \
+    --set "server.cluster.selfReplicaId=$i" \
+    --set "server.nodeSelector.kubernetes\.io/hostname=node-$i"
+done
+```
+
+The chart turns `server.cluster` into the server's `IGGY_CLUSTER_*` environment
+variables and passes `--replica-id`, so no configuration file is mounted. The
+values mirror the server's `[[cluster.nodes]]` config one for one.
+
+### Why hostNetwork and node pinning are required
+
+The server's consensus listener binds `cluster.nodes[*].ip` **verbatim**, unlike
+the client listeners, which keep their own bind address and take only the port
+from the roster. A pod therefore has to own the address its roster entry names.
+Pod IPs are neither stable nor known before install, and a Service ClusterIP is
+not an address a pod can bind, so the workable layout today is `hostNetwork:
+true` with each release pinned to a node and its roster `ip` set to that node's
+IP. Node IPs are known up front and survive a pod restart, which is what lets a
+replica come back and rejoin.
+
+The cost is real: the server pod shares the node's network namespace and its
+ports. Weigh it before running this in a shared cluster.
+
+If a release lands on a node whose IP is not the one in its roster entry, the
+server refuses to start rather than misbehaving quietly:
+
+```text
+Error: ShardJoinFailures { failures: [ShardJoinFailure { shard_id: 0,
+  kind: Error(Iggy(CannotBindToSocket("10.0.1.11:9090"))) }] }
+```
+
+Check the `nodeSelector` on that release against the `ip` in its roster entry.
+
+### Upgrades
+
+Host ports make a rolling update impossible: the replacement pod cannot bind
+ports the outgoing pod still holds, so it stays `Pending` while the Deployment
+waits for it to become ready. The chart therefore switches the server to the
+`Recreate` strategy whenever `hostNetwork` is set, which takes the node down
+for the length of the restart. Roll **one release at a time** and let the
+cluster regain quorum before starting the next.
+
+Turning `hostNetwork` on for a release that already exists is rejected by the
+API server, because a Deployment cannot move from `RollingUpdate` to `Recreate`
+in place:
+
+```text
+Deployment.apps "iggy-n0" is invalid: spec.strategy.rollingUpdate: Forbidden:
+  may not be specified when strategy `type` is 'Recreate'
+```
+
+Uninstall that release and install it again. Set `server.strategy` explicitly if
+you want a different strategy.
+
+### Roster rules
+
+* Every node runs the **identical** `server.cluster.nodes` list. Only
+  `selfReplicaId` differs between releases.
+* `replicaId` values are unique and cover `0..N-1` for an `N`-node roster.
+* `ports.tcpReplica` is required on every entry. In cluster mode the server
+  takes every listener port from the roster and will not fall back to defaults,
+  because two nodes on one host would otherwise race for the same socket. The
+  remaining ports default to `server.ports`.
+* `server.cluster.name` is hashed into the on-disk cluster id on first boot.
+  Changing it later makes the server refuse to start against existing data.
+* `ip` must be a literal IP. Hostnames are rejected. Use
+  `advertisedAddress` for the name clients dial, which does accept DNS.
+
+### Storage
+
+A replica cannot move between nodes without invalidating its roster entry, so
+give each release storage that stays on its node, and size
+`server.persistence` per node rather than for the cluster. A replica that starts
+on an empty volume rejoins by state transfer, which is correct but re-reads the
+whole dataset from its peers.
+
+### What the chart refuses
+
+`server.replicaCount > 1` and `autoscaling.enabled` both fail at render time.
+Scaling the server Deployment produces N independent servers behind one Service,
+all writing the same PVC subpath with no lock between them, which corrupts the
+data directory while `helm --wait` still reports success. Cluster size is a
+roster decision, so add a node to `server.cluster.nodes` and install another
+release instead.
+
 ## Uninstallation
 
 ```bash
@@ -166,7 +265,7 @@ If a previous local smoke install failed and left resources behind, reset the sm
 scripts/ci/test-helm.sh cleanup-smoke
 ```
 
-On Apple Silicon hosts, the released `apache/iggy:0.7.0` `arm64` image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
+On Apple Silicon hosts, the released `arm64` server image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
 
 ```bash
 HELM_SMOKE_KIND_PLATFORM=linux/amd64 scripts/ci/setup-helm-smoke-cluster.sh

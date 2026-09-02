@@ -222,14 +222,11 @@ validate() {
 
   helm template iggy "$CHART_DIR" \
     --set server.persistence.enabled=true \
-    --set autoscaling.enabled=true \
-    --set autoscaling.targetCPUUtilizationPercentage=80 \
     --set server.ingress.enabled=true \
     --set ui.ingress.enabled=true \
     --set server.serviceMonitor.enabled=true \
     > "$HELM_RENDER_DIR/all-features.yaml"
   grep -q '^kind: PersistentVolumeClaim$' "$HELM_RENDER_DIR/all-features.yaml"
-  grep -q '^kind: HorizontalPodAutoscaler$' "$HELM_RENDER_DIR/all-features.yaml"
   test "$(grep -c '^kind: Ingress$' "$HELM_RENDER_DIR/all-features.yaml")" -eq 2
   test "$(extract_kind_names "$HELM_RENDER_DIR/all-features.yaml" Ingress | sort -u | wc -l | tr -d ' ')" -eq 2
   extract_kind_names "$HELM_RENDER_DIR/all-features.yaml" Ingress | grep -qx 'iggy'
@@ -239,14 +236,10 @@ validate() {
   helm template iggy "$CHART_DIR" \
     --kube-version 1.18.0 \
     --api-versions networking.k8s.io/v1beta1 \
-    --api-versions autoscaling/v2beta2 \
-    --set autoscaling.enabled=true \
-    --set autoscaling.targetCPUUtilizationPercentage=80 \
     --set server.ingress.enabled=true \
     --set ui.ingress.enabled=true \
     > "$HELM_RENDER_DIR/legacy-k8s-1.18.yaml"
   test "$(grep -c '^apiVersion: networking.k8s.io/v1beta1$' "$HELM_RENDER_DIR/legacy-k8s-1.18.yaml")" -eq 2
-  grep -q '^apiVersion: autoscaling/v2beta2$' "$HELM_RENDER_DIR/legacy-k8s-1.18.yaml"
 
   helm template iggy "$CHART_DIR" --set ui.enabled=false > "$HELM_RENDER_DIR/server-only.yaml"
   test "$(grep -c '^kind: Deployment$' "$HELM_RENDER_DIR/server-only.yaml")" -eq 1
@@ -266,9 +259,37 @@ validate() {
   fi
   grep -q 'name: supersecret' "$HELM_RENDER_DIR/existing-secret.yaml"
 
+  helm template iggy "$CHART_DIR" \
+    -f "$CHART_DIR/examples/cluster-3-node.yaml" \
+    --set server.cluster.selfReplicaId=1 \
+    > "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: IGGY_CLUSTER_ENABLED' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: IGGY_CLUSTER_NODES_2_PORTS_TCP_REPLICA' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q -- '- "--replica-id"' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q '^      hostNetwork: true$' "$HELM_RENDER_DIR/cluster.yaml"
+  grep -q 'name: tcp-replica' "$HELM_RENDER_DIR/cluster.yaml"
+
+  assert_render_rejected "server.replicaCount=3" --set server.replicaCount=3
+  assert_render_rejected "autoscaling.enabled=true" --set autoscaling.enabled=true
+  assert_render_rejected "cluster without a roster" --set server.cluster.enabled=true
+  assert_render_rejected "selfReplicaId outside the roster" \
+    -f "$CHART_DIR/examples/cluster-3-node.yaml" --set server.cluster.selfReplicaId=9
+
   validate_yamllint
   validate_helmfmt
   validate_helm_docs
+}
+
+# Assert that `helm template` refuses a values combination the chart guards
+# against. A guard that stops failing is a silent data-corruption regression,
+# so the render succeeding is the error case here.
+assert_render_rejected() {
+  local description="$1"
+  shift
+  if helm template iggy "$CHART_DIR" "$@" > /dev/null 2>&1; then
+    echo "Error: chart rendered ${description}, but that combination must be refused" >&2
+    exit 1
+  fi
 }
 
 # PID of the kubectl port-forward process started by smoke().

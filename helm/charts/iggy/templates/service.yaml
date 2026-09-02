@@ -32,11 +32,21 @@ spec:
     - name: quic
       port: {{ .Values.server.ports.quic }}
       targetPort: quic
-      protocol: TCP
+      protocol: UDP
     - name: tcp
       port: {{ .Values.server.ports.tcp }}
       targetPort: tcp
       protocol: TCP
+    - name: websocket
+      port: {{ .Values.server.ports.websocket }}
+      targetPort: websocket
+      protocol: TCP
+  {{- if .Values.server.cluster.enabled }}
+    - name: tcp-replica
+      port: {{ .Values.server.ports.tcpReplica }}
+      targetPort: tcp-replica
+      protocol: TCP
+  {{- end }}
   selector:
     {{- include "iggy.selectorLabels" . | nindent 4 }}
 {{- end }}

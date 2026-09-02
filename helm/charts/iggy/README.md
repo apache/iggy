@@ -2,7 +2,7 @@
 
 A Helm chart for Apache Iggy server and web-ui
 
-![Version: 0.5.0](https://img.shields.io/badge/Version-0.5.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.7.0](https://img.shields.io/badge/AppVersion-0.7.0-informational?style=flat-square)
+![Version: 0.6.0](https://img.shields.io/badge/Version-0.6.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.9.0-edge.6](https://img.shields.io/badge/AppVersion-0.9.0--edge.6-informational?style=flat-square)
 
 ## Prerequisites
 
@@ -83,6 +83,105 @@ If Prometheus Operator is installed and you want monitoring, set
 `server.serviceMonitor.enabled=true` in `custom-values.yaml` or pass it on the
 command line with `--set server.serviceMonitor.enabled=true`.
 
+## Cluster Mode
+
+The server runs a Viewstamped Replication cluster when `cluster.enabled` is set
+and each node is told which roster entry it is. The chart models this as **one
+release per node**: every release is handed the same roster and overrides only
+its own identity.
+
+`helm/charts/iggy/examples/cluster-3-node.yaml` is a ready three-node roster.
+Point the `ip` values at the nodes you will pin the releases to, then:
+
+```bash
+for i in 0 1 2; do
+  helm upgrade --install "iggy-n$i" ./helm/charts/iggy \
+    -f ./helm/charts/iggy/examples/cluster-3-node.yaml \
+    --set "server.cluster.selfReplicaId=$i" \
+    --set "server.nodeSelector.kubernetes\.io/hostname=node-$i"
+done
+```
+
+The chart turns `server.cluster` into the server's `IGGY_CLUSTER_*` environment
+variables and passes `--replica-id`, so no configuration file is mounted. The
+values mirror the server's `[[cluster.nodes]]` config one for one.
+
+### Why hostNetwork and node pinning are required
+
+The server's consensus listener binds `cluster.nodes[*].ip` **verbatim**, unlike
+the client listeners, which keep their own bind address and take only the port
+from the roster. A pod therefore has to own the address its roster entry names.
+Pod IPs are neither stable nor known before install, and a Service ClusterIP is
+not an address a pod can bind, so the workable layout today is `hostNetwork:
+true` with each release pinned to a node and its roster `ip` set to that node's
+IP. Node IPs are known up front and survive a pod restart, which is what lets a
+replica come back and rejoin.
+
+The cost is real: the server pod shares the node's network namespace and its
+ports. Weigh it before running this in a shared cluster.
+
+If a release lands on a node whose IP is not the one in its roster entry, the
+server refuses to start rather than misbehaving quietly:
+
+```text
+Error: ShardJoinFailures { failures: [ShardJoinFailure { shard_id: 0,
+  kind: Error(Iggy(CannotBindToSocket("10.0.1.11:9090"))) }] }
+```
+
+Check the `nodeSelector` on that release against the `ip` in its roster entry.
+
+### Upgrades
+
+Host ports make a rolling update impossible: the replacement pod cannot bind
+ports the outgoing pod still holds, so it stays `Pending` while the Deployment
+waits for it to become ready. The chart therefore switches the server to the
+`Recreate` strategy whenever `hostNetwork` is set, which takes the node down
+for the length of the restart. Roll **one release at a time** and let the
+cluster regain quorum before starting the next.
+
+Turning `hostNetwork` on for a release that already exists is rejected by the
+API server, because a Deployment cannot move from `RollingUpdate` to `Recreate`
+in place:
+
+```text
+Deployment.apps "iggy-n0" is invalid: spec.strategy.rollingUpdate: Forbidden:
+  may not be specified when strategy `type` is 'Recreate'
+```
+
+Uninstall that release and install it again. Set `server.strategy` explicitly if
+you want a different strategy.
+
+### Roster rules
+
+* Every node runs the **identical** `server.cluster.nodes` list. Only
+  `selfReplicaId` differs between releases.
+* `replicaId` values are unique and cover `0..N-1` for an `N`-node roster.
+* `ports.tcpReplica` is required on every entry. In cluster mode the server
+  takes every listener port from the roster and will not fall back to defaults,
+  because two nodes on one host would otherwise race for the same socket. The
+  remaining ports default to `server.ports`.
+* `server.cluster.name` is hashed into the on-disk cluster id on first boot.
+  Changing it later makes the server refuse to start against existing data.
+* `ip` must be a literal IP. Hostnames are rejected. Use
+  `advertisedAddress` for the name clients dial, which does accept DNS.
+
+### Storage
+
+A replica cannot move between nodes without invalidating its roster entry, so
+give each release storage that stays on its node, and size
+`server.persistence` per node rather than for the cluster. A replica that starts
+on an empty volume rejoins by state transfer, which is correct but re-reads the
+whole dataset from its peers.
+
+### What the chart refuses
+
+`server.replicaCount > 1` and `autoscaling.enabled` both fail at render time.
+Scaling the server Deployment produces N independent servers behind one Service,
+all writing the same PVC subpath with no lock between them, which corrupts the
+data directory while `helm --wait` still reports success. Cluster size is a
+roster decision, so add a node to `server.cluster.nodes` and install another
+release instead.
+
 ## Uninstallation
 
 ```bash
@@ -148,7 +247,7 @@ If a previous local smoke install failed and left resources behind, reset the sm
 scripts/ci/test-helm.sh cleanup-smoke
 ```
 
-On Apple Silicon hosts, the released `apache/iggy:0.7.0` `arm64` image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
+On Apple Silicon hosts, the released `arm64` server image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
 
 ```bash
 HELM_SMOKE_KIND_PLATFORM=linux/amd64 scripts/ci/setup-helm-smoke-cluster.sh
@@ -336,14 +435,20 @@ pre-commit install
 | podSecurityContext | object | `{"seccompProfile":{"type":"Unconfined"}}` | Pod security context (server uses io_uring, requires unconfined seccomp) |
 | resources | object | `{}` | Resource limits and requests for server |
 | securityContext | object | `{"capabilities":{"add":["IPC_LOCK"]}}` | Container security context (server requires IPC_LOCK for io_uring) |
-| server | object | `{"advertisedAddress":"","affinity":{},"enabled":true,"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":"0.7.0"},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
+| server | object | `{"advertisedAddress":"","affinity":{},"cluster":{"enabled":false,"name":"iggy-cluster","nodes":[],"selfReplicaId":0},"enabled":true,"env":[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}],"extraArgs":[],"hostNetwork":false,"image":{"pullPolicy":"Always","repository":"apache/iggy","tag":"0.9.0-edge.6"},"ingress":{"annotations":{},"className":"","enabled":false,"hosts":[{"host":"chart-example.local","paths":[{"path":"/","pathType":"ImplementationSpecific"}]}],"tls":[]},"nodeSelector":{},"persistence":{"accessMode":"ReadWriteOnce","annotations":{},"enabled":false,"existingClaim":"","size":"8Gi","storageClass":""},"ports":{"http":3000,"quic":8080,"tcp":8090,"tcpReplica":9090,"websocket":8092},"replicaCount":1,"service":{"port":3000,"type":"ClusterIP"},"serviceMonitor":{"additionalLabels":{},"authorization":{},"enabled":false,"honorLabels":false,"interval":"30s","namespace":"","path":"/metrics","scrapeTimeout":"10s"},"strategy":{},"tolerations":[],"users":{"root":{"createSecret":true,"existingSecret":{"name":"","passwordKey":"password","usernameKey":"username"},"password":"changeit","username":"iggy"}}}` | Iggy server configuration |
 | server.advertisedAddress | string | `""` | Client-facing address published in cluster metadata. Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but setting both is refused at render time. Empty falls back to the in-cluster Service DNS name. |
 | server.affinity | object | `{}` | Affinity rules for server pods |
+| server.cluster.enabled | bool | `false` | Enable cluster (VSR consensus) mode. One Helm release per node: every release shares the same `nodes` roster and overrides only `selfReplicaId`. See the Cluster Mode section of the chart README. |
+| server.cluster.name | string | `"iggy-cluster"` | Cluster name, byte-identical on every node. Hashed into the on-disk cluster id on first boot, so changing it later means starting from an empty data directory. |
+| server.cluster.nodes | list | `[]` | Cluster roster, mirroring the server's `[[cluster.nodes]]` config. Every node runs the identical list. `ip` is the replica-plane address: this node's consensus listener binds it verbatim and every peer dials it verbatim, so it must be a literal IP that the pod itself owns. With `server.hostNetwork` that is the node IP. `ports.tcpReplica` is required on every entry; the remaining ports default to `server.ports`. |
+| server.cluster.selfReplicaId | int | `0` | Which `nodes` entry this release runs, matched against `replicaId`. |
 | server.enabled | bool | `true` | Enable the Iggy server deployment |
 | server.env | list | `[{"name":"RUST_LOG","value":"info"},{"name":"IGGY_HTTP_ADDRESS","value":"0.0.0.0:3000"},{"name":"IGGY_TCP_ADDRESS","value":"0.0.0.0:8090"},{"name":"IGGY_QUIC_ADDRESS","value":"0.0.0.0:8080"},{"name":"IGGY_WEBSOCKET_ADDRESS","value":"0.0.0.0:8092"}]` | Environment variables for the server container |
+| server.extraArgs | list | `[]` | Extra command-line arguments appended to the server entrypoint, e.g. `["--replica-id", "0"]` when running a cluster node. |
+| server.hostNetwork | bool | `false` | Run the server pod in the host network namespace. Required for cluster mode, where the replica listener binds the roster IP verbatim. |
 | server.image.pullPolicy | string | `"Always"` | Image pull policy |
 | server.image.repository | string | `"apache/iggy"` | Server image repository |
-| server.image.tag | string | `"0.7.0"` | Server image tag (overrides chart appVersion) |
+| server.image.tag | string | `"0.9.0-edge.6"` | Server image tag (overrides chart appVersion) |
 | server.ingress.annotations | object | `{}` | Ingress annotations (controller-specific) |
 | server.ingress.className | string | `""` | Ingress class name (controller-neutral) |
 | server.ingress.enabled | bool | `false` | Enable ingress for the server |
@@ -357,8 +462,10 @@ pre-commit install
 | server.persistence.size | string | `"8Gi"` | PVC storage size |
 | server.persistence.storageClass | string | `""` | Storage class for PVC (empty uses default provisioner) |
 | server.ports.http | int | `3000` | HTTP API port |
-| server.ports.quic | int | `8080` | QUIC protocol port |
+| server.ports.quic | int | `8080` | QUIC protocol port (UDP) |
 | server.ports.tcp | int | `8090` | TCP protocol port |
+| server.ports.tcpReplica | int | `9090` | Replica-to-replica consensus port. Only published when `server.cluster.enabled` is true. |
+| server.ports.websocket | int | `8092` | WebSocket protocol port |
 | server.replicaCount | int | `1` | Number of server replicas |
 | server.service.port | int | `3000` | Service port for the server |
 | server.service.type | string | `"ClusterIP"` | Service type for the server |
@@ -370,6 +477,7 @@ pre-commit install
 | server.serviceMonitor.namespace | string | `""` | Namespace to deploy the ServiceMonitor |
 | server.serviceMonitor.path | string | `"/metrics"` | Path to scrape metrics from |
 | server.serviceMonitor.scrapeTimeout | string | `"10s"` | Timeout for scrape metrics request |
+| server.strategy | object | `{}` | Deployment update strategy. Empty lets the chart choose: `Recreate` when `hostNetwork` is set, because a rolling update would wait forever for a replacement pod that cannot bind host ports the outgoing pod still holds, and the Kubernetes default otherwise. |
 | server.tolerations | list | `[]` | Tolerations for server pods |
 | server.users.root.createSecret | bool | `true` | Create a secret for the root user credentials |
 | server.users.root.existingSecret.name | string | `""` | Name of existing secret for root credentials |

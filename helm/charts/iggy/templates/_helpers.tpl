@@ -97,3 +97,77 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
   {{- end }}
 {{- end }}
+
+{{/*
+Validate the cluster roster and fail the render with an actionable message.
+Every check here is one the server would otherwise only reject at boot, after
+the pod is already scheduled.
+*/}}
+{{- define "iggy.validateCluster" -}}
+  {{- $cluster := .Values.server.cluster }}
+  {{- if not $cluster.nodes }}
+    {{- fail "server.cluster.enabled is true but server.cluster.nodes is empty. Every node runs the identical roster; see the Cluster Mode section of the chart README." }}
+  {{- end }}
+  {{- $count := len $cluster.nodes }}
+  {{- $seen := dict }}
+  {{- range $cluster.nodes }}
+    {{- if not .name }}
+      {{- fail "every server.cluster.nodes entry needs a name" }}
+    {{- end }}
+    {{- if not .ip }}
+      {{- fail (printf "server.cluster.nodes entry %q has no ip. The replica listener binds this address verbatim, so it must be a literal IP the pod owns." .name) }}
+    {{- end }}
+    {{- if kindIs "invalid" .replicaId }}
+      {{- fail (printf "server.cluster.nodes entry %q has no replicaId" .name) }}
+    {{- end }}
+    {{- $id := int .replicaId }}
+    {{- if or (lt $id 0) (ge $id $count) }}
+      {{- fail (printf "server.cluster.nodes entry %q has replicaId %d, which is outside 0..%d for a %d-node roster" .name $id (sub $count 1) $count) }}
+    {{- end }}
+    {{- if hasKey $seen (printf "%d" $id) }}
+      {{- fail (printf "server.cluster.nodes has two entries with replicaId %d; ids must be unique" $id) }}
+    {{- end }}
+    {{- $_ := set $seen (printf "%d" $id) .name }}
+    {{- if not (and .ports .ports.tcpReplica) }}
+      {{- fail (printf "server.cluster.nodes entry %q has no ports.tcpReplica. In cluster mode the server takes every listener port from the roster and refuses to start without it." .name) }}
+    {{- end }}
+  {{- end }}
+  {{- if not (hasKey $seen (printf "%d" (int $cluster.selfReplicaId))) }}
+    {{- fail (printf "server.cluster.selfReplicaId is %d but no server.cluster.nodes entry declares that replicaId. Each release picks its own identity out of the shared roster." (int $cluster.selfReplicaId)) }}
+  {{- end }}
+{{- end }}
+
+{{/*
+Render the roster as IGGY_CLUSTER_* environment variables. The server accepts
+the whole cluster config this way, so the chart needs no config file mount.
+*/}}
+{{- define "iggy.clusterEnv" -}}
+  {{- $ports := .Values.server.ports }}
+- name: IGGY_CLUSTER_ENABLED
+  value: "true"
+- name: IGGY_CLUSTER_NAME
+  value: {{ .Values.server.cluster.name | quote }}
+  {{- range .Values.server.cluster.nodes }}
+    {{- $id := int .replicaId }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_NAME
+  value: {{ .name | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_IP
+  value: {{ .ip | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_REPLICA_ID
+  value: {{ $id | quote }}
+    {{- if .advertisedAddress }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_ADVERTISED_ADDRESS
+  value: {{ .advertisedAddress | quote }}
+    {{- end }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_TCP
+  value: {{ (default $ports.tcp (and .ports .ports.tcp)) | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_QUIC
+  value: {{ (default $ports.quic (and .ports .ports.quic)) | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_HTTP
+  value: {{ (default $ports.http (and .ports .ports.http)) | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_WEBSOCKET
+  value: {{ (default $ports.websocket (and .ports .ports.websocket)) | quote }}
+- name: IGGY_CLUSTER_NODES_{{ $id }}_PORTS_TCP_REPLICA
+  value: {{ .ports.tcpReplica | quote }}
+  {{- end }}
+{{- end }}

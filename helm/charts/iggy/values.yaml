@@ -32,14 +32,19 @@ server:
     # -- Image pull policy
     pullPolicy: Always
     # -- Server image tag (overrides chart appVersion)
-    tag: "0.7.0"
+    tag: "0.9.0-edge.6"
   ports:
     # -- HTTP API port
     http: 3000
-    # -- QUIC protocol port
+    # -- QUIC protocol port (UDP)
     quic: 8080
     # -- TCP protocol port
     tcp: 8090
+    # -- WebSocket protocol port
+    websocket: 8092
+    # -- Replica-to-replica consensus port. Only published when
+    # `server.cluster.enabled` is true.
+    tcpReplica: 9090
 
   service:
     # -- Service type for the server
@@ -99,6 +104,51 @@ server:
     accessMode: ReadWriteOnce
     # -- PVC storage size
     size: 8Gi
+
+  cluster:
+    # -- Enable cluster (VSR consensus) mode. One Helm release per node: every
+    # release shares the same `nodes` roster and overrides only `selfReplicaId`.
+    # See the Cluster Mode section of the chart README.
+    enabled: false
+    # -- Cluster name, byte-identical on every node. Hashed into the on-disk
+    # cluster id on first boot, so changing it later means starting from an
+    # empty data directory.
+    name: iggy-cluster
+    # -- Which `nodes` entry this release runs, matched against `replicaId`.
+    selfReplicaId: 0
+    # -- Cluster roster, mirroring the server's `[[cluster.nodes]]` config.
+    # Every node runs the identical list. `ip` is the replica-plane address:
+    # this node's consensus listener binds it verbatim and every peer dials it
+    # verbatim, so it must be a literal IP that the pod itself owns. With
+    # `server.hostNetwork` that is the node IP. `ports.tcpReplica` is required
+    # on every entry; the remaining ports default to `server.ports`.
+    nodes: []
+    # nodes:
+    #   - name: iggy-node-0
+    #     ip: 10.0.1.5
+    #     replicaId: 0
+    #     # -- Optional client-facing address, a literal IP or a DNS hostname.
+    #     advertisedAddress: ""
+    #     ports:
+    #       tcp: 8090
+    #       quic: 8080
+    #       http: 3000
+    #       websocket: 8092
+    #       tcpReplica: 9090
+
+  # -- Run the server pod in the host network namespace. Required for cluster
+  # mode, where the replica listener binds the roster IP verbatim.
+  hostNetwork: false
+
+  # -- Deployment update strategy. Empty lets the chart choose: `Recreate` when
+  # `hostNetwork` is set, because a rolling update would wait forever for a
+  # replacement pod that cannot bind host ports the outgoing pod still holds,
+  # and the Kubernetes default otherwise.
+  strategy: {}
+
+  # -- Extra command-line arguments appended to the server entrypoint, e.g.
+  # `["--replica-id", "0"]` when running a cluster node.
+  extraArgs: []
 
   # -- Environment variables for the server container
   env:
