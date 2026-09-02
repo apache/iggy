@@ -128,6 +128,13 @@ public partial class IggyConsumer
 
             if (rental.Messages.Count == 0)
             {
+                if (rental.PartitionId == PolledMessages.NO_ASSIGNED_PARTITION)
+                {
+                    LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
+                    await Task.Delay(NoAssignedPartitionBackoffMs, ct);
+                    return;
+                }
+
                 if (_logger.IsEnabled(LogLevel.Debug))
                 {
                     _logger.LogDebug("No messages received from poll for partition {PartitionId}", rental.PartitionId);

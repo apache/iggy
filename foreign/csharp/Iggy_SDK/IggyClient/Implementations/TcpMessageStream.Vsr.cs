@@ -91,6 +91,18 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
     private const uint VsrResyncRequiredPartitionSentinel = uint.MaxValue;
 
     /// <summary>
+    ///     Shared empty poll result for a group member that currently owns no partition, carrying
+    ///     <see cref="PolledMessages.NO_ASSIGNED_PARTITION" /> so a consumer can back off instead of re-polling at
+    ///     once. Same ownership rules as <see cref="EmptyPolledMessages" />.
+    /// </summary>
+    private static readonly PolledMessagesRental NoAssignedPartitionPolledMessages = new(EmptyMemoryOwner.Instance)
+    {
+        PartitionId = PolledMessages.NO_ASSIGNED_PARTITION,
+        CurrentOffset = 0,
+        Messages = []
+    };
+
+    /// <summary>
     ///     Shared empty poll result. An idle consumer loop returns one on every iteration, and the instance owns
     ///     no rented buffer - <see cref="EmptyMemoryOwner" /> disposes to nothing - so it is safe to hand out
     ///     repeatedly even after a caller disposes it.
@@ -274,7 +286,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
                         $"Client is not a member of consumer group {consumer.ConsumerId} on topic {topicId}.");
                 }
 
-                return EmptyPolledMessages;
+                return NoAssignedPartitionPolledMessages;
             }
 
             PolledMessagesRental? rental = null;
@@ -307,7 +319,9 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider
             await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token);
         }
 
-        return EmptyPolledMessages;
+        // Running out of attempts mid-rebalance is not a failure: report it like a member that owns nothing
+        // yet, so the consumer backs off and polls again.
+        return NoAssignedPartitionPolledMessages;
     }
 
     /// <summary>

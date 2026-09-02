@@ -18,6 +18,7 @@
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
@@ -40,6 +41,12 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     unrecoverable (client disconnected, group deleted).
     /// </summary>
     private const int GroupRejoinRetryDelayMs = 1_000;
+
+    /// <summary>
+    ///     Backoff after a group poll reported <see cref="PolledMessages.NO_ASSIGNED_PARTITION" />. Without it a
+    ///     member holding zero partitions re-polls in a hot loop whenever <c>PollingIntervalMs</c> is zero.
+    /// </summary>
+    private const int NoAssignedPartitionBackoffMs = 1_000;
 
     private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
@@ -409,6 +416,12 @@ public partial class IggyConsumer : IAsyncDisposable
 
             if (messages.Messages.Count == 0)
             {
+                if (messages.PartitionId == PolledMessages.NO_ASSIGNED_PARTITION)
+                {
+                    LogNoPartitionAssignedBackingOff(NoAssignedPartitionBackoffMs);
+                    await Task.Delay(NoAssignedPartitionBackoffMs, ct);
+                }
+
                 return;
             }
 

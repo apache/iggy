@@ -38,12 +38,15 @@ internal sealed class ConsumerGroupClientState
     /// <summary>Nothing tells this client when another one resizes a topic, so the count expires on its own.</summary>
     private const long PartitionCountTtlMs = 30_000;
 
-    /// <summary>True when a non-empty assignment is cached for the group.</summary>
+    /// <summary>
+    ///     True when an assignment is cached for the group, even one holding zero partitions. Treating an empty
+    ///     assignment as missing would re-sync on every poll of a member that owns nothing.
+    /// </summary>
     internal bool HasAssignment(GroupKey key)
     {
         lock (_gate)
         {
-            return _assignments.TryGetValue(key, out var assignment) && assignment.Partitions.Count > 0;
+            return _assignments.ContainsKey(key);
         }
     }
 

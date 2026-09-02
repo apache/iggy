@@ -94,7 +94,8 @@ public sealed class ConsumerGroupClientStateTests
         state.RegisterGroup(Key, Identifier.Numeric(1), Identifier.Numeric(2), Identifier.Numeric(3));
         state.SetAssignment(Key, 1, []);
 
-        Assert.False(state.HasAssignment(Key));
+        Assert.True(state.HasAssignment(Key));
+        Assert.Null(state.NextGroupPartition(Key));
         Assert.True(state.IsRegistered(Key));
 
         state.DeregisterGroup(Key);

@@ -795,25 +795,15 @@ internal static class BinaryMapper
     private static Dictionary<HeaderKey, HeaderValue> MapOptions(ReadOnlySpan<byte> payload, int position,
         out int readBytes)
     {
-        // Every length here is server-controlled. Read the block length as long
-        // so a value above int.MaxValue cannot wrap negative, and bound each
-        // entry against the block before slicing: an entry that overruns `end`
-        // would otherwise be accepted and silently consume the response bytes
-        // that follow the block.
-        var optionsLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
-        var available = (long)payload.Length - (position + 4);
-        if (optionsLength > available)
-        {
-            throw new MalformedResponseException(
-                $"Malformed options block at byte {position}: declared length {optionsLength} exceeds the " +
-                $"{available} bytes remaining in the payload.");
-        }
-
-        readBytes = 4 + (int)optionsLength;
+        // Every length here is server-controlled. Bound each entry against the
+        // block before slicing: an entry that overruns `end` would otherwise be
+        // accepted and silently consume the response bytes that follow the block.
+        var optionsLength = ReadLength(payload, position, "Options block");
+        readBytes = 4 + optionsLength;
 
         var options = new Dictionary<HeaderKey, HeaderValue>();
         var cursor = position + 4;
-        var end = cursor + (int)optionsLength;
+        var end = cursor + optionsLength;
         while (cursor < end)
         {
             var keyKindCode = ReadOptionByte(payload, ref cursor, end, position);
