@@ -33,7 +33,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use simd_json::{OwnedValue, StaticNode};
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -377,7 +376,7 @@ impl DynamoDbSink {
         &self,
         items: Vec<HashMap<String, AttributeValue>>,
     ) -> (Vec<HashMap<String, AttributeValue>>, u64) {
-        let mut positions: HashMap<String, usize> = HashMap::with_capacity(items.len());
+        let mut positions: HashMap<ItemKey, usize> = HashMap::with_capacity(items.len());
         let mut deduplicated: Vec<HashMap<String, AttributeValue>> =
             Vec::with_capacity(items.len());
         let mut duplicates = 0u64;
@@ -399,15 +398,18 @@ impl DynamoDbSink {
         (deduplicated, duplicates)
     }
 
-    /// `AttributeValue` is not hashable, so the key attributes are rendered
-    /// into a string that only lives for the deduplication pass.
-    fn key_signature(&self, item: &HashMap<String, AttributeValue>) -> String {
-        let mut signature = key_attribute_signature(item.get(&self.partition_key_field));
-        if let Some(sort_key_field) = &self.sort_key_field {
-            signature.push('|');
-            signature.push_str(&key_attribute_signature(item.get(sort_key_field)));
+    /// `AttributeValue` is not hashable, so the key attributes are copied into
+    /// a typed key that only lives for the deduplication pass. Rendering them
+    /// into one string would let a value containing the separator collide with
+    /// another pair of key values.
+    fn key_signature(&self, item: &HashMap<String, AttributeValue>) -> ItemKey {
+        ItemKey {
+            partition: key_attribute_signature(item.get(&self.partition_key_field)),
+            sort: self
+                .sort_key_field
+                .as_ref()
+                .map(|sort_key_field| key_attribute_signature(item.get(sort_key_field))),
         }
-        signature
     }
 
     /// One `BatchWriteItem` round, retrying both throttled requests and the
@@ -663,18 +665,28 @@ fn json_into_attribute_value(value: OwnedValue) -> AttributeValue {
     }
 }
 
-fn key_attribute_signature(value: Option<&AttributeValue>) -> String {
+/// The primary key of one item, compared as typed values so that two different
+/// keys never look alike.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ItemKey {
+    partition: KeyAttribute,
+    sort: Option<KeyAttribute>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum KeyAttribute {
+    String(String),
+    Number(String),
+    Binary(Vec<u8>),
+    Missing,
+}
+
+fn key_attribute_signature(value: Option<&AttributeValue>) -> KeyAttribute {
     match value {
-        Some(AttributeValue::S(text)) => format!("S:{text}"),
-        Some(AttributeValue::N(number)) => format!("N:{number}"),
-        Some(AttributeValue::B(blob)) => {
-            let mut signature = String::from("B:");
-            for byte in blob.as_ref() {
-                let _ = write!(signature, "{byte:02x}");
-            }
-            signature
-        }
-        _ => String::new(),
+        Some(AttributeValue::S(text)) => KeyAttribute::String(text.clone()),
+        Some(AttributeValue::N(number)) => KeyAttribute::Number(number.clone()),
+        Some(AttributeValue::B(blob)) => KeyAttribute::Binary(blob.as_ref().to_vec()),
+        _ => KeyAttribute::Missing,
     }
 }
 
@@ -1392,6 +1404,24 @@ mod tests {
             DEFAULT_PARTITION_KEY_FIELD.to_owned(),
             AttributeValue::B(Blob::new(vec![0x01, 0x03])),
         )]);
+
+        assert_ne!(sink.key_signature(&first), sink.key_signature(&second));
+    }
+
+    #[test]
+    fn given_composite_string_keys_when_signed_should_not_collide() {
+        let mut config = given_default_config();
+        config.partition_key_field = Some("pk".to_owned());
+        config.sort_key_field = Some("sk".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        let first = HashMap::from([
+            ("pk".to_owned(), AttributeValue::S("a".to_owned())),
+            ("sk".to_owned(), AttributeValue::S("b|S:c".to_owned())),
+        ]);
+        let second = HashMap::from([
+            ("pk".to_owned(), AttributeValue::S("a|S:b".to_owned())),
+            ("sk".to_owned(), AttributeValue::S("c".to_owned())),
+        ]);
 
         assert_ne!(sink.key_signature(&first), sink.key_signature(&second));
     }
