@@ -82,7 +82,14 @@ because DynamoDB would reject the whole batch.
 
 The key fields are checked against the table on startup. A `partition_key_field`
 or `sort_key_field` that does not match the table key schema fails the connector
-while it opens, instead of on the first write.
+while it opens, instead of on the first write. The declared key types are read
+from the same call. The generated partition key is a string (`S`) and the
+generated sort key is a number (`N`), so a table typing its keys as anything
+else only accepts messages that carry those fields, which the connector warns
+about on startup. Every item is then checked against the declared `S`, `N`, or
+`B` type and against the DynamoDB key size limits, 2,048 bytes for a partition
+key and 1,024 bytes for a sort key. A mismatched item is skipped instead of
+failing its whole batch.
 
 DynamoDB rejects a request that writes the same key twice, so within one
 `consume()` call only the newest item per key is sent.

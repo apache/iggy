@@ -22,7 +22,8 @@ use aws_sdk_dynamodb::config::{Credentials, Region};
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{
-    AttributeValue, KeySchemaElement, KeyType, PutRequest, WriteRequest,
+    AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, PutRequest,
+    ScalarAttributeType, WriteRequest,
 };
 use humantime::Duration as HumanDuration;
 use iggy_connector_sdk::retry::{exponential_backoff, jitter};
@@ -44,6 +45,10 @@ sink_connector!(DynamoDbSink);
 const MAX_BATCH_WRITE_ITEMS: usize = 25;
 /// DynamoDB rejects items larger than 400 KB.
 const MAX_ITEM_SIZE: usize = 400 * 1024;
+/// DynamoDB rejects a partition key value longer than 2,048 bytes.
+const MAX_PARTITION_KEY_SIZE: usize = 2048;
+/// DynamoDB rejects a sort key value longer than 1,024 bytes.
+const MAX_SORT_KEY_SIZE: usize = 1024;
 const DEFAULT_PARTITION_KEY_FIELD: &str = "iggy_id";
 const DEFAULT_MAX_RETRIES: u32 = 3;
 const DEFAULT_RETRY_DELAY: &str = "500ms";
@@ -58,6 +63,7 @@ pub struct DynamoDbSink {
     config: DynamoDbSinkConfig,
     partition_key_field: String,
     sort_key_field: Option<String>,
+    key_types: TableKeyTypes,
     batch_size: usize,
     include_metadata: bool,
     include_checksum: bool,
@@ -71,6 +77,15 @@ pub struct DynamoDbSink {
     items_skipped: AtomicU64,
     items_deduplicated: AtomicU64,
     write_errors: AtomicU64,
+}
+
+/// Exact key attribute types the table declares. DynamoDB rejects the whole
+/// `BatchWriteItem` request when a key value has another type, so an item that
+/// does not match is dropped before the request is built.
+#[derive(Debug, Default, Clone)]
+struct TableKeyTypes {
+    partition: Option<ScalarAttributeType>,
+    sort: Option<ScalarAttributeType>,
 }
 
 /// Only `Deserialize` - nothing serializes a plugin config back out, and the
@@ -132,6 +147,7 @@ impl DynamoDbSink {
             config,
             partition_key_field,
             sort_key_field,
+            key_types: TableKeyTypes::default(),
             batch_size,
             include_metadata,
             include_checksum,
@@ -169,12 +185,16 @@ impl Sink for DynamoDbSink {
                     describe_sdk_error(&error)
                 ))
             })?;
-        self.validate_key_schema(
-            description
-                .table
-                .and_then(|table| table.key_schema)
-                .unwrap_or_default(),
-        )?;
+        let (key_schema, attribute_definitions) = description
+            .table
+            .map(|table| {
+                (
+                    table.key_schema.unwrap_or_default(),
+                    table.attribute_definitions.unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        self.key_types = self.validate_key_schema(&key_schema, &attribute_definitions)?;
 
         self.client = Some(client);
         info!(
@@ -256,18 +276,29 @@ impl DynamoDbSink {
 
     /// A key field that does not match the table makes DynamoDB reject every
     /// write, and the runtime stops the connector on the first error, so the
-    /// mismatch is reported while the sink is still opening.
-    fn validate_key_schema(&self, key_schema: Vec<KeySchemaElement>) -> Result<(), Error> {
+    /// mismatch is reported while the sink is still opening. The declared key
+    /// types are returned because every item is checked against them.
+    fn validate_key_schema(
+        &self,
+        key_schema: &[KeySchemaElement],
+        attribute_definitions: &[AttributeDefinition],
+    ) -> Result<TableKeyTypes, Error> {
         let table_key = |key_type: KeyType| {
             key_schema
                 .iter()
                 .find(|element| element.key_type == key_type)
-                .map(|element| element.attribute_name.clone())
+                .map(|element| element.attribute_name.as_str())
+        };
+        let attribute_type = |name: &str| {
+            attribute_definitions
+                .iter()
+                .find(|definition| definition.attribute_name == name)
+                .map(|definition| definition.attribute_type.clone())
         };
 
         let partition_key = table_key(KeyType::Hash);
-        if let Some(partition_key) = &partition_key
-            && partition_key != &self.partition_key_field
+        if let Some(partition_key) = partition_key
+            && partition_key != self.partition_key_field
         {
             return Err(Error::InvalidConfigValue(format!(
                 "Table '{}' uses '{partition_key}' as its partition key, but partition_key_field is '{}'",
@@ -275,23 +306,56 @@ impl DynamoDbSink {
             )));
         }
 
-        match (table_key(KeyType::Range), &self.sort_key_field) {
-            (Some(sort_key), Some(sort_key_field)) if &sort_key != sort_key_field => {
-                Err(Error::InvalidConfigValue(format!(
+        let sort_key = table_key(KeyType::Range);
+        match (sort_key, &self.sort_key_field) {
+            (Some(sort_key), Some(sort_key_field)) if sort_key != sort_key_field => {
+                return Err(Error::InvalidConfigValue(format!(
                     "Table '{}' uses '{sort_key}' as its sort key, but sort_key_field is '{sort_key_field}'",
                     self.config.table
-                )))
+                )));
             }
-            (Some(sort_key), None) => Err(Error::InvalidConfigValue(format!(
-                "Table '{}' has a sort key '{sort_key}', so sort_key_field must be set",
-                self.config.table
-            ))),
-            (None, Some(sort_key_field)) => Err(Error::InvalidConfigValue(format!(
-                "Table '{}' has no sort key, so sort_key_field '{sort_key_field}' must be removed",
-                self.config.table
-            ))),
-            _ => Ok(()),
+            (Some(sort_key), None) => {
+                return Err(Error::InvalidConfigValue(format!(
+                    "Table '{}' has a sort key '{sort_key}', so sort_key_field must be set",
+                    self.config.table
+                )));
+            }
+            (None, Some(sort_key_field)) => {
+                return Err(Error::InvalidConfigValue(format!(
+                    "Table '{}' has no sort key, so sort_key_field '{sort_key_field}' must be removed",
+                    self.config.table
+                )));
+            }
+            _ => {}
         }
+
+        let key_types = TableKeyTypes {
+            partition: partition_key.and_then(attribute_type),
+            sort: sort_key.and_then(attribute_type),
+        };
+        if let Some(partition_type) = &key_types.partition
+            && partition_type != &ScalarAttributeType::S
+        {
+            warn!(
+                "DynamoDB sink ID: {} writes a string partition key, but table '{}' types '{}' as '{}', so only messages carrying that field are written",
+                self.id,
+                self.config.table,
+                self.partition_key_field,
+                partition_type.as_str()
+            );
+        }
+        if let (Some(sort_type), Some(sort_key_field)) = (&key_types.sort, &self.sort_key_field)
+            && sort_type != &ScalarAttributeType::N
+        {
+            warn!(
+                "DynamoDB sink ID: {} writes a numeric sort key, but table '{}' types '{sort_key_field}' as '{}', so only messages carrying that field are written",
+                self.id,
+                self.config.table,
+                sort_type.as_str()
+            );
+        }
+
+        Ok(key_types)
     }
 
     async fn write_messages(
@@ -568,9 +632,19 @@ impl DynamoDbSink {
                 .or_insert_with(|| AttributeValue::N(message.offset.to_string()));
         }
 
-        validate_key_attribute(&item, &self.partition_key_field)?;
+        validate_key_attribute(
+            &item,
+            &self.partition_key_field,
+            self.key_types.partition.as_ref(),
+            MAX_PARTITION_KEY_SIZE,
+        )?;
         if let Some(sort_key_field) = &self.sort_key_field {
-            validate_key_attribute(&item, sort_key_field)?;
+            validate_key_attribute(
+                &item,
+                sort_key_field,
+                self.key_types.sort.as_ref(),
+                MAX_SORT_KEY_SIZE,
+            )?;
         }
 
         let size = estimate_item_size(&item);
@@ -709,29 +783,49 @@ fn build_message_key(
     )
 }
 
-/// DynamoDB key attributes must be a non-empty string, number, or binary
-/// value. Anything else fails the whole batch with a validation error, so the
-/// offending message is dropped before it is sent.
+/// DynamoDB key attributes must be a non-empty value of the exact type the
+/// table declares, within the key size limits. Anything else fails the whole
+/// batch with a validation error, so the offending message is dropped before it
+/// is sent.
 fn validate_key_attribute(
     item: &HashMap<String, AttributeValue>,
     field: &str,
+    declared_type: Option<&ScalarAttributeType>,
+    max_size: usize,
 ) -> Result<(), Error> {
     let value = item
         .get(field)
         .ok_or_else(|| Error::InvalidRecordValue(format!("key field '{field}' is missing")))?;
-    let valid = match value {
-        AttributeValue::S(text) => !text.is_empty(),
-        AttributeValue::N(number) => !number.is_empty(),
-        AttributeValue::B(blob) => !blob.as_ref().is_empty(),
-        _ => false,
+    let (key_type, size) = match value {
+        AttributeValue::S(text) => (ScalarAttributeType::S, text.len()),
+        AttributeValue::N(number) => (ScalarAttributeType::N, number.len()),
+        AttributeValue::B(blob) => (ScalarAttributeType::B, blob.as_ref().len()),
+        _ => {
+            return Err(Error::InvalidRecordValue(format!(
+                "key field '{field}' must be a string, number, or binary value"
+            )));
+        }
     };
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::InvalidRecordValue(format!(
-            "key field '{field}' must be a non-empty string, number, or binary value"
-        )))
+    if size == 0 {
+        return Err(Error::InvalidRecordValue(format!(
+            "key field '{field}' must not be empty"
+        )));
     }
+    if let Some(declared_type) = declared_type
+        && declared_type != &key_type
+    {
+        return Err(Error::InvalidRecordValue(format!(
+            "key field '{field}' is of type '{}', but the table declares '{}'",
+            key_type.as_str(),
+            declared_type.as_str()
+        )));
+    }
+    if size > max_size {
+        return Err(Error::InvalidRecordValue(format!(
+            "key field '{field}' of {size} bytes exceeds the limit of {max_size} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn estimate_item_size(item: &HashMap<String, AttributeValue>) -> usize {
@@ -1300,6 +1394,29 @@ mod tests {
         assert_eq!(sink.items_written.load(Ordering::Relaxed), 0);
     }
 
+    fn given_attribute_definitions(
+        partition_key: (&str, ScalarAttributeType),
+        sort_key: Option<(&str, ScalarAttributeType)>,
+    ) -> Vec<AttributeDefinition> {
+        let mut definitions = vec![
+            AttributeDefinition::builder()
+                .attribute_name(partition_key.0)
+                .attribute_type(partition_key.1)
+                .build()
+                .expect("build attribute definition"),
+        ];
+        if let Some((name, attribute_type)) = sort_key {
+            definitions.push(
+                AttributeDefinition::builder()
+                    .attribute_name(name)
+                    .attribute_type(attribute_type)
+                    .build()
+                    .expect("build attribute definition"),
+            );
+        }
+        definitions
+    }
+
     fn given_key_schema(partition_key: &str, sort_key: Option<&str>) -> Vec<KeySchemaElement> {
         let mut key_schema = vec![
             KeySchemaElement::builder()
@@ -1326,19 +1443,27 @@ mod tests {
         config.sort_key_field = Some("iggy_offset".to_owned());
         let sink = DynamoDbSink::new(1, config);
 
-        let result = sink.validate_key_schema(given_key_schema(
-            DEFAULT_PARTITION_KEY_FIELD,
-            Some("iggy_offset"),
-        ));
+        let result = sink.validate_key_schema(
+            &given_key_schema(DEFAULT_PARTITION_KEY_FIELD, Some("iggy_offset")),
+            &given_attribute_definitions(
+                (DEFAULT_PARTITION_KEY_FIELD, ScalarAttributeType::S),
+                Some(("iggy_offset", ScalarAttributeType::N)),
+            ),
+        );
 
-        assert!(result.is_ok());
+        let key_types = result.expect("validate key schema");
+        assert_eq!(key_types.partition, Some(ScalarAttributeType::S));
+        assert_eq!(key_types.sort, Some(ScalarAttributeType::N));
     }
 
     #[test]
     fn given_another_partition_key_when_validated_should_reject_the_table() {
         let sink = DynamoDbSink::new(1, given_default_config());
 
-        let result = sink.validate_key_schema(given_key_schema("user_id", None));
+        let result = sink.validate_key_schema(
+            &given_key_schema("user_id", None),
+            &given_attribute_definitions(("user_id", ScalarAttributeType::S), None),
+        );
 
         assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
     }
@@ -1347,10 +1472,13 @@ mod tests {
     fn given_table_sort_key_without_configured_field_when_validated_should_reject_the_table() {
         let sink = DynamoDbSink::new(1, given_default_config());
 
-        let result = sink.validate_key_schema(given_key_schema(
-            DEFAULT_PARTITION_KEY_FIELD,
-            Some("iggy_offset"),
-        ));
+        let result = sink.validate_key_schema(
+            &given_key_schema(DEFAULT_PARTITION_KEY_FIELD, Some("iggy_offset")),
+            &given_attribute_definitions(
+                (DEFAULT_PARTITION_KEY_FIELD, ScalarAttributeType::S),
+                Some(("iggy_offset", ScalarAttributeType::N)),
+            ),
+        );
 
         assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
     }
@@ -1361,7 +1489,13 @@ mod tests {
         config.sort_key_field = Some("iggy_offset".to_owned());
         let sink = DynamoDbSink::new(1, config);
 
-        let result = sink.validate_key_schema(given_key_schema(DEFAULT_PARTITION_KEY_FIELD, None));
+        let result = sink.validate_key_schema(
+            &given_key_schema(DEFAULT_PARTITION_KEY_FIELD, None),
+            &given_attribute_definitions(
+                (DEFAULT_PARTITION_KEY_FIELD, ScalarAttributeType::S),
+                None,
+            ),
+        );
 
         assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
     }
@@ -1424,5 +1558,43 @@ mod tests {
         ]);
 
         assert_ne!(sink.key_signature(&first), sink.key_signature(&second));
+    }
+
+    #[test]
+    fn given_a_numeric_table_partition_key_when_built_should_skip_the_generated_key() {
+        let mut sink = DynamoDbSink::new(1, given_default_config());
+        sink.key_types = TableKeyTypes {
+            partition: Some(ScalarAttributeType::N),
+            sort: None,
+        };
+        let mut message = given_message(given_json_payload(r#"{"name":"first"}"#));
+
+        let result = sink.build_item(
+            &given_topic_metadata(),
+            &given_messages_metadata(),
+            &mut message,
+        );
+
+        assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
+    }
+
+    #[test]
+    fn given_an_oversized_key_when_built_should_skip_message() {
+        let mut config = given_default_config();
+        config.partition_key_field = Some("user_id".to_owned());
+        let sink = DynamoDbSink::new(1, config);
+        let payload = format!(
+            r#"{{"user_id":"{}"}}"#,
+            "x".repeat(MAX_PARTITION_KEY_SIZE + 1)
+        );
+        let mut message = given_message(given_json_payload(&payload));
+
+        let result = sink.build_item(
+            &given_topic_metadata(),
+            &given_messages_metadata(),
+            &mut message,
+        );
+
+        assert!(matches!(result, Err(Error::InvalidRecordValue(_))));
     }
 }
