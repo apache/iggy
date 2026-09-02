@@ -64,7 +64,10 @@ possible, otherwise they are stored as binary. Protobuf, FlatBuffer, and Avro
 payloads are not supported and are skipped with a warning.
 
 Metadata attributes are written after the payload, so they overwrite payload
-fields of the same name.
+fields of the same name, including a payload field configured as a key.
+
+Message headers are not written. An item carries the payload and the enabled
+`iggy_*` metadata attributes only.
 
 ## Keys and Idempotency
 
@@ -80,10 +83,12 @@ inside its partition and stays the same on redelivery, unlike the message ID,
 which is `0` for every message sent without an explicit one. When
 `sort_key_field` is configured and missing, the message offset is injected.
 
-A payload value always wins over the injected one, so a message that carries the
-key field with an empty value, or with a value that is neither a string, a
-number, nor binary, is skipped rather than falling back to the injected key,
-because DynamoDB would reject the whole batch.
+A payload value wins over the injected one, so a message that carries the key
+field with an empty value, or with a value that is neither a string, a number,
+nor binary, is skipped rather than falling back to the injected key, because
+DynamoDB would reject the whole batch. Metadata attributes are the exception:
+they are written after the payload, so a key field named `iggy_offset`, for
+example, takes the metadata value.
 
 The key fields are checked against the table on startup. A `partition_key_field`
 or `sort_key_field` that does not match the table key schema fails the connector
