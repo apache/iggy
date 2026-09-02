@@ -31,7 +31,9 @@ verbose_logging = false
 - `endpoint`: Custom endpoint URL, for DynamoDB Local or a VPC endpoint.
 - `access_key_id` / `secret_access_key` / `session_token`: Static credentials.
   Provide both `access_key_id` and `secret_access_key`, or neither. When both
-  are omitted the connector uses the default AWS credential chain.
+  are omitted the connector uses the default AWS credential chain. A
+  `session_token` belongs to those static credentials, so it is rejected when
+  they are missing instead of being silently ignored.
 - `partition_key_field`: Item attribute used as the table partition key.
   Defaults to `iggy_id`.
 - `sort_key_field`: Item attribute used as the table sort key. Only set this

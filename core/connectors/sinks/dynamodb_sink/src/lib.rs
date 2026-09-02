@@ -246,6 +246,13 @@ impl DynamoDbSink {
                     .to_owned(),
             ));
         }
+        if self.config.session_token.is_some() && self.config.access_key_id.is_none() {
+            return Err(Error::InvalidConfigValue(
+                "A session_token only applies to static credentials. You must provide \
+                 access_key_id and secret_access_key with it, or remove it."
+                    .to_owned(),
+            ));
+        }
 
         let mut loader = aws_config::defaults(BehaviorVersion::latest());
         if let Some(region) = &self.config.region {
@@ -1694,5 +1701,16 @@ mod tests {
         for attempt in 1..=10 {
             assert!(sink.backoff_delay(attempt) <= Duration::from_secs(5));
         }
+    }
+
+    #[tokio::test]
+    async fn given_a_session_token_without_credentials_when_client_built_should_fail() {
+        let mut config = given_default_config();
+        config.session_token = Some(SecretString::from("token"));
+        let sink = DynamoDbSink::new(1, config);
+
+        let result = sink.build_client().await;
+
+        assert!(matches!(result, Err(Error::InvalidConfigValue(_))));
     }
 }
