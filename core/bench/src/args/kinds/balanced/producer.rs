@@ -16,7 +16,6 @@
 // under the License.
 
 use crate::args::{
-    common::IggyBenchArgs,
     defaults::{
         DEFAULT_BALANCED_NUMBER_OF_PARTITIONS, DEFAULT_BALANCED_NUMBER_OF_STREAMS,
         DEFAULT_NUMBER_OF_PRODUCERS,
@@ -24,7 +23,7 @@ use crate::args::{
     props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
-use clap::{CommandFactory, Parser, error::ErrorKind};
+use clap::Parser;
 use iggy::prelude::{IggyByteSize, IggyExpiry};
 use std::num::NonZeroU32;
 
@@ -88,16 +87,8 @@ impl BenchmarkKindProps for BalancedProducerArgs {
         self.message_expiry.unwrap_or(IggyExpiry::NeverExpire)
     }
 
-    fn validate(&self) {
-        let partitions = self.partitions();
-        let mut cmd = IggyBenchArgs::command();
-
-        if partitions < 2 {
-            cmd.error(
-                ErrorKind::ArgumentConflict,
-                format!("For balanced producer, number of partitions must be at least 2, got {partitions}"),
-            )
-            .exit();
-        }
-    }
+    // No partition floor: a lone partition is a legal target (producers route
+    // straight to it and balance only across several), and it is the shape
+    // the fsync-gated benchmark needs, N producers into one partition.
+    fn validate(&self) {}
 }

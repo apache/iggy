@@ -101,6 +101,67 @@ func TestFailover_ResumesOnASurvivorAfterTheSignedInNodeDies(t *testing.T) {
 		"the remembered credentials signed in again on the survivor")
 }
 
+func TestFailover_WalksPastTwoRefusingReplicasToThePartitionPrimary(t *testing.T) {
+	var metadataLeader *testListener
+
+	partitionPrimary := listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch read.operation() {
+		case vsr.OperationRegister:
+			return registerReplyFrame(7, 384)
+		case vsr.OperationCreateStream:
+			return replyFrame(vsr.OperationCreateStream, resultSection())
+		default:
+			return replyFrame(vsr.OperationNonReplicated, nil)
+		}
+	})
+	follower := listenVSR(t, nil, func(_, _ int, read request) []byte {
+		if read.operation() == vsr.OperationRegister {
+			return registerReplyFrame(7, 256)
+		}
+		return statusReplyFrame(vsr.OperationCreateStream,
+			uint32(ierror.TransientNotAcceptedCode), nil)
+	})
+	metadataLeader = listenVSR(t, nil, func(_, _ int, read request) []byte {
+		switch {
+		case read.code() == uint32(command.GetClusterMetadataCode):
+			return clusterMetadataFrame(t, 0, metadataLeader.address(),
+				follower.address(), partitionPrimary.address())
+		case read.operation() == vsr.OperationRegister:
+			return registerReplyFrame(7, 128)
+		default:
+			return statusReplyFrame(vsr.OperationCreateStream,
+				uint32(ierror.TransientNotAcceptedCode), nil)
+		}
+	})
+
+	client := newDialingClient(t, metadataLeader.address())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	require.NoError(t, client.Connect(ctx))
+	_, err := client.LoginUser(ctx, "iggy", "iggy")
+	require.NoError(t, err)
+
+	_, err = client.do(ctx, &command.CreateStream{Name: "orders"})
+	require.NoError(t, err)
+	assert.Equal(t, partitionPrimary.address(), client.currentServerAddress)
+	assert.True(t, len(follower.recorded()) >= 2,
+		"the roster walk skipped the second replica")
+}
+
+func TestFailover_RosterWalkVisitsEachEndpointOnce(t *testing.T) {
+	roster := []string{"iggy-0:8090", "iggy-1:8090", "iggy-2:8090"}
+	visited := make(map[string]struct{})
+
+	second := nextRosterEndpoint(roster[0], roster, visited)
+	third := nextRosterEndpoint(second, roster, visited)
+	exhausted := nextRosterEndpoint(third, roster, visited)
+
+	assert.Equal(t, roster[1], second)
+	assert.Equal(t, roster[2], third)
+	assert.Empty(t, exhausted)
+	assert.Len(t, visited, len(roster))
+}
+
 // Without any credentials there is nothing to sign in with, so a request on a
 // dead node fails instead of reconnecting into an unauthenticated session.
 func TestFailover_FailsFastWhenNothingEverSignedIn(t *testing.T) {
@@ -685,6 +746,41 @@ func TestConnect_ConcurrentReconnectsThroughExchangeShareOneAttempt(t *testing.T
 
 	assert.Equal(t, 2, server.connections(),
 		"the two failing requests reconnected separately")
+}
+
+// The teardown that follows a failure belongs to the connection the request
+// ran on. Connect marks the client connected before it signs in, so a caller
+// parked on c.mtx for that sign-in wakes to a healthy-looking state that says
+// nothing about which connection is installed.
+func TestDisconnect_DoesNotCloseAConnectionItDidNotFailOn(t *testing.T) {
+	var server *testListener
+	server = listenVSR(t, nil, singleNodeHandler(t, func() string { return server.address() }))
+
+	client := newDialingClient(t, server.address(),
+		WithAutoLogin(NewUsernamePasswordCredentials("iggy", "iggy")))
+	require.NoError(t, client.Connect(context.Background()))
+
+	// What a request that fails on this connection carries with it.
+	failed := client.connGeneration
+
+	require.NoError(t, client.disconnect())
+	require.NoError(t, client.Connect(context.Background()))
+	require.NotEqual(t, failed, client.connGeneration,
+		"a reconnect installs a connection of its own")
+
+	torn, err := client.disconnectGeneration(failed)
+	require.NoError(t, err)
+	assert.False(t, torn, "the stale generation reported a teardown it did not make")
+	assert.Equal(t, iggcon.TransportStateConnected, client.transportState)
+	require.NoError(t, client.Ping(context.Background()),
+		"the reconnected client was torn down by a stale failure")
+	assert.Equal(t, 2, server.connections(), "the stale teardown forced a third connection")
+
+	// The connection the caller did fail on is still torn down.
+	torn, err = client.disconnectGeneration(client.connGeneration)
+	require.NoError(t, err)
+	assert.True(t, torn)
+	assert.Equal(t, iggcon.TransportStateDisconnected, client.transportState)
 }
 
 // The sign-in transaction holds registerMtx across its reconnect, and an

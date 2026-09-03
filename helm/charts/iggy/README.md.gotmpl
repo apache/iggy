@@ -33,8 +33,15 @@ under the License.
 
 Iggy server uses `io_uring` for high-performance async I/O. This requires:
 
-1. **IPC_LOCK capability** - For locking memory required by io_uring
-2. **Unconfined seccomp profile** - To allow io_uring syscalls
+1. **Linux kernel 5.19 or newer on the node**
+
+   * Shard rings require `IORING_SETUP_COOP_TASKRUN` and `IORING_SETUP_TASKRUN_FLAG`.
+   * Compio's asynchronous socket creation requires `IORING_OP_SOCKET`.
+   * Mainline Linux provides these features starting in 5.19.
+   * Older kernels fail during shard startup. The node kernel matters, not the container image.
+
+2. **IPC_LOCK capability** - For locking memory required by io_uring
+3. **Unconfined seccomp profile** - To allow io_uring syscalls
 
 These are configured by default for the Iggy server via the chart's root-level
 `securityContext` and `podSecurityContext`. The web UI uses `ui.securityContext`
@@ -93,6 +100,156 @@ helm install iggy ./helm/charts/iggy -f custom-values.yaml
 If Prometheus Operator is installed and you want monitoring, set
 `server.serviceMonitor.enabled=true` in `custom-values.yaml` or pass it on the
 command line with `--set server.serviceMonitor.enabled=true`.
+
+## Cluster Mode
+
+The server runs a Viewstamped Replication cluster when `cluster.enabled` is set
+and each node is told which roster entry it is. The chart models this as **one
+release per node**: every release is handed the same roster and overrides only
+its own identity.
+
+`helm/charts/iggy/examples/cluster-3-node.yaml` is a ready three-node roster.
+Point the `ip` values at the nodes you will pin the releases to, then:
+
+```bash
+for i in 0 1 2; do
+  helm upgrade --install "iggy-n$i" ./helm/charts/iggy \
+    -f ./helm/charts/iggy/examples/cluster-3-node.yaml \
+    --set "server.cluster.selfReplicaId=$i" \
+    --set "server.nodeSelector.kubernetes\.io/hostname=node-$i"
+done
+```
+
+The chart turns `server.cluster` into the server's `IGGY_CLUSTER_*` environment
+variables and passes `--replica-id`, so no configuration file is mounted. The
+values mirror the server's `[[cluster.nodes]]` config one for one.
+
+### Why hostNetwork and node pinning are required
+
+The server's consensus listener binds `cluster.nodes[*].ip` **verbatim**, unlike
+the client listeners, which keep their own bind address and take only the port
+from the roster. A pod therefore has to own the address its roster entry names.
+Pod IPs are neither stable nor known before install, and a Service ClusterIP is
+not an address a pod can bind, so the workable layout today is `hostNetwork:
+true` with each release pinned to a node and its roster `ip` set to that node's
+IP. Node IPs are known up front and survive a pod restart, which is what lets a
+replica come back and rejoin.
+
+The cost is real: the server pod shares the node's network namespace and its
+ports. Weigh it before running this in a shared cluster.
+
+If a release lands on a node whose IP is not the one in its roster entry, the
+server refuses to start rather than misbehaving quietly:
+
+```text
+Error: ShardJoinFailures { failures: [ShardJoinFailure { shard_id: 0,
+  kind: Error(Iggy(CannotBindToSocket("10.0.1.11:9090"))) }] }
+```
+
+Check the `nodeSelector` on that release against the `ip` in its roster entry.
+
+### Upgrades
+
+Host ports make a rolling update impossible: the replacement pod cannot bind
+ports the outgoing pod still holds, so it stays `Pending` while the Deployment
+waits for it to become ready. The chart therefore switches the server to the
+`Recreate` strategy whenever `hostNetwork` is set, which takes the node down
+for the length of the restart. Roll **one release at a time** and let the
+cluster regain quorum before starting the next.
+
+Turning `hostNetwork` on for a release that already exists moves the Deployment
+from `RollingUpdate` to `Recreate`. Under Helm 4's server-side apply that is
+rejected, because the patch cannot drop the `rollingUpdate` block the API server
+defaulted in:
+
+```text
+Deployment.apps "iggy-n0" is invalid: spec.strategy.rollingUpdate: Forbidden:
+  may not be specified when strategy `type` is 'Recreate'
+```
+
+On Helm 4, run that one upgrade with `helm upgrade --server-side=false`, which
+replaces the strategy in place. Helm 3 has no such flag, since it does not use
+server-side apply. Set `server.strategy` explicitly if you want a different
+strategy.
+
+### Roster rules
+
+* Every node runs the **identical** `server.cluster.nodes` list. Only
+  `selfReplicaId` differs between releases.
+* `replicaId` values are unique and cover `0..N-1` for an `N`-node roster.
+* `ports.tcpReplica` is required on every entry. In cluster mode the server
+  takes every listener port from the roster and will not fall back to defaults,
+  because two nodes on one host would otherwise race for the same socket. The
+  remaining ports default to `server.ports`.
+* `server.cluster.name` is hashed into the on-disk cluster id on first boot.
+  Changing it later makes the server refuse to start against existing data.
+* `ip` must be a literal IP. Hostnames are rejected. Use
+  `advertisedAddress` for the name clients dial, which does accept DNS.
+
+### Secrets
+
+Four settings have to carry the byte-identical value on every node, so they
+belong in one Secret that all releases reference rather than in each release's
+values. Create it in the release namespace before the first install:
+
+```bash
+JWT="$(head -c 32 /dev/urandom | base64)"
+kubectl create secret generic iggy-cluster-secrets \
+  --from-literal=username=iggy \
+  --from-literal=password="$(head -c 24 /dev/urandom | base64)" \
+  --from-literal=clusterSharedSecret="$(head -c 32 /dev/urandom | base64)" \
+  --from-literal=jwtEncodingSecret="$JWT" \
+  --from-literal=jwtDecodingSecret="$JWT" \
+  --from-literal=encryptionKey="$(head -c 32 /dev/urandom | base64)"
+```
+
+`examples/cluster-3-node.yaml` points `server.users.root`, `server.encryption`,
+`server.jwt` and `server.cluster.auth` at that one Secret. All four also accept
+an inline value, which the chart turns into a Secret of its own:
+`<release>-root-credentials` for the root username and password,
+`<release>-secrets` for the other three. That is convenient for a single node
+and a poor fit for a cluster, since the value then lives in every release's
+stored values.
+
+* **`server.users.root`** seeds the root user. Every node creates it locally
+  from its own `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD`, so a password that
+  differs on one release logs in on that node only, and a first cluster boot
+  refuses to start without both.
+* **`server.cluster.auth`** makes every replica connection complete an
+  authenticated handshake or be rejected. The key is at least 32 bytes of
+  CSPRNG output. Turning it on or off is a coordinated restart of the whole
+  cluster: a node that authenticates cannot talk to one that does not.
+* **`server.encryption`** encrypts message payloads and state commands at rest
+  with AES-256-GCM, under a 32-byte base64 key. A node holding a different key
+  cannot read what its peers wrote.
+* **`server.jwt`** makes HTTP bearer tokens valid on every node and survive a
+  restart. With `cluster.auth` enabled the server already derives a cluster-wide
+  key from the replica PSK, so setting the JWT secrets is an alternative to that
+  rather than an addition; setting them anyway keeps tokens working if auth is
+  later turned off.
+
+None of the encryption, JWT and replica-auth values is written to the data
+directory, and each is masked as `******` in the startup log.
+
+### Storage
+
+A replica cannot move between nodes without invalidating its roster entry, so
+give each release storage that stays on its node, and size
+`server.persistence` per node rather than for the cluster. A replica that starts
+on an empty volume rejoins by state transfer, which is correct but re-reads the
+whole dataset from its peers. `server.persistence.enabled: false` puts the
+replica on `emptyDir` and forces exactly that on every pod replacement, so the
+cluster example enables persistence and leaves `storageClass` for you to point
+at a node-local provisioner.
+
+### What the chart refuses
+
+`server.replicaCount > 1` fails at render time. Scaling the server Deployment
+produces N independent servers behind one Service, all writing the same PVC
+subpath with no lock between them, which corrupts the data directory while
+`helm --wait` still reports success. The chart ships no HorizontalPodAutoscaler
+for the same reason. Cluster size is a roster decision, so add a node to
+`server.cluster.nodes` and install another release instead.
 
 ## Uninstallation
 
@@ -159,7 +316,7 @@ If a previous local smoke install failed and left resources behind, reset the sm
 scripts/ci/test-helm.sh cleanup-smoke
 ```
 
-On Apple Silicon hosts, the released `apache/iggy:0.7.0` `arm64` image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
+On Apple Silicon hosts, the released `arm64` server image may still fail during the runtime smoke path in kind. If your Docker setup supports amd64 emulation well enough, you can try recreating the dedicated smoke cluster with:
 
 ```bash
 HELM_SMOKE_KIND_PLATFORM=linux/amd64 scripts/ci/setup-helm-smoke-cluster.sh
@@ -227,6 +384,29 @@ Ensure the server binds to `0.0.0.0` instead of `127.0.0.1`. This is configured 
 * `IGGY_HTTP_ADDRESS=0.0.0.0:3000`
 * `IGGY_TCP_ADDRESS=0.0.0.0:8090`
 * `IGGY_QUIC_ADDRESS=0.0.0.0:8080`
+
+A wildcard bind says which interfaces accept connections, not where clients
+reach the pod, so the server also needs the address to publish in cluster
+metadata. Server builds that carry the setting refuse to start without it.
+`{{ template "chart.appVersion" . }}`, the image this chart pins, predates it:
+that build logs `IGGY_NODE_ADVERTISED_ADDRESS` as an unknown variable and
+publishes the bind address, so the chart's default stays inert until the pinned
+image moves past it. Either way the chart sets `IGGY_NODE_ADVERTISED_ADDRESS` to
+the in-cluster Service DNS name; override it with `server.advertisedAddress`
+when clients arrive through a LoadBalancer or an Ingress.
+
+In cluster mode the server ignores the variable altogether and publishes each
+node's roster `ip`, or its `advertisedAddress` when the entry carries one, so
+the chart leaves the variable out there and refuses a render that sets
+`server.advertisedAddress` alongside `server.cluster.enabled`.
+
+Declaring `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` yourself works too:
+the chart then leaves its own default out, so the variable is declared once.
+Give that entry a non-empty value; an empty one suppresses the chart default
+and reaches the server as unset, so the render fails instead.
+Setting it in `server.env` and in `server.advertisedAddress` at the same time
+is refused at render time rather than resolved silently, since only the
+`server.env` entry would take effect.
 
 ## Accessing the Server
 

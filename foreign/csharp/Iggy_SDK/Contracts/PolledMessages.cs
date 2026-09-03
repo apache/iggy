@@ -23,9 +23,16 @@ namespace Apache.Iggy.Contracts;
 public sealed class PolledMessages
 {
     /// <summary>
+    ///     Partition id an empty group poll reports when the member currently owns no partition of the group,
+    ///     for example mid-rebalance or when the group has more members than partitions. Matches the Go and
+    ///     Node SDKs. Consumers should back off before polling again rather than spin.
+    /// </summary>
+    public static readonly uint NoAssignedPartition = 0xFFFF_FFFE;
+
+    /// <summary>
     ///     Partition identifier for the messages.
     /// </summary>
-    public required int PartitionId { get; init; }
+    public required uint PartitionId { get; init; }
 
     /// <summary>
     ///     Current offset for the partition.

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-cpp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [package.metadata.cargo-machete]
@@ -28,7 +28,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 bytes = "1.12.1"
-cxx = "1.0.198"
+cxx = "1.0.199"
 iggy = { path = "../../core/sdk" }
 iggy_binary_protocol = { path = "../../core/binary_protocol" }
 iggy_common = { path = "../../core/common" }
@@ -37,4 +37,4 @@ iggy_common = { path = "../../core/common" }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 [build-dependencies]
-cxx-build = "1.0.198"
+cxx-build = "1.0.199"
