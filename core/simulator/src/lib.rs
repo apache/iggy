@@ -57,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
 
 /// Poll budget per [`DetExecutor::run_until_stalled`]. Pumps are event-driven, so
 /// hitting it means a task is spin-waking: a bug, panicked with the seed.
@@ -398,7 +398,7 @@ impl Simulator {
             // One applied-metadata frontier per REPLICA, shared by its shards,
             // as the server bootstrap mints one per process. Volatile: a restart
             // below builds a fresh cell, matching a rebooted node.
-            let metadata_applied_frontier = Arc::new(AtomicU64::new(0));
+            let metadata_applied_frontier = Arc::<metadata::AppliedFrontier>::default();
             for shard_idx in 0..shards_per_replica {
                 let inbox = inboxes[usize::from(shard_idx)]
                     .take()
@@ -1137,7 +1137,7 @@ impl Simulator {
         let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
         let mut pump_tasks = Vec::with_capacity(usize::from(shards_per_replica));
         let mut metadata_bundle: Option<replica::SimMetadataBundle> = None;
-        let metadata_applied_frontier = Arc::new(AtomicU64::new(0));
+        let metadata_applied_frontier = Arc::<metadata::AppliedFrontier>::default();
         for shard_idx in 0..shards_per_replica {
             let inbox = inboxes[usize::from(shard_idx)]
                 .take()
@@ -5150,12 +5150,18 @@ mod metadata_read_frontier_tests {
     /// couple of these; the gate must hold the read past all of them.
     ///
     /// Well under the gate's own poll budget, so expiry cannot masquerade as a
-    /// held read.
+    /// held read, and what is left of that budget is [`CONVERGE_STEPS`].
     const STALE_WINDOW_STEPS: u32 = 50;
 
-    /// Steps allowed for repair to reach the backup and the held read to answer
+    /// Steps left for repair to reach the backup and the held read to answer
     /// once replication is restored.
-    const CONVERGE_STEPS: u32 = 2_000;
+    ///
+    /// Derived, not chosen: one `sim.step()` advances the virtual clock by one
+    /// consensus tick, the unit the gate's budget is denominated in, so phase 1
+    /// spends `STALE_WINDOW_STEPS` of that budget and what remains is the whole
+    /// window the read can still be answered in. A larger number would just
+    /// spin past an expiry the status assertion below already caught.
+    const CONVERGE_STEPS: u32 = server::METADATA_READ_FRONTIER_BUDGET_TICKS - STALE_WINDOW_STEPS;
 
     /// The frames that would let the backup learn the committed writes. Journal
     /// repair and `StartView` adoption are cut with the same knife as live
@@ -5350,7 +5356,8 @@ mod metadata_read_frontier_tests {
             );
         }
 
-        let advanced = shards[0].plane.metadata().applied_frontier() + SHARED_FRONTIER_ADVANCE;
+        let advanced =
+            shards[0].plane.metadata().applied_frontier().get() + SHARED_FRONTIER_ADVANCE;
         shards[0]
             .plane
             .metadata()
@@ -5358,7 +5365,7 @@ mod metadata_read_frontier_tests {
 
         for (shard_idx, shard) in shards.iter().enumerate() {
             assert_eq!(
-                shard.plane.metadata().applied_frontier(),
+                shard.plane.metadata().applied_frontier().get(),
                 advanced,
                 "shard {shard_idx} did not observe shard 0's advance: the \
                  applied-frontier cell is per shard, not per process, so every \

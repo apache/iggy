@@ -1542,6 +1542,45 @@ pub fn build_reply_from_bytes(
     )
 }
 
+/// The reply body past the generic header, bounded by the header's `size`
+/// rather than by the buffer length: `size` is the frame's authoritative
+/// extent, so a short frame reads as "no result section" instead of into
+/// allocation padding.
+#[must_use]
+pub fn reply_body(reply: &Message<GenericHeader>) -> &[u8] {
+    let size = reply.header().size as usize;
+    reply
+        .as_slice()
+        .get(std::mem::size_of::<ReplyHeader>()..size)
+        .unwrap_or_default()
+}
+
+/// The transient variant of a reply-shaped pre-consensus rejection frame
+/// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
+/// for a committed outcome. Either transient means the op did not commit, so
+/// the write path must replay the same request id rather than grade it as a
+/// committed result or advance the session gate. The two codes are kept
+/// distinct because they exhaust differently: `TransientNotAccepted` never
+/// entered the pipeline and is safe to re-issue anywhere, while
+/// `TransientNotCommitted` may still commit and only a same-session same-id
+/// replay is safe.
+///
+/// Lives here rather than in the HTTP reply module both planes' write paths
+/// grade through: the dispatch spine needs it too, and importing it from
+/// `http` would close a module cycle.
+#[must_use]
+pub fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
+    match result_code(reply_body(reply)) {
+        Some(code) if code == IggyError::TransientNotCommitted.as_code() => {
+            Some(IggyError::TransientNotCommitted)
+        }
+        Some(code) if code == IggyError::TransientNotAccepted.as_code() => {
+            Some(IggyError::TransientNotAccepted)
+        }
+        _ => None,
+    }
+}
+
 /// If a raw PAT token was minted (`CreatePersonalAccessToken`) and the commit
 /// succeeded, replace the committed reply -- whose body is empty because the
 /// raw token never entered consensus -- with a `RawPersonalAccessTokenResponse`,
@@ -1571,7 +1610,6 @@ pub fn build_raw_pat_reply(
         bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])
             .map_err(|_| IggyError::InvalidFormat)?;
     let commit = committed_header.commit;
-    let size = committed_header.size as usize;
     // A `Reply` whose result section is nonzero is not a successful commit:
     // a committed business rejection (duplicate name, invalid expiry) or a
     // `TransientNotCommitted` retry frame, both with no payload and no token
@@ -1579,15 +1617,7 @@ pub fn build_raw_pat_reply(
     // else through untouched so the client decodes the typed result (and, for
     // a transient, replays) instead of having a raw token grafted onto a
     // rejection body. Mirrors the HTTP handler's `committed_payload` gate.
-    //
-    // Bounded by the header's own `size` rather than running to the end of the
-    // buffer, so a short frame reads as "no result section" instead of into
-    // allocation padding.
-    let reply_body = committed
-        .as_slice()
-        .get(header_len..size)
-        .unwrap_or_default();
-    if result_code(reply_body) != Some(0) {
+    if result_code(reply_body(&committed)) != Some(0) {
         return Ok(committed);
     }
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;

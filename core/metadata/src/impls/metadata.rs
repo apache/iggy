@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::MuxStateMachine;
+use crate::applied_frontier::AppliedFrontier;
 use crate::stm::authz::gated_apply;
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::snapshot::{
@@ -67,7 +68,6 @@ use std::mem::size_of;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
 
 fn freeze_client_reply(
@@ -771,21 +771,28 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// whole snapshot on shard 0's pump, and hands each requester its own
     /// multi-MB copy.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
-    /// Highest metadata op whose apply has been PUBLISHED on this node, shared
-    /// by every shard.
+    /// Highest metadata op whose apply has been PUBLISHED on this node, plus
+    /// the reads parked on it. Shared by every shard; see
+    /// [`AppliedFrontier`] for the ordering and the wake contract.
+    applied_frontier: Arc<AppliedFrontier>,
+}
+
+impl<B, J, S, M, SB> IggyMetadata<VsrConsensus<B>, J, S, M, SB>
+where
+    B: MessageBus,
+{
+    /// Resume the applied frontier where recovery left the state machine.
     ///
-    /// `consensus.commit_min()` answers the same question but exists only on
-    /// shard 0, so a read served by a peer shard has no way to tell whether the
-    /// node caught up to an op its client already saw committed. One
-    /// process-wide atomic does, for one `Acquire` load on the read fast path.
-    ///
-    /// Written `Release` right after each apply's `publish()`, read `Acquire`;
-    /// observing `>= op` therefore happens-after that publish, so a following
-    /// left-right `enter()` is guaranteed to see the op. `fetch_max` rather
-    /// than `store` because three writers move it -- the commit loop, the
-    /// recovery seed, and a state-transfer install -- and only monotonicity
-    /// makes their order irrelevant.
-    applied_frontier: Arc<AtomicU64>,
+    /// Recovery replays the committed WAL prefix before any listener binds, so
+    /// without this the frontier reads zero on a rebooted node and every read
+    /// whose caller holds a pre-restart commit parks until its deadline. A
+    /// no-op on a peer shard, which owns no consensus and shares shard 0's
+    /// cell.
+    pub fn seed_applied_frontier_from_consensus(&self) {
+        if let Some(consensus) = self.consensus.as_ref() {
+            self.advance_applied_frontier(consensus.commit_min());
+        }
+    }
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB>
@@ -825,7 +832,7 @@ where
             commit_notifier: RefCell::new(None),
             client_table_frontier: Cell::new(0),
             transfer_offer_cache: RefCell::new(None),
-            applied_frontier: Arc::new(AtomicU64::new(0)),
+            applied_frontier: Arc::default(),
         }
     }
 }
@@ -838,26 +845,27 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// never moves. Shard 0 mints the cell in bootstrap, before any shard is
     /// built, and hands each shard a clone.
     #[must_use]
-    pub fn with_applied_frontier(mut self, applied_frontier: Arc<AtomicU64>) -> Self {
+    pub fn with_applied_frontier(mut self, applied_frontier: Arc<AppliedFrontier>) -> Self {
         self.applied_frontier = applied_frontier;
         self
     }
 
-    /// Highest metadata op this NODE has applied and published, readable on
-    /// every shard. Reads gate on it so a client cannot be served state older
-    /// than a write it already saw acked.
+    /// The node-wide applied frontier, readable on every shard. Reads gate on
+    /// it so a client cannot be served state older than a write it already saw
+    /// acked, and park on its wait when it is behind.
     #[must_use]
-    pub fn applied_frontier(&self) -> u64 {
-        self.applied_frontier.load(Ordering::Acquire)
+    pub const fn applied_frontier(&self) -> &Arc<AppliedFrontier> {
+        &self.applied_frontier
     }
 
-    /// Publish `op` as applied. Monotone, so a lower value is a no-op.
+    /// Publish `op` as applied and wake the reads waiting at or below it.
+    /// Monotone, so a lower value is a no-op.
     ///
     /// Must run AFTER the apply's `publish()` and, on the commit path, in the
     /// same await-free region as `advance_commit_min`: a reader that sees the
     /// frontier must be guaranteed to see the op's effects.
     pub fn advance_applied_frontier(&self, op: u64) {
-        self.applied_frontier.fetch_max(op, Ordering::Release);
+        self.applied_frontier.advance(op);
     }
 
     /// Slot capacity of the LIVE client table, i.e. the largest transferred
@@ -1521,10 +1529,15 @@ impl std::error::Error for StateTransferUnavailable {
 /// invites a caller to treat a completed install as a failure and redo it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstallOutcome {
-    /// The receiver's new applied frontier, `max(snapshot_seq,
+    /// The receiver's applied position after the install, `max(snapshot_seq,
     /// local_applied)`. These differ whenever a serving peer offered a
     /// snapshot BEHIND this replica and the local state machine was kept.
-    pub applied_frontier: u64,
+    ///
+    /// Named apart from [`IggyMetadata::applied_frontier`] deliberately: that
+    /// one is the node-wide cell the read gate consults, which the install
+    /// raises to `snapshot_seq` alone, so the two carry different numbers
+    /// exactly when a behind-snapshot was kept.
+    pub installed_frontier: u64,
     /// Whether the transferred checkpoint's `(checkpoint_op, checksum)`
     /// pairing reached the durable superblock.
     ///
@@ -1658,7 +1671,7 @@ where
     /// reconciler's periodic full diff against the committed STM, which
     /// reads the restored state on its next tick.
     ///
-    /// Returns an [`InstallOutcome`]: the new applied frontier, plus whether
+    /// Returns an [`InstallOutcome`]: the installed frontier, plus whether
     /// the transferred checkpoint's pairing reached the durable superblock.
     ///
     /// # Errors
@@ -1916,7 +1929,7 @@ where
         }
 
         Ok(InstallOutcome {
-            applied_frontier: snapshot_seq.max(local_applied),
+            installed_frontier: snapshot_seq.max(local_applied),
             pairing_durable,
         })
     }
@@ -5728,7 +5741,7 @@ mod tests {
             "ops at or below the floor stay for the walk and tail repair"
         );
         assert_eq!(
-            md.applied_frontier(),
+            md.applied_frontier().get(),
             SNAPSHOT_SEQ,
             "the snapshot IS ops up to its sequence applied, so the read gate has \
              to admit reads at the floor the install jumped to"

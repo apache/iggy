@@ -125,34 +125,6 @@ pub(in crate::http) struct HttpSession {
     /// [`MAX_IN_FLIGHT_WRITES_PER_SESSION`]. Only [`InFlightWriteGuard`]
     /// touches it, so every admission is paired with exactly one release.
     pub(in crate::http) in_flight_writes: Cell<u32>,
-    /// Highest metadata op this credential has been told committed.
-    ///
-    /// Seeded from [`Self::session`] (the `Register` commit op, which floors
-    /// every metadata op that register could have observed) and raised by every
-    /// committed control-plane reply on this session. The read gate holds a
-    /// local read until the node's applied frontier covers it, so a caller
-    /// cannot be served state older than a write it already saw acked.
-    ///
-    /// Per-credential rather than per-request because that is the unit a
-    /// bearer's requests share; a caller presenting a fresh credential
-    /// re-seeds from the session it registers. A plain `Cell` suffices on
-    /// single-threaded shard 0, and it is never read across an `.await`.
-    pub(in crate::http) metadata_watermark: Cell<u64>,
-}
-
-impl HttpSession {
-    /// Raise this session's metadata watermark to `commit`. Monotone, so a
-    /// reply that lands out of order (concurrent requests on one credential
-    /// are legal) cannot lower it.
-    ///
-    /// Only COMMITTED metadata replies belong here. A pre-consensus rejection
-    /// stamps the primary's `commit_max`, an op this caller was never promised
-    /// and, on a backup, one its own reads would then wait for; partition-plane
-    /// replies carry a different group's commit position entirely.
-    pub(in crate::http) fn record_metadata_watermark(&self, commit: u64) {
-        self.metadata_watermark
-            .set(self.metadata_watermark.get().max(commit));
-    }
 }
 
 /// Serializes first-use VSR registration per credential key so a herd of
@@ -287,18 +259,7 @@ mod tests {
     /// construction plus the live cancellation smoke, not faked here.
     #[compio::test]
     async fn detached_task_advances_gate_and_ignores_dead_receiver() {
-        let session = Rc::new(HttpSession {
-            key: "jwt:test".to_owned(),
-            client_id: 7,
-            session: 1,
-            user_id: DEFAULT_ROOT_USER_ID,
-            expiry: u64::MAX,
-            gate: Mutex::new(FIRST_REQUEST_ID),
-            data_gate: Mutex::new(FIRST_REQUEST_ID),
-            registry_token: Cell::new(None),
-            in_flight_writes: Cell::new(0),
-            metadata_watermark: Cell::new(1),
-        });
+        let session = fake_session("jwt:test", 7, u64::MAX);
         let (result_slot, committed) = oneshot::channel::<u64>();
         // The handler future dies (client disconnect) before the task runs.
         drop(committed);
@@ -316,11 +277,6 @@ mod tests {
         assert_eq!(*session.gate.lock().await, FIRST_REQUEST_ID + 1);
     }
 
-    /// Register commit op every fixture binds. Non-zero on purpose: the read
-    /// gate's watermark seeds from it, so a fixture at zero could not tell a
-    /// seeded session from an unseeded one.
-    const FIXTURE_EPOCH: u64 = 1;
-
     /// `InstanceToken` has no public constructor, so fixtures carry no reply
     /// target; the token-teardown branch of the sweep/forget helpers is
     /// exercised via their `Option` path, not fabricated here.
@@ -328,14 +284,13 @@ mod tests {
         Rc::new(HttpSession {
             key: key.to_owned(),
             client_id,
-            session: FIXTURE_EPOCH,
+            session: 1,
             user_id: DEFAULT_ROOT_USER_ID,
             expiry,
             gate: Mutex::new(FIRST_REQUEST_ID),
             data_gate: Mutex::new(FIRST_REQUEST_ID),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
-            metadata_watermark: Cell::new(FIXTURE_EPOCH),
         })
     }
 
@@ -445,29 +400,6 @@ mod tests {
                 &replacement
             ),
             "the pointer fence spares the re-registered session"
-        );
-    }
-
-    /// The mark is a floor the read gate waits for, so nothing may lower it:
-    /// two concurrent requests on one credential can have their committed
-    /// replies land out of order, and the later-but-lower reply must not undo
-    /// the earlier-but-higher one. The seed is the register's own commit op
-    /// (`session`), which floors every op that register could have observed.
-    #[test]
-    fn given_out_of_order_replies_when_recording_should_keep_the_watermark_monotone() {
-        let session = fake_session("jwt:a", 1, u64::MAX);
-        assert_eq!(
-            session.metadata_watermark.get(),
-            session.session,
-            "a fresh session starts at its register commit op"
-        );
-
-        session.record_metadata_watermark(50);
-        session.record_metadata_watermark(7);
-        assert_eq!(
-            session.metadata_watermark.get(),
-            50,
-            "a lower commit must not lower the mark"
         );
     }
 }

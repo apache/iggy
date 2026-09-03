@@ -76,9 +76,9 @@ use journal::{Journal, JournalHandle};
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
-use metadata::ReplicaIdentity;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
+use metadata::{AppliedFrontier, ReplicaIdentity};
 use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
@@ -92,7 +92,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tracing::{error, info, warn};
 
@@ -304,10 +304,11 @@ pub fn bootstrap(
     let mut shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerError>>)> =
         Vec::with_capacity(shards_count);
     let roster_cells = RosterCells::default();
-    // Shared applied-metadata frontier: shard 0's commit path advances it, every
-    // shard's read gate reads it. Minted here, before any shard exists, because
-    // a shard holding a private cell would gate reads on a number nothing moves.
-    let metadata_applied_frontier = Arc::new(AtomicU64::new(0));
+    // Shared applied-metadata frontier: shard 0's commit path advances it and
+    // wakes the reads parked on it, every shard's read gate reads it. Minted
+    // here, before any shard exists, because a shard holding a private cell
+    // would gate reads on a number nothing moves.
+    let metadata_applied_frontier = Arc::<AppliedFrontier>::default();
     // Every shard's metric handles, minted before the threads spawn: each
     // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
     // the whole set (counters are Arc-backed, so cross-thread reads see the
@@ -435,7 +436,7 @@ async fn shard_main(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     roster_cells: RosterCells,
-    metadata_applied_frontier: Arc<AtomicU64>,
+    metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
@@ -589,13 +590,7 @@ async fn shard_main(
         Some(PathBuf::from(&config.system.path)),
     )
     .with_applied_frontier(metadata_applied_frontier);
-    // Recovery already replayed the committed WAL prefix into the state
-    // machine, so the frontier resumes where the commit walk will rather than
-    // at zero -- otherwise every read on a rebooted node parks until its
-    // deadline. No-op on peer shards, which share shard 0's cell.
-    if let Some(consensus) = metadata.consensus.as_ref() {
-        metadata.advance_applied_frontier(consensus.commit_min());
-    }
+    metadata.seed_applied_frontier_from_consensus();
     // Size the VSR client table before listeners bind and any client registers.
     // Must precede the recovered-table install below: the setter rebuilds the
     // table from scratch, so running it afterwards would drop every resumed

@@ -28,13 +28,14 @@ use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
+use metadata::AppliedFrontier;
 use partitions::FatalCommit;
 use server_common::executor::create_shard_executor;
 use shard::metrics::ShardMetrics;
 use shard::{Receiver as ShardReceiver, Sender, ShardFrame, TaggedSender};
 use std::backtrace::Backtrace;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use std::{panic, thread};
@@ -426,7 +427,7 @@ pub(in crate::boot) fn run_shard_thread(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     roster_cells: RosterCells,
-    metadata_applied_frontier: Arc<AtomicU64>,
+    metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic

@@ -145,7 +145,9 @@ public class BasicMessagingSteps {
         // The assertion is "not the stream we deleted", not "nothing at this id":
         // the server hands out the lowest free stream id, so once these scenarios
         // run concurrently against one server a fresh create can legitimately
-        // occupy the deleted stream's id.
+        // occupy the deleted stream's id. Named, so a missing pre-value fails
+        // here instead of making the comparison below vacuously true.
+        assertNotNull(context.lastStreamName, "Stream should have been created");
         Optional<StreamDetails> stream = getClient().streams().getStream(context.lastStreamId);
         assertTrue(
                 stream.isEmpty() || !stream.get().name().equals(context.lastStreamName),

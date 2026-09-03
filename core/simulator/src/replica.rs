@@ -30,7 +30,7 @@ use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::RestoreSnapshot;
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
-use metadata::{IggyMetadata, apply_committed_prepare};
+use metadata::{AppliedFrontier, IggyMetadata, apply_committed_prepare};
 use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
 use server::boot::wire_shell_handlers;
 use server::shell::{ShellHandlers, ShellShardHandle};
@@ -40,7 +40,6 @@ use shard::shards_table::PapayaShardsTable;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 // TODO: Make configurable
 const CLUSTER_ID: u128 = 1;
@@ -158,7 +157,7 @@ pub fn new_shard(
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
     seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
-    applied_frontier: Arc<AtomicU64>,
+    applied_frontier: Arc<AppliedFrontier>,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
@@ -371,12 +370,8 @@ pub fn new_shard(
             );
         }
     }
-    // Same seed the server bootstrap does after its own replay: the frontier
-    // resumes where the commit walk will, so a read on a rebuilt replica does
-    // not park until its deadline. No-op on peer shards, which share the cell.
-    if let Some(consensus) = metadata.consensus.as_ref() {
-        metadata.advance_applied_frontier(consensus.commit_min());
-    }
+    // Same seed the server bootstrap runs after its own replay.
+    metadata.seed_applied_frontier_from_consensus();
     // Mint the peers' read-side bundle AFTER reconstruction so it reflects the
     // recovered state. Shard 0 only; peers pass it back in as `reader_bundle`.
     let metadata_bundle = (shard_idx == 0).then(|| metadata.mux_stm.factory_bundle());

@@ -57,6 +57,54 @@ use crate::shell::ServerShard;
 /// follower's possibly-stale one.
 pub(in crate::http) const VIEW_HEADER: HeaderName = HeaderName::from_static("iggy-view");
 
+/// Per-user read-your-writes floors: the highest metadata op each user has
+/// been told committed BY THIS NODE.
+///
+/// Keyed by user id, and held outside the session table, both deliberately. A
+/// session entry is dropped outright when its VSR slot dies
+/// ([`HttpInner::forget_session`]) or when the expiry sweep runs, and
+/// `POST /users/refresh-token` answers with a fresh `jti` that registers no
+/// session at all: a floor living in the session entry, or keyed by the
+/// credential, reads `0` again in all three cases while the caller's bearer
+/// stays valid - the stale read this exists to prevent, for exactly the
+/// callers still holding a committed reply. Keying by user also bounds the
+/// table by the user count instead of by every token ever minted.
+///
+/// One user's floor is shared by its credentials, which is stronger than
+/// read-your-writes and never weaker: the extra ops a second credential waits
+/// for are the same user's.
+#[derive(Debug, Default)]
+pub(in crate::http) struct MetadataWatermarks(RefCell<HashMap<u32, u64>>);
+
+impl MetadataWatermarks {
+    /// Highest metadata op `user_id` was told committed here, or `0` when it
+    /// was told none - no write of its ever ran on this node, so there is
+    /// nothing to read back.
+    ///
+    /// Deliberately not expiry-filtered: the number is a consistency floor,
+    /// not a capability, and the request that consults it has already
+    /// re-verified the bearer.
+    ///
+    /// Confines the `RefCell` borrow to this call, so it can never span the
+    /// read gate's `.await`.
+    pub(in crate::http) fn get(&self, user_id: u32) -> u64 {
+        self.0.borrow().get(&user_id).copied().unwrap_or(0)
+    }
+
+    /// Raise `user_id`'s floor to `commit`. Monotone, so a reply that lands
+    /// out of order (concurrent requests on one credential are legal) cannot
+    /// lower it.
+    ///
+    /// Only COMMITTED metadata replies belong here; see
+    /// [`crate::dispatch::submit::committed_reply_commit`] for what that
+    /// excludes and why.
+    pub(in crate::http) fn record(&self, user_id: u32, commit: u64) {
+        let mut floors = self.0.borrow_mut();
+        let floor = floors.entry(user_id).or_insert(0);
+        *floor = (*floor).max(commit);
+    }
+}
+
 /// Axum router state: shard-0's [`HttpInner`] behind an `Rc`, `!Send` yet
 /// bridged into axum's `Send + Sync` requirement by `SendWrapper`. Sound
 /// because the listener and every handler run on shard 0's compio thread - the
@@ -122,6 +170,10 @@ pub(in crate::http) struct HttpInner {
     /// Legacy-parity metric registry served by the scrape route; the router's
     /// counting layer holds a clone of its request counter.
     pub(in crate::http) metrics: HttpMetrics,
+    /// Per-user read-your-writes floors the read gate holds reads against.
+    /// Behind `Rc` because the write path records from a detached task that
+    /// outlives its handler by design (see `submit_committed`).
+    pub(in crate::http) metadata_watermarks: Rc<MetadataWatermarks>,
 }
 
 impl HttpInner {
@@ -229,23 +281,11 @@ impl HttpInner {
         }
     }
 
-    /// Highest metadata op the credential behind `key` has been told
-    /// committed, or `0` when this node has told it none - an unknown key, so
-    /// no write of its ever ran here and there is nothing to read back.
-    ///
-    /// Deliberately NOT expiry-filtered, unlike [`Self::live_session`]: the
-    /// number is a consistency floor, not a capability, and the request that
-    /// consults it has already re-verified the bearer. Dropping the floor
-    /// because a swept-but-still-present entry aged out would reintroduce the
-    /// stale read for exactly the callers still holding a committed reply.
-    ///
-    /// Confines the shared `RefCell` borrow to this call, so it can never span
-    /// the read gate's `.await`.
-    pub(in crate::http) fn metadata_watermark(&self, key: &str) -> u64 {
-        self.sessions
-            .borrow()
-            .get(key)
-            .map_or(0, |session| session.metadata_watermark.get())
+    /// Highest metadata op `user_id` was told committed here; see
+    /// [`MetadataWatermarks`] for why the floor is per user and lives outside
+    /// the session table.
+    pub(in crate::http) fn metadata_watermark(&self, user_id: u32) -> u64 {
+        self.metadata_watermarks.get(user_id)
     }
 
     /// Clone the live (non-expired) entry for `key`, if present. Confines the
@@ -379,12 +419,12 @@ impl HttpInner {
             );
             return Err(AuthError::SessionIdTaken);
         }
-        // `bound.epoch` also seeds the read gate's watermark: a HEALTHY BACKUP
-        // forwards the register to the primary (see
-        // `submit_register_local_or_forward`), so this node can hand back an
-        // epoch its own commit walk has not reached, and the caller's first
-        // read would otherwise be served from state older than the register it
-        // is holding.
+        // `bound.epoch` also floors the read gate: a HEALTHY BACKUP forwards the
+        // register to the primary (see `submit_register_local_or_forward`), so
+        // this node can hand back an epoch its own commit walk has not
+        // reached, and the caller's first read would otherwise be served from
+        // state older than the register it is holding.
+        self.metadata_watermarks.record(user_id, bound.epoch);
         Ok(Rc::new(HttpSession {
             key,
             client_id,
@@ -395,7 +435,6 @@ impl HttpInner {
             data_gate: Mutex::new(FIRST_REQUEST_ID),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
-            metadata_watermark: Cell::new(bound.epoch),
         }))
     }
 
@@ -485,9 +524,42 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
 
 #[cfg(test)]
 mod tests {
-    use super::register_submit_auth_error;
+    use super::{MetadataWatermarks, register_submit_auth_error};
     use crate::http::error::AuthError;
     use metadata::MetadataSubmitError;
+
+    /// The floor is what the read gate waits for, so nothing may lower it: two
+    /// concurrent requests by one user can have their committed replies land
+    /// out of order, and the later-but-lower reply must not undo the
+    /// earlier-but-higher one.
+    #[test]
+    fn given_out_of_order_replies_when_recording_should_keep_the_floor_monotone() {
+        const USER: u32 = 3;
+
+        let watermarks = MetadataWatermarks::default();
+        assert_eq!(
+            watermarks.get(USER),
+            0,
+            "a user this node never wrote for was promised nothing"
+        );
+
+        watermarks.record(USER, 50);
+        watermarks.record(USER, 7);
+        assert_eq!(
+            watermarks.get(USER),
+            50,
+            "a lower commit must not lower the floor"
+        );
+    }
+
+    /// One user's floor is not another's: a busy writer must not park an
+    /// unrelated user's reads behind ops it never issued.
+    #[test]
+    fn given_two_users_when_one_writes_should_leave_the_other_floor_alone() {
+        let watermarks = MetadataWatermarks::default();
+        watermarks.record(1, 50);
+        assert_eq!(watermarks.get(2), 0);
+    }
 
     #[test]
     fn register_submit_errors_preserve_known_and_unknown_outcomes() {

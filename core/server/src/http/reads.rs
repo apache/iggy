@@ -17,11 +17,14 @@
 
 //! Read-path gates: the shared per-op RBAC + consistency check, the two waits
 //! a local read serves behind (the post-restart recovery barrier and the
-//! per-credential read-your-writes frontier), the local metadata-STM read
+//! per-user read-your-writes frontier), the local metadata-STM read
 //! entry, and the wire/domain identifier resolvers the read and data-plane
 //! routes ground their scopes through.
 
-use crate::dispatch::reads::read_needs_metadata_frontier;
+use crate::dispatch::reads::{
+    FrontierUnreached, FrontierWait, READ_FRONTIER_BUDGET, hold_for_frontier,
+    read_needs_metadata_frontier,
+};
 use crate::shell::ServerShard;
 use bytes::Bytes;
 use consensus::MetadataHandle;
@@ -59,7 +62,7 @@ pub(in crate::http) fn authorize_read(
     state: &HttpInner,
     identity: &Identity,
     consistency: Consistency,
-    rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
+    rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<(), ReadError> {
     state
         .shard
@@ -94,7 +97,7 @@ pub(in crate::http) async fn read_local(
     consistency: Consistency,
     code: u32,
     body: &[u8],
-    rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
+    rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<Bytes, ReadError> {
     await_recovery_barrier(&state.shard).await?;
     // Ahead of the frontier wait on purpose. `authorize_read` renders the
@@ -102,9 +105,17 @@ pub(in crate::http) async fn read_local(
     // parking first would delay a request this node is not going to serve at
     // all - and an authorization denial is terminal, so holding the connection
     // for it buys nothing.
-    authorize_read(state, identity, consistency, rule)?;
-    if read_needs_metadata_frontier(code) {
-        await_metadata_read_frontier(state, identity).await?;
+    authorize_read(state, identity, consistency, &rule)?;
+    if read_needs_metadata_frontier(code)
+        && await_metadata_read_frontier(state, identity).await? == FrontierWait::CaughtUp
+    {
+        // Every scoped route's rule resolves its entity when the rule RUNS,
+        // and a park is precisely the case where the state machine moved under
+        // it: an entity that did not exist on the first pass resolved to
+        // nothing, where a scope miss is a pass-through, and would be served
+        // with no permissioner call at all. Only the parked outcome pays for
+        // the second pass.
+        authorize_read(state, identity, consistency, &rule)?;
     }
     let clients_count = if code == GET_STATS_CODE {
         u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
@@ -128,85 +139,50 @@ pub(in crate::http) async fn read_local(
     }
 }
 
-/// Poll cadence while a metadata read waits for this node's applied frontier.
-/// The recovery barrier's cadence and the binary read gate's: what the wait is
-/// usually short of is a single commit broadcast.
-const READ_FRONTIER_POLL: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Polls one held read is given before it fails retryable: 3s at the cadence
-/// above. Matches the binary read gate's budget so both planes give up at the
-/// same point, and stays far below the 30s the control-plane write path already
-/// spends replaying a transient frame.
-const READ_FRONTIER_MAX_POLLS: u32 = 300;
-
 /// Hold a local metadata read until this node has applied everything the
-/// presenting credential was told committed.
+/// calling user was told committed.
 ///
 /// A committed control-plane reply hands the caller an op number; answering its
 /// next read from a state machine below that op contradicts the response it is
 /// holding. The lag is real on a node that is not the metadata primary: a
 /// healthy backup FORWARDS a `Register` to the primary
 /// (`dispatch::submit_register_local_or_forward`) and binds the committed epoch
-/// while its own commit walk is still behind it - and a cluster without shared
-/// bearer key material runs with HTTP forwarding off, so control-plane writes
-/// stay on that backup instead of being relayed.
+/// while its own commit walk is still behind it, so the caller holds an op that
+/// node has not applied before it has issued a single write. That is the whole
+/// window on a backup: a control-plane write posted there is either relayed to
+/// the primary (forwarding on) or refused transient (forwarding off), so the
+/// epoch is the only promise a backup makes on its own.
 ///
 /// Adjacent to `?consistency=linearizable`, not in competition with it. That
 /// asks for the freshest CLUSTER state and is answered by leaving this node
 /// (307 to the primary), which [`authorize_read`] decides before this wait and
 /// which this wait never sees. This gate makes an UNQUALIFIED read
-/// read-your-writes for its own credential, at no redirect and no consensus
-/// round trip.
+/// read-your-writes for its own user, at no redirect and no consensus round
+/// trip. Per user rather than per credential because a bearer is not stable:
+/// a refreshed access token is a new credential for the same writer (see
+/// [`crate::http::state::MetadataWatermarks`]).
 ///
-/// Scope is this node's own view. A credential whose write this node relayed
-/// over HTTP, or that wrote through a different node entirely, left no
-/// watermark here; closing that needs the serving primary's commit op to reach
-/// the reading node, which nothing in the response carries today.
+/// Scope is this node's own view. A user whose write this node relayed over
+/// HTTP, or who wrote through a different node entirely, left no floor here;
+/// closing that needs the serving primary's commit op to reach the reading
+/// node, which nothing in the response carries today.
+///
+/// The wait itself is the binary plane's [`hold_for_frontier`]: woken by the
+/// commit that advances the frontier, bounded by a `compio::time` timer like
+/// the recovery barrier below, since this listener is pinned to shard 0's
+/// compio thread and has no blocking pool to hand a wait to. Only this request
+/// parks, and it parks on one wake rather than a timer per tick.
 async fn await_metadata_read_frontier(
     state: &HttpInner,
     identity: &Identity,
-) -> Result<(), ReadError> {
-    let metadata = state.shard.plane.metadata();
+) -> Result<FrontierWait, ReadError> {
     hold_for_frontier(
-        || metadata.applied_frontier(),
-        state.metadata_watermark(&identity.session_key),
-        READ_FRONTIER_MAX_POLLS,
+        state.shard.plane.metadata().applied_frontier(),
+        state.metadata_watermark(identity.user_id),
+        compio::time::sleep(READ_FRONTIER_BUDGET),
     )
     .await
-}
-
-/// Poll `frontier` for `watermark` up to `max_polls` times, then give up
-/// retryable. Split from its call site so the fast path, the park, the catch-up
-/// and the expiry are all testable without a live shard - the same reason
-/// [`barrier_state`] is split out below.
-///
-/// A caller with nothing to read back has `watermark == 0`, which the first
-/// comparison satisfies: one `Acquire` load, no await, no allocation. Expiry is
-/// loud and carries both numbers, so a frontier that stopped moving is visible
-/// instead of showing up as latency.
-async fn hold_for_frontier(
-    frontier: impl Fn() -> u64,
-    watermark: u64,
-    max_polls: u32,
-) -> Result<(), ReadError> {
-    if frontier() >= watermark {
-        return Ok(());
-    }
-    for _ in 0..max_polls {
-        // `compio::time::sleep` like the recovery barrier below: this listener
-        // is pinned to shard 0's compio thread, which has no blocking pool to
-        // hand a wait to. Only this request parks.
-        compio::time::sleep(READ_FRONTIER_POLL).await;
-        if frontier() >= watermark {
-            return Ok(());
-        }
-    }
-    tracing::warn!(
-        frontier = frontier(),
-        watermark,
-        "metadata read frontier unreached past deadline; failing read with retryable 503"
-    );
-    Err(ReadError::MetadataFrontierUnreached)
+    .map_err(|FrontierUnreached| ReadError::MetadataFrontierUnreached)
 }
 
 /// One recovery-barrier check's outcome, factored out of [`await_recovery_barrier`]
@@ -253,7 +229,9 @@ const fn barrier_state(barrier: u64, commit_min: u64, expired: bool) -> BarrierW
 pub(in crate::http) async fn await_recovery_barrier(
     shard: &Rc<ServerShard>,
 ) -> Result<(), ReadError> {
-    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+    // The consensus tick, like the read gate's cadence: what lifts this
+    // barrier is a commit walk, which advances on that clock.
+    const POLL: std::time::Duration = consensus::TICK_INTERVAL;
 
     let Some(consensus) = shard.plane.metadata().consensus.as_ref() else {
         return Ok(());
@@ -383,81 +361,83 @@ pub(in crate::http) fn authorize_data_plane(
 #[cfg(test)]
 mod tests {
     use super::{
-        BarrierWait, READ_FRONTIER_MAX_POLLS, ReadError, barrier_state, hold_for_frontier,
+        BarrierWait, FrontierWait, ReadError, barrier_state, hold_for_frontier,
         read_needs_metadata_frontier,
     };
+    use crate::http::state::MetadataWatermarks;
     use iggy_binary_protocol::codes::{
-        DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUPS_CODE,
-        GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE,
-        GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+        DESCRIBE_OPTIONS_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
+        GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
+        GET_USER_CODE, GET_USERS_CODE,
     };
-    use std::cell::Cell;
+    use metadata::AppliedFrontier;
+    use std::future::pending;
+    use std::sync::Arc;
 
-    /// A caller with nothing to read back (`watermark == 0`) and one whose
-    /// watermark this node has already applied are the whole steady state, and
-    /// neither may cost a park: exactly one load, no await. A gate that polled
-    /// here would put 10ms on every REST read in the cluster.
+    /// Root's user id, the caller every fixture below writes and reads as.
+    const USER: u32 = 0;
+
+    /// The gate exactly as [`await_metadata_read_frontier`] composes it: the
+    /// per-user floor a committed control-plane reply left behind, against the
+    /// node-wide applied frontier. Whether a read is HELD is decided by those
+    /// two numbers and nothing else, so this is the plane's own contract:
+    /// seeded floor, read held, commit that closes the gap serves it.
+    ///
+    /// The budget is a future that never completes, so a gate that failed to
+    /// park would answer instead of hanging, and a gate that failed to wake
+    /// would hang instead of answering. The end-to-end REST path (a follower
+    /// that binds a forwarded epoch, then reads through axum) is
+    /// `integration::server::http_read_your_writes`; the race it depends on
+    /// cannot be forced from outside the process, which is why the hold is
+    /// pinned here.
     #[compio::test]
-    async fn given_a_frontier_at_the_watermark_when_gating_should_serve_without_parking() {
-        for (frontier_value, watermark) in [(0, 0), (7, 7), (9, 7)] {
-            let loads = Cell::new(0u32);
-            let outcome = hold_for_frontier(
-                || {
-                    loads.set(loads.get() + 1);
-                    frontier_value
-                },
-                watermark,
-                READ_FRONTIER_MAX_POLLS,
-            )
-            .await;
-            assert!(
-                outcome.is_ok(),
-                "frontier {frontier_value} covers {watermark}"
-            );
-            assert_eq!(
-                loads.get(),
-                1,
-                "frontier {frontier_value} covers {watermark}, so the read must not poll"
-            );
-        }
-    }
+    async fn given_a_recorded_floor_when_the_node_catches_up_should_serve_the_held_read() {
+        let watermarks = MetadataWatermarks::default();
+        let frontier = Arc::new(AppliedFrontier::default());
+        frontier.advance(4);
 
-    /// The gate's whole point: a read whose credential was told op 9 committed
-    /// is held, not answered, while this node is still at op 4 - and it is
-    /// answered as soon as the node catches up, rather than being failed.
-    #[compio::test]
-    async fn given_a_frontier_behind_the_watermark_when_gating_should_hold_until_it_catches_up() {
-        const CATCH_UP_AFTER: u32 = 2;
-        let polls = Cell::new(0u32);
-        let outcome = hold_for_frontier(
-            || {
-                let seen = polls.get();
-                polls.set(seen + 1);
-                if seen >= CATCH_UP_AFTER { 9 } else { 4 }
-            },
-            9,
-            8,
-        )
-        .await;
-
-        assert!(
-            outcome.is_ok(),
-            "the read must be served once the node caught up"
+        // A caller this node never wrote for waits for nothing.
+        assert_eq!(
+            hold_for_frontier(&frontier, watermarks.get(USER), pending()).await,
+            Ok(FrontierWait::Ready),
+            "an unseeded caller has no write to read back"
         );
-        assert!(
-            polls.get() > CATCH_UP_AFTER,
-            "the read was answered off the lagging frontier after {} loads",
-            polls.get()
+
+        // The committed reply's op becomes the floor, which is above what this
+        // node has applied: the read must not be answered yet.
+        watermarks.record(USER, 9);
+        let committer = Arc::clone(&frontier);
+        compio::runtime::spawn(async move {
+            compio::runtime::time::sleep(std::time::Duration::ZERO).await;
+            committer.advance(9);
+        })
+        .detach();
+        assert_eq!(
+            hold_for_frontier(&frontier, watermarks.get(USER), pending()).await,
+            Ok(FrontierWait::CaughtUp),
+            "the read must be held until the node applies the caller's own op"
+        );
+
+        // Caught up: back to the fast path, with the floor still in place.
+        assert_eq!(
+            hold_for_frontier(&frontier, watermarks.get(USER), pending()).await,
+            Ok(FrontierWait::Ready),
+            "an applied floor must not cost a park on every later read"
         );
     }
 
-    /// A node can legitimately never catch up (a durably lagging replica), so
-    /// the park is bounded - and the exit is a retryable refusal, never the
-    /// stale answer. `MetadataFrontierUnreached` renders the shared 503 (see
-    /// `error.rs`).
+    /// The refusal this plane renders when the frontier never arrives: the
+    /// shared retryable 503, never a 2xx carrying the pre-write state.
     #[compio::test]
-    async fn given_a_frontier_that_never_catches_up_when_gating_should_fail_retryable() {
-        let outcome = hold_for_frontier(|| 4, 9, 3).await;
+    async fn given_a_floor_the_node_never_reaches_when_gating_should_render_the_retryable_503() {
+        let watermarks = MetadataWatermarks::default();
+        watermarks.record(USER, 9);
+        let frontier = AppliedFrontier::default();
+        frontier.advance(4);
+
+        let outcome = hold_for_frontier(&frontier, watermarks.get(USER), std::future::ready(()))
+            .await
+            .map_err(|_| ReadError::MetadataFrontierUnreached);
         assert!(
             matches!(outcome, Err(ReadError::MetadataFrontierUnreached)),
             "an unreached frontier must refuse the read, not serve it"
@@ -468,6 +448,11 @@ mod tests {
     /// pins what that list means for the codes HTTP actually serves: every
     /// entity read is gated, and the static option catalog is not. Forking the
     /// list per plane is what this is here to catch.
+    ///
+    /// `GET_CLUSTER_METADATA` is deliberately absent: `/cluster/metadata` has
+    /// its own local handler and never reaches [`read_local`], so asserting it
+    /// here would pin a code this plane cannot produce. The shared predicate's
+    /// own arm for it is covered where it is used, in the dispatch spine.
     #[test]
     fn given_the_http_read_codes_when_classified_should_gate_all_but_the_static_catalog() {
         for code in [
@@ -486,12 +471,10 @@ mod tests {
                 "code {code} answers from the metadata STM and must be gated"
             );
         }
-        for code in [DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE] {
-            assert!(
-                !read_needs_metadata_frontier(code),
-                "code {code} answers from a static catalog or the roster; holding it buys nothing"
-            );
-        }
+        assert!(
+            !read_needs_metadata_frontier(DESCRIBE_OPTIONS_CODE),
+            "the option catalog is static; holding a read of it buys nothing"
+        );
     }
 
     #[test]

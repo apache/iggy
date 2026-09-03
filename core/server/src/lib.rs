@@ -47,6 +47,11 @@ pub(crate) mod pat;
 pub(crate) mod responses;
 pub mod session_manager;
 pub mod shell;
+/// The metadata read gate's budget, in consensus ticks. Re-exported for the
+/// simulator's read-frontier spec, which spends part of the budget with
+/// replication cut and has to know what is left; `dispatch` itself stays
+/// crate-internal.
+pub use dispatch::reads::READ_FRONTIER_BUDGET_TICKS as METADATA_READ_FRONTIER_BUDGET_TICKS;
 pub(crate) mod users;
 pub(crate) mod wire;
 

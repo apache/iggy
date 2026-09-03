@@ -334,9 +334,6 @@ pub(in crate::http) async fn get_stream(
 ) -> Result<Json<StreamDetails>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
-    // Resolve for the gate; a miss leaves it a pass-through so the read renders
-    // the existing 404 rather than a 403.
-    let scope = resolve_gate_stream(&state, &wire_stream_id);
     let request = GetStreamRequest {
         stream_id: wire_stream_id,
     };
@@ -347,8 +344,14 @@ pub(in crate::http) async fn get_stream(
         query.consistency,
         GET_STREAM_CODE,
         &body,
+        // Resolved when the rule RUNS, not here: `read_local` can park for the
+        // read-your-writes frontier, and an entity created during that wait
+        // would resolve to nothing on a pre-wait pass, where a miss is a
+        // pass-through. A miss still leaves the gate a pass-through so the read
+        // renders the existing 404 rather than a 403.
         |permissioner, uid| {
-            scope.map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
+            resolve_gate_stream(&state, &request.stream_id)
+                .map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
         },
     ))
     .await?;
@@ -370,7 +373,6 @@ pub(in crate::http) async fn get_topics(
 ) -> Result<Json<Vec<Topic>>, ReadError> {
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_stream(&state, &wire_stream_id);
     let request = GetTopicsRequest {
         stream_id: wire_stream_id,
     };
@@ -382,7 +384,8 @@ pub(in crate::http) async fn get_topics(
         GET_TOPICS_CODE,
         &body,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
+            resolve_gate_stream(&state, &request.stream_id)
+                .map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
         },
     ))
     .await?;
@@ -406,7 +409,6 @@ pub(in crate::http) async fn get_topic(
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
     let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetTopicRequest {
         stream_id: wire_stream_id,
         topic_id: wire_topic_id,
@@ -419,9 +421,10 @@ pub(in crate::http) async fn get_topic(
         GET_TOPIC_CODE,
         &body,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |(stream_id, topic_id)| {
-                permissioner.get_topic(uid, stream_id, topic_id)
-            })
+            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.get_topic(uid, stream_id, topic_id)
+                })
         },
     ))
     .await?;
@@ -473,7 +476,6 @@ pub(in crate::http) async fn get_user(
         let user_id = Identifier::from_str_value(&user_id).map_err(ReadError::Rejected)?;
         identifier_to_wire(&user_id).map_err(ReadError::Rejected)?
     };
-    let is_self = resolve_gate_user(&state, &wire_user_id) == Some(identity.user_id as usize);
     let request = GetUserRequest {
         user_id: wire_user_id,
     };
@@ -485,6 +487,9 @@ pub(in crate::http) async fn get_user(
         GET_USER_CODE,
         &body,
         |permissioner, uid| {
+            #[allow(clippy::cast_possible_truncation)]
+            let is_self =
+                resolve_gate_user(&state, &request.user_id) == Some(identity.user_id as usize);
             if is_self {
                 Ok(())
             } else {
@@ -513,7 +518,6 @@ pub(in crate::http) async fn get_cgs(
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
     let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetConsumerGroupsRequest {
         stream_id: wire_stream_id,
         topic_id: wire_topic_id,
@@ -526,9 +530,10 @@ pub(in crate::http) async fn get_cgs(
         GET_CONSUMER_GROUPS_CODE,
         &body,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |(stream_id, topic_id)| {
-                permissioner.get_consumer_groups(uid, stream_id, topic_id)
-            })
+            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.get_consumer_groups(uid, stream_id, topic_id)
+                })
         },
     ))
     .await?;
@@ -552,7 +557,6 @@ pub(in crate::http) async fn get_cg(
     let group_id = Identifier::from_str_value(&group_id).map_err(ReadError::Rejected)?;
     let wire_stream_id = identifier_to_wire(&stream_id).map_err(ReadError::Rejected)?;
     let wire_topic_id = identifier_to_wire(&topic_id).map_err(ReadError::Rejected)?;
-    let scope = resolve_gate_topic(&state, &wire_stream_id, &wire_topic_id);
     let request = GetConsumerGroupRequest {
         stream_id: wire_stream_id,
         topic_id: wire_topic_id,
@@ -566,9 +570,10 @@ pub(in crate::http) async fn get_cg(
         GET_CONSUMER_GROUP_CODE,
         &body,
         |permissioner, uid| {
-            scope.map_or(Ok(()), |(stream_id, topic_id)| {
-                permissioner.get_consumer_group(uid, stream_id, topic_id)
-            })
+            resolve_gate_topic(&state, &request.stream_id, &request.topic_id)
+                .map_or(Ok(()), |(stream_id, topic_id)| {
+                    permissioner.get_consumer_group(uid, stream_id, topic_id)
+                })
         },
     ))
     .await?;

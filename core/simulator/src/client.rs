@@ -601,13 +601,49 @@ impl SimClient {
         self.build_request_with_namespace(Operation::SendMessages, &buf, group)
     }
 
+    /// Build a `NonReplicated` request: `code` in the header's `reserved`
+    /// prefix, `group` as the routing namespace, `body` already encoded.
+    ///
+    /// The request id ECHOES the current counter WITHOUT advancing it (matching
+    /// the SDK, and unlike [`Self::header`]): the server ignores the id for ops
+    /// its `ClientTable` never sees, so burning one would buy nothing - and
+    /// burning one here would desync every replicated request that follows.
+    ///
+    /// # Panics
+    /// Panics if the request buffer is invalid.
+    #[allow(clippy::cast_possible_truncation)]
+    fn non_replicated_request(
+        &self,
+        code: u32,
+        group: u64,
+        body: &[u8],
+    ) -> Message<RoutedRequestHeader> {
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let total_size = header_size + body.len();
+        let mut reserved = [0u8; 52];
+        reserved[..4].copy_from_slice(&code.to_le_bytes());
+        let header = RoutedRequestHeader {
+            command: iggy_binary_protocol::Command::Request,
+            operation: Operation::NonReplicated,
+            size: total_size as u32,
+            client: self.client_id,
+            session: self.session_id(),
+            request: self.request_counter.get(),
+            reserved,
+            group,
+            ..Default::default()
+        };
+
+        let mut buffer = Vec::with_capacity(total_size);
+        buffer.extend_from_slice(bytemuck::bytes_of(&header));
+        buffer.extend_from_slice(body);
+        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
+            .expect("non-replicated request must be valid")
+    }
+
     /// Build a `POLL_MESSAGES` request for an individual consumer, reading
     /// `count` messages from offset 0 of `group`'s partition.
     ///
-    /// A `NonReplicated` read: the command code sits in the header's
-    /// `reserved` prefix, and the request id ECHOES the current counter
-    /// without advancing it (matching the SDK). The server ignores the id for
-    /// ops its `ClientTable` never sees, so burning one would buy nothing.
     /// Requires a bound session (polls are auth-gated).
     ///
     /// # Panics
@@ -625,70 +661,25 @@ impl SimClient {
             auto_commit: false,
         }
         .to_bytes();
-
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
-        let total_size = header_size + body.len();
-        let mut reserved = [0u8; 52];
-        reserved[..4].copy_from_slice(&POLL_MESSAGES_CODE.to_le_bytes());
-        let header = RoutedRequestHeader {
-            command: iggy_binary_protocol::Command::Request,
-            operation: Operation::NonReplicated,
-            size: total_size as u32,
-            client: self.client_id,
-            session: self.session_id(),
-            request: self.request_counter.get(),
-            reserved,
-            group: group.inner(),
-            ..Default::default()
-        };
-
-        let mut buffer = Vec::with_capacity(total_size);
-        buffer.extend_from_slice(bytemuck::bytes_of(&header));
-        buffer.extend_from_slice(&body);
-        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
-            .expect("poll request must be valid")
+        self.non_replicated_request(POLL_MESSAGES_CODE, group.inner(), &body)
     }
 
     /// Build a `GET_STREAM` read for `name`.
     ///
-    /// A `NonReplicated` metadata read, so it is answered from whichever
-    /// replica's state machine the request lands on rather than routed to the
-    /// primary: the command code sits in the header's `reserved` prefix, the
-    /// group is the metadata sentinel, and the request id echoes the counter
-    /// without advancing it (matching [`Self::poll_messages`] and the SDK).
-    /// Requires a bound session, since the read is auth-gated.
+    /// A metadata read, so it is answered from whichever replica's state
+    /// machine the request lands on rather than routed to the primary; the
+    /// group is the metadata sentinel. Requires a bound session, since the read
+    /// is auth-gated.
     ///
     /// # Panics
     /// Panics if `name` is not a valid wire name or the request buffer is
     /// invalid.
-    #[allow(clippy::cast_possible_truncation)]
     pub fn get_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
         let body = GetStreamRequest {
             stream_id: WireIdentifier::named(name).expect("stream name must be valid"),
         }
         .to_bytes();
-
-        let header_size = std::mem::size_of::<RoutedRequestHeader>();
-        let total_size = header_size + body.len();
-        let mut reserved = [0u8; 52];
-        reserved[..4].copy_from_slice(&GET_STREAM_CODE.to_le_bytes());
-        let header = RoutedRequestHeader {
-            command: iggy_binary_protocol::Command::Request,
-            operation: Operation::NonReplicated,
-            size: total_size as u32,
-            client: self.client_id,
-            session: self.session_id(),
-            request: self.request_counter.get(),
-            reserved,
-            group: METADATA_GROUP,
-            ..Default::default()
-        };
-
-        let mut buffer = Vec::with_capacity(total_size);
-        buffer.extend_from_slice(bytemuck::bytes_of(&header));
-        buffer.extend_from_slice(&body);
-        Message::try_from(Owned::<4096>::copy_from_slice(&buffer))
-            .expect("get stream request must be valid")
+        self.non_replicated_request(GET_STREAM_CODE, METADATA_GROUP, &body)
     }
 
     /// Store offset with explicit `AckLevel`. `NoAck` takes the primary's

@@ -29,9 +29,10 @@ use crate::dispatch::session_ops::{
     submit_register_local_or_forward,
 };
 use crate::dispatch::upgrade_shard_handle;
-use crate::http::reply::transient_code;
+use crate::responses::{reply_body, transient_code};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use consensus::MetadataHandle;
+use iggy_binary_protocol::consensus::result_code;
 use iggy_binary_protocol::{
     Command, GenericHeader, PrepareHeader, ReplyHeader, RoutedRequestHeader,
 };
@@ -196,26 +197,142 @@ where
     rx.recv().await.ok().flatten()
 }
 
-/// The commit position a COMMITTED metadata reply carries, or `None` when the
-/// frame promises the client nothing.
+/// The commit position a SUCCESSFULLY COMMITTED metadata reply carries, or
+/// `None` when the frame promises the caller nothing.
 ///
-/// Three frames arrive on this path and only one is a promise. An eviction is
-/// an `EvictionHeader` whose bytes would cast cleanly as a reply, so the
-/// command is checked first (same guard as `build_raw_pat_reply`). A
-/// pre-consensus rejection stamps the primary's `commit_max`, an op the caller
-/// was never told committed and, on a backup-homed caller, one the read gate
-/// would then wait for. A committed business rejection (duplicate name, bad
-/// expiry) DID commit and counts.
+/// Only a success promises. Every other frame on this path stamps `commit` with
+/// the primary's `commit_max`, an op the caller was never told committed and,
+/// on a backup-homed caller, one its own reads would then wait for:
 ///
-/// Shared with the HTTP write path, which grades the same three frames off the
-/// same submit entry point ([`submit_client_request_on_owner`]); one classifier
-/// is what keeps the two planes' watermarks meaning the same thing.
+/// - an eviction is an `EvictionHeader` whose bytes would cast cleanly as a
+///   reply, so the command is checked first (same guard as
+///   `build_raw_pat_reply`);
+/// - a request-level denial names itself in `ReplyHeader.status`, the channel
+///   the SDK peeks before body decode (see `build_deny_reply`);
+/// - a transient rejection did not commit and will be replayed;
+/// - a TERMINAL pre-consensus rejection (`PreflightOutcome::Reject`, e.g. a
+///   fenced session) is a result section carrying a non-transient code, which
+///   is byte-identical to a COMMITTED business rejection (duplicate name, bad
+///   expiry). Neither is separable here, and neither has to be: a rejection
+///   mutated nothing, so the caller has nothing to read back from it, and
+///   grading both as no-promise is the only reading that cannot make a read
+///   wait for an op that never committed.
+///
+/// Every reply on this path is result-framed (`Operation::is_result_framed`
+/// covers every metadata op; the partition plane grades through
+/// `classify_partition_reply` instead), so a missing result section is a
+/// malformed frame, not a bare payload.
+///
+/// Shared with the HTTP write path, which grades the same frames off the same
+/// submit entry point ([`submit_client_request_on_owner`]); one classifier is
+/// what keeps the two planes' watermarks meaning the same thing.
 pub fn committed_reply_commit(reply: &Message<GenericHeader>) -> Option<u64> {
     if reply.header().command != Command::Reply || transient_code(reply).is_some() {
         return None;
     }
-    let header = reply.as_slice().get(..size_of::<ReplyHeader>())?;
-    bytemuck::checked::try_from_bytes::<ReplyHeader>(header)
-        .ok()
-        .map(|header| header.commit)
+    let Some(bytes) = reply.as_slice().get(..size_of::<ReplyHeader>()) else {
+        warn!(
+            size = reply.header().size,
+            "metadata reply shorter than its own header; not advancing the read watermark"
+        );
+        return None;
+    };
+    let header = match bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes) {
+        Ok(header) => header,
+        Err(error) => {
+            warn!(
+                ?error,
+                "metadata reply header failed to cast; not advancing the read watermark"
+            );
+            return None;
+        }
+    };
+    if header.status != 0 {
+        return None;
+    }
+    (result_code(reply_body(reply)) == Some(0)).then_some(header.commit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::committed_reply_commit;
+    use crate::dispatch::test_support::request_message;
+    use crate::responses::{build_deny_reply, build_reply_from_bytes};
+    use bytes::Bytes;
+    use iggy_binary_protocol::Operation;
+    use iggy_common::IggyError;
+
+    /// Commit position of the frames below. Above zero on purpose: `0` is the
+    /// "promised nothing" answer, so a fixture at zero could not tell a
+    /// classified success from a rejected frame.
+    const COMMIT: u64 = 9;
+
+    /// A result-framed body: `[count][index][result]`, then the payload.
+    fn result_body(code: u32, payload: &[u8]) -> Bytes {
+        let mut body = Vec::new();
+        let count = u32::from(code != 0);
+        body.extend_from_slice(&count.to_le_bytes());
+        if count == 1 {
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&code.to_le_bytes());
+        }
+        body.extend_from_slice(payload);
+        Bytes::from(body)
+    }
+
+    /// The whole classification in one table: only a successful commit hands
+    /// the read gate a floor. Everything else stamps the primary's
+    /// `commit_max` into a frame that promised the caller nothing, and a floor
+    /// taken from one of those parks the caller's next read on a backup until
+    /// the budget expires.
+    #[test]
+    fn given_a_metadata_reply_when_classified_should_promise_only_a_committed_success() {
+        let request = request_message(Operation::CreateStream, 42, 7, 3, &[]);
+
+        let committed =
+            build_reply_from_bytes(request.header(), 42, 7, COMMIT, &result_body(0, b"payload"))
+                .into_generic();
+        assert_eq!(
+            committed_reply_commit(&committed),
+            Some(COMMIT),
+            "a committed success is the one frame that promises the caller its op"
+        );
+
+        for code in [
+            IggyError::TransientNotCommitted.as_code(),
+            IggyError::TransientNotAccepted.as_code(),
+            IggyError::UserAlreadyExists.as_code(),
+        ] {
+            let rejected =
+                build_reply_from_bytes(request.header(), 42, 7, COMMIT, &result_body(code, &[]))
+                    .into_generic();
+            assert_eq!(
+                committed_reply_commit(&rejected),
+                None,
+                "result code {code} mutated nothing, so it promises no read floor"
+            );
+        }
+
+        let denied = build_deny_reply(
+            request.header(),
+            42,
+            7,
+            COMMIT,
+            IggyError::Unauthorized.as_code(),
+        )
+        .into_generic();
+        assert_eq!(
+            committed_reply_commit(&denied),
+            None,
+            "a request-level denial names itself in `status` and commits nothing"
+        );
+
+        // Any non-`Reply` command stands in for the eviction frame, whose bytes
+        // would otherwise cast cleanly as a `ReplyHeader`.
+        assert_eq!(
+            committed_reply_commit(&request.into_generic()),
+            None,
+            "only a `Reply` carries a commit position"
+        );
+    }
 }

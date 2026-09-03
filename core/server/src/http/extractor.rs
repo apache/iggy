@@ -94,14 +94,6 @@ impl FromRequestParts<HttpState> for Authenticated {
 /// [`resolve_credential`] chokepoint, so a JWT and a PAT are honored identically.
 pub struct Identity {
     pub user_id: u32,
-    /// Session-table key of the presenting credential (`jwt:{jti}` /
-    /// `pat:{sha}`), the SAME key [`Authenticated`] resolves its session under.
-    ///
-    /// A read mints no session, so this is the only join back to what this
-    /// credential's writes committed: the read gate looks its metadata
-    /// watermark up by this key. Carried rather than resolved again in the
-    /// handler because [`resolve_credential`] already computed it.
-    pub session_key: String,
     /// Original request path + query (e.g. `/streams?consistency=linearizable`),
     /// captured so a linearizable read that reaches a follower can build the
     /// `Location` for its 307 redirect to the primary. Empty only when the URI
@@ -124,18 +116,17 @@ impl FromRequestParts<HttpState> for Identity {
     ) -> Result<Self, Self::Rejection> {
         let bearer = bearer_token(&parts.headers)?;
 
-        // Verify only: no session is minted or Registered. The key is kept
-        // (the read gate resolves this credential's metadata watermark under
-        // it) while the expiry is discarded - nothing here installs a table
-        // entry to expire.
+        // Verify only. The session key and expiry `resolve_credential` also
+        // returns feed the write path's session table; a read discards them -
+        // its read-your-writes floor is keyed by user id, not by credential
+        // (see `MetadataWatermarks`).
         // The verify is `!Send` (a trusted-issuer JWT may await a JWKS fetch),
         // so bridge it with `SendWrapper` - sound only because compio pins this
         // future to shard 0's single thread, the only thread the JWKS client
         // ever runs on (mirrors legacy `HttpSafeShard`). It holds no `RefCell`
         // borrow or `DashMap` guard across the `.await`, so a sibling task
         // scheduled on this thread meanwhile never observes a borrowed cell.
-        let (session_key, user_id, _expiry) =
-            SendWrapper::new(resolve_credential(state, bearer)).await?;
+        let (_key, user_id, _expiry) = SendWrapper::new(resolve_credential(state, bearer)).await?;
         let path_and_query = parts
             .uri
             .path_and_query()
@@ -153,7 +144,6 @@ impl FromRequestParts<HttpState> for Identity {
         }
         Ok(Self {
             user_id,
-            session_key,
             path_and_query,
             client_ip,
         })

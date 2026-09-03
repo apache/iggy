@@ -39,13 +39,15 @@ use crate::snapshot;
 use crate::wire::request_body;
 use bytes::Bytes;
 use configs::server::ServerSystemConfig;
-use consensus::MetadataHandle;
+use consensus::{MetadataHandle, TICK_INTERVAL, TimeoutManager};
+use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
     DESCRIBE_OPTIONS_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE,
     GET_CONSUMER_OFFSET_CODE, GET_ME_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE,
     GET_STATS_CODE, PING_CODE, POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
 };
+use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::system::get_client::GetClientRequest;
 use iggy_binary_protocol::requests::system::get_snapshot::GetSnapshotRequest;
@@ -59,11 +61,14 @@ use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::framing::MAX_MESSAGE_SIZE;
+use metadata::AppliedFrontier;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
 use std::cell::RefCell;
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,30 +128,109 @@ async fn handle_get_me<B, MJ, S, SB>(
     .await;
 }
 
-/// Poll cadence while a read waits for this node's applied metadata frontier.
-/// The consensus tick, so a node one commit behind resumes on the next commit
-/// broadcast rather than a tick later.
-const READ_FRONTIER_POLL: Duration = Duration::from_millis(10);
+/// Budget one held read is given before it fails retryable, in consensus
+/// ticks: six commit-broadcast intervals.
+///
+/// Sized for a node merely behind on its commit walk, NOT for a view change --
+/// detecting one costs `heartbeat_timeout` and escalating it another
+/// `view_change_status_timeout`, and `recovery_barrier_deadline` budgets at
+/// least 15s for the same event, so a read that waits out an election is a read
+/// the caller should retry elsewhere. Far below the SDK's 30s request budget,
+/// inside which it replays the same id on the same connection.
+///
+/// In ticks rather than a bare duration because that is the unit the thing
+/// being waited for moves in, and the unit the simulator steps in.
+#[allow(clippy::cast_possible_truncation)]
+pub const READ_FRONTIER_BUDGET_TICKS: u32 = 6 * TimeoutManager::COMMIT_MESSAGE_TICKS as u32;
 
-/// Polls a held read is given before it fails retryable: 3s at the cadence
-/// above. Long enough to ride out a view change, far below the SDK's 30s
-/// request budget, inside which it replays the same id on the same connection.
-const READ_FRONTIER_MAX_POLLS: u32 = 300;
+/// The same budget as a duration, for the timers the two planes measure it
+/// with.
+pub const READ_FRONTIER_BUDGET: Duration =
+    match TICK_INTERVAL.checked_mul(READ_FRONTIER_BUDGET_TICKS) {
+        Some(budget) => budget,
+        None => panic!("the read frontier budget must fit a Duration"),
+    };
 
 /// Whether `code`'s answer comes from the metadata state machine, and so must
 /// not be served below the caller's watermark.
 ///
-/// The two exclusions only look like metadata reads: `DescribeOptions` decodes
-/// a static catalog, and `GetClusterMetadata` answers from the configured
-/// roster plus the consensus view. Holding either buys no consistency, and the
-/// roster read is on the SDK's leader-discovery path, where the wait would be
-/// real.
+/// The two named exclusions only look like metadata reads: `DescribeOptions`
+/// decodes a static catalog, and `GetClusterMetadata` answers from the
+/// configured roster plus the consensus view. Holding either buys no
+/// consistency, and the roster read is on the SDK's leader-discovery path,
+/// where the wait would be real. A code this build does not know is excluded
+/// too: its only outcome is `InvalidCommand`, and parking a terminal error for
+/// the whole budget serves nobody.
+///
+/// A deny-list otherwise, so a read code added later is gated by default: the
+/// failure mode of forgetting to add one is a wait, while forgetting to add it
+/// to an allow-list is a silent stale read.
 ///
 /// Shared with the HTTP read path, which gates the identical set of command
 /// codes through `build_non_replicated_response`: two lists would drift, and a
 /// code dropped from one plane's list is a silent stale read on that plane.
 pub const fn read_needs_metadata_frontier(code: u32) -> bool {
     !matches!(code, DESCRIBE_OPTIONS_CODE | GET_CLUSTER_METADATA_CODE)
+        && lookup_command(code).is_some()
+}
+
+/// Whether a frontier wait actually parked.
+///
+/// The caller's authorization resolved its scope off the pre-wait state
+/// machine, and a wait that parked is one where that state machine moved, so
+/// only the parked outcome forces the gate to run again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontierWait {
+    /// The frontier already covered the watermark: no await ran.
+    Ready,
+    /// The read parked, and the frontier caught up while it waited.
+    CaughtUp,
+}
+
+/// The frontier never reached the watermark inside the budget. Each plane
+/// renders it in its own error currency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontierUnreached;
+
+/// Hold a read until `frontier` covers `watermark`, or until `budget` expires.
+///
+/// Event-driven: the wait is woken by the commit that advances the frontier
+/// (see [`AppliedFrontier::advance`]), so a read resumes on the commit it was
+/// short of rather than on a poll that happens to land after it. The caller
+/// supplies the budget as a future because the two read planes measure time
+/// differently -- the shard bus timer, which is virtual under the simulator,
+/// against `compio::time` on the HTTP listener.
+///
+/// Shared by both planes because one wait with two copies is one wait with a
+/// drift vector, and split from its callers so the fast path, the park, the
+/// wake and the expiry are all testable without a live shard.
+///
+/// A caller with nothing to read back has `watermark == 0`, which the first
+/// comparison satisfies: one `Acquire` load, no registration, no await. Expiry
+/// is loud and carries both numbers, so a frontier that stopped moving is
+/// visible instead of showing up as latency.
+pub async fn hold_for_frontier(
+    frontier: &AppliedFrontier,
+    watermark: u64,
+    budget: impl Future<Output = ()>,
+) -> Result<FrontierWait, FrontierUnreached> {
+    if frontier.get() >= watermark {
+        return Ok(FrontierWait::Ready);
+    }
+    let reached = pin!(frontier.reached(watermark));
+    let budget = pin!(budget);
+    match select(reached, budget).await {
+        Either::Left(((), _)) => Ok(FrontierWait::CaughtUp),
+        Either::Right(((), _)) => {
+            warn!(
+                frontier = frontier.get(),
+                watermark,
+                budget = ?READ_FRONTIER_BUDGET,
+                "metadata read frontier unreached inside the budget; failing the read retryable"
+            );
+            Err(FrontierUnreached)
+        }
+    }
 }
 
 /// Hold a local metadata read until this node has applied everything the
@@ -161,17 +245,52 @@ pub const fn read_needs_metadata_frontier(code: u32) -> bool {
 /// every shard of a node reads one shared frontier and gates identically.
 ///
 /// Fast path is a single `Acquire` load and no await, which is what keeps an
-/// uncontended read shared-nothing. Otherwise it polls the bus timer (virtual
-/// under the simulator, wall clock in production) from inside the
-/// per-connection drain task, so only this connection waits. Expiry fails
-/// loud and retryable rather than serving state the client already saw
-/// replaced; the log carries both numbers so a frontier that stopped moving
-/// is visible instead of showing up as a hang.
+/// uncontended read shared-nothing. A park costs this connection more than the
+/// read itself: the per-connection drain loop serves one frame at a time, so
+/// the client's queued `SendMessages`, `PollMessages` and `PING` wait behind
+/// the held read. No OTHER connection waits, and the budget above is what
+/// bounds it. Expiry fails loud and retryable rather than serving state the
+/// client already saw replaced.
+///
+/// The wait ends on the commit that closes the gap, not on a poll: the budget
+/// timer is the only timer armed, so a read that resumes costs one wake.
 #[allow(clippy::future_not_send)]
 async fn await_metadata_read_frontier<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    transport_client_id: u128,
+    watermark: u64,
+) -> Result<FrontierWait, IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    hold_for_frontier(
+        shard.plane.metadata().applied_frontier(),
+        watermark,
+        shard.bus.sleep(READ_FRONTIER_BUDGET),
+    )
+    .await
+    // `TransientNotAccepted`, not `NotCommitted`: a read never entered a
+    // pipeline, so it is safe to re-issue anywhere, and it is the code that
+    // drives the SDK's roster walk rather than a replay against the same
+    // durably lagging replica.
+    .map_err(|FrontierUnreached| IggyError::TransientNotAccepted)
+}
+
+/// Authorize a metadata read, then hold it for this node's applied frontier.
+///
+/// Authorization first: a denial is terminal, and parking the connection for
+/// the whole budget before answering one buys nothing. Then again on a wait
+/// that parked -- the rule resolves its scope and the caller's grants off the
+/// state machine, and a park is exactly the case where both moved under it.
+#[allow(clippy::future_not_send)]
+async fn authorize_and_hold_read<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    code: u32,
+    watermark: u64,
+    authorize: impl Fn() -> Result<(), IggyError>,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -180,24 +299,14 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // Own statement: the borrow has to be released before the poll below, which
-    // awaits on the same task the session manager's mutators run on.
-    let watermark = sessions.borrow().metadata_watermark(transport_client_id);
-    let metadata = shard.plane.metadata();
-    if metadata.applied_frontier() >= watermark {
+    authorize()?;
+    if !read_needs_metadata_frontier(code) {
         return Ok(());
     }
-    for _ in 0..READ_FRONTIER_MAX_POLLS {
-        shard.bus.sleep(READ_FRONTIER_POLL).await;
-        if metadata.applied_frontier() >= watermark {
-            return Ok(());
-        }
+    if await_metadata_read_frontier(shard, watermark).await? == FrontierWait::CaughtUp {
+        authorize()?;
     }
-    warn!(
-        frontier = metadata.applied_frontier(),
-        watermark, "metadata read frontier unreached past deadline; failing the read retryable"
-    );
-    Err(IggyError::TransientNotCommitted)
+    Ok(())
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -216,10 +325,11 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
-    // Acting user and peer address for the read gates below, resolved in one
-    // connection lookup. `user_id` is `None` only on the pre-auth path
-    // (PING), which serves ungated codes; the gated arms fail closed on it.
-    let (user_id, client_address) = sessions.borrow().read_context(transport_client_id);
+    // Acting user, peer address and read-your-writes floor for the gates
+    // below, resolved in one connection lookup. `user_id` is `None` only on the
+    // pre-auth path (PING), which serves ungated codes; the gated arms fail
+    // closed on it.
+    let (user_id, client_address, watermark) = sessions.borrow().read_context(transport_client_id);
     match code {
         PING_CODE => {
             // A ping is the client's liveness proof; reset its staleness clock
@@ -245,12 +355,18 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             }
         }
         GET_ME_CODE => {
+            // Self-scoped, so no permissioner rule -- but the consumer-group
+            // list it carries is read off the streams STM, so it is gated like
+            // any other metadata read.
+            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
+                send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
+                    .await;
+                return;
+            }
             handle_get_me(shard, sessions, transport_client_id, &request).await;
         }
         GET_PERSONAL_ACCESS_TOKENS_CODE => {
-            if let Err(error) =
-                await_metadata_read_frontier(shard, sessions, transport_client_id).await
-            {
+            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
                 return;
@@ -258,7 +374,11 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             handle_get_personal_access_tokens(shard, sessions, transport_client_id, &request).await;
         }
         GET_CLIENTS_CODE => {
-            if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_clients) {
+            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
+                authorize_uid(shard, user_id, Permissioner::get_clients)
+            })
+            .await
+            {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
                 return;
@@ -282,7 +402,11 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             .await;
         }
         GET_CLIENT_CODE => {
-            if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_client) {
+            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
+                authorize_uid(shard, user_id, Permissioner::get_client)
+            })
+            .await
+            {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
                 return;
@@ -335,18 +459,16 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
         }
         SYNC_CONSUMER_GROUP_CODE => {
             // Self-scoped: serves the caller's own assignment keyed by the
-            // header client id, so it carries no permissioner rule.
-            handle_sync_consumer_group(shard, transport_client_id, &request).await;
-        }
-        _ => {
-            if read_needs_metadata_frontier(code)
-                && let Err(error) =
-                    await_metadata_read_frontier(shard, sessions, transport_client_id).await
-            {
+            // header client id, so it carries no permissioner rule. The
+            // assignment itself is metadata-STM state, hence the gate.
+            if let Err(error) = authorize_and_hold_read(shard, code, watermark, || Ok(())).await {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
                 return;
             }
+            handle_sync_consumer_group(shard, transport_client_id, &request).await;
+        }
+        _ => {
             let roster = sessions.borrow().cluster_roster();
             let client_ip = client_address.map(|address| address.ip());
             if client_ip.is_none() {
@@ -362,6 +484,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 code,
                 &request,
                 user_id,
+                watermark,
                 &roster,
                 client_ip,
             )
@@ -377,6 +500,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     code: u32,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    watermark: u64,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
 ) where
@@ -388,8 +512,14 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
 {
     // Gate by command code before the shared builder runs. The builder stays
     // authz-free (it is byte-shared with the HTTP read path, which gates
-    // separately); a denial replies status!=0 with an empty body.
-    if let Err(error) = authorize_default_read(shard, code, request_body(request), user_id) {
+    // separately); a denial replies status!=0 with an empty body. The
+    // read-your-writes hold sits INSIDE the same call, behind that denial: an
+    // unauthorized read must fail now, not after the whole poll budget.
+    if let Err(error) = authorize_and_hold_read(shard, code, watermark, || {
+        authorize_default_read(shard, code, request_body(request), user_id)
+    })
+    .await
+    {
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
@@ -581,4 +711,110 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
         "sync_consumer_group",
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrontierUnreached, FrontierWait, hold_for_frontier, read_needs_metadata_frontier};
+    use iggy_binary_protocol::codes::{
+        DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_ME_CODE, GET_STREAM_CODE,
+        SYNC_CONSUMER_GROUP_CODE,
+    };
+    use metadata::AppliedFrontier;
+    use std::future::pending;
+    use std::sync::Arc;
+
+    /// A caller with nothing to read back (`watermark == 0`) and one whose
+    /// watermark this node has already applied are the whole steady state, and
+    /// neither may cost a park: no registration, no await. The budget here is
+    /// a future that never completes, so a gate that parked would hang instead
+    /// of quietly costing a tick.
+    #[compio::test]
+    async fn given_a_frontier_at_the_watermark_when_gating_should_serve_without_parking() {
+        let frontier = AppliedFrontier::default();
+        frontier.advance(9);
+        for watermark in [0, 7, 9] {
+            assert_eq!(
+                hold_for_frontier(&frontier, watermark, pending()).await,
+                Ok(FrontierWait::Ready),
+                "frontier 9 covers {watermark}, so the read must not park"
+            );
+        }
+        assert_eq!(frontier.waiting(), 0, "a served read registers no wait");
+    }
+
+    /// The gate's whole point, and the reason the wait is event-driven: a read
+    /// whose caller was told op 9 committed is held while this node is at 4,
+    /// and the COMMIT that advances the frontier is what answers it - here a
+    /// detached task standing in for the commit path, with no timer in the
+    /// budget at all. The parked outcome is what tells the caller to re-run
+    /// the authorization it resolved off the pre-wait state machine.
+    #[compio::test]
+    async fn given_a_frontier_behind_the_watermark_when_it_advances_should_answer_the_held_read() {
+        let frontier = Arc::new(AppliedFrontier::default());
+        frontier.advance(4);
+        let committer = Arc::clone(&frontier);
+        compio::runtime::spawn(async move {
+            // Yields first, so the read is provably parked before the advance:
+            // a gate that answered off the lagging frontier would already have
+            // returned by the time this runs.
+            compio::runtime::time::sleep(std::time::Duration::ZERO).await;
+            committer.advance(9);
+        })
+        .detach();
+
+        assert_eq!(
+            hold_for_frontier(&frontier, 9, pending()).await,
+            Ok(FrontierWait::CaughtUp),
+            "the commit that closed the gap must answer the held read"
+        );
+        assert_eq!(frontier.waiting(), 0, "the answered wait deregisters");
+    }
+
+    /// A node can legitimately never catch up (a durably lagging replica), so
+    /// the wait is bounded - and the exit is a refusal, never the stale answer.
+    /// Each plane renders it retryable: `TransientNotAccepted` on the binary
+    /// transports, the shared 503 over HTTP.
+    #[compio::test]
+    async fn given_a_frontier_that_never_catches_up_when_the_budget_expires_should_fail_retryable()
+    {
+        let frontier = AppliedFrontier::default();
+        frontier.advance(4);
+        assert_eq!(
+            hold_for_frontier(&frontier, 9, std::future::ready(())).await,
+            Err(FrontierUnreached),
+            "an unreached frontier must refuse the read, not serve it"
+        );
+        assert_eq!(
+            frontier.waiting(),
+            0,
+            "the expired wait must not leave its waker behind"
+        );
+    }
+
+    /// The deny-list's whole point is that a read answered from the metadata
+    /// STM is gated even when nobody remembered to name it, so the arms that
+    /// are NOT gated are the ones worth pinning: the static catalog, the
+    /// roster read on the leader-discovery path, and a code this build cannot
+    /// serve at all (whose only outcome is `InvalidCommand`, which must not
+    /// wait out the budget first).
+    #[test]
+    fn given_a_read_code_when_classified_should_gate_all_but_the_named_exclusions() {
+        for code in [GET_STREAM_CODE, GET_ME_CODE, SYNC_CONSUMER_GROUP_CODE] {
+            assert!(
+                read_needs_metadata_frontier(code),
+                "code {code} answers from the metadata STM and must be gated"
+            );
+        }
+        for code in [DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE] {
+            assert!(
+                !read_needs_metadata_frontier(code),
+                "code {code} answers from a static catalog or the roster; holding it buys nothing"
+            );
+        }
+        assert!(
+            !read_needs_metadata_frontier(u32::MAX),
+            "an unknown code has no answer to hold, so it must not park"
+        );
+    }
 }

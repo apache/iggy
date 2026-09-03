@@ -347,13 +347,17 @@ impl SessionManager {
             .map(|conn| conn.address)
     }
 
-    /// Acting user and transport peer address for a connection, in one map
-    /// lookup: the non-replicated dispatch path needs both, and the separate
-    /// accessors would walk the connection map twice per request.
+    /// Acting user, transport peer address and metadata watermark for a
+    /// connection, in one map lookup: the non-replicated dispatch path needs
+    /// all three per request, and the separate accessors would walk the
+    /// connection map (and take the shared borrow) once each.
+    ///
+    /// An unknown connection reads as a watermark of `0`: it was promised
+    /// nothing, so its reads wait for nothing.
     #[must_use]
-    pub fn read_context(&self, connection_id: u128) -> (Option<u32>, Option<SocketAddr>) {
+    pub fn read_context(&self, connection_id: u128) -> (Option<u32>, Option<SocketAddr>, u64) {
         let Some(conn) = self.connections.get(&connection_id) else {
-            return (None, None);
+            return (None, None, 0);
         };
         let user_id = match conn.state {
             ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
@@ -361,7 +365,7 @@ impl SessionManager {
             }
             ConnectionState::Connected => None,
         };
-        (user_id, Some(conn.address))
+        (user_id, Some(conn.address), conn.metadata_watermark)
     }
 
     /// Look up the authenticated user id for a connection.
