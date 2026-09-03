@@ -45,5 +45,10 @@ public enum ClusterNodeStatus : byte
     /// <summary>
     ///     Node is in maintenance mode
     /// </summary>
-    Maintenance = 4
+    Maintenance = 4,
+
+    /// <summary>
+    ///     Node status could not be determined
+    /// </summary>
+    Unknown = 5
 }
