@@ -17,7 +17,8 @@
 
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
-    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps, IcebergPreCreatedFixture,
+    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
+    IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
 };
 use bytes::Bytes;
 use iggy::prelude::{IggyMessage, Partitioning};
@@ -33,6 +34,9 @@ const ICEBERG_SINK_KEY: &str = "iceberg";
 const SNAPSHOT_POLL_ATTEMPTS: usize = 30;
 const SNAPSHOT_POLL_INTERVAL_MS: u64 = 500;
 const BULK_SNAPSHOT_POLL_ATTEMPTS: usize = 60;
+/// `create_test_messages` alternates `active`, so this many messages span both partition values.
+const PARTITIONED_MESSAGE_COUNT: usize = 5;
+const ACTIVE_PARTITION_COUNT: usize = 2;
 
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/iceberg/sink.toml")),
@@ -204,6 +208,82 @@ async fn iceberg_sink_handles_bulk_messages(
 
     assert_eq!(sinks.len(), 1);
     assert!(sinks[0].last_error.is_none());
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/iceberg/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn iceberg_sink_routes_messages_to_table_partitions(
+    harness: &TestHarness,
+    fixture: IcebergPartitionedTableFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+
+    let test_messages = create_test_messages(PARTITIONED_MESSAGE_COUNT);
+    let mut messages: Vec<IggyMessage> = test_messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            let payload = serde_json::to_vec(msg).expect("Failed to serialize message");
+            IggyMessage::builder()
+                .id((i + 1) as u128)
+                .payload(Bytes::from(payload))
+                .build()
+                .expect("Failed to build message")
+        })
+        .collect();
+
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send messages");
+
+    fixture
+        .wait_for_snapshots(
+            DEFAULT_NAMESPACE,
+            DEFAULT_TABLE,
+            1,
+            SNAPSHOT_POLL_ATTEMPTS,
+            SNAPSHOT_POLL_INTERVAL_MS,
+        )
+        .await
+        .expect("Data should be written to Iceberg table");
+
+    let metadata = fixture
+        .get_table_metadata(DEFAULT_NAMESPACE, DEFAULT_TABLE)
+        .await
+        .expect("Failed to get table metadata");
+    let snapshots = metadata
+        .metadata
+        .snapshots
+        .expect("Table should have a snapshot");
+    assert_eq!(snapshots.len(), 1, "One batch must produce one snapshot");
+    let summary = snapshots[0]
+        .summary
+        .as_ref()
+        .expect("Snapshot should have a summary");
+
+    assert_eq!(
+        summary.added_records.as_deref(),
+        Some(PARTITIONED_MESSAGE_COUNT.to_string().as_str())
+    );
+    assert_eq!(
+        summary.changed_partition_count.as_deref(),
+        Some(ACTIVE_PARTITION_COUNT.to_string().as_str())
+    );
+    assert_eq!(
+        summary.added_data_files.as_deref(),
+        Some(ACTIVE_PARTITION_COUNT.to_string().as_str())
+    );
 }
 
 #[iggy_harness(

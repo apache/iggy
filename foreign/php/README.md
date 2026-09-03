@@ -117,7 +117,9 @@ foreach ($messages as $message) {
 }
 ```
 
-Consumer group callbacks require a finite message limit:
+Consumer group callbacks require a finite message limit. The partition id
+argument is ignored for a consumer group, since the member reads the partitions
+the server assigns to it:
 
 ```php
 <?php
@@ -126,7 +128,7 @@ $consumer = $client->consumerGroup(
     'php-consumer',
     $stream,
     $topic,
-    $partitionId,
+    null,
     \Iggy\PollingStrategy::next(),
     10,
     \Iggy\AutoCommit::disabled(),

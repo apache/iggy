@@ -75,6 +75,28 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
             self.source.slice(self.start..self.end)
         }
     }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.source[self.start..self.end]
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Whether this fragment refcounts `source`'s allocation (and thus keeps
+    /// all of it alive, not just the sliced window).
+    #[must_use]
+    pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
+        self.source.shares_allocation(source)
+    }
 }
 
 /// Arguments for polling messages from a partition.
