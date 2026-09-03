@@ -21,8 +21,8 @@
 //! entry, and the wire/domain identifier resolvers the read and data-plane
 //! routes ground their scopes through.
 
-use crate::bootstrap::ServerShard;
-use crate::dispatch::read_needs_metadata_frontier;
+use crate::dispatch::reads::read_needs_metadata_frontier;
+use crate::shell::ServerShard;
 use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::WireIdentifier;

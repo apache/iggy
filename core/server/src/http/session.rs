@@ -104,12 +104,18 @@ pub(in crate::http) struct HttpSession {
     /// a larger one would arrive at or below the watermark and be refused as a
     /// duplicate.
     pub(in crate::http) gate: Mutex<u64>,
-    /// Next data-plane request id. A separate, gate-free counter: partition ops
-    /// are at-least-once with no consensus dedup, so the id only correlates the
-    /// in-process reply slot and concurrent produces on one session are legal.
-    /// A plain `Cell` suffices on single-threaded shard 0; ids are minted
-    /// monotonically and never reused, which the slot-guard contract requires.
-    pub(in crate::http) data_request: Cell<u64>,
+    /// Serializes this session's data-plane writes the way `gate` does its
+    /// metadata writes: the guarded value is the NEXT request id, and the write
+    /// path holds the lock from the mint until the request has been handed to
+    /// the owning shard's inbox. The partition slice dedups on a per-client
+    /// watermark, so two handlers that minted in one order but reached the
+    /// shard in the other (one slept in the routable wait, say) would have the
+    /// lower id absorbed as a duplicate with a success status. Concurrent
+    /// awaits stay legal: the lock covers admission, not the commit round trip.
+    /// Shared with the `?ack=none` path so a shed reply's id never collides
+    /// with a live awaited slot on this session. Ids are minted monotonically
+    /// and never reused, which the slot-guard contract requires.
+    pub(in crate::http) data_gate: Mutex<u64>,
     /// Registry token of this session's lazily-installed in-process reply
     /// target (`None` until the first awaited partition write). Stored so
     /// session eviction can tear the registry entry down fenced by the same
@@ -135,43 +141,6 @@ pub(in crate::http) struct HttpSession {
 }
 
 impl HttpSession {
-    /// Build the session a completed `Register` establishes: the identity
-    /// fields come from the caller, every counter starts where the write and
-    /// read paths expect it to.
-    ///
-    /// The seeds are here rather than at the mint site because
-    /// `metadata_watermark` starting at `session` is a correctness invariant
-    /// (see the field), and one that no fixture can be trusted to restate.
-    pub(in crate::http) fn registered(
-        key: String,
-        client_id: u128,
-        session: u64,
-        user_id: u32,
-        expiry: u64,
-    ) -> Self {
-        Self {
-            key,
-            client_id,
-            session,
-            user_id,
-            expiry,
-            gate: Mutex::new(FIRST_REQUEST_ID),
-            data_request: Cell::new(FIRST_REQUEST_ID),
-            registry_token: Cell::new(None),
-            in_flight_writes: Cell::new(0),
-            metadata_watermark: Cell::new(session),
-        }
-    }
-
-    /// Mint the next data-plane request id. Also consumed by the `?ack=none`
-    /// path, which installs no slot: sharing one counter keeps a shed reply's
-    /// id from ever colliding with a live awaited slot on this session.
-    pub(in crate::http) fn next_data_request_id(&self) -> u64 {
-        let id = self.data_request.get();
-        self.data_request.set(id + 1);
-        id
-    }
-
     /// Raise this session's metadata watermark to `commit`. Monotone, so a
     /// reply that lands out of order (concurrent requests on one credential
     /// are legal) cannot lower it.
@@ -318,13 +287,18 @@ mod tests {
     /// construction plus the live cancellation smoke, not faked here.
     #[compio::test]
     async fn detached_task_advances_gate_and_ignores_dead_receiver() {
-        let session = Rc::new(HttpSession::registered(
-            "jwt:test".to_owned(),
-            7,
-            1,
-            DEFAULT_ROOT_USER_ID,
-            u64::MAX,
-        ));
+        let session = Rc::new(HttpSession {
+            key: "jwt:test".to_owned(),
+            client_id: 7,
+            session: 1,
+            user_id: DEFAULT_ROOT_USER_ID,
+            expiry: u64::MAX,
+            gate: Mutex::new(FIRST_REQUEST_ID),
+            data_gate: Mutex::new(FIRST_REQUEST_ID),
+            registry_token: Cell::new(None),
+            in_flight_writes: Cell::new(0),
+            metadata_watermark: Cell::new(1),
+        });
         let (result_slot, committed) = oneshot::channel::<u64>();
         // The handler future dies (client disconnect) before the task runs.
         drop(committed);
@@ -349,17 +323,20 @@ mod tests {
 
     /// `InstanceToken` has no public constructor, so fixtures carry no reply
     /// target; the token-teardown branch of the sweep/forget helpers is
-    /// exercised via their `Option` path, not fabricated here. Built through
-    /// [`HttpSession::registered`], the same constructor the live mint uses, so
-    /// a fixture can never drift from the seeds production ships.
+    /// exercised via their `Option` path, not fabricated here.
     fn fake_session(key: &str, client_id: u128, expiry: u64) -> Rc<HttpSession> {
-        Rc::new(HttpSession::registered(
-            key.to_owned(),
+        Rc::new(HttpSession {
+            key: key.to_owned(),
             client_id,
-            FIXTURE_EPOCH,
-            DEFAULT_ROOT_USER_ID,
+            session: FIXTURE_EPOCH,
+            user_id: DEFAULT_ROOT_USER_ID,
             expiry,
-        ))
+            gate: Mutex::new(FIRST_REQUEST_ID),
+            data_gate: Mutex::new(FIRST_REQUEST_ID),
+            registry_token: Cell::new(None),
+            in_flight_writes: Cell::new(0),
+            metadata_watermark: Cell::new(FIXTURE_EPOCH),
+        })
     }
 
     // The barrier is what makes a herd of concurrent first-requests for one

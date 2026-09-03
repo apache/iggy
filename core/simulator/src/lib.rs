@@ -50,8 +50,8 @@ use replica::{Replica, SIM_INBOX_CAPACITY, new_shard};
 use seeds::SimSeeds;
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
-use shard::CONSENSUS_TICK_INTERVAL;
 use shard::shards_table::{ShardsTable, calculate_shard_assignment};
+use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -907,12 +907,13 @@ impl Simulator {
         }
     }
 
-    /// Lost-wake tripwire. At executor quiescence every live pump must have drained
-    /// its inbox; a non-empty one on a non-crashed replica means a frame reached the
-    /// channel without waking the target pump. Every pump holds a standing
+    /// Lost-work tripwire. At executor quiescence every live pump must have drained
+    /// both inbox lanes and its parked-frame redispatch queue. A non-empty lane on a
+    /// non-crashed replica means a frame reached the channel without waking the
+    /// target pump. A non-empty redispatch queue means a materialisation staged work
+    /// without the pump's priority drain completing. Every pump holds a standing
     /// `CONSENSUS_TICK_INTERVAL` timer, so the next `advance_time` would re-poll and
-    /// silently drain it, masking the exact wake-loss class this harness exists to
-    /// catch. Trip here instead.
+    /// silently drain either case, masking the fault. Trip here instead.
     ///
     /// Incomplete by construction: only catches a lost wakeup while the un-woken
     /// frame is still queued at quiescence, since a later frame that does wake the
@@ -944,6 +945,16 @@ impl Simulator {
                     0,
                     "lost wakeup: replica {replica_id} shard {} reply lane holds \
                      {pending_replies} frame(s) at quiescence (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
+                let pending_redispatch = shard.redispatched_frame_count();
+                assert_eq!(
+                    pending_redispatch,
+                    0,
+                    "lost redispatch: replica {replica_id} shard {} redispatch queue holds \
+                     {pending_redispatch} frame(s) at quiescence (seed {:#x}, schedule hash {:#x})",
                     shard.id,
                     self.seed,
                     self.executor.schedule_hash(),
@@ -1467,7 +1478,7 @@ fn materialise_partition(
         recovered_state,
         retained,
         restore_frontier,
-        created_view,
+        PartitionMaterialisation::new(epoch, created_view),
     );
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -1999,122 +2010,6 @@ mod tests {
         );
     }
 
-    /// At-least-once failover: a `SendMessages` retry on a new primary re-executes.
-    /// The retry reply carries a HIGHER `commit` op, proof of re-execution rather
-    /// than dedup, and the duplicate payload lives at two offsets. Consumers dedup
-    /// if they want at-most-once-per-payload.
-    #[test]
-    fn failover_retry_re_executes_under_at_least_once() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
-            enabled: false,
-            size: iggy_common::IggyByteSize::from(0u64),
-            bucket_capacity: 1,
-        });
-
-        let replica_count: u8 = 5;
-        let client_id: u128 = 1;
-        let network_opts = packet::PacketSimulatorOptions {
-            node_count: replica_count,
-            client_count: 1,
-            ..packet::PacketSimulatorOptions::default()
-        };
-
-        let mut sim = Simulator::new(
-            replica_count as usize,
-            std::iter::once(client_id),
-            network_opts,
-        );
-        let client = SimClient::new(client_id);
-        let ns = IggyNamespace::new(1, 1, 0);
-        sim.init_partition(ns);
-        sim.register_client_with_primary(&client);
-
-        // Same `(client, session, request)` for replay; mirrors SDK's
-        // connection-loss retry.
-        let original_req = client.send_messages(ns, &[Bytes::from_static(b"failover-test")]);
-        let replay_req = original_req.deep_copy();
-        let original_request_id = original_req.header().request;
-
-        sim.submit_request(client_id, 0, original_req.into_generic());
-
-        let mut original_reply: Option<Message<ReplyHeader>> = None;
-        for _ in 0..200 {
-            let replies = sim.step();
-            if !replies.is_empty() {
-                original_reply = Some(replies[0].deep_copy());
-                break;
-            }
-        }
-        let original_reply = original_reply.expect("commit reply must arrive before primary crash");
-        let original_commit_op = original_reply.header().commit;
-        assert_eq!(
-            original_reply.header().request,
-            original_request_id,
-            "sanity: original reply must echo the request id"
-        );
-
-        // Crash primary. Real-world: TCP buffer might have lost reply
-        // before ack; same retry path.
-        sim.replica_crash(0);
-
-        // Steps for view change across 4 survivors.
-        for _ in 0..800 {
-            sim.step();
-        }
-
-        // Find new primary via any live replica.
-        let live = &sim.replicas[1].shards[0];
-        let live_consensus = live
-            .plane
-            .partitions()
-            .get_by_ns(&ns)
-            .expect("partition must exist on a live replica")
-            .consensus();
-        assert!(
-            live_consensus.view() > 0,
-            "view must have advanced past the crashed primary"
-        );
-        let new_primary_idx = live_consensus.primary_index(live_consensus.view());
-        assert_ne!(
-            new_primary_idx, 0,
-            "new primary must not be the crashed replica"
-        );
-
-        // Replay the SAME request to the new primary. No dedup, so re-execution.
-        sim.submit_request(client_id, new_primary_idx, replay_req.into_generic());
-
-        let mut retry_reply: Option<Message<ReplyHeader>> = None;
-        for _ in 0..200 {
-            let replies = sim.step();
-            if !replies.is_empty() {
-                retry_reply = Some(replies[0].deep_copy());
-                break;
-            }
-        }
-        let retry_reply = retry_reply.expect(
-            "reply must arrive after retry; new primary re-commits as \
-             fresh prepare (at-least-once)",
-        );
-
-        // At-least-once: same request id (correlation), HIGHER commit op
-        // (re-execution). No dedup absorbs the retry.
-        assert_eq!(
-            retry_reply.header().request,
-            original_request_id,
-            "retry's reply must correlate to the request id"
-        );
-        assert!(
-            retry_reply.header().commit > original_commit_op,
-            "retry must re-execute (commit op > original={original_commit_op}, got {})",
-            retry_reply.header().commit
-        );
-        assert_eq!(
-            retry_reply.header().client,
-            client_id,
-            "retry must echo original client_id"
-        );
-    }
-
     /// Determinism: fresh simulator + workload from the same seed (network
     /// and workload) produces an identical reply-header sequence.
     #[test]
@@ -2440,11 +2335,10 @@ mod tests {
     /// behind VSR retransmit.
     ///
     /// `park_overflow` is deliberately NOT excluded. The reconciler is unwired here
-    /// (`init_partition` mirrors its outcome directly), so nothing drains the park
-    /// buffer and a parked frame is never re-dispatched or swept. Non-zero
-    /// `park_overflow` therefore means frames shed for a namespace that will never
-    /// materialise, which is the fault class this catches rather than the
-    /// back-pressure it would be in production.
+    /// and only an explicit `init_partition` mirrors its materialisation outcome and
+    /// drains the matching park entry. Non-zero `park_overflow` therefore means
+    /// frames shed for a namespace the driver never materialised, which is the fault
+    /// class this catches rather than the back-pressure it would be in production.
     ///
     /// Same reason the park buffer must be empty at quiescence: a frame still parked
     /// has no drainer, so it is neither delivered nor answered.
@@ -2459,7 +2353,8 @@ mod tests {
                 assert!(
                     shard.parked_namespaces().is_empty(),
                     "replica {replica_idx} shard {shard_idx} left partition frames parked; the \
-                     simulator wires no reconciler, so nothing will deliver or answer them"
+                     simulator wires no reconciler, so only explicit materialisation can \
+                     deliver or answer them"
                 );
             }
         }
@@ -2545,6 +2440,227 @@ mod tests {
             schedule_a, schedule_b,
             "shell schedule diverged at same seed"
         );
+    }
+
+    fn successful_send_reply_count(replies: &[Message<ReplyHeader>]) -> usize {
+        replies
+            .iter()
+            .filter(|reply| {
+                reply.header().operation == iggy_binary_protocol::Operation::SendMessages
+                    && reply.header().status == 0
+            })
+            .count()
+    }
+
+    fn retained_prepare(
+        sim: &Simulator,
+        replica: usize,
+        namespace: IggyNamespace,
+        op: u64,
+    ) -> Message<iggy_binary_protocol::PrepareHeader> {
+        let partitions = sim.replicas[replica]
+            .partition_shard(namespace)
+            .plane
+            .partitions();
+        let partition = partitions.get_by_ns(&namespace).expect("partition");
+        let stored = partition
+            .log
+            .journal()
+            .inner
+            .repair_entry(op)
+            .unwrap_or_else(|| panic!("replica {replica} retains prepare op {op} for repair"));
+        Message::<iggy_binary_protocol::PrepareHeader>::try_from(server_common::iobuf::Owned::<
+            { server_common::MESSAGE_ALIGN },
+        >::copy_from_slice(
+            stored.as_slice()
+        ))
+        .expect("journaled prepare remains a valid frame")
+    }
+
+    /// Leave one backup without the partition while the primary commits two
+    /// sends through the other backup. The lagging replica parks both replicated
+    /// prepares. A third prepare is withheld from it, then placed on its inbox
+    /// after simulator materialisation stages the parked prefix. Running the pump
+    /// without advancing its tick forces the inbox arm to drain the prefix first.
+    fn parked_prepare_redispatch_trace(seed: u64) -> (usize, Vec<PartitionOffsets>, u64) {
+        const CLIENT_ID: u128 = 1;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: 3,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(3, 1, std::iter::once(CLIENT_ID), network_opts);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.seed_stream_topic_partition(namespace);
+        let created_view = sim.partition_created_views[&namespace];
+
+        // Replica 0 is the view-0 primary. Replica 2 supplies quorum while
+        // replica 1 has committed metadata but no local partition yet.
+        materialise_partition(&sim.replicas[0], namespace, false, created_view);
+        materialise_partition(&sim.replicas[2], namespace, false, created_view);
+
+        let client = SimClient::new(CLIENT_ID);
+        sim.shell_login(&client);
+        // Both sends in flight at once. The simulated link delays each packet
+        // independently, so the lower request id can reach the primary after
+        // the higher one committed; the dedup slice's committed-id window is
+        // what keeps that reordered arrival a new write rather than an absorbed
+        // duplicate, and this loop is the check that both payloads commit.
+        for payload in [
+            Bytes::from_static(b"parked-redispatch-0"),
+            Bytes::from_static(b"parked-redispatch-1"),
+        ] {
+            let request = client.send_messages(namespace, std::slice::from_ref(&payload));
+            sim.submit_request(CLIENT_ID, 0, request.into_generic());
+        }
+
+        let lagging_shard = Rc::clone(&sim.replicas[1].shards[0]);
+        let mut successful_replies = 0usize;
+        let mut parked = 0usize;
+        for _ in 0..500 {
+            successful_replies += successful_send_reply_count(&sim.step());
+            parked = lagging_shard.parked_frame_count(namespace);
+            if successful_replies >= 2 && parked >= 2 {
+                break;
+            }
+        }
+        assert!(
+            successful_replies >= 2,
+            "primary never committed both sends"
+        );
+        assert!(parked >= 2, "lagging backup never parked both prepares");
+
+        // Keep the third prepare off replica 1's network path. Replica 0 can
+        // still commit it through replica 2, after which its journal supplies
+        // the exact wire frame to put on the lagging backup's inbox below.
+        sim.network.process_disable(ProcessId::Replica(1));
+        let third = client.send_messages(namespace, &[Bytes::from_static(b"parked-redispatch-2")]);
+        sim.submit_request(CLIENT_ID, 0, third.into_generic());
+        for _ in 0..500 {
+            successful_replies += successful_send_reply_count(&sim.step());
+            if successful_replies >= 3 {
+                break;
+            }
+        }
+        assert!(
+            successful_replies >= 3,
+            "primary never committed the later send"
+        );
+        let later_prepare = retained_prepare(&sim, 0, namespace, 3);
+        sim.network.process_enable(ProcessId::Replica(1));
+
+        materialise_partition(&sim.replicas[1], namespace, false, created_view);
+        assert_eq!(lagging_shard.parked_frame_count(namespace), 0);
+        assert_eq!(
+            lagging_shard.redispatched_frame_count(),
+            parked,
+            "materialisation must move every parked prepare to the pump queue"
+        );
+
+        // No virtual-time advance here. The materialisation marker and inbox
+        // wake poll the pump, whose ranked redispatch arm must put ops 1 and 2
+        // ahead of this op 3 frame.
+        lagging_shard.dispatch(later_prepare.into_generic());
+        sim.run_pumps();
+        let lagging_holds_later = sim.replicas[1]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .is_some_and(|partition| partition.log.journal().inner.header_by_op(3).is_some());
+        assert!(
+            lagging_holds_later,
+            "inbox op 3 reached the gap check before the redispatched prefix"
+        );
+
+        let expected = sim
+            .offsets(0, namespace)
+            .expect("primary partition offsets");
+        let mut converged = false;
+        for _ in 0..500 {
+            sim.step();
+            converged = (0..3).all(|replica| sim.offsets(replica, namespace) == Some(expected));
+            if converged {
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "redispatched prepares did not converge the backup"
+        );
+        assert_eq!(lagging_shard.redispatched_frame_count(), 0);
+        assert_no_frame_drops(&sim);
+
+        let offsets = (0..3)
+            .map(|replica| sim.offsets(replica, namespace).expect("partition offsets"))
+            .collect();
+        (parked, offsets, sim.schedule_hash())
+    }
+
+    #[test]
+    fn parked_prepare_redispatch_is_seed_replayable() {
+        let first = parked_prepare_redispatch_trace(0x5CED_4005);
+        let second = parked_prepare_redispatch_trace(0x5CED_4005);
+        assert_eq!(first, second, "same seed diverged on parked redispatch");
+    }
+
+    #[test]
+    fn redispatched_solo_request_commits_without_another_inbox_frame() {
+        const CLIENT_ID: u128 = 1;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: 1,
+            client_count: 1,
+            seed: 0x5CED_4006,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(1, 1, std::iter::once(CLIENT_ID), network_opts);
+        let namespace = IggyNamespace::new(0, 0, 0);
+        sim.seed_stream_topic_partition(namespace);
+
+        let client = SimClient::new(CLIENT_ID);
+        sim.shell_login(&client);
+        let request = client.send_messages(namespace, &[Bytes::from_static(b"solo-redispatch")]);
+        let shard = Rc::clone(&sim.replicas[0].shards[0]);
+        let request = server_common::MessageBag::try_from(request.into_generic())
+            .expect("valid send request");
+        futures::executor::block_on(shard.on_message(request));
+        assert_eq!(
+            shard.parked_frame_count(namespace),
+            1,
+            "the request must park before materialisation"
+        );
+
+        sim.init_partition(namespace);
+        assert_eq!(
+            shard.redispatched_frame_count(),
+            1,
+            "materialisation must stage and wake the parked request"
+        );
+
+        // No network or virtual-time step follows materialisation. The ranked
+        // redispatch arm must deliver this request and process its self-ack in
+        // the same pump iteration.
+        sim.run_pumps();
+        let state = sim
+            .partition_consensus_state(0, namespace)
+            .expect("the materialised solo partition has consensus state");
+        assert_eq!(state.commit_min, 1, "the self-ack must commit the request");
+        assert_eq!(shard.redispatched_frame_count(), 0);
     }
 
     /// The dispatch shell's reason to exist: detect the PR #3557 async-concurrency
@@ -2706,7 +2822,14 @@ mod tests {
             executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
             let grow = Rc::clone(&sim.replicas[0].shards[0]);
             executor.spawn(async move {
-                grow.init_partition(ns_grow, None, None, None, false, 0);
+                grow.init_partition(
+                    ns_grow,
+                    None,
+                    None,
+                    None,
+                    false,
+                    PartitionMaterialisation::new(0, 0),
+                );
             });
             executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
         }))
@@ -2741,7 +2864,14 @@ mod tests {
         executor.run_until_stalled(POLL_BUDGET);
         let grow = Rc::clone(&sim.replicas[0].shards[0]);
         executor.spawn(async move {
-            grow.init_partition(ns_grow, None, None, None, false, 0);
+            grow.init_partition(
+                ns_grow,
+                None,
+                None,
+                None,
+                false,
+                PartitionMaterialisation::new(0, 0),
+            );
         });
         executor.run_until_stalled(POLL_BUDGET);
 
@@ -2992,6 +3122,149 @@ mod tests {
             epoch_after, epoch_before,
             "the client session must survive a restart, reconstructed from the retained WAL, \
              so a returning client is recognized instead of hitting NoSession"
+        );
+    }
+
+    /// Failover retry absorbed by the partition dedup slice: a `SendMessages`
+    /// replay of an already-committed `(client, request)` on a NEW primary is
+    /// answered without re-executing. The slice is folded in on every replica
+    /// at commit, so the promoted primary knows the watermark its predecessor
+    /// established -- that inheritance is what this test proves.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn failover_retry_absorbed_by_partition_dedup() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 5;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.register_client_with_primary(&client);
+
+        // Same `(client, session, request)` for replay; mirrors SDK's
+        // connection-loss retry.
+        let original_req = client.send_messages(ns, &[Bytes::from_static(b"failover-test")]);
+        let replay_req = original_req.deep_copy();
+        let original_request_id = original_req.header().request;
+
+        sim.submit_request(client_id, 0, original_req.into_generic());
+
+        let mut original_reply: Option<Message<ReplyHeader>> = None;
+        for _ in 0..200 {
+            let replies = sim.step();
+            if !replies.is_empty() {
+                original_reply = Some(replies[0].deep_copy());
+                break;
+            }
+        }
+        let original_reply = original_reply.expect("commit reply must arrive before primary crash");
+        let original_commit_op = original_reply.header().commit;
+        // Offset after exactly one committed batch: the duplicate must not
+        // move it.
+        let offset_after_original = sim.replicas[1].shards[0]
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on a live replica")
+            .stats
+            .current_offset();
+        assert_eq!(
+            original_reply.header().request,
+            original_request_id,
+            "sanity: original reply must echo the request id"
+        );
+
+        // Crash primary. Real-world: TCP buffer might have lost reply
+        // before ack; same retry path.
+        sim.replica_crash(0);
+
+        // Steps for view change across 4 survivors.
+        for _ in 0..800 {
+            sim.step();
+        }
+
+        // Find new primary via any live replica.
+        let live = &sim.replicas[1].shards[0];
+        let live_consensus = live
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on a live replica")
+            .consensus();
+        assert!(
+            live_consensus.view() > 0,
+            "view must have advanced past the crashed primary"
+        );
+        let new_primary_idx = live_consensus.primary_index(live_consensus.view());
+        assert_ne!(
+            new_primary_idx, 0,
+            "new primary must not be the crashed replica"
+        );
+
+        // Replay the SAME request to the new primary: the dedup slice it
+        // inherited at commit must absorb it.
+        sim.submit_request(client_id, new_primary_idx, replay_req.into_generic());
+
+        let mut retry_reply: Option<Message<ReplyHeader>> = None;
+        for _ in 0..200 {
+            let replies = sim.step();
+            if !replies.is_empty() {
+                retry_reply = Some(replies[0].deep_copy());
+                break;
+            }
+        }
+        let retry_reply = retry_reply
+            .expect("reply must arrive after retry; the new primary absorbs it as a duplicate");
+
+        assert_eq!(
+            retry_reply.header().request,
+            original_request_id,
+            "retry's reply must correlate to the request id"
+        );
+        assert_eq!(
+            retry_reply.header().client,
+            client_id,
+            "retry must echo original client_id"
+        );
+        assert_eq!(
+            retry_reply.header().status,
+            0,
+            "an absorbed duplicate is a success, not an error"
+        );
+        // The absorbed answer is synthesized at admission, so it never earns a
+        // new op. Re-execution would have committed past the original.
+        assert!(
+            retry_reply.header().op <= original_commit_op,
+            "retry must NOT re-execute (original commit={original_commit_op}, reply op={})",
+            retry_reply.header().op
+        );
+        // The payload committed exactly once.
+        let committed = sim.replicas[usize::from(new_primary_idx)].shards[0]
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on the new primary")
+            .stats
+            .current_offset();
+        assert_eq!(
+            committed, offset_after_original,
+            "duplicate must not append a second copy"
         );
     }
 
@@ -4844,7 +5117,8 @@ mod metadata_read_frontier_tests {
     //! client already holds. Register forwarding is the supported way to get
     //! there -- a backup verifies the credentials itself, forwards only the
     //! consensus proposal, and binds the committed session while its own
-    //! `commit_journal` is still behind that op (see `server::auth`).
+    //! `commit_journal` is still behind that op (see
+    //! `server::dispatch::session_ops`).
     //!
     //! Blocking replication INTO one backup while the quorum commits without
     //! it produces the lag deterministically, and the login still completes

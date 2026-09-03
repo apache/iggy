@@ -6,7 +6,7 @@ Every new PR that introduces new functionality must link to an approved issue.
 PRs without one may be closed at maintainer's discretion.
 
 1. Create an issue or comment under existing
-2. Wait for maintainer approval (`good-first-issue` label or comment)
+2. Wait for the issue to be assigned to you
     - Maintainer may request for more details or a different approach
 3. Then code
 

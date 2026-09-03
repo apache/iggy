@@ -26,7 +26,8 @@
 //! each caller derives it from its own on-shard view (`None` when the serving
 //! shard has no consensus - peer shards - in which case no node is marked
 //! leader, but the full roster is still returned). The self-synthesized single
-//! node is the cluster-disabled fallback, shared by both callers.
+//! node is the cluster-disabled fallback, shared by both callers, and the one
+//! place this node's own bound ports are reported.
 
 use configs::ConfigurationError;
 use configs::cluster::{AdvertisedAddress, ClusterConfig, ResolvedClusterNode, TransportPorts};
@@ -34,8 +35,8 @@ use iggy_common::{
     ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints,
 };
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Node name reported for the synthesized self node when no roster applies.
 const SELF_NODE_NAME: &str = "iggy-node";
@@ -90,11 +91,12 @@ pub fn resolved_roster_nodes(
         .collect()
 }
 
-/// Config-derived cluster topology reported by cluster-metadata reads.
+/// Cluster topology reported by cluster-metadata reads.
 ///
-/// Copied out of `ClusterConfig` at listener/shard start so both handlers stay
-/// synchronous and never borrow live config. `self_*` describe this node and
-/// back the cluster-disabled self-synthesis only.
+/// Copied out of `ClusterConfig` at shard start so both handlers stay
+/// synchronous and never borrow live config. `self_advertised` and the two
+/// port sets describe this node and back the cluster-disabled self-synthesis
+/// only.
 pub struct ClusterRoster {
     pub enabled: bool,
     pub name: String,
@@ -104,9 +106,14 @@ pub struct ClusterRoster {
     /// This node's own client-facing address, reported for the synthesized
     /// self node (see [`self_advertised_address`]).
     pub self_advertised: String,
-    /// This node's own client ports for the same self node (`None` = transport
-    /// disabled).
-    pub self_ports: TransportPorts,
+    /// This node's own client ports for the same self node as configured
+    /// (`None` = transport disabled), reported until the bound ones are
+    /// published.
+    pub configured_ports: TransportPorts,
+    /// The same ports as the OS bound them, published by shard 0 once its
+    /// listeners are up, so a configured `:0` port resolves for the
+    /// self-synthesized node; cluster mode serves `cluster.nodes[*].ports`.
+    pub bound_ports: Arc<BoundPorts>,
     /// Metadata-group view, published by shard 0 (the only shard holding the
     /// consensus instance) so every shard's cluster-metadata read marks the
     /// current leader. `u64::MAX` until shard 0 first publishes.
@@ -115,6 +122,20 @@ pub struct ClusterRoster {
 
 /// Sentinel for "shard 0 has not published a view yet".
 pub const METADATA_VIEW_UNKNOWN: u64 = u64::MAX;
+
+/// Client ports as bound by shard 0's listeners. One cell per process, shared
+/// by every shard's roster: blank from bootstrap until the last listener has
+/// bound, then filled once, before the HTTP listener serves. A binary read
+/// that lands in the bind window answers the configured ports instead.
+#[derive(Default)]
+pub struct BoundPorts(OnceLock<TransportPorts>);
+
+impl BoundPorts {
+    pub fn publish(&self, ports: TransportPorts) {
+        let published = self.0.set(ports);
+        debug_assert!(published.is_ok(), "listeners bind once per process");
+    }
+}
 
 impl ClusterRoster {
     /// A cluster-disabled roster with no self address. The pre-bootstrap
@@ -127,9 +148,16 @@ impl ClusterRoster {
             name: String::new(),
             nodes: Vec::new(),
             self_advertised: String::new(),
-            self_ports: TransportPorts::default(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: Arc::default(),
             metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
         }
+    }
+
+    /// This node's own client ports: the bound ones once shard 0 has
+    /// published them, the configured ones before.
+    fn self_ports(&self) -> &TransportPorts {
+        self.bound_ports.0.get().unwrap_or(&self.configured_ports)
     }
 
     /// The current metadata primary's REPLICA ID, from the shard-0-published
@@ -192,7 +220,7 @@ impl ClusterRoster {
             nodes: vec![ClusterNode {
                 name: SELF_NODE_NAME.to_owned(),
                 ip: self.self_advertised.clone(),
-                endpoints: ports_to_endpoints(&self.self_ports),
+                endpoints: ports_to_endpoints(self.self_ports()),
                 role: ClusterNodeRole::Leader,
                 status: ClusterNodeStatus::Healthy,
             }],
@@ -250,7 +278,8 @@ mod tests {
             name: "test-cluster".to_owned(),
             nodes: vec![ResolvedClusterNode::try_from(node).expect("valid roster node")],
             self_advertised: "127.0.0.1".to_owned(),
-            self_ports: TransportPorts::default(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: Arc::default(),
             metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
         }
     }
@@ -408,10 +437,11 @@ mod tests {
             name: String::new(),
             nodes: Vec::new(),
             self_advertised: "broker-1.example.com".to_owned(),
-            self_ports: TransportPorts {
+            configured_ports: TransportPorts {
                 tcp: Some(8090),
                 ..TransportPorts::default()
             },
+            bound_ports: Arc::default(),
             metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
         };
 
@@ -422,5 +452,38 @@ mod tests {
         assert_eq!(metadata.nodes[0].endpoints.tcp, 8090);
         assert_eq!(metadata.nodes[0].role, ClusterNodeRole::Leader);
         assert_eq!(metadata.nodes[0].status, ClusterNodeStatus::Healthy);
+    }
+
+    #[test]
+    fn self_metadata_reports_bound_ports_once_published() {
+        let roster = ClusterRoster {
+            enabled: false,
+            name: String::new(),
+            nodes: Vec::new(),
+            self_advertised: "127.0.0.1".to_owned(),
+            configured_ports: TransportPorts {
+                tcp: Some(0),
+                http: Some(0),
+                ..TransportPorts::default()
+            },
+            bound_ports: Arc::default(),
+            metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
+        };
+        assert_eq!(
+            roster.cluster_metadata(None, None).nodes[0].endpoints.tcp,
+            0
+        );
+
+        roster.bound_ports.publish(TransportPorts {
+            tcp: Some(45001),
+            http: Some(45002),
+            ..TransportPorts::default()
+        });
+
+        let endpoints = roster.cluster_metadata(None, None).nodes[0]
+            .endpoints
+            .clone();
+        assert_eq!(endpoints.tcp, 45001);
+        assert_eq!(endpoints.http, 45002);
     }
 }

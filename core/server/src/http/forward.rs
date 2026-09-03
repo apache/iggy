@@ -68,7 +68,7 @@ use configs::http::HttpTlsConfig;
 use consensus::MetadataHandle;
 use futures::StreamExt;
 use iggy_common::IggyError;
-use message_bus::transports::tls::{install_default_crypto_provider, load_pem};
+use message_bus::transports::tls::load_pem;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -82,7 +82,7 @@ use crate::http::error::{
     CustomError, error_response, gateway_timeout_response, primary_http_socket, with_retry_after,
 };
 use crate::http::extractor::{bearer_token, resolve_credential};
-use crate::http::state::{HttpInner, VIEW_HEADER};
+use crate::http::state::{ForwardState, HttpInner, VIEW_HEADER};
 use crate::server_error::ServerError;
 
 /// Marker stamped on every forwarded request. Loop guard only: a node that is
@@ -135,23 +135,6 @@ const RESPONSE_CAPACITY_HINT: usize = 64 * 1024;
 /// (the view layer only fills the header when absent).
 const RELAYED_RESPONSE_HEADERS: [HeaderName; 3] = [CONTENT_TYPE, RETRY_AFTER, VIEW_HEADER];
 
-/// Per-node forwarding context hung off `HttpInner`: the outbound client
-/// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
-/// request-body buffer bound, and the in-flight budget.
-pub(in crate::http) struct ForwardState {
-    /// False when no cluster-wide bearer key material exists (no configured
-    /// JWT secret, no cluster PSK): a forwarded bearer would 401 on the
-    /// primary, so the middleware passes through and followers answer with
-    /// the transient 503 instead.
-    active: bool,
-    client: cyper::Client,
-    /// Also read by the 307 redirect builder: the primary is assumed to serve
-    /// the same scheme as this node (uniform cluster HTTP config).
-    pub(in crate::http) scheme: &'static str,
-    body_limit: usize,
-    in_flight: Cell<u32>,
-}
-
 /// Build the [`ForwardState`] at listener startup.
 ///
 /// With `http.tls.enabled` the forward hop dials `https` and verifies the peer
@@ -173,13 +156,17 @@ pub(in crate::http) fn build_forward_state(
     body_limit: usize,
     active: bool,
 ) -> Result<ForwardState, ServerError> {
-    // Unconditional: cyper's rustls connector resolves the process default
-    // provider even when the client only ever dials plain http.
-    install_default_crypto_provider();
     let builder = cyper::Client::builder()
         // The retry loop re-resolves the primary from the local roster; a
         // followed `Location` would let the peer steer the bearer anywhere.
         .redirect(cyper::redirect::Policy::none());
+    // `bootstrap()` installs the process-level provider before any shard
+    // thread exists; both `ClientConfig` builders below panic without one, so
+    // fail the boot instead. A unit test building this state installs it
+    // itself, as http/tls.rs does.
+    let provider = CryptoProvider::get_default().ok_or_else(|| ServerError::HttpForwardClient {
+        reason: "no process-level rustls CryptoProvider installed".to_string(),
+    })?;
     let (builder, scheme) = if tls.enabled {
         let credentials =
             load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
@@ -195,10 +182,7 @@ pub(in crate::http) fn build_forward_state(
                 reason: "TLS certificate chain is empty".to_string(),
             }
         })?;
-        let algorithms = CryptoProvider::get_default()
-            // Installed above; absence is unreachable.
-            .expect("default crypto provider installed")
-            .signature_verification_algorithms;
+        let algorithms = provider.signature_verification_algorithms;
         let config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier { pinned, algorithms }))
@@ -743,7 +727,8 @@ mod tests {
                 .map(|node| ResolvedClusterNode::try_from(node).expect("valid roster node"))
                 .collect(),
             self_advertised: "127.0.0.1".to_owned(),
-            self_ports: TransportPorts::default(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: Arc::default(),
             metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
             )),

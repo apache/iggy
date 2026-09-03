@@ -31,7 +31,7 @@ use tracing::debug;
 use super::HttpState;
 use super::error::AuthError;
 use super::session::HttpSession;
-use crate::auth::verify_pat_credentials_with_expiry;
+use crate::dispatch::session_ops::verify_pat_credentials_with_expiry;
 use crate::http::ClientAddr;
 
 /// Bearer scheme prefix in the `Authorization` header.

@@ -25,8 +25,8 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
-use crate::bootstrap::{ShellBus, ShellShard};
 use crate::responses::resolve_partition_namespace;
+use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
@@ -60,7 +60,7 @@ use std::rc::Rc;
 /// (via the partition-read mesh), so the cooperative rebalance pending-revokes
 /// only those and hands off never-polled/drained partitions synchronously at
 /// join. Every other operation passes through.
-pub(crate) async fn maybe_rewrite_consumer_group_request<B, MJ, S, SB>(
+pub async fn maybe_rewrite_consumer_group_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
 ) -> Result<Message<RoutedRequestHeader>, IggyError>
@@ -205,7 +205,7 @@ where
 /// purge agree, and a re-created group (new id) never inherits a stale offset.
 /// Individual-consumer ops and every other operation pass through untouched.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn maybe_rewrite_consumer_offset_request<B, MJ, S, SB>(
+pub fn maybe_rewrite_consumer_offset_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
 ) -> Result<Message<RoutedRequestHeader>, IggyError>

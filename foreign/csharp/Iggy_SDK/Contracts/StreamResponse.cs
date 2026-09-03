@@ -56,7 +56,7 @@ public sealed class StreamResponse
     /// <summary>
     ///     Number of topics in the stream.
     /// </summary>
-    public required int TopicsCount { get; init; }
+    public required uint TopicsCount { get; init; }
 
     /// <summary>
     ///     List of topics in the stream.

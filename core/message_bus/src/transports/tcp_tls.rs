@@ -573,9 +573,9 @@ async fn run_pump(tls: &mut TlsStream<TcpStream>, ctx: ActorContext) {
                 // preserving the Vec's allocation for the next
                 // iteration; `into_iter()` would move the buffer out.
                 #[allow(clippy::iter_with_drain)]
-                for msg in batch.drain(..) {
-                    let len = msg.buf_len();
-                    let compio::BufResult(result, _) = tls.write_all(msg).await;
+                for fragment in batch.drain(..).flat_map(BusMessage::into_fragments) {
+                    let len = fragment.buf_len();
+                    let compio::BufResult(result, _) = tls.write_all(fragment).await;
                     if let Err(e) = result {
                         warn!(
                             %label,
@@ -742,12 +742,12 @@ mod tests {
     fn drive(
         conn: TcpTlsTransportConn,
     ) -> (
-        Sender<Frozen<MESSAGE_ALIGN>>,
+        Sender<BusMessage>,
         Receiver<Message<GenericHeader>>,
         Shutdown,
         compio::runtime::JoinHandle<()>,
     ) {
-        let (out_tx, out_rx) = bounded::<Frozen<MESSAGE_ALIGN>>(16);
+        let (out_tx, out_rx) = bounded::<BusMessage>(16);
         let (in_tx, in_rx) = bounded::<Message<GenericHeader>>(16);
         let (shutdown, token) = Shutdown::new();
         let ctx = ActorContext {
@@ -780,7 +780,7 @@ mod tests {
         let (client_out, client_in, client_shutdown, client_handle) = drive(client_conn);
 
         client_out
-            .send(header_only(Command::Request))
+            .send(header_only(Command::Request).into())
             .await
             .expect("client send");
         let received = compio::time::timeout(Duration::from_secs(5), server_in.recv())
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(received.header().command, Command::Request);
 
         server_out
-            .send(header_only(Command::Reply))
+            .send(header_only(Command::Reply).into())
             .await
             .expect("server send");
         let reply = compio::time::timeout(Duration::from_secs(5), client_in.recv())
@@ -854,7 +854,7 @@ mod tests {
         let (client_out, _client_in, client_shutdown, client_handle) = drive(client_conn);
 
         client_out
-            .send(padded(Command::Request, total))
+            .send(padded(Command::Request, total).into())
             .await
             .expect("client send 1 MiB");
         let received = compio::time::timeout(Duration::from_secs(10), server_in.recv())
@@ -924,7 +924,7 @@ mod tests {
         let (client_out, _client_in, client_shutdown, client_handle) = drive(client_conn);
 
         client_out
-            .send(header_only(Command::Request))
+            .send(header_only(Command::Request).into())
             .await
             .expect("client send");
         let received = compio::time::timeout(Duration::from_secs(5), server_in.recv())
