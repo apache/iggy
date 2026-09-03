@@ -228,6 +228,13 @@ impl SessionManager {
         match conn.state {
             ConnectionState::Connected => {
                 conn.state = ConnectionState::Authenticated { user_id };
+                // The floor belongs to whoever was told those ops committed,
+                // and this socket now serves someone else: a `Connected`
+                // connection is either fresh or one `bind_session` demoted, so
+                // carrying the old mark over would make the new login wait for
+                // a write it never issued. Never the other direction - the
+                // bind below re-seeds from the register epoch.
+                conn.metadata_watermark = 0;
                 Ok(())
             }
             _ => Err(SessionError::InvalidTransition {
@@ -682,6 +689,38 @@ mod tests {
             mgr.metadata_watermark(conn),
             50,
             "a lower commit must not lower the mark"
+        );
+    }
+
+    /// A socket that logs in again is serving a new caller, so it must not
+    /// inherit the floor of the one before it: the mark is what the PREVIOUS
+    /// login was told committed, and waiting for it would only ever delay the
+    /// new one.
+    #[test]
+    fn given_a_rebound_connection_when_it_logs_in_again_should_start_from_no_floor() {
+        let mut mgr = SessionManager::new();
+        let conn = 1;
+        mgr.ensure_connection(conn, addr(5201), ClientTransportKind::Tcp);
+        mgr.login(conn, 3).unwrap();
+        mgr.bind_session(conn, 100, 42).unwrap();
+        mgr.record_metadata_watermark(conn, 50);
+
+        // `bind_session` for the same client id on ANOTHER connection demotes
+        // this one to `Connected`, which is the state a re-login accepts.
+        mgr.ensure_connection(2, addr(5202), ClientTransportKind::Tcp);
+        mgr.login(2, 3).unwrap();
+        mgr.bind_session(2, 100, 43).unwrap();
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            50,
+            "the demotion alone leaves the mark; the re-login is what clears it"
+        );
+
+        mgr.login(conn, 7).unwrap();
+        assert_eq!(
+            mgr.metadata_watermark(conn),
+            0,
+            "a different user on this socket was promised nothing"
         );
     }
 

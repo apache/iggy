@@ -103,6 +103,7 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use sysinfo::System as SysinfoSystem;
 use system_stats::SystemProbe;
+use tracing::warn;
 
 /// Build the `get_me` reply for the requesting connection. Identity
 /// (`user_id`, transport kind, peer address) comes from the per-shard
@@ -1555,6 +1556,55 @@ pub fn reply_body(reply: &Message<GenericHeader>) -> &[u8] {
         .unwrap_or_default()
 }
 
+/// The header of a SUCCESSFULLY COMMITTED metadata reply, or `None` when the
+/// frame promises the caller nothing.
+///
+/// Three checks, in this order, and both callers need all three:
+///
+/// - an eviction is an `EvictionHeader` whose bytes would cast cleanly as a
+///   `ReplyHeader`, so the command is checked FIRST: casting it would both
+///   swallow the eviction and grade it as a commit;
+/// - a request-level denial names itself in `ReplyHeader.status`, the channel
+///   the SDK peeks before body decode (see [`build_deny_reply`]);
+/// - a nonzero result section is a rejection, transient or committed. Every
+///   reply here is result-framed (`Operation::is_result_framed` covers the
+///   metadata ops; the partition plane grades through
+///   `classify_partition_reply` instead), so a missing section is a malformed
+///   frame, not a bare payload.
+///
+/// The read-your-writes floor and the raw-PAT splice both hang off exactly
+/// this predicate - the floor must not advance on a frame that committed
+/// nothing, and the token must not be grafted onto a rejection body - so they
+/// share one implementation rather than two that have to stay in step.
+///
+/// A frame too short to hold a header, or one whose header will not cast, is
+/// `None` with a warning: it is malformed, and the alternative is a panic on
+/// the reply path.
+#[must_use]
+pub fn committed_reply_header(reply: &Message<GenericHeader>) -> Option<&ReplyHeader> {
+    if reply.header().command != Command::Reply {
+        return None;
+    }
+    let Some(bytes) = reply.as_slice().get(..std::mem::size_of::<ReplyHeader>()) else {
+        warn!(
+            size = reply.header().size,
+            "metadata reply shorter than its own header"
+        );
+        return None;
+    };
+    let header = match bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes) {
+        Ok(header) => header,
+        Err(error) => {
+            warn!(?error, "metadata reply header failed to cast");
+            return None;
+        }
+    };
+    if header.status != 0 || result_code(reply_body(reply)) != Some(0) {
+        return None;
+    }
+    Some(header)
+}
+
 /// The transient variant of a reply-shaped pre-consensus rejection frame
 /// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
 /// for a committed outcome. Either transient means the op did not commit, so
@@ -1595,31 +1645,15 @@ pub fn build_raw_pat_reply(
     let Some(raw) = raw_token else {
         return Ok(committed);
     };
-    // `submit_request_in_process` hands back an `EvictionHeader`-backed message
-    // on the evict outcome (e.g. a `CreatePersonalAccessToken` whose session
-    // was evicted between bind and request). Its byte pattern is a valid
-    // `ReplyHeader`, so the checked cast below would silently pass and we would
-    // both swallow the eviction and ship a raw token whose hash never
-    // committed. Only rewrite a genuine committed `Reply`; pass anything else
-    // (the eviction) through untouched so the client learns its session died.
-    if committed.header().command != Command::Reply {
+    // Only a genuine committed success gets the secret spliced in. An eviction
+    // frame (a `CreatePersonalAccessToken` whose session died between bind and
+    // request), a request-level denial, and a rejection result section all pass
+    // through untouched, so the client decodes the typed outcome - or, for a
+    // transient, replays - instead of having a raw token grafted onto a
+    // rejection body whose hash never committed.
+    let Some(commit) = committed_reply_header(&committed).map(|header| header.commit) else {
         return Ok(committed);
-    }
-    let header_len = std::mem::size_of::<ReplyHeader>();
-    let committed_header =
-        bytemuck::checked::try_from_bytes::<ReplyHeader>(&committed.as_slice()[..header_len])
-            .map_err(|_| IggyError::InvalidFormat)?;
-    let commit = committed_header.commit;
-    // A `Reply` whose result section is nonzero is not a successful commit:
-    // a committed business rejection (duplicate name, invalid expiry) or a
-    // `TransientNotCommitted` retry frame, both with no payload and no token
-    // to ship. Splice the secret only into a genuine success; pass everything
-    // else through untouched so the client decodes the typed result (and, for
-    // a transient, replays) instead of having a raw token grafted onto a
-    // rejection body. Mirrors the HTTP handler's `committed_payload` gate.
-    if result_code(reply_body(&committed)) != Some(0) {
-        return Ok(committed);
-    }
+    };
     let token = WireName::new(raw.as_str()).map_err(|_| IggyError::InvalidFormat)?;
     let response = RawPersonalAccessTokenResponse { token };
     let reply = build_result_framed_reply(

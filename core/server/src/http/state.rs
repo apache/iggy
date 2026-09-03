@@ -57,6 +57,25 @@ use crate::shell::ServerShard;
 /// follower's possibly-stale one.
 pub(in crate::http) const VIEW_HEADER: HeaderName = HeaderName::from_static("iggy-view");
 
+/// Response header carrying the SERVING node's applied metadata op, stamped by
+/// [`insert_view_header`] on the same responses as [`VIEW_HEADER`].
+///
+/// Load-bearing, not diagnostic: a follower that RELAYS a control-plane write
+/// to the primary never runs the local write path, so nothing would record
+/// what that caller was told committed, and its next unqualified GET - which
+/// stays local - could answer from before its own write. The relay reads this
+/// header off the primary's response and records it as the caller's floor (see
+/// `http::forward`). Filled if absent, so a relayed response keeps the serving
+/// node's number rather than the relaying follower's lower one.
+///
+/// The op is a floor, not the caller's exact commit: the primary applies a
+/// metadata op before it replies, so its applied frontier at reply time is at
+/// or above the op the caller now holds. Above means waiting for a few of
+/// someone else's committed ops too, which is stronger than read-your-writes
+/// and never weaker.
+pub(in crate::http) const APPLIED_OP_HEADER: HeaderName =
+    HeaderName::from_static("iggy-applied-op");
+
 /// Per-user read-your-writes floors: the highest metadata op each user has
 /// been told committed BY THIS NODE.
 ///
@@ -519,6 +538,15 @@ pub(in crate::http) fn insert_view_header(state: &HttpInner, mut response: Respo
             .entry(VIEW_HEADER)
             .or_insert(HeaderValue::from(consensus.view()));
     }
+    // Same fill-if-absent rule, and for the same reason: the relay needs the
+    // op the SERVING node had applied, not this one's (see
+    // [`APPLIED_OP_HEADER`]).
+    response
+        .headers_mut()
+        .entry(APPLIED_OP_HEADER)
+        .or_insert(HeaderValue::from(
+            state.shard.plane.metadata().applied_frontier().get(),
+        ));
     response
 }
 

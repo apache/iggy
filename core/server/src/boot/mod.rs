@@ -56,6 +56,7 @@ use crate::boot::threads::{
 };
 use crate::boot::topology::{RosterCells, resolve_tcp_topology};
 use crate::dispatch::partition::make_partition_read_handler;
+use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::dispatch::submit::make_metadata_submit_handler;
 use crate::dispatch::{
@@ -307,8 +308,10 @@ pub fn bootstrap(
     // Shared applied-metadata frontier: shard 0's commit path advances it and
     // wakes the reads parked on it, every shard's read gate reads it. Minted
     // here, before any shard exists, because a shard holding a private cell
-    // would gate reads on a number nothing moves.
-    let metadata_applied_frontier = Arc::<AppliedFrontier>::default();
+    // would gate reads on a number nothing moves - and it carries the held
+    // reads' budget, which is sized from the configured commit-broadcast
+    // cadence and which a peer shard has no other way to learn.
+    let metadata_applied_frontier = Arc::new(AppliedFrontier::new(read_frontier_budget(&config)));
     // Every shard's metric handles, minted before the threads spawn: each
     // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
     // the whole set (counters are Arc-backed, so cross-thread reads see the

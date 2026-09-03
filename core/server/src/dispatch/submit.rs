@@ -29,13 +29,10 @@ use crate::dispatch::session_ops::{
     submit_register_local_or_forward,
 };
 use crate::dispatch::upgrade_shard_handle;
-use crate::responses::{reply_body, transient_code};
+use crate::responses::committed_reply_header;
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use consensus::MetadataHandle;
-use iggy_binary_protocol::consensus::result_code;
-use iggy_binary_protocol::{
-    Command, GenericHeader, PrepareHeader, ReplyHeader, RoutedRequestHeader,
-};
+use iggy_binary_protocol::{GenericHeader, PrepareHeader, RoutedRequestHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use server_common::Message;
@@ -218,39 +215,14 @@ where
 ///   grading both as no-promise is the only reading that cannot make a read
 ///   wait for an op that never committed.
 ///
-/// Every reply on this path is result-framed (`Operation::is_result_framed`
-/// covers every metadata op; the partition plane grades through
-/// `classify_partition_reply` instead), so a missing result section is a
-/// malformed frame, not a bare payload.
+/// The grading itself is [`committed_reply_header`], shared with the raw-PAT
+/// splice, which must admit exactly the same frames.
 ///
 /// Shared with the HTTP write path, which grades the same frames off the same
 /// submit entry point ([`submit_client_request_on_owner`]); one classifier is
 /// what keeps the two planes' watermarks meaning the same thing.
 pub fn committed_reply_commit(reply: &Message<GenericHeader>) -> Option<u64> {
-    if reply.header().command != Command::Reply || transient_code(reply).is_some() {
-        return None;
-    }
-    let Some(bytes) = reply.as_slice().get(..size_of::<ReplyHeader>()) else {
-        warn!(
-            size = reply.header().size,
-            "metadata reply shorter than its own header; not advancing the read watermark"
-        );
-        return None;
-    };
-    let header = match bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes) {
-        Ok(header) => header,
-        Err(error) => {
-            warn!(
-                ?error,
-                "metadata reply header failed to cast; not advancing the read watermark"
-            );
-            return None;
-        }
-    };
-    if header.status != 0 {
-        return None;
-    }
-    (result_code(reply_body(reply)) == Some(0)).then_some(header.commit)
+    committed_reply_header(reply).map(|header| header.commit)
 }
 
 #[cfg(test)]

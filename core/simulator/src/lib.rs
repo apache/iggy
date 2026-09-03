@@ -5145,23 +5145,33 @@ mod metadata_read_frontier_tests {
     /// for the whole run and is the node the client re-homes onto.
     const LAGGING: u8 = 1;
 
+    /// The gate's own budget, in `sim.step()`s: one step advances the virtual
+    /// clock by one consensus tick, so the tick count of the budget IS the step
+    /// count a held read survives.
+    ///
+    /// The simulator's replicas carry the frontier's built-in default, since
+    /// they are built without a `[cluster]` config to size it from.
+    #[allow(clippy::cast_possible_truncation)]
+    const BUDGET_STEPS: u32 = (metadata::AppliedFrontier::DEFAULT_READ_BUDGET.as_millis()
+        / shard::CONSENSUS_TICK_INTERVAL.as_millis()) as u32;
+
     /// Steps the read is given while the backup is still cut off. A server that
     /// answers a metadata read from an unconverged state answers within a
     /// couple of these; the gate must hold the read past all of them.
     ///
-    /// Well under the gate's own poll budget, so expiry cannot masquerade as a
-    /// held read, and what is left of that budget is [`CONVERGE_STEPS`].
-    const STALE_WINDOW_STEPS: u32 = 50;
+    /// A fifth of the budget, so expiry cannot masquerade as a held read and
+    /// the convergence phase below still has most of the budget left.
+    const STALE_WINDOW_STEPS: u32 = BUDGET_STEPS / 5;
 
-    /// Steps left for repair to reach the backup and the held read to answer
-    /// once replication is restored.
+    /// Steps the convergence phase spends waiting for the held read.
     ///
-    /// Derived, not chosen: one `sim.step()` advances the virtual clock by one
-    /// consensus tick, the unit the gate's budget is denominated in, so phase 1
-    /// spends `STALE_WINDOW_STEPS` of that budget and what remains is the whole
-    /// window the read can still be answered in. A larger number would just
-    /// spin past an expiry the status assertion below already caught.
-    const CONVERGE_STEPS: u32 = server::METADATA_READ_FRONTIER_BUDGET_TICKS - STALE_WINDOW_STEPS;
+    /// Deliberately PAST the budget rather than exactly up to it: repair that
+    /// lands one tick late would otherwise flip this test onto the expiry path
+    /// and fail on the status assertion, which reads as "the gate is broken"
+    /// when it means "convergence was slow". Overshooting instead lets the
+    /// expired read be reported as what it is. Expiry has its own case, which
+    /// never restores replication at all.
+    const CONVERGE_STEPS: u32 = BUDGET_STEPS - STALE_WINDOW_STEPS + BUDGET_STEPS / 2;
 
     /// The frames that would let the backup learn the committed writes. Journal
     /// repair and `StartView` adoption are cut with the same knife as live
@@ -5174,10 +5184,19 @@ mod metadata_read_frontier_tests {
         Command::StartView,
     ];
 
-    /// A stream deleted before the client re-homed must not come back on the
-    /// backup that has not applied the delete yet.
-    #[test]
-    fn given_backup_behind_the_client_epoch_when_reading_a_deleted_stream_should_not_serve_it() {
+    /// Both cases below need the same shape: a stream created everywhere, then
+    /// deleted on a quorum that excludes `LAGGING` while the client re-homes
+    /// onto it, so the client holds a committed epoch above a delete that
+    /// backup has not applied. Returns the sim, the re-homed client, and the
+    /// op the delete committed at.
+    ///
+    /// Replication into `LAGGING` is left CUT: each case decides whether to
+    /// restore it.
+    fn backup_behind_a_deleted_stream(
+        seed: u64,
+        stream_name: &str,
+        client_id: u128,
+    ) -> (Simulator, SimClient, u64) {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
@@ -5185,12 +5204,10 @@ mod metadata_read_frontier_tests {
         });
 
         let replica_count: u8 = 3;
-        let client_id: u128 = 1;
-        let stream_name = "read-your-writes";
         let network_opts = packet::PacketSimulatorOptions {
             node_count: replica_count,
             client_count: 1,
-            seed: 0x1A7E_0F31,
+            seed,
             ..packet::PacketSimulatorOptions::default()
         };
         let mut sim = Simulator::with_shards_shell(
@@ -5204,7 +5221,7 @@ mod metadata_read_frontier_tests {
         sim.shell_login(&client);
 
         // The create lands on every replica: the backup has to HOLD the stream
-        // for the read below to be able to serve a stale one.
+        // for the read to be able to serve a stale one.
         let created = commit_write(&mut sim, client_id, 0, client.create_stream(stream_name));
         step_until_applied(&mut sim, LAGGING, created);
 
@@ -5217,7 +5234,7 @@ mod metadata_read_frontier_tests {
         let deleted = commit_write(&mut sim, client_id, 0, client.delete_stream(stream_name));
         assert!(
             deleted > created,
-            "the delete must commit above the create, else the read below cannot \
+            "the delete must commit above the create, else the read cannot \
              distinguish the two states"
         );
 
@@ -5234,15 +5251,26 @@ mod metadata_read_frontier_tests {
         assert!(
             (created..deleted).contains(&lagging_commit),
             "the backup applied up to op {lagging_commit}, outside the window \
-             [{created}, {deleted}) this test needs: it must hold the create and \
+             [{created}, {deleted}) these tests need: it must hold the create and \
              miss the delete"
         );
         assert_eq!(
             read_stream_name_on(&sim, LAGGING, stream_name),
             Some(stream_name.to_string()),
             "the backup no longer holds the deleted stream, so a read cannot \
-             serve a stale one and the assertions below prove nothing"
+             serve a stale one and the assertions prove nothing"
         );
+        (sim, client, deleted)
+    }
+
+    /// A stream deleted before the client re-homed must not come back on the
+    /// backup that has not applied the delete yet.
+    #[test]
+    fn given_backup_behind_the_client_epoch_when_reading_a_deleted_stream_should_not_serve_it() {
+        let stream_name = "read-your-writes";
+        let client_id: u128 = 1;
+        let (mut sim, client, deleted) =
+            backup_behind_a_deleted_stream(0x1A7E_0F31, stream_name, client_id);
 
         let read = client.get_stream(stream_name);
         let request_id = read.header().request;
@@ -5275,7 +5303,7 @@ mod metadata_read_frontier_tests {
         // Phase 2: restore replication. The held read must answer from the
         // converged state, which no longer holds the stream.
         set_replication(&mut sim, LAGGING, true);
-        for _ in 0..CONVERGE_STEPS {
+        for step in 0..CONVERGE_STEPS {
             if let Some(reply) = sim
                 .step()
                 .into_iter()
@@ -5284,7 +5312,10 @@ mod metadata_read_frontier_tests {
                 assert_eq!(
                     reply.header().status,
                     0,
-                    "the read failed instead of answering once the backup converged"
+                    "the read was refused rather than answered {step} steps into a \
+                     restored link: the gate expired at its {BUDGET_STEPS}-step budget, \
+                     of which phase 1 spent {STALE_WINDOW_STEPS}, so repair was slower \
+                     than the budget rather than the gate being wrong"
                 );
                 assert_eq!(
                     read_stream_name(&reply),
@@ -5297,6 +5328,50 @@ mod metadata_read_frontier_tests {
         panic!(
             "no answer to the held metadata read within {CONVERGE_STEPS} steps of \
              restored replication; backup applied frontier {}, client epoch {deleted}",
+            metadata_commit(&sim, usize::from(LAGGING)),
+        );
+    }
+
+    /// The other half of the bound: a backup that NEVER catches up must refuse
+    /// the held read rather than serve the state the client already saw
+    /// replaced, and it must do so inside the budget rather than hanging.
+    ///
+    /// Same setup as the test above with replication left cut, so the only
+    /// possible outcomes are the refusal this asserts or a stale answer.
+    #[test]
+    fn given_a_backup_that_never_converges_when_reading_should_refuse_inside_the_budget() {
+        let stream_name = "read-your-writes-expiry";
+        let client_id: u128 = 1;
+        let (mut sim, client, deleted) =
+            backup_behind_a_deleted_stream(0x1A7E_0F32, stream_name, client_id);
+
+        let read = client.get_stream(stream_name);
+        let request_id = read.header().request;
+        sim.submit_request(client_id, LAGGING, read.into_generic());
+
+        // Overshoot the budget: the refusal must land inside it, and a read
+        // still unanswered after it is a hang, which the panic below names.
+        for _ in 0..(BUDGET_STEPS + BUDGET_STEPS / 2) {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                assert_ne!(
+                    reply.header().status,
+                    0,
+                    "the cut-off backup answered a read below the client's committed \
+                     epoch ({deleted}) instead of refusing it: stream={:?}",
+                    read_stream_name(&reply),
+                );
+                assert_eq!(read_stream_name(&reply), None, "a refusal carries no body");
+                return;
+            }
+        }
+        panic!(
+            "the held read neither answered nor expired within {} steps; backup applied \
+             frontier {}, client epoch {deleted}",
+            BUDGET_STEPS + BUDGET_STEPS / 2,
             metadata_commit(&sim, usize::from(LAGGING)),
         );
     }

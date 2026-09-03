@@ -21,8 +21,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 /// Highest metadata op whose apply has been PUBLISHED on this node, shared by
 /// every shard, plus the wakers of the reads waiting for it to reach them.
@@ -42,11 +43,29 @@ use std::task::{Context, Poll, Waker};
 /// A `std::sync::Mutex` guards the waiter list, not a `tokio` one: it is taken
 /// and dropped inside [`Self::advance`] and inside one `poll`, never across an
 /// `.await`, and it has to be `Sync` because the writer is shard 0's thread
-/// while the sleepers are on every shard.
-#[derive(Debug, Default)]
+/// while the sleepers are on every shard. `parked` keeps [`Self::advance`] off
+/// that lock entirely in the normal case, where no read is waiting.
+///
+/// Carries the read gates' budget too: it is config-derived (see the server's
+/// `dispatch::reads`), and this cell is the one object minted before the shards
+/// spawn that all of them can read, including peer shards with no consensus.
+#[derive(Debug)]
 pub struct AppliedFrontier {
     op: AtomicU64,
+    /// Waits currently registered, so an advancing commit can skip the lock.
+    /// `Release` on the way in and `Acquire` on the way out, NOT relaxed: the
+    /// count is what tells [`Self::advance`] a waiter exists at all, so if it
+    /// reads zero it must be guaranteed that no registration it has to wake
+    /// happened before it.
+    parked: AtomicUsize,
     waiters: Mutex<Waiters>,
+    read_budget: Duration,
+}
+
+impl Default for AppliedFrontier {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_READ_BUDGET)
+    }
 }
 
 /// Registered waits, keyed by an id so a re-poll can refresh its own waker and
@@ -65,6 +84,36 @@ struct Waiter {
 }
 
 impl AppliedFrontier {
+    /// The budget a held read gets when nothing sizes it from config: six
+    /// commit broadcasts at the built-in `COMMIT_MESSAGE_TICKS` interval.
+    ///
+    /// The server always overrides this from `[cluster]
+    /// commit_broadcast_interval`, and a test asserts the two agree at the
+    /// config default; this is what the simulator and unit fixtures get.
+    pub const DEFAULT_READ_BUDGET: Duration = Duration::from_millis(3_000);
+
+    /// A frontier at zero whose held reads get `read_budget` before they fail
+    /// retryable.
+    #[must_use]
+    pub const fn new(read_budget: Duration) -> Self {
+        Self {
+            op: AtomicU64::new(0),
+            parked: AtomicUsize::new(0),
+            waiters: Mutex::new(Waiters {
+                next_id: 0,
+                entries: Vec::new(),
+            }),
+            read_budget,
+        }
+    }
+
+    /// How long a read may be held before it must fail retryable. Read by both
+    /// planes' gates, which arm their own timers with it.
+    #[must_use]
+    pub const fn read_budget(&self) -> Duration {
+        self.read_budget
+    }
+
     /// Highest metadata op this NODE has applied and published.
     #[must_use]
     pub fn get(&self) -> u64 {
@@ -81,14 +130,30 @@ impl AppliedFrontier {
         if self.op.fetch_max(op, Ordering::Release) >= op {
             return;
         }
-        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
-        waiters.entries.retain(|waiter| {
-            if waiter.target > op {
-                return true;
-            }
-            waiter.waker.wake_by_ref();
-            false
-        });
+        // The normal case is a commit with nobody waiting on it, and this runs
+        // on the commit path: skip the lock rather than contend it per op.
+        if self.parked.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let woken = {
+            let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut woken = Vec::new();
+            waiters.entries.retain(|waiter| {
+                if waiter.target > op {
+                    return true;
+                }
+                woken.push(waiter.waker.clone());
+                false
+            });
+            self.parked.store(waiters.entries.len(), Ordering::Release);
+            woken
+        };
+        // Woken OUTSIDE the guard: each waker's task deregisters through this
+        // same mutex, so waking under it would hand every reader a lock the
+        // commit path is still holding.
+        for waker in woken {
+            waker.wake();
+        }
     }
 
     /// A future that completes once the frontier covers `target`.
@@ -136,17 +201,16 @@ impl AppliedFrontier {
             });
             id
         };
+        self.parked.store(waiters.entries.len(), Ordering::Release);
         drop(waiters);
         Registered::Waiting(id)
     }
 
     /// Drop the registration `id`, if it is still listed.
     fn deregister(&self, id: u64) {
-        self.waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entries
-            .retain(|waiter| waiter.id != id);
+        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        waiters.entries.retain(|waiter| waiter.id != id);
+        self.parked.store(waiters.entries.len(), Ordering::Release);
     }
 
     /// Waits currently parked. For tests: a wait that outlives its future is a
@@ -269,6 +333,30 @@ mod tests {
         assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
     }
 
+    /// The commit path must not wake a reader while holding the lock that
+    /// reader needs to deregister, and it must not take that lock at all when
+    /// nothing is parked - a commit with no waiting read is the normal case.
+    #[test]
+    fn given_an_advance_when_waking_should_not_hold_the_waiter_lock() {
+        let frontier = Arc::new(AppliedFrontier::default());
+        frontier.advance(4);
+        assert_eq!(frontier.waiting(), 0, "an advance with nobody parked");
+
+        // This waker re-enters the frontier's own lock, which is what a woken
+        // reader does when it deregisters. Waking under the guard therefore
+        // deadlocks this test outright rather than merely contending.
+        let waker = futures::task::waker(Arc::new(ReentrantWaker {
+            frontier: Arc::clone(&frontier),
+        }));
+        let mut context = Context::from_waker(&waker);
+        let mut wait = pin!(frontier.reached(9));
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Pending);
+
+        frontier.advance(9);
+        assert_eq!(frontier.waiting(), 0, "the woken wait is off the list");
+        assert_eq!(wait.as_mut().poll(&mut context), Poll::Ready(()));
+    }
+
     /// A re-poll must not stack a second registration, and a dropped wait must
     /// take its waker with it: an HTTP read is cancelled whenever its client
     /// disconnects mid-wait, and a leaked waker would be a leak per disconnect.
@@ -284,6 +372,18 @@ mod tests {
             assert_eq!(frontier.waiting(), 1, "a re-poll refreshes, never stacks");
         }
         assert_eq!(frontier.waiting(), 0, "a dropped wait deregisters");
+    }
+
+    /// Stands in for a woken reader: waking takes the frontier's waiter lock,
+    /// exactly as the woken task's `deregister` does.
+    struct ReentrantWaker {
+        frontier: Arc<AppliedFrontier>,
+    }
+
+    impl futures::task::ArcWake for ReentrantWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            let _parked = arc_self.frontier.waiting();
+        }
     }
 
     struct FlagWaker {

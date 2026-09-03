@@ -22,8 +22,7 @@
 //! routes ground their scopes through.
 
 use crate::dispatch::reads::{
-    FrontierUnreached, FrontierWait, READ_FRONTIER_BUDGET, hold_for_frontier,
-    read_needs_metadata_frontier,
+    FrontierUnreached, FrontierWait, hold_for_frontier, read_needs_metadata_frontier,
 };
 use crate::shell::ServerShard;
 use bytes::Bytes;
@@ -44,21 +43,19 @@ use crate::responses::{
     NonReplicatedResponse, build_non_replicated_response, resolve_stream_id, resolve_topic_id,
 };
 
-/// The two cross-cutting gates every authenticated read enforces before it
-/// touches state. Factored out of [`read_local`] so the cross-shard client
-/// reads (`get_clients` / `get_client`) - which serve from the shard session
-/// managers, not the local STM, and so cannot use [`read_local`] - still pass
-/// the identical gate. Keeping it in one place is what guarantees no read route
-/// can silently skip authz or answer a linearizable request on a follower.
-///
-/// Per-op RBAC: run the route's `rule` against the caller's committed
-/// permissions via the live permissioner. A denial (always `Unauthorized`)
-/// renders 403 through the legacy `IggyError -> status` map; root holds every
-/// grant, so its reads pass without a user-id short-circuit. A linearizable
-/// read must come from the primary; on a follower it redirects (307) to the
-/// primary's HTTP address when resolvable, else fails closed to a 503 (see
+/// The per-op RBAC + consistency check itself, without the waits: run the
+/// route's `rule` against the caller's committed permissions via the live
+/// permissioner. A denial (always `Unauthorized`) renders 403 through the
+/// legacy `IggyError -> status` map; root holds every grant, so its reads pass
+/// without a user-id short-circuit. A linearizable read must come from the
+/// primary; on a follower it redirects (307) to the primary's HTTP address when
+/// resolvable, else fails closed to a 503 (see
 /// [`HttpInner::not_primary_read_error`]).
-pub(in crate::http) fn authorize_read(
+///
+/// Every read route reaches this through [`gate_local_read`], which is what
+/// pairs it with the two waits a local read must serve behind. Callable on its
+/// own only for a read that is NOT served from local state.
+fn authorize_read(
     state: &HttpInner,
     identity: &Identity,
     consistency: Consistency,
@@ -99,24 +96,7 @@ pub(in crate::http) async fn read_local(
     body: &[u8],
     rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
 ) -> Result<Bytes, ReadError> {
-    await_recovery_barrier(&state.shard).await?;
-    // Ahead of the frontier wait on purpose. `authorize_read` renders the
-    // linearizable follower redirect, which must answer 307 immediately -
-    // parking first would delay a request this node is not going to serve at
-    // all - and an authorization denial is terminal, so holding the connection
-    // for it buys nothing.
-    authorize_read(state, identity, consistency, &rule)?;
-    if read_needs_metadata_frontier(code)
-        && await_metadata_read_frontier(state, identity).await? == FrontierWait::CaughtUp
-    {
-        // Every scoped route's rule resolves its entity when the rule RUNS,
-        // and a park is precisely the case where the state machine moved under
-        // it: an entity that did not exist on the first pass resolved to
-        // nothing, where a scope miss is a pass-through, and would be served
-        // with no permissioner call at all. Only the parked outcome pays for
-        // the second pass.
-        authorize_read(state, identity, consistency, &rule)?;
-    }
+    gate_local_read(state, identity, consistency, code, rule).await?;
     let clients_count = if code == GET_STATS_CODE {
         u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
             .unwrap_or(u32::MAX)
@@ -137,6 +117,48 @@ pub(in crate::http) async fn read_local(
         NonReplicatedResponse::Empty => Err(ReadError::NotFound),
         NonReplicatedResponse::Bytes(bytes) => Ok(bytes),
     }
+}
+
+/// Every gate a read served from THIS node's state has to pass, in the one
+/// order that is safe.
+///
+/// The chokepoint for the whole REST read surface: [`read_local`] runs it for
+/// the metadata-STM entity reads, and the routes that cannot use `read_local`
+/// call it directly - the cross-shard client reads, which serve from each
+/// shard's session manager; the snapshot route, which shells out; and the
+/// partition reads, which answer from a partition group's log. Skipping it is
+/// how a route silently loses authorization, the post-restart barrier, or the
+/// read-your-writes hold; which of the two waits actually applies is
+/// [`read_needs_metadata_frontier`]'s decision, not the caller's.
+///
+/// Order:
+/// 1. the recovery barrier, so nothing is served off a WAL suffix that is
+///    about to re-commit;
+/// 2. authorization, because it is terminal: the linearizable follower
+///    redirect must answer 307 immediately rather than after a park, and
+///    holding a connection to then answer 403 buys nothing;
+/// 3. the read-your-writes hold;
+/// 4. authorization AGAIN if that hold actually parked. Every scoped route's
+///    rule resolves its entity when the rule RUNS, and a park is precisely
+///    the case where the state machine moved under it: an entity that did not
+///    exist on the first pass resolved to nothing, where a scope miss is a
+///    pass-through, and would be served with no permissioner call at all. Only
+///    the parked outcome pays for the second pass.
+pub(in crate::http) async fn gate_local_read(
+    state: &HttpInner,
+    identity: &Identity,
+    consistency: Consistency,
+    code: u32,
+    rule: impl Fn(&Permissioner, u32) -> Result<(), IggyError>,
+) -> Result<(), ReadError> {
+    await_recovery_barrier(&state.shard).await?;
+    authorize_read(state, identity, consistency, &rule)?;
+    if read_needs_metadata_frontier(code)
+        && await_metadata_read_frontier(state, identity).await? == FrontierWait::CaughtUp
+    {
+        authorize_read(state, identity, consistency, &rule)?;
+    }
+    Ok(())
 }
 
 /// Hold a local metadata read until this node has applied everything the
@@ -176,13 +198,27 @@ async fn await_metadata_read_frontier(
     state: &HttpInner,
     identity: &Identity,
 ) -> Result<FrontierWait, ReadError> {
+    let frontier = state.shard.plane.metadata().applied_frontier();
+    let budget = frontier.read_budget();
     hold_for_frontier(
-        state.shard.plane.metadata().applied_frontier(),
+        frontier,
         state.metadata_watermark(identity.user_id),
-        compio::time::sleep(READ_FRONTIER_BUDGET),
+        compio::time::sleep(budget),
     )
     .await
-    .map_err(|FrontierUnreached| ReadError::MetadataFrontierUnreached)
+    .map_err(|FrontierUnreached| {
+        state
+            .shard
+            .metrics()
+            .record_metadata_read_frontier_refusal();
+        tracing::debug!(
+            frontier = frontier.get(),
+            watermark = state.metadata_watermark(identity.user_id),
+            ?budget,
+            "metadata read frontier unreached inside the budget; failing read with retryable 503"
+        );
+        ReadError::MetadataFrontierUnreached
+    })
 }
 
 /// One recovery-barrier check's outcome, factored out of [`await_recovery_barrier`]

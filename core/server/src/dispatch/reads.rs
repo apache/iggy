@@ -38,8 +38,8 @@ use crate::shell::{ShellBus, ShellShard};
 use crate::snapshot;
 use crate::wire::request_body;
 use bytes::Bytes;
-use configs::server::ServerSystemConfig;
-use consensus::{MetadataHandle, TICK_INTERVAL, TimeoutManager};
+use configs::server::{ServerConfig, ServerSystemConfig};
+use consensus::MetadataHandle;
 use futures::future::{Either, select};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
@@ -128,50 +128,69 @@ async fn handle_get_me<B, MJ, S, SB>(
     .await;
 }
 
-/// Budget one held read is given before it fails retryable, in consensus
-/// ticks: six commit-broadcast intervals.
+/// Commit broadcasts a held read waits out before it fails retryable.
 ///
 /// Sized for a node merely behind on its commit walk, NOT for a view change --
 /// detecting one costs `heartbeat_timeout` and escalating it another
 /// `view_change_status_timeout`, and `recovery_barrier_deadline` budgets at
 /// least 15s for the same event, so a read that waits out an election is a read
-/// the caller should retry elsewhere. Far below the SDK's 30s request budget,
-/// inside which it replays the same id on the same connection.
-///
-/// In ticks rather than a bare duration because that is the unit the thing
-/// being waited for moves in, and the unit the simulator steps in.
-#[allow(clippy::cast_possible_truncation)]
-pub const READ_FRONTIER_BUDGET_TICKS: u32 = 6 * TimeoutManager::COMMIT_MESSAGE_TICKS as u32;
+/// the caller should retry elsewhere.
+const READ_FRONTIER_BROADCASTS: u32 = 6;
 
-/// The same budget as a duration, for the timers the two planes measure it
-/// with.
-pub const READ_FRONTIER_BUDGET: Duration =
-    match TICK_INTERVAL.checked_mul(READ_FRONTIER_BUDGET_TICKS) {
-        Some(budget) => budget,
-        None => panic!("the read frontier budget must fit a Duration"),
-    };
+/// How long a held metadata read may wait for this node's applied frontier,
+/// sized from `[cluster] commit_broadcast_interval`: the thing the read is
+/// short of is a commit broadcast, so the budget has to move with the
+/// configured cadence rather than with the compile-time default that
+/// `TimeoutManager::COMMIT_MESSAGE_TICKS` names (the runtime overrides it
+/// through `set_commit_message_ticks`).
+///
+/// Minted once per process into the shared [`AppliedFrontier`], because a peer
+/// shard's read gate has neither consensus nor the cluster config.
+#[must_use]
+pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
+    config
+        .cluster
+        .commit_broadcast_interval
+        .get_duration()
+        // No config ceiling on the interval, so plain `*` can overflow.
+        .saturating_mul(READ_FRONTIER_BROADCASTS)
+}
 
 /// Whether `code`'s answer comes from the metadata state machine, and so must
 /// not be served below the caller's watermark.
 ///
-/// The two named exclusions only look like metadata reads: `DescribeOptions`
-/// decodes a static catalog, and `GetClusterMetadata` answers from the
-/// configured roster plus the consensus view. Holding either buys no
-/// consistency, and the roster read is on the SDK's leader-discovery path,
-/// where the wait would be real. A code this build does not know is excluded
-/// too: its only outcome is `InvalidCommand`, and parking a terminal error for
-/// the whole budget serves nobody.
+/// The decision for both planes, consulted by every read path that CAN hold:
+/// the binary spine's gated arms run it through [`authorize_and_hold_read`] and
+/// the REST spine through `http::reads::gate_local_read`. The arms that never
+/// consult it are exactly the codes named below, so this is the single list of
+/// what is not gated:
+///
+/// - `Ping` is the pre-auth liveness probe and reads nothing.
+/// - `DescribeOptions` decodes a static catalog.
+/// - `GetClusterMetadata` answers from the configured roster plus the
+///   consensus view, and sits on the SDK's leader-discovery path, where the
+///   wait would be real.
+/// - `PollMessages` and `GetConsumerOffset` are partition-plane reads: their
+///   answer comes from a partition group's own log, not the metadata STM, and
+///   holding them would put metadata lag on the data path.
+/// - `GetSnapshotFile` shells out to system tools off-thread; there is no
+///   metadata answer to hold.
+/// - A code this build does not know: its only outcome is `InvalidCommand`,
+///   and parking a terminal error for the whole budget serves nobody.
 ///
 /// A deny-list otherwise, so a read code added later is gated by default: the
-/// failure mode of forgetting to add one is a wait, while forgetting to add it
-/// to an allow-list is a silent stale read.
-///
-/// Shared with the HTTP read path, which gates the identical set of command
-/// codes through `build_non_replicated_response`: two lists would drift, and a
-/// code dropped from one plane's list is a silent stale read on that plane.
+/// failure mode of forgetting to name one here is a wait, while forgetting to
+/// add it to an allow-list is a silent stale read.
 pub const fn read_needs_metadata_frontier(code: u32) -> bool {
-    !matches!(code, DESCRIBE_OPTIONS_CODE | GET_CLUSTER_METADATA_CODE)
-        && lookup_command(code).is_some()
+    !matches!(
+        code,
+        PING_CODE
+            | DESCRIBE_OPTIONS_CODE
+            | GET_CLUSTER_METADATA_CODE
+            | POLL_MESSAGES_CODE
+            | GET_CONSUMER_OFFSET_CODE
+            | GET_SNAPSHOT_FILE_CODE
+    ) && lookup_command(code).is_some()
 }
 
 /// Whether a frontier wait actually parked.
@@ -221,15 +240,10 @@ pub async fn hold_for_frontier(
     let budget = pin!(budget);
     match select(reached, budget).await {
         Either::Left(((), _)) => Ok(FrontierWait::CaughtUp),
-        Either::Right(((), _)) => {
-            warn!(
-                frontier = frontier.get(),
-                watermark,
-                budget = ?READ_FRONTIER_BUDGET,
-                "metadata read frontier unreached inside the budget; failing the read retryable"
-            );
-            Err(FrontierUnreached)
-        }
+        // Reported by the caller, not here: a durably lagging node refuses
+        // every held read of every client for as long as it lags, so this is
+        // a counter plus a `debug!`, never a line per refusal.
+        Either::Right(((), _)) => Err(FrontierUnreached),
     }
 }
 
@@ -248,9 +262,12 @@ pub async fn hold_for_frontier(
 /// uncontended read shared-nothing. A park costs this connection more than the
 /// read itself: the per-connection drain loop serves one frame at a time, so
 /// the client's queued `SendMessages`, `PollMessages` and `PING` wait behind
-/// the held read. No OTHER connection waits, and the budget above is what
-/// bounds it. Expiry fails loud and retryable rather than serving state the
-/// client already saw replaced.
+/// the held read, and a client that keeps pipelining through the hold is
+/// answered `TransientNotAccepted` once its queue hits
+/// [`MAX_QUEUED_CLIENT_REQUESTS`](crate::dispatch::MAX_QUEUED_CLIENT_REQUESTS)
+/// rather than growing it unbounded. No OTHER connection waits, and the budget
+/// bounds the hold itself. Expiry fails loud and retryable rather than serving
+/// state the client already saw replaced.
 ///
 /// The wait ends on the commit that closes the gap, not on a poll: the budget
 /// timer is the only timer armed, so a read that resumes costs one wake.
@@ -266,17 +283,24 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    hold_for_frontier(
-        shard.plane.metadata().applied_frontier(),
-        watermark,
-        shard.bus.sleep(READ_FRONTIER_BUDGET),
-    )
-    .await
-    // `TransientNotAccepted`, not `NotCommitted`: a read never entered a
-    // pipeline, so it is safe to re-issue anywhere, and it is the code that
-    // drives the SDK's roster walk rather than a replay against the same
-    // durably lagging replica.
-    .map_err(|FrontierUnreached| IggyError::TransientNotAccepted)
+    let frontier = shard.plane.metadata().applied_frontier();
+    let budget = frontier.read_budget();
+    hold_for_frontier(frontier, watermark, shard.bus.sleep(budget))
+        .await
+        // `TransientNotAccepted`, not `NotCommitted`: a read never entered a
+        // pipeline, so it is safe to re-issue anywhere, and it is the code that
+        // drives the SDK's roster walk rather than a replay against the same
+        // durably lagging replica.
+        .map_err(|FrontierUnreached| {
+            shard.metrics().record_metadata_read_frontier_refusal();
+            debug!(
+                frontier = frontier.get(),
+                watermark,
+                ?budget,
+                "metadata read frontier unreached inside the budget; failing the read retryable"
+            );
+            IggyError::TransientNotAccepted
+        })
 }
 
 /// Authorize a metadata read, then hold it for this node's applied frontier.
@@ -715,14 +739,46 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
 
 #[cfg(test)]
 mod tests {
-    use super::{FrontierUnreached, FrontierWait, hold_for_frontier, read_needs_metadata_frontier};
+    use super::{
+        FrontierUnreached, FrontierWait, hold_for_frontier, read_frontier_budget,
+        read_needs_metadata_frontier,
+    };
+    use configs::server::ServerConfig;
     use iggy_binary_protocol::codes::{
-        DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_ME_CODE, GET_STREAM_CODE,
+        DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, GET_ME_CODE,
+        GET_SNAPSHOT_FILE_CODE, GET_STREAM_CODE, PING_CODE, POLL_MESSAGES_CODE,
         SYNC_CONSUMER_GROUP_CODE,
     };
+    use iggy_common::IggyDuration;
     use metadata::AppliedFrontier;
     use std::future::pending;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The budget has to move with the CONFIGURED commit cadence, not with the
+    /// compile-time default: `[cluster] commit_broadcast_interval` is what
+    /// sizes the timer the read is waiting on, and a cluster that widens it to
+    /// 2s would otherwise get a budget of one and a half broadcasts and refuse
+    /// reads on a backup that is merely a commit behind.
+    ///
+    /// The default arm also pins the fallback the simulator and the unit
+    /// fixtures run on, so the two cannot drift apart silently.
+    #[test]
+    fn given_a_configured_commit_cadence_when_sizing_the_budget_should_scale_with_it() {
+        let mut config = ServerConfig::default();
+        assert_eq!(
+            read_frontier_budget(&config),
+            AppliedFrontier::DEFAULT_READ_BUDGET,
+            "the config default must agree with the frontier's built-in fallback"
+        );
+
+        config.cluster.commit_broadcast_interval = IggyDuration::from(Duration::from_secs(2));
+        assert_eq!(
+            read_frontier_budget(&config),
+            Duration::from_secs(12),
+            "six broadcasts of the configured interval"
+        );
+    }
 
     /// A caller with nothing to read back (`watermark == 0`) and one whose
     /// watermark this node has already applied are the whole steady state, and
@@ -806,10 +862,18 @@ mod tests {
                 "code {code} answers from the metadata STM and must be gated"
             );
         }
-        for code in [DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE] {
+        for code in [
+            PING_CODE,
+            DESCRIBE_OPTIONS_CODE,
+            GET_CLUSTER_METADATA_CODE,
+            POLL_MESSAGES_CODE,
+            GET_CONSUMER_OFFSET_CODE,
+            GET_SNAPSHOT_FILE_CODE,
+        ] {
             assert!(
                 !read_needs_metadata_frontier(code),
-                "code {code} answers from a static catalog or the roster; holding it buys nothing"
+                "code {code} has no metadata-STM answer to hold; the arms that skip \
+                 the gate are exactly these"
             );
         }
         assert!(
