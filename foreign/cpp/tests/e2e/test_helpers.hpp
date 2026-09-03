@@ -101,6 +101,25 @@ inline bool has_header(const rust::Vec<iggy::ffi::HeaderEntry> &headers,
     return false;
 }
 
+inline iggy::ffi::TopicCreateOptions make_topic_create_options(
+    std::uint32_t partitions_count,
+    const std::string &compression_algorithm = "none",
+    const std::string &message_expiry_kind   = "server_default",
+    std::uint64_t message_expiry_value       = 0,
+    const std::string &max_topic_size        = "server_default") {
+    iggy::ffi::TopicCreateOptions opts{};
+    opts.has_partitions_count      = true;
+    opts.partitions_count          = partitions_count;
+    opts.has_compression_algorithm = true;
+    opts.compression_algorithm     = compression_algorithm;
+    opts.has_message_expiry        = true;
+    opts.message_expiry_kind       = message_expiry_kind;
+    opts.message_expiry_value      = message_expiry_value;
+    opts.has_max_topic_size        = true;
+    opts.max_topic_size            = max_topic_size;
+    return opts;
+}
+
 struct TrackedConsumerGroup {
     std::string stream_name;
     std::string topic_name;

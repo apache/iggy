@@ -80,9 +80,12 @@ TEST_F(E2E_Topic, CreateTopicWithAllOptionCombinations) {
                 SCOPED_TRACE("compression=" + compression_algorithm.name + ", expiry_kind=" + expiry_option.name +
                              ", max_topic_size=" + max_topic_size.name);
 
-                ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1,
-                                                   compression_algorithm.value, expiry_option.value,
-                                                   max_topic_size.value));
+                iggy::TopicCreateOptions options;
+                options.SetPartitionsCount(1)
+                    .SetCompressionAlgorithm(compression_algorithm.value)
+                    .SetMessageExpiry(expiry_option.value)
+                    .SetMaxTopicSize(max_topic_size.value);
+                ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options));
                 ++expected_topics_count;
                 expected_topic_names.insert(topic_name);
             }
@@ -105,17 +108,25 @@ TEST_F(E2E_Topic, CreateTopicWithAllOptionCombinations) {
 TEST_F(E2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
     RecordProperty("description", "Accepts boundary partition counts and rejects values above the supported maximum.");
     const std::string stream_name                = GetRandomName();
-    const std::string zero_partitions_topic_name = GetRandomName();
+    const std::string default_partitions_topic   = GetRandomName();
     const std::string max_partitions_topic_name  = GetRandomName();
     const std::string overflow_topic_name        = GetRandomName();
+    const std::string zero_partitions_topic_name = GetRandomName();
 
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), zero_partitions_topic_name, 0));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), max_partitions_topic_name, 1000));
-    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), overflow_topic_name, 1001), std::exception);
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), default_partitions_topic,
+                                       iggy::TopicCreateOptions()));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), max_partitions_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1000)));
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), overflow_topic_name,
+                                    iggy::TopicCreateOptions().SetPartitionsCount(1001)),
+                 std::exception);
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), zero_partitions_topic_name,
+                                    iggy::TopicCreateOptions().SetPartitionsCount(0)),
+                 std::exception);
 
     const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
     EXPECT_EQ(stream_details.TopicsCount(), 2u);
@@ -126,7 +137,7 @@ TEST_F(E2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
     }
 
     EXPECT_EQ(topic_partitions.size(), 2u);
-    EXPECT_EQ(topic_partitions[zero_partitions_topic_name], 0u);
+    EXPECT_EQ(topic_partitions[default_partitions_topic], 1u);
     EXPECT_EQ(topic_partitions[max_partitions_topic_name], 1000u);
 }
 
@@ -144,11 +155,14 @@ TEST_F(E2E_Topic, CreateTopicWithInvalidNamesThrows) {
     };
     for (const auto &topic_name : illegal_topic_names) {
         SCOPED_TRACE(topic_name);
-        ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1), std::exception);
+        ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                        iggy::TopicCreateOptions().SetPartitionsCount(1)),
+                     std::exception);
     }
 
     const std::string max_length_name(255, 'a');
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), max_length_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), max_length_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 }
 
 TEST_F(E2E_Topic, CreateDuplicateTopicThrows) {
@@ -159,8 +173,11 @@ TEST_F(E2E_Topic, CreateDuplicateTopicThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
-    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1), std::exception);
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                    iggy::TopicCreateOptions().SetPartitionsCount(1)),
+                 std::exception);
 }
 
 TEST_F(E2E_Topic, CreateSameTopicNameInDifferentStreamsSucceeds) {
@@ -175,8 +192,10 @@ TEST_F(E2E_Topic, CreateSameTopicNameInDifferentStreamsSucceeds) {
     ASSERT_NO_THROW(client.CreateStream(second_stream_name));
     TrackStream(second_stream_name);
 
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(first_stream_name), topic_name, 1));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(second_stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(first_stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(second_stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 }
 
 TEST_F(E2E_Topic, CreateTopicWithInvalidOptionsThrows) {
@@ -186,19 +205,22 @@ TEST_F(E2E_Topic, CreateTopicWithInvalidOptionsThrows) {
     const std::string invalid_expiry_topic_name      = GetRandomName();
     const std::string invalid_max_size_topic_name    = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_compression_topic_name, 1,
-                                      "invalid-compression", "server_default", 0, "server_default", {}),
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), invalid_compression_topic_name,
+                                    iggy::TopicCreateOptions().SetPartitionsCount(1).SetRawEntries(
+                                        {{"compression_algorithm", "invalid-compression"}})),
                  std::exception);
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_expiry_topic_name, 1, "none",
-                                      "invalid-expiry-kind", 0, "server_default", {}),
+    ASSERT_THROW(client.CreateTopic(
+                     iggy::Identifier::String(stream_name), invalid_expiry_topic_name,
+                     iggy::TopicCreateOptions().SetPartitionsCount(1).SetRawEntries({{"message_expiry", "invalid"}})),
                  std::exception);
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_max_size_topic_name, 1, "none",
-                                      "server_default", 0, "not-a-size", {}),
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), invalid_max_size_topic_name,
+                                    iggy::TopicCreateOptions().SetPartitionsCount(1).SetRawEntries(
+                                        {{"max_topic_size", "not-a-size"}})),
                  std::exception);
 }
 
@@ -214,47 +236,30 @@ TEST_F(E2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRemainder)
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
-    const auto options = iggy::ResourceOptions::Explicit({iggy::TopicOption::Durability(iggy::Durability::Persisted)});
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1,
-                                       iggy::CompressionAlgorithm::None(), iggy::Expiry::ServerDefault(),
-                                       iggy::MaxTopicSize::ServerDefault(), options));
+    iggy::TopicCreateOptions options;
+    options.SetPartitionsCount(1).SetRawEntries({{"enforce_fsync", "true"}});
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options));
 
     const auto topic_details =
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
 
     // Admission re-encodes the block from its own parse, so a value comes back
     // in its key's catalog kind rather than in the kind that was sent.
-    // The SDK sends both durability fields, including the independently
-    // defaulted offset policy.
     const auto &explicit_options = topic_details.Options().Explicit();
-    ASSERT_EQ(explicit_options.size(), 2u);
-    std::unordered_map<std::string, std::vector<std::uint8_t>> explicit_by_key;
-    for (const auto &entry : explicit_options) {
-        const auto &key = entry.Key().Value();
-        EXPECT_EQ(entry.Key().Kind(), iggy::HeaderKind::String);
-        EXPECT_EQ(entry.Value().Kind(), iggy::HeaderKind::String);
-        explicit_by_key.emplace(std::string(key.begin(), key.end()), entry.Value().Value());
-    }
-    EXPECT_EQ(explicit_by_key["durability"], (std::vector<std::uint8_t>{'p', 'e', 'r', 's', 'i', 's', 't', 'e', 'd'}));
-    EXPECT_EQ(explicit_by_key["consumer_offset_durability"],
-              (std::vector<std::uint8_t>{'r', 'e', 'p', 'l', 'i', 'c', 'a', 't', 'e', 'd'}));
+    ASSERT_EQ(explicit_options.size(), 1u);
+    auto explicit_it = explicit_options.find("enforce_fsync");
+    ASSERT_NE(explicit_it, explicit_options.end());
+    EXPECT_EQ(explicit_it->second.Kind(), iggy::HeaderKind::Bool);
+    EXPECT_EQ(explicit_it->second.Value(), (std::vector<std::uint8_t>{1}));
 
     EXPECT_FALSE(topic_details.Options().Derived().empty());
-    std::unordered_set<std::string> derived_option_keys;
-    for (const auto &derived_option : topic_details.Options().Derived()) {
-        const auto &key = derived_option.Key().Value();
-        derived_option_keys.emplace(key.begin(), key.end());
-    }
-    EXPECT_EQ(derived_option_keys.count("max_topic_size"), 1u);
-    EXPECT_EQ(derived_option_keys.count("durability"), 0u);
+    const auto &derived_options = topic_details.Options().Derived();
+    EXPECT_EQ(derived_options.count("max_topic_size"), 1u);
+    EXPECT_EQ(derived_options.count("enforce_fsync"), 0u);
 
-    const auto unknown_options = iggy::ResourceOptions::Explicit({iggy::HeaderEntry::Create(
-        iggy::HeaderField::Create(iggy::HeaderKind::String, {'n', 'o', 't', '_', 'a', '_', 'r', 'e', 'a', 'l', '_', 'o',
-                                                             'p', 't', 'i', 'o', 'n'}),
-        iggy::HeaderField::Create(iggy::HeaderKind::String, {'t', 'r', 'u', 'e'}))});
-    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), unknown_option_topic, 1,
-                                    iggy::CompressionAlgorithm::None(), iggy::Expiry::ServerDefault(),
-                                    iggy::MaxTopicSize::ServerDefault(), unknown_options),
+    iggy::TopicCreateOptions unknown_options;
+    unknown_options.SetPartitionsCount(1).SetRawEntries({{"not_a_real_option", "true"}});
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), unknown_option_topic, unknown_options),
                  std::exception);
 }
 
@@ -273,43 +278,40 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     constexpr std::uint32_t messages_required_to_save         = 512;
     constexpr std::uint64_t size_of_messages_required_to_save = 2ULL * 1024ULL * 1024ULL;
 
-    const auto options = iggy::ResourceOptions::Explicit({
-        iggy::TopicOption::SegmentSize(segment_size_bytes),
-        iggy::TopicOption::Durability(iggy::Durability::Persisted),
-        iggy::TopicOption::ConsumerOffsetDurability(iggy::Durability::Persisted),
-        iggy::TopicOption::MessagesRequiredToSave(messages_required_to_save),
-        iggy::TopicOption::SizeOfMessagesRequiredToSave(size_of_messages_required_to_save),
-        iggy::TopicOption::PreallocateSegments(false),
-    });
+    iggy::TopicCreateOptions options;
+    options.SetPartitionsCount(1)
+        .SetSegmentSize(segment_size_bytes)
+        .SetEnforceFsync(true)
+        .SetMessagesRequiredToSave(messages_required_to_save)
+        .SetSizeOfMessagesRequiredToSave(size_of_messages_required_to_save)
+        .SetPreallocateSegments(false);
 
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1,
-                                       iggy::CompressionAlgorithm::None(), iggy::Expiry::ServerDefault(),
-                                       iggy::MaxTopicSize::ServerDefault(), options));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options));
 
     const auto topic_details =
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
 
-    auto expected_options          = options.Explicit();
-    auto explicit_options          = topic_details.Options().Explicit();
-    const auto compare_option_keys = [](const auto &left, const auto &right) {
-        return left.Key().Value() < right.Key().Value();
+    const auto &explicit_options = topic_details.Options().Explicit();
+    EXPECT_EQ(explicit_options.count("segment_size"), 1u);
+    EXPECT_EQ(explicit_options.count("enforce_fsync"), 1u);
+    EXPECT_EQ(explicit_options.count("messages_required_to_save"), 1u);
+    EXPECT_EQ(explicit_options.count("size_of_messages_required_to_save"), 1u);
+    EXPECT_EQ(explicit_options.count("preallocate_segments"), 1u);
+
+    auto check_kind = [&](const std::string &key, iggy::HeaderKind expected) {
+        auto it = explicit_options.find(key);
+        ASSERT_NE(it, explicit_options.end()) << "Missing explicit key: " << key;
+        EXPECT_EQ(it->second.Kind(), expected) << "Wrong kind for key: " << key;
     };
-    std::sort(expected_options.begin(), expected_options.end(), compare_option_keys);
-    std::sort(explicit_options.begin(), explicit_options.end(), compare_option_keys);
+    check_kind("segment_size", iggy::HeaderKind::Uint64);
+    check_kind("enforce_fsync", iggy::HeaderKind::Bool);
+    check_kind("messages_required_to_save", iggy::HeaderKind::Uint32);
+    check_kind("size_of_messages_required_to_save", iggy::HeaderKind::Uint64);
+    check_kind("preallocate_segments", iggy::HeaderKind::Bool);
 
-    ASSERT_EQ(explicit_options.size(), expected_options.size());
-    for (std::size_t index = 0; index < explicit_options.size(); ++index) {
-        EXPECT_EQ(explicit_options[index].Key().Kind(), expected_options[index].Key().Kind());
-        EXPECT_EQ(explicit_options[index].Key().Value(), expected_options[index].Key().Value());
-        EXPECT_EQ(explicit_options[index].Value().Kind(), expected_options[index].Value().Kind());
-        EXPECT_EQ(explicit_options[index].Value().Value(), expected_options[index].Value().Value());
-    }
-
-    for (const auto &derived_option : topic_details.Options().Derived()) {
-        const auto &key = derived_option.Key().Value();
-        const std::string derived_key(key.begin(), key.end());
-        EXPECT_NE(derived_key, "segment_size") << "segment_size was set explicitly, so it cannot be derived";
-    }
+    EXPECT_EQ(explicit_options.size(), 5u);
+    EXPECT_EQ(topic_details.Options().Derived().count("segment_size"), 0u)
+        << "segment_size was set explicitly, so it cannot be derived";
 }
 
 TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
@@ -323,18 +325,18 @@ TEST_F(E2E_Topic, DescribeOptionsServesTopicCatalogAndRejectsUnknownScope) {
     ASSERT_NO_THROW({ topic_options = client->describe_options("topic"); });
 
     const iggy::ffi::OptionSpec *segment_size = nullptr;
-    bool found_durability                     = false;
+    bool found_enforce_fsync                  = false;
     for (const auto &option : topic_options) {
         const std::string key = static_cast<std::string>(option.key);
         if (key == "segment_size") {
             segment_size = &option;
-        } else if (key == "durability") {
-            found_durability = true;
+        } else if (key == "enforce_fsync") {
+            found_enforce_fsync = true;
         }
     }
 
     ASSERT_NE(segment_size, nullptr) << "Topic catalog is missing segment_size";
-    EXPECT_TRUE(found_durability) << "Topic catalog is missing durability";
+    EXPECT_TRUE(found_enforce_fsync) << "Topic catalog is missing enforce_fsync";
     EXPECT_EQ(segment_size->kind, static_cast<std::uint8_t>(iggy::ffi::HeaderKind::Uint64));
     EXPECT_FALSE(segment_size->default_value.empty());
     EXPECT_FALSE(segment_size->description.empty());
@@ -357,10 +359,9 @@ TEST_F(E2E_Topic, CreateTopicWithMaxTopicSizeBelowSegmentSizeThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_THROW(
-        client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1, iggy::CompressionAlgorithm::None(),
-                           iggy::Expiry::ServerDefault(), iggy::MaxTopicSize::FromBytes(1024)),
-        std::exception);
+    iggy::TopicCreateOptions options;
+    options.SetPartitionsCount(1).SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options), std::exception);
 }
 
 TEST_F(E2E_Topic, CreateTopicOnNonExistentStreamThrows) {
@@ -369,7 +370,9 @@ TEST_F(E2E_Topic, CreateTopicOnNonExistentStreamThrows) {
     const std::string topic_name  = GetRandomName();
 
     auto client = GetLoggedInHighLevelClient();
-    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1), std::exception);
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                    iggy::TopicCreateOptions().SetPartitionsCount(1)),
+                 std::exception);
 }
 
 TEST_F(E2E_Topic, CreateTopicAfterStreamDeletionThrows) {
@@ -383,34 +386,8 @@ TEST_F(E2E_Topic, CreateTopicAfterStreamDeletionThrows) {
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1), std::exception);
-}
-
-TEST_F(E2E_Topic, CreateTopicWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects topic creation requests that use invalid stream identifier formats.");
-    const std::string stream_name       = GetRandomName();
-    const std::string first_topic_name  = GetRandomName();
-    const std::string second_topic_name = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->create_topic(std::move(invalid_kind_id), first_topic_name, 1, "none", "server_default", 0,
-                                      "server_default", {}),
-                 std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->create_topic(std::move(invalid_numeric_id), second_topic_name, 1, "none", "server_default", 0,
-                                      "server_default", {}),
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                    iggy::TopicCreateOptions().SetPartitionsCount(1)),
                  std::exception);
 }
 
@@ -425,14 +402,17 @@ TEST_F(E2E_Topic, CreateTopicBeforeLoginThrows) {
 
     auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
-    ASSERT_THROW(unauthenticated_client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1),
+    ASSERT_THROW(unauthenticated_client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                                    iggy::TopicCreateOptions().SetPartitionsCount(1)),
                  std::exception);
     ASSERT_NO_THROW(unauthenticated_client.Connect());
-    ASSERT_THROW(unauthenticated_client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1),
+    ASSERT_THROW(unauthenticated_client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                                    iggy::TopicCreateOptions().SetPartitionsCount(1)),
                  std::exception);
     ASSERT_NO_THROW(unauthenticated_client.Login("iggy", "iggy"));
     ASSERT_NO_THROW(unauthenticated_client.Disconnect());
-    ASSERT_THROW(unauthenticated_client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1),
+    ASSERT_THROW(unauthenticated_client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                                    iggy::TopicCreateOptions().SetPartitionsCount(1)),
                  std::exception);
 }
 
@@ -441,17 +421,17 @@ TEST_F(E2E_Topic, DeleteTopicAfterCreate) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+    ASSERT_NO_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)));
 
     ASSERT_NO_THROW({
-        const auto topics = client->get_topics(make_string_identifier(stream_name));
+        const auto topics = client.GetTopics(iggy::Identifier::String(stream_name));
         EXPECT_TRUE(topics.empty());
     });
 }
@@ -461,9 +441,9 @@ TEST_F(E2E_Topic, DeleteTopicOnNonExistentStreamThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+    ASSERT_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
 }
 
@@ -472,12 +452,12 @@ TEST_F(E2E_Topic, DeleteTopicOnNonExistentTopicThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+    ASSERT_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
 }
 
@@ -486,15 +466,15 @@ TEST_F(E2E_Topic, DeleteTopicTwiceThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+    ASSERT_NO_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)));
+    ASSERT_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
 }
 
@@ -503,16 +483,16 @@ TEST_F(E2E_Topic, DeleteTopicAfterStreamDeletionThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+    ASSERT_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
 }
 
@@ -521,79 +501,27 @@ TEST_F(E2E_Topic, DeleteTopicBeforeLoginThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
-    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+    auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
     ASSERT_THROW(
-        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        unauthenticated_client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
         std::exception);
-    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_NO_THROW(unauthenticated_client.Connect());
     ASSERT_THROW(
-        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        unauthenticated_client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
         std::exception);
-    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
-    ASSERT_NO_THROW(unauthenticated_client->disconnect());
+    ASSERT_NO_THROW(unauthenticated_client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client.Disconnect());
     ASSERT_THROW(
-        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        unauthenticated_client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
         std::exception);
-}
-
-TEST_F(E2E_Topic, DeleteTopicWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects topic deletion requests that use invalid stream identifier formats.");
-    const std::string stream_name = GetRandomName();
-    const std::string topic_name  = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->delete_topic(std::move(invalid_kind_id), make_string_identifier(topic_name)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->delete_topic(std::move(invalid_numeric_id), make_string_identifier(topic_name)),
-                 std::exception);
-}
-
-TEST_F(E2E_Topic, DeleteTopicWithInvalidTopicIdentifierThrows) {
-    RecordProperty("description", "Rejects topic deletion requests that use invalid topic identifier formats.");
-    const std::string stream_name = GetRandomName();
-    const std::string topic_name  = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), std::move(invalid_kind_id)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), std::move(invalid_numeric_id)),
-                 std::exception);
 }
 
 TEST_F(E2E_Topic, GetTopicReturnsTopicForExistingTopic) {
@@ -605,9 +533,13 @@ TEST_F(E2E_Topic, GetTopicReturnsTopicForExistingTopic) {
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3,
-                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(
+        client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                           iggy::TopicCreateOptions()
+                               .SetPartitionsCount(3)
+                               .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                               .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                               .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
         const auto topic_details =
@@ -629,7 +561,8 @@ TEST_F(E2E_Topic, GetTopicBeforeLoginThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
@@ -658,7 +591,8 @@ TEST_F(E2E_Topic, GetTopicWithWrongStreamIdThrows) {
     TrackStream(first_stream_name);
     ASSERT_NO_THROW(client.CreateStream(second_stream_name));
     TrackStream(second_stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(first_stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(first_stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     ASSERT_THROW(client.GetTopic(iggy::Identifier::String(second_stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
@@ -673,7 +607,8 @@ TEST_F(E2E_Topic, GetTopicWithWrongTopicThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     ASSERT_THROW(client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(wrong_topic_name)),
                  std::exception);
@@ -687,7 +622,8 @@ TEST_F(E2E_Topic, GetTopicAfterStreamDeletionThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
@@ -703,7 +639,8 @@ TEST_F(E2E_Topic, GetTopicAfterTopicDeletionThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
     ASSERT_NO_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)));
 
     ASSERT_THROW(client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
@@ -711,21 +648,25 @@ TEST_F(E2E_Topic, GetTopicAfterTopicDeletionThrows) {
 }
 
 TEST_F(E2E_Topic, GetTopicReturnsEmptyPartitionsForZeroPartitionTopic) {
-    RecordProperty("description", "Returns an empty partitions vector for a topic created with zero partitions.");
+    RecordProperty("description", "Rejects zero partitions and creates a topic with the default partition count.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
+    const std::string zero_topic  = GetRandomName();
 
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 0));
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), zero_topic,
+                                    iggy::TopicCreateOptions().SetPartitionsCount(0)),
+                 std::exception);
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, iggy::TopicCreateOptions()));
 
     ASSERT_NO_THROW({
         const auto topic_details =
             client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
         EXPECT_EQ(topic_details.Name(), topic_name);
-        EXPECT_EQ(topic_details.PartitionsCount(), 0u);
-        EXPECT_TRUE(topic_details.Partitions().empty());
+        EXPECT_EQ(topic_details.PartitionsCount(), 1u);
+        EXPECT_EQ(topic_details.Partitions().size(), 1u);
     });
 }
 
@@ -737,7 +678,8 @@ TEST_F(E2E_Topic, GetTopicReturnsMaxBoundaryPartitionCount) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1000));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1000)));
 
     ASSERT_NO_THROW({
         const auto topic_details =
@@ -756,9 +698,13 @@ TEST_F(E2E_Topic, GetTopicIsStableAcrossBackToBackCalls) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3,
-                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(
+        client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                           iggy::TopicCreateOptions()
+                               .SetPartitionsCount(3)
+                               .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                               .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                               .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
         const auto first_topic =
@@ -783,9 +729,13 @@ TEST_F(E2E_Topic, GetTopicAgreesWithGetStreamTopicSummary) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3,
-                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(
+        client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                           iggy::TopicCreateOptions()
+                               .SetPartitionsCount(3)
+                               .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                               .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                               .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
         const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
@@ -820,18 +770,25 @@ TEST_F(E2E_Topic, GetTopicsReturnsCreatedTopicInputFields) {
     const std::unordered_map<std::string, ExpectedTopic> expected_topics = {
         {first_topic_name, {2, "gzip", 1000, 1024ULL * 1024ULL * 1024ULL}},
         {second_topic_name,
-         {0, "none", std::numeric_limits<std::uint64_t>::max(), std::numeric_limits<std::uint64_t>::max()}},
+         {1, "none", std::numeric_limits<std::uint64_t>::max(), std::numeric_limits<std::uint64_t>::max()}},
     };
 
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name, 2,
-                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name, 0,
-                                       iggy::CompressionAlgorithm::None(), iggy::Expiry::NeverExpire(),
-                                       iggy::MaxTopicSize::Unlimited()));
+    ASSERT_NO_THROW(
+        client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name,
+                           iggy::TopicCreateOptions()
+                               .SetPartitionsCount(2)
+                               .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                               .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                               .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
+                                       iggy::TopicCreateOptions()
+                                           .SetPartitionsCount(1)
+                                           .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
+                                           .SetMessageExpiry(iggy::Expiry::NeverExpire())
+                                           .SetMaxTopicSize(iggy::MaxTopicSize::Unlimited())));
 
     ASSERT_NO_THROW({
         const auto topics = client.GetTopics(iggy::Identifier::String(stream_name));
@@ -896,8 +853,10 @@ TEST_F(E2E_Topic, GetTopicsAfterTopicDeletionReturnsRemainingTopics) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), deleted_topic, 1));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), remaining_topic, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), deleted_topic,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), remaining_topic,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
     ASSERT_NO_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(deleted_topic)));
 
     ASSERT_NO_THROW({
@@ -916,11 +875,14 @@ TEST_F(E2E_Topic, GetTopicsAfterTopicUpdateReturnsUpdatedInputFields) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic, 2));
-    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
-                                       updated_topic_name, iggy::CompressionAlgorithm::Gzip(),
-                                       iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(2)));
+    ASSERT_NO_THROW(client.UpdateTopic(
+        iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
+        iggy::TopicUpdateOptions()
+            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+            .SetMessageExpiry(iggy::Expiry::Duration(1000))
+            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
         const auto topics = client.GetTopics(iggy::Identifier::String(stream_name));
@@ -942,11 +904,14 @@ TEST_F(E2E_Topic, UpdateTopicWorksCorrectly) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic, 2));
-    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
-                                       updated_topic_name, iggy::CompressionAlgorithm::Gzip(),
-                                       iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(2)));
+    ASSERT_NO_THROW(client.UpdateTopic(
+        iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
+        iggy::TopicUpdateOptions()
+            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+            .SetMessageExpiry(iggy::Expiry::Duration(1000))
+            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
         const auto topic_details =
@@ -977,12 +942,15 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangePartitionsCount) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic, partitions_count));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(partitions_count)));
 
-    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
-                                       updated_topic_name, iggy::CompressionAlgorithm::Gzip(),
-                                       iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(client.UpdateTopic(
+        iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
+        iggy::TopicUpdateOptions()
+            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+            .SetMessageExpiry(iggy::Expiry::Duration(1000))
+            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
         const auto topic_details =
@@ -1003,7 +971,8 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     const auto created_stream = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(created_stream.Topics().size(), 1u);
@@ -1016,10 +985,12 @@ TEST_F(E2E_Topic, UpdateTopicDoesNotChangeMessages) {
                                                   make_numeric_identifier(topic_id), "partition_id",
                                                   partition_id_bytes(0), std::move(messages)));
 
-    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic),
-                                       updated_topic_name, iggy::CompressionAlgorithm::Gzip(),
-                                       iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(client.UpdateTopic(
+        iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic), updated_topic_name,
+        iggy::TopicUpdateOptions()
+            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+            .SetMessageExpiry(iggy::Expiry::Duration(1000))
+            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     ASSERT_NO_THROW({
         const auto polled = message_client->poll_messages(make_numeric_identifier(created_stream.Id()),
@@ -1068,7 +1039,8 @@ TEST_F(E2E_Topic, UpdateTopicWithAllOptionCombinationsUpdatesInputFields) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 2));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(2)));
 
     for (const auto &compression_algorithm : compression_algorithms) {
         for (const auto &expiry_option : expiry_options) {
@@ -1077,9 +1049,12 @@ TEST_F(E2E_Topic, UpdateTopicWithAllOptionCombinationsUpdatesInputFields) {
                 SCOPED_TRACE("compression=" + compression_algorithm.name + ", expiry_kind=" + expiry_option.name +
                              ", max_topic_size=" + max_topic_size.name);
 
-                ASSERT_NO_THROW(client.UpdateTopic(
-                    iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), updated_topic_name,
-                    compression_algorithm.value, expiry_option.value, max_topic_size.value));
+                ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name),
+                                                   iggy::Identifier::String(topic_name), updated_topic_name,
+                                                   iggy::TopicUpdateOptions()
+                                                       .SetCompressionAlgorithm(compression_algorithm.value)
+                                                       .SetMessageExpiry(expiry_option.value)
+                                                       .SetMaxTopicSize(max_topic_size.value)));
                 topic_name = updated_topic_name;
             }
         }
@@ -1095,22 +1070,27 @@ TEST_F(E2E_Topic, UpdateTopicWithSameOptionsIsIdempotent) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic, 2));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), original_topic,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(2)));
 
     const auto created_topic =
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(original_topic));
 
-    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name),
-                                       iggy::Identifier::Numeric(created_topic.Id()), updated_topic_name,
-                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(client.UpdateTopic(
+        iggy::Identifier::String(stream_name), iggy::Identifier::Numeric(created_topic.Id()), updated_topic_name,
+        iggy::TopicUpdateOptions()
+            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+            .SetMessageExpiry(iggy::Expiry::Duration(1000))
+            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
     const auto first_update =
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::Numeric(created_topic.Id()));
 
-    ASSERT_NO_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name),
-                                       iggy::Identifier::Numeric(created_topic.Id()), updated_topic_name,
-                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(client.UpdateTopic(
+        iggy::Identifier::String(stream_name), iggy::Identifier::Numeric(created_topic.Id()), updated_topic_name,
+        iggy::TopicUpdateOptions()
+            .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+            .SetMessageExpiry(iggy::Expiry::Duration(1000))
+            .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
     const auto second_update =
         client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::Numeric(created_topic.Id()));
 
@@ -1131,12 +1111,17 @@ TEST_F(E2E_Topic, UpdateTopicWithDuplicateTopicNameThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name, 1));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(first_topic_name),
-                                    second_topic_name, iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                    iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)),
+                                    second_topic_name,
+                                    iggy::TopicUpdateOptions()
+                                        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                                        .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))),
                  std::exception);
 }
 
@@ -1148,7 +1133,8 @@ TEST_F(E2E_Topic, UpdateTopicWithInvalidNamesThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     const std::vector<std::string> invalid_topic_names = {
         "",
@@ -1160,8 +1146,11 @@ TEST_F(E2E_Topic, UpdateTopicWithInvalidNamesThrows) {
 
         ASSERT_THROW(
             client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
-                               invalid_topic_name, iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                               iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)),
+                               invalid_topic_name,
+                               iggy::TopicUpdateOptions()
+                                   .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                                   .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                   .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))),
             std::exception);
     }
 }
@@ -1172,31 +1161,41 @@ TEST_F(E2E_Topic, UpdateTopicFailedValidationDoesNotMutateTopic) {
     const std::string topic_name         = GetRandomName();
     const std::string updated_topic_name = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
     ASSERT_NO_THROW(
-        client->create_topic(make_string_identifier(stream_name), topic_name, 2, "gzip", "duration", 1000, "1GiB", {}));
+        client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                           iggy::TopicCreateOptions()
+                               .SetPartitionsCount(2)
+                               .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                               .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                               .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     const auto topic_before_update =
-        client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+        client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
 
-    ASSERT_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
-                                      updated_topic_name, "none", "duration", 2000, "not-a-size", {}),
+    ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                    updated_topic_name,
+                                    iggy::TopicUpdateOptions()
+                                        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
+                                        .SetMessageExpiry(iggy::Expiry::Duration(2000))
+                                        .SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault())
+                                        .SetRawEntries({{"max_topic_size", "not-a-size"}})),
                  std::exception);
 
     const auto topic_after_failed_update =
-        client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+        client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
 
-    EXPECT_EQ(topic_after_failed_update.id, topic_before_update.id);
-    EXPECT_EQ(topic_after_failed_update.name, topic_before_update.name);
-    EXPECT_EQ(topic_after_failed_update.partitions_count, topic_before_update.partitions_count);
-    EXPECT_EQ(topic_after_failed_update.compression_algorithm, topic_before_update.compression_algorithm);
-    EXPECT_EQ(topic_after_failed_update.message_expiry, topic_before_update.message_expiry);
-    EXPECT_EQ(topic_after_failed_update.max_topic_size, topic_before_update.max_topic_size);
+    EXPECT_EQ(topic_after_failed_update.Id(), topic_before_update.Id());
+    EXPECT_EQ(topic_after_failed_update.Name(), topic_before_update.Name());
+    EXPECT_EQ(topic_after_failed_update.PartitionsCount(), topic_before_update.PartitionsCount());
+    EXPECT_EQ(topic_after_failed_update.CompressionAlgorithm(), topic_before_update.CompressionAlgorithm());
+    EXPECT_EQ(topic_after_failed_update.MessageExpiry(), topic_before_update.MessageExpiry());
+    EXPECT_EQ(topic_after_failed_update.MaxTopicSize(), topic_before_update.MaxTopicSize());
 
-    EXPECT_THROW(client->get_topic(make_string_identifier(stream_name), make_string_identifier(updated_topic_name)),
+    EXPECT_THROW(client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(updated_topic_name)),
                  std::exception);
 }
 
@@ -1209,7 +1208,8 @@ TEST_F(E2E_Topic, UpdateTopicBeforeLoginThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
@@ -1234,11 +1234,13 @@ TEST_F(E2E_Topic, UpdateTopicOnNonExistentStreamThrows) {
     const std::string updated_topic_name = GetRandomName();
 
     auto client = GetLoggedInHighLevelClient();
-    ASSERT_THROW(
-        client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
-                           updated_topic_name, iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                           iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)),
-        std::exception);
+    ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                    updated_topic_name,
+                                    iggy::TopicUpdateOptions()
+                                        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                                        .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))),
+                 std::exception);
 }
 
 TEST_F(E2E_Topic, UpdateTopicOnNonExistentTopicThrows) {
@@ -1251,11 +1253,13 @@ TEST_F(E2E_Topic, UpdateTopicOnNonExistentTopicThrows) {
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_THROW(
-        client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
-                           updated_topic_name, iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                           iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)),
-        std::exception);
+    ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                    updated_topic_name,
+                                    iggy::TopicUpdateOptions()
+                                        .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                                        .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                                        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))),
+                 std::exception);
 }
 
 TEST_F(E2E_Topic, GetTopicsAfterStreamDeletionReturnsEmpty) {
@@ -1266,7 +1270,8 @@ TEST_F(E2E_Topic, GetTopicsAfterStreamDeletionReturnsEmpty) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
@@ -1294,7 +1299,8 @@ TEST_F(E2E_Topic, PurgeTopicAfterStreamDeletionThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
     ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
@@ -1315,58 +1321,6 @@ TEST_F(E2E_Topic, PurgeTopicOnNonExistentTopicThrows) {
                  std::exception);
 }
 
-TEST_F(E2E_Topic, PurgeTopicWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects topic purge requests that use invalid stream identifier formats.");
-    const std::string stream_name = GetRandomName();
-    const std::string topic_name  = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->purge_topic(std::move(invalid_kind_id), make_string_identifier(topic_name)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->purge_topic(std::move(invalid_numeric_id), make_string_identifier(topic_name)),
-                 std::exception);
-}
-
-TEST_F(E2E_Topic, PurgeTopicWithInvalidTopicIdentifierThrows) {
-    RecordProperty("description", "Rejects topic purge requests that use invalid topic identifier formats.");
-    const std::string stream_name = GetRandomName();
-    const std::string topic_name  = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), std::move(invalid_kind_id)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), std::move(invalid_numeric_id)),
-                 std::exception);
-}
-
 TEST_F(E2E_Topic, PurgeTopicPreservesTopicMetadata) {
     RecordProperty("description", "Preserves topic metadata after purging its messages.");
     const std::string stream_name = GetRandomName();
@@ -1377,9 +1331,13 @@ TEST_F(E2E_Topic, PurgeTopicPreservesTopicMetadata) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3,
-                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
+    ASSERT_NO_THROW(
+        client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                           iggy::TopicCreateOptions()
+                               .SetPartitionsCount(3)
+                               .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                               .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                               .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
 
     auto stream_before_purge = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(stream_before_purge.Topics().size(), 1u);
@@ -1423,8 +1381,10 @@ TEST_F(E2E_Topic, PurgeTopicRemovesOnlyTargetTopicMessages) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name, 1));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
@@ -1486,7 +1446,8 @@ TEST_F(E2E_Topic, PurgeTopicAcrossMultiplePartitionsClearsAllPartitions) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(3)));
 
     for (std::uint32_t partition_id = 0; partition_id < 3; ++partition_id) {
         rust::Vec<iggy::ffi::IggyMessageToSend> messages;
@@ -1526,7 +1487,8 @@ TEST_F(E2E_Topic, PurgeTopicThenSendMessagesAgainSucceeds) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_batch;
     first_batch.push_back(
@@ -1565,8 +1527,10 @@ TEST_F(E2E_Topic, PurgeTopicTwiceKeepsTargetTopicEmptyAndOtherTopicsUntouched) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name, 1));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> first_topic_messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
@@ -1629,7 +1593,8 @@ TEST_F(E2E_Topic, PurgeTopicBeforeLoginThrows) {
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
