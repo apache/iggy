@@ -351,13 +351,13 @@ where
                     self.apply_reconcile_ops();
                     consensus_tick.set(rearm_tick());
                 }
-                (message, provenance) = poll_fn(|_| {
+                frame = poll_fn(|_| {
                     self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
                 }).fuse() => {
                     // One frame per select iteration. Ranking this arm above
                     // the inbox preserves park order without making a full
                     // queue stall ticks and commit broadcasts for other groups.
-                    self.dispatch_message(message, Some(provenance)).await;
+                    self.dispatch_redispatched_frame(frame).await;
                     // A request handled by a solo primary self-acks here. If
                     // loopback waited for another inbox frame, the request
                     // would remain uncommitted indefinitely on a quiet shard.
@@ -480,8 +480,8 @@ where
         M: RestorableMetadataStm,
     {
         loop {
-            while let Some((message, provenance)) = self.pop_redispatched_frame() {
-                self.dispatch_message(message, Some(provenance)).await;
+            while let Some(frame) = self.pop_redispatched_frame() {
+                self.dispatch_redispatched_frame(frame).await;
                 self.process_loopback(loopback_buf, namespace_scratch).await;
                 self.apply_reconcile_ops();
                 if let Some(fault) = self.first_partition_commit_fault() {
@@ -717,6 +717,14 @@ where
                 // sender means the read is skipped and the gather side
                 // times out.
                 (self.on_partition_read)(namespace, read, reply);
+            }
+            LifecycleFrame::PartitionSubmit { request, reply } => {
+                // Addressed to the shard owning the request's namespace (the
+                // sender resolved it via the shards table, same fallback as
+                // `route_typed`). Every refusal answers on `reply`, so the
+                // awaiting shard never waits out its budget on a decision
+                // already made.
+                self.on_partition_submit(request, reply).await;
             }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
