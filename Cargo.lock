@@ -6843,12 +6843,18 @@ name = "iggy-gateway-kafka"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "iggy",
  "kafka-protocol",
  "libc",
+ "secrecy",
+ "serde",
+ "serial_test",
  "socket2 0.6.5",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
+ "toml 1.1.3+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
