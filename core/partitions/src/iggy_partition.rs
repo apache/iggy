@@ -5183,7 +5183,7 @@ mod tests {
     use compio::io::AsyncWriteAtExt;
     use consensus::LocalPipeline;
     use iggy_binary_protocol::{Command, ReplyHeader, WireConsumer, WireEncode};
-    use message_bus::SendError;
+    use message_bus::{BusMessage, SendError};
     use server_common::MESSAGE_ALIGN;
     use server_common::send_messages::{
         COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
@@ -5570,9 +5570,11 @@ mod tests {
         async fn send_to_client(
             &self,
             client_id: u128,
-            data: Frozen<MESSAGE_ALIGN>,
+            data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
-            self.sent_to_clients.borrow_mut().push((client_id, data));
+            self.sent_to_clients
+                .borrow_mut()
+                .push((client_id, data.into().into_contiguous()));
             Ok(())
         }
 
@@ -8551,8 +8553,12 @@ mod purge_floor_tests {
             .expect("purge partition");
         assert_eq!(partition.applied_purge_generation(), 4);
 
+        // Boxed: all four rebuilt partitions live across awaits. Five inline
+        // partitions make this future large enough that unoptimized builds,
+        // which keep a copy of it in every compio `block_on` wrapper frame,
+        // overflow the 2 MiB test thread stack.
         let rebuild = |created_revision: u64| {
-            let mut rebuilt = test_partition();
+            let mut rebuilt = Box::new(test_partition());
             rebuilt.set_partition_dir(dir.to_string_lossy().into_owned());
             rebuilt.set_created_revision(created_revision);
             rebuilt

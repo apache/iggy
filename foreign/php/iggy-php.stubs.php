@@ -94,6 +94,9 @@ namespace Iggy {
         /**
          * Creates and initializes a consumer group consumer.
          *
+         * `$partition_id` is ignored for a consumer group: the member reads the partitions
+         * the server assigns to it.
+         *
          * @param string $name
          * @param string $stream
          * @param string $topic

@@ -33,10 +33,10 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
-hex = "0.4"
-iggy-gateway-kafka = { path = "../.." }
+hex = { workspace = true }
+iggy-gateway-kafka = { workspace = true }
 indexmap = { workspace = true }
-kafka-protocol = "0.17"
+kafka-protocol = { workspace = true, features = ["client"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

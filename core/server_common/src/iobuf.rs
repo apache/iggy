@@ -23,6 +23,12 @@ use std::ptr::NonNull;
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 
+/// Linux `IOV_MAX`: the most iovecs one vectored IO syscall accepts.
+/// Vectored writers must chunk their buffer lists at this many entries or
+/// the syscall fails: `EINVAL` from `writev(2)`/`pwritev(2)` (segment file
+/// writes), `EMSGSIZE` from `sendmsg(2)` (socket writes).
+pub const IOV_MAX: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct Owned<const ALIGN: usize = 4096> {
     inner: AVec<u8, ConstAlign<ALIGN>>,
@@ -113,6 +119,10 @@ impl<const ALIGN: usize> Owned<ALIGN> {
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.inner
+    }
+
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.inner.extend_from_slice(bytes);
     }
 
     pub fn split_at(self, split_at: usize) -> (Prefix<ALIGN>, Frozen<ALIGN>) {
@@ -274,6 +284,13 @@ impl<const ALIGN: usize> From<Owned<ALIGN>> for Frozen<ALIGN> {
 impl<const ALIGN: usize> Frozen<ALIGN> {
     pub fn as_slice(&self) -> &[u8] {
         self.inner.as_slice()
+    }
+
+    /// Whether `self` and `other` refcount the same backing allocation,
+    /// regardless of their sliced windows. Any hit keeps the whole
+    /// allocation alive, not just the window.
+    pub fn shares_allocation(&self, other: &Self) -> bool {
+        self.inner.ctrlb == other.inner.ctrlb
     }
 
     pub fn split_at(self, split_at: usize) -> (Prefix<ALIGN>, Frozen<ALIGN>) {
@@ -646,6 +663,16 @@ mod tests {
         v.extend_from_slice(b"abc");
         let prefix = Prefix::<A>::from_aligned_vec(v);
         assert_eq!(prefix.as_slice(), b"abc");
+    }
+
+    #[test]
+    fn owned_extend_from_slice_fills_reserved_capacity_in_place() {
+        let mut o: Owned<A> = Owned::with_capacity(6);
+        let capacity = o.buf_capacity();
+        o.extend_from_slice(b"abc");
+        o.extend_from_slice(b"def");
+        assert_eq!(o.as_slice(), b"abcdef");
+        assert_eq!(o.buf_capacity(), capacity);
     }
 
     //  Owned::split_at: shared control block / disjoint views

@@ -1395,6 +1395,8 @@ class IggyClient:
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
+        `partition_id` is ignored for a consumer group: the member reads the partitions
+        the server assigns to it.
         Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
         `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
         `AutoCommit` interval is negative, or if any of those except `poll_interval`

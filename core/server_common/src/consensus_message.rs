@@ -17,6 +17,7 @@
 
 use crate::iobuf::{Frozen, Owned};
 use crate::sharding::METADATA_GROUP;
+use aligned_vec::{AVec, ConstAlign};
 use iggy_binary_protocol::{
     Command, CommitHeader, ConsensusError, ConsensusHeader, DoViewChangeHeader,
     ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
@@ -34,6 +35,12 @@ use std::{
 };
 
 pub const MESSAGE_ALIGN: usize = 4096;
+
+/// Fragment list behind a [`ResponseBacking`]. Inline for the single-buffer
+/// frame every reply but a poll is, so the per-connection mailboxes and the
+/// inter-shard reply lane stay one word wider than a bare [`Frozen`]; a
+/// vectored poll reply spills its fragment table to the heap once.
+pub type ResponseFragments = SmallVec<[Frozen<MESSAGE_ALIGN>; 1]>;
 
 pub trait MessageBacking<H>
 where
@@ -73,13 +80,67 @@ pub struct RequestBacking {
     owned: Owned<MESSAGE_ALIGN>,
 }
 
+/// An outbound frame as a list of buffers written back to back: the wire bytes
+/// are the concatenation of `fragments`. Never empty; the first fragment holds
+/// the whole frame header.
 #[derive(Debug, Clone)]
 pub struct ResponseBacking {
-    fragments: SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>,
+    fragments: ResponseFragments,
 }
 
 impl RequestBackingKind for RequestBacking {}
 impl ResponseBackingKind for ResponseBacking {}
+
+impl ResponseBacking {
+    /// The fragment carrying the frame header.
+    #[must_use]
+    pub fn first(&self) -> &Frozen<MESSAGE_ALIGN> {
+        self.fragments
+            .first()
+            .expect("response backing is never empty")
+    }
+
+    #[must_use]
+    pub fn fragments(&self) -> &[Frozen<MESSAGE_ALIGN>] {
+        &self.fragments
+    }
+
+    #[must_use]
+    pub fn into_fragments(self) -> ResponseFragments {
+        self.fragments
+    }
+
+    #[must_use]
+    pub fn total_len(&self) -> usize {
+        self.fragments.iter().map(Frozen::len).sum()
+    }
+
+    /// The frame as one buffer: the single fragment as is, or the fragments
+    /// copied back to back. For writers whose record layer needs a contiguous
+    /// payload (WebSocket frames, in-process reply decoding).
+    #[must_use]
+    pub fn into_contiguous(self) -> Frozen<MESSAGE_ALIGN> {
+        match self.fragments.as_slice() {
+            [single] => single.clone(),
+            fragments => {
+                let mut joined: AVec<u8, ConstAlign<MESSAGE_ALIGN>> =
+                    AVec::with_capacity(MESSAGE_ALIGN, self.total_len());
+                for fragment in fragments {
+                    joined.extend_from_slice(fragment);
+                }
+                Owned::from(joined).into()
+            }
+        }
+    }
+}
+
+impl From<Frozen<MESSAGE_ALIGN>> for ResponseBacking {
+    fn from(frozen: Frozen<MESSAGE_ALIGN>) -> Self {
+        Self {
+            fragments: smallvec::smallvec![frozen],
+        }
+    }
+}
 
 impl RequestBacking {
     fn into_owned(self) -> Owned<MESSAGE_ALIGN> {
@@ -503,13 +564,13 @@ where
     }
 }
 
-impl<H> TryFrom<SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>> for Message<H, ResponseBacking>
+impl<H> TryFrom<ResponseFragments> for Message<H, ResponseBacking>
 where
     H: ConsensusHeader,
 {
     type Error = ConsensusError;
 
-    fn try_from(fragments: SmallVec<[Frozen<MESSAGE_ALIGN>; 4]>) -> Result<Self, Self::Error> {
+    fn try_from(fragments: ResponseFragments) -> Result<Self, Self::Error> {
         let Some(first) = fragments.first() else {
             return Err(ConsensusError::InvalidCommand {
                 expected: H::COMMAND,
@@ -1600,7 +1661,7 @@ mod tests {
     fn response_backing_single_fragment_roundtrip() {
         let owned = header_bytes(Command::Reply, 256);
         let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
-        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let fragments: ResponseFragments = smallvec![frozen];
         let msg = Message::<ReplyHeader, ResponseBacking>::try_from(fragments).expect("valid");
         assert_eq!(msg.header().command, Command::Reply);
         assert_eq!(msg.fragments().len(), 1);
@@ -1608,7 +1669,7 @@ mod tests {
 
     #[test]
     fn response_backing_empty_fragments_returns_err() {
-        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![];
+        let fragments: ResponseFragments = smallvec![];
         let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
@@ -1617,7 +1678,7 @@ mod tests {
     fn response_backing_first_fragment_too_short_returns_err() {
         let owned = Owned::<MESSAGE_ALIGN>::zeroed(100);
         let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
-        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let fragments: ResponseFragments = smallvec![frozen];
         let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
@@ -1628,7 +1689,7 @@ mod tests {
         // the header; the floor must reject before any consumer slices a body.
         let owned = header_bytes(Command::Reply, size_of::<ReplyHeader>() as u32 - 1);
         let frozen: Frozen<MESSAGE_ALIGN> = owned.into();
-        let fragments: smallvec::SmallVec<[Frozen<MESSAGE_ALIGN>; 4]> = smallvec![frozen];
+        let fragments: ResponseFragments = smallvec![frozen];
         let result = Message::<ReplyHeader, ResponseBacking>::try_from(fragments);
         assert!(matches!(result, Err(ConsensusError::InvalidCommand { .. })));
     }
