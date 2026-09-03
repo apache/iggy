@@ -18,6 +18,8 @@
  */
 
 #include <cstdint>
+#include <limits>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -25,18 +27,6 @@
 #include <gtest/gtest.h>
 
 #include "iggy.hpp"
-
-namespace {
-
-std::string option_key(const iggy::HeaderEntry &entry) {
-    return std::string(entry.Key().Value().begin(), entry.Key().Value().end());
-}
-
-const std::vector<std::uint8_t> &option_value_bytes(const iggy::HeaderEntry &entry) {
-    return entry.Value().Value();
-}
-
-}  // namespace
 
 TEST(CompressionAlgorithmTest, ReturnsExpectedValues) {
     EXPECT_EQ(iggy::CompressionAlgorithm::None().CompressionAlgorithmValue(), "none");
@@ -107,69 +97,158 @@ TEST(ExpiryTest, ReturnsExpectedKindAndValue) {
     EXPECT_EQ(duration.ExpiryValue(), static_cast<std::uint64_t>(15));
 }
 
-TEST(TopicOptionTest, SegmentSizeEncodesLittleEndianUint64) {
-    const auto option = iggy::TopicOption::SegmentSize(0x0102030405060708ULL);
-
-    EXPECT_EQ(option.Key().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_key(option), "segment_size");
-    EXPECT_EQ(option.Value().Kind(), iggy::HeaderKind::Uint64);
-    EXPECT_EQ(option_value_bytes(option), (std::vector<std::uint8_t>{0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01}));
+TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
+    const iggy::TopicCreateOptions options;
+    EXPECT_FALSE(options.PartitionsCount().has_value());
+    EXPECT_FALSE(options.CompressionAlgorithm().has_value());
+    EXPECT_FALSE(options.MessageExpiry().has_value());
+    EXPECT_FALSE(options.MaxTopicSize().has_value());
+    EXPECT_FALSE(options.SegmentSize().has_value());
+    EXPECT_FALSE(options.EnforceFsync().has_value());
+    EXPECT_FALSE(options.MessagesRequiredToSave().has_value());
+    EXPECT_FALSE(options.SizeOfMessagesRequiredToSave().has_value());
+    EXPECT_FALSE(options.PreallocateSegments().has_value());
+    EXPECT_TRUE(options.RawEntries().empty());
 }
 
-TEST(TopicOptionTest, EnforceFsyncEncodesSingleBoolByte) {
-    const auto enabled = iggy::TopicOption::EnforceFsync(true);
-
-    EXPECT_EQ(enabled.Key().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_key(enabled), "enforce_fsync");
-    EXPECT_EQ(enabled.Value().Kind(), iggy::HeaderKind::Bool);
-    EXPECT_EQ(option_value_bytes(enabled), (std::vector<std::uint8_t>{1}));
-
-    const auto disabled = iggy::TopicOption::EnforceFsync(false);
-
-    EXPECT_EQ(option_key(disabled), "enforce_fsync");
-    EXPECT_EQ(disabled.Value().Kind(), iggy::HeaderKind::Bool);
-    EXPECT_EQ(option_value_bytes(disabled), (std::vector<std::uint8_t>{0}));
+TEST(TopicCreateOptionsTest, PartitionsCountStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetPartitionsCount(3);
+    ASSERT_TRUE(options.PartitionsCount().has_value());
+    EXPECT_EQ(*options.PartitionsCount(), 3u);
+    options.SetPartitionsCount(1000);
+    EXPECT_EQ(*options.PartitionsCount(), 1000u);
 }
 
-TEST(TopicOptionTest, MessagesRequiredToSaveEncodesLittleEndianUint32) {
-    const auto option = iggy::TopicOption::MessagesRequiredToSave(0x01020304U);
-
-    EXPECT_EQ(option.Key().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_key(option), "messages_required_to_save");
-    EXPECT_EQ(option.Value().Kind(), iggy::HeaderKind::Uint32);
-    EXPECT_EQ(option_value_bytes(option), (std::vector<std::uint8_t>{0x04, 0x03, 0x02, 0x01}));
+TEST(TopicCreateOptionsTest, SegmentSizeStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetSegmentSize(0x0102030405060708ULL);
+    ASSERT_TRUE(options.SegmentSize().has_value());
+    EXPECT_EQ(*options.SegmentSize(), 0x0102030405060708ULL);
 }
 
-TEST(TopicOptionTest, SizeOfMessagesRequiredToSaveEncodesLittleEndianUint64) {
-    const auto option = iggy::TopicOption::SizeOfMessagesRequiredToSave(1024ULL * 1024ULL);
+TEST(TopicCreateOptionsTest, EnforceFsyncStoresBool) {
+    iggy::TopicCreateOptions enabled;
+    enabled.SetEnforceFsync(true);
+    ASSERT_TRUE(enabled.EnforceFsync().has_value());
+    EXPECT_EQ(*enabled.EnforceFsync(), true);
 
-    EXPECT_EQ(option.Key().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_key(option), "size_of_messages_required_to_save");
-    EXPECT_EQ(option.Value().Kind(), iggy::HeaderKind::Uint64);
-    EXPECT_EQ(option_value_bytes(option), (std::vector<std::uint8_t>{0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00}));
+    iggy::TopicCreateOptions disabled;
+    disabled.SetEnforceFsync(false);
+    ASSERT_TRUE(disabled.EnforceFsync().has_value());
+    EXPECT_EQ(*disabled.EnforceFsync(), false);
 }
 
-TEST(TopicOptionTest, PreallocateSegmentsEncodesSingleBoolByte) {
-    const auto enabled = iggy::TopicOption::PreallocateSegments(true);
-
-    EXPECT_EQ(enabled.Key().Kind(), iggy::HeaderKind::String);
-    EXPECT_EQ(option_key(enabled), "preallocate_segments");
-    EXPECT_EQ(enabled.Value().Kind(), iggy::HeaderKind::Bool);
-    EXPECT_EQ(option_value_bytes(enabled), (std::vector<std::uint8_t>{1}));
-
-    const auto disabled = iggy::TopicOption::PreallocateSegments(false);
-
-    EXPECT_EQ(option_value_bytes(disabled), (std::vector<std::uint8_t>{0}));
+TEST(TopicCreateOptionsTest, MessagesRequiredToSaveStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetMessagesRequiredToSave(0x01020304U);
+    ASSERT_TRUE(options.MessagesRequiredToSave().has_value());
+    EXPECT_EQ(*options.MessagesRequiredToSave(), 0x01020304U);
 }
 
-TEST(TopicOptionTest, MaximumValuesFillEveryValueByte) {
-    const auto segment_size = iggy::TopicOption::SegmentSize(std::numeric_limits<std::uint64_t>::max());
-    EXPECT_EQ(option_value_bytes(segment_size),
-              (std::vector<std::uint8_t>{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}));
+TEST(TopicCreateOptionsTest, SizeOfMessagesRequiredToSaveStoresValue) {
+    iggy::TopicCreateOptions options;
+    options.SetSizeOfMessagesRequiredToSave(1024ULL * 1024ULL);
+    ASSERT_TRUE(options.SizeOfMessagesRequiredToSave().has_value());
+    EXPECT_EQ(*options.SizeOfMessagesRequiredToSave(), 1024ULL * 1024ULL);
+}
 
-    const auto messages_required_to_save =
-        iggy::TopicOption::MessagesRequiredToSave(std::numeric_limits<std::uint32_t>::max());
-    EXPECT_EQ(option_value_bytes(messages_required_to_save), (std::vector<std::uint8_t>{0xFF, 0xFF, 0xFF, 0xFF}));
+TEST(TopicCreateOptionsTest, PreallocateSegmentsStoresBool) {
+    iggy::TopicCreateOptions enabled;
+    enabled.SetPreallocateSegments(true);
+    ASSERT_TRUE(enabled.PreallocateSegments().has_value());
+    EXPECT_EQ(*enabled.PreallocateSegments(), true);
+
+    iggy::TopicCreateOptions disabled;
+    disabled.SetPreallocateSegments(false);
+    ASSERT_TRUE(disabled.PreallocateSegments().has_value());
+    EXPECT_EQ(*disabled.PreallocateSegments(), false);
+}
+
+TEST(TopicCreateOptionsTest, MaximumValuesPreserved) {
+    iggy::TopicCreateOptions options;
+    options.SetSegmentSize(std::numeric_limits<std::uint64_t>::max());
+    ASSERT_TRUE(options.SegmentSize().has_value());
+    EXPECT_EQ(*options.SegmentSize(), std::numeric_limits<std::uint64_t>::max());
+
+    options.SetMessagesRequiredToSave(std::numeric_limits<std::uint32_t>::max());
+    ASSERT_TRUE(options.MessagesRequiredToSave().has_value());
+    EXPECT_EQ(*options.MessagesRequiredToSave(), std::numeric_limits<std::uint32_t>::max());
+
+    options.SetSizeOfMessagesRequiredToSave(std::numeric_limits<std::uint64_t>::max());
+    ASSERT_TRUE(options.SizeOfMessagesRequiredToSave().has_value());
+    EXPECT_EQ(*options.SizeOfMessagesRequiredToSave(), std::numeric_limits<std::uint64_t>::max());
+}
+
+TEST(TopicCreateOptionsTest, ChainingAndOverwrite) {
+    iggy::TopicCreateOptions options;
+    options.SetSegmentSize(1024).SetEnforceFsync(true).SetMessagesRequiredToSave(512);
+    EXPECT_EQ(*options.SegmentSize(), 1024ULL);
+    EXPECT_EQ(*options.EnforceFsync(), true);
+    EXPECT_EQ(*options.MessagesRequiredToSave(), 512u);
+    options.SetSegmentSize(2048);
+    EXPECT_EQ(*options.SegmentSize(), 2048ULL);
+}
+
+TEST(TopicCreateOptionsTest, CompressionAlgorithmAndExpiryAndMaxTopicSize) {
+    iggy::TopicCreateOptions options;
+    options.SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+        .SetMessageExpiry(iggy::Expiry::Duration(15))
+        .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    ASSERT_TRUE(options.CompressionAlgorithm().has_value());
+    EXPECT_EQ(options.CompressionAlgorithm()->CompressionAlgorithmValue(), "gzip");
+    ASSERT_TRUE(options.MessageExpiry().has_value());
+    EXPECT_EQ(options.MessageExpiry()->ExpiryKind(), "duration");
+    EXPECT_EQ(options.MessageExpiry()->ExpiryValue(), 15u);
+    ASSERT_TRUE(options.MaxTopicSize().has_value());
+    EXPECT_EQ(options.MaxTopicSize()->MaxTopicSizeValue(), "1024");
+}
+
+TEST(TopicCreateOptionsTest, RawMapStoresForwardCompatibleKeys) {
+    iggy::TopicCreateOptions options;
+    options.SetRawEntries({{"custom_key", "custom_value"}});
+    EXPECT_EQ(options.RawEntries().count("custom_key"), 1u);
+    EXPECT_EQ(options.RawEntries().at("custom_key"), "custom_value");
+    options.SetRawEntries(std::map<std::string, std::string>{{"a", "1"}, {"b", "2"}});
+    EXPECT_EQ(options.RawEntries().size(), 3u);
+    EXPECT_EQ(options.RawEntries().at("a"), "1");
+}
+
+TEST(TopicUpdateOptionsTest, DefaultHasNoValues) {
+    const iggy::TopicUpdateOptions options;
+    EXPECT_FALSE(options.CompressionAlgorithm().has_value());
+    EXPECT_FALSE(options.MessageExpiry().has_value());
+    EXPECT_FALSE(options.MaxTopicSize().has_value());
+    EXPECT_TRUE(options.RawEntries().empty());
+}
+
+TEST(TopicUpdateOptionsTest, StoresUpdatableFields) {
+    iggy::TopicUpdateOptions options;
+    options.SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+        .SetMessageExpiry(iggy::Expiry::NeverExpire())
+        .SetMaxTopicSize(iggy::MaxTopicSize::Unlimited());
+    ASSERT_TRUE(options.CompressionAlgorithm().has_value());
+    EXPECT_EQ(options.CompressionAlgorithm()->CompressionAlgorithmValue(), "gzip");
+    ASSERT_TRUE(options.MessageExpiry().has_value());
+    EXPECT_EQ(options.MessageExpiry()->ExpiryKind(), "never_expire");
+    ASSERT_TRUE(options.MaxTopicSize().has_value());
+    EXPECT_EQ(options.MaxTopicSize()->MaxTopicSizeValue(), "unlimited");
+}
+
+TEST(TopicUpdateOptionsTest, RawMapStoresKeys) {
+    iggy::TopicUpdateOptions options;
+    options.SetRawEntries({{"message_expiry", "7 days"}});
+    EXPECT_EQ(options.RawEntries().count("message_expiry"), 1u);
+    options.SetRawEntries(std::map<std::string, std::string>{{"compression_algorithm", "gzip"}});
+    EXPECT_EQ(options.RawEntries().size(), 2u);
+}
+
+TEST(StreamUpdateOptionsTest, RawMapStoresKeys) {
+    iggy::StreamUpdateOptions options;
+    EXPECT_TRUE(options.RawEntries().empty());
+    options.SetRawEntries({{"future_key", "future_value"}});
+    EXPECT_EQ(options.RawEntries().count("future_key"), 1u);
+    EXPECT_EQ(options.RawEntries().at("future_key"), "future_value");
 }
 
 TEST(IggyExceptionTest, StoresMessage) {

@@ -310,22 +310,31 @@ class ResourceOptions final {
     static ResourceOptions Explicit(std::vector<HeaderEntry> entries);
 
     /**
-     * @brief Returns entries supplied explicitly at resource creation.
-     * @return Explicit entries owned by this option collection.
+     * @brief Creates request options from explicit map.
+     * @param entries Explicit option map keyed by option name.
+     * @return Resource options that will submit @p entries.
      */
-    const std::vector<HeaderEntry> &Explicit() const noexcept { return explicit_; }
+    static ResourceOptions Explicit(std::map<std::string, HeaderField> entries);
+
+    /**
+     * @brief Returns entries supplied explicitly at resource creation.
+     * @return Explicit entries as map from option name to typed value.
+     */
+    const std::map<std::string, HeaderField> &Explicit() const noexcept { return explicit_; }
 
     /**
      * @brief Returns entries derived from configured defaults at admission.
-     * @return Derived entries owned by this option collection.
+     * @return Derived entries as map from option name to typed value.
      * @note Stream responses currently expose explicit entries only, so this
      *       collection is empty for Stream and StreamDetails.
      */
-    const std::vector<HeaderEntry> &Derived() const noexcept { return derived_; }
+    const std::map<std::string, HeaderField> &Derived() const noexcept { return derived_; }
 
   private:
-    explicit ResourceOptions(std::vector<HeaderEntry> explicit_entries) : explicit_(std::move(explicit_entries)) {}
-    ResourceOptions(std::vector<HeaderEntry> explicit_entries, std::vector<HeaderEntry> derived_entries)
+    explicit ResourceOptions(std::map<std::string, HeaderField> explicit_entries)
+        : explicit_(std::move(explicit_entries)) {}
+    ResourceOptions(std::map<std::string, HeaderField> explicit_entries,
+                    std::map<std::string, HeaderField> derived_entries)
         : explicit_(std::move(explicit_entries)), derived_(std::move(derived_entries)) {}
 
     static ResourceOptions FromFfi(rust::Vec<ffi::HeaderEntry> explicit_entries,
@@ -338,8 +347,8 @@ class ResourceOptions final {
     friend class Stream;
     friend class StreamDetails;
 
-    std::vector<HeaderEntry> explicit_;
-    std::vector<HeaderEntry> derived_;
+    std::map<std::string, HeaderField> explicit_;
+    std::map<std::string, HeaderField> derived_;
 };
 
 /**
@@ -1198,13 +1207,17 @@ class TopicCreateOptions final {
      *       name the same key (`mod.rs:1374` `typed_field_wins_over_raw_entry_for_the_same_key`).
      *       `partitions_count` is not a key and is rejected if placed in `raw`.
      */
-    const std::map<std::string, std::string> &Raw() const noexcept { return raw_; }
-    TopicCreateOptions &SetRaw(std::map<std::string, std::string> raw) {
-        raw_ = std::move(raw);
+    const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+    TopicCreateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
+        for (const auto &entry : entries) {
+            raw_.emplace(entry.first, entry.second);
+        }
         return *this;
     }
-    TopicCreateOptions &SetRawEntry(std::string key, std::string value) {
-        raw_.emplace(std::move(key), std::move(value));
+    TopicCreateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
+        for (auto &entry : entries) {
+            raw_.emplace(std::move(entry.first), std::move(entry.second));
+        }
         return *this;
     }
 
@@ -1283,14 +1296,17 @@ class TopicUpdateOptions final {
      *         `UnsupportedOptionKey`; a bad value with `InvalidOptionValue`.
      * @note Typed field wins on collision.
      */
-    const std::map<std::string, std::string> &Raw() const noexcept { return raw_; }
-    TopicUpdateOptions &SetRaw(std::map<std::string, std::string> raw) {
-        raw_ = std::move(raw);
+    const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+    TopicUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
+        for (const auto &entry : entries) {
+            raw_.emplace(entry.first, entry.second);
+        }
         return *this;
     }
-    TopicUpdateOptions &SetRawEntry(std::string key,
-                                    std::string value) {  // NOLINT(bugprone-easily-swappable-parameters)
-        raw_.emplace(std::move(key), std::move(value));
+    TopicUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
+        for (auto &entry : entries) {
+            raw_.emplace(std::move(entry.first), std::move(entry.second));
+        }
         return *this;
     }
 
@@ -1323,13 +1339,17 @@ class StreamUpdateOptions final {
      *         server-side via `FromStr`. Unknown keys rejected with
      *         `UnsupportedOptionKey`.
      */
-    const std::map<std::string, std::string> &Raw() const noexcept { return raw_; }
-    StreamUpdateOptions &SetRaw(std::map<std::string, std::string> raw) {
-        raw_ = std::move(raw);
+    const std::map<std::string, std::string> &RawEntries() const noexcept { return raw_; }
+    StreamUpdateOptions &SetRawEntries(const std::map<std::string, std::string> &entries) {
+        for (const auto &entry : entries) {
+            raw_.emplace(entry.first, entry.second);
+        }
         return *this;
     }
-    StreamUpdateOptions &SetRawEntry(std::string key, std::string value) {
-        raw_.emplace(std::move(key), std::move(value));
+    StreamUpdateOptions &SetRawEntries(std::map<std::string, std::string> &&entries) {
+        for (auto &entry : entries) {
+            raw_.emplace(std::move(entry.first), std::move(entry.second));
+        }
         return *this;
     }
 
@@ -1392,48 +1412,6 @@ class PollingStrategy final {
     std::string polling_strategy_kind_;
     std::uint64_t polling_strategy_value_;
 };
-
-namespace detail {
-
-/// Numeric option values are little-endian on the wire. Encoded byte by byte so
-/// a big-endian host produces the same block as a little-endian one.
-template <typename Value>
-std::vector<std::uint8_t> to_little_endian_bytes(const Value value) {
-    std::vector<std::uint8_t> bytes{};
-    bytes.reserve(sizeof(Value));
-    for (std::size_t index{}; index < sizeof(Value); ++index) {
-        bytes.push_back(static_cast<std::uint8_t>((value >> (index * 8)) & 0xFF));
-    }
-
-    return bytes;
-}
-
-inline std::vector<std::uint8_t> to_bool_bytes(const bool value) {
-    std::vector<std::uint8_t> bytes{};
-    bytes.push_back(static_cast<std::uint8_t>(value ? 1 : 0));
-
-    return bytes;
-}
-
-inline std::vector<std::uint8_t> to_key_bytes(const std::string_view key) {
-    std::vector<std::uint8_t> bytes{};
-    bytes.reserve(key.size());
-    for (const char character : key) {
-        bytes.push_back(static_cast<std::uint8_t>(character));
-    }
-
-    return bytes;
-}
-
-/// An option key is always `String`-kinded. Only the value kind varies per key.
-inline HeaderEntry to_option_entry(const std::string_view key,
-                                   const HeaderKind value_kind,
-                                   std::vector<std::uint8_t> value) {
-    return HeaderEntry::Create(HeaderField::Create(HeaderKind::String, to_key_bytes(key)),
-                               HeaderField::Create(value_kind, std::move(value)));
-}
-
-}  // namespace detail
 
 /**
  * @brief Owning client connection to an Apache Iggy server.

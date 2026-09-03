@@ -37,7 +37,8 @@ TEST_F(E2E_Partition, CreatePartitionsSucceeds) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
     ASSERT_NO_THROW(
         client.CreatePartitions(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 43));
 
@@ -82,7 +83,8 @@ TEST_F(E2E_Partition, CreatePartitionsOnNonExistentResourcesThrows) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     ASSERT_THROW(
         client.CreatePartitions(iggy::Identifier::String(missing_stream_name), iggy::Identifier::String(topic_name), 1),
@@ -101,7 +103,8 @@ TEST_F(E2E_Partition, CreatePartitionsWithInvalidIdentifiersThrows) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     ASSERT_THROW(client.CreatePartitions(iggy::Identifier::String(""), iggy::Identifier::String(topic_name), 1),
                  std::exception);
@@ -143,7 +146,8 @@ TEST_F(E2E_Partition, CreatePartitionsWithBoundaryPartitionsCountValues) {
 
     for (const auto &test_case : test_cases) {
         SCOPED_TRACE(test_case.topic_name);
-        ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), test_case.topic_name, 1));
+        ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), test_case.topic_name,
+                                           iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
         if (test_case.should_succeed) {
             ASSERT_NO_THROW(client.CreatePartitions(iggy::Identifier::String(stream_name),
@@ -184,7 +188,8 @@ TEST_F(E2E_Partition, CreatePartitionsWithNumericIdentifiersSucceeds) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(stream_details.Topics().size(), 1u);
@@ -210,7 +215,8 @@ TEST_F(E2E_Partition, DeletePartitionsSucceeds) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 44));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(44)));
     ASSERT_NO_THROW(
         client.DeletePartitions(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 43));
 
@@ -249,8 +255,9 @@ TEST_F(E2E_Partition, DeleteMorePartitionsThanExistingThrows) {
 
     for (const auto &test_case : test_cases) {
         SCOPED_TRACE(test_case.topic_name);
-        ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), test_case.topic_name,
-                                           test_case.initial_partitions));
+        ASSERT_NO_THROW(
+            client.CreateTopic(iggy::Identifier::String(stream_name), test_case.topic_name,
+                               iggy::TopicCreateOptions().SetPartitionsCount(test_case.initial_partitions)));
 
         if (test_case.should_succeed) {
             ASSERT_NO_THROW(client.DeletePartitions(iggy::Identifier::String(stream_name),
@@ -291,7 +298,8 @@ TEST_F(E2E_Partition, DeletePartitionsBeforeCreatingAdditionalPartitionsSucceeds
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(3)));
     ASSERT_NO_THROW(
         client.DeletePartitions(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 1));
 
@@ -312,7 +320,10 @@ TEST_F(E2E_Partition, DeletePartitionsFromTopicWithZeroPartitionsThrows) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 0));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(
+        client.DeletePartitions(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 1));
 
     ASSERT_THROW(
         client.DeletePartitions(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 1),
@@ -359,7 +370,8 @@ TEST_F(E2E_Partition, DeletePartitionsOnNonExistentResourcesThrows) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(3)));
 
     ASSERT_THROW(
         client.DeletePartitions(iggy::Identifier::String(missing_stream_name), iggy::Identifier::String(topic_name), 1),
@@ -378,7 +390,8 @@ TEST_F(E2E_Partition, DeletePartitionsWithInvalidIdentifiersThrows) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(3)));
 
     ASSERT_THROW(client.DeletePartitions(iggy::Identifier::String(""), iggy::Identifier::String(topic_name), 1),
                  std::exception);
@@ -401,7 +414,8 @@ TEST_F(E2E_Partition, DeletePartitionsTwiceForSameTopicSucceeds) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 45));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(45)));
     ASSERT_NO_THROW(
         client.DeletePartitions(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name), 20));
     ASSERT_NO_THROW(
@@ -424,7 +438,8 @@ TEST_F(E2E_Partition, DeletePartitionsAfterStreamDeletionThrows) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 3));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(3)));
 
     const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(stream_details.Topics().size(), 1u);
@@ -446,7 +461,8 @@ TEST_F(E2E_Partition, CreatePartitionsAfterTopicDeletionThrows) {
 
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
     ASSERT_NO_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)));
 
     ASSERT_THROW(

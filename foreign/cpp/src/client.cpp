@@ -116,21 +116,27 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.partitions_count     = 0;
         }
         if (auto value = options.CompressionAlgorithm()) {
-            ffi_options.compression_algorithm = std::string(value->CompressionAlgorithmValue());
+            ffi_options.has_compression_algorithm = true;
+            ffi_options.compression_algorithm     = std::string(value->CompressionAlgorithmValue());
         } else {
-            ffi_options.compression_algorithm = "";
+            ffi_options.has_compression_algorithm = false;
+            ffi_options.compression_algorithm     = "";
         }
         if (auto value = options.MessageExpiry()) {
+            ffi_options.has_message_expiry   = true;
             ffi_options.message_expiry_kind  = std::string(value->ExpiryKind());
             ffi_options.message_expiry_value = value->ExpiryValue();
         } else {
+            ffi_options.has_message_expiry   = false;
             ffi_options.message_expiry_kind  = "";
             ffi_options.message_expiry_value = 0;
         }
         if (auto value = options.MaxTopicSize()) {
-            ffi_options.max_topic_size = std::string(value->MaxTopicSizeValue());
+            ffi_options.has_max_topic_size = true;
+            ffi_options.max_topic_size     = std::string(value->MaxTopicSizeValue());
         } else {
-            ffi_options.max_topic_size = "";
+            ffi_options.has_max_topic_size = false;
+            ffi_options.max_topic_size     = "";
         }
         if (auto value = options.SegmentSize()) {
             ffi_options.has_segment_size = true;
@@ -167,8 +173,8 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.has_preallocate_segments = false;
             ffi_options.preallocate_segments     = false;
         }
-        ffi_options.raw_options.reserve(options.Raw().size());
-        for (const auto &entry : options.Raw()) {
+        ffi_options.raw_options.reserve(options.RawEntries().size());
+        for (const auto &entry : options.RawEntries()) {
             ffi::HeaderEntry ffi_entry;
             ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
             ffi_entry.key.value.reserve(entry.first.size());
@@ -194,24 +200,30 @@ void IggyBlockingClient::UpdateTopic(const Identifier &stream,
     return RethrowAsIggyException([this, &stream, &topic, &name, &options] {
         ffi::TopicUpdateOptions ffi_options;
         if (auto value = options.CompressionAlgorithm()) {
-            ffi_options.compression_algorithm = std::string(value->CompressionAlgorithmValue());
+            ffi_options.has_compression_algorithm = true;
+            ffi_options.compression_algorithm     = std::string(value->CompressionAlgorithmValue());
         } else {
-            ffi_options.compression_algorithm = "";
+            ffi_options.has_compression_algorithm = false;
+            ffi_options.compression_algorithm     = "";
         }
         if (auto value = options.MessageExpiry()) {
+            ffi_options.has_message_expiry   = true;
             ffi_options.message_expiry_kind  = std::string(value->ExpiryKind());
             ffi_options.message_expiry_value = value->ExpiryValue();
         } else {
+            ffi_options.has_message_expiry   = false;
             ffi_options.message_expiry_kind  = "";
             ffi_options.message_expiry_value = 0;
         }
         if (auto value = options.MaxTopicSize()) {
-            ffi_options.max_topic_size = std::string(value->MaxTopicSizeValue());
+            ffi_options.has_max_topic_size = true;
+            ffi_options.max_topic_size     = std::string(value->MaxTopicSizeValue());
         } else {
-            ffi_options.max_topic_size = "";
+            ffi_options.has_max_topic_size = false;
+            ffi_options.max_topic_size     = "";
         }
-        ffi_options.raw_options.reserve(options.Raw().size());
-        for (const auto &entry : options.Raw()) {
+        ffi_options.raw_options.reserve(options.RawEntries().size());
+        for (const auto &entry : options.RawEntries()) {
             ffi::HeaderEntry ffi_entry;
             ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
             ffi_entry.key.value.reserve(entry.first.size());

@@ -431,9 +431,12 @@ mod ffi {
     struct TopicCreateOptions {
         has_partitions_count: bool,
         partitions_count: u32,
+        has_compression_algorithm: bool,
         compression_algorithm: String,
+        has_message_expiry: bool,
         message_expiry_kind: String,
         message_expiry_value: u64,
+        has_max_topic_size: bool,
         max_topic_size: String,
         has_segment_size: bool,
         segment_size: u64,
@@ -449,9 +452,12 @@ mod ffi {
     }
 
     struct TopicUpdateOptions {
+        has_compression_algorithm: bool,
         compression_algorithm: String,
+        has_message_expiry: bool,
         message_expiry_kind: String,
         message_expiry_value: u64,
+        has_max_topic_size: bool,
         max_topic_size: String,
         raw_options: Vec<HeaderEntry>,
     }

@@ -27,10 +27,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 
-#include "iggy.hpp"
 #include "world.hpp"
 
 GIVEN("^I have no streams in the system$") {
@@ -69,18 +69,19 @@ WHEN("^I create a topic with name \"([^\"]{1,255})\" in stream ([0-9]+) with ([0
     REGEX_PARAM(int, partitions_count);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    // Drive the SDK through the typed helpers in iggy.hpp rather than raw strings. Options that
-    // still take plain strings below (partitioning kind, consumer kind) mark where the C++ SDK
-    // does not yet expose a typed wrapper.
-    const auto compression    = iggy::CompressionAlgorithm::None();
-    const auto message_expiry = iggy::Expiry::NeverExpire();
-    const auto max_topic_size = iggy::MaxTopicSize::ServerDefault();
+    iggy::ffi::TopicCreateOptions opts{};
+    opts.has_partitions_count      = true;
+    opts.partitions_count          = static_cast<std::uint32_t>(partitions_count);
+    opts.has_compression_algorithm = true;
+    opts.compression_algorithm     = "none";
+    opts.has_message_expiry        = true;
+    opts.message_expiry_kind       = "never_expire";
+    opts.message_expiry_value      = std::numeric_limits<std::uint64_t>::max();
+    opts.has_max_topic_size        = true;
+    opts.max_topic_size            = "server_default";
 
     context->client->create_topic(bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)), topic_name,
-                                  static_cast<std::uint32_t>(partitions_count),
-                                  std::string(compression.CompressionAlgorithmValue()),
-                                  std::string(message_expiry.ExpiryKind()), message_expiry.ExpiryValue(),
-                                  std::string(max_topic_size.MaxTopicSizeValue()), {});
+                                  std::move(opts));
 }
 
 THEN("^the topic should be created successfully$") {
@@ -146,12 +147,10 @@ WHEN("^I poll messages from stream ([0-9]+), topic ([0-9]+), partition ([0-9]+) 
     REGEX_PARAM(int, offset);
     cucumber::ScenarioScope<bdd::GlobalContext> context;
 
-    const auto polling_strategy = iggy::PollingStrategy::Offset(static_cast<std::uint64_t>(offset));
-    const auto polled           = context->client->poll_messages(
+    const auto polled = context->client->poll_messages(
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), static_cast<std::uint32_t>(partition_id),
-        "consumer", bdd::make_numeric_identifier(1), std::string(polling_strategy.PollingStrategyKind()),
-        polling_strategy.PollingStrategyValue(), 100, false);
+        "consumer", bdd::make_numeric_identifier(1), "offset", static_cast<std::uint64_t>(offset), 100, false);
 
     context->polled.count = polled.count;
     context->polled.offsets.clear();

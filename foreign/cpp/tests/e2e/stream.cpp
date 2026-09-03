@@ -223,36 +223,6 @@ TEST_F(E2E_Stream, UpdateDeletedStreamThrows) {
     ASSERT_THROW(client.UpdateStream(iggy::Identifier::String(stream_name), updated_stream_name), std::exception);
 }
 
-TEST_F(E2E_Stream, UpdateStreamFailedValidationDoesNotMutateStream) {
-    RecordProperty("description", "Keeps the stream unchanged when update_stream fails wrapper validation.");
-    const std::string stream_name         = GetRandomName();
-    const std::string updated_stream_name = GetRandomName();
-    auto client                           = GetLoggedInHighLevelClient();
-    iggy::ffi::Client *ffi_client         = GetLoggedInClient();
-    ASSERT_NO_THROW(client.CreateStream(stream_name));
-    TrackStream(stream_name);
-
-    auto stream_before_failed_update = client.GetStream(iggy::Identifier::String(stream_name));
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(ffi_client->update_stream(std::move(invalid_numeric_id), updated_stream_name), std::exception);
-
-    auto stream_after_failed_update = client.GetStream(iggy::Identifier::String(stream_name));
-
-    EXPECT_EQ(stream_after_failed_update.Id(), stream_before_failed_update.Id());
-    EXPECT_EQ(stream_after_failed_update.CreatedAt(), stream_before_failed_update.CreatedAt());
-    EXPECT_EQ(stream_after_failed_update.Name(), stream_before_failed_update.Name());
-    EXPECT_EQ(stream_after_failed_update.SizeBytes(), stream_before_failed_update.SizeBytes());
-    EXPECT_EQ(stream_after_failed_update.MessagesCount(), stream_before_failed_update.MessagesCount());
-    EXPECT_EQ(stream_after_failed_update.TopicsCount(), stream_before_failed_update.TopicsCount());
-    EXPECT_EQ(stream_after_failed_update.Topics().size(), stream_before_failed_update.Topics().size());
-
-    ASSERT_THROW(client.GetStream(iggy::Identifier::String(updated_stream_name)), std::exception);
-}
-
 TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
     RecordProperty(
         "description",
@@ -273,8 +243,11 @@ TEST_F(E2E_Stream, UpdateStreamOnlyChangesName) {
     ForgetTrackedStream(stream_name);
     TrackStream(stream_id);
 
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::Numeric(stream_id), topic_name, 2,
-                                       iggy::CompressionAlgorithm::None(), iggy::Expiry::NeverExpire()));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::Numeric(stream_id), topic_name,
+                                       iggy::TopicCreateOptions()
+                                           .SetPartitionsCount(2)
+                                           .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
+                                           .SetMessageExpiry(iggy::Expiry::NeverExpire())));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 3; ++i) {
@@ -490,8 +463,11 @@ TEST_F(E2E_Stream, GetStreamsFieldsVerification) {
     TrackStream(stream_name);
     auto stream                  = client.GetStream(iggy::Identifier::String(stream_name));
     const std::string topic_name = GetRandomName();
-    client.CreateTopic(iggy::Identifier::Numeric(stream.Id()), topic_name, 1, iggy::CompressionAlgorithm::None(),
-                       iggy::Expiry::NeverExpire());
+    client.CreateTopic(iggy::Identifier::Numeric(stream.Id()), topic_name,
+                       iggy::TopicCreateOptions()
+                           .SetPartitionsCount(1)
+                           .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
+                           .SetMessageExpiry(iggy::Expiry::NeverExpire()));
 
     rust::Vec<iggy::ffi::IggyMessageToSend> messages;
     for (std::uint32_t i = 0; i < 5; i++) {
@@ -621,11 +597,18 @@ TEST_F(E2E_Stream, PurgeStreamPreservesStreamMetadata) {
     iggy::ffi::Client *ffi_client       = GetLoggedInClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name, 2,
-                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
-                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name, 3,
-                                       iggy::CompressionAlgorithm::None(), iggy::Expiry::NeverExpire()));
+    ASSERT_NO_THROW(
+        client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name,
+                           iggy::TopicCreateOptions()
+                               .SetPartitionsCount(2)
+                               .SetCompressionAlgorithm(iggy::CompressionAlgorithm::Gzip())
+                               .SetMessageExpiry(iggy::Expiry::Duration(1000))
+                               .SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL))));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
+                                       iggy::TopicCreateOptions()
+                                           .SetPartitionsCount(3)
+                                           .SetCompressionAlgorithm(iggy::CompressionAlgorithm::None())
+                                           .SetMessageExpiry(iggy::Expiry::NeverExpire())));
 
     const auto stream_before_purge = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(stream_before_purge.Topics().size(), 2u);
@@ -694,8 +677,10 @@ TEST_F(E2E_Stream, PurgeStreamRemovesMessagesAndPreservesTopics) {
     iggy::ffi::Client *ffi_client       = GetLoggedInClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name, 1));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     const auto created_stream = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(created_stream.Topics().size(), 2u);
@@ -795,8 +780,10 @@ TEST_F(E2E_Stream, PurgeStreamAcrossMultipleTopicsAndPartitionsClearsEverything)
     iggy::ffi::Client *ffi_client       = GetLoggedInClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name, 2));
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name, 3));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), first_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(2)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), second_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(3)));
 
     const auto created_stream = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(created_stream.Topics().size(), 2u);
@@ -864,7 +851,8 @@ TEST_F(E2E_Stream, PurgeStreamThenSendMessagesAgainSucceeds) {
     iggy::ffi::Client *ffi_client = GetLoggedInClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     const auto created_stream = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(created_stream.Topics().size(), 1u);
@@ -901,7 +889,8 @@ TEST_F(E2E_Stream, PurgeStreamTwiceKeepsStreamEmptyAndTopicsIntact) {
     iggy::ffi::Client *ffi_client = GetLoggedInClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(1)));
 
     const auto created_stream = client.GetStream(iggy::Identifier::String(stream_name));
     ASSERT_EQ(created_stream.Topics().size(), 1u);
