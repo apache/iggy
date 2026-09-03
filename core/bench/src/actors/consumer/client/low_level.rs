@@ -22,6 +22,7 @@ use crate::benchmarks::common::create_consumer;
 use crate::utils::ClientFactory;
 use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
 use iggy::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -36,7 +37,9 @@ pub struct LowLevelConsumerClient {
     partition_id: Option<u32>,
     polling_strategy: PollingStrategy,
     auto_commit: bool,
-    offset: u64,
+    /// Where offset polling continues in each partition. A group member polls its partitions
+    /// round-robin, so one shared cursor would skip the start of every partition but the first.
+    next_offsets: HashMap<u32, u64>,
 }
 
 impl LowLevelConsumerClient {
@@ -51,7 +54,7 @@ impl LowLevelConsumerClient {
             partition_id: None,
             polling_strategy: PollingStrategy::next(),
             auto_commit: true,
-            offset: 0,
+            next_offsets: HashMap::new(),
         }
     }
 }
@@ -62,14 +65,21 @@ impl ConsumerClient for LowLevelConsumerClient {
         let consumer = self.consumer.as_ref().expect("consumer not initialized");
         let messages_to_receive = self.config.messages_per_batch.get();
 
+        let polling_strategy = self.polling_strategy;
+        let next_offsets = &self.next_offsets;
+        let strategy_for = |partition_id: u32| {
+            next_offsets
+                .get(&partition_id)
+                .map_or(polling_strategy, |offset| PollingStrategy::offset(*offset))
+        };
         let before_poll = Instant::now();
         let polled = client
-            .poll_messages(
+            .poll_messages_with_strategy_for(
                 &self.stream_id,
                 &self.topic_id,
                 self.partition_id,
                 consumer,
-                &self.polling_strategy,
+                &strategy_for,
                 messages_to_receive,
                 self.auto_commit,
             )
@@ -99,9 +109,11 @@ impl ConsumerClient for LowLevelConsumerClient {
         let user_bytes = batch_user_size_bytes(&polled);
         let total_bytes = batch_total_size_bytes(&polled);
 
-        self.offset += messages_count;
-        if self.polling_strategy.kind == PollingKind::Offset {
-            self.polling_strategy.value += messages_count;
+        if self.polling_strategy.kind == PollingKind::Offset
+            && let Some(last) = polled.messages.last()
+        {
+            self.next_offsets
+                .insert(polled.partition_id, last.header.offset + 1);
         }
 
         Ok(Some(BatchMetrics {
@@ -137,7 +149,7 @@ impl BenchmarkInit for LowLevelConsumerClient {
         )
         .await;
         let (polling_strategy, auto_commit) = match self.config.polling_kind {
-            PollingKind::Offset => (PollingStrategy::offset(self.offset), false),
+            PollingKind::Offset => (PollingStrategy::offset(0), false),
             PollingKind::Next => (PollingStrategy::next(), true),
             _ => panic!("Unsupported polling kind: {:?}", self.config.polling_kind),
         };
