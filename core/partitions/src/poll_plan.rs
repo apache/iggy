@@ -33,7 +33,9 @@
 use crate::PollFragments;
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
-use crate::journal::{MessageLookup, push_selected_batch_fragments, select_batch_slice};
+use crate::journal::{
+    MessageLookup, push_selected_batch_fragments, select_batch_slice, unpin_sparse_source,
+};
 use compio::io::AsyncReadAtExt;
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets, IggyError,
@@ -572,6 +574,7 @@ impl DiskReadPlan {
                     faulted = true;
                     break 'walk;
                 };
+                let fragments_before_chunk = fragments.len();
                 let ChunkWalk { consumed, corrupt } = walk_disk_chunk(
                     &chunk,
                     query,
@@ -586,6 +589,8 @@ impl DiskReadPlan {
                     },
                     self.namespace_raw,
                 );
+                // Detached from the pump, so the ratio alone bounds the copy.
+                unpin_sparse_source(&mut fragments, fragments_before_chunk, &chunk, usize::MAX);
                 if corrupt {
                     // A batch that does not match its own checksum. Fail closed like
                     // an IO fault: serving it hands a consumer data provably not what

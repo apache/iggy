@@ -688,7 +688,7 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// the WAL at all. They receive a `MetadataHandoff::Waiter` factory
     /// bundle from shard 0 over the bootstrap broadcast channel and
     /// reconstruct `mux_stm` from the in-memory snapshot it carries (see
-    /// `server/src/bootstrap.rs` `await_metadata_bundle` /
+    /// `server/src/boot/handoff.rs` `await_metadata_bundle` /
     /// `broadcast_metadata_bundle`).
     pub journal: Option<J>,
     /// `Some` on shard 0, `None` on other shards.
@@ -4056,7 +4056,9 @@ mod tests {
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_common::variadic;
     use journal::prepare_journal::PrepareJournal;
-    use message_bus::{ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError};
+    use message_bus::{
+        BusMessage, ClientForwardFn, ConnectionLostFn, JoinHandle, ReplicaForwardFn, SendError,
+    };
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
     use std::cell::RefCell;
@@ -4389,7 +4391,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }
@@ -4545,7 +4547,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             if self.stall.get() {
                 self.stall_hits.set(self.stall_hits.get() + 1);

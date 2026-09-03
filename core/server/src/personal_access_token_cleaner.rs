@@ -22,7 +22,7 @@
 //! proposes it once and every replica applies the commit. Backups never
 //! propose, so cleanup cannot race across the cluster.
 
-use crate::bootstrap::ServerShard;
+use crate::shell::ServerShard;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::WireName;
 use iggy_common::IggyTimestamp;

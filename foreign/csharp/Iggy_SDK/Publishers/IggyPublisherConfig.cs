@@ -93,16 +93,18 @@ public class IggyPublisherConfig
     public Identifier TopicId { get; set; }
 
     /// <summary>
-    ///     Gets or sets the size of the receive buffer in bytes.
-    ///     Default is 4096 bytes (4 KB).
+    ///     The size of the receive buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_rmem</c>.
     /// </summary>
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public int? ReceiveBufferSize { get; set; } = null;
 
     /// <summary>
-    ///     Gets or sets the size of the send buffer in bytes.
-    ///     Default is 4096 bytes (4 KB).
+    ///     The size of the send buffer in bytes. When null, the size is not set on the socket, so the
+    ///     operating system default is used. On Linux, this keeps TCP auto-tuning enabled. The initial size
+    ///     is the middle value in <c>/proc/sys/net/ipv4/tcp_wmem</c>.
     /// </summary>
-    public int SendBufferSize { get; set; } = 4096;
+    public int? SendBufferSize { get; set; } = null;
 
     /// <summary>
     ///     Gets or sets the partitioning strategy for messages.

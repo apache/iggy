@@ -113,6 +113,15 @@ pub const DEFAULT_EVICTED_RING_BYTES_MAX: u64 = 16 * 1024 * 1024;
 /// trips first evicts; this byte ceiling is the second typo guard.
 pub const MAX_EVICTED_RING_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Shipped default for [`PartitionConfig::dedup_clients_max`]; pinned against
+/// the runtime constant by a bootstrap assert.
+pub const PARTITION_DEDUP_CLIENTS_DEFAULT: usize = 4096;
+
+/// Ceiling for [`PartitionConfig::dedup_clients_max`]. A per-group budget, so
+/// the ceiling bounds worst-case memory at roughly `partitions * this * 146
+/// bytes`: a 112-byte slot entry plus its index-map slot.
+pub const PARTITION_DEDUP_CLIENTS_CEILING: usize = 1 << 16;
+
 /// Capacity tunables for the per-partition consensus plane.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct PartitionConfig {
@@ -122,6 +131,18 @@ pub struct PartitionConfig {
     /// path the SDK retries. Applies to every partition; raising it multiplies
     /// pinned request-buffer memory by the partition count.
     pub prepare_queue_depth: usize,
+
+    /// Distinct clients each partition group tracks request watermarks for,
+    /// deduplicating retried produces and consumer-offset writes. At capacity
+    /// the entry whose newest commit is oldest is evicted, which costs dedup
+    /// coverage for that client (its next replay re-executes, exactly as it
+    /// would have before dedup existed) and never correctness. Must be > 0 and
+    /// <= [`PARTITION_DEDUP_CLIENTS_CEILING`].
+    ///
+    /// Unlike `[metadata] clients_table_max`, this budget is PER GROUP, so the
+    /// worst case scales with partition count: size it to the producers a
+    /// single partition actually sees, not the node's client total.
+    pub dedup_clients_max: usize,
 
     /// Entries the evicted ring retains per multi-replica partition for
     /// journal repair after a peer rejoins. Larger widens the window a
@@ -174,6 +195,14 @@ impl Validatable<ConfigurationError> for PartitionConfig {
                  bitset, and this depth bounds that suffix. Deeper produces entries a new \
                  primary can neither adopt nor prove dead. Lowered from 256; not raisable.",
                 self.prepare_queue_depth
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.dedup_clients_max == 0 || self.dedup_clients_max > PARTITION_DEDUP_CLIENTS_CEILING {
+            eprintln!(
+                "{COMPONENT} partition.dedup_clients_max ({}) must be > 0 and <= \
+                 {PARTITION_DEDUP_CLIENTS_CEILING}",
+                self.dedup_clients_max
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -251,6 +280,29 @@ mod tests {
             DEFAULT_TRANSFER_SERVED_CACHE_BYTES_MAX,
             "config.toml transfer_served_cache_bytes_max drifted from the runtime default"
         );
+    }
+
+    #[test]
+    fn shipped_dedup_default_matches_the_runtime_constant() {
+        assert_eq!(
+            PartitionConfig::default().dedup_clients_max,
+            PARTITION_DEDUP_CLIENTS_DEFAULT,
+            "config.toml dedup_clients_max drifted from the runtime default"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_dedup_clients_max() {
+        for value in [0, PARTITION_DEDUP_CLIENTS_CEILING + 1] {
+            let config = PartitionConfig {
+                dedup_clients_max: value,
+                ..PartitionConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "dedup_clients_max {value} must be rejected"
+            );
+        }
     }
 
     #[test]

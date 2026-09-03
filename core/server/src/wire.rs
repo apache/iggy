@@ -26,7 +26,7 @@ use iggy_common::IggyError;
 use message_bus::installer::conn_info::ClientTransportKind;
 use server_common::Message;
 
-pub(crate) fn request_body(request: &Message<RoutedRequestHeader>) -> &[u8] {
+pub fn request_body(request: &Message<RoutedRequestHeader>) -> &[u8] {
     &request.as_slice()[std::mem::size_of::<RoutedRequestHeader>()..request.header().size as usize]
 }
 
@@ -38,9 +38,7 @@ pub(crate) fn request_body(request: &Message<RoutedRequestHeader>) -> &[u8] {
 ///
 /// # Errors
 /// [`IggyError::InvalidFormat`] when the stamp disagrees with the body.
-pub(crate) fn verify_request_checksum(
-    request: &Message<RoutedRequestHeader>,
-) -> Result<(), IggyError> {
+pub fn verify_request_checksum(request: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
     let stamped = request.header().request_checksum;
     if stamped == 0 || u128::from(iggy_common::calculate_checksum(request_body(request))) == stamped
     {
@@ -53,7 +51,7 @@ pub(crate) fn verify_request_checksum(
 /// (`1=TCP, 2=QUIC, 4=WebSocket`); TLS variants report their base
 /// transport. `ClientTransportKind` is `#[non_exhaustive]`, so any other
 /// (TCP, TCP-TLS, or a future) variant falls back to TCP.
-pub(crate) const fn transport_kind_to_wire(kind: ClientTransportKind) -> u8 {
+pub const fn transport_kind_to_wire(kind: ClientTransportKind) -> u8 {
     match kind {
         ClientTransportKind::Quic => 2,
         ClientTransportKind::Ws | ClientTransportKind::Wss => 4,
@@ -61,7 +59,7 @@ pub(crate) const fn transport_kind_to_wire(kind: ClientTransportKind) -> u8 {
     }
 }
 
-pub(crate) fn usize_to_u32(value: usize) -> Result<u32, IggyError> {
+pub fn usize_to_u32(value: usize) -> Result<u32, IggyError> {
     u32::try_from(value).map_err(|_| IggyError::InvalidIdentifier)
 }
 
@@ -69,7 +67,7 @@ pub(crate) fn usize_to_u32(value: usize) -> Result<u32, IggyError> {
 /// preserving the header (and fixing `size`). Used by the primary-side
 /// request rewrites that swap a secret-bearing wire body for the
 /// hash-carrying replicated body before consensus.
-pub(crate) fn rewrite_request_body(
+pub fn rewrite_request_body(
     request: &Message<RoutedRequestHeader>,
     body: &Bytes,
 ) -> Result<Message<RoutedRequestHeader>, IggyError> {
