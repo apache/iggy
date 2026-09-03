@@ -92,23 +92,21 @@ impl<'de> Deserialize<'de> for BenchmarkGroupMetrics {
 
                 let mut updated_summary = summary.clone();
 
-                // Calculate and populate missing statistics from the time series data
+                // Backfill for reports written before the three fields
+                // existed: `serde(default)` lands them at zero together, so
+                // all three being zero is what identifies such a report.
+                // Keyed on all three rather than on each alone -- a run whose
+                // samples are all equal reports a real zero std dev beside a
+                // nonzero min and max, and refilling that from the per-bucket
+                // moving average would put back the averaged-away extremes
+                // the summary is computed from raw samples to avoid.
                 if updated_summary.min_latency_ms == 0.0
-                    && let Some(min_val) = min(&avg_latency_ts)
+                    && updated_summary.max_latency_ms == 0.0
+                    && updated_summary.std_dev_latency_ms == 0.0
                 {
-                    updated_summary.min_latency_ms = min_val;
-                }
-
-                if updated_summary.max_latency_ms == 0.0
-                    && let Some(max_val) = max(&avg_latency_ts)
-                {
-                    updated_summary.max_latency_ms = max_val;
-                }
-
-                if updated_summary.std_dev_latency_ms == 0.0
-                    && let Some(std_dev_val) = std_dev(&avg_latency_ts)
-                {
-                    updated_summary.std_dev_latency_ms = std_dev_val;
+                    updated_summary.min_latency_ms = min(&avg_latency_ts).unwrap_or(0.0);
+                    updated_summary.max_latency_ms = max(&avg_latency_ts).unwrap_or(0.0);
+                    updated_summary.std_dev_latency_ms = std_dev(&avg_latency_ts).unwrap_or(0.0);
                 }
 
                 Ok(BenchmarkGroupMetrics {

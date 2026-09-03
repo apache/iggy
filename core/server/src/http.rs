@@ -36,6 +36,8 @@ mod session;
 mod state;
 mod submit;
 mod tls;
+#[cfg(feature = "iggy-web")]
+mod web;
 mod wire;
 
 use std::cell::{Cell, RefCell};
@@ -45,7 +47,6 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use axum::Router;
 use axum::extract::connect_info::Connected;
@@ -55,7 +56,7 @@ use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
 use compio::net::TcpListener;
-use configs::cluster::{ClusterConfig, TransportPorts, http_forwarding_key_material};
+use configs::cluster::{ClusterConfig, http_forwarding_key_material};
 use configs::http::{HttpConfig, HttpCorsConfig};
 use configs::server::ServerSystemConfig;
 use iggy_common::IggyError;
@@ -64,7 +65,6 @@ use send_wrapper::SendWrapper;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn};
 
-use crate::bootstrap::ServerShard;
 use crate::cluster_meta::ClusterRoster;
 use crate::http::handlers::{
     change_password, create_cg, create_partitions, create_pat, create_stream, create_topic,
@@ -78,34 +78,47 @@ use crate::http::handlers::{
 };
 use crate::http::jwt::JwtManager;
 use crate::http::session::RegistrationBarrier;
-use crate::http::state::{HttpInner, HttpState, insert_view_header};
+use crate::http::state::{ForwardState, HttpInner, HttpState, insert_view_header};
 use crate::server_error::ServerError;
+use crate::shell::ServerShard;
 
-/// Bind the shard-0 HTTP listener and spawn the `cyper-axum` serve loop as a
-/// background task on shard 0's compio runtime. Serves HTTPS when
-/// `http.tls.enabled` (a TLS accept pump feeds handshaken streams to the
-/// serve loop, see [`mod@tls`]), plain HTTP otherwise.
-///
-/// The caller gates this to shard 0 and to `http.enabled`; the listener stops
-/// when the bus shutdown token fires.
+/// The shard-0 HTTP listener before its socket exists: the address to bind
+/// and the config products the serve loop needs. Built first at boot, so a
+/// bad `[http.*]` section fails before any listener accepts; [`Self::bind`]
+/// opens the socket.
+pub struct PreparedHttp {
+    addr: SocketAddr,
+    jwt: JwtManager,
+    forward: ForwardState,
+    cors: Option<CorsLayer>,
+    metrics_endpoint: Option<String>,
+    max_request_size: usize,
+}
+
+/// The shard-0 HTTP listener between bind and serve, held apart so the bound
+/// port can be published (cluster roster, `current_config.toml`) before any
+/// request is answered.
+pub struct BoundHttp {
+    listener: TcpListener,
+    pub bound_addr: SocketAddr,
+    prepared: PreparedHttp,
+}
+
+/// Validate the HTTP config and build what the serve loop needs, without
+/// opening the socket; [`PreparedHttp::bind`] binds it and [`start`] serves
+/// it. The caller gates this to shard 0 and to `http.enabled`.
 ///
 /// # Errors
 ///
 /// Returns [`ServerError`] if the JWT manager cannot be built from
 /// `http_config.jwt`, the `[http.cors]` config is invalid, the `[http.tls]`
-/// credentials cannot be loaded, or the listener cannot bind to `addr`.
-#[allow(clippy::too_many_arguments)]
-pub async fn start(
-    shard: &Rc<ServerShard>,
+/// forwarding credentials cannot be loaded, or the `[http.metrics]` endpoint
+/// is not a route path.
+pub fn prepare(
     addr: SocketAddr,
     http_config: &HttpConfig,
-    clients_table_max: usize,
-    max_tokens_per_user: u32,
     cluster: &ClusterConfig,
-    system_config: Arc<ServerSystemConfig>,
-    self_ports: TransportPorts,
-    shard_metrics_all: &[shard::metrics::ShardMetrics],
-) -> Result<(), ServerError> {
+) -> Result<PreparedHttp, ServerError> {
     // In cluster mode with no configured JWT secret the signing key derives
     // from the cluster PSK, so a bearer minted on any node verifies on every
     // node - the invariant follower-to-primary forwarding depends on.
@@ -128,8 +141,8 @@ pub async fn start(
         usize::try_from(http_config.max_request_size.as_bytes_u64()).unwrap_or(usize::MAX);
     let forward =
         forward::build_forward_state(&http_config.tls, max_request_size, forwarding_active)?;
-    // Validated before bind so a bad [http.cors] fails boot before the socket
-    // opens and the "started" log prints.
+    // Validated here, before the socket opens, so a bad [http.cors] fails boot
+    // before the "started" log prints.
     let cors = http_config
         .cors
         .enabled
@@ -138,37 +151,89 @@ pub async fn start(
     // Same early-fail rule for the scrape path: axum panics on a route
     // without a leading '/', so reject it as a config error instead.
     let metrics_endpoint = metrics::validated_endpoint(&http_config.metrics)?;
-    let (listener, bound_addr) = client_listener::tcp::bind(addr).await?;
+    Ok(PreparedHttp {
+        addr,
+        jwt,
+        forward,
+        cors,
+        metrics_endpoint,
+        max_request_size,
+    })
+}
 
+impl PreparedHttp {
+    /// Open the socket. Kept apart from [`prepare`] so the caller can order it
+    /// after any boot step that may block, and the port never sits listening
+    /// with nothing serving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] if the listener cannot bind to the prepared
+    /// address.
+    pub fn bind(self) -> Result<BoundHttp, ServerError> {
+        let (listener, bound_addr) = client_listener::tcp::bind(self.addr).map_err(|source| {
+            error!(addr = %self.addr, error = %source, "failed to bind HTTP listener");
+            source
+        })?;
+        Ok(BoundHttp {
+            listener,
+            bound_addr,
+            prepared: self,
+        })
+    }
+}
+
+/// Assemble the router over a bound listener and spawn the `cyper-axum`
+/// serve loop as a background task on shard 0's compio runtime. Serves HTTPS
+/// when `http.tls.enabled` (a TLS accept pump feeds handshaken streams to the
+/// serve loop, see [`mod@tls`]), plain HTTP otherwise; the listener stops
+/// when the bus shutdown token fires.
+///
+/// `roster` is shard 0's own [`ClusterRoster`], so the HTTP and binary
+/// cluster-metadata reads serve one truth.
+///
+/// # Errors
+///
+/// Returns [`ServerError`] if the `[http.tls]` server credentials cannot be
+/// loaded.
+#[allow(clippy::too_many_arguments)]
+pub fn start(
+    bound: BoundHttp,
+    shard: &Rc<ServerShard>,
+    http_config: &HttpConfig,
+    clients_table_max: usize,
+    max_tokens_per_user: u32,
+    system_config: Arc<ServerSystemConfig>,
+    roster: Rc<ClusterRoster>,
+    shard_metrics_all: &[shard::metrics::ShardMetrics],
+) -> Result<(), ServerError> {
+    let BoundHttp {
+        listener,
+        bound_addr,
+        prepared:
+            PreparedHttp {
+                jwt,
+                forward,
+                cors,
+                metrics_endpoint,
+                max_request_size,
+                ..
+            },
+    } = bound;
     let state: HttpState = SendWrapper::new(Rc::new(HttpInner {
         shard: Rc::clone(shard),
         jwt,
         system_config,
         sessions: RefCell::new(HashMap::new()),
         registrations: RegistrationBarrier::default(),
-        roster: ClusterRoster {
-            enabled: cluster.enabled,
-            name: cluster.name.clone(),
-            nodes: cluster.nodes.iter().cloned().map(Into::into).collect(),
-            self_ip: bound_addr.ip().to_string(),
-            // The self node reports the live bound HTTP port; the other client
-            // ports arrive resolved from the caller.
-            self_ports: TransportPorts {
-                http: Some(bound_addr.port()),
-                ..self_ports
-            },
-            // The HTTP listener is shard-0-only, where the live consensus
-            // handle supplies the leader; the published-view fallback is
-            // never consulted here.
-            metadata_view: Arc::new(AtomicU64::new(crate::cluster_meta::METADATA_VIEW_UNKNOWN)),
-        },
+        roster,
         max_http_sessions: crate::http::session::max_http_sessions(clients_table_max),
         max_tokens_per_user,
         in_flight_writes: Cell::new(0),
         forward,
         metrics: metrics::HttpMetrics::init(shard_metrics_all),
     }));
-    let router = router(
+    let app = router(
         state,
         max_request_size,
         cors,
@@ -186,7 +251,7 @@ pub async fn start(
         );
         shard.bus.track_background(pump);
         info!(address = %bound_addr, "server HTTPS listener started");
-        let handle = compio::runtime::spawn(tls::serve(connections, router, shard.bus.token()));
+        let handle = compio::runtime::spawn(tls::serve(connections, app, shard.bus.token()));
         shard.bus.track_background(handle);
     } else {
         info!(address = %bound_addr, "server HTTP listener started");
@@ -194,7 +259,7 @@ pub async fn start(
         let handle = compio::runtime::spawn(async move {
             if let Err(error) = cyper_axum::serve(
                 listener,
-                router.into_make_service_with_connect_info::<ClientAddr>(),
+                app.into_make_service_with_connect_info::<ClientAddr>(),
             )
             .with_graceful_shutdown(async move { shutdown.wait().await })
             .await
@@ -299,7 +364,7 @@ fn router(
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client));
     let local = match metrics_endpoint {
-        Some(endpoint) => local.route(endpoint, get(metrics::get_metrics)),
+        Some(endpoint) => local.route(endpoint, get(handlers::get_metrics)),
         None => local,
     };
     let router = Router::new()
@@ -457,7 +522,7 @@ fn merge_web_ui(router: Router, web_ui: bool) -> Router {
     #[cfg(feature = "iggy-web")]
     let router = if web_ui {
         info!("Web UI enabled at /ui");
-        router.merge(crate::web::router())
+        router.merge(web::router())
     } else {
         router
     };

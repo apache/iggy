@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Login/register failure taxonomy.
+//! Login/register failure taxonomy, shared by both spines.
 //!
-//! The login/register flow itself lives in `dispatch` + `auth`; this module
-//! owns the error type those handlers return and the terminal-vs-transient
-//! split that decides a fast-fail reply versus a silent close (recoverable
-//! failures stay silent so the SDK replays).
+//! Its own leaf because the TCP spine raises these ([`super::session_ops`])
+//! while the HTTP spine maps them to wire errors (`crate::http::reply`).
+//! Parked in either spine it would make one import the other's session module
+//! for a type neither owns.
 
 use crate::session_manager::SessionError;
 use metadata::MetadataSubmitError;
@@ -71,18 +71,3 @@ impl std::fmt::Display for LoginRegisterError {
 }
 
 impl std::error::Error for LoginRegisterError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn terminal_vs_transient() {
-        assert!(LoginRegisterError::InvalidCredentials.is_terminal());
-        assert!(LoginRegisterError::InvalidToken.is_terminal());
-        assert!(LoginRegisterError::UserInactive.is_terminal());
-        assert!(LoginRegisterError::Session(SessionError::ConnectionNotFound(0)).is_terminal());
-        // Transient is the only recoverable variant: never terminal.
-        assert!(!LoginRegisterError::Transient(MetadataSubmitError::PipelineFull).is_terminal());
-    }
-}

@@ -17,16 +17,16 @@
 
 use crate::router::arrow_streamer::JsonArrowReader;
 use crate::slice_user_table;
+use arrow_array::RecordBatch;
 use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
 use iceberg::TableIdent;
-use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{
-    Literal, PartitionKey, PartitionSpec, PrimitiveLiteral, PrimitiveType, Struct, StructType,
-};
+use iceberg::arrow::{RecordBatchPartitionSplitter, schema_to_arrow_schema};
+use iceberg::io::FileIO;
+use iceberg::spec::{DataFile, PartitionKey, Struct};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder};
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
@@ -36,9 +36,15 @@ use iceberg::{
 };
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
 use parquet::file::properties::WriterProperties;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
+
+type ParquetDataFileWriterBuilder =
+    DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
+type ParquetDataFileWriter =
+    DataFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
 fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut chain = err.to_string();
@@ -67,56 +73,51 @@ async fn table_exists(route_field_val: &str, catalog: &dyn Catalog) -> Option<Ta
     catalog.load_table(&table_ident).await.ok()
 }
 
-pub fn primitive_type_to_literal(pt: &PrimitiveType) -> Result<PrimitiveLiteral, Error> {
-    match pt {
-        PrimitiveType::Boolean => Ok(PrimitiveLiteral::Boolean(false)),
-        PrimitiveType::Int => Ok(PrimitiveLiteral::Int(0)),
-        PrimitiveType::Long => Ok(PrimitiveLiteral::Long(0)),
-        PrimitiveType::Decimal { .. } => Ok(PrimitiveLiteral::Int128(0)),
-        PrimitiveType::Date => Ok(PrimitiveLiteral::Int(0)), // e.g. days since epoch
-        PrimitiveType::Time => Ok(PrimitiveLiteral::Long(0)), // microseconds since midnight
-        PrimitiveType::Timestamp => Ok(PrimitiveLiteral::Long(0)), // microseconds since epoch
-        PrimitiveType::Timestamptz => Ok(PrimitiveLiteral::Long(0)),
-        PrimitiveType::TimestampNs => Ok(PrimitiveLiteral::Long(0)),
-        PrimitiveType::TimestamptzNs => Ok(PrimitiveLiteral::Long(0)),
-        PrimitiveType::String => Ok(PrimitiveLiteral::String(String::new())),
-        PrimitiveType::Uuid => Ok(PrimitiveLiteral::Binary(vec![0; 16])),
-        PrimitiveType::Fixed(len) => Ok(PrimitiveLiteral::Binary(vec![0; *len as usize])),
-        PrimitiveType::Binary => Ok(PrimitiveLiteral::Binary(Vec::new())),
-        _ => {
-            error!("Partition type not supported");
-            Err(Error::InvalidConfig)
-        }
-    }
-}
-
-fn get_partition_type_value(default_partition_type: &StructType) -> Result<Option<Struct>, Error> {
-    let mut fields: Vec<Option<Literal>> = Vec::new();
-
-    if default_partition_type.fields().is_empty() {
-        return Ok(None);
-    };
-
-    for field in default_partition_type.fields() {
-        let field_type = field.field_type.as_primitive_type().ok_or_else(|| {
-            error!("The partition type of the configured iceberg table is not a primitive type");
-            Error::InvalidConfig
-        })?;
-
-        let value = Some(Literal::Primitive(primitive_type_to_literal(field_type)?));
-
-        fields.push(value);
-    }
-    Ok(Some(Struct::from_iter(fields)))
-}
-
 async fn write_data(
     messages: &[Payload],
     table: &Table,
     catalog: &dyn Catalog,
     messages_schema: Schema,
 ) -> Result<(), Error> {
-    let location = DefaultLocationGenerator::new(table.metadata().clone()).map_err(|err| {
+    let data_files = write_data_files(messages, table, messages_schema).await?;
+
+    // Data files are kept on commit failure: the catalog may have applied the
+    // commit before the error surfaced, and deleting files referenced by a
+    // committed snapshot would corrupt the table.
+    let table_commit = Transaction::new(table);
+
+    let action = table_commit.fast_append().add_data_files(data_files);
+
+    let tx = action.apply(table_commit).map_err(|err| {
+        let chain = format_error_chain(&err);
+        error!(
+            "Failed to apply transaction on table with UUID: {}, Error: {}",
+            table.metadata().uuid(),
+            chain
+        );
+        Error::TransactionApplyError(chain)
+    })?;
+
+    tx.commit(catalog).await.map_err(|err| {
+        let chain = format_error_chain(&err);
+        error!(
+            "Failed to commit transaction on table with UUID: {}, Error: {}",
+            table.metadata().uuid(),
+            chain
+        );
+        Error::CatalogCommitError(chain)
+    })?;
+    Ok(())
+}
+
+/// Writes the JSON payloads as Parquet data files under the table location,
+/// laid out by the table's default partition spec. Nothing is committed here.
+async fn write_data_files(
+    messages: &[Payload],
+    table: &Table,
+    messages_schema: Schema,
+) -> Result<Vec<DataFile>, Error> {
+    let location = DefaultLocationGenerator::new(table.metadata()).map_err(|err| {
         error!(
             "Failed to get location on table: {}. Error: {}",
             table.metadata().uuid(),
@@ -145,27 +146,6 @@ async fn write_data(
 
     let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
 
-    let partition_spec = PartitionSpec::builder(table.current_schema_ref());
-
-    let partition_type = get_partition_type_value(table.metadata().default_partition_type())?;
-
-    let mut writer = data_file_writer_builder
-        .build(match partition_type {
-            None => None,
-            Some(p_type) => Some(PartitionKey::new(
-                partition_spec
-                    .build()
-                    .map_err(|err| Error::InitError(err.to_string()))?,
-                table.current_schema_ref(),
-                p_type,
-            )),
-        })
-        .await
-        .map_err(|err| {
-            error!("Error while constructing data file writer: {}", err);
-            Error::InitError(err.to_string())
-        })?;
-
     let msgs: Vec<&simd_json::OwnedValue> = messages
         .iter()
         .filter_map(|payload| match payload {
@@ -179,6 +159,14 @@ async fn write_data(
             }
         })
         .collect();
+
+    if msgs.is_empty() {
+        error!(
+            "Batch of {} messages has no JSON payloads, the Iceberg sink requires schema = json",
+            messages.len()
+        );
+        return Err(Error::InvalidPayloadType);
+    }
 
     let cursor = JsonArrowReader::new(msgs.as_slice());
     let reader = ReaderBuilder::new(Arc::new(
@@ -201,6 +189,12 @@ async fn write_data(
         Error::InitError(err.to_string())
     })?;
 
+    let mut writer = TableWriter::new(table, data_file_writer_builder).map_err(|err| {
+        let chain = format_error_chain(&err);
+        error!("Error while constructing data file writer: {}", chain);
+        Error::InitError(chain)
+    })?;
+
     let write_result: Result<(), Error> = async {
         for batch in reader {
             let batch_data = batch.map_err(|err| {
@@ -208,60 +202,158 @@ async fn write_data(
                 error!("Error while getting record batch: {}", chain);
                 Error::InvalidRecordValue(chain)
             })?;
-            writer.write(batch_data).await.map_err(|err| {
-                let chain = format_error_chain(&err);
-                error!("Error while writing record batch: {}", chain);
-                Error::WriteFailure(chain)
-            })?;
+            writer.write(batch_data).await?;
         }
         Ok(())
     }
     .await;
 
-    if let Err(e) = &write_result {
+    let (data_files, close_error) = writer.close().await;
+    if let Some(err) = write_result.err().or(close_error) {
         error!(
-            "Batch loop failed ({}), closing writer to release resources",
-            e
+            "Writing data files failed ({}), deleting the uncommitted ones",
+            err
         );
-        if let Err(close_err) = writer.close().await {
-            error!("Failed to close writer after batch error: {}", close_err);
+        delete_uncommitted_files(table.file_io(), &data_files).await;
+        return Err(err);
+    }
+    Ok(data_files)
+}
+
+/// Files finalized by a failed batch are never committed, so they are removed
+/// instead of being left as orphans on the object store.
+async fn delete_uncommitted_files(file_io: &FileIO, data_files: &[DataFile]) {
+    for data_file in data_files {
+        if let Err(err) = file_io.delete(data_file.file_path()).await {
+            warn!(
+                "Failed to delete uncommitted data file {}: {}",
+                data_file.file_path(),
+                err
+            );
         }
-        return Err(write_result.unwrap_err());
+    }
+}
+
+/// Data file writer bound to the table's default partition spec.
+///
+/// Every batch is mapped to partition keys and fanned out to one data file
+/// writer per key, so a mixed batch lands in the right partitions. An
+/// unpartitioned table maps every batch to the single key of its spec.
+///
+/// The per-partition writers are owned here rather than by iceberg's
+/// `FanoutWriter` because its `close` stops at the first failing writer and
+/// loses the files the other writers already finalized.
+struct TableWriter {
+    partitioner: Partitioner,
+    builder: ParquetDataFileWriterBuilder,
+    writers: HashMap<Struct, ParquetDataFileWriter>,
+}
+
+enum Partitioner {
+    Unpartitioned(PartitionKey),
+    /// Boxed to keep the enum small (`clippy::large_enum_variant`).
+    Partitioned(Box<RecordBatchPartitionSplitter>),
+}
+
+impl TableWriter {
+    fn new(table: &Table, builder: ParquetDataFileWriterBuilder) -> iceberg::Result<Self> {
+        let partition_spec = table.metadata().default_partition_spec();
+        let schema = table.metadata().current_schema().clone();
+        let partitioner = if partition_spec.is_unpartitioned() {
+            // A spec whose fields are all `Transform::Void` counts as unpartitioned,
+            // but its partition type still has one field per void field and the
+            // commit rejects data files whose partition value has a different arity.
+            let void_field_count = table.metadata().default_partition_type().fields().len();
+            Partitioner::Unpartitioned(PartitionKey::new(
+                partition_spec.as_ref().clone(),
+                schema,
+                Struct::from_iter(vec![None; void_field_count]),
+            ))
+        } else {
+            let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
+                schema,
+                partition_spec.clone(),
+            )?;
+            Partitioner::Partitioned(Box::new(splitter))
+        };
+        Ok(Self {
+            partitioner,
+            builder,
+            writers: HashMap::new(),
+        })
     }
 
-    let data_files = writer.close().await.map_err(|err| {
-        let chain = format_error_chain(&err);
-        error!(
-            "Error while writing data records to Parquet file: {}",
-            chain
-        );
-        Error::WriteFailure(chain)
-    })?;
+    async fn write(&mut self, batch: RecordBatch) -> Result<(), Error> {
+        let Self {
+            partitioner,
+            builder,
+            writers,
+        } = self;
+        match partitioner {
+            Partitioner::Unpartitioned(partition_key) => {
+                write_partition(writers, builder, partition_key, batch).await
+            }
+            Partitioner::Partitioned(splitter) => {
+                let partitioned_batches = splitter.split(&batch).map_err(|err| {
+                    let chain = format_error_chain(&err);
+                    error!("Error while splitting record batch by partition: {}", chain);
+                    Error::InvalidRecordValue(chain)
+                })?;
+                for (partition_key, partition_batch) in partitioned_batches {
+                    write_partition(writers, builder, &partition_key, partition_batch).await?;
+                }
+                Ok(())
+            }
+        }
+    }
 
-    let table_commit = Transaction::new(table);
+    /// Closes every partition writer even after one of them fails, so the
+    /// caller learns about all finalized files and can commit or delete them.
+    /// Returns the first close failure alongside the files.
+    async fn close(self) -> (Vec<DataFile>, Option<Error>) {
+        let mut data_files = Vec::new();
+        let mut first_error = None;
+        for mut writer in self.writers.into_values() {
+            match writer.close().await {
+                Ok(files) => data_files.extend(files),
+                Err(err) => {
+                    let close_error = write_failure(err);
+                    if first_error.is_none() {
+                        first_error = Some(close_error);
+                    }
+                }
+            }
+        }
+        (data_files, first_error)
+    }
+}
 
-    let action = table_commit.fast_append().add_data_files(data_files);
+/// The partition key is cloned only when a writer is created, not on every batch.
+async fn write_partition(
+    writers: &mut HashMap<Struct, ParquetDataFileWriter>,
+    builder: &ParquetDataFileWriterBuilder,
+    partition_key: &PartitionKey,
+    batch: RecordBatch,
+) -> Result<(), Error> {
+    if let Some(writer) = writers.get_mut(partition_key.data()) {
+        return writer.write(batch).await.map_err(write_failure);
+    }
+    let writer = builder
+        .build(Some(partition_key.clone()))
+        .await
+        .map_err(write_failure)?;
+    writers
+        .entry(partition_key.data().clone())
+        .or_insert(writer)
+        .write(batch)
+        .await
+        .map_err(write_failure)
+}
 
-    let tx = action.apply(table_commit).map_err(|err| {
-        let chain = format_error_chain(&err);
-        error!(
-            "Failed to apply transaction on table with UUID: {}, Error: {}",
-            table.metadata().uuid(),
-            chain
-        );
-        Error::TransactionApplyError(chain)
-    })?;
-
-    let _table = tx.commit(catalog).await.map_err(|err| {
-        let chain = format_error_chain(&err);
-        error!(
-            "Failed to commit transaction on table with UUID: {}, Error: {}",
-            table.metadata().uuid(),
-            chain
-        );
-        Error::CatalogCommitError(chain)
-    })?;
-    Ok(())
+fn write_failure(err: iceberg::Error) -> Error {
+    let chain = format_error_chain(&err);
+    error!("Error while writing data file: {}", chain);
+    Error::WriteFailure(chain)
 }
 
 #[async_trait]
@@ -271,4 +363,157 @@ pub trait Router: std::fmt::Debug + Sync + Send {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iceberg::Runtime as IcebergRuntime;
+    use iceberg::spec::{
+        FormatVersion, Literal, NestedField, PrimitiveLiteral, PrimitiveType,
+        Schema as IcebergSchema, SortOrder, TableMetadataBuilder, Transform, Type,
+        UnboundPartitionSpec,
+    };
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    const REGION_FIELD_ID: i32 = 2;
+
+    // Table keeps only tokio handles, so the runtime must outlive every table.
+    fn test_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("Failed to create runtime"))
+    }
+
+    fn in_memory_table(partition_spec: UnboundPartitionSpec) -> Table {
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(
+                    REGION_FIELD_ID,
+                    "region",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("Failed to build schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            SortOrder::unsorted_order(),
+            "memory://warehouse/test/events".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("Failed to create table metadata")
+        .build()
+        .expect("Failed to build table metadata")
+        .metadata;
+
+        Table::builder()
+            .identifier(TableIdent::from_strs(["test", "events"]).expect("Failed to build ident"))
+            .metadata(metadata)
+            .file_io(FileIO::new_with_memory())
+            .runtime(IcebergRuntime::new(test_runtime()))
+            .build()
+            .expect("Failed to build table")
+    }
+
+    fn json_payloads(rows: &[(i64, &str)]) -> Vec<Payload> {
+        rows.iter()
+            .map(|(id, region)| Payload::Json(simd_json::json!({ "id": *id, "region": *region })))
+            .collect()
+    }
+
+    fn write(table: &Table, payloads: &[Payload]) -> Vec<DataFile> {
+        test_runtime()
+            .block_on(write_data_files(payloads, table, Schema::Json))
+            .expect("Failed to write data files")
+    }
+
+    fn partition_region(data_file: &DataFile) -> String {
+        match &data_file.partition()[0] {
+            Some(Literal::Primitive(PrimitiveLiteral::String(region))) => region.clone(),
+            other => panic!("Expected string partition value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_partitioned_table_should_write_one_data_file_per_partition_value() {
+        let partition_spec = UnboundPartitionSpec::builder()
+            .add_partition_field(REGION_FIELD_ID, "region", Transform::Identity)
+            .expect("Failed to add partition field")
+            .build();
+        let table = in_memory_table(partition_spec);
+        let payloads = json_payloads(&[(1, "eu"), (2, "us"), (3, "eu")]);
+
+        let data_files = write(&table, &payloads);
+
+        assert_eq!(data_files.len(), 2);
+        let by_region: HashMap<String, &DataFile> = data_files
+            .iter()
+            .map(|data_file| (partition_region(data_file), data_file))
+            .collect();
+        assert_eq!(by_region["eu"].record_count(), 2);
+        assert!(by_region["eu"].file_path().contains("/data/region=eu/"));
+        assert_eq!(by_region["us"].record_count(), 1);
+        assert!(by_region["us"].file_path().contains("/data/region=us/"));
+    }
+
+    #[test]
+    fn given_void_only_partition_spec_should_write_null_partition_values() {
+        let partition_spec = UnboundPartitionSpec::builder()
+            .add_partition_field(REGION_FIELD_ID, "region_void", Transform::Void)
+            .expect("Failed to add partition field")
+            .build();
+        let table = in_memory_table(partition_spec);
+        let payloads = json_payloads(&[(1, "eu"), (2, "us")]);
+
+        let data_files = write(&table, &payloads);
+
+        assert_eq!(data_files.len(), 1);
+        assert_eq!(data_files[0].partition().fields(), &[None]);
+        assert!(!data_files[0].file_path().contains("region_void="));
+    }
+
+    #[test]
+    fn given_uncommitted_files_should_be_deleted_from_store() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let payloads = json_payloads(&[(1, "eu")]);
+        let data_files = write(&table, &payloads);
+        let file_path = data_files[0].file_path().to_string();
+
+        let exists_after_delete = test_runtime().block_on(async {
+            assert!(table.file_io().exists(&file_path).await.expect("exists"));
+            delete_uncommitted_files(table.file_io(), &data_files).await;
+            table.file_io().exists(&file_path).await.expect("exists")
+        });
+
+        assert!(!exists_after_delete);
+    }
+
+    #[test]
+    fn given_unpartitioned_table_should_write_single_data_file_without_partition() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let payloads = json_payloads(&[(1, "eu"), (2, "us")]);
+
+        let data_files = write(&table, &payloads);
+
+        assert_eq!(data_files.len(), 1);
+        assert_eq!(data_files[0].record_count(), 2);
+        assert!(data_files[0].partition().fields().is_empty());
+        assert!(data_files[0].file_path().contains("/data/"));
+        assert!(!data_files[0].file_path().contains("region="));
+    }
+
+    #[test]
+    fn given_batch_without_json_payloads_should_fail_with_invalid_payload_type() {
+        let table = in_memory_table(UnboundPartitionSpec::builder().build());
+        let payloads = vec![Payload::Text("not json".to_string())];
+
+        let result = test_runtime().block_on(write_data_files(&payloads, &table, Schema::Text));
+
+        assert!(matches!(result, Err(Error::InvalidPayloadType)));
+    }
 }

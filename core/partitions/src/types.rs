@@ -15,10 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::Operation;
 use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// A local commit that failed for an op the cluster had already committed.
+///
+/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// the op, its `commit_min` never advanced, and the next
+/// `advance_commit_min` would assert on the gap. Continuing would either
+/// serve a prefix the cluster has moved past or panic somewhere less
+/// legible, so the partition fences itself on this and the shard brings the
+/// server down through the ordinary shutdown path. Recorded rather than
+/// panicked because a panic on the pump task is swallowed by the runtime,
+/// which wedges every partition on the shard while the process reports
+/// healthy.
+#[derive(Debug, Clone)]
+pub struct FatalCommit {
+    pub namespace_raw: u64,
+    pub op: u64,
+    pub operation: Operation,
+}
 
 #[derive(Debug, Clone)]
 pub struct Fragment<const ALIGN: usize = 4096> {
@@ -55,6 +74,28 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
         } else {
             self.source.slice(self.start..self.end)
         }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.source[self.start..self.end]
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Whether this fragment refcounts `source`'s allocation (and thus keeps
+    /// all of it alive, not just the sliced window).
+    #[must_use]
+    pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
+        self.source.shares_allocation(source)
     }
 }
 
