@@ -69,13 +69,16 @@ verbose_logging = false
 - `max_retries`: Maximum transient retries for a bulk request after the
   initial attempt. Defaults to `3`.
 - `retry_delay` / `max_retry_delay`: Exponential backoff bounds for
-  transient retries. Defaults to `500ms` / `5s`. If configured with
-  `retry_delay > max_retry_delay`, the values are swapped and a warning is
-  logged.
+  transient retries, shared by both bulk requests and `open()`-time requests
+  (see `max_open_retries` below). Defaults to `500ms` / `5s`. If configured
+  with `retry_delay > max_retry_delay`, the values are swapped and a warning
+  is logged.
 - `max_open_retries`: Maximum transient retries for each `open()`-time
   request: the cluster health check, the index existence check, and index
-  creation. Defaults to `5`. A permanent failure (for example a rejected
-  index mapping) is not retried and fails `open()` immediately.
+  creation. Defaults to `5`. Paced by the same `retry_delay` /
+  `max_retry_delay` backoff bounds used for bulk requests. A permanent
+  failure (for example a rejected index mapping) is not retried and fails
+  `open()` immediately.
 - `verbose_logging`: Log per-batch receive and index counts at `info` instead
   of `debug`. Defaults to `false`.
 
