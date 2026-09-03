@@ -70,8 +70,12 @@ StreamDetails IggyBlockingClient::CreateStream(std::string name) {
         [this, &name] { return StreamDetails::FromFfi(Handle()->create_stream(std::move(name))); });
 }
 
-void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name) {
-    return RethrowAsIggyException([this, &stream, &name] { Handle()->update_stream(stream.ToFfi(), std::move(name)); });
+void IggyBlockingClient::UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options) {
+    return RethrowAsIggyException([this, &stream, &name, &options] {
+        // Stream options are currently null-op (UPDATABLE_STREAM_OPTION_KEYS empty), no conversion needed.
+        (void)options;
+        Handle()->update_stream(stream.ToFfi(), std::move(name), rust::Vec<ffi::HeaderEntry>{});
+    });
 }
 
 std::vector<Stream> IggyBlockingClient::GetStreams() {
@@ -101,36 +105,129 @@ void IggyBlockingClient::PurgeStream(const Identifier &stream) {
 
 TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
                                              std::string name,
-                                             const std::uint32_t partitions_count,
-                                             const CompressionAlgorithm compression_algorithm,
-                                             const Expiry message_expiry,
-                                             const MaxTopicSize max_topic_size,
-                                             ResourceOptions options) {
-    return RethrowAsIggyException(
-        [this, &stream, &name, partitions_count, &compression_algorithm, &message_expiry, &max_topic_size, &options] {
-            return TopicDetails::FromFfi(Handle()->create_topic(
-                stream.ToFfi(), std::move(name), partitions_count,
-                std::string(compression_algorithm.CompressionAlgorithmValue()),
-                std::string(message_expiry.ExpiryKind()), message_expiry.ExpiryValue(),
-                std::string(max_topic_size.MaxTopicSizeValue()), ResourceOptions::ToFfi(std::move(options))));
-        });
+                                             const TopicCreateOptions &options) {
+    return RethrowAsIggyException([this, &stream, &name, &options] {
+        ffi::TopicCreateOptions ffi_options;
+        if (auto value = options.PartitionsCount()) {
+            ffi_options.has_partitions_count = true;
+            ffi_options.partitions_count     = *value;
+        } else {
+            ffi_options.has_partitions_count = false;
+            ffi_options.partitions_count     = 0;
+        }
+        if (auto value = options.CompressionAlgorithm()) {
+            ffi_options.compression_algorithm = std::string(value->CompressionAlgorithmValue());
+        } else {
+            ffi_options.compression_algorithm = "";
+        }
+        if (auto value = options.MessageExpiry()) {
+            ffi_options.message_expiry_kind  = std::string(value->ExpiryKind());
+            ffi_options.message_expiry_value = value->ExpiryValue();
+        } else {
+            ffi_options.message_expiry_kind  = "";
+            ffi_options.message_expiry_value = 0;
+        }
+        if (auto value = options.MaxTopicSize()) {
+            ffi_options.max_topic_size = std::string(value->MaxTopicSizeValue());
+        } else {
+            ffi_options.max_topic_size = "";
+        }
+        if (auto value = options.SegmentSize()) {
+            ffi_options.has_segment_size = true;
+            ffi_options.segment_size     = *value;
+        } else {
+            ffi_options.has_segment_size = false;
+            ffi_options.segment_size     = 0;
+        }
+        if (auto value = options.EnforceFsync()) {
+            ffi_options.has_enforce_fsync = true;
+            ffi_options.enforce_fsync     = *value;
+        } else {
+            ffi_options.has_enforce_fsync = false;
+            ffi_options.enforce_fsync     = false;
+        }
+        if (auto value = options.MessagesRequiredToSave()) {
+            ffi_options.has_messages_required_to_save = true;
+            ffi_options.messages_required_to_save     = *value;
+        } else {
+            ffi_options.has_messages_required_to_save = false;
+            ffi_options.messages_required_to_save     = 0;
+        }
+        if (auto value = options.SizeOfMessagesRequiredToSave()) {
+            ffi_options.has_size_of_messages_required_to_save = true;
+            ffi_options.size_of_messages_required_to_save     = *value;
+        } else {
+            ffi_options.has_size_of_messages_required_to_save = false;
+            ffi_options.size_of_messages_required_to_save     = 0;
+        }
+        if (auto value = options.PreallocateSegments()) {
+            ffi_options.has_preallocate_segments = true;
+            ffi_options.preallocate_segments     = *value;
+        } else {
+            ffi_options.has_preallocate_segments = false;
+            ffi_options.preallocate_segments     = false;
+        }
+        ffi_options.raw_options.reserve(options.Raw().size());
+        for (const auto &entry : options.Raw()) {
+            ffi::HeaderEntry ffi_entry;
+            ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
+            ffi_entry.key.value.reserve(entry.first.size());
+            for (char character : entry.first) {
+                ffi_entry.key.value.push_back(static_cast<std::uint8_t>(character));
+            }
+            ffi_entry.value.kind = static_cast<std::uint8_t>(HeaderKind::String);
+            ffi_entry.value.value.reserve(entry.second.size());
+            for (char character : entry.second) {
+                ffi_entry.value.value.push_back(static_cast<std::uint8_t>(character));
+            }
+            ffi_options.raw_options.push_back(std::move(ffi_entry));
+        }
+
+        return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), std::move(name), std::move(ffi_options)));
+    });
 }
 
 void IggyBlockingClient::UpdateTopic(const Identifier &stream,
                                      const Identifier &topic,
                                      std::string name,
-                                     const CompressionAlgorithm compression_algorithm,
-                                     const Expiry message_expiry,
-                                     const MaxTopicSize max_topic_size,
-                                     ResourceOptions options) {
-    return RethrowAsIggyException(
-        [this, &stream, &topic, &name, &compression_algorithm, &message_expiry, &max_topic_size, &options] {
-            Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), std::move(name),
-                                   std::string(compression_algorithm.CompressionAlgorithmValue()),
-                                   std::string(message_expiry.ExpiryKind()), message_expiry.ExpiryValue(),
-                                   std::string(max_topic_size.MaxTopicSizeValue()),
-                                   ResourceOptions::ToFfi(std::move(options)));
-        });
+                                     const TopicUpdateOptions &options) {
+    return RethrowAsIggyException([this, &stream, &topic, &name, &options] {
+        ffi::TopicUpdateOptions ffi_options;
+        if (auto value = options.CompressionAlgorithm()) {
+            ffi_options.compression_algorithm = std::string(value->CompressionAlgorithmValue());
+        } else {
+            ffi_options.compression_algorithm = "";
+        }
+        if (auto value = options.MessageExpiry()) {
+            ffi_options.message_expiry_kind  = std::string(value->ExpiryKind());
+            ffi_options.message_expiry_value = value->ExpiryValue();
+        } else {
+            ffi_options.message_expiry_kind  = "";
+            ffi_options.message_expiry_value = 0;
+        }
+        if (auto value = options.MaxTopicSize()) {
+            ffi_options.max_topic_size = std::string(value->MaxTopicSizeValue());
+        } else {
+            ffi_options.max_topic_size = "";
+        }
+        ffi_options.raw_options.reserve(options.Raw().size());
+        for (const auto &entry : options.Raw()) {
+            ffi::HeaderEntry ffi_entry;
+            ffi_entry.key.kind = static_cast<std::uint8_t>(HeaderKind::String);
+            ffi_entry.key.value.reserve(entry.first.size());
+            for (char character : entry.first) {
+                ffi_entry.key.value.push_back(static_cast<std::uint8_t>(character));
+            }
+            ffi_entry.value.kind = static_cast<std::uint8_t>(HeaderKind::String);
+            ffi_entry.value.value.reserve(entry.second.size());
+            for (char character : entry.second) {
+                ffi_entry.value.value.push_back(static_cast<std::uint8_t>(character));
+            }
+            ffi_options.raw_options.push_back(std::move(ffi_entry));
+        }
+
+        Handle()->update_topic(stream.ToFfi(), topic.ToFfi(), std::move(name), std::move(ffi_options));
+    });
 }
 
 std::vector<Topic> IggyBlockingClient::GetTopics(const Identifier &stream) {

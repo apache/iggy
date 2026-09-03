@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -290,10 +291,8 @@ class HeaderEntry final {
  * history and may differ if the resource is recreated under another server
  * configuration.
  *
- * Construct creation options with, for example,
- * `ResourceOptions::Explicit({TopicOption::SegmentSize(1024 * 1024)})`.
  * Only explicit entries are sent; derived entries returned by Options() are
- * not resubmitted.
+ * not resubmitted. For topic creation prefer `TopicCreateOptions`.
  */
 class ResourceOptions final {
   public:
@@ -1045,6 +1044,302 @@ class Expiry final {
 };
 
 /**
+ * @brief Options for creating a topic.
+ *
+ * Mirrors Rust `TopicCreateOptions` (`core/common/src/types/options/mod.rs:698`).
+ * Each `std::optional` field corresponds to a catalog key; `std::nullopt`
+ * means the server default is used and the key is omitted from the request.
+ * `Raw` carries forward-compatible string keys; a typed field wins on
+ * collision when encoded. The wire form is the topic options TLV block
+ * (`core/binary_protocol/src/primitives/options.rs:18`), the same encoding
+ * used for message user headers.
+ */
+class TopicCreateOptions final {
+  public:
+    TopicCreateOptions() = default;
+
+    /**
+     * @brief Number of partitions to create with the topic.
+     * @return Partition count when set; `nullopt` uses the server default
+     *         `DEFAULT_PARTITIONS_COUNT` (1).
+     * @note Not an option key. Fills the `CreateTopic` command's fixed field;
+     *       it is consumed to compute assignments and is not stored as a topic
+     *       option. Must be `1..=1000` when set; server rejects `0`.
+     */
+    std::optional<std::uint32_t> PartitionsCount() const noexcept { return partitions_count_; }
+    TopicCreateOptions &SetPartitionsCount(std::uint32_t partitions_count) noexcept {
+        partitions_count_ = partitions_count;
+        return *this;
+    }
+
+    /**
+     * @brief Storage compression for the topic.
+     * @return Compression algorithm when set; `nullopt` uses the server default
+     *         (`none`).
+     * @note Catalog key `compression_algorithm` (`HeaderKind::String`, values
+     *       `none`, `gzip`). Also updatable via `TopicUpdateOptions`.
+     */
+    std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept { return compression_algorithm_; }
+    TopicCreateOptions &SetCompressionAlgorithm(::iggy::CompressionAlgorithm compression_algorithm) {
+        compression_algorithm_ = std::move(compression_algorithm);
+        return *this;
+    }
+
+    /**
+     * @brief Message retention policy for the topic.
+     * @return Expiry when set; `nullopt` uses the server default
+     *         `IggyExpiry::ServerDefault` (alias `never_expire` with sentinel
+     *         `u64::MAX` on the wire as `Uint64`).
+     * @note Catalog key `message_expiry` (`Uint64` micros, or `String` like
+     *       `"7 days"` via `Raw`). `0` normalizes to `nullopt`. Also updatable.
+     */
+    std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
+    TopicCreateOptions &SetMessageExpiry(::iggy::Expiry message_expiry) {
+        message_expiry_ = std::move(message_expiry);
+        return *this;
+    }
+
+    /**
+     * @brief Maximum retained topic size.
+     * @return Max size when set; `nullopt` uses the server default
+     *         `MaxTopicSize::ServerDefault` (`unlimited`, `u64::MAX` on wire).
+     * @note Catalog key `max_topic_size` (`Uint64` bytes or `String` like
+     *       `"1 GiB"` via `Raw`). `0` normalizes to `nullopt`. Must be `>=`
+     *       the resolved segment size when both are set. Also updatable.
+     */
+    std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
+    TopicCreateOptions &SetMaxTopicSize(::iggy::MaxTopicSize max_topic_size) {
+        max_topic_size_ = std::move(max_topic_size);
+        return *this;
+    }
+
+    /**
+     * @brief Size at which a partition segment rotates.
+     * @return Segment size in bytes when set; `nullopt` uses the server default
+     *         `DEFAULT_SEGMENT_SIZE` (1 GiB).
+     * @note Catalog key `segment_size` (`Uint64` bytes, `String` `"128MiB"` via
+     *       `Raw`). Constraints: multiple of `512`, `1 MiB` (`MIN_TOPIC_SEGMENT_SIZE`)
+     *       `..=` `1 GiB` (`MAX_TOPIC_SEGMENT_SIZE`, the server segment ceiling
+     *       `core/common/src/types/options/mod.rs:310`). `0` normalizes to
+     *       `nullopt`. Creation-only; `UpdateTopic` rejects it.
+     */
+    std::optional<std::uint64_t> SegmentSize() const noexcept { return segment_size_; }
+    TopicCreateOptions &SetSegmentSize(std::uint64_t segment_size) noexcept {
+        segment_size_ = segment_size;
+        return *this;
+    }
+
+    /**
+     * @brief Whether partition writes are fsynced.
+     * @return Fsync flag when set; `nullopt` uses the server default
+     *         `DEFAULT_ENFORCE_FSYNC` (`false`).
+     * @note Catalog key `enforce_fsync` (`Bool` `0`/`1`, or `String`
+     *       `"true"`/`"false"` via `Raw`). Creation-only.
+     */
+    std::optional<bool> EnforceFsync() const noexcept { return enforce_fsync_; }
+    TopicCreateOptions &SetEnforceFsync(bool enforce_fsync) noexcept {
+        enforce_fsync_ = enforce_fsync;
+        return *this;
+    }
+
+    /**
+     * @brief Journal flush threshold in message count.
+     * @return Count when set; `nullopt` uses the server default
+     *         `DEFAULT_MESSAGES_REQUIRED_TO_SAVE` (`1024`).
+     * @note Catalog key `messages_required_to_save` (`Uint32`). Must be
+     *       `1..=16_777_216` (`MAX_MESSAGES_REQUIRED_TO_SAVE`). `0` is rejected.
+     *       Paired with `SizeOfMessagesRequiredToSave`; whichever trips first
+     *       flushes. Creation-only.
+     */
+    std::optional<std::uint32_t> MessagesRequiredToSave() const noexcept { return messages_required_to_save_; }
+    TopicCreateOptions &SetMessagesRequiredToSave(std::uint32_t messages_required_to_save) noexcept {
+        messages_required_to_save_ = messages_required_to_save;
+        return *this;
+    }
+
+    /**
+     * @brief Journal flush threshold in bytes.
+     * @return Byte threshold when set; `nullopt` uses the server default
+     *         `DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE` (1 MiB).
+     * @note Catalog key `size_of_messages_required_to_save` (`Uint64` bytes,
+     *       `String` like `"4KiB"` via `Raw`). Must be `1..=1 GiB`
+     *       (`MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE`). `0` normalizes to
+     *       `nullopt`. Paired with `MessagesRequiredToSave`. Creation-only.
+     */
+    std::optional<std::uint64_t> SizeOfMessagesRequiredToSave() const noexcept {
+        return size_of_messages_required_to_save_;
+    }
+    TopicCreateOptions &SetSizeOfMessagesRequiredToSave(std::uint64_t size_of_messages_required_to_save) noexcept {
+        size_of_messages_required_to_save_ = size_of_messages_required_to_save;
+        return *this;
+    }
+
+    /**
+     * @brief Whether segment bytes are reserved on disk at creation.
+     * @return Flag when set; `nullopt` uses the server default
+     *         `DEFAULT_PREALLOCATE_SEGMENTS` (`false`).
+     * @note Catalog key `preallocate_segments` (`Bool`). Creation-only.
+     *       Admission rejects `segment_size * partitions_count > 64 GiB`
+     *       (`MAX_PREALLOCATED_TOPIC_BYTES`).
+     */
+    std::optional<bool> PreallocateSegments() const noexcept { return preallocate_segments_; }
+    TopicCreateOptions &SetPreallocateSegments(bool preallocate_segments) noexcept {
+        preallocate_segments_ = preallocate_segments;
+        return *this;
+    }
+
+    /**
+     * @brief Forward-compatible string keys not yet covered by a typed field.
+     * @return Ordered map of `key -> value` strings; values are parsed server-side
+     *         via the same `FromStr` as config file entries. An unknown key is
+     *         rejected with `UnsupportedOptionKey`; a bad value with
+     *         `InvalidOptionValue`.
+     * @note A typed field wins on collision when both `raw` and the typed setter
+     *       name the same key (`mod.rs:1374` `typed_field_wins_over_raw_entry_for_the_same_key`).
+     *       `partitions_count` is not a key and is rejected if placed in `raw`.
+     */
+    const std::map<std::string, std::string> &Raw() const noexcept { return raw_; }
+    TopicCreateOptions &SetRaw(std::map<std::string, std::string> raw) {
+        raw_ = std::move(raw);
+        return *this;
+    }
+    TopicCreateOptions &SetRawEntry(std::string key, std::string value) {
+        raw_.emplace(std::move(key), std::move(value));
+        return *this;
+    }
+
+  private:
+    std::optional<std::uint32_t> partitions_count_;
+    std::optional<::iggy::CompressionAlgorithm> compression_algorithm_;
+    std::optional<::iggy::Expiry> message_expiry_;
+    std::optional<::iggy::MaxTopicSize> max_topic_size_;
+    std::optional<std::uint64_t> segment_size_;
+    std::optional<bool> enforce_fsync_;
+    std::optional<std::uint32_t> messages_required_to_save_;
+    std::optional<std::uint64_t> size_of_messages_required_to_save_;
+    std::optional<bool> preallocate_segments_;
+    std::map<std::string, std::string> raw_;
+
+    friend class IggyBlockingClient;
+};
+
+/**
+ * @brief Options for updating a topic.
+ *
+ * Mirrors Rust `TopicUpdateOptions` (`core/common/src/types/options/mod.rs:640`).
+ * Separate from `TopicCreateOptions` so creation-only keys cannot be set on
+ * update. Patch semantics: `std::nullopt` keeps the topic's current value;
+ * only the keys present are changed. Only `compression_algorithm`,
+ * `message_expiry`, `max_topic_size` and `raw` keys in
+ * `UPDATABLE_TOPIC_OPTION_KEYS` (`core/common/src/types/options/mod.rs:476`)
+ * are accepted. Creation-only keys (`segment_size`, `enforce_fsync`,
+ * `messages_required_to_save`, `size_of_messages_required_to_save`,
+ * `preallocate_segments`) and unknown keys are rejected with
+ * `UnsupportedOptionKey`.
+ */
+class TopicUpdateOptions final {
+  public:
+    TopicUpdateOptions() = default;
+
+    /**
+     * @brief New storage compression.
+     * @return Algorithm when set; `nullopt` keeps the current value.
+     * @note Catalog key `compression_algorithm` (`HeaderKind::String`, `none`/`gzip`).
+     */
+    std::optional<::iggy::CompressionAlgorithm> CompressionAlgorithm() const noexcept { return compression_algorithm_; }
+    TopicUpdateOptions &SetCompressionAlgorithm(::iggy::CompressionAlgorithm compression_algorithm) {
+        compression_algorithm_ = std::move(compression_algorithm);
+        return *this;
+    }
+
+    /**
+     * @brief New message retention policy.
+     * @return Expiry when set; `nullopt` keeps the current value.
+     * @note Catalog key `message_expiry` (`Uint64` micros or `String` like
+     *       `"7 days"` via `Raw`). `0` is treated as `nullopt` on the Rust side.
+     */
+    std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
+    TopicUpdateOptions &SetMessageExpiry(::iggy::Expiry message_expiry) {
+        message_expiry_ = std::move(message_expiry);
+        return *this;
+    }
+
+    /**
+     * @brief New maximum retained topic size.
+     * @return Max size when set; `nullopt` keeps the current value.
+     * @note Catalog key `max_topic_size` (`Uint64` bytes or `String` like
+     *       `"1 GiB"` via `Raw`). `0` is treated as `nullopt` on the Rust side.
+     */
+    std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
+    TopicUpdateOptions &SetMaxTopicSize(::iggy::MaxTopicSize max_topic_size) {
+        max_topic_size_ = std::move(max_topic_size);
+        return *this;
+    }
+
+    /**
+     * @brief Forward-compatible updatable string keys.
+     * @return Ordered map of `key -> value`; only keys in the updatable catalog
+     *         are accepted. A create-only or unknown key is rejected with
+     *         `UnsupportedOptionKey`; a bad value with `InvalidOptionValue`.
+     * @note Typed field wins on collision.
+     */
+    const std::map<std::string, std::string> &Raw() const noexcept { return raw_; }
+    TopicUpdateOptions &SetRaw(std::map<std::string, std::string> raw) {
+        raw_ = std::move(raw);
+        return *this;
+    }
+    TopicUpdateOptions &SetRawEntry(std::string key,
+                                    std::string value) {  // NOLINT(bugprone-easily-swappable-parameters)
+        raw_.emplace(std::move(key), std::move(value));
+        return *this;
+    }
+
+  private:
+    std::optional<::iggy::CompressionAlgorithm> compression_algorithm_;
+    std::optional<::iggy::Expiry> message_expiry_;
+    std::optional<::iggy::MaxTopicSize> max_topic_size_;
+    std::map<std::string, std::string> raw_;
+
+    friend class IggyBlockingClient;
+};
+
+/**
+ * @brief Options for updating a stream.
+ *
+ * Mirrors Rust `StreamUpdateOptions` (`core/common/src/types/options/mod.rs:547`).
+ * Separate from creation because streams have no catalog keys yet. Patch
+ * semantics: `std::nullopt` keeps current value; only keys present are
+ * changed. Currently `UPDATABLE_STREAM_OPTION_KEYS` (`mod.rs:486`) is empty,
+ * so every key is rejected with `UnsupportedOptionKey` until the first stream
+ * option lands. `raw` carries forward-compatible string keys.
+ */
+class StreamUpdateOptions final {
+  public:
+    StreamUpdateOptions() = default;
+
+    /**
+     * @brief Forward-compatible string keys for stream update.
+     * @return Ordered map of `key -> value` strings; values are parsed
+     *         server-side via `FromStr`. Unknown keys rejected with
+     *         `UnsupportedOptionKey`.
+     */
+    const std::map<std::string, std::string> &Raw() const noexcept { return raw_; }
+    StreamUpdateOptions &SetRaw(std::map<std::string, std::string> raw) {
+        raw_ = std::move(raw);
+        return *this;
+    }
+    StreamUpdateOptions &SetRawEntry(std::string key, std::string value) {
+        raw_.emplace(std::move(key), std::move(value));
+        return *this;
+    }
+
+  private:
+    std::map<std::string, std::string> raw_;
+
+    friend class IggyBlockingClient;
+};
+
+/**
  * @brief Starting position for polling messages.
  *
  * @note The strategy kind and value are passed across the Rust FFI as a pair.
@@ -1139,94 +1434,6 @@ inline HeaderEntry to_option_entry(const std::string_view key,
 }
 
 }  // namespace detail
-
-/**
- * @brief Creates catalog entries for ResourceOptions::Explicit().
- *
- * Each factory encodes one key from the server's topic option catalog using
- * that key's required value kind. The server rejects unknown keys and values
- * encoded with a different kind.
- *
- * For example, pass
- * `ResourceOptions::Explicit({TopicOption::SegmentSize(1024 * 1024)})` to
- * CreateTopic(). The server rejects unknown keys and values encoded with a
- * different kind.
- *
- * @note These options are accepted only during topic creation. UpdateTopic()
- *       rejects them because they define how partition storage is created.
- *       Changing them later could leave existing and new segments with
- *       different storage settings.
- */
-class TopicOption final {
-  public:
-    /**
-     * @brief Set the size at which this topic's segments rotate.
-     *
-     * Must be a multiple of 512 bytes, at least 1 MiB, and no larger than the
-     * server's segment ceiling.
-     *
-     * @param bytes Segment size in bytes.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry SegmentSize(const std::uint64_t bytes) {
-        return detail::to_option_entry("segment_size", HeaderKind::Uint64, detail::to_little_endian_bytes(bytes));
-    }
-
-    /**
-     * @brief Choose whether writes to this topic's partitions are fsynced.
-     *
-     * @param enabled Whether partition writes are fsynced.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry EnforceFsync(const bool enabled) {
-        return detail::to_option_entry("enforce_fsync", HeaderKind::Bool, detail::to_bool_bytes(enabled));
-    }
-
-    /**
-     * @brief Flush the journal once it holds this many messages.
-     *
-     * Must be non-zero. Paired with
-     * `SizeOfMessagesRequiredToSave(bytes)`: whichever threshold trips
-     * first flushes.
-     *
-     * @param messages Message count at which to flush the journal.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry MessagesRequiredToSave(const std::uint32_t messages) {
-        return detail::to_option_entry("messages_required_to_save", HeaderKind::Uint32,
-                                       detail::to_little_endian_bytes(messages));
-    }
-
-    /**
-     * @brief Flush the journal once it holds this many bytes.
-     *
-     * Capped at 1 GiB: a threshold above the largest a segment may be never
-     * trips, and the journal does not survive a crash.
-     *
-     * @param bytes Byte count at which to flush the journal.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry SizeOfMessagesRequiredToSave(const std::uint64_t bytes) {
-        return detail::to_option_entry("size_of_messages_required_to_save", HeaderKind::Uint64,
-                                       detail::to_little_endian_bytes(bytes));
-    }
-
-    /**
-     * @brief Choose whether a segment's bytes are reserved on disk when it is created.
-     *
-     * Reserves `segment_size * partitions_count` up front, which the server
-     * caps at 64 GiB per topic.
-     *
-     * @param enabled Whether to reserve segment storage on disk.
-     * @return Encoded topic option entry.
-     */
-    static HeaderEntry PreallocateSegments(const bool enabled) {
-        return detail::to_option_entry("preallocate_segments", HeaderKind::Bool, detail::to_bool_bytes(enabled));
-    }
-
-  private:
-    TopicOption() = delete;
-};
 
 /**
  * @brief Owning client connection to an Apache Iggy server.
@@ -1475,11 +1682,13 @@ class IggyBlockingClient final {
      *
      * @param stream Stream to rename, addressed by numeric ID or name.
      * @param name New unique stream name.
+     * @param options Stream update options (currently no updatable keys; `raw`
+     *        carries forward-compatible keys, each rejected until catalogued).
      * @throws IggyException if the client is unavailable, the caller lacks
      *         stream-management permission, either value is invalid, the stream
      *         does not exist, the name is already taken, or the request fails.
      */
-    void UpdateStream(const Identifier &stream, std::string name);
+    void UpdateStream(const Identifier &stream, std::string name, const StreamUpdateOptions &options = {});
 
     /**
      * @brief Lists stream summaries visible to the authenticated user.
@@ -1535,55 +1744,37 @@ class IggyBlockingClient final {
     /**
      * @brief Creates a topic and its initial partitions in a stream.
      *
-     * A topic is the message namespace within a stream. The server creates
-     * exactly @p partitions_count partitions and returns their initial
-     * summaries. Its name is unique only within the selected stream.
-     *
-     * @p options must contain only entries selected by the caller. Use
-     * ResourceOptions::Explicit() with TopicOption factories for catalog
-     * options. The server resolves omitted keys from its configuration and
-     * returns those choices in TopicDetails::Options().Derived().
+     * Mirrors Rust `TopicClient::create_topic` (`core/common/src/traits/topic_client.rs:43`)
+     * with `TopicCreateOptions` (`core/common/src/types/options/mod.rs:698`).
+     * Each `std::optional` corresponds to a catalog key; `nullopt` uses the
+     * server default. `raw` carries forward string keys; a typed field wins
+     * on collision.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param name Unique topic name within @p stream.
-     * @param partitions_count Number of initial partitions.
-     * @param compression_algorithm Storage compression setting.
-     * @param message_expiry Message retention setting.
-     * @param max_topic_size Maximum retained topic size.
-     * @param options Explicit catalog options for the new topic.
+     * @param options Topic creation options.
      * @return Metadata and initial partition summaries for the created topic.
      * @throws IggyException if the client is unavailable or unauthenticated;
      *         an identifier, name, partition count, or option is invalid; the
      *         stream does not exist; the caller lacks topic-management
      *         permission; or the server rejects or cannot commit the write.
      */
-    TopicDetails CreateTopic(const Identifier &stream,
-                             std::string name,
-                             std::uint32_t partitions_count,
-                             CompressionAlgorithm compression_algorithm = CompressionAlgorithm::None(),
-                             Expiry message_expiry                      = Expiry::ServerDefault(),
-                             MaxTopicSize max_topic_size                = MaxTopicSize::ServerDefault(),
-                             ResourceOptions options                    = ResourceOptions::Empty());
+    TopicDetails CreateTopic(const Identifier &stream, std::string name, const TopicCreateOptions &options = {});
 
     /**
      * @brief Renames a topic and updates its mutable configuration.
      *
-     * The partition count and creation-only options, including segment size,
-     * fsync policy, flush thresholds, and segment preallocation, cannot be
-     * changed here. Default arguments leave compression, expiry, and maximum
-     * size unchanged. The current update catalog exposes those three mutable
-     * settings only through their named parameters, so leave @p options empty.
+     * Mirrors Rust `TopicClient::update_topic` with `TopicUpdateOptions`
+     * (`core/common/src/types/options/mod.rs:640`). Only `compression_algorithm`,
+     * `message_expiry`, `max_topic_size` and `raw` keys in
+     * `UPDATABLE_TOPIC_OPTION_KEYS` are accepted; `nullopt` keeps the current
+     * value. Creation-only keys (`segment_size`, `enforce_fsync`, etc.) are
+     * rejected.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Topic to update, addressed by numeric ID or name.
      * @param name New unique topic name within @p stream.
-     * @param compression_algorithm New compression setting, or the default to
-     *        preserve the existing setting.
-     * @param message_expiry New retention setting, or the default to preserve
-     *        the existing setting.
-     * @param max_topic_size New maximum size, or the default to preserve the
-     *        existing setting.
-     * @param options Explicit mutable catalog options.
+     * @param options Topic update options.
      * @throws IggyException if the client is unavailable or unauthenticated;
      *         an identifier, name, setting, or option is invalid; the stream or
      *         topic does not exist; the caller lacks permission; or the server
@@ -1592,10 +1783,7 @@ class IggyBlockingClient final {
     void UpdateTopic(const Identifier &stream,
                      const Identifier &topic,
                      std::string name,
-                     CompressionAlgorithm compression_algorithm = CompressionAlgorithm::None(),
-                     Expiry message_expiry                      = Expiry::ServerDefault(),
-                     MaxTopicSize max_topic_size                = MaxTopicSize::ServerDefault(),
-                     ResourceOptions options                    = ResourceOptions::Empty());
+                     const TopicUpdateOptions &options = {});
 
     /**
      * @brief Lists topic summaries in a stream.
