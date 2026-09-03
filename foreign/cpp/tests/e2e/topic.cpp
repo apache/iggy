@@ -124,21 +124,21 @@ TEST_F(E2E_Topic, CreateTopicWithBoundaryPartitionsCountValues) {
     ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), overflow_topic_name,
                                     iggy::TopicCreateOptions().SetPartitionsCount(1001)),
                  std::exception);
-    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), zero_partitions_topic_name,
-                                    iggy::TopicCreateOptions().SetPartitionsCount(0)),
-                 std::exception);
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), zero_partitions_topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(0)));
 
     const auto stream_details = client.GetStream(iggy::Identifier::String(stream_name));
-    EXPECT_EQ(stream_details.TopicsCount(), 2u);
+    EXPECT_EQ(stream_details.TopicsCount(), 3u);
 
     std::unordered_map<std::string, std::uint32_t> topic_partitions;
     for (const auto &topic : stream_details.Topics()) {
         topic_partitions[topic.Name()] = topic.PartitionsCount();
     }
 
-    EXPECT_EQ(topic_partitions.size(), 2u);
+    EXPECT_EQ(topic_partitions.size(), 3u);
     EXPECT_EQ(topic_partitions[default_partitions_topic], 1u);
     EXPECT_EQ(topic_partitions[max_partitions_topic_name], 1000u);
+    EXPECT_EQ(topic_partitions[zero_partitions_topic_name], 0u);
 }
 
 TEST_F(E2E_Topic, CreateTopicWithInvalidNamesThrows) {
@@ -648,25 +648,22 @@ TEST_F(E2E_Topic, GetTopicAfterTopicDeletionThrows) {
 }
 
 TEST_F(E2E_Topic, GetTopicReturnsEmptyPartitionsForZeroPartitionTopic) {
-    RecordProperty("description", "Rejects zero partitions and creates a topic with the default partition count.");
+    RecordProperty("description", "Returns an empty partitions vector for a topic created with zero partitions.");
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
-    const std::string zero_topic  = GetRandomName();
 
     auto client = GetLoggedInHighLevelClient();
     ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), zero_topic,
-                                    iggy::TopicCreateOptions().SetPartitionsCount(0)),
-                 std::exception);
-    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, iggy::TopicCreateOptions()));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name,
+                                       iggy::TopicCreateOptions().SetPartitionsCount(0)));
 
     ASSERT_NO_THROW({
         const auto topic_details =
             client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
         EXPECT_EQ(topic_details.Name(), topic_name);
-        EXPECT_EQ(topic_details.PartitionsCount(), 1u);
-        EXPECT_EQ(topic_details.Partitions().size(), 1u);
+        EXPECT_EQ(topic_details.PartitionsCount(), 0u);
+        EXPECT_TRUE(topic_details.Partitions().empty());
     });
 }
 
