@@ -24,7 +24,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
+
+# Minor versions deliberately not built as Windows wheels. Every other
+# version in the pyproject classifiers must appear in the wheel job
+# matrix, so adding a new supported version still fails this check
+# until the matrix is updated.
+WHEEL_MATRIX_SKIP=("3.10")
 
 # Default mode
 MODE=""
@@ -266,6 +273,12 @@ ensure_lock_python_requirement() {
     fi
 }
 
+# Every supported minor version, oldest first, as declared by the
+# pyproject classifiers.
+read_classifier_versions() {
+    sed -nE 's/^    "Programming Language :: Python :: ([0-9]+\.[0-9]+)",$/\1/p' "$SOURCE_FILE"
+}
+
 ensure_wheel_interpreters() {
     local file="$1"
     local classifier_versions=()
@@ -284,7 +297,7 @@ ensure_wheel_interpreters() {
     fi
 
     classifier_versions=()
-    while IFS= read -r _py_cls_tmp; do classifier_versions+=("$_py_cls_tmp"); done < <(sed -nE 's/^    "Programming Language :: Python :: ([0-9]+\.[0-9]+)",$/\1/p' "$SOURCE_FILE")
+    while IFS= read -r _py_cls_tmp; do classifier_versions+=("$_py_cls_tmp"); done < <(read_classifier_versions)
 
     if [ "${#classifier_versions[@]}" -eq 0 ]; then
         echo -e "${RED}✗${NC} $SOURCE_FILE: could not find Python version classifiers"
@@ -323,6 +336,77 @@ ensure_wheel_interpreters() {
         echo -e "${GREEN}Fixed${NC} $file: wheel interpreter versions"
     else
         echo -e "${RED}✗${NC} $file: wheel interpreter versions are not $expected_interpreters"
+        FAILED=1
+    fi
+}
+
+# The Windows wheel job builds one interpreter per matrix entry rather
+# than passing --interpreter, so its version list needs its own check.
+ensure_wheel_matrix() {
+    local file="$1"
+    local expected=""
+    local current
+    local version
+    local skipped
+    local seen=0
+
+    TOTAL_CHECKS=$((TOTAL_CHECKS + 1))
+
+    if [ ! -f "$file" ]; then
+        echo -e "${RED}✗${NC} $file: file does not exist"
+        FAILED=1
+        return
+    fi
+
+    while IFS= read -r version; do
+        seen=$((seen + 1))
+        for skipped in "${WHEEL_MATRIX_SKIP[@]}"; do
+            [ "$version" = "$skipped" ] && continue 2
+        done
+        expected+=", \"${version}\""
+    done < <(read_classifier_versions)
+
+    if [ "$seen" -eq 0 ]; then
+        echo -e "${RED}✗${NC} $SOURCE_FILE: could not find Python version classifiers"
+        FAILED=1
+        return
+    fi
+
+    if [ -z "$expected" ]; then
+        echo -e "${RED}✗${NC} $SOURCE_FILE: WHEEL_MATRIX_SKIP excludes every classifier version"
+        FAILED=1
+        return
+    fi
+    expected="[${expected#, }]"
+
+    current=$(sed -nE 's/^[[:space:]]*python-version: (\[.*\])$/\1/p' "$file")
+
+    if [ -z "$current" ]; then
+        echo -e "${RED}✗${NC} $file: could not find wheel matrix python-version list"
+        FAILED=1
+        return
+    fi
+
+    # --fix rewrites every match, so refuse to touch a file that grew a
+    # second list rather than collapsing both onto the same versions.
+    if [ "$(printf '%s\n' "$current" | wc -l)" -gt 1 ]; then
+        echo -e "${RED}✗${NC} $file: multiple python-version lists, cannot pick one"
+        FAILED=1
+        return
+    fi
+
+    if [ "$current" = "$expected" ]; then
+        echo -e "${GREEN}✓${NC} $file: wheel matrix Python versions"
+        return
+    fi
+
+    if [ "$MODE" = "fix" ]; then
+        sed -i.bak -E "s|^([[:space:]]*python-version: )\[.*\]$|\\1${expected}|" "$file"
+        rm -f "$file.bak"
+        FIXED_CHECKS=$((FIXED_CHECKS + 1))
+        echo -e "${GREEN}Fixed${NC} $file: wheel matrix Python versions"
+    else
+        echo -e "${RED}✗${NC} $file: wheel matrix Python versions are not $expected"
         FAILED=1
     fi
 }
@@ -401,6 +485,7 @@ ensure_line \
     "wheel workflow setup-python versions"
 
 ensure_wheel_interpreters ".github/workflows/_build_python_wheels.yml"
+ensure_wheel_matrix ".github/workflows/_build_python_wheels.yml"
 
 PYLOCK_FILES=(
     "foreign/python/pylock.toml"
