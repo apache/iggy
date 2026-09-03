@@ -317,7 +317,7 @@ Get `dev` stream details:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> stream get dev`
 
-Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), no topic compression (`none`), and disabled message expiry (skipped optional parameter). Other compression values are reserved for future server-side support:
+Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 0 and 1), no topic compression (`none`), and disabled message expiry (skipped optional parameter). Other compression values are reserved for future server-side support:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic create dev sample 2 none`
 
@@ -329,17 +329,17 @@ Get topic details for topic `sample` in stream `dev`:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic get dev sample`
 
-Send a message 'hello world' (message ID 1) to the stream `dev` to topic `sample` and partition 1:
+Send the first message 'hello world' to the stream `dev` to topic `sample` and partition 0:
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "hello world"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 0 dev sample "hello world"`
 
-Send another message 'lorem ipsum' (message ID 2) to the same stream, topic and partition:
+Send a second message 'lorem ipsum' to the same stream, topic and partition:
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "lorem ipsum"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 0 dev sample "lorem ipsum"`
 
-Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 1, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
+Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 0, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 0`
 
 Finally, restart the server to see it is able to load the persisted data.
 
