@@ -204,6 +204,17 @@ TEST(TopicCreateOptionsTest, CompressionAlgorithmAndExpiryAndMaxTopicSize) {
     EXPECT_EQ(options.MaxTopicSize()->MaxTopicSizeValue(), "1024");
 }
 
+TEST(TopicCreateOptionsTest, ServerDefaultSentinelsClearValues) {
+    iggy::TopicCreateOptions options;
+    options.SetMessageExpiry(iggy::Expiry::Duration(15)).SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    ASSERT_TRUE(options.MessageExpiry().has_value());
+    ASSERT_TRUE(options.MaxTopicSize().has_value());
+
+    options.SetMessageExpiry(iggy::Expiry::ServerDefault()).SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault());
+    EXPECT_FALSE(options.MessageExpiry().has_value());
+    EXPECT_FALSE(options.MaxTopicSize().has_value());
+}
+
 TEST(TopicCreateOptionsTest, RawMapStoresForwardCompatibleKeys) {
     iggy::TopicCreateOptions options;
     options.SetRawEntries({{"custom_key", "custom_value"}});
@@ -233,6 +244,17 @@ TEST(TopicUpdateOptionsTest, StoresUpdatableFields) {
     EXPECT_EQ(options.MessageExpiry()->ExpiryKind(), "never_expire");
     ASSERT_TRUE(options.MaxTopicSize().has_value());
     EXPECT_EQ(options.MaxTopicSize()->MaxTopicSizeValue(), "unlimited");
+}
+
+TEST(TopicUpdateOptionsTest, ServerDefaultSentinelsClearValues) {
+    iggy::TopicUpdateOptions options;
+    options.SetMessageExpiry(iggy::Expiry::Duration(15)).SetMaxTopicSize(iggy::MaxTopicSize::FromBytes(1024));
+    ASSERT_TRUE(options.MessageExpiry().has_value());
+    ASSERT_TRUE(options.MaxTopicSize().has_value());
+
+    options.SetMessageExpiry(iggy::Expiry::ServerDefault()).SetMaxTopicSize(iggy::MaxTopicSize::ServerDefault());
+    EXPECT_FALSE(options.MessageExpiry().has_value());
+    EXPECT_FALSE(options.MaxTopicSize().has_value());
 }
 
 TEST(TopicUpdateOptionsTest, RawMapStoresKeys) {

@@ -1073,7 +1073,7 @@ class TopicCreateOptions final {
      *         `DEFAULT_PARTITIONS_COUNT` (1).
      * @note Not an option key. Fills the `CreateTopic` command's fixed field;
      *       it is consumed to compute assignments and is not stored as a topic
-     *       option. Must be `1..=1000` when set; server rejects `0`.
+     *       option. Must be `0..=1000` when set.
      */
     std::optional<std::uint32_t> PartitionsCount() const noexcept { return partitions_count_; }
     TopicCreateOptions &SetPartitionsCount(std::uint32_t partitions_count) noexcept {
@@ -1100,11 +1100,16 @@ class TopicCreateOptions final {
      *         `IggyExpiry::ServerDefault` (alias `never_expire` with sentinel
      *         `u64::MAX` on the wire as `Uint64`).
      * @note Catalog key `message_expiry` (`Uint64` micros, or `String` like
-     *       `"7 days"` via `Raw`). `0` normalizes to `nullopt`. Also updatable.
+     *       `"7 days"` via `Raw`). `ServerDefault()` normalizes to `nullopt`.
+     *       Also updatable.
      */
     std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
     TopicCreateOptions &SetMessageExpiry(::iggy::Expiry message_expiry) {
-        message_expiry_ = std::move(message_expiry);
+        if (message_expiry.ExpiryKind() == "server_default") {
+            message_expiry_.reset();
+        } else {
+            message_expiry_ = std::move(message_expiry);
+        }
         return *this;
     }
 
@@ -1113,12 +1118,17 @@ class TopicCreateOptions final {
      * @return Max size when set; `nullopt` uses the server default
      *         `MaxTopicSize::ServerDefault` (`unlimited`, `u64::MAX` on wire).
      * @note Catalog key `max_topic_size` (`Uint64` bytes or `String` like
-     *       `"1 GiB"` via `Raw`). `0` normalizes to `nullopt`. Must be `>=`
-     *       the resolved segment size when both are set. Also updatable.
+     *       `"1 GiB"` via `Raw`). `ServerDefault()` normalizes to `nullopt`.
+     *       Must be `>=` the resolved segment size when both are set. Also
+     *       updatable.
      */
     std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
     TopicCreateOptions &SetMaxTopicSize(::iggy::MaxTopicSize max_topic_size) {
-        max_topic_size_ = std::move(max_topic_size);
+        if (max_topic_size.MaxTopicSizeValue() == "server_default") {
+            max_topic_size_.reset();
+        } else {
+            max_topic_size_ = std::move(max_topic_size);
+        }
         return *this;
     }
 
@@ -1269,11 +1279,15 @@ class TopicUpdateOptions final {
      * @brief New message retention policy.
      * @return Expiry when set; `nullopt` keeps the current value.
      * @note Catalog key `message_expiry` (`Uint64` micros or `String` like
-     *       `"7 days"` via `Raw`). `0` is treated as `nullopt` on the Rust side.
+     *       `"7 days"` via `Raw`). `ServerDefault()` normalizes to `nullopt`.
      */
     std::optional<::iggy::Expiry> MessageExpiry() const noexcept { return message_expiry_; }
     TopicUpdateOptions &SetMessageExpiry(::iggy::Expiry message_expiry) {
-        message_expiry_ = std::move(message_expiry);
+        if (message_expiry.ExpiryKind() == "server_default") {
+            message_expiry_.reset();
+        } else {
+            message_expiry_ = std::move(message_expiry);
+        }
         return *this;
     }
 
@@ -1281,11 +1295,15 @@ class TopicUpdateOptions final {
      * @brief New maximum retained topic size.
      * @return Max size when set; `nullopt` keeps the current value.
      * @note Catalog key `max_topic_size` (`Uint64` bytes or `String` like
-     *       `"1 GiB"` via `Raw`). `0` is treated as `nullopt` on the Rust side.
+     *       `"1 GiB"` via `Raw`). `ServerDefault()` normalizes to `nullopt`.
      */
     std::optional<::iggy::MaxTopicSize> MaxTopicSize() const noexcept { return max_topic_size_; }
     TopicUpdateOptions &SetMaxTopicSize(::iggy::MaxTopicSize max_topic_size) {
-        max_topic_size_ = std::move(max_topic_size);
+        if (max_topic_size.MaxTopicSizeValue() == "server_default") {
+            max_topic_size_.reset();
+        } else {
+            max_topic_size_ = std::move(max_topic_size);
+        }
         return *this;
     }
 
