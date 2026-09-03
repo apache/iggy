@@ -25,7 +25,7 @@ public sealed class OffsetResponse
     /// <summary>
     ///     Partition identifier.
     /// </summary>
-    public required int PartitionId { get; init; }
+    public required uint PartitionId { get; init; }
 
     /// <summary>
     ///     Current offset.

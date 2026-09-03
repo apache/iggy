@@ -15,45 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
-using Apache.Iggy.JsonConverters;
-
-namespace Apache.Iggy.Contracts;
+namespace Apache.Iggy.Enums;
 
 /// <summary>
-///     Information about a partition.
+///     Transport a connected client reached the server through, as reported by the server.
 /// </summary>
-public sealed class PartitionResponse
+public enum ClientTransport : byte
 {
     /// <summary>
-    ///     Partition identifier.
+    ///     Transport this SDK does not recognize, or one newer than this SDK.
     /// </summary>
-    public required uint Id { get; init; }
+    Unknown = 0,
 
     /// <summary>
-    ///     Number of messages in the partition.
+    ///     Custom binary protocol over TCP.
     /// </summary>
-    public required ulong MessagesCount { get; init; }
+    Tcp = 1,
 
     /// <summary>
-    ///     Creation date of the partition.
+    ///     QUIC.
     /// </summary>
-    [JsonConverter(typeof(DateTimeOffsetConverter))]
-    public required DateTimeOffset CreatedAt { get; init; }
+    Quic = 2,
 
     /// <summary>
-    ///     Number of segments in the partition.
+    ///     HTTP REST.
     /// </summary>
-    public required uint SegmentsCount { get; init; }
+    Http = 3,
 
     /// <summary>
-    ///     Current offset of the partition.
+    ///     WebSocket.
     /// </summary>
-    public required ulong CurrentOffset { get; init; }
-
-    /// <summary>
-    ///     Size of the partition.
-    /// </summary>
-    [JsonConverter(typeof(SizeConverter))]
-    public required ulong Size { get; init; }
+    WebSocket = 4
 }
