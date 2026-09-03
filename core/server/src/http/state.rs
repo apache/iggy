@@ -367,7 +367,7 @@ impl HttpInner {
             user_id,
             expiry,
             gate: Mutex::new(FIRST_REQUEST_ID),
-            data_request: Cell::new(FIRST_REQUEST_ID),
+            data_gate: Mutex::new(FIRST_REQUEST_ID),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
         }))
