@@ -614,7 +614,6 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
                 None
             },
             raw,
-            ..RustTopicCreateOptions::default()
         })
     }
 }
