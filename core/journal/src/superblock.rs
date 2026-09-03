@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 
 use crate::prepare_journal::TmpFileGuard;
+use server_common::fs_utils::fsync_dir_async;
 use twox_hash::XxHash3_64;
 
 /// Identifies a superblock file and rejects a foreign or zeroed one. "SBLK".
@@ -536,9 +537,7 @@ async fn atomic_replace(dir: &Path, file_name: &str, bytes: Vec<u8>) -> io::Resu
     compio::fs::rename(&tmp_path, &final_path).await?;
     guard.defuse();
 
-    let dir_file = compio::fs::File::open(dir).await?;
-    dir_file.sync_all().await?;
-    Ok(())
+    fsync_dir_async(dir).await
 }
 
 #[cfg(test)]

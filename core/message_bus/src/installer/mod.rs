@@ -130,8 +130,13 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     ) {
-        let stream = fd_transfer::wrap_duped_fd(fd);
-        install_replica_inbound(self, stream, on_message, on_done);
+        match fd_transfer::wrap_duped_fd(fd) {
+            Ok(stream) => install_replica_inbound(self, stream, on_message, on_done),
+            Err(e) => {
+                warn!("failed to wrap delegated inbound replica fd: {e}");
+                on_done();
+            }
+        }
     }
 
     fn install_replica_outbound_fd(
@@ -141,8 +146,16 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
         on_message: MessageHandler,
         on_done: ReplicaHandshakeDoneFn,
     ) {
-        let stream = fd_transfer::wrap_duped_fd(fd);
-        install_replica_outbound(self, replica_id, stream, on_message, on_done);
+        match fd_transfer::wrap_duped_fd(fd) {
+            Ok(stream) => install_replica_outbound(self, replica_id, stream, on_message, on_done),
+            Err(e) => {
+                warn!(
+                    replica_id,
+                    "failed to wrap delegated outbound replica fd: {e}"
+                );
+                on_done();
+            }
+        }
     }
 
     fn release_replica_handshake_slot(&self, slot: u64) {
@@ -154,12 +167,26 @@ impl ConnectionInstaller for Rc<IggyMessageBus> {
     }
 
     fn install_client_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler) {
-        let stream = fd_transfer::wrap_duped_fd(fd);
-        install_client_tcp(self, meta, stream, on_request);
+        match fd_transfer::wrap_duped_fd(fd) {
+            Ok(stream) => install_client_tcp(self, meta, stream, on_request),
+            Err(e) => warn!(
+                client_id = meta.client_id,
+                "failed to wrap delegated client fd: {e}"
+            ),
+        }
     }
 
     fn install_client_ws_fd(&self, fd: DupedFd, meta: ClientConnMeta, on_request: RequestHandler) {
-        let stream = fd_transfer::wrap_duped_fd(fd);
+        let stream = match fd_transfer::wrap_duped_fd(fd) {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!(
+                    client_id = meta.client_id,
+                    "failed to wrap delegated client WS fd: {e}"
+                );
+                return;
+            }
+        };
         let bus = Self::clone(self);
         let cfg = bus.config();
         let ws_config = cfg.ws_config;

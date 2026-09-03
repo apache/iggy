@@ -271,6 +271,43 @@ Start the server:
 
 `cargo run --bin iggy-server`
 
+### Native Windows builds
+
+Native Windows server builds require the MSVC Rust toolchain and the `hwloc`
+and `pkgconf` packages. Install them with [vcpkg](https://github.com/microsoft/vcpkg)
+from a PowerShell prompt:
+
+```powershell
+$vcpkg = Join-Path $env:USERPROFILE "vcpkg"
+git clone https://github.com/microsoft/vcpkg.git $vcpkg
+Set-Location $vcpkg
+.\bootstrap-vcpkg.bat
+.\vcpkg.exe install hwloc:x64-windows pkgconf:x64-windows
+```
+
+Configure Cargo to use vcpkg's `pkgconf` and hwloc metadata:
+
+```powershell
+$vcpkgInstalled = Join-Path $vcpkg "installed\x64-windows"
+$env:PKG_CONFIG = "$vcpkgInstalled\tools\pkgconf\pkgconf.exe"
+$env:PKG_CONFIG_PATH = "$vcpkgInstalled\lib\pkgconfig"
+$env:PATH = "$vcpkgInstalled\bin;$vcpkgInstalled\tools\pkgconf;$env:PATH"
+```
+
+Some vcpkg versions generate `hwloc.pc` with `-lhwloc`, while MSVC expects
+the import library to be named `libhwloc.lib`. If the build reports that
+`libhwloc.lib` is missing, create the compatibility name once:
+
+```powershell
+Copy-Item "$vcpkgInstalled\lib\hwloc.lib" "$vcpkgInstalled\lib\libhwloc.lib"
+```
+
+Then build the server normally:
+
+```powershell
+cargo build --locked -p server --bin iggy-server
+```
+
 All the data used by the server will be persisted under the `local_data` directory by default, unless specified differently in the configuration (see `system.path` in `config.toml`).
 
 One can use default root credentials with optional `--with-default-root-credentials`.

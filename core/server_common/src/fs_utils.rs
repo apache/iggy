@@ -102,3 +102,76 @@ pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Fsync `dir` so a rename published into it is itself durable, not just the
+/// bytes it publishes.
+///
+/// # Platform behaviour
+///
+/// On Windows this is a no-op. A directory cannot be opened through the
+/// ordinary file path there (`CreateFile` needs `FILE_FLAG_BACKUP_SEMANTICS`,
+/// which `File::open` does not pass, so the call fails with
+/// `ERROR_ACCESS_DENIED`), and NTFS exposes no documented equivalent of the
+/// Unix "fsync the directory" barrier. Every caller fsyncs the file itself
+/// before renaming, so the published bytes stay durable; only the ordering
+/// guarantee on the directory entry is weaker.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] when the directory cannot be opened
+/// or synced. Always returns `Ok(())` on Windows.
+#[cfg(unix)]
+pub fn fsync_dir(dir: impl AsRef<Path>) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(windows)]
+pub fn fsync_dir(_dir: impl AsRef<Path>) -> io::Result<()> {
+    Ok(())
+}
+
+/// Fsync the parent directory of `path`, if it has one.
+///
+/// See [`fsync_dir`] for the Windows behaviour.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] when the parent directory cannot be
+/// opened or synced.
+pub fn fsync_parent_dir(path: impl AsRef<Path>) -> io::Result<()> {
+    match path.as_ref().parent() {
+        Some(parent) => fsync_dir(parent),
+        None => Ok(()),
+    }
+}
+
+/// Async counterpart of [`fsync_dir`] for callers already on the compio
+/// runtime.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] when the directory cannot be opened
+/// or synced. Always returns `Ok(())` on Windows.
+#[cfg(unix)]
+pub async fn fsync_dir_async(dir: impl AsRef<Path>) -> io::Result<()> {
+    fs::File::open(dir).await?.sync_all().await
+}
+
+#[cfg(windows)]
+#[allow(clippy::unused_async)]
+pub async fn fsync_dir_async(_dir: impl AsRef<Path>) -> io::Result<()> {
+    Ok(())
+}
+
+/// Async counterpart of [`fsync_parent_dir`].
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] when the parent directory cannot be
+/// opened or synced.
+pub async fn fsync_parent_dir_async(path: impl AsRef<Path>) -> io::Result<()> {
+    match path.as_ref().parent() {
+        Some(parent) => fsync_dir_async(parent).await,
+        None => Ok(()),
+    }
+}

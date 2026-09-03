@@ -499,15 +499,21 @@ mod tests {
 
     #[compio::test]
     async fn read_offset_record_real_io_error_propagates() {
-        // A directory opens read-only but every read fails with EISDIR: a real
-        // I/O error, not a short read. It must surface as Err, never as None
-        // (a blanket None would silently rewind a valid higher offset).
+        // A directory is never a readable offset record. Unix opens it
+        // read-only and fails every read with EISDIR; Windows refuses the open
+        // outright. Either way it is a real I/O error, not a short read, and it
+        // must surface as Err, never as None (a blanket None would silently
+        // rewind a valid higher offset).
         let dir = unique_temp_dir();
         let path = dir.to_string_lossy().into_owned();
 
         let result = read_offset_record(&path).await;
         assert!(
-            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
+            matches!(
+                result,
+                Err(IggyError::CannotReadConsumerOffsets(_)
+                    | IggyError::CannotOpenConsumerOffsetsFile(_))
+            ),
             "real I/O error must propagate, got {result:?}",
         );
 
@@ -546,10 +552,15 @@ mod tests {
 
         // A directory path is a real I/O error, not a short read: it must
         // surface, not collapse to the re-purge sentinel (a silent re-purge
-        // would destroy post-purge messages).
+        // would destroy post-purge messages). Unix fails at read (EISDIR),
+        // Windows at open; both must propagate.
         let result = read_purge_generation(&dir.to_string_lossy(), 11).await;
         assert!(
-            matches!(result, Err(IggyError::CannotReadConsumerOffsets(_))),
+            matches!(
+                result,
+                Err(IggyError::CannotReadConsumerOffsets(_)
+                    | IggyError::CannotOpenConsumerOffsetsFile(_))
+            ),
             "real I/O error must propagate, got {result:?}",
         );
 
