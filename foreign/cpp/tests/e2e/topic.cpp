@@ -186,19 +186,33 @@ TEST_F(E2E_Topic, CreateTopicWithInvalidOptionsThrows) {
     const std::string invalid_expiry_topic_name      = GetRandomName();
     const std::string invalid_max_size_topic_name    = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_compression_topic_name, 1,
-                                      "invalid-compression", "server_default", 0, "server_default", {}),
+    const auto invalidCompressionOptions = iggy::ResourceOptions::Explicit({iggy::HeaderEntry::Create(
+        iggy::HeaderField::Create(iggy::HeaderKind::String, {'i', 'n', 'v', 'a', 'l', 'i', 'd', '-', 'c', 'o', 'm', 'p',
+                                                             'r', 'e', 's', 's', 'i', 'o', 'n'}),
+        iggy::HeaderField::Create(iggy::HeaderKind::String, {'t', 'r', 'u', 'e'}))});
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), invalid_compression_topic_name, 1,
+                                    iggy::CompressionAlgorithm::None(), iggy::Expiry::ServerDefault(),
+                                    iggy::MaxTopicSize::ServerDefault(), invalidCompressionOptions),
                  std::exception);
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_expiry_topic_name, 1, "none",
-                                      "invalid-expiry-kind", 0, "server_default", {}),
+    const auto invalidExpiryOptions = iggy::ResourceOptions::Explicit({iggy::HeaderEntry::Create(
+        iggy::HeaderField::Create(iggy::HeaderKind::String, {'i', 'n', 'v', 'a', 'l', 'i', 'd', '-', 'e', 'x', 'p', 'i',
+                                                             'r', 'y', '-', 'k', 'i', 'n', 'd'}),
+        iggy::HeaderField::Create(iggy::HeaderKind::String, {'t', 'r', 'u', 'e'}))});
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), invalid_expiry_topic_name, 1,
+                                    iggy::CompressionAlgorithm::None(), iggy::Expiry::ServerDefault(),
+                                    iggy::MaxTopicSize::ServerDefault(), invalidExpiryOptions),
                  std::exception);
-    ASSERT_THROW(client->create_topic(make_string_identifier(stream_name), invalid_max_size_topic_name, 1, "none",
-                                      "server_default", 0, "not-a-size", {}),
+    const auto invalidMaxSizeOptions = iggy::ResourceOptions::Explicit({iggy::HeaderEntry::Create(
+        iggy::HeaderField::Create(iggy::HeaderKind::String, {'n', 'o', 't', '-', 'a', '-', 's', 'i', 'z', 'e'}),
+        iggy::HeaderField::Create(iggy::HeaderKind::String, {'t', 'r', 'u', 'e'}))});
+    ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), invalid_max_size_topic_name, 1,
+                                    iggy::CompressionAlgorithm::None(), iggy::Expiry::ServerDefault(),
+                                    iggy::MaxTopicSize::ServerDefault(), invalidMaxSizeOptions),
                  std::exception);
 }
 
@@ -227,7 +241,7 @@ TEST_F(E2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRemainder)
 
     // Admission re-encodes the block from its own parse, so a value comes back
     // in its key's catalog kind rather than in the kind that was sent.
-    const auto &explicit_options = topic_details.Options().Explicit();
+    const auto explicit_options = topic_details.Options().Explicit();
     ASSERT_EQ(explicit_options.size(), 1u);
     EXPECT_EQ(explicit_options.front().Key().Kind(), iggy::HeaderKind::String);
     EXPECT_EQ(explicit_options.front().Key().Value(),
@@ -235,11 +249,12 @@ TEST_F(E2E_Topic, CreateTopicWithOptionsReturnsCanonicalKindAndDerivedRemainder)
     EXPECT_EQ(explicit_options.front().Value().Kind(), iggy::HeaderKind::Bool);
     EXPECT_EQ(explicit_options.front().Value().Value(), (std::vector<std::uint8_t>{1}));
 
-    EXPECT_FALSE(topic_details.Options().Derived().empty());
+    EXPECT_FALSE(!topic_details.Options().DerivedMap().empty());
     std::unordered_set<std::string> derived_option_keys;
-    for (const auto &derived_option : topic_details.Options().Derived()) {
-        const auto &key = derived_option.Key().Value();
-        derived_option_keys.emplace(key.begin(), key.end());
+    for (const auto &kv : topic_details.Options().DerivedMap()) {
+        const auto &key       = kv.first;
+        const auto &key_bytes = key.Value();
+        derived_option_keys.emplace(key_bytes.begin(), key_bytes.end());
     }
     EXPECT_EQ(derived_option_keys.count("max_topic_size"), 1u);
     EXPECT_EQ(derived_option_keys.count("enforce_fsync"), 0u);
@@ -381,34 +396,6 @@ TEST_F(E2E_Topic, CreateTopicAfterStreamDeletionThrows) {
     ASSERT_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1), std::exception);
 }
 
-TEST_F(E2E_Topic, CreateTopicWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects topic creation requests that use invalid stream identifier formats.");
-    const std::string stream_name       = GetRandomName();
-    const std::string first_topic_name  = GetRandomName();
-    const std::string second_topic_name = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->create_topic(std::move(invalid_kind_id), first_topic_name, 1, "none", "server_default", 0,
-                                      "server_default", {}),
-                 std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->create_topic(std::move(invalid_numeric_id), second_topic_name, 1, "none", "server_default", 0,
-                                      "server_default", {}),
-                 std::exception);
-}
-
 TEST_F(E2E_Topic, CreateTopicBeforeLoginThrows) {
     RecordProperty("description", "Throws when topic creation is attempted from an unauthenticated client.");
     const std::string stream_name = GetRandomName();
@@ -436,17 +423,16 @@ TEST_F(E2E_Topic, DeleteTopicAfterCreate) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
 
-    ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
+    ASSERT_NO_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)));
 
     ASSERT_NO_THROW({
-        const auto topics = client->get_topics(make_string_identifier(stream_name));
+        const auto topics = client.GetTopics(iggy::Identifier::String(stream_name));
         EXPECT_TRUE(topics.empty());
     });
 }
@@ -456,9 +442,9 @@ TEST_F(E2E_Topic, DeleteTopicOnNonExistentStreamThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+    ASSERT_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
 }
 
@@ -467,12 +453,12 @@ TEST_F(E2E_Topic, DeleteTopicOnNonExistentTopicThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
 
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+    ASSERT_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
 }
 
@@ -481,15 +467,14 @@ TEST_F(E2E_Topic, DeleteTopicTwiceThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
 
-    ASSERT_NO_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)));
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+    ASSERT_NO_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)));
+    ASSERT_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
 }
 
@@ -498,16 +483,15 @@ TEST_F(E2E_Topic, DeleteTopicAfterStreamDeletionThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-    ASSERT_NO_THROW(client->delete_stream(make_string_identifier(stream_name)));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
+    ASSERT_NO_THROW(client.DeleteStream(iggy::Identifier::String(stream_name)));
     ForgetTrackedStream(stream_name);
 
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+    ASSERT_THROW(client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
                  std::exception);
 }
 
@@ -516,79 +500,26 @@ TEST_F(E2E_Topic, DeleteTopicBeforeLoginThrows) {
     const std::string stream_name = GetRandomName();
     const std::string topic_name  = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 1));
 
-    iggy::ffi::Client *unauthenticated_client = GetLoggedOutClient();
+    auto unauthenticated_client = GetLoggedOutHighLevelClient();
 
     ASSERT_THROW(
-        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        unauthenticated_client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
         std::exception);
-    ASSERT_NO_THROW(unauthenticated_client->connect());
+    ASSERT_NO_THROW(unauthenticated_client.Connect());
     ASSERT_THROW(
-        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        unauthenticated_client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
         std::exception);
-    ASSERT_NO_THROW(unauthenticated_client->login_user("iggy", "iggy"));
-    ASSERT_NO_THROW(unauthenticated_client->disconnect());
+    ASSERT_NO_THROW(unauthenticated_client.Login("iggy", "iggy"));
+    ASSERT_NO_THROW(unauthenticated_client.Disconnect());
     ASSERT_THROW(
-        unauthenticated_client->delete_topic(make_string_identifier(stream_name), make_string_identifier(topic_name)),
+        unauthenticated_client.DeleteTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
         std::exception);
-}
-
-TEST_F(E2E_Topic, DeleteTopicWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects topic deletion requests that use invalid stream identifier formats.");
-    const std::string stream_name = GetRandomName();
-    const std::string topic_name  = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->delete_topic(std::move(invalid_kind_id), make_string_identifier(topic_name)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->delete_topic(std::move(invalid_numeric_id), make_string_identifier(topic_name)),
-                 std::exception);
-}
-
-TEST_F(E2E_Topic, DeleteTopicWithInvalidTopicIdentifierThrows) {
-    RecordProperty("description", "Rejects topic deletion requests that use invalid topic identifier formats.");
-    const std::string stream_name = GetRandomName();
-    const std::string topic_name  = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), std::move(invalid_kind_id)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->delete_topic(make_string_identifier(stream_name), std::move(invalid_numeric_id)),
-                 std::exception);
 }
 
 TEST_F(E2E_Topic, GetTopicReturnsTopicForExistingTopic) {
@@ -1167,31 +1098,37 @@ TEST_F(E2E_Topic, UpdateTopicFailedValidationDoesNotMutateTopic) {
     const std::string topic_name         = GetRandomName();
     const std::string updated_topic_name = GetRandomName();
 
-    iggy::ffi::Client *client = GetLoggedInClient();
+    auto client = GetLoggedInHighLevelClient();
 
-    ASSERT_NO_THROW(client->create_stream(stream_name));
+    ASSERT_NO_THROW(client.CreateStream(stream_name));
     TrackStream(stream_name);
-    ASSERT_NO_THROW(
-        client->create_topic(make_string_identifier(stream_name), topic_name, 2, "gzip", "duration", 1000, "1GiB", {}));
+    ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, 2,
+                                       iggy::CompressionAlgorithm::Gzip(), iggy::Expiry::Duration(1000),
+                                       iggy::MaxTopicSize::FromBytes(1024ULL * 1024ULL * 1024ULL)));
 
     const auto topic_before_update =
-        client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+        client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
 
-    ASSERT_THROW(client->update_topic(make_string_identifier(stream_name), make_string_identifier(topic_name),
-                                      updated_topic_name, "none", "duration", 2000, "not-a-size", {}),
+    const auto invalidOptions = iggy::ResourceOptions::Explicit({iggy::HeaderEntry::Create(
+        iggy::HeaderField::Create(iggy::HeaderKind::String,
+                                  {'m', 'a', 'x', '_', 't', 'o', 'p', 'i', 'c', '_', 's', 'i', 'z', 'e'}),
+        iggy::HeaderField::Create(iggy::HeaderKind::String, {'n', 'o', 't', '-', 'a', '-', 's', 'i', 'z', 'e'}))});
+    ASSERT_THROW(client.UpdateTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name),
+                                    updated_topic_name, iggy::CompressionAlgorithm::None(),
+                                    iggy::Expiry::Duration(2000), iggy::MaxTopicSize::ServerDefault(), invalidOptions),
                  std::exception);
 
     const auto topic_after_failed_update =
-        client->get_topic(make_string_identifier(stream_name), make_string_identifier(topic_name));
+        client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name));
 
-    EXPECT_EQ(topic_after_failed_update.id, topic_before_update.id);
-    EXPECT_EQ(topic_after_failed_update.name, topic_before_update.name);
-    EXPECT_EQ(topic_after_failed_update.partitions_count, topic_before_update.partitions_count);
-    EXPECT_EQ(topic_after_failed_update.compression_algorithm, topic_before_update.compression_algorithm);
-    EXPECT_EQ(topic_after_failed_update.message_expiry, topic_before_update.message_expiry);
-    EXPECT_EQ(topic_after_failed_update.max_topic_size, topic_before_update.max_topic_size);
+    EXPECT_EQ(topic_after_failed_update.Id(), topic_before_update.Id());
+    EXPECT_EQ(topic_after_failed_update.Name(), topic_before_update.Name());
+    EXPECT_EQ(topic_after_failed_update.PartitionsCount(), topic_before_update.PartitionsCount());
+    EXPECT_EQ(topic_after_failed_update.CompressionAlgorithm(), topic_before_update.CompressionAlgorithm());
+    EXPECT_EQ(topic_after_failed_update.MessageExpiry(), topic_before_update.MessageExpiry());
+    EXPECT_EQ(topic_after_failed_update.MaxTopicSize(), topic_before_update.MaxTopicSize());
 
-    EXPECT_THROW(client->get_topic(make_string_identifier(stream_name), make_string_identifier(updated_topic_name)),
+    EXPECT_THROW(client.GetTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(updated_topic_name)),
                  std::exception);
 }
 
@@ -1307,58 +1244,6 @@ TEST_F(E2E_Topic, PurgeTopicOnNonExistentTopicThrows) {
     TrackStream(stream_name);
 
     ASSERT_THROW(client.PurgeTopic(iggy::Identifier::String(stream_name), iggy::Identifier::String(topic_name)),
-                 std::exception);
-}
-
-TEST_F(E2E_Topic, PurgeTopicWithInvalidStreamIdentifierThrows) {
-    RecordProperty("description", "Rejects topic purge requests that use invalid stream identifier formats.");
-    const std::string stream_name = GetRandomName();
-    const std::string topic_name  = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->purge_topic(std::move(invalid_kind_id), make_string_identifier(topic_name)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->purge_topic(std::move(invalid_numeric_id), make_string_identifier(topic_name)),
-                 std::exception);
-}
-
-TEST_F(E2E_Topic, PurgeTopicWithInvalidTopicIdentifierThrows) {
-    RecordProperty("description", "Rejects topic purge requests that use invalid topic identifier formats.");
-    const std::string stream_name = GetRandomName();
-    const std::string topic_name  = GetRandomName();
-
-    iggy::ffi::Client *client = GetLoggedInClient();
-
-    ASSERT_NO_THROW(client->create_stream(stream_name));
-    TrackStream(stream_name);
-    ASSERT_NO_THROW(client->create_topic(make_string_identifier(stream_name), topic_name, 1, "none", "server_default",
-                                         0, "server_default", {}));
-
-    iggy::ffi::Identifier invalid_kind_id;
-    invalid_kind_id.kind   = "invalid";
-    invalid_kind_id.length = 4;
-    invalid_kind_id.value  = {1, 0, 0, 0};
-    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), std::move(invalid_kind_id)), std::exception);
-
-    iggy::ffi::Identifier invalid_numeric_id;
-    invalid_numeric_id.kind   = "numeric";
-    invalid_numeric_id.length = 1;
-    invalid_numeric_id.value.push_back(1);
-    ASSERT_THROW(client->purge_topic(make_string_identifier(stream_name), std::move(invalid_numeric_id)),
                  std::exception);
 }
 

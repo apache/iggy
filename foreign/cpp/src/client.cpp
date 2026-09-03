@@ -17,6 +17,8 @@
  * under the License.
  */
 
+#include <utility>
+
 #include "iggy.hpp"
 
 namespace iggy {

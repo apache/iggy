@@ -52,6 +52,7 @@ excludes = [
     "**/.bazelignore",
     "**/.bazelrc",
     "**/.clang-format",
+    "**/.clang-tidy",
     "**/.prettierrc",
     "**/CODEOWNERS",
     "**/gradlew",
