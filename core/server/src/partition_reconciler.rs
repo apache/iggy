@@ -146,7 +146,9 @@
 //! discriminator, like `checkpoint_id` on every prepare
 //! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
-use crate::partition_helpers::{build_partition_fresh, delete_partitions_from_disk};
+use crate::partition_helpers::{
+    build_partition_fresh, delete_partitions_from_disk, load_partition_or_fence,
+};
 use crate::shell::ServerShard;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -155,6 +157,7 @@ use futures::FutureExt;
 use iggy_common::{ConsumerGroupId, IggyTimestamp};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::Partition;
 use partitions::delete_persisted_offset;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -649,21 +652,52 @@ async fn reconcile_additions(
             continue;
         };
 
-        match build_partition_fresh(
-            ctx.config.as_ref(),
-            ns,
-            partition_stats,
-            epoch,
-            topic_runtime,
-            ctx.cluster_id,
-            ctx.self_replica_id,
-            ctx.replica_count,
-            created_view,
-            Rc::clone(&ctx.shard.bus),
-        )
-        .await
-        {
-            Ok(partition) => {
+        // A directory already on disk is a prior life of this namespace. The
+        // usual shape: this replica applied the create before a crash, but its
+        // WAL watermark trails the commit by one op, so boot saw no such
+        // partition and the post-election re-commit lands here. Recover it the
+        // way boot does, segments included. Building fresh opens segment 0
+        // with truncation and throws away flushed data that no peer may still
+        // hold once the whole cluster restarted.
+        let partition_dir =
+            ctx.config
+                .system
+                .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
+        let built = if std::fs::metadata(&partition_dir).is_ok() {
+            let Some(partition_metadata) = fetch_partition_metadata(ctx, ns) else {
+                continue;
+            };
+            load_partition_or_fence(
+                ctx.config.as_ref(),
+                ns,
+                partition_stats,
+                &partition_metadata,
+                topic_runtime,
+                ctx.cluster_id,
+                ctx.self_replica_id,
+                ctx.replica_count,
+                Rc::clone(&ctx.shard.bus),
+                partitions,
+            )
+            .await
+        } else {
+            build_partition_fresh(
+                ctx.config.as_ref(),
+                ns,
+                partition_stats,
+                epoch,
+                topic_runtime,
+                ctx.cluster_id,
+                ctx.self_replica_id,
+                ctx.replica_count,
+                created_view,
+                Rc::clone(&ctx.shard.bus),
+            )
+            .await
+            .map(Some)
+        };
+        match built {
+            Ok(Some(partition)) => {
                 ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                     namespace: ns,
                     partition: Box::new(partition),
@@ -672,6 +706,9 @@ async fn reconcile_additions(
                 ctx.record_success(ns, FailureCause::Add);
                 counters.materialised += 1;
             }
+            // Tombstoned by the loader over damaged files; the gate above keeps
+            // every later pass from rebuilding over them.
+            Ok(None) => {}
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
                 ctx.shard.metrics().record_partition_reconcile_failure();
@@ -1107,6 +1144,21 @@ fn fetch_partition_stats(
             ),
             iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options),
         ))
+    })
+}
+
+/// The committed [`Partition`] record for `ns`, which the disk loader needs
+/// (`created_at`, `created_revision`, `created_view`). `None` if the topic or
+/// partition vanished between the target snapshot and this read.
+fn fetch_partition_metadata(ctx: &ReconcilerCtx, ns: IggyNamespace) -> Option<Partition> {
+    ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        let stream = inner.items.get(ns.stream_id())?;
+        let topic = stream.topics.get(ns.topic_id())?;
+        topic
+            .partitions
+            .iter()
+            .find(|partition| partition.id == ns.partition_id())
+            .cloned()
     })
 }
 

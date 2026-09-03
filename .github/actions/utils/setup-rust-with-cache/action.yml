@@ -125,9 +125,12 @@ runs:
     - name: Install cargo-nextest
       if: runner.os == 'Linux' && inputs.install-nextest == 'true'
       run: |
-        if command -v cargo-nextest &> /dev/null; then
+        # A binary restored from the cargo cache can predate the floor in
+        # .config/nextest.toml. `show-config version` exits non-zero below it,
+        # and on a nextest too old to know the subcommand at all, so both fall
+        # through to a fresh install instead of aborting the lane later.
+        if command -v cargo-nextest &> /dev/null && cargo nextest show-config version; then
           echo "cargo-nextest already installed"
-          cargo nextest --version
           exit 0
         fi
 

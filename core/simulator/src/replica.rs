@@ -32,7 +32,7 @@ use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
 use metadata::{IggyMetadata, apply_committed_prepare};
 use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
-use server::bootstrap::wire_shell_handlers;
+use server::boot::wire_shell_handlers;
 use server::shell::{ShellHandlers, ShellShardHandle};
 use server_common::crypto;
 use server_common::sharding::{METADATA_GROUP, ShardId};
