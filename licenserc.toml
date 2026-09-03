@@ -37,6 +37,7 @@ excludes = [
     "**/local_data*/**",
     "**/performance_results*/**",
     "**/*.lock",
+    "**/pylock.toml",
     "**/*.txt",
     "**/*.tpl",
     "**/LICENSE",
