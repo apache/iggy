@@ -242,6 +242,11 @@ ALTER TABLE users ADD COLUMN is_processed BOOLEAN DEFAULT false;
 
 When `processed_column` is set, the connector automatically adds a `WHERE is_processed = FALSE` filter to the polling query, so only unprocessed rows are fetched. This improves polling efficiency as the table grows.
 
+With the generated polling query, a row whose tracking value moves past the
+batch boundary between poll and acknowledgement is left unchanged and returns
+in a later poll. Custom queries do not apply this boundary because their result
+order is not guaranteed.
+
 The connector persists the acknowledged offset before deleting or marking rows.
 If it stops in between, the rows have been delivered but may remain unchanged in
 PostgreSQL. The persisted offset prevents those rows from being selected again.

@@ -24,12 +24,8 @@ use crate::error::RuntimeError;
 
 const TOKEN_FILE_PREFIX: &str = "file:";
 
-fn append_query_parameters(connection_string: &str, parameters: &str) -> String {
-    let separator = if connection_string.contains('?') {
-        '&'
-    } else {
-        '?'
-    };
+fn append_query_parameters(connection_string: &str, address: &str, parameters: &str) -> String {
+    let separator = if address.contains('?') { '&' } else { '?' };
     format!("{connection_string}{separator}{parameters}")
 }
 
@@ -144,6 +140,7 @@ fn connection_string_with_token(
             .unwrap_or_default();
         Ok(append_query_parameters(
             &connection_string,
+            &config.address,
             &format!("tls=true&tls_ca_file={ca_file}{domain}"),
         ))
     } else {
@@ -205,8 +202,9 @@ mod tests {
     #[test]
     fn given_existing_query_when_appending_parameters_should_use_ampersand() {
         let connection_string = "iggy://user:password@127.0.0.1:8090?reconnection_retries=0";
+        let address = "127.0.0.1:8090?reconnection_retries=0";
 
-        let result = append_query_parameters(connection_string, "tls=true");
+        let result = append_query_parameters(connection_string, address, "tls=true");
 
         assert_eq!(
             result,
@@ -217,10 +215,21 @@ mod tests {
     #[test]
     fn given_no_query_when_appending_parameters_should_use_question_mark() {
         let connection_string = "iggy://user:password@127.0.0.1:8090";
+        let address = "127.0.0.1:8090";
 
-        let result = append_query_parameters(connection_string, "tls=true");
+        let result = append_query_parameters(connection_string, address, "tls=true");
 
         assert_eq!(result, "iggy://user:password@127.0.0.1:8090?tls=true");
+    }
+
+    #[test]
+    fn given_question_mark_in_credentials_should_use_address_separator() {
+        let connection_string = "iggy://user:pass?word@127.0.0.1:8090";
+        let address = "127.0.0.1:8090";
+
+        let result = append_query_parameters(connection_string, address, "tls=true");
+
+        assert_eq!(result, "iggy://user:pass?word@127.0.0.1:8090?tls=true");
     }
 
     #[test]

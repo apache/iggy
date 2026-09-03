@@ -163,16 +163,12 @@ impl Source for MySource {
     }
 
     async fn on_batch_result(&self, result: SourceBatchResult) -> Result<(), Error> {
-        let pending = self.pending.lock().await.take();
-        match result {
-            SourceBatchResult::Ack => {
-                let Some(candidate) = pending else {
-                    return Ok(());
-                };
-                *self.state.lock().await = candidate;
-            }
-            SourceBatchResult::Nack => {}
-        }
+        let (SourceBatchResult::Ack, Some(candidate)) =
+            (result, self.pending.lock().await.take())
+        else {
+            return Ok(());
+        };
+        *self.state.lock().await = candidate;
         Ok(())
     }
 

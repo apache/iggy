@@ -75,14 +75,28 @@ async fn poll_cdc_records(
 }
 
 async fn slot_contains_change(pool: &sqlx::PgPool, expected_value: &str) -> bool {
-    let changes = sqlx::query_scalar::<_, String>(
-        "SELECT data FROM pg_logical_slot_peek_changes($1, NULL, NULL)",
-    )
-    .bind(DEFAULT_SLOT)
-    .fetch_all(pool)
-    .await
-    .expect("CDC replication slot should be readable");
-    changes.iter().any(|change| change.contains(expected_value))
+    for attempt in 0..POLL_ATTEMPTS {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT data FROM pg_logical_slot_peek_changes($1, NULL, NULL)",
+        )
+        .bind(DEFAULT_SLOT)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(changes) => {
+                return changes.iter().any(|change| change.contains(expected_value));
+            }
+            Err(sqlx::Error::Database(ref database_error))
+                if attempt + 1 < POLL_ATTEMPTS
+                    && database_error.code().as_deref() == Some(PG_OBJECT_IN_USE) =>
+            {
+                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+            Err(error) => panic!("CDC replication slot should be readable: {error}"),
+        }
+    }
+
+    panic!("CDC replication slot remained active after {POLL_ATTEMPTS} attempts");
 }
 
 // End-to-end CDC coverage against a real wal_level=logical container:
@@ -239,6 +253,52 @@ async fn cdc_source_captures_insert_update_delete(
     );
 
     pool.close().await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn idle_cdc_source_advances_slot_to_current_wal(
+    harness: &TestHarness,
+    fixture: PostgresSourceCdcFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    wait_for_source_status(&Client::new(), &api_url, ConnectorStatus::Running).await;
+
+    sqlx::query("CHECKPOINT")
+        .execute(&pool)
+        .await
+        .expect("Failed to generate WAL without a logical table change");
+    let target_lsn: String = sqlx::query_scalar("SELECT pg_current_wal_flush_lsn()::text")
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to read current WAL flush LSN");
+
+    for _ in 0..POLL_ATTEMPTS {
+        let reached: bool = sqlx::query_scalar(
+            "SELECT confirmed_flush_lsn >= $2::pg_lsn FROM pg_replication_slots WHERE slot_name = $1",
+        )
+        .bind(DEFAULT_SLOT)
+        .bind(&target_lsn)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to read replication slot position");
+        if reached {
+            pool.close().await;
+            return;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    panic!("Idle CDC slot did not advance to WAL flush LSN {target_lsn}");
 }
 
 #[iggy_harness(

@@ -32,7 +32,7 @@ use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     PostgresOps, PostgresSourceByteaFixture, PostgresSourceDeleteFixture,
     PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    PostgresSourceOps,
+    PostgresSourceNumericTrackingFixture, PostgresSourceOps,
 };
 
 #[iggy_harness(
@@ -444,6 +444,64 @@ async fn delete_after_read_source_removes_rows_after_producing(
     assert_eq!(
         final_count, 0,
         "Expected 0 rows after delete_after_read, got {final_count}"
+    );
+
+    pool.close().await;
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn numeric_tracking_source_preserves_exact_ack_boundary(
+    harness: &TestHarness,
+    fixture: PostgresSourceNumericTrackingFixture,
+) {
+    const TRACKING_VALUE: &str = "9007199254740993.25";
+
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+    fixture.insert_row(&pool, 1, TRACKING_VALUE).await;
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "numeric_tracking_consumer".try_into().unwrap();
+    let mut received = false;
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                1,
+                true,
+            )
+            .await
+            && !polled.messages.is_empty()
+        {
+            received = true;
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert!(received, "NUMERIC tracking row should be delivered");
+
+    let mut remaining_rows = fixture.count_rows(&pool).await;
+    for _ in 0..POLL_ATTEMPTS {
+        if remaining_rows == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        remaining_rows = fixture.count_rows(&pool).await;
+    }
+    assert_eq!(
+        remaining_rows, 0,
+        "Exact NUMERIC tracking boundary should allow ACK cleanup"
     );
 
     pool.close().await;

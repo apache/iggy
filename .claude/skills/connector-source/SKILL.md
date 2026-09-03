@@ -69,6 +69,8 @@ let persisted = ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id)
 The SDK allows one in-flight batch. Five consecutive NACKs stop the source and
 require a manual restart. Returning `Err` from `on_batch_result` is fatal, so
 retry transient backend failures inside the callback before returning an error.
+The callback must complete within the SDK's 30-second batch-result window, so
+bound connection acquisition and the full retry budget comfortably below 30 seconds.
 
 ### Sleep first
 
