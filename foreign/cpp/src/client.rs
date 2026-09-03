@@ -230,13 +230,17 @@ impl Client {
     ) -> Result<(), String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not update stream '{stream_name}': {error}"))?;
-        let raw = crate::type_conversion::ffi_options_to_raw(options)
-            .map_err(|error| format!("Could not update stream '{stream_name}': {error}"))?;
-        let update_options = StreamUpdateOptions { raw };
+        // Stream options are currently null-op (UPDATABLE_STREAM_OPTION_KEYS is empty),
+        // so no conversion is needed. Keep param for surface parity and pass default.
+        let _ = options;
 
         RUNTIME.block_on(async {
             self.inner
-                .update_stream(&rust_stream_id, &stream_name, &update_options)
+                .update_stream(
+                    &rust_stream_id,
+                    &stream_name,
+                    &StreamUpdateOptions::default(),
+                )
                 .await
                 .map_err(|error| {
                     format!(
