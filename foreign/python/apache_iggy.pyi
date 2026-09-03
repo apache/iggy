@@ -1056,32 +1056,6 @@ class IggyClient:
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
         """
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-    def describe_options(
-        self, scope: builtins.str
-    ) -> collections.abc.Awaitable[builtins.list[OptionSpec]]:
-        r"""
-        Describe the option catalog for a resource scope.
-
-        This is the discovery surface for the `options` argument on
-        `create_topic`/`update_topic`: a key outside the catalog is refused at
-        create, and the binary transports carry only the error code back.
-
-        Args:
-            scope: One of `"topic"`, `"stream"`, `"user"`.
-
-        Returns:
-            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
-            with no keys yet.
-
-        Raises:
-            ValueError: If the scope name is not one of the three above.
-            RuntimeError: If the request fails.
-        """
-=======
->>>>>>> 76520fe4a (fixes)
     def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
         r"""
         Return all streams.
@@ -1169,7 +1143,6 @@ class IggyClient:
                 `manage_streams` or per-stream `manage_stream` permission, the
                 stream does not exist, or the request fails.
         """
->>>>>>> 2567de371 (feat(python): add stream listing, update, delete, and purge)
     def create_topic(
         self,
         stream: builtins.str | builtins.int,
@@ -2274,15 +2247,7 @@ class Topic:
         r"""
         Options admission resolved for the keys the client did not send.
 
-<<<<<<< HEAD
-<<<<<<< HEAD
         Same shape as `options`. These would have resolved differently
-=======
-        Same shape as [`Self::options`]. These would have resolved differently
->>>>>>> 76520fe4a (fixes)
-=======
-        Same shape as options. These would have resolved differently
->>>>>>> 88ba2b335 (address comments)
         under another server configuration.
         """
 
@@ -2347,15 +2312,7 @@ class TopicDetails:
         r"""
         Options admission resolved for the keys the client did not send.
 
-<<<<<<< HEAD
-<<<<<<< HEAD
         Same shape as `options`. These would have resolved differently
-=======
-        Same shape as [`Self::options`]. These would have resolved differently
->>>>>>> 76520fe4a (fixes)
-=======
-        Same shape as options. These would have resolved differently
->>>>>>> 88ba2b335 (address comments)
         under another server configuration.
         """
     @property
