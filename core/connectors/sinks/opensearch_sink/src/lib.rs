@@ -487,8 +487,11 @@ impl OpenSearchSink {
         let mut indexed = 0usize;
         let mut attempted = 0usize;
         // The runtime commits the offset regardless of this error, so returning
-        // early would drop the remaining chunks for good.
-        let mut last_error: Option<Error> = None;
+        // early would drop the remaining chunks for good. The first failure is
+        // kept, not the last, matching `BulkOutcome::merge`: it's the one an
+        // operator can act on if later chunks fail differently (e.g. a
+        // permanent mapping conflict followed by a transient timeout).
+        let mut first_error: Option<Error> = None;
 
         for chunk in documents.chunks(self.config.batch_size) {
             attempted += chunk.len();
@@ -496,10 +499,10 @@ impl OpenSearchSink {
                 Ok(outcome) => {
                     indexed += outcome.indexed;
                     if let Some(error) = outcome.into_error(&self.config.index) {
-                        last_error = Some(error);
+                        first_error = first_error.take().or(Some(error));
                     }
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => first_error = first_error.take().or(Some(error)),
             }
             debug!(
                 "OpenSearch sink with ID: {} indexed {}/{} documents",
@@ -507,7 +510,7 @@ impl OpenSearchSink {
             );
         }
 
-        match last_error {
+        match first_error {
             Some(error) => Err(PartialIndexError {
                 indexed,
                 failed: total - indexed,
@@ -1304,6 +1307,15 @@ fn sanitize_url_for_log(normalized: &str) -> String {
     url.to_string().trim_end_matches('/').to_string()
 }
 
+// Case-insensitive for the same reason as `normalize_url`'s scheme check:
+// `HTTP://host` is an explicit scheme, just not a lowercase one.
+fn explicit_http_scheme_hint(raw: &str) -> &'static str {
+    match raw.trim().split_once("://") {
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("http") => "explicit http://",
+        _ => "implicit http://",
+    }
+}
+
 fn warn_if_credentials_use_insecure_http(raw: &str, normalized: &str, has_password: bool) {
     if !has_password {
         return;
@@ -1322,11 +1334,7 @@ fn warn_if_credentials_use_insecure_http(raw: &str, normalized: &str, has_passwo
         return;
     }
 
-    let scheme_hint = if raw.trim().starts_with("http://") {
-        "explicit http://"
-    } else {
-        "implicit http://"
-    };
+    let scheme_hint = explicit_http_scheme_hint(raw);
     warn!(
         "OpenSearch credentials are configured with {scheme_hint} for non-loopback host '{host}'. They will be sent without TLS; use https:// unless this is intentional."
     );
@@ -2760,6 +2768,56 @@ mod tests {
         assert_eq!(error.failed, 2);
     }
 
+    // Regression test: index_documents must report the first chunk's failure,
+    // not whichever chunk fails last, mirroring BulkOutcome::merge's
+    // first-failure-wins semantics.
+    #[tokio::test]
+    async fn given_chunks_failing_differently_should_keep_first_chunks_error() {
+        let server = MockServer::start().await;
+        let mut config = fast_retry_config(1);
+        config.url = server.uri();
+        config.batch_size = Some(2);
+        config.max_retries = Some(0);
+        let sink = sink_with_config(config);
+        let client = mock_client(&sink);
+        let documents: Vec<PreparedDocument> =
+            ["a", "b", "c", "d"].into_iter().map(prepared).collect();
+        let chunk1_body = build_bulk_body(&sink.config.index, &[&documents[0], &documents[1]])
+            .expect("build chunk 1 body");
+        let chunk2_body = build_bulk_body(&sink.config.index, &[&documents[2], &documents[3]])
+            .expect("build chunk 2 body");
+
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(body_bytes(chunk1_body))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": { "type": "illegal_argument_exception", "reason": "malformed request" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/_bulk"))
+            .and(body_bytes(chunk2_body))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1) // max_retries = 0: no retry, exhausted after the first attempt
+            .mount(&server)
+            .await;
+
+        let error = sink
+            .index_documents(&client, documents)
+            .await
+            .expect_err("both chunks failing should surface an error");
+
+        assert!(
+            matches!(error.error, Error::PermanentHttpError(_)),
+            "expected the first chunk's permanent error to survive, got {:?}",
+            error.error
+        );
+        assert_eq!(error.indexed, 0);
+        assert_eq!(error.failed, 4);
+    }
+
     #[tokio::test]
     async fn given_concurrent_index_creation_should_not_fail_open() {
         let server = MockServer::start().await;
@@ -2891,6 +2949,29 @@ mod tests {
         assert!(is_loopback_host("127.0.0.1"));
         assert!(is_loopback_host("::1"));
         assert!(!is_loopback_host("opensearch.prod"));
+    }
+
+    // Regression test: an uppercase scheme is still explicit, matching
+    // normalize_url's case-insensitive scheme detection.
+    #[test]
+    fn given_uppercase_http_scheme_should_be_reported_as_explicit() {
+        assert_eq!(
+            explicit_http_scheme_hint("HTTP://host:9200"),
+            "explicit http://"
+        );
+    }
+
+    #[test]
+    fn given_lowercase_http_scheme_should_be_reported_as_explicit() {
+        assert_eq!(
+            explicit_http_scheme_hint("http://host:9200"),
+            "explicit http://"
+        );
+    }
+
+    #[test]
+    fn given_schemeless_url_should_be_reported_as_implicit() {
+        assert_eq!(explicit_http_scheme_hint("host:9200"), "implicit http://");
     }
 
     #[test]
