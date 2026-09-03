@@ -33,6 +33,15 @@ namespace Apache.Iggy.Mappers;
 
 internal static class BinaryMapper
 {
+    private const int CONSUMER_GROUP_HEADER_SIZE = 13;
+    private const int MEMBER_HEADER_SIZE = 8;
+    private const int CONSUMER_GROUP_INFO_SIZE = 12;
+    private const int CACHE_METRICS_ENTRY_SIZE = 32;
+    private const int MIN_TOPIC_SIZE = 50 + 4 + 4;
+    private const int MIN_OPTION_SPEC_SIZE = 1 + 1 + 4 + 4;
+    private const int CLUSTER_NODE_TAIL_SIZE = 4 * 2 + 1 + 1;
+    private const int MIN_CLUSTER_NODE_SIZE = 4 + 4 + CLUSTER_NODE_TAIL_SIZE;
+
     internal static RawPersonalAccessToken MapRawPersonalAccessToken(ReadOnlySpan<byte> payload)
     {
         var tokenLength = payload[0];
@@ -101,7 +110,7 @@ internal static class BinaryMapper
         var hasPermissions = payload[position];
         if (hasPermissions == 1)
         {
-            var permissionLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 1)..(position + 5)]);
+            var permissionLength = ReadLength(payload, position + 1, "User permissions");
             ReadOnlySpan<byte> permissionsPayload = payload[(position + 5)..(position + 5 + permissionLength)];
             var permissions = MapPermissions(permissionsPayload);
             return new UserResponse
@@ -128,7 +137,7 @@ internal static class BinaryMapper
 
     private static Permissions MapPermissions(ReadOnlySpan<byte> bytes)
     {
-        var streamMap = new Dictionary<int, StreamPermissions>();
+        var streamMap = new Dictionary<uint, StreamPermissions>();
         var index = 0;
 
         var globalPermissions = new GlobalPermissions
@@ -149,8 +158,8 @@ internal static class BinaryMapper
         {
             while (true)
             {
-                var streamId = BinaryPrimitives.ReadInt32LittleEndian(bytes[index..(index + 4)]);
-                index += sizeof(int);
+                var streamId = BinaryPrimitives.ReadUInt32LittleEndian(bytes[index..(index + 4)]);
+                index += sizeof(uint);
 
                 var manageStream = bytes[index++] == 1;
                 var readStream = bytes[index++] == 1;
@@ -158,14 +167,14 @@ internal static class BinaryMapper
                 var readTopics = bytes[index++] == 1;
                 var pollMessagesStream = bytes[index++] == 1;
                 var sendMessagesStream = bytes[index++] == 1;
-                var topicsMap = new Dictionary<int, TopicPermissions>();
+                var topicsMap = new Dictionary<uint, TopicPermissions>();
 
                 if (bytes[index++] == 1)
                 {
                     while (true)
                     {
-                        var topicId = BinaryPrimitives.ReadInt32LittleEndian(bytes[index..(index + 4)]);
-                        index += sizeof(int);
+                        var topicId = BinaryPrimitives.ReadUInt32LittleEndian(bytes[index..(index + 4)]);
+                        index += sizeof(uint);
 
                         var manageTopic = bytes[index++] == 1;
                         var readTopic = bytes[index++] == 1;
@@ -245,13 +254,14 @@ internal static class BinaryMapper
     internal static ClientResponse MapClient(ReadOnlySpan<byte> payload)
     {
         var (response, position) = MapClientInfo(payload, 0);
-        var consumerGroups = new List<ConsumerGroupInfo>(response.ConsumerGroupsCount);
+        var consumerGroups = new List<ConsumerGroupInfo>(ValidatedCollectionSize(response.ConsumerGroupsCount,
+            payload.Length - position, CONSUMER_GROUP_INFO_SIZE, "Client consumer groups count"));
 
         for (var i = 0; i < response.ConsumerGroupsCount; i++)
         {
-            var streamId = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-            var topicId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 4)..(position + 8)]);
-            var consumerGroupId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 8)..(position + 12)]);
+            var streamId = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+            var topicId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 4)..(position + 8)]);
+            var consumerGroupId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 8)..(position + 12)]);
             var consumerGroup
                 = new ConsumerGroupInfo
                 {
@@ -295,38 +305,37 @@ internal static class BinaryMapper
         return response;
     }
 
-    private static (ClientResponse response, int position) MapClientInfo(ReadOnlySpan<byte> payload, int position)
+    private static (ClientResponse response, int readBytes) MapClientInfo(ReadOnlySpan<byte> payload, int position)
     {
-        int readBytes;
+        var start = position;
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var userId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 4)..(position + 8)]);
-        var transportByte = payload[position + 8];
-        var transport = transportByte switch
+        var transport = payload[position + 8] switch
         {
-            1 => "TCP",
-            2 => "QUIC",
-            _ => "Unknown"
+            1 => ClientTransport.Tcp,
+            2 => ClientTransport.Quic,
+            3 => ClientTransport.Http,
+            4 => ClientTransport.WebSocket,
+            _ => ClientTransport.Unknown
         };
-        var addressLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 9)..(position + 13)]);
-        var address = Encoding.UTF8.GetString(payload[(position + 13)..(position + 13 + addressLength)]);
-        readBytes = 4 + 1 + 4 + 4 + addressLength;
-        position += readBytes;
-        var consumerGroupsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-        readBytes += 4;
+        position += 9;
+        var address = ReadString(payload, ref position, "Client address");
+        var consumerGroupsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        position += 4;
 
         return (new ClientResponse
         {
             ClientId = id,
-            UserId = userId,
-            Transport = Enum.Parse<Protocol>(transport, true),
+            UserId = userId == uint.MaxValue ? null : userId,
+            Transport = transport,
             Address = address,
             ConsumerGroupsCount = consumerGroupsCount
-        }, readBytes);
+        }, position - start);
     }
 
     internal static OffsetResponse MapOffsets(ReadOnlySpan<byte> payload)
     {
-        var partitionId = BinaryPrimitives.ReadInt32LittleEndian(payload[..4]);
+        var partitionId = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[4..12]);
         var offset = BinaryPrimitives.ReadUInt64LittleEndian(payload[12..20]);
 
@@ -343,7 +352,7 @@ internal static class BinaryMapper
     {
         ReadOnlySpan<byte> span = payload.Span;
         var length = payload.Length;
-        var partitionId = BinaryPrimitives.ReadInt32LittleEndian(span[..4]);
+        var partitionId = BinaryPrimitives.ReadUInt32LittleEndian(span[..4]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[4..12]);
         var messagesCount = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]);
         var position = 16;
@@ -433,7 +442,7 @@ internal static class BinaryMapper
                         }
                         catch (Exception ex)
                         {
-                            throw new MessageDecryptionException(offset, (uint)partitionId, ex);
+                            throw new MessageDecryptionException(offset, partitionId, ex);
                         }
                     }
 
@@ -608,31 +617,10 @@ internal static class BinaryMapper
 
         while (position < payload.Length)
         {
-            var keyKind = MapHeaderKind(payload[position]);
-            position++;
-
-            var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-            if (keyLength is 0 or > 255)
-            {
-                throw new ArgumentException("Key has incorrect size, must be between 1 and 255", nameof(keyLength));
-            }
-
-            position += 4;
-            var keyValue = payload[position..(position + keyLength)].ToArray();
-            position += keyLength;
-
-            var valueKind = MapHeaderKind(payload[position]);
-            position++;
-
-            var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-            if (valueLength is 0 or > 255)
-            {
-                throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(valueLength));
-            }
-
-            position += 4;
-            ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
-            position += valueLength;
+            var keyKind = ReadHeaderKind(payload, ref position, "key");
+            var keyValue = ReadHeaderField(payload, ref position, keyKind, "key");
+            var valueKind = ReadHeaderKind(payload, ref position, "value");
+            var value = ReadHeaderField(payload, ref position, valueKind, "value");
 
             headers[new HeaderKey
             {
@@ -642,97 +630,61 @@ internal static class BinaryMapper
                 new HeaderValue
                 {
                     Kind = valueKind,
-                    Value = value.ToArray()
+                    Value = value
                 };
         }
 
         return headers;
     }
 
-    internal static Dictionary<HeaderKey, HeaderValue>? TryMapHeaders(ReadOnlySpan<byte> payload)
+    private static HeaderKind ReadHeaderKind(ReadOnlySpan<byte> payload, ref int position, string field)
     {
-        if (payload.Length == 0 || payload[0] is 0 or > 15)
+        if (position >= payload.Length)
         {
-            return null;
+            throw new MalformedResponseException($"Header {field} kind at byte {position} is missing.");
         }
 
-        var headers = new Dictionary<HeaderKey, HeaderValue>();
-        var position = 0;
-
-        while (position < payload.Length)
+        if (!TryMapHeaderKind(payload[position], out var kind))
         {
-            if (!TryMapHeaderKind(payload[position], out var keyKind))
-            {
-                return null;
-            }
-
-            position++;
-
-            if (position + 4 > payload.Length)
-            {
-                return null;
-            }
-
-            var keyLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-            if (keyLength is <= 0 or > 255)
-            {
-                return null;
-            }
-
-            position += 4;
-            if (position + keyLength > payload.Length)
-            {
-                return null;
-            }
-
-            var keyValue = payload[position..(position + keyLength)].ToArray();
-            position += keyLength;
-
-            if (position >= payload.Length)
-            {
-                return null;
-            }
-
-            if (!TryMapHeaderKind(payload[position], out var valueKind))
-            {
-                return null;
-            }
-
-            position++;
-
-            if (position + 4 > payload.Length)
-            {
-                return null;
-            }
-
-            var valueLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-            if (valueLength is <= 0 or > 255)
-            {
-                return null;
-            }
-
-            position += 4;
-            if (position + valueLength > payload.Length)
-            {
-                return null;
-            }
-
-            ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
-            position += valueLength;
-
-            headers[new HeaderKey
-            {
-                Kind = keyKind,
-                Value = keyValue
-            }] =
-                new HeaderValue
-                {
-                    Kind = valueKind,
-                    Value = value.ToArray()
-                };
+            throw new MalformedResponseException(
+                $"Header {field} kind {payload[position]} at byte {position} is unknown.");
         }
 
-        return headers;
+        position++;
+        return kind;
+    }
+
+    private static byte[] ReadHeaderField(ReadOnlySpan<byte> payload, ref int position, HeaderKind kind,
+        string field)
+    {
+        if (position + 4 > payload.Length)
+        {
+            throw new MalformedResponseException($"Header {field} length at byte {position} is truncated.");
+        }
+
+        var length = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        if (length is 0 or > 255)
+        {
+            throw new MalformedResponseException(
+                $"Header {field} length {length} at byte {position} must be between 1 and 255.");
+        }
+
+        if (!ValueLengthMatchesKind(kind, (int)length))
+        {
+            throw new MalformedResponseException(
+                $"Header {field} of kind {kind} has {length} bytes, expected {HeaderKindWidth(kind)}.");
+        }
+
+        position += 4;
+        if (position + length > payload.Length)
+        {
+            throw new MalformedResponseException(
+                $"Header {field} of {length} bytes at byte {position} exceeds the {payload.Length}-byte payload.");
+        }
+
+        var value = payload[position..(position + (int)length)].ToArray();
+        position += (int)length;
+        return value;
     }
 
     internal static HeaderKind MapHeaderKind(byte value)
@@ -758,6 +710,76 @@ internal static class BinaryMapper
         };
     }
 
+    /// <summary>
+    ///     The typed accessors on <see cref="HeaderValue" /> slice the raw bytes by kind, so a value whose
+    ///     length disagrees with its kind byte is rejected at parse time instead of throwing in the caller's
+    ///     message handler.
+    /// </summary>
+    private static bool ValueLengthMatchesKind(HeaderKind kind, int length)
+    {
+        var width = HeaderKindWidth(kind);
+        return width == 0 || width == length;
+    }
+
+    private static int HeaderKindWidth(HeaderKind kind)
+    {
+        return kind switch
+        {
+            HeaderKind.Bool or HeaderKind.Int8 or HeaderKind.Uint8 => 1,
+            HeaderKind.Int16 or HeaderKind.Uint16 => 2,
+            HeaderKind.Int32 or HeaderKind.Uint32 or HeaderKind.Float => 4,
+            HeaderKind.Int64 or HeaderKind.Uint64 or HeaderKind.Double => 8,
+            HeaderKind.Int128 or HeaderKind.Uint128 => 16,
+            _ => 0
+        };
+    }
+
+    /// <summary>
+    ///     The bytes left in the payload bound how many elements can exist, so a count above that is rejected
+    ///     before the list is pre-sized instead of failing mid-loop.
+    /// </summary>
+    private static int ValidatedCollectionSize(uint count, int remaining, int minElementSize, string field)
+    {
+        if (count > Math.Max(remaining, 0) / minElementSize)
+        {
+            throw new MalformedResponseException(
+                $"{field} {count} exceeds remaining payload of {remaining} bytes.");
+        }
+
+        return (int)count;
+    }
+
+    /// <summary>
+    ///     Length prefixes are u32 on the wire. Reading them signed would let 2^31 and above go negative and
+    ///     surface as a slicing exception instead of <see cref="MalformedResponseException" />.
+    /// </summary>
+    private static int ReadLength(ReadOnlySpan<byte> payload, int position, string field)
+    {
+        if (position + 4 > payload.Length)
+        {
+            throw new MalformedResponseException($"{field} length prefix at byte {position} is truncated.");
+        }
+
+        var length = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        var remaining = payload.Length - position - 4;
+        if (length > remaining)
+        {
+            throw new MalformedResponseException(
+                $"{field} length {length} exceeds remaining payload of {remaining} bytes.");
+        }
+
+        return (int)length;
+    }
+
+    private static string ReadString(ReadOnlySpan<byte> payload, ref int position, string field)
+    {
+        var length = ReadLength(payload, position, field);
+        position += 4;
+        var value = Encoding.UTF8.GetString(payload[position..(position + length)]);
+        position += length;
+        return value;
+    }
+
     private static bool TryMapHeaderKind(byte value, out HeaderKind kind)
     {
         if (value is >= 1 and <= 15)
@@ -773,25 +795,15 @@ internal static class BinaryMapper
     private static Dictionary<HeaderKey, HeaderValue> MapOptions(ReadOnlySpan<byte> payload, int position,
         out int readBytes)
     {
-        // Every length here is server-controlled. Read the block length as long
-        // so a value above int.MaxValue cannot wrap negative, and bound each
-        // entry against the block before slicing: an entry that overruns `end`
-        // would otherwise be accepted and silently consume the response bytes
-        // that follow the block.
-        var optionsLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
-        var available = (long)payload.Length - (position + 4);
-        if (optionsLength > available)
-        {
-            throw new MalformedResponseException(
-                $"Malformed options block at byte {position}: declared length {optionsLength} exceeds the " +
-                $"{available} bytes remaining in the payload.");
-        }
-
-        readBytes = 4 + (int)optionsLength;
+        // Every length here is server-controlled. Bound each entry against the
+        // block before slicing: an entry that overruns `end` would otherwise be
+        // accepted and silently consume the response bytes that follow the block.
+        var optionsLength = ReadLength(payload, position, "Options block");
+        readBytes = 4 + optionsLength;
 
         var options = new Dictionary<HeaderKey, HeaderValue>();
         var cursor = position + 4;
-        var end = cursor + (int)optionsLength;
+        var end = cursor + optionsLength;
         while (cursor < end)
         {
             var keyKindCode = ReadOptionByte(payload, ref cursor, end, position);
@@ -807,6 +819,19 @@ internal static class BinaryMapper
                 !TryMapHeaderKind(valueKindCode, out var valueKind))
             {
                 continue;
+            }
+
+            if (!ValueLengthMatchesKind(keyKind, key.Length))
+            {
+                throw new MalformedResponseException(
+                    $"Malformed options block at byte {position}: key of kind {keyKind} has {key.Length} bytes.");
+            }
+
+            if (!ValueLengthMatchesKind(valueKind, value.Length))
+            {
+                throw new MalformedResponseException(
+                    $"Malformed options block at byte {position}: value of kind {valueKind} has {value.Length} " +
+                    "bytes.");
             }
 
             options[new HeaderKey
@@ -932,9 +957,8 @@ internal static class BinaryMapper
     {
         var (stream, position) = MapToStream(payload, 0);
 
-        // Count-driven: topic elements carry variable-length options blocks,
-        // so "consume until the buffer ends" no longer delimits them.
-        List<TopicResponse> topics = new(stream.TopicsCount);
+        List<TopicResponse> topics = new(ValidatedCollectionSize(stream.TopicsCount, payload.Length - position,
+            MIN_TOPIC_SIZE, "Stream topics count"));
         for (var i = 0; i < stream.TopicsCount; i++)
         {
             var (topic, readBytes) = MapToTopic(payload, position);
@@ -959,7 +983,7 @@ internal static class BinaryMapper
     {
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
-        var topicsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 12)..(position + 16)]);
+        var topicsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 12)..(position + 16)]);
         var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
         var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
         var nameLength = (int)payload[position + 32];
@@ -985,8 +1009,9 @@ internal static class BinaryMapper
     internal static IReadOnlyList<TopicResponse> MapTopics(ReadOnlySpan<byte> payload)
     {
         var topicsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
-        List<TopicResponse> topics = new((int)topicsCount);
         var position = 4;
+        List<TopicResponse> topics = new(ValidatedCollectionSize(topicsCount, payload.Length - position,
+            MIN_TOPIC_SIZE, "Topics count"));
 
         for (var i = 0; i < topicsCount; i++)
         {
@@ -1066,9 +1091,9 @@ internal static class BinaryMapper
     private static (PartitionResponse partition, int readBytes) MapToPartition(ReadOnlySpan<byte>
         payload, int position)
     {
-        var id = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
+        var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
-        var segmentsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 12)..(position + 16)]);
+        var segmentsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 12)..(position + 16)]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
         var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
         var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
@@ -1103,7 +1128,7 @@ internal static class BinaryMapper
 
     internal static StatsResponse MapStats(ReadOnlySpan<byte> payload)
     {
-        var processId = BinaryPrimitives.ReadInt32LittleEndian(payload[..4]);
+        var processId = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
         var cpuUsage = BitConverter.ToSingle(payload[4..8]);
         var totalCpuUsage = BitConverter.ToSingle(payload[8..12]);
         var memoryUsage = BinaryPrimitives.ReadUInt64LittleEndian(payload[12..20]);
@@ -1114,37 +1139,28 @@ internal static class BinaryMapper
         var readBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[52..60]);
         var writtenBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[60..68]);
         var totalSizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[68..76]);
-        var streamsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[76..80]);
-        var topicsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[80..84]);
-        var partitionsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[84..88]);
-        var segmentsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[88..92]);
+        var streamsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[76..80]);
+        var topicsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[80..84]);
+        var partitionsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[84..88]);
+        var segmentsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[88..92]);
         var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[92..100]);
-        var clientsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[100..104]);
-        var consumerGroupsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[104..108]);
+        var clientsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[100..104]);
+        var consumerGroupsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[104..108]);
         var position = 108;
 
-        var hostnameLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-        var hostname = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + hostnameLength)]);
-        position += 4 + hostnameLength;
-        var osNameLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-        var osName = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + osNameLength)]);
-        position += 4 + osNameLength;
-        var osVersionLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-        var osVersion = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + osVersionLength)]);
-        position += 4 + osVersionLength;
-        var kernelVersionLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-        var kernelVersion = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + kernelVersionLength)]);
-        position += 4 + kernelVersionLength;
-        var iggyVersionLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
-        var iggyVersion = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + iggyVersionLength)]);
-        position += 4 + iggyVersionLength;
+        var hostname = ReadString(payload, ref position, "Stats hostname");
+        var osName = ReadString(payload, ref position, "Stats os name");
+        var osVersion = ReadString(payload, ref position, "Stats os version");
+        var kernelVersion = ReadString(payload, ref position, "Stats kernel version");
+        var iggyVersion = ReadString(payload, ref position, "Stats iggy version");
         var iggySemVersion = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
 
-        var cacheMetricsLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
+        var cacheMetricsLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
 
-        var cacheMetricsList = new Dictionary<CacheMetricsKey, CacheMetrics>(cacheMetricsLength);
+        var cacheMetricsList = new Dictionary<CacheMetricsKey, CacheMetrics>(ValidatedCollectionSize(
+            cacheMetricsLength, payload.Length - position, CACHE_METRICS_ENTRY_SIZE, "Cache metrics count"));
         for (var i = 0; i < cacheMetricsLength; i++)
         {
             var cacheMetricsKey = new CacheMetricsKey
@@ -1228,13 +1244,29 @@ internal static class BinaryMapper
 
     private static (ConsumerGroupMember, int readBytes) MapToMember(ReadOnlySpan<byte> payload, int position)
     {
+        if (position + MEMBER_HEADER_SIZE > payload.Length)
+        {
+            throw new MalformedResponseException(
+                $"Malformed consumer group member at byte {position}: {payload.Length - position} bytes cannot " +
+                "hold a member header.");
+        }
+
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
-        var partitionsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 4)..(position + 8)]);
-        var partitions = new List<int>();
+        var partitionsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 4)..(position + 8)]);
+
+        var readBytes = MEMBER_HEADER_SIZE + (long)partitionsCount * 4;
+        if (position + readBytes > payload.Length)
+        {
+            throw new MalformedResponseException(
+                $"Malformed consumer group member at byte {position}: partitions count {partitionsCount} does not " +
+                "fit the response.");
+        }
+
+        var partitions = new List<uint>((int)partitionsCount);
         for (var i = 0; i < partitionsCount; i++)
         {
-            var partitionId
-                = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 8 + i * 4)..(position + 8 + (i + 1) * 4)]);
+            var partitionStart = position + MEMBER_HEADER_SIZE + i * 4;
+            var partitionId = BinaryPrimitives.ReadUInt32LittleEndian(payload[partitionStart..(partitionStart + 4)]);
             partitions.Add(partitionId);
         }
 
@@ -1244,17 +1276,30 @@ internal static class BinaryMapper
             PartitionsCount = partitionsCount,
             Partitions = partitions
         },
-            8 + partitionsCount * 4);
+            (int)readBytes);
     }
 
     private static (ConsumerGroupResponse consumerGroup, int readBytes) MapToConsumerGroup(ReadOnlySpan<byte> payload,
         int position)
     {
+        if (position + CONSUMER_GROUP_HEADER_SIZE > payload.Length)
+        {
+            throw new MalformedResponseException(
+                $"Malformed consumer group at byte {position}: {payload.Length - position} bytes cannot hold a " +
+                "consumer group header.");
+        }
+
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var partitionsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 4)..(position + 8)]);
         var membersCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 8)..(position + 12)]);
         var nameLength = payload[position + 12];
-        var name = Encoding.UTF8.GetString(payload[(position + 13)..(position + 13 + nameLength)]);
+        if (position + CONSUMER_GROUP_HEADER_SIZE + nameLength > payload.Length)
+        {
+            throw new MalformedResponseException(
+                $"Malformed consumer group at byte {position}: name length {nameLength} does not fit the response.");
+        }
+
+        var name = Encoding.UTF8.GetString(payload[(position + CONSUMER_GROUP_HEADER_SIZE)..(position + CONSUMER_GROUP_HEADER_SIZE + nameLength)]);
 
         return (new ConsumerGroupResponse
         {
@@ -1262,36 +1307,38 @@ internal static class BinaryMapper
             Name = name,
             MembersCount = membersCount,
             PartitionsCount = partitionsCount
-        }, 13 + name.Length);
+        }, CONSUMER_GROUP_HEADER_SIZE + nameLength);
     }
 
     internal static IReadOnlyList<OptionSpec> MapOptionSpecs(ReadOnlySpan<byte> payload)
     {
         var count = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
         var position = 4;
-        var specs = new List<OptionSpec>();
+        var specs = new List<OptionSpec>(ValidatedCollectionSize(count, payload.Length - position,
+            MIN_OPTION_SPEC_SIZE, "Option specs count"));
         for (var i = 0; i < count; i++)
         {
             var keyLength = payload[position];
             position += 1;
-            EnsureFits(payload, position, keyLength, "option key");
+            if (position + keyLength > payload.Length)
+            {
+                throw new MalformedResponseException(
+                    $"Malformed DescribeOptions response: option key of {keyLength} bytes at offset {position} " +
+                    $"overruns the {payload.Length}-byte payload");
+            }
+
             var key = Encoding.UTF8.GetString(payload[position..(position + keyLength)]);
             position += keyLength;
 
             var kind = payload[position];
             position += 1;
 
-            var defaultLength = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+            var defaultLength = ReadLength(payload, position, "Option default value");
             position += 4;
-            EnsureFits(payload, position, defaultLength, "option default value");
             var defaultValue = payload[position..(position + defaultLength)].ToArray();
             position += defaultLength;
 
-            var descriptionLength = (int)BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
-            position += 4;
-            EnsureFits(payload, position, descriptionLength, "option description");
-            var description = Encoding.UTF8.GetString(payload[position..(position + descriptionLength)]);
-            position += descriptionLength;
+            var description = ReadString(payload, ref position, "Option description");
 
             specs.Add(new OptionSpec
             {
@@ -1305,31 +1352,23 @@ internal static class BinaryMapper
         return specs;
     }
 
-    private static void EnsureFits(ReadOnlySpan<byte> payload, int position, int length, string what)
-    {
-        if (position + length > payload.Length)
-        {
-            throw new InvalidOperationException(
-                $"Malformed DescribeOptions response: {what} of {length} bytes at offset {position} " +
-                $"overruns the {payload.Length}-byte payload");
-        }
-    }
-
     internal static ClusterMetadata MapClusterMetadata(ReadOnlySpan<byte> payload)
     {
-        var nameLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
-        var clusterName = Encoding.UTF8.GetString(payload[4..(4 + (int)nameLength)]);
-        var position = 4 + (int)nameLength;
+        var position = 0;
+        var clusterName = ReadString(payload, ref position, "Cluster name");
+        if (position + 4 > payload.Length)
+        {
+            throw new MalformedResponseException($"Cluster nodes count at byte {position} is truncated.");
+        }
 
         var nodesCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         position += 4;
 
-        var nodes = new ClusterNode[nodesCount];
-        for (var i = 0; i < nodesCount; i++)
+        var nodes = new ClusterNode[ValidatedCollectionSize(nodesCount, payload.Length - position,
+            MIN_CLUSTER_NODE_SIZE, "Cluster nodes count")];
+        for (var i = 0; i < nodes.Length; i++)
         {
-            var node = MapClusterNode(payload[position..]);
-            nodes[i] = node;
-            position += node.GetSize();
+            nodes[i] = MapClusterNode(payload, ref position);
         }
 
         return new ClusterMetadata
@@ -1339,37 +1378,36 @@ internal static class BinaryMapper
         };
     }
 
-    private static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload)
+    private static ClusterNode MapClusterNode(ReadOnlySpan<byte> payload, ref int position)
     {
-        var position = 0;
+        var name = ReadString(payload, ref position, "Cluster node name");
+        var ip = ReadString(payload, ref position, "Cluster node ip");
+        if (position + CLUSTER_NODE_TAIL_SIZE > payload.Length)
+        {
+            throw new MalformedResponseException(
+                $"Cluster node at byte {position}: {payload.Length - position} bytes cannot hold the ports, role and status.");
+        }
 
-        // Read name
-        var nameLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
-        position += 4;
-
-        var name = Encoding.UTF8.GetString(payload[position..(position + (int)nameLength)]);
-        position += (int)nameLength;
-
-        // Read IP
-        var ipLength = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
-        position += 4;
-
-        var ip = Encoding.UTF8.GetString(payload[position..(position + (int)ipLength)]);
-        position += (int)ipLength;
-
-        // Read transport endpoints (4 ports, each 2 bytes)
         var tcp = BinaryPrimitives.ReadUInt16LittleEndian(payload[position..(position + 2)]);
-        position += 2;
-        var quic = BinaryPrimitives.ReadUInt16LittleEndian(payload[position..(position + 2)]);
-        position += 2;
-        var http = BinaryPrimitives.ReadUInt16LittleEndian(payload[position..(position + 2)]);
-        position += 2;
-        var webSocket = BinaryPrimitives.ReadUInt16LittleEndian(payload[position..(position + 2)]);
-        position += 2;
-
-        // Read role and status
-        var role = (ClusterNodeRole)payload[position++];
-        var status = (ClusterNodeStatus)payload[position];
+        var quic = BinaryPrimitives.ReadUInt16LittleEndian(payload[(position + 2)..(position + 4)]);
+        var http = BinaryPrimitives.ReadUInt16LittleEndian(payload[(position + 4)..(position + 6)]);
+        var webSocket = BinaryPrimitives.ReadUInt16LittleEndian(payload[(position + 6)..(position + 8)]);
+        var role = payload[position + 8] switch
+        {
+            0 => ClusterNodeRole.Leader,
+            1 => ClusterNodeRole.Follower,
+            var unknown => throw new MalformedResponseException($"Unknown cluster node role {unknown}.")
+        };
+        var status = payload[position + 9] switch
+        {
+            0 => ClusterNodeStatus.Healthy,
+            1 => ClusterNodeStatus.Starting,
+            2 => ClusterNodeStatus.Stopping,
+            3 => ClusterNodeStatus.Unreachable,
+            4 => ClusterNodeStatus.Maintenance,
+            _ => ClusterNodeStatus.Unknown
+        };
+        position += 10;
 
         return new ClusterNode
         {
