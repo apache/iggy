@@ -161,7 +161,7 @@ npm run build
 ### test
 
 note: use env var `IGGY_TCP_ADDRESS="host:port"` to set the server
-address for bdd and e2e tests.
+address for e2e tests. bdd tests need more variables, see below.
 
 #### unit tests
 
@@ -179,15 +179,27 @@ npm run test:e2e
 
 #### bdd tests
 
-bdd test expect an iggy-server at tcp://127.0.0.1:8090
+the bdd suite has no defaults and fails when `IGGY_TCP_ADDRESS`,
+`IGGY_ROOT_USERNAME` or `IGGY_ROOT_PASSWORD` is missing. from the repository
+root run
 
 ```bash
-npm run test:bdd
+./scripts/run-bdd-tests.sh node
 ```
+
+the script starts the server and sets every variable, so none of them have to be
+exported by hand. to iterate against a server you started yourself, see
+[src/bdd/README.md](./src/bdd/README.md).
 
 #### run all test
 
-`npm run test` runs unit, bdd and e2e tests suite (expect an iggy-server at tcp://127.0.0.1:8090)
+`npm run test` runs unit, bdd and e2e tests suite against an iggy-server at
+tcp://127.0.0.1:8090, started with the same root credentials
+
+```bash
+IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+  npm run test
+```
 
 ### lint
 

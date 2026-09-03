@@ -4,20 +4,35 @@ Scenario are located at [/bdd/scenarios](../../../bdd/scenarios)
 
 ## env var
 
-use env var `IGGY_TCP_ADDRESS="host:port"` to set expected server address for bdd test suite.
+the bdd test suite has no defaults and fails when any of these is missing:
 
-## Run via docker
+- `IGGY_TCP_ADDRESS="host:port"` - server address
+- `IGGY_ROOT_USERNAME` / `IGGY_ROOT_PASSWORD` - root credentials
+- `IGGY_TCP_ADDRESS_LEADER` / `IGGY_TCP_ADDRESS_FOLLOWER` - cluster addresses, leader redirection scenarios only
 
-see [/bdd/README.md](../../../bdd/README.md)
+## Run (recommended)
+
+from the repository root run
+
+```bash
+./scripts/run-bdd-tests.sh csharp
+```
+
+the script starts the server, brings up the leader and follower for the cluster
+scenarios, and sets every variable above, so none of them have to be exported by
+hand. see [/bdd/README.md](../../../bdd/README.md) for the sdk and feature
+matrix.
 
 ## Run locally
 
-note: bdd test expect an iggy-server at tcp://127.0.0.1:8090
+for iterating against a server you started yourself. note: bdd test expect an
+iggy-server started with the same root credentials
 
 from [/foreign/csharp/Iggy_SDK.Tests.BDD](.) run
 
 ```bash
-dotnet test
+IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy \
+  dotnet test
 ```
 
 ## Troubleshooting

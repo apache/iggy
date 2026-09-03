@@ -18,6 +18,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 
 namespace Apache.Iggy.Tests.MapperTests;
@@ -77,6 +78,15 @@ public sealed class OptionsBlockGoldenVectorTests
         Assert.Equal(HeaderKind.Bool, topic.Options[HeaderKey.FromString("enforce_fsync")].Kind);
         Assert.Equal(HeaderKind.Uint64, topic.Options[HeaderKey.FromString("segment_size")].Kind);
         Assert.Empty(topic.DerivedOptions!);
+    }
+
+    [Fact]
+    public void MapTopic_WithOptionsLengthPrefixCutShort_ThrowsMalformedResponse()
+    {
+        var payload = TopicPayloadWithOptions(GoldenOptionsBlock);
+        var truncated = payload[..(50 + "topic".Length + 2)];
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(truncated));
     }
 
     /// <summary>

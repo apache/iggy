@@ -185,6 +185,24 @@ impl ConsumerGroupClientState {
             .cloned()
             .collect()
     }
+
+    /// Drop what the consensus session owned. Membership is per connection
+    /// and the coordinator fences assignments by a generation it tracks per
+    /// session, so nothing synced under the old session holds once it is
+    /// reset. The balanced cursors and the partition counts stay: they belong
+    /// to a topic, not to a session, and clearing them would restart the
+    /// produce round-robin at partition 0 and cost a metadata round trip per
+    /// topic on every reconnect.
+    pub fn clear_session_scoped(&self) {
+        self.assignments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.joined_groups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +259,25 @@ mod tests {
 
         state.deregister_group("s|t|g");
         assert!(!state.is_registered("s|t|g"));
+    }
+
+    #[test]
+    fn session_reset_drops_membership_and_keeps_topic_state() {
+        let state = ConsumerGroupClientState::new();
+        let id = Identifier::named("g").unwrap();
+        state.register_group("s|t|g".to_owned(), id.clone(), id.clone(), id);
+        state.set_assignment("s|t|g".to_owned(), 1, vec![0, 1]);
+        assert_eq!(state.next_balanced_partition("s|t", 3), 0);
+        state.set_partition_count("s|t".to_owned(), 3);
+
+        state.clear_session_scoped();
+
+        assert!(state.registered_groups().is_empty());
+        assert!(!state.is_registered("s|t|g"));
+        assert!(!state.has_assignment("s|t|g"));
+        // Topic state outlives the session: the produce cursor carries on and
+        // the partition count is still cached.
+        assert_eq!(state.next_balanced_partition("s|t", 3), 1);
+        assert_eq!(state.partition_count("s|t"), Some(3));
     }
 }

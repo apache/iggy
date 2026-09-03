@@ -176,6 +176,14 @@ pub const PROBE_ATTEMPTS_MAX: u32 = 5;
 /// When exceeded, the client with the oldest committed request is evicted.
 pub const CLIENTS_TABLE_MAX: usize = 8192;
 
+/// Default live dedup entries per PARTITION consensus group.
+///
+/// Far below [`CLIENTS_TABLE_MAX`] because this budget is per group rather than
+/// per node: the worst case scales with partition count, so it is sized to the
+/// producers one partition sees. Pinned against the
+/// `[partition] dedup_clients_max` default by a bootstrap assert.
+pub const PARTITION_DEDUP_CLIENTS_MAX: usize = 4096;
+
 #[derive(Debug)]
 pub struct PipelineEntry {
     pub header: PrepareHeader,
@@ -286,13 +294,10 @@ pub struct RequestEntry {
 }
 
 impl RequestEntry {
+    /// Queued request on the network reply path: no in-process subscriber.
     #[must_use]
     pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
-        Self {
-            message,
-            received_at: 0,
-            reply_sender: None,
-        }
+        Self::with_sender(message, None)
     }
 
     /// Queued request paired with a fresh receiver that resolves when the
@@ -305,12 +310,22 @@ impl RequestEntry {
         message: Message<RoutedRequestHeader>,
     ) -> (Self, Receiver<Message<ReplyHeader>>) {
         let (sender, receiver) = oneshot::channel();
-        let entry = Self {
+        (Self::with_sender(message, Some(sender)), receiver)
+    }
+
+    /// Queued request carrying a sender the caller already owns, for a submit
+    /// that parked before reaching a prepare slot. `None` is the network reply
+    /// path; the other two constructors are this one with a fixed sender.
+    #[must_use]
+    pub const fn with_sender(
+        message: Message<RoutedRequestHeader>,
+        reply_sender: Option<Sender<Message<ReplyHeader>>>,
+    ) -> Self {
+        Self {
             message,
             received_at: 0,
-            reply_sender: Some(sender),
-        };
-        (entry, receiver)
+            reply_sender,
+        }
     }
 
     /// Take the reply sender for hand-off to the promoted pipeline entry.
@@ -656,6 +671,24 @@ impl LocalPipeline {
                 .any(|r| r.message.header().client == client)
     }
 
+    /// True if either queue already holds this exact `(client, request)`.
+    ///
+    /// The partition-plane in-flight check. Narrower than
+    /// [`Self::has_message_from_client`] on purpose: the partition pipeline is
+    /// depth-`prepare_queue_depth` by design, so blocking every concurrent
+    /// request from one client would serialize it to one in-flight write per
+    /// group. Only an exact replay needs absorbing.
+    #[must_use]
+    pub fn has_message_from_client_request(&self, client: u128, request: u64) -> bool {
+        self.prepare_queue
+            .iter()
+            .any(|p| p.header.client == client && p.header.request == request)
+            || self.request_queue.iter().any(|r| {
+                let header = r.message.header();
+                header.client == client && header.request == request
+            })
+    }
+
     /// Verify pipeline invariants.
     ///
     /// # Panics
@@ -767,6 +800,10 @@ impl Pipeline for LocalPipeline {
 
     fn has_message_from_client(&self, client_id: u128) -> bool {
         Self::has_message_from_client(self, client_id)
+    }
+
+    fn has_message_from_client_request(&self, client_id: u128, request: u64) -> bool {
+        Self::has_message_from_client_request(self, client_id, request)
     }
 
     fn cancel_all_subscribers(&mut self) {
@@ -1152,14 +1189,21 @@ pub struct VsrRestore<'a> {
     /// durable record exists; `log_view` cannot be inferred and stays 0.
     pub view_fallback: Option<u32>,
     /// Starting `(view, log_view)` for a group with NO history of its own,
-    /// consulted only when neither of the two above applies.
+    /// consulted only when neither of the two above applies: the view the
+    /// group was created in, as recorded by the metadata plane.
+    ///
+    /// Safe to start `Normal` in without a quorum only because every replica
+    /// seeds the same value and the group's real view never drops below it:
+    /// an empty log at the creation view is the floor a view-0 start used to
+    /// be, never canonical over committed history. Seeded above the group's
+    /// real view it would be canonical: the empty log wins the next DVC merge
+    /// and wedges the group on its committed ops.
     ///
     /// Sets `log_view` as well as `view`, unlike `view_fallback`: the log is
     /// empty, so there is no history to misattribute to the view, and a
     /// primary whose `log_view` lags its `view` is treated as mid-transition
     /// and answers no `RequestStartView` probe (see
-    /// [`VsrConsensus::handle_request_start_view`]) - it would hold its own group's
-    /// probes open forever.
+    /// [`VsrConsensus::handle_request_start_view`]).
     ///
     /// Deliberately NOT marked superblock-durable: nothing has been written
     /// yet, and claiming otherwise would let a restart resume a view no record
@@ -1192,12 +1236,14 @@ pub struct FreshGroupStart {
 ///
 /// `restarted` is the caller's own evidence of a prior life, since the two
 /// paths read it differently: a partition directory already on disk for the
-/// server, a retained in-memory log for the simulator.
+/// server, a retained in-memory log for the simulator. `created_view` is the
+/// view the metadata plane created the group in; see
+/// [`VsrRestore::seed_view`].
 #[must_use]
 pub const fn fresh_group_start(
     restarted: bool,
     durable_view: Option<(u32, u32)>,
-    metadata_view: Option<u32>,
+    created_view: u32,
 ) -> FreshGroupStart {
     let join = if restarted {
         JoinMode::ProbeAsBackup {
@@ -1211,7 +1257,7 @@ pub const fn fresh_group_start(
     // `StartView` to move it forward, and seeded above that the reply reads as
     // stale and is dropped.
     let seed_view = match (durable_view, join) {
-        (None, JoinMode::Init) => metadata_view,
+        (None, JoinMode::Init) => Some(created_view),
         _ => None,
     };
     FreshGroupStart { join, seed_view }
@@ -1295,7 +1341,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             tracing::info!(
                 group,
                 view,
-                "seeded a group with no history of its own into the current view"
+                "seeded a group with no history of its own at its creation view"
             );
             consensus.set_view(view);
             consensus.set_log_view(view);
@@ -1752,6 +1798,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub fn pipeline_has_message_from_client(&self, client_id: u128) -> bool {
         self.pipeline.borrow().has_message_from_client(client_id)
+    }
+
+    /// True iff this exact `(client, request)` is already in flight. The
+    /// partition plane's in-flight dedup: absorbs a replay without serializing
+    /// a client's pipeline depth.
+    #[must_use]
+    pub fn pipeline_has_message_from_client_request(&self, client_id: u128, request: u64) -> bool {
+        self.pipeline
+            .borrow()
+            .has_message_from_client_request(client_id, request)
     }
 
     /// Header of the oldest in-flight prepare.
@@ -4061,33 +4117,23 @@ where
 mod fresh_group_start_tests {
     use super::{JoinMode, fresh_group_start};
 
-    const METADATA_VIEW: u32 = 4;
+    const CREATED_VIEW: u32 = 4;
 
     /// The case the seed exists for: a group created after the metadata plane
     /// elected must not start at view 0, or it names a replica the roster does
     /// not advertise and no client can be routed to it.
     #[test]
-    fn given_a_fresh_group_when_the_metadata_view_moved_should_seed_that_view() {
-        let start = fresh_group_start(false, None, Some(METADATA_VIEW));
+    fn given_a_fresh_group_when_created_after_an_election_should_seed_the_creation_view() {
+        let start = fresh_group_start(false, None, CREATED_VIEW);
         assert_eq!(start.join, JoinMode::Init);
-        assert_eq!(start.seed_view, Some(METADATA_VIEW));
-    }
-
-    /// No published view is "no opinion", not "view 0". The caller defers
-    /// materialising rather than seeding; this only asserts nothing is
-    /// invented here.
-    #[test]
-    fn given_a_fresh_group_when_no_metadata_view_is_known_should_not_seed() {
-        let start = fresh_group_start(false, None, None);
-        assert_eq!(start.join, JoinMode::Init);
-        assert_eq!(start.seed_view, None);
+        assert_eq!(start.seed_view, Some(CREATED_VIEW));
     }
 
     /// A durable record outranks the seed: it is what this replica actually
-    /// promised, and the seed is a guess about someone else's plane.
+    /// promised, and the seed only describes where the group began.
     #[test]
     fn given_a_durable_record_when_seeding_should_prefer_the_record() {
-        let start = fresh_group_start(false, Some((7, 7)), Some(METADATA_VIEW));
+        let start = fresh_group_start(false, Some((7, 7)), CREATED_VIEW);
         assert_eq!(start.seed_view, None);
     }
 
@@ -4096,7 +4142,7 @@ mod fresh_group_start_tests {
     /// reads as stale and the replica never rejoins.
     #[test]
     fn given_a_prior_life_when_seeding_should_probe_without_a_seed() {
-        let start = fresh_group_start(true, None, Some(METADATA_VIEW));
+        let start = fresh_group_start(true, None, CREATED_VIEW);
         assert!(matches!(start.join, JoinMode::ProbeAsBackup { .. }));
         assert_eq!(start.seed_view, None);
     }
@@ -4378,6 +4424,7 @@ mod timestamp_clamp_tests {
 
     use super::*;
     use crate::LocalPipeline;
+    use message_bus::BusMessage;
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
 
@@ -4399,7 +4446,7 @@ mod timestamp_clamp_tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), message_bus::SendError> {
             Ok(())
         }
@@ -4712,6 +4759,7 @@ mod timestamp_clamp_tests {
 #[cfg(test)]
 mod vsr_consensus_tests {
     use super::*;
+    use message_bus::BusMessage;
 
     #[test]
     fn stage_transitions_follow_the_machine() {
@@ -4754,7 +4802,7 @@ mod vsr_consensus_tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), message_bus::SendError> {
             Ok(())
         }
@@ -5285,6 +5333,7 @@ mod quorum_tests {
 
     use super::*;
     use crate::LocalPipeline;
+    use message_bus::BusMessage;
     use server_common::MESSAGE_ALIGN;
     use server_common::iobuf::Frozen;
 
@@ -5294,7 +5343,7 @@ mod quorum_tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), message_bus::SendError> {
             Ok(())
         }

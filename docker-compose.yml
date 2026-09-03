@@ -30,6 +30,10 @@ services:
       memlock:
         soft: -1
         hard: -1
+    environment:
+      # The image binds every listener to 0.0.0.0 (Dockerfile), so the address
+      # clients dial has to be declared here.
+      - IGGY_NODE_ADVERTISED_ADDRESS=localhost
     networks:
       - iggy
     ports:

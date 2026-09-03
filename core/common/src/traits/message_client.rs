@@ -16,8 +16,8 @@
 // under the License.
 
 use crate::{
-    Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
-    SendMessagesResponse,
+    Consumer, ConsumerKind, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages,
+    PollingStrategy, SendMessagesResponse,
 };
 use async_trait::async_trait;
 
@@ -29,6 +29,7 @@ pub trait MessageClient {
     /// Authentication is required, and the permission to poll the messages.
     ///
     /// Polling a consumer group the client is not (or no longer) a member of fails with `ConsumerGroupMemberNotFound` rather than returning an empty batch, so the caller can rejoin.
+    /// A member that holds no partitions gets an empty batch whose `partition_id` is [`NO_ASSIGNED_PARTITION`](crate::NO_ASSIGNED_PARTITION).
     #[allow(clippy::too_many_arguments)]
     async fn poll_messages(
         &self,
@@ -40,6 +41,42 @@ pub trait MessageClient {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError>;
+
+    /// [`poll_messages`](Self::poll_messages) whose strategy is chosen once the partition is
+    /// known. A consumer-group poll without a partition picks one of the member's assigned
+    /// partitions first and then asks `strategy_for` for it, so a caller can continue every
+    /// partition from its own position. Any other poll has its partition up front and asks
+    /// `strategy_for` for that one, or for `0` when none was given, which is the partition the
+    /// server reads then.
+    ///
+    /// The default implementation is for transports that cannot pick a partition client-side:
+    /// a consumer-group poll without a partition fails with `FeatureUnavailable`.
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_messages_with_strategy_for(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        strategy_for: &(dyn Fn(u32) -> PollingStrategy + Send + Sync),
+        count: u32,
+        auto_commit: bool,
+    ) -> Result<PolledMessages, IggyError> {
+        if consumer.kind == ConsumerKind::ConsumerGroup && partition_id.is_none() {
+            return Err(IggyError::FeatureUnavailable);
+        }
+        let strategy = strategy_for(partition_id.unwrap_or(0));
+        self.poll_messages(
+            stream_id,
+            topic_id,
+            partition_id,
+            consumer,
+            &strategy,
+            count,
+            auto_commit,
+        )
+        .await
+    }
 
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///

@@ -8,13 +8,13 @@ exclude-newer-span = "P7D"
 
 [[package]]
 name = "apache-iggy"
-version = "0.9.0.dev5"
+version = "0.9.0.dev6"
 source = { directory = "../../foreign/python" }
 
 [package.metadata]
 requires-dist = [
-    { name = "maturin", marker = "extra == 'all'", specifier = ">=1.14.1,<2.0" },
-    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.14.1,<2.0" },
+    { name = "maturin", marker = "extra == 'all'", specifier = ">=1.15.0,<2.0" },
+    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.15.0,<2.0" },
     { name = "pyrefly", marker = "extra == 'all'", specifier = ">=1.2.0" },
     { name = "pyrefly", marker = "extra == 'dev'", specifier = ">=1.2.0" },
     { name = "pytest", marker = "extra == 'all'", specifier = ">=9.1.1,<10.0" },
