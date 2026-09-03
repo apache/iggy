@@ -132,6 +132,12 @@ pub mod frame_drop_reason {
     pub const MISROUTED: &str = "misrouted";
     pub const PARK_OVERFLOW: &str = "park_overflow";
     pub const PARK_DROPPED: &str = "park_dropped";
+    /// A partition write's reply channel was dropped before a reply arrived
+    /// (view-change pipeline reset, park teardown, shutdown): the outcome is
+    /// unknown and the client is left to its read-timeout.
+    pub const SUBMIT_ABANDONED: &str = "submit_abandoned";
+    /// A partition write's reply did not arrive within the submit budget.
+    pub const SUBMIT_TIMEOUT: &str = "submit_timeout";
 }
 
 // The tables only index the lazy fast-path cache below; a `{variant, reason}`
@@ -139,7 +145,7 @@ pub mod frame_drop_reason {
 // site actually produces it, so the unreachable corners of the 7 x 9 cross
 // product never appear as permanent zero-valued series.
 const VARIANT_COUNT: usize = 7;
-const REASON_COUNT: usize = 9;
+const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::CONSENSUS,
@@ -161,6 +167,8 @@ const REASONS: [&str; REASON_COUNT] = [
     frame_drop_reason::MISROUTED,
     frame_drop_reason::PARK_OVERFLOW,
     frame_drop_reason::PARK_DROPPED,
+    frame_drop_reason::SUBMIT_ABANDONED,
+    frame_drop_reason::SUBMIT_TIMEOUT,
 ];
 
 fn variant_index(s: &str) -> Option<usize> {

@@ -797,6 +797,7 @@ async fn load_partition(
         config.partition.evicted_ring_capacity,
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
+    partition.set_dedup_clients_max(config.partition.dedup_clients_max);
     partition.set_partition_dir(partition_dir.clone());
     // Before the hydrate: the durable record is keyed by incarnation, so a
     // `purge.gen` left behind by a previous life of this namespace reads 0.
@@ -1210,6 +1211,7 @@ pub async fn build_partition_fresh(
         config.partition.evicted_ring_capacity,
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
+    partition.set_dedup_clients_max(config.partition.dedup_clients_max);
     partition.set_partition_dir(partition_dir);
     // Fresh dirs read generation 0; a dir surviving from a crashed process
     // (this "fresh" build races repair re-materialization) reads the last

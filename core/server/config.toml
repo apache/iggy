@@ -985,6 +985,17 @@ clients_table_max = 8192
 # u128 bitset, and this depth bounds that suffix.
 prepare_queue_depth = 32
 
+# Distinct clients each partition group tracks request watermarks for, so a
+# retried produce or consumer-offset write is answered instead of committing a
+# second time. At capacity the client whose newest commit is oldest is evicted;
+# that client's next replay re-executes, exactly as it would have before dedup
+# existed, so under-sizing degrades rather than breaks. Must be > 0 and <= 65536.
+#
+# Unlike [metadata] clients_table_max, this budget is PER GROUP, so worst-case
+# memory scales with partition count. Size it to the producers one partition
+# actually sees, not the node's client total.
+dedup_clients_max = 4096
+
 # Entries the evicted ring retains per multi-replica partition for journal
 # repair after a peer rejoins. Larger widens the window a restarting peer can be
 # served from the ring before falling back to bulk sync, at the cost of pinned
