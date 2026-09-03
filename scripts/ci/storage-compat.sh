@@ -86,7 +86,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # its own CWD, and the baseline below builds from a worktree elsewhere on
 # disk, so a relative value would scatter the two builds and the lookup of
 # either binary across three directories. Exported so every cargo call here,
-# nextest included, lands in the same place.
+# nextest included, lands in the same place -- except the baseline build, which
+# must have a target directory of its own (see the worktree build below).
 TARGET_DIR="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}"
 mkdir -p "${TARGET_DIR}"
 TARGET_DIR="$(cd "${TARGET_DIR}" && pwd)"
@@ -201,39 +202,51 @@ else
   WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/iggy-storage-compat.XXXXXX")"
   git worktree add --detach "${WORKTREE_DIR}" "${BASELINE_SHA}"
 
-  # Symmetric to the guard before the HEAD build below: a HEAD binary left by an
-  # earlier run makes cargo skip the uplift, and the cp further down would then
-  # capture that HEAD binary as the baseline, comparing HEAD against itself.
-  rm -f "${HEAD_SERVER}"
-
   echo "Building baseline iggy-server from ${BASELINE_SHA}..."
   # Built from the worktree as CWD so the baseline's own rust-toolchain.toml
-  # applies, into the shared CARGO_TARGET_DIR so the registry graph compiles
-  # once.
+  # applies, and into a target directory of the worktree's own.
+  #
+  # The two trees MUST NOT share one. Cargo keys a workspace member's unit hash
+  # on its manifest path RELATIVE to the workspace root, and records that
+  # member's sources in the dep-info relative too, so `core/configs` in the
+  # worktree and `core/configs` here hash identically and both resolve against
+  # whichever root cargo is invoked from. Sharing a target directory therefore
+  # makes the second build read the first build's rlibs as fresh: HEAD's
+  # `server` would compile against MASTER's `configs`, `consensus`,
+  # `partitions` and `shard`. Any PR touching a crate below `server` fails to
+  # build here with errors that do not reproduce anywhere else. The duplicated
+  # dependency compile is the price of the two halves being what they claim.
+  #
+  # Inside the worktree so the cleanup trap reclaims it with the worktree; only
+  # the copied binary below outlives the run.
   #
   # Debug profile on both sides, and no --all-features: release would compile
   # debug_assert! out of the baseline while HEAD still panics on it, and
   # --all-features turns on the server's `disable-mimalloc`, so the two halves
   # would differ in ways the storage format never changed.
+  BASELINE_TARGET_DIR="${WORKTREE_DIR}/target"
   (
     cd "${WORKTREE_DIR}"
-    cargo build --locked -p server --bin iggy-server
+    CARGO_TARGET_DIR="${BASELINE_TARGET_DIR}" cargo build --locked -p server --bin iggy-server
   )
 
-  if [ ! -x "${HEAD_SERVER}" ]; then
-    echo "Baseline build did not produce ${HEAD_SERVER}"
+  BASELINE_BUILT="${BASELINE_TARGET_DIR}/debug/iggy-server"
+  if [ ! -x "${BASELINE_BUILT}" ]; then
+    echo "Baseline build did not produce ${BASELINE_BUILT}"
     exit 1
   fi
 
-  # Copy before HEAD builds: both trees uplift to the same target/debug path.
   mkdir -p "$(dirname "${BASELINE_SERVER}")"
-  cp "${HEAD_SERVER}" "${BASELINE_SERVER}"
+  cp "${BASELINE_BUILT}" "${BASELINE_SERVER}"
+  # Now, not at cleanup: a second full debug dependency graph is several GB, and
+  # the HEAD build plus the integration test still have to fit on the runner.
+  rm -rf "${BASELINE_TARGET_DIR}"
 fi
 
-# Delete the uplifted binary before building HEAD. Cargo skips re-uplifting when
-# the destination already looks current, and the baseline build just refreshed
-# it, so on a second run the BASELINE binary could survive at
-# target/debug/iggy-server and the test would compare master against master.
+# The baseline never writes here any more, but a binary left by an earlier run
+# of this script (or by any other build in this tree) would satisfy the
+# existence check below without cargo having produced it now. Delete it so that
+# check means what it says.
 rm -f "${HEAD_SERVER}"
 
 echo "Building HEAD iggy-server from ${HEAD_SHA}..."

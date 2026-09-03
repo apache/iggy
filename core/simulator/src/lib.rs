@@ -2002,122 +2002,6 @@ mod tests {
         );
     }
 
-    /// At-least-once failover: a `SendMessages` retry on a new primary re-executes.
-    /// The retry reply carries a HIGHER `commit` op, proof of re-execution rather
-    /// than dedup, and the duplicate payload lives at two offsets. Consumers dedup
-    /// if they want at-most-once-per-payload.
-    #[test]
-    fn failover_retry_re_executes_under_at_least_once() {
-        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
-            enabled: false,
-            size: iggy_common::IggyByteSize::from(0u64),
-            bucket_capacity: 1,
-        });
-
-        let replica_count: u8 = 5;
-        let client_id: u128 = 1;
-        let network_opts = packet::PacketSimulatorOptions {
-            node_count: replica_count,
-            client_count: 1,
-            ..packet::PacketSimulatorOptions::default()
-        };
-
-        let mut sim = Simulator::new(
-            replica_count as usize,
-            std::iter::once(client_id),
-            network_opts,
-        );
-        let client = SimClient::new(client_id);
-        let ns = IggyNamespace::new(1, 1, 0);
-        sim.init_partition(ns);
-        sim.register_client_with_primary(&client);
-
-        // Same `(client, session, request)` for replay; mirrors SDK's
-        // connection-loss retry.
-        let original_req = client.send_messages(ns, &[Bytes::from_static(b"failover-test")]);
-        let replay_req = original_req.deep_copy();
-        let original_request_id = original_req.header().request;
-
-        sim.submit_request(client_id, 0, original_req.into_generic());
-
-        let mut original_reply: Option<Message<ReplyHeader>> = None;
-        for _ in 0..200 {
-            let replies = sim.step();
-            if !replies.is_empty() {
-                original_reply = Some(replies[0].deep_copy());
-                break;
-            }
-        }
-        let original_reply = original_reply.expect("commit reply must arrive before primary crash");
-        let original_commit_op = original_reply.header().commit;
-        assert_eq!(
-            original_reply.header().request,
-            original_request_id,
-            "sanity: original reply must echo the request id"
-        );
-
-        // Crash primary. Real-world: TCP buffer might have lost reply
-        // before ack; same retry path.
-        sim.replica_crash(0);
-
-        // Steps for view change across 4 survivors.
-        for _ in 0..800 {
-            sim.step();
-        }
-
-        // Find new primary via any live replica.
-        let live = &sim.replicas[1].shards[0];
-        let live_consensus = live
-            .plane
-            .partitions()
-            .get_by_ns(&ns)
-            .expect("partition must exist on a live replica")
-            .consensus();
-        assert!(
-            live_consensus.view() > 0,
-            "view must have advanced past the crashed primary"
-        );
-        let new_primary_idx = live_consensus.primary_index(live_consensus.view());
-        assert_ne!(
-            new_primary_idx, 0,
-            "new primary must not be the crashed replica"
-        );
-
-        // Replay the SAME request to the new primary. No dedup, so re-execution.
-        sim.submit_request(client_id, new_primary_idx, replay_req.into_generic());
-
-        let mut retry_reply: Option<Message<ReplyHeader>> = None;
-        for _ in 0..200 {
-            let replies = sim.step();
-            if !replies.is_empty() {
-                retry_reply = Some(replies[0].deep_copy());
-                break;
-            }
-        }
-        let retry_reply = retry_reply.expect(
-            "reply must arrive after retry; new primary re-commits as \
-             fresh prepare (at-least-once)",
-        );
-
-        // At-least-once: same request id (correlation), HIGHER commit op
-        // (re-execution). No dedup absorbs the retry.
-        assert_eq!(
-            retry_reply.header().request,
-            original_request_id,
-            "retry's reply must correlate to the request id"
-        );
-        assert!(
-            retry_reply.header().commit > original_commit_op,
-            "retry must re-execute (commit op > original={original_commit_op}, got {})",
-            retry_reply.header().commit
-        );
-        assert_eq!(
-            retry_reply.header().client,
-            client_id,
-            "retry must echo original client_id"
-        );
-    }
-
     /// Determinism: fresh simulator + workload from the same seed (network
     /// and workload) produces an identical reply-header sequence.
     #[test]
@@ -2617,6 +2501,11 @@ mod tests {
 
         let client = SimClient::new(CLIENT_ID);
         sim.shell_login(&client);
+        // Both sends in flight at once. The simulated link delays each packet
+        // independently, so the lower request id can reach the primary after
+        // the higher one committed; the dedup slice's committed-id window is
+        // what keeps that reordered arrival a new write rather than an absorbed
+        // duplicate, and this loop is the check that both payloads commit.
         for payload in [
             Bytes::from_static(b"parked-redispatch-0"),
             Bytes::from_static(b"parked-redispatch-1"),
@@ -3225,6 +3114,149 @@ mod tests {
             epoch_after, epoch_before,
             "the client session must survive a restart, reconstructed from the retained WAL, \
              so a returning client is recognized instead of hitting NoSession"
+        );
+    }
+
+    /// Failover retry absorbed by the partition dedup slice: a `SendMessages`
+    /// replay of an already-committed `(client, request)` on a NEW primary is
+    /// answered without re-executing. The slice is folded in on every replica
+    /// at commit, so the promoted primary knows the watermark its predecessor
+    /// established -- that inheritance is what this test proves.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn failover_retry_absorbed_by_partition_dedup() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 5;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            ..packet::PacketSimulatorOptions::default()
+        };
+
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.register_client_with_primary(&client);
+
+        // Same `(client, session, request)` for replay; mirrors SDK's
+        // connection-loss retry.
+        let original_req = client.send_messages(ns, &[Bytes::from_static(b"failover-test")]);
+        let replay_req = original_req.deep_copy();
+        let original_request_id = original_req.header().request;
+
+        sim.submit_request(client_id, 0, original_req.into_generic());
+
+        let mut original_reply: Option<Message<ReplyHeader>> = None;
+        for _ in 0..200 {
+            let replies = sim.step();
+            if !replies.is_empty() {
+                original_reply = Some(replies[0].deep_copy());
+                break;
+            }
+        }
+        let original_reply = original_reply.expect("commit reply must arrive before primary crash");
+        let original_commit_op = original_reply.header().commit;
+        // Offset after exactly one committed batch: the duplicate must not
+        // move it.
+        let offset_after_original = sim.replicas[1].shards[0]
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on a live replica")
+            .stats
+            .current_offset();
+        assert_eq!(
+            original_reply.header().request,
+            original_request_id,
+            "sanity: original reply must echo the request id"
+        );
+
+        // Crash primary. Real-world: TCP buffer might have lost reply
+        // before ack; same retry path.
+        sim.replica_crash(0);
+
+        // Steps for view change across 4 survivors.
+        for _ in 0..800 {
+            sim.step();
+        }
+
+        // Find new primary via any live replica.
+        let live = &sim.replicas[1].shards[0];
+        let live_consensus = live
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on a live replica")
+            .consensus();
+        assert!(
+            live_consensus.view() > 0,
+            "view must have advanced past the crashed primary"
+        );
+        let new_primary_idx = live_consensus.primary_index(live_consensus.view());
+        assert_ne!(
+            new_primary_idx, 0,
+            "new primary must not be the crashed replica"
+        );
+
+        // Replay the SAME request to the new primary: the dedup slice it
+        // inherited at commit must absorb it.
+        sim.submit_request(client_id, new_primary_idx, replay_req.into_generic());
+
+        let mut retry_reply: Option<Message<ReplyHeader>> = None;
+        for _ in 0..200 {
+            let replies = sim.step();
+            if !replies.is_empty() {
+                retry_reply = Some(replies[0].deep_copy());
+                break;
+            }
+        }
+        let retry_reply = retry_reply
+            .expect("reply must arrive after retry; the new primary absorbs it as a duplicate");
+
+        assert_eq!(
+            retry_reply.header().request,
+            original_request_id,
+            "retry's reply must correlate to the request id"
+        );
+        assert_eq!(
+            retry_reply.header().client,
+            client_id,
+            "retry must echo original client_id"
+        );
+        assert_eq!(
+            retry_reply.header().status,
+            0,
+            "an absorbed duplicate is a success, not an error"
+        );
+        // The absorbed answer is synthesized at admission, so it never earns a
+        // new op. Re-execution would have committed past the original.
+        assert!(
+            retry_reply.header().op <= original_commit_op,
+            "retry must NOT re-execute (original commit={original_commit_op}, reply op={})",
+            retry_reply.header().op
+        );
+        // The payload committed exactly once.
+        let committed = sim.replicas[usize::from(new_primary_idx)].shards[0]
+            .plane
+            .partitions()
+            .get_by_ns(&ns)
+            .expect("partition must exist on the new primary")
+            .stats
+            .current_offset();
+        assert_eq!(
+            committed, offset_after_original,
+            "duplicate must not append a second copy"
         );
     }
 
