@@ -337,7 +337,7 @@ Send a second message 'lorem ipsum' to the same stream, topic and partition:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 0 dev sample "lorem ipsum"`
 
-Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 0, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
+Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 0, starting with offset 0, messages count 2, with auto commit (storing consumer offset on server):
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 0`
 
