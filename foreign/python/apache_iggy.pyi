@@ -1222,12 +1222,12 @@ class IggyClient:
         partitions_count: builtins.int,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Delete partitions from a topic.
+        Delete the last partitions from a topic, including all messages stored in them.
 
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
-            partitions_count: Number of partitions to delete.
+            partitions_count: Number of partitions to delete from the end of the topic.
 
         Returns:
             An awaitable that resolves to `None` when the partitions are deleted.
