@@ -31,6 +31,7 @@ pub mod consumer_timestamp_polling_scenario;
 // shard-0 HTTP listener and the create/delete commit through the metadata STM,
 // so the token replicates to every shard a TCP client may land on.
 pub mod cross_protocol_pat_scenario;
+pub mod delete_stats_rollback_scenario;
 pub mod encryption_scenario;
 pub mod invalid_consumer_offset_scenario;
 pub mod log_rotation_scenario;

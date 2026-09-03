@@ -504,9 +504,7 @@ async fn shard_main(
             // and decrement the parent `StreamStats` by it.
             let () = recovered.mux_stm.streams().read(|inner| {
                 for (_, stream) in &inner.items {
-                    for (_, topic) in &stream.topics {
-                        topic.stats.zero_out_all();
-                    }
+                    clear_snapshot_totals(stream);
                 }
             });
             broadcast_metadata_bundle(
@@ -951,6 +949,27 @@ async fn shard_main(
 /// and dropped (the periodic tick recovers). Installed via
 /// [`metadata::IggyMetadata::set_commit_notifier`] on shard 0 only, the
 /// sole writer of the metadata state machine.
+/// Drop a restored checkpoint's aggregate totals so the per-shard
+/// `load_partition` deltas in `build_shard_for_thread` rebuild them from disk.
+///
+/// Both levels, not just the topics. A checkpoint reads a stream's total and
+/// each of its topics' as separate loads while the partition plane keeps
+/// counting, so `stream_snapshot - sum(topic_snapshot)` can be either sign;
+/// leaving that residue on the stream means a later rollback subtracts against
+/// a total nothing backs.
+///
+/// Topics are stored rather than zeroed out: `zero_out_all` swaps and decrements
+/// the parent by what it swapped, and on a checkpoint whose topics sum above
+/// its stream that cascade would trip the rollup-underflow alarm at every boot
+/// with no real divergence behind it. The stream is the rollup root, so its
+/// `zero_out_all` is a plain store.
+fn clear_snapshot_totals(stream: &metadata::stm::stream::Stream) {
+    for (_, topic) in &stream.topics {
+        topic.stats.store_from_snapshot(0, 0, 0);
+    }
+    stream.stats.zero_out_all();
+}
+
 fn make_metadata_commit_notifier(
     senders: Vec<TaggedSender>,
     metrics: ShardMetrics,
@@ -1038,6 +1057,57 @@ mod tests {
         assert!(
             !operation_triggers_partition_reconcile(Operation::CreateUser),
             "ops with no partition-shape effect must stay off the broadcast"
+        );
+    }
+
+    /// A checkpoint loads a stream's total and its topics' as separate reads
+    /// while the partition plane keeps counting, so the two can disagree in
+    /// either direction. Boot has to drop both, or the surviving residue sits
+    /// under a total nothing on disk backs.
+    #[test]
+    fn clear_snapshot_totals_drops_both_levels_of_a_torn_checkpoint() {
+        use iggy_common::{
+            CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize, StreamStats,
+        };
+        use metadata::stm::stream::{Stream, Topic};
+
+        let stream_stats = Arc::new(StreamStats::default());
+        let mut stream = Stream::with_stats(
+            Arc::from("stream"),
+            IggyTimestamp::now(),
+            Arc::clone(&stream_stats),
+        );
+        let topic = Topic::new(
+            Arc::from("topic"),
+            IggyTimestamp::now(),
+            IggyExpiry::NeverExpire,
+            CompressionAlgorithm::default(),
+            MaxTopicSize::Unlimited,
+            Arc::clone(&stream_stats),
+        );
+        let topic_stats = Arc::clone(&topic.stats);
+        stream.topics.insert(topic);
+
+        // Topics summing above their stream is the torn shape: the stream was
+        // read first, and the topic kept counting before its own read.
+        stream_stats.store_from_snapshot(100, 1, 1);
+        topic_stats.store_from_snapshot(200, 2, 2);
+        let underflows_before = iggy_common::rollup_underflows();
+
+        clear_snapshot_totals(&stream);
+
+        assert_eq!(topic_stats.size_bytes_inconsistent(), 0);
+        assert_eq!(
+            stream_stats.size_bytes_inconsistent(),
+            0,
+            "the stream total is snapshotted independently, so it has to be dropped too"
+        );
+        assert_eq!(stream_stats.messages_count_inconsistent(), 0);
+        assert_eq!(stream_stats.segments_count_inconsistent(), 0);
+        assert_eq!(
+            iggy_common::rollup_underflows(),
+            underflows_before,
+            "a torn checkpoint is not a divergence; boot must not raise the alarm"
         );
     }
 }
