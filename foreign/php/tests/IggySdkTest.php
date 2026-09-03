@@ -19,6 +19,7 @@
 declare(strict_types=1);
 
 use Iggy\AutoCommit;
+use Iggy\AutoCommitWhen;
 use Iggy\Client as IggyClient;
 use Iggy\PollingStrategy;
 use Iggy\ReceiveMessage;
@@ -51,7 +52,7 @@ final class IggySdkTest extends TestCase
 
         $client = new IggyClient('');
         $client->connect();
-        $client->loginUser(env_or_default('IGGY_USERNAME', 'iggy'), env_or_default('IGGY_PASSWORD', 'iggy'));
+        $client->loginUser(env_or_default('IGGY_ROOT_USERNAME', 'iggy'), env_or_default('IGGY_ROOT_PASSWORD', 'iggy'));
         $client->ping();
 
         assert_true($client instanceof IggyClient);
@@ -409,6 +410,39 @@ final class IggySdkTest extends TestCase
         }
     }
 
+    #[TestDox('Consumer group accepts a zero polling interval')]
+    public function testConsumerGroupAcceptsZeroPollInterval(): void
+    {
+        $client = new_client();
+        $consumerName = unique_name('consumer-group-consumer');
+        $streamName = unique_name('consumer-group-stream');
+        $topicName = unique_name('consumer-group-topic');
+
+        try {
+            create_stream_and_topic($client, $streamName, $topicName);
+            $consumer = $client->consumerGroup(
+                $consumerName,
+                $streamName,
+                $topicName,
+                0,
+                PollingStrategy::next(),
+                10,
+                AutoCommit::disabled(),
+                true,
+                true,
+                0,
+                null,
+                null,
+                null,
+                false,
+            );
+
+            assert_same($consumerName, $consumer->name());
+        } finally {
+            cleanup_stream_with_topics($client, $streamName, [$topicName]);
+        }
+    }
+
     #[TestDox('Consumer group rejects zero duration options before initialization')]
     public function testConsumerGroupRejectsZeroDurationOptions(): void
     {
@@ -421,23 +455,13 @@ final class IggySdkTest extends TestCase
             create_stream_and_topic($client, $streamName, $topicName);
 
             assert_throws(
-                static fn () => $client->consumerGroup(
-                    $consumerName,
-                    $streamName,
-                    $topicName,
-                    0,
-                    PollingStrategy::next(),
-                    10,
-                    AutoCommit::disabled(),
-                    true,
-                    true,
-                    0,
-                    null,
-                    null,
-                    null,
-                    false,
-                ),
-                'poll_interval_micros',
+                static fn () => AutoCommit::interval(0),
+                'interval_micros',
+            );
+
+            assert_throws(
+                static fn () => AutoCommit::intervalOrWhen(0, AutoCommitWhen::pollingMessages()),
+                'interval_micros',
             );
 
             assert_throws(

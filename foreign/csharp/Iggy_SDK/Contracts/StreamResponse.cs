@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 using System.Text.Json.Serialization;
 using Apache.Iggy.Headers;
 using Apache.Iggy.JsonConverters;
@@ -57,7 +56,7 @@ public sealed class StreamResponse
     /// <summary>
     ///     Number of topics in the stream.
     /// </summary>
-    public required int TopicsCount { get; init; }
+    public required uint TopicsCount { get; init; }
 
     /// <summary>
     ///     List of topics in the stream.

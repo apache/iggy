@@ -80,9 +80,9 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
     BaseAddress = "127.0.0.1:8090",
     Protocol = Protocol.Tcp,
 
-    // Buffer sizes (optional, default: 4096)
-    ReceiveBufferSize = 4096,
-    SendBufferSize = 4096,
+    // Socket buffer sizes in bytes (optional, null = OS default)
+    ReceiveBufferSize = null,
+    SendBufferSize = null,
 
     // TLS/SSL configuration
     TlsSettings = new TlsSettings
@@ -108,8 +108,9 @@ var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
         BackoffMultiplier = 2.0
     },
 
-    // Auto-login after connection. Reconnection needs it: without credentials to replay a reconnect cannot
-    // restore the session, so a lost connection fails the request instead
+    // Auto-login after connection. Optional for reconnection: a client that signs in with
+    // LoginUserAsync has that sign-in replayed on a reconnect too. Without either, a reconnect
+    // cannot restore the session and a lost connection fails the request
     AutoLoginSettings = AutoLoginSettings.For("your_username", "your_password"),
     // or AutoLoginSettings.ForPersonalAccessToken("your_token")
 
@@ -196,14 +197,20 @@ The SDK replays a request whenever the server says it never admitted it. Two cas
   to `WithConnection`. Before, a builder-created client came back from a
   reconnect unauthenticated; now the credentials are held for the lifetime of the connection and replayed.
 - The TCP client now pings the server every `HeartbeatInterval` (5 seconds, always on) on its own, and
-  reconnection is on by default (it was off before) with unlimited retries, like the Rust client. Only a
-  failed dial is retried; a rejected certificate, bad credentials or a missing leader is thrown right away.
-  A dropped connection fails every in-flight request at once; they share a single reconnect and are replayed
-  on the connection it establishes. With the default `MaxRetries = 0` an unreachable server is retried
-  forever, so a request that passes no `CancellationToken` waits for as long as the server stays down - set
-  `MaxRetries` or pass a token to bound it. Reconnection only replays a request when `AutoLoginSettings` can
-  restore the session; a client that logged in by hand fails fast on a lost connection. Set
-  `ReconnectionSettings.Enabled = false` to opt out of reconnection.
+  reconnection is on by default (it was off before) with unlimited retries, like the Rust client. Bringing an
+  endpoint up is what gets another attempt, and one retry is a full pass over every endpoint the client knows -
+  where it is, the configured address, and every node the roster named - rather than one dial of the first.
+  Bad credentials or a missing leader is thrown right away, and so is a TLS fault no retry can fix (an
+  unreadable CA file, a certificate this client will never accept), once the pass has given the other
+  endpoints their turn. A dropped connection fails every in-flight request at once; they share a single
+  reconnect and are replayed on the connection it establishes. With the default `MaxRetries = 0` an
+  unreachable server is retried forever, so a request that passes no `CancellationToken` waits for as long as
+  the server stays down - set `MaxRetries` or pass a token to bound it. A reconnect restores the session from
+  `AutoLoginSettings` or from the sign-in a `LoginUserAsync` call succeeded with, so a client that logged in by
+  hand reconnects too; without either there is nothing to restore and the request fails. A server-side
+  eviction (the heartbeat verifier reacting to silence) is recovered from the same way; only `LogoutUserAsync`
+  or `Dispose` ends a session for good. Set `ReconnectionSettings.Enabled = false` to opt out of
+  reconnection.
 - `AutoLoginSettings` properties are now `init`-only, as is `IggyClientConfigurator.HeartbeatInterval`. Build
   them with an object initializer or the `AutoLoginSettings.For` / `AutoLoginSettings.ForPersonalAccessToken`
   factories instead of assigning after construction.

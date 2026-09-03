@@ -29,6 +29,7 @@ mod mongodb;
 mod opensearch;
 mod postgres;
 mod quickwit;
+mod redshift;
 mod s3;
 mod surrealdb;
 mod wiremock;
@@ -63,7 +64,8 @@ pub use http::{
     HttpSinkNdjsonFixture, HttpSinkNoMetadataFixture, HttpSinkRawFixture,
 };
 pub use iceberg::{
-    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps, IcebergPreCreatedFixture,
+    DEFAULT_NAMESPACE, DEFAULT_TABLE, IcebergEnvAuthFixture, IcebergOps,
+    IcebergPartitionedTableFixture, IcebergPreCreatedFixture,
 };
 pub use influxdb::{
     InfluxDb3SinkFixture, InfluxDb3SourceFixture, InfluxDbSinkBase64Fixture, InfluxDbSinkFixture,
@@ -83,6 +85,10 @@ pub use postgres::{
     PostgresSourceOps,
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
+pub use redshift::{
+    RedshiftSinkFixture, RedshiftSinkJsonFixture, RedshiftSinkNoArchiveFixture,
+    RedshiftSinkVarbyteFixture,
+};
 pub use s3::{S3SinkFixture, S3SinkOps, S3SinkRotationFixture};
 pub use surrealdb::{
     SurrealDbOps, SurrealDbSinkBatchFixture, SurrealDbSinkFixture, SurrealDbSinkJsonFixture,

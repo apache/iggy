@@ -18,6 +18,7 @@
 use crate::configs::connectors::{ConnectorsConfigProvider, SinkConfig, SourceConfig};
 use crate::configs::runtime::ConnectorsRuntimeConfig;
 use crate::metrics::Metrics;
+use crate::state::StateStorageFactory;
 use crate::stream::IggyClients;
 use crate::{
     FailedPlugin, SinkConnectorWrapper, SourceConnectorWrapper,
@@ -43,7 +44,7 @@ pub struct RuntimeContext {
     pub metrics: Arc<Metrics>,
     pub start_time: IggyTimestamp,
     pub iggy_clients: Arc<IggyClients>,
-    pub state_path: String,
+    pub state_factory: Arc<dyn StateStorageFactory>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -57,7 +58,7 @@ pub fn init(
     failed_sources: &[FailedPlugin],
     config_provider: Box<dyn ConnectorsConfigProvider>,
     iggy_clients: Arc<IggyClients>,
-    state_path: String,
+    state_factory: Arc<dyn StateStorageFactory>,
 ) -> RuntimeContext {
     let metrics = Arc::new(Metrics::init());
     let mut sink_details = map_sinks(sinks_config, sink_wrappers);
@@ -79,7 +80,7 @@ pub fn init(
         metrics,
         start_time: IggyTimestamp::now(),
         iggy_clients,
-        state_path,
+        state_factory,
     }
 }
 

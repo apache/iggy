@@ -126,7 +126,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.7.0-edge.1` or `apache/igg
 - [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
 - [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
 
-[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) is work in progress.
+[C++](https://github.com/apache/iggy/tree/master/foreign/cpp) and [PHP](https://github.com/apache/iggy/tree/master/foreign/php) are work in progress.
 
 ---
 
@@ -288,7 +288,7 @@ For configuration options and detailed help:
 You can also use environment variables to override any configuration setting:
 
 - Override TCP address
-   `IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server`
+   `IGGY_TCP_ADDRESS=127.0.0.1:8090 cargo run --bin iggy-server`
 
 - Set custom data path
    `IGGY_SYSTEM_PATH=/data/iggy cargo run --bin iggy-server`
@@ -317,7 +317,7 @@ Get `dev` stream details:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> stream get dev`
 
-Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), no topic compression (`none`), and disabled message expiry (skipped optional parameter). Other compression values are reserved for future server-side support:
+Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 0 and 1), no topic compression (`none`), and disabled message expiry (skipped optional parameter). Other compression values are reserved for future server-side support:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic create dev sample 2 none`
 
@@ -329,17 +329,17 @@ Get topic details for topic `sample` in stream `dev`:
 
 `cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic get dev sample`
 
-Send a message 'hello world' (message ID 1) to the stream `dev` to topic `sample` and partition 1:
+Send the first message 'hello world' to the stream `dev` to topic `sample` and partition 0:
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "hello world"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 0 dev sample "hello world"`
 
-Send another message 'lorem ipsum' (message ID 2) to the same stream, topic and partition:
+Send a second message 'lorem ipsum' to the same stream, topic and partition:
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "lorem ipsum"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 0 dev sample "lorem ipsum"`
 
-Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 1, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
+Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 0, starting with offset 0, messages count 2, with auto commit (storing consumer offset on server):
 
-`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 0`
 
 Finally, restart the server to see it is able to load the persisted data.
 
@@ -391,7 +391,7 @@ producer.send(messages).await?;
 let mut consumer = client
     .consumer_group("my_app", "dev01", "events")?
     .auto_commit(AutoCommit::IntervalOrWhen(
-        IggyDuration::from_str("1s")?,
+        NonZeroIggyDuration::from_str("1s")?,
         AutoCommitWhen::ConsumingAllMessages,
     ))
     .create_consumer_group_if_not_exists()

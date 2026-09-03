@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//
 
 import { randomBytes } from 'node:crypto';
 
@@ -25,9 +24,9 @@ const MAX_U64 = 0xFFFF_FFFF_FFFF_FFFFn;
  *
  * Each client instance generates an ephemeral random `clientId` (u128).
  * After a Register commits, the server assigns a `session` number (commit op
- * number). Replicated metadata requests advance a monotonic request watermark.
- * Non-replicated and partition-plane requests reuse the current value because
- * the server only applies request sequencing to replicated metadata.
+ * number). Every replicated request (metadata and partition) advances a
+ * monotonic request watermark; non-replicated requests reuse the current
+ * value because they bypass server-side request sequencing.
  */
 export class ConsensusSession {
   private _clientId: bigint;

@@ -99,14 +99,23 @@ pub(in crate::http) struct HttpSession {
     /// Serializes this session's writes: the guarded value is the NEXT request
     /// id. A `tokio::sync::Mutex` because the write path holds it across the
     /// submit `.await` so each session's request numbers reach the primary in
-    /// order and stay gap-free for the depth-1 consensus dedup.
+    /// order. Ordering is what matters, not contiguity: the client table dedups
+    /// on a watermark (see `submit.rs`), so gaps are free but an id overtaken by
+    /// a larger one would arrive at or below the watermark and be refused as a
+    /// duplicate.
     pub(in crate::http) gate: Mutex<u64>,
-    /// Next data-plane request id. A separate, gate-free counter: partition ops
-    /// are at-least-once with no consensus dedup, so the id only correlates the
-    /// in-process reply slot and concurrent produces on one session are legal.
-    /// A plain `Cell` suffices on single-threaded shard 0; ids are minted
-    /// monotonically and never reused, which the slot-guard contract requires.
-    pub(in crate::http) data_request: Cell<u64>,
+    /// Serializes this session's data-plane writes the way `gate` does its
+    /// metadata writes: the guarded value is the NEXT request id, and the write
+    /// path holds the lock from the mint until the request has been handed to
+    /// the owning shard's inbox. The partition slice dedups on a per-client
+    /// watermark, so two handlers that minted in one order but reached the
+    /// shard in the other (one slept in the routable wait, say) would have the
+    /// lower id absorbed as a duplicate with a success status. Concurrent
+    /// awaits stay legal: the lock covers admission, not the commit round trip.
+    /// Shared with the `?ack=none` path so a shed reply's id never collides
+    /// with a live awaited slot on this session. Ids are minted monotonically
+    /// and never reused, which the slot-guard contract requires.
+    pub(in crate::http) data_gate: Mutex<u64>,
     /// Registry token of this session's lazily-installed in-process reply
     /// target (`None` until the first awaited partition write). Stored so
     /// session eviction can tear the registry entry down fenced by the same
@@ -116,17 +125,6 @@ pub(in crate::http) struct HttpSession {
     /// [`MAX_IN_FLIGHT_WRITES_PER_SESSION`]. Only [`InFlightWriteGuard`]
     /// touches it, so every admission is paired with exactly one release.
     pub(in crate::http) in_flight_writes: Cell<u32>,
-}
-
-impl HttpSession {
-    /// Mint the next data-plane request id. Also consumed by the `?ack=none`
-    /// path, which installs no slot: sharing one counter keeps a shed reply's
-    /// id from ever colliding with a live awaited slot on this session.
-    pub(in crate::http) fn next_data_request_id(&self) -> u64 {
-        let id = self.data_request.get();
-        self.data_request.set(id + 1);
-        id
-    }
 }
 
 /// Serializes first-use VSR registration per credential key so a herd of
@@ -268,7 +266,7 @@ mod tests {
             user_id: DEFAULT_ROOT_USER_ID,
             expiry: u64::MAX,
             gate: Mutex::new(FIRST_REQUEST_ID),
-            data_request: Cell::new(FIRST_REQUEST_ID),
+            data_gate: Mutex::new(FIRST_REQUEST_ID),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
         });
@@ -300,7 +298,7 @@ mod tests {
             user_id: DEFAULT_ROOT_USER_ID,
             expiry,
             gate: Mutex::new(FIRST_REQUEST_ID),
-            data_request: Cell::new(FIRST_REQUEST_ID),
+            data_gate: Mutex::new(FIRST_REQUEST_ID),
             registry_token: Cell::new(None),
             in_flight_writes: Cell::new(0),
         })

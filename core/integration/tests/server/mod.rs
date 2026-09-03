@@ -39,7 +39,7 @@ mod stats_vsr;
 mod purge_vsr;
 // Shared HTTP transport plumbing (session + verb helpers) for the raw-HTTP
 // server suites below.
-mod http_client;
+pub(crate) mod http_client;
 // Raw-HTTP data-plane contract against the server's shard-0 listener.
 mod http_vsr;
 // Raw-HTTP wire-contract residue against the server (status codes + typed error
@@ -48,8 +48,17 @@ mod http_rbac;
 // End-to-end HTTPS: the server serves the REST listener over TLS and negotiates
 // HTTP/2 via ALPN.
 mod http_tls;
+// The iggy-view response header: on authenticated success and redirect
+// responses only, never on errors or /ping, relayed from the primary.
+mod http_view_header;
 // Binary GetClusterMetadata must serve the real roster from a VSR cluster.
 mod cluster_metadata_vsr;
+// A declared node.advertised_address outranks the bind address a
+// cluster-disabled server would otherwise publish.
+mod cluster_metadata_advertised;
+// Listeners bound to :0 must publish the OS-chosen ports through the runtime
+// config dump and both cluster-metadata spines.
+mod port_discovery;
 // A metadata view change must persist the advanced view and recover it from disk
 // across a replica restart.
 mod cluster_view_durability_vsr;

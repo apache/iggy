@@ -12,6 +12,15 @@ cargo run --bin iggy-server --release
 
 The Docker image `apache/iggy:latest` ships the server together with the CLI; the `edge` tag tracks the latest development build.
 
+The image binds every listener to `0.0.0.0` so the container is reachable from outside it. A wildcard bind says which interfaces accept connections, not where a client reaches the server, so the address to publish in cluster metadata has to be supplied and the server refuses to start without it. On a single host with published ports that address is `localhost`:
+
+```sh
+docker run -p 3000:3000 -p 8090:8090 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost apache/iggy:latest
+```
+
+Use the hostname or load balancer address clients actually dial when they are not on the same host. The Helm chart derives it from the Service DNS name.
+
 To run one node of a cluster, pass its replica ID from the `cluster.nodes` roster:
 
 ```sh
@@ -27,7 +36,7 @@ Settings are read from [config.toml](config.toml), resolved relative to the work
 Any single value can be overridden with an `IGGY_`-prefixed environment variable that mirrors the TOML path:
 
 ```sh
-IGGY_TCP_ADDRESS=0.0.0.0:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-server
+IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_HTTP_ENABLED=false cargo run --bin iggy-server
 ```
 
 Cluster membership, quorum and replica addressing live under `[cluster]`.

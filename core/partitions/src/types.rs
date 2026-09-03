@@ -15,10 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use iggy_binary_protocol::Operation;
 use iggy_common::{EncryptorKind, IggyByteSize, PollingStrategy};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
 use std::sync::Arc;
+
+/// A local commit that failed for an op the cluster had already committed.
+///
+/// The replica is divergent from here on: `drain_committable_prefix` popped
+/// the op, its `commit_min` never advanced, and the next
+/// `advance_commit_min` would assert on the gap. Continuing would either
+/// serve a prefix the cluster has moved past or panic somewhere less
+/// legible, so the partition fences itself on this and the shard brings the
+/// server down through the ordinary shutdown path. Recorded rather than
+/// panicked because a panic on the pump task is swallowed by the runtime,
+/// which wedges every partition on the shard while the process reports
+/// healthy.
+#[derive(Debug, Clone)]
+pub struct FatalCommit {
+    pub namespace_raw: u64,
+    pub op: u64,
+    pub operation: Operation,
+}
 
 #[derive(Debug, Clone)]
 pub struct Fragment<const ALIGN: usize = 4096> {
@@ -55,6 +74,28 @@ impl<const ALIGN: usize> Fragment<ALIGN> {
         } else {
             self.source.slice(self.start..self.end)
         }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.source[self.start..self.end]
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Whether this fragment refcounts `source`'s allocation (and thus keeps
+    /// all of it alive, not just the sliced window).
+    #[must_use]
+    pub fn borrows_from(&self, source: &Frozen<ALIGN>) -> bool {
+        self.source.shares_allocation(source)
     }
 }
 
@@ -213,10 +254,20 @@ pub const REPAIR_RETRY_TICKS: u32 = 100;
 /// One in-flight journal-repair stream for a partition group.
 #[derive(Debug, Clone, Copy)]
 pub struct RepairSession {
-    /// Fences stale repair frames from an earlier attempt.
+    /// Fences range replies from an earlier attempt. Repair bodies carry the
+    /// stored prepare header instead, so [`Self::view`] and canonical suffix
+    /// checks fence their ingest.
     pub nonce: u128,
-    /// Last op the stream is expected to serve (the frontier at request time).
-    pub to_op: u64,
+    /// Consensus view in which this session was armed. A later view discards
+    /// the session before any delayed repair body can enter its journal.
+    pub view: u32,
+    /// Committed frontier this repair must make locally walkable. Floor
+    /// completeness and session completion are bounded here.
+    pub commit_to_op: u64,
+    /// Highest op requested from the peer. This may extend above
+    /// [`Self::commit_to_op`] only for the canonical suffix carried by the
+    /// adopted `StartView`.
+    pub fetch_to_op: u64,
     /// Commit floor learned from `RangeEvicted { retained_from }`:
     /// `retained_from - 1`. `None` until (unless) the serving peer reports a
     /// truncated prefix.

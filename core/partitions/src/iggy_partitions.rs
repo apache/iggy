@@ -21,12 +21,17 @@ use crate::poll_plan::PollPlan;
 use crate::types::PartitionsConfig;
 use crate::{IggyPartition, Partition, PollingArgs, PollingConsumer};
 use ahash::AHashSet;
-use consensus::{Consensus, Plane, PlaneIdentity, VsrConsensus};
-use iggy_binary_protocol::{
-    Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, RoutedRequestHeader,
+use consensus::{
+    Consensus, Plane, PlaneIdentity, VsrConsensus, build_deny_reply_from_request_header,
 };
+use iggy_binary_protocol::{
+    Command, ConsensusHeader, Operation, PrepareHeader, PrepareOkHeader, ReplyHeader,
+    RoutedRequestHeader,
+};
+use iggy_common::IggyError;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
+use server_common::Message;
 use server_common::send_messages::{ChecksumMode, convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 #[cfg(debug_assertions)]
@@ -407,6 +412,13 @@ where
         self.tombstoned.borrow().contains(namespace)
     }
 
+    /// Snapshot every tombstoned namespace, including ones never
+    /// materialised: a boot-time damage verdict fences a namespace before
+    /// any partition exists, so it appears in no other view of this map.
+    pub fn tombstoned_namespaces(&self) -> Vec<IggyNamespace> {
+        self.tombstoned.borrow().iter().copied().collect()
+    }
+
     /// Mark a namespace as tombstoned. Callable from any task on the
     /// shard's runtime (reconciler sets the fence synchronously before
     /// awaiting disk delete).
@@ -521,21 +533,34 @@ where
     }
 }
 
-impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>
+impl<B, SB> IggyPartitions<B, SB>
 where
     B: MessageBus,
     SB: SuperblockStore,
 {
-    async fn on_request(
+    /// [`Plane::on_request`] carrying the in-process reply channel a
+    /// `PartitionSubmit` arrived with; `None` keeps the bus-reply path.
+    pub async fn on_request_with_reply(
         &self,
         message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+        reply: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
         let namespace = IggyNamespace::from_raw(message.header().group);
+        // Every exit below that drops the request answers its waiter first: a
+        // submit's reply cannot be routed by `header.client` (the VSR id), so
+        // an unanswered channel costs the client a full read-timeout for an
+        // outcome that was decided here and now.
+        let mut reply = reply;
         if self.is_tombstoned(&namespace) {
             warn!(
                 target: "iggy.partitions.diag",
                 namespace_raw = namespace.inner(),
                 "dropping request: namespace tombstoned"
+            );
+            Self::answer_waiter(
+                reply.take(),
+                message.header(),
+                IggyError::TransientNotAccepted.as_code(),
             );
             return;
         }
@@ -552,6 +577,9 @@ where
             // `encrypt_batch_request`'s decode before re-encryption, and the
             // re-encrypted batch (checksum kept by `encrypt_batch_request`) then
             // re-enters `convert` as the canonical-vs-legacy discriminator.
+            // The header outlives the message consumed by the conversion, so a
+            // failure can still be answered with the frame's own identity.
+            let header = *message.header();
             let canonical = convert_request_message(namespace, message, ChecksumMode::Compute)
                 .and_then(|message| encrypt_batch_request(message, encryptor));
             match canonical {
@@ -563,6 +591,7 @@ where
                         %error,
                         "dropping send_messages: failed to encrypt batch at ingestion"
                     );
+                    Self::answer_waiter(reply.take(), &header, error.as_code());
                     return;
                 }
             }
@@ -577,9 +606,40 @@ where
                 operation = ?message.header().operation,
                 "partition not initialized for namespace"
             );
+            Self::answer_waiter(
+                reply.take(),
+                message.header(),
+                IggyError::TransientNotAccepted.as_code(),
+            );
             return;
         };
-        partition.on_request(message).await;
+        partition.on_request(message, reply).await;
+    }
+
+    /// Deny a request that never reached its partition on the submit channel
+    /// it arrived with, if any. The bus path has no waiter to answer and keeps
+    /// its drop-and-warn behaviour.
+    fn answer_waiter(
+        waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
+        header: &RoutedRequestHeader,
+        status: u32,
+    ) {
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(build_deny_reply_from_request_header(header, status));
+        }
+    }
+}
+
+impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    async fn on_request(
+        &self,
+        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+    ) {
+        self.on_request_with_reply(message, None).await;
     }
 
     async fn on_replicate(&self, message: <VsrConsensus<B> as Consensus>::Message<PrepareHeader>) {

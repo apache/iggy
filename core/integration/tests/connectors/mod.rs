@@ -32,6 +32,7 @@ mod postgres;
 mod quickwit;
 mod random;
 mod random_source_liveness;
+mod redshift;
 mod runtime;
 mod s3;
 mod stdout;

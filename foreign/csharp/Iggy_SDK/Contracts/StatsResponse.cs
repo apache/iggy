@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 using System.Text.Json.Serialization;
 using Apache.Iggy.JsonConverters;
 
@@ -29,7 +28,7 @@ public sealed class StatsResponse
     /// <summary>
     ///     Process identifier.
     /// </summary>
-    public required int ProcessId { get; init; }
+    public required uint ProcessId { get; init; }
 
     /// <summary>
     ///     CPU usage of the process.
@@ -91,22 +90,22 @@ public sealed class StatsResponse
     /// <summary>
     ///     Total number of streams.
     /// </summary>
-    public required int StreamsCount { get; init; }
+    public required uint StreamsCount { get; init; }
 
     /// <summary>
     ///     Total number of topics.
     /// </summary>
-    public required int TopicsCount { get; init; }
+    public required uint TopicsCount { get; init; }
 
     /// <summary>
     ///     Total number of partitions.
     /// </summary>
-    public required int PartitionsCount { get; init; }
+    public required uint PartitionsCount { get; init; }
 
     /// <summary>
     ///     Total number of segments.
     /// </summary>
-    public required int SegmentsCount { get; init; }
+    public required uint SegmentsCount { get; init; }
 
     /// <summary>
     ///     Total number of messages.
@@ -116,12 +115,12 @@ public sealed class StatsResponse
     /// <summary>
     ///     Total number of connected clients.
     /// </summary>
-    public required int ClientsCount { get; init; }
+    public required uint ClientsCount { get; init; }
 
     /// <summary>
     ///     Total number of consumer groups.
     /// </summary>
-    public required int ConsumerGroupsCount { get; init; }
+    public required uint ConsumerGroupsCount { get; init; }
 
     /// <summary>
     ///     Hostname of the server.

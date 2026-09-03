@@ -116,30 +116,36 @@ pub fn lttb_downsample(points: &[TimePoint], threshold: usize) -> Vec<TimePoint>
     result
 }
 
+/// Calculate the population standard deviation of `values`
+///
+/// Returns None if there are fewer than 2 values
+pub fn std_dev_values(values: &[f64]) -> Option<f64> {
+    let count = values.len();
+
+    if count < 2 {
+        return None;
+    }
+
+    let mean = values.iter().sum::<f64>() / count as f64;
+
+    let variance = values
+        .iter()
+        .map(|value| {
+            let diff = value - mean;
+            diff * diff
+        })
+        .sum::<f64>()
+        / count as f64;
+
+    Some(variance.sqrt())
+}
+
 /// Calculate the standard deviation of values from a TimeSeries
 ///
 /// Returns None if the TimeSeries has fewer than 2 points
 pub fn std_dev(series: &TimeSeries) -> Option<f64> {
-    let points_count = series.points.len();
-
-    if points_count < 2 {
-        return None;
-    }
-
-    let sum: f64 = series.points.iter().map(|p| p.value).sum();
-    let mean = sum / points_count as f64;
-
-    let variance = series
-        .points
-        .iter()
-        .map(|p| {
-            let diff = p.value - mean;
-            diff * diff
-        })
-        .sum::<f64>()
-        / points_count as f64;
-
-    Some(variance.sqrt())
+    let values: Vec<f64> = series.points.iter().map(|p| p.value).collect();
+    std_dev_values(&values)
 }
 
 #[cfg(test)]

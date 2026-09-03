@@ -52,7 +52,20 @@ use crate::stm::user::UsersSnapshot;
 /// position out of place. The bump is what turns that into
 /// `UnsupportedFormatVersion` instead of an opaque deserializer error, or worse a
 /// silent misread.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+///
+/// Version 5: `PartitionSnapshot` gained `created_view` as a trailing, defaulted
+/// field.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
+
+/// Oldest format version [`MetadataSnapshot::decode`] still reads.
+///
+/// Versions 4 and 5 each appended a trailing, defaulted field (the client
+/// table's dedup fences, then `PartitionSnapshot::created_view`), so a version 3
+/// or 4 checkpoint decodes under the current layout and simply carries the
+/// defaults. Accepting them is what lets a node upgrade in place instead of
+/// refusing its own last checkpoint; anything older than 3 changed field
+/// positions and is refused as before.
+pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -203,7 +216,8 @@ impl From<std::io::Error> for SnapshotError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataSnapshot {
     /// The version of the snapshot format in use, reserved for breaking changes.
-    /// See [`SNAPSHOT_FORMAT_VERSION`]; [`Self::decode`] refuses anything else.
+    /// See [`SNAPSHOT_FORMAT_VERSION`]; [`Self::decode`] reads back to
+    /// [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`] and refuses anything else.
     ///
     /// First field deliberately: msgpack encodes the struct positionally, so this is
     /// the one element [`peek_format_version`] can pull out before it knows the rest
@@ -276,7 +290,7 @@ impl MetadataSnapshot {
         // Bytes carrying no readable version are not a snapshot at all, so they fall
         // through to the deserializer, whose error names what actually went wrong.
         if let Some(version) = peek_format_version(bytes)
-            && version != SNAPSHOT_FORMAT_VERSION
+            && !(MIN_READABLE_SNAPSHOT_FORMAT_VERSION..=SNAPSHOT_FORMAT_VERSION).contains(&version)
         {
             return Err(SnapshotError::UnsupportedFormatVersion {
                 found: version,
@@ -558,7 +572,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 7;
-        const PINNED_VERSION: u32 = 3;
+        const PINNED_VERSION: u32 = 5;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -583,6 +597,24 @@ mod tests {
         const TOPIC_FIELD_COUNT: u32 = 11;
         const STREAM_FIELD_COUNT: u32 = 6;
         const USER_FIELD_COUNT: u32 = 7;
+        // Version 4 appended `fences`; it is defaulted on read, which is what
+        // keeps version 3 readable, so a further append here needs the same
+        // treatment or a bump.
+        const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
+        // Version 5 appended `created_view` the same way.
+        const PARTITION_FIELD_COUNT: u32 = 7;
+
+        let client_table = consensus::ClientTableSnapshot {
+            slots: Vec::new(),
+            fences: Vec::new(),
+        };
+        let mut cursor = rmp_serde::to_vec(&client_table).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut cursor.as_slice()).unwrap(),
+            CLIENT_TABLE_FIELD_COUNT,
+            "ClientTableSnapshot's field count changed; default the new field or bump the version"
+        );
+        cursor.clear();
 
         let topic = TopicSnapshot {
             id: 0,
@@ -606,6 +638,22 @@ mod tests {
             rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
             TOPIC_FIELD_COUNT,
             "TopicSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let partition = PartitionSnapshot {
+            id: 0,
+            consensus_group_id: 0,
+            created_at: IggyTimestamp::default(),
+            created_revision: 0,
+            deleted_up_to_offset: 0,
+            purge_generation: 0,
+            created_view: 0,
+        };
+        let encoded = rmp_serde::to_vec(&partition).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            PARTITION_FIELD_COUNT,
+            "PartitionSnapshot's field count changed; default the new field or bump the version"
         );
 
         let stream = StreamSnapshot {
@@ -689,6 +737,59 @@ mod tests {
         assert_eq!(peek_format_version(&[0xa1, b'x']), None);
         // An array whose first element is not an unsigned integer.
         assert_eq!(peek_format_version(&[0x91, 0xc0]), None);
+    }
+
+    /// A version 3 checkpoint predates persisted dedup fences: its client table
+    /// has one positional element. It must decode under this layout with no
+    /// fences rather than refuse boot, or upgrading a node would cost it its
+    /// last checkpoint.
+    #[test]
+    fn decode_reads_a_version_3_snapshot_as_carrying_no_fences() {
+        #[derive(Serialize)]
+        struct ClientTableBeforeFences {
+            slots: Vec<(u32, consensus::ClientEntrySnapshot)>,
+        }
+        #[derive(Serialize)]
+        struct SnapshotVersion3 {
+            version: u32,
+            created_at: u64,
+            sequence_number: u64,
+            users: Option<UsersSnapshot>,
+            streams: Option<StreamsSnapshot>,
+            client_table: Option<ClientTableBeforeFences>,
+            writer_release: u32,
+        }
+        let old = SnapshotVersion3 {
+            version: MIN_READABLE_SNAPSHOT_FORMAT_VERSION,
+            created_at: 5,
+            sequence_number: 9,
+            users: None,
+            streams: None,
+            client_table: Some(ClientTableBeforeFences {
+                slots: vec![(
+                    0,
+                    consensus::ClientEntrySnapshot {
+                        client_id: 1,
+                        epoch: 10,
+                        user_id: 1,
+                        watermark: 3,
+                        watermark_checksum: 0,
+                        reply: vec![1, 2, 3],
+                    },
+                )],
+            }),
+            writer_release: 0,
+        };
+        let bytes = rmp_serde::to_vec(&old).expect("encode the old layout");
+        assert_eq!(peek_format_version(&bytes), Some(3));
+
+        let decoded = MetadataSnapshot::decode(&bytes).expect("a version 3 snapshot still decodes");
+        let table = decoded.client_table.expect("the table survived");
+        assert_eq!(table.slots.len(), 1);
+        assert!(
+            table.fences.is_empty(),
+            "an old checkpoint carries no fences"
+        );
     }
 
     #[test]
@@ -782,6 +883,7 @@ mod tests {
                                 created_revision: 0,
                                 deleted_up_to_offset: 0,
                                 purge_generation: 0,
+                                created_view: 0,
                             }],
                             consumer_groups: Vec::new(),
                             // Nonzero and distinct from every id above so the

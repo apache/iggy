@@ -1087,6 +1087,8 @@ impl IggyClient {
     }
 
     /// Creates a new consumer group consumer.
+    /// `partition_id` is ignored for a consumer group: the member reads the partitions
+    /// the server assigns to it.
     /// Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
     /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
     /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
@@ -1201,8 +1203,16 @@ impl IggyClient {
                 .init()
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            let state = consumer.state();
+            let name = consumer.name().to_string();
+            let stream = PyIdentifier::try_from(consumer.stream())?;
+            let topic = PyIdentifier::try_from(consumer.topic())?;
             Ok(IggyConsumer {
                 inner: Arc::new(Mutex::new(consumer)),
+                state,
+                name,
+                stream,
+                topic,
             })
         })
     }

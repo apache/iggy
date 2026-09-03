@@ -116,7 +116,10 @@ func (c ClientID) IsZero() bool {
 }
 
 // RequestFields are the header fields a client fills in. The rest of the 256
-// bytes stay zero, including both checksums, which the server does not read.
+// bytes stay zero. The frame and body checksums are not read on the client
+// request path. request_checksum is read, but zero means unstamped and opts out
+// of the server's payload comparison, so leaving it zero is legal; the Rust SDK
+// stamps it for deduped ops, this SDK does not yet.
 type RequestFields struct {
 	// Size is the header plus body total.
 	Size uint32

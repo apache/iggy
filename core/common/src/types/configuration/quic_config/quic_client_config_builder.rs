@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, IggyError, QuicClientConfig, validate_server_address};
+use crate::{
+    AutoLogin, IggyDuration, IggyError, NonZeroIggyDuration, QuicClientConfig,
+    validate_server_address,
+};
 
 /// Builder for the QUIC client configuration.
 ///
@@ -81,7 +84,7 @@ impl QuicClientConfigBuilder {
     }
 
     /// Sets the interval between retries when connecting to the server.
-    pub fn with_reconnection_interval(mut self, interval: IggyDuration) -> Self {
+    pub fn with_reconnection_interval(mut self, interval: NonZeroIggyDuration) -> Self {
         self.config.reconnection.interval = interval;
         self
     }
@@ -147,7 +150,7 @@ impl QuicClientConfigBuilder {
     }
 
     /// Sets the heartbeat interval. Defaults to 5000ms.
-    pub fn with_heartbeat_interval(mut self, interval: IggyDuration) -> Self {
+    pub fn with_heartbeat_interval(mut self, interval: NonZeroIggyDuration) -> Self {
         self.config.heartbeat_interval = interval;
         self
     }

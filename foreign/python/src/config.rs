@@ -121,19 +121,25 @@ impl TcpReconnectionConfig {
     ///
     /// Args:
     ///     enabled: Whether to reconnect at all. Defaults to enabled.
-    ///     max_retries: Attempts before giving up, or `None` for unlimited.
-    ///         Defaults to unlimited, which means a call awaited while the server
-    ///         is down never returns: `connect()`, `send_messages()` and
+    ///     max_retries: Passes over the known endpoints after the first, or
+    ///         `None` for unlimited; `0` still makes that first pass. One pass
+    ///         tries the endpoint the client is on, the address it was
+    ///         configured with, and every node the roster named, so this counts
+    ///         passes rather than dials. Defaults
+    ///         to unlimited, which means a call awaited while the server is
+    ///         down never returns: `connect()`, `send_messages()` and
     ///         `poll_messages()` all wait inside the retry loop. Set a finite
     ///         number for request/reply style usage, so a call fails instead.
-    ///     interval: Delay between attempts. Defaults to 1 second.
-    ///     reestablish_after: Cooldown before reconnecting after a previously
-    ///         successful connection. Defaults to 5 seconds.
+    ///     interval: Delay between passes. Defaults to 1 second. The first pass
+    ///         runs at once when more than one endpoint is known.
+    ///     reestablish_after: Cooldown before redialing the endpoint of the last
+    ///         successful connection, measured from when it was established, so
+    ///         a session that outlived the interval is redialed at once. Owed to
+    ///         that endpoint alone. Defaults to 5 seconds.
     ///
     /// Raises:
     ///     ValueError: If a duration is negative, if `max_retries` is outside the
-    ///         range of an unsigned 32-bit integer, or if `interval` is zero while
-    ///         reconnection is enabled and `max_retries` is unlimited.
+    ///         range of an unsigned 32-bit integer, or if `interval` is zero.
     #[new]
     #[pyo3(signature = (*, enabled=None, max_retries=None, interval=None, reestablish_after=None))]
     fn new(
@@ -160,15 +166,9 @@ impl TcpReconnectionConfig {
             .as_ref()
             .map(py_delta_to_iggy_duration)
             .transpose()?
+            .map(|interval| reject_zero(interval, "interval"))
+            .transpose()?
             .unwrap_or(defaults.interval);
-        // Unlimited retries at a zero interval reconnect in a continuous loop;
-        // a zero interval with a retry cap is a legitimate fast-retry policy, and
-        // with reconnection off the interval is never read at all.
-        if enabled && interval.is_zero() && max_retries.is_none() {
-            return Err(PyValueError::new_err(
-                "'interval' must not be zero unless 'max_retries' is set",
-            ));
-        }
         Ok(Self {
             inner: RustTcpClientReconnectionConfig {
                 enabled,
@@ -197,7 +197,7 @@ impl TcpReconnectionConfig {
     #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
     #[getter]
     fn interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
-        iggy_duration_to_py_delta(py, self.inner.interval)
+        iggy_duration_to_py_delta(py, self.inner.interval.get())
     }
 
     #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
@@ -214,7 +214,7 @@ impl TcpReconnectionConfig {
         format!(
             "TcpReconnectionConfig(enabled={}, max_retries={max_retries}, interval={}, reestablish_after={})",
             python_bool(self.inner.enabled),
-            duration_repr(self.inner.interval),
+            duration_repr(self.inner.interval.get()),
             duration_repr(self.inner.reestablish_after),
         )
     }
@@ -360,7 +360,7 @@ impl TcpConfig {
     #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
     #[getter]
     fn heartbeat_interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
-        iggy_duration_to_py_delta(py, self.inner.heartbeat_interval)
+        iggy_duration_to_py_delta(py, self.inner.heartbeat_interval.get())
     }
 
     #[getter]
@@ -399,7 +399,7 @@ impl TcpConfig {
             self.inner.server_address,
             self.auto_login().__repr__(),
             self.reconnection().__repr__(),
-            duration_repr(self.inner.heartbeat_interval),
+            duration_repr(self.inner.heartbeat_interval.get()),
             python_bool(self.inner.tls_enabled),
             self.inner.tls_domain,
             python_bool(self.inner.tls_validate_certificate),

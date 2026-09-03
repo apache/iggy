@@ -455,4 +455,19 @@ pub enum Error {
     /// be duplicated.
     #[error("Catalog commit error: {0}")]
     CatalogCommitError(String),
+    /// The state store is temporarily unavailable (5xx, timeout, connect
+    /// failure) and bounded retries were exhausted. The operation may succeed
+    /// later; the batch-ack path Nacks and the plugin re-polls.
+    #[error("Transient state error: {0}")]
+    TransientState(String),
+    /// The state store rejected the operation in a way retrying cannot fix
+    /// (version conflict, revoked authorization, protocol violation). No
+    /// write from this process can be expected to succeed again.
+    #[error("Permanent state error: {0}")]
+    PermanentState(String),
+    /// A previous save failed permanently, so the state provider refuses
+    /// further saves without touching the network. Fail-fast marker, never
+    /// retried.
+    #[error("State provider latched after a permanent state error")]
+    StateLatched,
 }

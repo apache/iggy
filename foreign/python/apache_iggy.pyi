@@ -872,6 +872,27 @@ class IggyClient:
         Sends a ping request to the server to check connectivity.
         Raises `RuntimeError` if the connection fails.
         """
+    def describe_options(
+        self, scope: builtins.str
+    ) -> collections.abc.Awaitable[list[OptionSpec]]:
+        r"""
+        Describe the option catalog for a resource scope.
+
+        This is the discovery surface for the `options` argument on
+        `create_topic`/`update_topic`: a key outside the catalog is refused at
+        create, and the binary transports carry only the error code back.
+
+        Args:
+            scope: One of `"topic"`, `"stream"`, `"user"`.
+
+        Returns:
+            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+            with no keys yet.
+
+        Raises:
+            ValueError: If the scope name is not one of the three above.
+            RuntimeError: If the request fails.
+        """
     def login_user(
         self, username: builtins.str, password: builtins.str
     ) -> collections.abc.Awaitable[None]:
@@ -1033,27 +1054,6 @@ class IggyClient:
         Gets stream by id.
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
-        """
-    def describe_options(
-        self, scope: builtins.str
-    ) -> collections.abc.Awaitable[builtins.list[OptionSpec]]:
-        r"""
-        Describe the option catalog for a resource scope.
-
-        This is the discovery surface for the `options` argument on
-        `create_topic`/`update_topic`: a key outside the catalog is refused at
-        create, and the binary transports carry only the error code back.
-
-        Args:
-            scope: One of `"topic"`, `"stream"`, `"user"`.
-
-        Returns:
-            An awaitable that resolves to `list[OptionSpec]`, empty for a scope
-            with no keys yet.
-
-        Raises:
-            ValueError: If the scope name is not one of the three above.
-            RuntimeError: If the request fails.
         """
     def create_topic(
         self,
@@ -1377,6 +1377,8 @@ class IggyClient:
     ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
+        `partition_id` is ignored for a consumer group: the member reads the partitions
+        the server assigns to it.
         Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
         `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
         `AutoCommit` interval is negative, or if any of those except `poll_interval`
@@ -1412,11 +1414,15 @@ class IggyConsumer:
         self, partition_id: builtins.int
     ) -> builtins.int | None:
         r"""
-        Get the last consumed offset or `None` if no offset has been consumed yet.
+        Get the last consumed offset for the given partition, or `None` while that partition
+        is untracked. Polling starts tracking a partition at `0`, so `0` also means
+        "seen, nothing consumed yet".
         """
     def get_last_stored_offset(self, partition_id: builtins.int) -> builtins.int | None:
         r"""
-        Get the last stored offset or `None` if no offset has been stored yet.
+        Get the last stored offset for the given partition, or `None` while that partition is
+        untracked. Polling starts tracking a partition at `0`, so `0` also means
+        "seen, nothing stored yet", including under `AutoCommit.Disabled()`.
         """
     def name(self) -> builtins.str:
         r"""
@@ -1428,11 +1434,11 @@ class IggyConsumer:
         """
     def stream(self) -> builtins.str | builtins.int:
         r"""
-        Gets the name of the stream this consumer group is configured for.
+        Gets the identifier of the stream this consumer group is configured for.
         """
     def topic(self) -> builtins.str | builtins.int:
         r"""
-        Gets the name of the topic this consumer group is configured for.
+        Gets the identifier of the topic this consumer group is configured for.
         """
     def store_offset(
         self, offset: builtins.int, partition_id: builtins.int | None
@@ -2016,19 +2022,25 @@ class TcpReconnectionConfig:
 
         Args:
             enabled: Whether to reconnect at all. Defaults to enabled.
-            max_retries: Attempts before giving up, or `None` for unlimited.
-                Defaults to unlimited, which means a call awaited while the server
-                is down never returns: `connect()`, `send_messages()` and
+            max_retries: Passes over the known endpoints after the first, or
+                `None` for unlimited; `0` still makes that first pass. One pass
+                tries the endpoint the client is on, the address it was
+                configured with, and every node the roster named, so this counts
+                passes rather than dials. Defaults
+                to unlimited, which means a call awaited while the server is
+                down never returns: `connect()`, `send_messages()` and
                 `poll_messages()` all wait inside the retry loop. Set a finite
                 number for request/reply style usage, so a call fails instead.
-            interval: Delay between attempts. Defaults to 1 second.
-            reestablish_after: Cooldown before reconnecting after a previously
-                successful connection. Defaults to 5 seconds.
+            interval: Delay between passes. Defaults to 1 second. The first pass
+                runs at once when more than one endpoint is known.
+            reestablish_after: Cooldown before redialing the endpoint of the last
+                successful connection, measured from when it was established, so
+                a session that outlived the interval is redialed at once. Owed to
+                that endpoint alone. Defaults to 5 seconds.
 
         Raises:
             ValueError: If a duration is negative, if `max_retries` is outside the
-                range of an unsigned 32-bit integer, or if `interval` is zero while
-                reconnection is enabled and `max_retries` is unlimited.
+                range of an unsigned 32-bit integer, or if `interval` is zero.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -2093,8 +2105,8 @@ class Topic:
         r"""
         Options admission resolved for the keys the client did not send.
 
-        Same shape as `options`. These would have resolved differently under
-        another server configuration.
+        Same shape as `options`. These would have resolved differently
+        under another server configuration.
         """
 
 @typing.final
@@ -2158,8 +2170,8 @@ class TopicDetails:
         r"""
         Options admission resolved for the keys the client did not send.
 
-        Same shape as `options`. These would have resolved differently under
-        another server configuration.
+        Same shape as `options`. These would have resolved differently
+        under another server configuration.
         """
     @property
     def partitions(self) -> builtins.list[Partition]:

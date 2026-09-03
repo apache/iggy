@@ -60,7 +60,6 @@ use std::time::{Duration, Instant};
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
-use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -69,7 +68,7 @@ use configs::http::HttpTlsConfig;
 use consensus::MetadataHandle;
 use futures::StreamExt;
 use iggy_common::IggyError;
-use message_bus::transports::tls::{install_default_crypto_provider, load_pem};
+use message_bus::transports::tls::load_pem;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -83,7 +82,7 @@ use crate::http::error::{
     CustomError, error_response, gateway_timeout_response, primary_http_socket, with_retry_after,
 };
 use crate::http::extractor::{bearer_token, resolve_credential};
-use crate::http::state::{HttpInner, VIEW_HEADER};
+use crate::http::state::{ForwardState, HttpInner, VIEW_HEADER};
 use crate::server_error::ServerError;
 
 /// Marker stamped on every forwarded request. Loop guard only: a node that is
@@ -136,23 +135,6 @@ const RESPONSE_CAPACITY_HINT: usize = 64 * 1024;
 /// (the view layer only fills the header when absent).
 const RELAYED_RESPONSE_HEADERS: [HeaderName; 3] = [CONTENT_TYPE, RETRY_AFTER, VIEW_HEADER];
 
-/// Per-node forwarding context hung off `HttpInner`: the outbound client
-/// (pinned-cert TLS when the listener serves HTTPS), the scheme it dials, the
-/// request-body buffer bound, and the in-flight budget.
-pub(in crate::http) struct ForwardState {
-    /// False when no cluster-wide bearer key material exists (no configured
-    /// JWT secret, no cluster PSK): a forwarded bearer would 401 on the
-    /// primary, so the middleware passes through and followers answer with
-    /// the transient 503 instead.
-    active: bool,
-    client: cyper::Client,
-    /// Also read by the 307 redirect builder: the primary is assumed to serve
-    /// the same scheme as this node (uniform cluster HTTP config).
-    pub(in crate::http) scheme: &'static str,
-    body_limit: usize,
-    in_flight: Cell<u32>,
-}
-
 /// Build the [`ForwardState`] at listener startup.
 ///
 /// With `http.tls.enabled` the forward hop dials `https` and verifies the peer
@@ -174,13 +156,17 @@ pub(in crate::http) fn build_forward_state(
     body_limit: usize,
     active: bool,
 ) -> Result<ForwardState, ServerError> {
-    // Unconditional: cyper's rustls connector resolves the process default
-    // provider even when the client only ever dials plain http.
-    install_default_crypto_provider();
     let builder = cyper::Client::builder()
         // The retry loop re-resolves the primary from the local roster; a
         // followed `Location` would let the peer steer the bearer anywhere.
         .redirect(cyper::redirect::Policy::none());
+    // `bootstrap()` installs the process-level provider before any shard
+    // thread exists; both `ClientConfig` builders below panic without one, so
+    // fail the boot instead. A unit test building this state installs it
+    // itself, as http/tls.rs does.
+    let provider = CryptoProvider::get_default().ok_or_else(|| ServerError::HttpForwardClient {
+        reason: "no process-level rustls CryptoProvider installed".to_string(),
+    })?;
     let (builder, scheme) = if tls.enabled {
         let credentials =
             load_pem(Path::new(&tls.cert_file), Path::new(&tls.key_file)).map_err(|source| {
@@ -196,10 +182,7 @@ pub(in crate::http) fn build_forward_state(
                 reason: "TLS certificate chain is empty".to_string(),
             }
         })?;
-        let algorithms = CryptoProvider::get_default()
-            // Installed above; absence is unreachable.
-            .expect("default crypto provider installed")
-            .signature_verification_algorithms;
+        let algorithms = provider.signature_verification_algorithms;
         let config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedCertVerifier { pinned, algorithms }))
@@ -245,6 +228,21 @@ pub(in crate::http) async fn forward_to_primary(
     SendWrapper::new(forward_or_pass(state, request, next)).await
 }
 
+/// Route-layer fallback for acknowledged partition writes over HTTP.
+///
+/// HTTP has no persistent leader-aware connection to retarget. Execute on the
+/// contacted node first, then walk every other configured HTTP node at most
+/// once when the response is the typed `TransientNotAccepted` denial. That
+/// denial proves the write never entered a partition pipeline. Every ambiguous
+/// outcome is returned without replay.
+pub(in crate::http) async fn forward_partition_write(
+    State(state): State<HttpState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    SendWrapper::new(forward_partition_or_pass(state, request, next)).await
+}
+
 async fn forward_or_pass(state: HttpState, request: Request, next: Next) -> Response {
     if !state.forward.active || state.is_metadata_primary() {
         return next.run(request).await;
@@ -283,6 +281,69 @@ async fn forward_or_pass(state: HttpState, request: Request, next: Next) -> Resp
     forward(&state, request).await
 }
 
+async fn forward_partition_or_pass(state: HttpState, request: Request, next: Next) -> Response {
+    if !state.forward.active || request.headers().contains_key(FORWARDED_HEADER) {
+        return next.run(request).await;
+    }
+    let bearer = match bearer_token(request.headers()) {
+        Ok(bearer) => bearer,
+        Err(error) => return CustomError::from(error).into_response(),
+    };
+    if let Err(rejection) = resolve_credential(&state, bearer).await {
+        return rejection.into_response();
+    }
+
+    let (parts, request_body) = request.into_parts();
+    let Ok(body) = to_bytes(request_body, state.forward.body_limit).await else {
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "request body exceeds http.max_request_size",
+        );
+    };
+    let method = parts.method.clone();
+    let request_headers = parts.headers.clone();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or("/", |path_and_query| path_and_query.as_str())
+        .to_owned();
+    let local = next
+        .run(Request::from_parts(parts, Body::from(body.clone())))
+        .await;
+    if let AttemptOutcome::Relay(response) = classify_local_partition_reply(local).await {
+        return response;
+    }
+
+    let Some(_guard) = ForwardGuard::admit(&state.forward.in_flight) else {
+        return with_retry_after(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "forward_busy",
+            "node is at its forward budget; retry with backoff",
+        ));
+    };
+    let self_id = state
+        .shard
+        .plane
+        .metadata()
+        .consensus
+        .as_ref()
+        .map(consensus::VsrConsensus::replica);
+    let deadline = Instant::now() + FORWARD_RETRY_DEADLINE;
+    for socket in partition_http_sockets(&state.roster, self_id) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
+        match attempt(&state, &method, &request_headers, &body, &url, false).await {
+            AttemptOutcome::Relay(response) => return response,
+            AttemptOutcome::Retry => {}
+        }
+    }
+
+    with_retry_after(CustomError::from(IggyError::TransientNotAccepted).into_response())
+}
+
 /// Buffer the request and drive forward attempts until one yields a relayable
 /// outcome or the retry budget runs out.
 async fn forward(state: &HttpInner, request: Request) -> Response {
@@ -309,7 +370,7 @@ async fn forward(state: &HttpInner, request: Request) -> Response {
             None => AttemptOutcome::Retry,
             Some(socket) => {
                 let url = format!("{}://{socket}{path_and_query}", state.forward.scheme);
-                attempt(state, &parts, &body, &url).await
+                attempt(state, &parts.method, &parts.headers, &body, &url, true).await
             }
         };
         match outcome {
@@ -342,8 +403,15 @@ enum AttemptOutcome {
 
 /// Run one forward attempt end to end (connect, send, read the full reply)
 /// under [`FORWARD_ATTEMPT_TIMEOUT`].
-async fn attempt(state: &HttpInner, parts: &Parts, body: &Bytes, url: &str) -> AttemptOutcome {
-    let builder = match state.forward.client.request(parts.method.clone(), url) {
+async fn attempt(
+    state: &HttpInner,
+    method: &Method,
+    request_headers: &HeaderMap,
+    body: &Bytes,
+    url: &str,
+    retry_redirect: bool,
+) -> AttemptOutcome {
+    let builder = match state.forward.client.request(method.clone(), url) {
         Ok(builder) => builder,
         Err(error) => {
             warn!(%error, "forward request build failed");
@@ -351,7 +419,7 @@ async fn attempt(state: &HttpInner, parts: &Parts, body: &Bytes, url: &str) -> A
         }
     };
     let request = builder
-        .headers(forwarded_headers(&parts.headers))
+        .headers(forwarded_headers(request_headers))
         .body(body.clone())
         .build();
     let attempt = async {
@@ -403,7 +471,7 @@ async fn attempt(state: &HttpInner, parts: &Parts, body: &Bytes, url: &str) -> A
             }
             body.extend_from_slice(&chunk);
         }
-        classify_reply(status, relayed_headers, Bytes::from(body))
+        classify_reply(status, relayed_headers, Bytes::from(body), retry_redirect)
     };
     match compio::time::timeout(FORWARD_ATTEMPT_TIMEOUT, attempt).await {
         // Elapsed: the request may be mid-commit on the primary. Outcome
@@ -463,8 +531,9 @@ fn classify_reply(
     status: StatusCode,
     relayed_headers: Vec<(HeaderName, HeaderValue)>,
     body: Bytes,
+    retry_redirect: bool,
 ) -> AttemptOutcome {
-    if status == StatusCode::TEMPORARY_REDIRECT {
+    if retry_redirect && status == StatusCode::TEMPORARY_REDIRECT {
         return AttemptOutcome::Retry;
     }
     if status == StatusCode::SERVICE_UNAVAILABLE && is_transient_not_accepted_body(&body) {
@@ -476,6 +545,23 @@ fn classify_reply(
         response.headers_mut().insert(name, value);
     }
     AttemptOutcome::Relay(response)
+}
+
+/// Inspect a response produced on this node without changing any terminal
+/// response. Only the typed never-admitted denial opens the roster fallback.
+async fn classify_local_partition_reply(response: Response) -> AttemptOutcome {
+    let (parts, body) = response.into_parts();
+    let body = match to_bytes(body, RESPONSE_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(error) => {
+            warn!(%error, "local partition response body read failed; outcome unknown");
+            return AttemptOutcome::Relay(bad_gateway());
+        }
+    };
+    if parts.status == StatusCode::SERVICE_UNAVAILABLE && is_transient_not_accepted_body(&body) {
+        return AttemptOutcome::Retry;
+    }
+    AttemptOutcome::Relay(Response::from_parts(parts, Body::from(body)))
 }
 
 /// True when a 503 body is the JSON `ErrorResponse` whose `id` is the
@@ -497,6 +583,26 @@ fn primary_socket(state: &HttpInner) -> Option<SocketAddr> {
     let consensus = state.shard.plane.metadata().consensus.as_ref()?;
     let primary_index = consensus.primary_index(consensus.view());
     primary_http_socket(&state.roster, primary_index)
+}
+
+/// Private HTTP sockets for every other configured replica, in stable roster
+/// order. The caller tries each once. HTTP-disabled entries are skipped
+/// because they cannot accept the forwarded request.
+fn partition_http_sockets(
+    roster: &crate::cluster_meta::ClusterRoster,
+    self_id: Option<u8>,
+) -> Vec<SocketAddr> {
+    roster
+        .nodes
+        .iter()
+        .filter(|node| Some(node.config().replica_id) != self_id)
+        .filter_map(|node| {
+            Some(SocketAddr::new(
+                node.replica_ip(),
+                node.config().ports.http?,
+            ))
+        })
+        .collect()
 }
 
 fn wants_linearizable(query: Option<&str>) -> bool {
@@ -593,6 +699,42 @@ impl ServerCertVerifier for PinnedCertVerifier {
 mod tests {
     use super::*;
 
+    use configs::cluster::{ClusterNodeConfig, ResolvedClusterNode, TransportPorts};
+
+    fn node(replica_id: u8, ip: &str, http: Option<u16>) -> ClusterNodeConfig {
+        ClusterNodeConfig {
+            name: format!("node-{replica_id}"),
+            ip: ip.to_owned(),
+            advertised_address: None,
+            advertised_addresses: Vec::new(),
+            replica_id,
+            ports: TransportPorts {
+                tcp: None,
+                quic: None,
+                http,
+                websocket: None,
+                tcp_replica: None,
+            },
+        }
+    }
+
+    fn roster(nodes: Vec<ClusterNodeConfig>) -> crate::cluster_meta::ClusterRoster {
+        crate::cluster_meta::ClusterRoster {
+            enabled: true,
+            name: "test-cluster".to_owned(),
+            nodes: nodes
+                .into_iter()
+                .map(|node| ResolvedClusterNode::try_from(node).expect("valid roster node"))
+                .collect(),
+            self_advertised: "127.0.0.1".to_owned(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: Arc::default(),
+            metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::cluster_meta::METADATA_VIEW_UNKNOWN,
+            )),
+        }
+    }
+
     #[test]
     fn linearizable_query_detected_only_on_exact_pair() {
         assert!(wants_linearizable(Some("consistency=linearizable")));
@@ -628,5 +770,37 @@ mod tests {
         drop(guards);
         assert_eq!(in_flight.get(), 0);
         assert!(ForwardGuard::admit(&in_flight).is_some());
+    }
+
+    #[test]
+    fn partition_roster_walk_skips_self_and_undialable_nodes_once() {
+        let roster = roster(vec![
+            node(0, "10.0.0.1", Some(8080)),
+            node(1, "10.0.0.2", Some(8081)),
+            node(2, "10.0.0.3", None),
+        ]);
+
+        assert_eq!(
+            partition_http_sockets(&roster, Some(0)),
+            vec!["10.0.0.2:8081".parse().expect("valid socket")]
+        );
+    }
+
+    #[compio::test]
+    async fn partition_fallback_opens_only_for_typed_never_admitted_reply() {
+        let retry = classify_local_partition_reply(
+            CustomError::from(IggyError::TransientNotAccepted).into_response(),
+        )
+        .await;
+        assert!(matches!(retry, AttemptOutcome::Retry));
+
+        let terminal = classify_local_partition_reply(
+            CustomError::from(IggyError::TransientNotCommitted).into_response(),
+        )
+        .await;
+        let AttemptOutcome::Relay(terminal) = terminal else {
+            panic!("an ambiguous commit outcome must never be retried")
+        };
+        assert_eq!(terminal.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
