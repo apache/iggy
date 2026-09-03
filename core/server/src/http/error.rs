@@ -555,7 +555,7 @@ pub(in crate::http) fn primary_http_socket(
     primary_index: u8,
 ) -> Option<SocketAddr> {
     let (node, http_port) = primary_node(roster, primary_index)?;
-    Some(SocketAddr::new(node.replica_ip()?, http_port))
+    Some(SocketAddr::new(node.replica_ip(), http_port))
 }
 
 /// Resolve the client-facing HTTP authority (`host:port`) for a redirect
@@ -563,18 +563,16 @@ pub(in crate::http) fn primary_http_socket(
 /// match first, then the catch-all advertised address, then the private
 /// roster IP as the compatibility fallback. `AdvertisedAddress::authority`
 /// brackets IPv6 hosts and passes hostnames through, so the redirect URL
-/// stays valid. This is the fail-closed caller: a host that is neither a
-/// valid IP nor a valid hostname yields `None` and the redirect becomes a
-/// 503 rather than a `Location` pointing at an unparsable target (cluster
-/// metadata makes the opposite choice and publishes such a host verbatim).
+/// stays valid. `None` here means the roster has no node at `primary_index`
+/// or that node declares no HTTP port, never that its address failed to
+/// parse: such a node never becomes a [`ResolvedClusterNode`].
 fn primary_advertised_http_authority(
     roster: &ClusterRoster,
     primary_index: u8,
     client_ip: Option<IpAddr>,
 ) -> Option<String> {
     let (node, http_port) = primary_node(roster, primary_index)?;
-    let address = node.advertised_for(client_ip)?;
-    Some(address.authority(http_port))
+    Some(node.advertised_for(client_ip).authority(http_port))
 }
 
 fn primary_node(roster: &ClusterRoster, primary_index: u8) -> Option<(&ResolvedClusterNode, u16)> {
@@ -614,9 +612,13 @@ mod tests {
         ClusterRoster {
             enabled: true,
             name: "test-cluster".to_owned(),
-            nodes: nodes.into_iter().map(Into::into).collect(),
-            self_ip: "127.0.0.1".to_owned(),
-            self_ports: TransportPorts::default(),
+            nodes: nodes
+                .into_iter()
+                .map(|node| ResolvedClusterNode::try_from(node).expect("valid roster node"))
+                .collect(),
+            self_advertised: "127.0.0.1".to_owned(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: std::sync::Arc::default(),
             metadata_view: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::cluster_meta::METADATA_VIEW_UNKNOWN,
             )),

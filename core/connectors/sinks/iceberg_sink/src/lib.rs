@@ -63,6 +63,14 @@ pub struct IcebergSinkConfig {
     pub store_secret_access_key: Option<String>,
     pub store_region: String,
     pub store_class: IcebergSinkStoreClass,
+    /// Path-style S3 addressing (`http://host/bucket/key`). MinIO-style endpoints
+    /// need it; iceberg 0.10 defaults to the virtual-host style otherwise.
+    #[serde(default = "default_true")]
+    pub store_path_style_access: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn slice_user_table(table: &str) -> Vec<String> {

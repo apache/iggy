@@ -65,7 +65,6 @@ members = [
     "core/server",
     "core/server_common",
     "core/shard",
-    "core/shard_allocator",
     "core/simulator",
     "core/system_stats",
     "core/tools",
@@ -83,52 +82,49 @@ rust-version = "1.95"
 warnings = "deny"
 
 [workspace.dependencies]
-actix-cors = "0.7.1"
-actix-files = "0.6.10"
-actix-web = "4.14.0"
-aes-gcm = "0.11.0"
+actix-cors = "0.7.2"
+actix-files = "0.7.0"
+actix-web = "4.15.0"
+aes-gcm = "0.11.1"
 ahash = { version = "0.8.12", features = ["serde"] }
 aligned-vec = "0.6.4"
 anyhow = "1.0.104"
-apache-avro = "0.21.0"
-apple-native-keyring-store = { version = "1.0.1", features = ["keychain"] }
-# "std" is load-bearing: it cascades to rand_core/getrandom, which the
-# crypto module's `OsRng` import needs even when no sibling crate in the
-# build graph happens to enable it via feature unification.
-argon2 = { version = "0.5.3", features = ["std"] }
-# Pinned to 57 because iceberg 0.9.1 still requires arrow/parquet 57.
-arrow = "57.3.1"
-arrow-array = "57.3.1"
-arrow-json = "57.3.1"
+apache-avro = "0.22.0"
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+argon2 = "0.6.0"
+# arrow 58: iceberg 0.10.1 and deltalake 0.32.4 still require it.
+arrow = "58.4.0"
+arrow-array = "58.4.0"
+arrow-json = "58.4.0"
 assert_cmd = "2.2.2"
 async-broadcast = "0.7.2"
 async-channel = "2.5.0"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
-async-trait = "0.1.91"
-async_zip = { version = "0.0.18", features = ["tokio", "lzma", "bzip2", "xz", "deflate", "zstd"] }
+async-trait = "0.1.92"
+async_zip = { version = "0.0.19", features = ["tokio", "lzma", "bzip2", "xz", "deflate", "zstd"] }
 axum = { version = "0.8.9", features = ["macros"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
 bench-dashboard-server = { path = "core/bench/dashboard/server" }
 bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
 bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
 bit-set = "0.11.1"
-blake3 = "1.8.5"
-bon = "3.9.3"
+blake3 = "1.8.7"
+bon = "3.10.0"
 byte-unit = { version = "5.2.5", default-features = false, features = ["serde", "byte", "std"] }
 bytemuck = { version = "1.25", features = ["derive", "min_const_generics"] }
 bytes = "1.12.1"
 cfg_aliases = "0.2.2"
 charming = "0.6.0"
 chrono = { version = "0.4.45", features = ["serde"] }
-clap = { version = "4.6.3", features = ["derive", "wrap_help"] }
-clap_complete = "4.6.7"
+clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
+clap_complete = "4.6.9"
 clock = { path = "core/clock" }
 colored = "3.1.1"
-comfy-table = { version = "7.2.2", default-features = false }
-compio = { version = "=0.19.1", features = [
+comfy-table = { version = "8.0.0", default-features = false }
+compio = { version = "0.19.2", features = [
     "runtime",
     "macros",
     "io-uring",
@@ -142,9 +138,9 @@ compio = { version = "=0.19.1", features = [
     "fs",
 ] }
 compio-buf = "0.8.3"
-compio-driver = "0.12.4"
-compio-quic = "=0.8.0"
-compio-ws = "=0.4.0"
+compio-driver = "0.12.5"
+compio-quic = "0.8.2"
+compio-ws = "0.4.0"
 configs = { path = "core/configs", version = "0.1.0" }
 configs_derive = { path = "core/configs_derive", version = "0.1.0" }
 consensus = { path = "core/consensus" }
@@ -153,13 +149,13 @@ cpu_allocation = { path = "core/cpu_allocation" }
 crossbeam = "0.8.4"
 crossfire = "3.1.19"
 csv = "1.4.0"
-ctor = "1.0.9"
+ctor = "1.0.13"
 ctrlc = { version = "3.5", features = ["termination"] }
 cucumber = "0.23"
 cyper = { version = "0.9.0", features = ["rustls", "stream"], default-features = false }
 cyper-axum = { version = "0.9.0" }
 cyper-core = { version = "0.9.0", default-features = false }
-darling = "0.23"
+darling = "0.24"
 dashmap = "6.2.1"
 deltalake = { version = "0.32.4", features = ["azure", "gcs", "s3"] }
 derive-new = "0.7.0"
@@ -167,9 +163,9 @@ derive_builder = "0.20.2"
 derive_more = { version = "2.1.1", features = ["full"] }
 dircpy = "0.3.20"
 dirs = "6.0.0"
-dlopen2 = "0.8.2"
+dlopen2 = "0.9.0"
 dotenvy = "0.15.7"
-dtor = "1.0.5"
+dtor = "1.0.6"
 elasticsearch = { version = "9.1.0-alpha.1", features = ["rustls-tls"], default-features = false }
 enumset = "1.1"
 env_logger = "0.11.11"
@@ -177,19 +173,15 @@ err_trail = { version = "0.11.1", features = ["tracing"] }
 error_set = "0.9.2"
 figlet-rs = "1.0.0"
 figment = { version = "0.10.19", features = ["toml", "env"] }
-file-operation = "0.8.28"
+file-operation = "0.8.32"
 flatbuffers = "25.12.19"
 flume = "0.12.0"
 fs2 = "0.4.3"
-futures = "0.3.33"
-futures-core = { version = "0.3.33", default-features = false }
-# Pinned to the minor compio-tls 0.10.0 resolves to: the replica plane
-# handshakes with futures-rustls directly (TLS exporter access) and hands
-# the stream to compio-tls via its From impls, so both crates must agree
-# on the futures-rustls types. Cargo unifies within 0.26.x; drift to 0.27
-# fails compilation loudly (see the tripwire test in message_bus).
+futures = "0.3.34"
+futures-core = { version = "0.3.34", default-features = false }
+# Keep on the minor compio-tls 0.10 uses; the message_bus tripwire test catches drift.
 futures-rustls = "0.26.0"
-futures-util = "0.3.33"
+futures-util = "0.3.34"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 gloo = "0.12"
@@ -198,31 +190,34 @@ harness_derive = { path = "core/harness_derive" }
 hash32 = "1.0.0"
 hex = "0.4.3"
 hostname = "0.4.2"
-http = "1.4.2"
+http = "1.5.0"
 human-repr = "1.1.0"
 humantime = "2.4.0"
 hwlocality = "1.0.0-alpha.12"
-hyper = "1.11.0"
+hyper = "1.11.1"
 hyper-util = { version = "0.1.20", features = ["server-auto", "service"] }
-iceberg = "0.9.1"
-iceberg-catalog-rest = "0.9.1"
-iceberg-storage-opendal = "0.9.1"
-iggy = { path = "core/sdk", version = "0.11.0-edge.4" }
-iggy-cli = { path = "core/cli", version = "0.14.0-edge.4" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.4" }
-iggy_common = { path = "core/common", version = "0.11.0-edge.4" }
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+iceberg-storage-opendal = "0.10.1"
+iggy = { path = "core/sdk", version = "0.11.0-edge.6" }
+iggy-cli = { path = "core/cli", version = "0.14.0-edge.6" }
+iggy-gateway-kafka = { path = "gateways/kafka" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.11.0-edge.6" }
+iggy_common = { path = "core/common", version = "0.11.0-edge.6" }
+iggy_connector_doris_sink = { path = "core/connectors/sinks/doris_sink" }
 iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.4.0-edge.3" }
-indexmap = "2.14.0"
+indexmap = "2.14.1"
 integration = { path = "core/integration" }
-ipnet = "2.12.0"
+ipnet = "2.12.1"
 journal = { path = "core/journal" }
 js-sys = "0.3"
-jsonwebtoken = { version = "10.4.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+kafka-protocol = { version = "0.18.0", default-features = false, features = ["broker"] }
 keyring-core = "1.0.0"
 lazy_static = "1.5.0"
 left-right = "0.11"
-libc = "0.2.188"
-log = "0.4.33"
+libc = "0.2.189"
+log = "0.4.34"
 lz4_flex = "0.14.0"
 meilisearch-sdk = { version = "0.33.0", default-features = false, features = [
     "reqwest",
@@ -234,11 +229,11 @@ metadata = { path = "core/metadata" }
 mimalloc = "0.1"
 mime_guess = "2.0"
 mockall = "0.15.0"
-mongodb = { version = "3.8.0", features = ["rustls-tls"] }
+mongodb = { version = "3.8.2", features = ["rustls-tls"] }
 nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
-octocrab = "0.54.0"
+octocrab = "0.54.1"
 opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
 opentelemetry-otlp = { version = "0.32.0", features = [
@@ -257,16 +252,16 @@ opentelemetry_sdk = { version = "0.32.1", features = [
     "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
-papaya = "0.2.4"
-parquet = "57.3.1"
+papaya = "0.2.5"
+parquet = "58.4.0"
 partitions = { path = "core/partitions" }
 passterm = "2.0.6"
 paste = "1.0"
-pgwire = "0.40.4"
+pgwire = "0.40.7"
 postcard = { version = "1.1.3", features = ["alloc"] }
 predicates = "3.1.4"
 proc-macro2 = "1"
-prometheus-client = "0.25.0"
+prometheus-client = "0.25.1"
 prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.9.1"
@@ -276,7 +271,7 @@ quote = "1"
 rand = "0.10.2"
 rand_xoshiro = "0.8.1"
 rayon = "1.12.0"
-rcgen = "0.14.8"
+rcgen = "0.14.10"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 reqwest-middleware = { version = "0.5.2", features = ["json", "query"] }
@@ -284,13 +279,13 @@ reqwest-retry = "0.9.1"
 reqwest-tracing = "0.7.1"
 ring = "0.17.14"
 ringbuffer = "0.16.0"
-rmcp = "2.2.0"
+rmcp = "3.2.0"
 rmp = "0.8.15"
 rmp-serde = "1.3.1"
 rolling-file = "0.2.0"
 rust-embed = "8.12.0"
 rust-s3 = { version = "0.37.2", default-features = false, features = ["tokio-rustls-tls", "tags"] }
-rustls = { version = "0.23.42", features = ["ring"] }
+rustls = { version = "0.23.43", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 scopeguard = "1.2.0"
 sd-notify = "0.5"
@@ -298,24 +293,21 @@ secrecy = { version = "0.10", features = ["serde"] }
 send_wrapper = "0.6.0"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.151"
-serde_with = { version = "3.21.0", features = ["base64", "macros"] }
+serde_with = { version = "3.22.0", features = ["base64", "macros"] }
 serde_yaml_ng = "0.10.0"
-serial_test = "3.5.0"
-server = { path = "core/server" }
+serial_test = "4.0.1"
+server = { path = "core/server", default-features = false }
 server_common = { path = "core/server_common" }
 shard = { path = "core/shard" }
-shard_allocator = { path = "core/shard_allocator" }
-simd-json = { version = "0.17.3", features = ["serde_impl"] }
-smallvec = "1.15"
+simd-json = { version = "0.18.1", features = ["serde_impl"] }
+smallvec = "1.16"
 socket2 = "0.6.5"
 sqlparser = { version = "0.62.0", features = ["visitor"] }
 sqlx = { version = "0.9.0", features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
-    # "mysql": Doris exposes a MySQL-wire frontend; the Doris sink's
-    # integration-test fixture talks to it over this driver. Cargo unifies
-    # features across the workspace, so it is declared once here.
+    # "mysql": the Doris integration fixture talks to Doris over its MySQL frontend.
     "mysql",
     "chrono",
     "uuid",
@@ -325,23 +317,23 @@ static-toml = "1.3.0"
 strum = { version = "0.28.0", features = ["derive"] }
 strum_macros = "0.28.0"
 subtle = "2.6.1"
-# Pinned to 2 because darling 0.23 still emits syn 2 types.
-syn = { version = "2", features = ["full", "extra-traits"] }
+syn = { version = "3", features = ["full", "extra-traits"] }
 sysinfo = "0.39.6"
 system_stats = { path = "core/system_stats" }
 tempfile = "3.27.0"
 terminal_size = { version = "0.4.4" }
 test-case = "3.3.1"
+# Pinned to 0.27 because testcontainers-modules 0.15.0 still requires it.
 testcontainers = { version = "0.27.3", features = ["reusable-containers"] }
 testcontainers-modules = { version = "0.15.0", features = ["postgres", "http_wait"] }
-thiserror = "2.0.19"
+thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-postgres = "0.7.18"
 tokio-rustls = "0.26.4"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-tokio-util = { version = "0.7.18", features = ["compat"] }
-toml = "1.1.3"
-tower-http = { version = "0.7.0", features = ["add-extension", "cors", "trace"] }
+tokio-util = { version = "0.7.19", features = ["compat"] }
+toml = "1.1.4"
+tower-http = { version = "0.7.1", features = ["add-extension", "cors", "trace"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-opentelemetry = "0.33.0"
@@ -350,13 +342,13 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "env-filter",
     "ansi",
 ] }
-trait-variant = "0.1.2"
+trait-variant = "0.1.3"
 tungstenite = "0.30.0"
-twox-hash = { version = "2.1.3", features = ["xxhash32"] }
+twox-hash = { version = "2.1.4", features = ["xxhash32"] }
 ulid = "3.0.0"
-ureq = "3.3"
+ureq = "3.4"
 url = "2.5.8"
-uuid = { version = "1.24.0", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
+uuid = { version = "1.26.0", features = ["v4", "v7", "fast-rng", "serde", "zerocopy"] }
 vergen-git2 = { version = "10.0.1", features = ["build", "cargo", "rustc", "si"] }
 walkdir = "2.5.0"
 wasm-bindgen = "0.2"
@@ -374,7 +366,7 @@ windows-native-keyring-store = "1.1.0"
 wiremock = "0.6"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
-zbus-secret-service-keyring-store = { version = "1.0.0", features = ["rt-async-io-crypto-rust"] }
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["rt-async-io-crypto-rust"] }
 zeroize = "1.9.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
@@ -382,19 +374,15 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 lto = true
 codegen-units = 1
 
-# Selectively optimize CPU-intensive dependencies in dev profile:
-# - argon2: password hashing
-# - twox-hash: checksum calculation
-# - rand_chacha: random number generation
-# - iggy_common: wrapper functions for above
-# This is faster than global opt-level=1 which adds significant compile time.
+# CPU-heavy crates that dominate dev-profile test time: password hashing,
+# checksums, RNG. Cheaper than raising opt-level for the whole graph.
 [profile.dev.package.argon2]
 opt-level = 3
 
 [profile.dev.package.twox-hash]
 opt-level = 3
 
-[profile.dev.package.rand_chacha]
+[profile.dev.package.chacha20]
 opt-level = 3
 
 [profile.dev.package.iggy_common]

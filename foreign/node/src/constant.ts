@@ -15,3 +15,5 @@
 // specific language governing permissions and limitations
 // under the License.
 
+/** Largest value representable by the Rust u32 type. */
+export const MAX_U32 = 4294967295;

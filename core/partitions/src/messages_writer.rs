@@ -20,7 +20,7 @@ use compio::{
     io::AsyncWriteAtExt,
 };
 use iggy_common::{IggyByteSize, IggyError};
-use server_common::iobuf::Frozen;
+use server_common::iobuf::{Frozen, IOV_MAX};
 use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
@@ -29,8 +29,6 @@ use tracing::{error, warn};
 
 #[cfg(target_os = "linux")]
 use nix::fcntl::{FallocateFlags, fallocate};
-
-const MAX_IOV_COUNT: usize = 1024;
 
 #[derive(Debug)]
 pub struct MessagesWriter {
@@ -104,12 +102,15 @@ impl MessagesWriter {
         })
     }
 
-    /// Appends a batch of frozen message buffers to the segment file.
+    /// Appends a batch of frozen message buffers at the current write cursor
+    /// and returns how many bytes landed. The cursor is left where it was: the
+    /// caller advances it with `advance` once the companion index save has
+    /// also succeeded.
     ///
     /// # Errors
     ///
     /// Returns an error if any chunk cannot be written or synced to disk.
-    pub async fn save_frozen_batches<const ALIGN: usize>(
+    pub(crate) async fn save_frozen_batches<const ALIGN: usize>(
         &self,
         buffers: &[Frozen<ALIGN>],
     ) -> Result<IggyByteSize, IggyError> {
@@ -126,26 +127,14 @@ impl MessagesWriter {
             self.fsync().await?;
         }
 
-        self.messages_size_bytes
-            .fetch_add(messages_size, Ordering::Release);
-
         Ok(IggyByteSize::from(messages_size))
     }
 
-    /// Roll the in-memory write cursor back by `bytes`, undoing the advance of a
-    /// `save_frozen_batches` whose batch was written but whose companion index
-    /// save then failed. The committed prefix stays resident and is
-    /// re-persisted on the next `commit_messages`; rewinding the cursor makes
-    /// that retry overwrite the same region instead of appending a second copy
-    /// of the committed batch. Crash-safe without truncating: the rewound
-    /// bytes are whole batch records past the last index entry, so boot
-    /// recovery's indexed walk absorbs them and its truncate is a no-op.
-    pub(crate) fn rewind(&self, bytes: u64) {
-        debug_assert!(
-            bytes <= self.messages_size_bytes.load(Ordering::Relaxed),
-            "rewind underflow: bytes ({bytes}) exceeds the write cursor"
-        );
-        self.messages_size_bytes.fetch_sub(bytes, Ordering::Release);
+    /// Move the write cursor forward over `bytes` that are now durable. Split
+    /// out of the save so the segment and index cursors advance together, only
+    /// once both halves have succeeded.
+    pub(crate) fn advance(&self, bytes: u64) {
+        self.messages_size_bytes.fetch_add(bytes, Ordering::Release);
     }
 
     #[must_use]
@@ -187,9 +176,9 @@ fn preallocate_file(file: &File, file_path: &str, len: u64) {
     // sets `thread_pool_limit(0)` on the shard proactor, so `spawn_blocking`
     // has no worker to park a task on and compio panics the shard outright with
     // "the thread pool is needed but no worker thread is running". (That limit
-    // is skipped on macOS/aarch64, where the pool does exist -- see the FIXME
-    // there -- so the panic is Linux-and-most-targets, not universal. This arm
-    // is Linux-only regardless.)
+    // is skipped on macOS, whose polling driver routes fs through the pool, so
+    // the panic is Linux-and-most-targets, not universal. This arm is
+    // Linux-only regardless.)
     //
     // The cost is acceptable only because of what this call is: a metadata-only
     // extent reservation, microseconds on the local filesystems this option
@@ -226,7 +215,7 @@ async fn write_frozen_chunked<const ALIGN: usize>(
     mut position: u64,
     buffers: &[Frozen<ALIGN>],
 ) -> Result<(), IggyError> {
-    for chunk in buffers.chunks(MAX_IOV_COUNT) {
+    for chunk in buffers.chunks(IOV_MAX) {
         let chunk_size: usize = chunk.iter().map(Frozen::len).sum();
         let chunk_vec: Vec<_> = chunk.to_vec();
 

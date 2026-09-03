@@ -43,3 +43,4 @@ store_access_key_id = "admin"
 store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
+store_path_style_access = true

@@ -267,6 +267,7 @@ fn build_payload(api_key: i16, version: i16) -> Result<Bytes> {
             let rec = Record {
                 transactional: false,
                 control: false,
+                delete_horizon: false,
                 partition_leader_epoch: 0,
                 producer_id: -1,
                 producer_epoch: -1,

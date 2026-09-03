@@ -25,18 +25,18 @@ pub mod shards_table;
 pub use config::CoordinatorConfig;
 pub use router::CONSENSUS_TICK_INTERVAL;
 
-#[cfg(any(test, feature = "simulator"))]
+#[cfg(feature = "simulator")]
 use consensus::LocalPipeline;
 use consensus::{
     ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX, DvcHeaderKind,
     DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle, Pipeline, Plane,
     PlaneKind, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer,
     Status, VsrAction, VsrConsensus, build_deny_reply_from_request_header, dvc_blank,
-    dvc_header_kind, encode_prepare_headers, fatal, restamp_prepare_view, verify_prepare_integrity,
+    dvc_header_kind, encode_prepare_headers, fatal, repaired_frontier_update, restamp_prepare_view,
+    verify_prepare_integrity,
 };
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
-use crossfire::TrySendError;
 use futures::FutureExt;
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, DoViewChangeHeader,
@@ -46,31 +46,33 @@ use iggy_binary_protocol::{
     RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
     StartViewChangeHeader, StartViewHeader, StateChunkHeader, StateTransferTargetHeader,
 };
-#[cfg(any(test, feature = "simulator"))]
+#[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
 use iggy_common::variadic;
 use iggy_common::{IggyError, IggyExpiry, IggyTimestamp};
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use journal::{Journal, JournalHandle};
-use message_bus::MessageBus;
 use message_bus::client_listener::RequestHandler;
 use message_bus::fd_transfer::DupedFd;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
+use message_bus::{BusMessage, MessageBus};
 use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::StateMachine;
 use metadata::{BoundSession, MetadataSubmitError};
 use partitions::state_transfer::TransferArtifact;
-use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
+use partitions::{
+    FatalCommit, IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer,
+};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
 use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
-#[cfg(any(test, feature = "simulator"))]
+#[cfg(feature = "simulator")]
 use std::sync::Arc;
 
 pub type ShardPlane<B, J, S, M, SB = PingPongSuperblock> =
@@ -102,6 +104,27 @@ where
     /// are built by `partition_helpers::build_partition_fresh` on the
     /// system-clock default instead.
     pub clock: ConsensusClock,
+}
+
+/// Committed metadata the simulator carries into one partition
+/// materialisation. Named because both values are `u64`-compatible revision or
+/// view stamps and swapping positional arguments would compile.
+#[cfg(feature = "simulator")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionMaterialisation {
+    epoch: u64,
+    created_view: u32,
+}
+
+#[cfg(feature = "simulator")]
+impl PartitionMaterialisation {
+    #[must_use]
+    pub const fn new(epoch: u64, created_view: u32) -> Self {
+        Self {
+            epoch,
+            created_view,
+        }
+    }
 }
 
 /// Replica id + count bundle.
@@ -658,10 +681,7 @@ pub enum LifecycleFrame {
     },
     /// A shard that doesn't hold the client's TCP connection forwards a
     /// client send to the owning shard (top 16 bits of `client_id`).
-    ForwardClientSend {
-        client_id: u128,
-        msg: Frozen<MESSAGE_ALIGN>,
-    },
+    ForwardClientSend { client_id: u128, msg: BusMessage },
     /// A peer shard hands a metadata consensus submit (login/logout) to
     /// shard 0, the metadata consensus owner. The committed op returns over
     /// the `reply` sender carried in [`MetadataSubmit`]. Always addressed to
@@ -1392,18 +1412,17 @@ where
     /// admission, on the reactor thread inside the map's `borrow_mut`.
     parked_partition_bytes: Cell<usize>,
 
-    /// Namespaces holding frames [`Self::redispatch_parked_frames`] could not
-    /// re-queue, for the pump to retry.
+    /// Frames [`Self::redispatch_parked_frames`] handed back for the pump to
+    /// deliver, in park order.
     ///
-    /// Without it a re-parked frame has no exit: its namespace is materialised
-    /// by then, so the sweep skips it and `reconcile_additions` stages no second
-    /// `InsertOwned`. Only a topic delete would reach it. The pump drains the
-    /// inbox, so a refusal usually clears on its next iteration.
-    ///
-    /// [`BTreeSet`] for the reason [`Self::pending_partition_frames`] is a
-    /// [`BTreeMap`]: fixed-seed simulator replay needs iteration order to be a
-    /// function of the namespaces alone.
-    reparked_partition_namespaces: RefCell<BTreeSet<IggyNamespace>>,
+    /// Staging exists because re-dispatch runs inside the synchronous
+    /// [`Self::apply_reconcile_ops`] while the plane is reachable only through
+    /// an async path. A biased select arm takes one staged frame per pump
+    /// iteration and ranks above the inbox, so a parked op reaches the plane
+    /// ahead of a later op already sitting there. One-at-a-time delivery lets
+    /// consensus ticks and commit broadcasts run between frames instead of
+    /// stalling behind the whole bounded queue.
+    redispatch_queue: RefCell<VecDeque<ParkedFrame>>,
 
     /// Set while the shard-wide budget is shedding for namespaces holding no
     /// park entry of their own, which have no [`ParkEntry::shed`] to warn once
@@ -1494,6 +1513,21 @@ where
         self.reply_inbox.len()
     }
 
+    /// The armed metadata repair window as `(to_op, peer)`, `None` when no session
+    /// is running.
+    ///
+    /// Diagnostic accessor, like the two above. `maybe_request_metadata_repair`
+    /// refuses to arm while any session exists, so a stale one reads as repairing
+    /// forever and only this separates that from real progress.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn metadata_repair_window(&self) -> Option<(u64, u8)> {
+        self.metadata_repair
+            .borrow()
+            .as_ref()
+            .map(|session| (session.to_op, session.peer))
+    }
+
     /// Create a new shard with channel links and a shards table.
     ///
     /// * `bus` - shard-local bus handle (kept alongside the buses owned
@@ -1571,7 +1605,7 @@ where
             reconcile_queue: RefCell::new(VecDeque::new()),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
-            reparked_partition_namespaces: RefCell::new(BTreeSet::new()),
+            redispatch_queue: RefCell::new(VecDeque::new()),
             shard_park_shedding: Cell::new(false),
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
@@ -1901,7 +1935,7 @@ where
             reconcile_queue: RefCell::new(VecDeque::new()),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
-            reparked_partition_namespaces: RefCell::new(BTreeSet::new()),
+            redispatch_queue: RefCell::new(VecDeque::new()),
             shard_park_shedding: Cell::new(false),
             metadata_repair: RefCell::new(None),
             metadata_transfer: RefCell::new(None),
@@ -1992,6 +2026,13 @@ where
     /// queue never strands ops for longer than one tick.
     pub fn enqueue_reconcile_op(&self, op: ReconcileOp<B, SB>) {
         self.reconcile_queue.borrow_mut().push_back(op);
+        self.wake_reconcile_apply();
+    }
+
+    /// Wake the pump after off-pump work becomes visible. A refused marker is
+    /// safe because a full inbox has already woken the pump, whose frame and
+    /// tick arms both apply staged reconciliation work.
+    fn wake_reconcile_apply(&self) {
         let Some(sender) = self.senders.get(self.id as usize) else {
             return;
         };
@@ -2091,46 +2132,18 @@ where
         }));
     }
 
-    /// Re-drive the re-dispatch for namespaces whose frames the inbox refused.
-    ///
-    /// Runs on the pump, wherever [`Self::apply_reconcile_ops`] does, so it
-    /// fires right after a frame was consumed and a slot freed. Only another
-    /// refusal puts a namespace back, so the set empties itself.
-    ///
-    /// Epoch comes from the routing row, which `InsertOwned` writes alongside
-    /// the partition. Skipped when the row is gone or the namespace is fenced;
-    /// teardown does both, and the reconciler sweep retires the frames.
-    fn retry_reparked_frames(&self) {
-        let pending: Vec<IggyNamespace> = {
-            let mut reparked = self.reparked_partition_namespaces.borrow_mut();
-            if reparked.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *reparked).into_iter().collect()
-        };
-        let partitions = self.plane.partitions();
-        for namespace in pending {
-            if partitions.is_tombstoned(&namespace) {
-                continue;
-            }
-            let Some(epoch) = self.shards_table.epoch_for(namespace) else {
-                continue;
-            };
-            self.redispatch_parked_frames(namespace, epoch);
-        }
-    }
-
     /// Drain and apply staged [`ReconcileOp`]s on the pump task.
-    /// Synchronous: every arm is in-memory only. `ConfirmRemove`'s fsync +
-    /// blocking close is offloaded to a detached task so the pump doesn't
-    /// stall on bulk teardown.
+    ///
+    /// Synchronous: every arm is in-memory only. `ConfirmRemove`'s fsync and
+    /// blocking close are offloaded to a detached task so the pump does not
+    /// stall on bulk teardown. An `InsertOwned` can stage parked frames, so a
+    /// live-pump caller must return to the ranked redispatch select arm before
+    /// reading the inbox again. The graceful-shutdown caller drains the queue
+    /// explicitly because it has already left the select loop.
     pub fn apply_reconcile_ops(&self)
     where
         B: MessageBus + 'static,
     {
-        // Ahead of the staged ops and outside their empty-queue early return: a
-        // re-parked frame waits on inbox capacity, not on a reconcile op.
-        self.retry_reparked_frames();
         let staged: Vec<ReconcileOp<B, SB>> = {
             let mut q = self.reconcile_queue.borrow_mut();
             if q.is_empty() {
@@ -2368,7 +2381,8 @@ enum ParkOutcome<H> {
     /// Namespace is unmaterialised and its park buffer is at capacity. Client
     /// requests must be denied with a transient status: the frame is gone, and
     /// silence would leave a lockstep transport waiting out its response
-    /// read-timeout. Replicated traffic is dropped, recovered by retransmit.
+    /// read-timeout. Replicated traffic is dropped and recovers through either
+    /// retransmit or the same-view repair armed by a later commit heartbeat.
     Overflow(Message<H>),
 }
 
@@ -2388,9 +2402,9 @@ struct ParkedFrame {
     /// answers CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the
     /// simulator's virtual clock controls.
     ///
-    /// Never expires a replicated prepare: no client to answer, and
-    /// `consensus::retransmit_targets` skips an op that already reached quorum,
-    /// so expiry is silent permanent loss. Byte budgets bound those instead.
+    /// Never expires a replicated prepare: no client can retry it, and forcing
+    /// the same-view repair backstop to recover a gap is worse than retaining
+    /// the frame. Byte budgets bound those instead.
     ///
     /// Bounds RESIDENCY, not staleness. The SDK replays the identical request
     /// for the rest of its response timeout, so an absolute-offset
@@ -2410,6 +2424,20 @@ impl ParkedFrame {
     fn is_replicated(&self) -> bool {
         self.message.header().command != Command::Request
     }
+}
+
+/// What a frame keeps if it parks again after the pump re-delivers it.
+///
+/// Production prevents that race by ranking redispatch above inbox work and by
+/// applying reconcile operations only on the pump. Carrying the original stamp
+/// is defence in depth for off-pump staging such as simulator materialisation.
+/// There, re-deriving on a second park could stamp the frame with a replacement
+/// incarnation. `None` also stays `None`, since absence of a committed revision
+/// is not evidence that the frame belongs to a prior incarnation.
+#[derive(Clone, Copy)]
+struct ParkProvenance {
+    epoch: Option<u64>,
+    passes: u32,
 }
 
 /// One namespace's parked frames plus their running footprint.
@@ -2474,11 +2502,11 @@ const MAX_PARKED_BYTES: usize = 16 * 1024 * 1024;
 /// cannot spend the whole shard's budget and shed everyone else's frames.
 ///
 /// Applied only to an entry that already holds something. Sized against an
-/// empty entry a larger frame could never park at all, and for a prepare that is
-/// unrecoverable loss: `consensus::retransmit_targets` skips an op that already
-/// reached quorum. Shipped `message_bus.max_message_size` is 64 MiB, so an
-/// ordinary batched append exceeds this. Cost of the waiver is one convergence
-/// window of shard budget; cost of the loss is the replica.
+/// empty entry a larger frame could never park at all. For a prepare, shedding
+/// also forces a later commit heartbeat to discover the gap and run same-view
+/// repair. Shipped `message_bus.max_message_size` is 64 MiB, so an ordinary
+/// batched append exceeds this. The waiver costs one convergence window of
+/// shard budget and avoids unnecessary recovery work.
 const MAX_PARKED_BYTES_PER_NAMESPACE: usize = MAX_PARKED_BYTES / 4;
 
 /// Resident cost of parking a frame of `len` bytes.
@@ -2535,14 +2563,99 @@ where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-        M: StateMachine<
-                Input = Message<PrepareHeader>,
-                Output = metadata::stm::result::ApplyReply,
-                Error = iggy_common::IggyError,
-            > + StreamsFrontend
-            + metadata::stm::snapshot::RestoreSnapshotInPlace<
-                metadata::stm::snapshot::MetadataSnapshot,
-            >,
+        M: RestorableMetadataStm,
+        T: ShardsTable,
+    {
+        self.dispatch_message(message, None).await;
+    }
+
+    /// Remove and classify one staged frame for the pump's ranked redispatch
+    /// arm. The queue borrow ends before dispatch awaits, so simulator
+    /// materialisation can append off-pump without colliding with a suspended
+    /// `RefCell` guard.
+    fn pop_redispatched_frame(&self) -> Option<(MessageBag, ParkProvenance)> {
+        loop {
+            let ParkedFrame {
+                epoch,
+                passes,
+                message,
+            } = self.redispatch_queue.borrow_mut().pop_front()?;
+            let provenance = ParkProvenance { epoch, passes };
+            // Parked frames are stored generic (the buffer holds every variant
+            // in one Vec), so re-entering the pump costs one classify. That is
+            // the rare path - a post-`CreateTopic` convergence window, not the
+            // per-message steady state the bag handoff exists for.
+            match MessageBag::try_from(message) {
+                Ok(bag) => return Some((bag, provenance)),
+                Err(error) => {
+                    // The frame classified once already, on the way in, so this
+                    // is unreachable short of memory corruption. The consumed
+                    // bytes can no longer produce a client deny, but the drop
+                    // still needs the same operator-visible record as any other
+                    // parked frame retired unserved.
+                    self.metrics.record_frame_drop(
+                        crate::metrics::frame_drop_variant::PARTITION,
+                        crate::metrics::frame_drop_reason::PARK_DROPPED,
+                    );
+                    tracing::error!(
+                        shard = self.id,
+                        %error,
+                        "re-dispatched partition frame no longer classifies; dropping it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Test-only delivery of one staged frame. Production obtains frames through
+    /// the router's ranked select arm, which also processes loopback after each
+    /// one. This hook exists for the reconciler's defence-in-depth interleaving.
+    #[cfg(feature = "simulator")]
+    #[allow(clippy::future_not_send)]
+    pub async fn dispatch_one_redispatched_frame_for_test(&self) -> bool
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+        T: ShardsTable,
+    {
+        let Some((message, provenance)) = self.pop_redispatched_frame() else {
+            return false;
+        };
+        self.dispatch_message(message, Some(provenance)).await;
+        true
+    }
+
+    /// Retire staged frames the pump is no longer going to deliver, on its way
+    /// out. Client requests get a transient deny; the rest are counted as drops,
+    /// which is the only record a replicated frame leaves.
+    fn retire_redispatched_frames(&self) {
+        let staged: Vec<ParkedFrame> = self.redispatch_queue.borrow_mut().drain(..).collect();
+        if staged.is_empty() {
+            return;
+        }
+        let (answered, dropped) = self.retire_parked_frames(staged);
+        tracing::debug!(
+            shard = self.id,
+            answered,
+            dropped,
+            "retiring re-dispatched partition frames the pump will not deliver"
+        );
+    }
+
+    /// [`Self::on_message`] carrying the park provenance of a frame the pump is
+    /// re-delivering, so a second park keeps the stamp and age the first one
+    /// derived instead of deriving them again against newer committed state.
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_message(&self, message: MessageBag, provenance: Option<ParkProvenance>)
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
         T: ShardsTable,
     {
         match message {
@@ -2552,7 +2665,7 @@ where
                     let header = request.header();
                     (header.operation, header.group)
                 };
-                match self.park_if_unmaterialised(request, routing.0, routing.1) {
+                match self.park_if_unmaterialised(request, routing.0, routing.1, provenance) {
                     // The incarnation fence runs only here, on client traffic.
                     // A backup denying what the primary admitted would diverge
                     // the replicas, so replicated frames are never fenced.
@@ -2583,7 +2696,7 @@ where
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
-                match self.park_if_unmaterialised(prepare, routing.0, routing.1) {
+                match self.park_if_unmaterialised(prepare, routing.0, routing.1, provenance) {
                     ParkOutcome::Deliver(prepare) | ParkOutcome::Tombstoned(prepare) => {
                         self.on_replicate(prepare).await;
                         // A follower learns the cluster commit point from the
@@ -2788,13 +2901,10 @@ where
         }
     }
 
-    /// Remove a namespace's entry, debiting [`Self::parked_partition_bytes`] and
-    /// disarming the pump retry. Single place an entry leaves the map, so
-    /// neither can drift out of step with it.
+    /// Remove a namespace's entry, debiting [`Self::parked_partition_bytes`].
+    /// Single place an entry leaves the map, so the two cannot drift out of step
+    /// with each other.
     fn take_parked_partition_frames(&self, namespace: IggyNamespace) -> Option<Vec<ParkedFrame>> {
-        self.reparked_partition_namespaces
-            .borrow_mut()
-            .remove(&namespace);
         let (entry, converged) = {
             let mut pending = self.pending_partition_frames.borrow_mut();
             let entry = pending.remove(&namespace)?;
@@ -2821,17 +2931,26 @@ where
         let mut answered = 0;
         let mut dropped = 0;
         for frame in frames {
-            if self.deny_parked_client_request(frame) {
+            if self.retire_parked_frame(frame) {
                 answered += 1;
             } else {
                 dropped += 1;
-                self.metrics.record_frame_drop(
-                    crate::metrics::frame_drop_variant::PARTITION,
-                    crate::metrics::frame_drop_reason::PARK_DROPPED,
-                );
             }
         }
         (answered, dropped)
+    }
+
+    /// Answer one parked request or count one replicated frame as destroyed.
+    /// Returns `true` only when a client deny reached the pump.
+    fn retire_parked_frame(&self, frame: ParkedFrame) -> bool {
+        if self.deny_parked_client_request(frame) {
+            return true;
+        }
+        self.metrics.record_frame_drop(
+            crate::metrics::frame_drop_variant::PARTITION,
+            crate::metrics::frame_drop_reason::PARK_DROPPED,
+        );
+        false
     }
 
     /// Whether any frame is parked. Cheap enough for the reconciler's per-tick
@@ -2859,9 +2978,8 @@ where
             .collect()
     }
 
-    /// Re-queue the frames parked for `namespace` now that its partition exists
-    /// at `epoch`, onto this shard's own inbox so the pump serves them after the
-    /// current drain.
+    /// Hand the frames parked for `namespace` back to the pump, in park order,
+    /// now that its partition exists at `epoch`.
     ///
     /// A frame stamped with a DIFFERENT incarnation never makes it back: the
     /// namespace is byte-identical across incarnations, so serving it would land
@@ -2875,35 +2993,27 @@ where
     /// buffer exists to absorb -- the partition primary materialises and
     /// replicates as soon as its own metadata commits, well before a lagging
     /// backup applies the same commit. Treating that as "prior incarnation"
-    /// destroys live traffic: a replicated prepare has no client to answer, so
-    /// it would be dropped with no recovery until an unrelated view change.
+    /// destroys live traffic and forces the backup to recover a gap that the
+    /// park path could have delivered directly.
     /// The residual is unchanged from before the stamp existed -- a frame parked
     /// while the namespace was absent, then recreated under a new incarnation,
     /// is served against the replacement -- and closing it needs a wire-level
     /// discriminator (see the `TODO(krishna)` in
     /// `partition_reconciler`'s module docs), not a `None`-means-stale rule.
     ///
-    /// A frame the inbox refuses is re-parked: retained, so not counted as a
-    /// drop. Re-queuing appends, so a pass materialising many namespaces can
-    /// overrun the inbox; staging a deny is futile because it rides the same
-    /// sender with no await in between. One namespace alone can now do it, since
-    /// [`MAX_PARKED_BYTES_PER_NAMESPACE`] admits 1024 header-only prepares
-    /// against a default `inbox_capacity` of 1024. That costs other namespaces a
-    /// later convergence, not a frame. The first `Full` ends the loop, since
-    /// the sole consumer of `senders[self.id]` is the pump task running this
-    /// call and no later frame can find a slot the first one could not.
+    /// Staged onto [`Self::redispatch_queue`] rather than sent: the shard's own
+    /// inbox can already hold a LATER op of this partition, and the plane's
+    /// backup gap check drops anything that is not `current_op + 1`, so
+    /// appending would strand the parked op behind an op that will be dropped
+    /// for arriving too early. The pump's biased redispatch arm ranks above its
+    /// inbox arm and delivers one staged frame per iteration.
     ///
-    /// [`MAX_PARKED_PASSES`] does not bound a re-parked frame: the sweep ages a
-    /// namespace only while un-materialised, and by here it is materialised.
-    /// [`Self::repark_partition_frames`] arms the pump retry instead;
-    /// `partition_reconciler::reconcile_parked_frames` is the backstop for an
-    /// inbox that never drains.
-    fn redispatch_parked_frames(&self, namespace: IggyNamespace, epoch: u64)
-    where
-        B: MessageBus + 'static,
-    {
+    /// [`MAX_PARKED_PASSES`] does not bound a staged frame: it has left the park
+    /// buffer, and the pump selects the queue on the iteration after it was
+    /// filled. Returns whether at least one frame was staged.
+    fn redispatch_parked_frames(&self, namespace: IggyNamespace, epoch: u64) -> bool {
         let Some(frames) = self.take_parked_partition_frames(namespace) else {
-            return;
+            return false;
         };
         tracing::debug!(
             shard = self.id,
@@ -2912,8 +3022,6 @@ where
             epoch,
             "re-dispatching parked partition frames after materialisation"
         );
-        // Incarnation filter first, independent of the sender: a prior
-        // incarnation is rejected whether or not this shard can re-queue.
         let mut servable: Vec<ParkedFrame> = Vec::with_capacity(frames.len());
         for frame in frames {
             // Only a stamp that exists and disagrees is evidence of a prior
@@ -2926,119 +3034,21 @@ where
                 servable.push(frame);
             }
         }
-        let Some(sender) = self.senders.get(self.id as usize) else {
-            self.retire_parked_frames(servable);
-            return;
-        };
-        let mut refused_frames: Vec<ParkedFrame> = Vec::new();
-        let mut remaining = servable.into_iter();
-        while let Some(frame) = remaining.next() {
-            let passes = frame.passes;
-            let parked_epoch = frame.epoch;
-            // Parked frames are stored generic (the buffer holds every variant
-            // in one Vec), so re-entering the pump costs one classify. That is
-            // the rare path -- a post-`CreateTopic` convergence window, not the
-            // per-message steady state the bag handoff exists for.
-            let bag = match MessageBag::try_from(frame.message) {
-                Ok(bag) => bag,
-                Err(error) => {
-                    // The frame classified once already, on the way in, so this
-                    // is unreachable short of memory corruption. Dropping it
-                    // costs a client retry; panicking on the reconciler's path
-                    // would take the shard down.
-                    tracing::error!(
-                        shard = self.id,
-                        namespace_raw = namespace.inner(),
-                        %error,
-                        "parked partition frame no longer classifies; dropping it"
-                    );
-                    continue;
-                }
-            };
-            let Err(error) = sender.try_send(ShardFrame::consensus(self.id, bag)) else {
-                continue;
-            };
-            let (refused, disconnected) = match error {
-                TrySendError::Full(frame) => (frame, false),
-                TrySendError::Disconnected(frame) => (frame, true),
-            };
-            let ShardFrame::Consensus { message, .. } = refused else {
-                unreachable!("try_send returns the frame it was handed");
-            };
-            let refused_frame = ParkedFrame {
-                epoch: parked_epoch,
-                passes,
-                message: message.into_generic(),
-            };
-            if disconnected {
-                // Pump gone: re-parking holds the frame until process exit, and
-                // every later send hits the same dead channel.
-                self.metrics.record_frame_drop(
-                    crate::metrics::frame_drop_variant::PARTITION,
-                    crate::metrics::frame_drop_reason::DISCONNECTED,
-                );
-                tracing::warn!(
-                    shard = self.id,
-                    namespace_raw = namespace.inner(),
-                    "re-dispatch of parked partition frames refused: inbox disconnected"
-                );
-                let mut stranded = vec![refused_frame];
-                stranded.extend(remaining);
-                self.retire_parked_frames(stranded);
-                return;
-            }
-            refused_frames.push(refused_frame);
-            refused_frames.extend(remaining);
-            tracing::debug!(
-                shard = self.id,
-                namespace_raw = namespace.inner(),
-                count = refused_frames.len(),
-                passes,
-                "re-parking parked partition frames: inbox full"
-            );
-            break;
-        }
-        if !refused_frames.is_empty() {
-            self.repark_partition_frames(namespace, refused_frames);
-        }
-    }
-
-    /// Put frames back under `namespace` after a refused re-dispatch, keeping
-    /// [`Self::parked_partition_bytes`] in step and arming the pump-side retry.
-    ///
-    /// Deliberately not budget-checked: these bytes were already counted while
-    /// parked, so re-admitting them cannot grow the total past what it held a
-    /// moment ago, and shedding here would answer a frame the inbox merely
-    /// deferred.
-    ///
-    /// Arming [`Self::reparked_partition_namespaces`] is what makes it a
-    /// deferral. Every other exit is closed once materialised: the sweep only
-    /// ages a namespace it has not built, and `reconcile_additions` stages no
-    /// second `InsertOwned` for one already in `IggyPartitions`.
-    fn repark_partition_frames(&self, namespace: IggyNamespace, frames: Vec<ParkedFrame>) {
-        let restored: usize = frames.iter().map(ParkedFrame::footprint).sum();
-        let mut pending = self.pending_partition_frames.borrow_mut();
-        let entry = pending.entry(namespace).or_default();
-        for frame in frames {
-            entry.push(frame);
-        }
-        drop(pending);
-        self.parked_partition_bytes
-            .set(self.parked_partition_bytes.get().saturating_add(restored));
-        self.reparked_partition_namespaces
-            .borrow_mut()
-            .insert(namespace);
+        let staged = !servable.is_empty();
+        self.redispatch_queue.borrow_mut().extend(servable);
+        staged
     }
 
     /// Age every frame under `namespace` by one pass, answering CLIENT REQUESTS
     /// past `MAX_PARKED_PASSES`. Returns the number answered.
     ///
-    /// Prepares age but never expire. Expiry destroys a committed op with
-    /// nothing to recover it (see `ParkedFrame::passes`), and passes are
-    /// commit-driven: a non-empty buffer defeats the reconciler fast-skip, so a
-    /// create burst elapses four in milliseconds, across every parked namespace
-    /// rather than the one it concerns. Byte budgets bound them instead. Only
-    /// [`Self::discard_parked_partition_frames`] still destroys a prepare.
+    /// Prepares age but never expire. Expiry would manufacture a gap that a
+    /// later commit heartbeat must repair (see `ParkedFrame::passes`), and
+    /// passes are commit-driven: a non-empty buffer defeats the reconciler
+    /// fast-skip, so a create burst elapses four in milliseconds across every
+    /// parked namespace rather than the one it concerns. Byte budgets bound
+    /// them instead. Only [`Self::discard_parked_partition_frames`] still
+    /// destroys a prepare.
     ///
     /// Passes, not wall-clock, so the simulator's virtual clock governs it.
     pub fn age_parked_partition_frames(&self, namespace: IggyNamespace) -> usize {
@@ -3055,7 +3065,7 @@ where
             let emptied = entry.frames.is_empty();
             drop(pending);
             if emptied {
-                // Through the shared remover so the pump-retry set is disarmed
+                // Through the shared remover so the shed-episode flag clears
                 // with it; the entry is already empty, so this only unhooks it.
                 self.take_parked_partition_frames(namespace);
             }
@@ -3094,6 +3104,17 @@ where
             .map_or(0, |entry| entry.frames.len())
     }
 
+    /// How many frames are staged for the pump to re-deliver.
+    ///
+    /// Test/simulator accessor, gated for the same reason as
+    /// [`Self::parked_frame_count`]: the pump consumes this queue through a
+    /// dedicated select arm, so no production caller has a depth to branch on.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn redispatched_frame_count(&self) -> usize {
+        self.redispatch_queue.borrow().len()
+    }
+
     /// Retire a frame that will never be served: a client request gets a
     /// transient deny, replicated traffic is destroyed. Returns `true` only when
     /// a reply reached the pump.
@@ -3103,9 +3124,9 @@ where
     /// with no sender stages nothing, hence forwarding
     /// [`Self::stage_transient_deny`]'s verdict rather than assuming success.
     ///
-    /// No reply must not mean no record: the primary retransmits only what has
-    /// not reached quorum, so a destroyed prepare is invisible loss. The `false`
-    /// return is what makes callers bump
+    /// No reply must not mean no record: the primary may no longer retransmit an
+    /// op that reached quorum, so a destroyed prepare creates a gap that later
+    /// repair must fill. The `false` return is what makes callers bump
     /// `frame_drops_total{variant=partition,reason=park_dropped}`.
     fn deny_parked_client_request(&self, frame: ParkedFrame) -> bool {
         if frame.message.header().command == Command::Request
@@ -3157,7 +3178,7 @@ where
                 "rejecting parked partition frame from a prior incarnation"
             );
         }
-        self.deny_parked_client_request(frame);
+        self.retire_parked_frame(frame);
     }
 
     /// Park a partition-plane frame whose namespace this shard has not yet
@@ -3168,16 +3189,21 @@ where
     /// disk delete) report [`ParkOutcome::Tombstoned`] so the caller can deny
     /// client requests instead of feeding them to the plane's silent-drop
     /// guard, while replicated traffic still flows there. Parked frames are
-    /// re-dispatched by [`Self::apply_reconcile_ops`] once the matching
+    /// staged for the pump by [`Self::apply_reconcile_ops`] once the matching
     /// `ReconcileOp::InsertOwned` lands, and only if the epoch stamped here
     /// still matches (see [`ParkedFrame`]); a full buffer reports
     /// [`ParkOutcome::Overflow`] so the caller can answer rather than shed
     /// silently.
+    ///
+    /// `provenance` is `None` for a frame arriving off the wire and `Some` for
+    /// one the pump is re-delivering, which must keep the stamp and the age it
+    /// parked with (see [`ParkProvenance`]).
     fn park_if_unmaterialised<H>(
         &self,
         message: Message<H>,
         operation: Operation,
         namespace_raw: u64,
+        provenance: Option<ParkProvenance>,
     ) -> ParkOutcome<H>
     where
         H: iggy_binary_protocol::ConsensusHeader,
@@ -3199,13 +3225,18 @@ where
         }
         // Read the committed revision before taking the borrow below: the frame
         // is stamped with the incarnation it was addressed to, so a later drain
-        // can tell it apart from a same-key replacement.
-        let epoch = self
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .created_revision_for_namespace(namespace);
+        // can tell it apart from a same-key replacement. A re-delivered frame
+        // brings its own, since by now the committed revision can describe the
+        // replacement rather than the incarnation the frame was addressed to.
+        let ParkProvenance { epoch, passes } = provenance.unwrap_or_else(|| ParkProvenance {
+            epoch: self
+                .plane
+                .metadata()
+                .mux_stm
+                .streams()
+                .created_revision_for_namespace(namespace),
+            passes: 0,
+        });
         let frame_cost = parked_footprint(message.as_slice().len());
         let replicated = message.header().command() != Command::Request;
         let mut pending = self.pending_partition_frames.borrow_mut();
@@ -3216,13 +3247,12 @@ where
         let existing = pending.get_mut(&namespace);
         let parked_len = existing.as_ref().map_or(0, |entry| entry.frames.len());
         let namespace_bytes = existing.as_ref().map_or(0, |entry| entry.bytes);
-        // A prepare is never shed on a byte budget. No client to answer, and no
-        // recovery: `consensus::retransmit_targets` skips an op that already
-        // reached quorum and the plane opens a repair session only in
-        // `on_start_view`, so shedding one is permanent loss where shedding a
-        // request costs a retry. A request is refused the moment admitting it
-        // would cross a budget; a prepare only once one is already spent. Caps
-        // prepare residency at one frame of overshoot per budget (worst case
+        // A prepare is never shed on a byte budget before the budget is spent.
+        // It has no client to retry it, and recovery requires a later commit
+        // heartbeat to expose the gap and arm same-view repair. A request costs
+        // only a retry, so it is refused the moment admitting it would cross a
+        // budget. This caps prepare residency at one frame of overshoot per
+        // budget (worst case
         // `MAX_PARKED_BYTES` + `max_message_size`, 80 MiB per shard) instead of
         // at the budget, and is what makes an oversize frame parkable at all.
         let namespace_budget_spent = parked_len > 0
@@ -3299,7 +3329,7 @@ where
         );
         pending.entry(namespace).or_default().push(ParkedFrame {
             epoch,
-            passes: 0,
+            passes,
             message: message.into_generic(),
         });
         drop(pending);
@@ -3358,7 +3388,7 @@ where
         );
         let frame = ShardFrame::lifecycle(LifecycleFrame::ForwardClientSend {
             client_id: request_header.client,
-            msg: reply.into_generic().into_frozen(),
+            msg: reply.into_generic().into_frozen().into(),
         });
         let Some(sender) = self.senders.get(self.id as usize) else {
             return false;
@@ -3518,35 +3548,55 @@ where
         total
     }
 
-    /// Simulator-only. Mutates `IggyPartitions` off the pump task,
-    /// bypassing the reconciler's `ReconcileOp::InsertOwned` funnel (the
-    /// production runtime path; bootstrap recovery uses `load_partition`),
-    /// so it must never run in production. VSR replica id comes from
-    /// `PartitionConsensusConfig`, not `self.id` (the local shard index). A
-    /// `-p iggy-server` build excludes the `simulator` feature and this
-    /// method; `cargo build --workspace` compiles it in but with no
-    /// production caller.
-    /// `superblock` is this group's durable `(view, log_view)` store. Passing
-    /// `None` keeps the storeless branch, where the persist gate marks every view
-    /// durable without writing anything -- fine for specs that never restart a
-    /// replica, but it means the gate itself, its write-failure fence, and view
-    /// recovery are all unexercised. A caller that hands one in (the simulator,
-    /// which retains the store across a replica rebuild) gets the production
-    /// contract: a recorded view is restored before the group joins, and a failed
-    /// write withholds every view-scoped send.
+    /// Simulator-only: mutates `IggyPartitions` off the pump task, bypassing the
+    /// reconciler's `ReconcileOp::InsertOwned` funnel (production's runtime path;
+    /// bootstrap recovery uses `load_partition`). VSR replica id comes from
+    /// `PartitionConsensusConfig`, not `self.id` (the local shard index).
     ///
-    /// `recovered_state` is that store's last record, read by the caller (the
-    /// store's read is async and this is not), mirroring how `new_shard` takes the
-    /// metadata plane's.
-    #[cfg(any(test, feature = "simulator"))]
+    /// `superblock` is this group's durable `(view, log_view)` store. `None` takes
+    /// the storeless branch, where the persist gate marks every view durable
+    /// without writing, leaving the gate, its write-failure fence and view
+    /// recovery unexercised. Passing one in gets the production contract: a
+    /// recorded view is restored before the group joins, and a failed write
+    /// withholds every view-scoped send. `recovered_state` is that store's last
+    /// record, read by the caller because the store's read is async and this is
+    /// not.
+    ///
+    /// `retained` is the log a previous incarnation left behind, standing in for
+    /// the segments a real boot recovers from. `None` is right for a first
+    /// materialisation and wrong for a restart: a rebuilt partition with no data
+    /// reports `commit_offset` 0, which reads as a regression rather than a
+    /// harness that discarded the log.
+    ///
+    /// `materialisation` carries the committed `created_revision` and the view
+    /// the metadata plane created the namespace in; see `fresh_group_start`.
+    ///
+    /// Once inserted, this also runs the same parked-frame redispatch as
+    /// `ReconcileOp::InsertOwned`. The simulator bypasses the reconciler build,
+    /// but it must not bypass the pump handoff that follows materialisation.
+    // `feature = "simulator"` alone, unlike its neighbours: the body names items
+    // `partitions` gates the same way, and a `test` arm cannot turn those on.
+    // Under `cargo test -p shard` that arm fires from shard's own `cfg(test)`
+    // while `partitions` builds as a plain dependency, so `RetainedPartitionLog`
+    // and `adopt_retained_log` are configured out and the crate does not compile.
+    // The feature forwards to `partitions/simulator` instead.
+    #[cfg(feature = "simulator")]
     pub fn init_partition(
         &self,
         namespace: IggyNamespace,
         superblock: Option<Rc<SB>>,
         recovered_state: Option<consensus::VsrState>,
+        retained: Option<partitions::RetainedPartitionState>,
+        restore_frontier: bool,
+        materialisation: PartitionMaterialisation,
     ) where
-        B: MessageBus + Clone,
+        B: MessageBus + Clone + 'static,
+        T: ShardsTable,
     {
+        let PartitionMaterialisation {
+            epoch,
+            created_view,
+        } = materialisation;
         let partitions = self.plane.partitions();
         if partitions.contains(&namespace) {
             return;
@@ -3561,14 +3611,43 @@ where
             LocalPipeline::new(),
             self.partition_consensus.clock.clone(),
         );
+        // The SAME decision `build_partition_fresh` makes, not a copy of it.
+        // This path cannot call that builder (it does real filesystem work and
+        // this runs on in-memory storage), and while the two decided
+        // separately the simulator exercised neither the creation-view seed
+        // nor the plane split it closes. `retained` is populated only by the
+        // restart path, which is this path's evidence of a prior life.
+        let durable_view = recovered_state
+            .as_ref()
+            .map(|state| (state.view, state.log_view));
+        let restarted = retained.is_some() && self.partition_consensus.replica_count > 1;
+        let consensus::FreshGroupStart { join, seed_view } =
+            consensus::fresh_group_start(restarted, durable_view, created_view);
+
         // Recorded view first, exactly as the two boot paths order it: restoring
         // after `init` would advertise a view older than the recorded one.
-        if let Some(state) = recovered_state.as_ref() {
-            consensus.set_view(state.view);
-            consensus.set_log_view(state.log_view);
-            consensus.mark_superblock_durable(state.view, state.log_view);
+        if let Some((view, log_view)) = durable_view {
+            consensus.set_view(view);
+            consensus.set_log_view(log_view);
+            consensus.mark_superblock_durable(view, log_view);
+        } else if let Some(view) = seed_view {
+            consensus.set_view(view);
+            consensus.set_log_view(view);
         }
-        consensus.init();
+        // A rebuilt replica cannot know the group's `(op, commit)`: the
+        // partition journal is in-memory and segments carry no op numbers. So
+        // in a cluster it joins quorum-invisible and asks the view's primary
+        // rather than resuming as a primary its peers may have replaced. Plain
+        // `init` would set `Status::Normal` and arm the commit broadcast on
+        // whichever replica is primary-by-index, the split-brain
+        // `init_as_backup` exists to prevent.
+        match join {
+            consensus::JoinMode::ProbeAsBackup { .. } => {
+                consensus.init_as_backup();
+                consensus.begin_view_probe();
+            }
+            consensus::JoinMode::Init => consensus.init(),
+        }
 
         let stats = Arc::new(PartitionStats::default());
         let mut partition = IggyPartition::with_in_memory_storage(
@@ -3580,6 +3659,39 @@ where
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state.as_ref());
         }
+        // Retained log before the frontier restore, so the restore maxes against
+        // the offsets the log proved rather than the zeroes of an empty one.
+        // `restore_offset_frontier` STORES `recovered_end` once past its guard, so
+        // it can lower `dirty_offset`; harmless only because `write_superblock`
+        // maxes the recorded frontier against `offset_frontier()`. The order also
+        // keeps that restore's precondition (`should_increment_offset` already set
+        // by a recovered offset space) meaningful.
+        if let Some(state) = retained {
+            partition.adopt_retained_log(state);
+            // OPT-IN, off by default: it models durability Iggy does not have.
+            // Production's `load_partition` restores the view alone, joins as a
+            // backup and probes, so a harness handing the frontier back cannot
+            // reproduce the empty-frontier restart that is the real hazard. With it
+            // off a restarted replica rebuilds at op 0 while holding a log full of
+            // ops and ADVERTISES that empty frontier in its `DoViewChange`, which
+            // trips the sequential-advance assert in `advance_commit_min`. A
+            // scenario turns this on only to look past that at something later in
+            // the run.
+            //
+            // `max_commit_watermark` is a lower bound: a prepare records the
+            // primary's commit point at send time, so the true point may be one
+            // higher and re-commits on rejoin.
+            let journal = &partition.log.journal().inner;
+            if restore_frontier && let Some(head) = journal.last_op() {
+                let watermark = journal.max_commit_watermark();
+                let consensus = partition.consensus();
+                consensus.sequencer().set_sequence(head);
+                consensus.restore_commit_state(watermark, watermark);
+                if let Some(header) = journal.header_by_op(head) {
+                    consensus.set_last_prepare_checksum(header.checksum);
+                }
+            }
+        }
         // The SAME call the boot paths make, not a copy of it: this restore is
         // a max against what the segments already proved, and a harness running
         // a divergent copy of that rule cannot catch a violation of it. Without
@@ -3587,6 +3699,12 @@ where
         // store resumes minting at 0 while its group is at N.
         partition.restore_offset_frontier(recovered_state.as_ref());
         partitions.insert(namespace, partition);
+        if self.redispatch_parked_frames(namespace, epoch) {
+            // This mutation occurs outside the pump, unlike production's
+            // `InsertOwned`. Wake the ranked redispatch arm so quiescence does
+            // not leave real work staged without a poll source.
+            self.wake_reconcile_apply();
+        }
     }
 
     /// Resolve the single partition a VSR control frame addresses, keyed by
@@ -3907,6 +4025,10 @@ where
                 .handle_start_view(PlaneKind::Partitions, &header, suffix_body);
         let adopted = !actions.is_empty();
         if adopted {
+            // Any stream armed before this adoption belongs to the superseded
+            // view. Repair bodies carry no nonce, so drop the receiving session
+            // before reconciling or arming the new view's canonical range.
+            partition.repair = None;
             // Ahead of the local dispatch, which rebuilds the pipeline out of the
             // journal this rewrites. Same position as the metadata arm's twin, and
             // like it, pending-less adoptions (empty StartView suffix) still sweep
@@ -4280,7 +4402,17 @@ where
             );
             return;
         }
-        let to_op = header.to_op.min(partition.consensus().commit_max());
+        // The frontier bounds the serve, not `commit_max` alone, mirroring the
+        // metadata twin: a rejoining backup needs the BODIES of the adopted
+        // suffix above the commit point. Its ack for those ops is withheld
+        // until the body is journaled, and the primary's retransmit is dropped
+        // by the backup gap check (adoption already advanced its sequencer to
+        // the head), so repair is the only channel that can deliver them.
+        let to_op = repair_serve_ceiling(
+            header.to_op,
+            partition.consensus().commit_max(),
+            partition.consensus().sequencer().current_sequence(),
+        );
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
         // evicted ring with it, so a freshly installed or freshly restarted
@@ -4473,26 +4605,23 @@ where
             // `apply_repaired_prepare`: DVC advertises the sequencer, so a
             // hole below a repaired op must stall the advance rather than
             // mint an election candidate with an unwalkable log.
-            let mut frontier = consensus.sequencer().current_sequence();
+            let previous_frontier = consensus.sequencer().current_sequence();
             #[allow(clippy::cast_possible_truncation)]
-            while journal.header((frontier + 1) as usize).is_some() {
-                frontier += 1;
-            }
-            if frontier > consensus.sequencer().current_sequence() {
+            let update = repaired_frontier_update(previous_frontier, |op| {
+                journal.header(op as usize).map(|header| *header)
+            });
+            if let Some((frontier, frontier_checksum)) = update {
                 consensus.sequencer().set_sequence(frontier);
+                consensus.set_last_prepare_checksum(frontier_checksum);
             }
-            consensus.set_last_prepare_checksum(header.checksum);
             return;
         }
         // A metadata-plane op that did not match above (no metadata consensus on
         // this shard, or a namespace neither plane claims) is DROPPED, never
-        // offered to the partition arm. Falling through let a metadata prepare
-        // reach `apply_repaired_prepare`: it journals nothing, but it resets the
-        // partition repair session's idle ticks (masking a genuine stall) and
-        // carries the metadata prepare's checksum into the partition consensus
-        // via `set_last_prepare_checksum` -- inert only while prepare checksums
-        // are structurally zero, and a cross-plane parent stamp the moment the
-        // checksum chain is activated (see the note in `consensus::impls`).
+        // offered to the partition arm. Falling through would let a metadata
+        // prepare reach `apply_repaired_prepare`: it journals nothing and never
+        // reaches the frontier update, but it resets the partition repair
+        // session's idle ticks, masking a genuine stall.
         if metadata_plane_op {
             tracing::debug!(
                 shard = self.id,
@@ -4649,6 +4778,10 @@ where
         if header.nonce != session.nonce {
             return;
         }
+        if !partition.consensus().is_normal() || partition.consensus().view() != session.view {
+            partition.repair = None;
+            return;
+        }
         // Receiver half of the serve-side purge gate: while a committed purge
         // is not yet locally applied, this replica's `recovered_durable_offset`
         // still describes the PRE-purge segments, so a floor from a peer that
@@ -4758,7 +4891,7 @@ where
                 } else {
                     let commit_min = partition.consensus().commit_min();
                     let next = partition.repair.as_ref().and_then(|live| {
-                        (commit_min > before).then_some((live.peer, live.nonce, live.to_op))
+                        (commit_min > before).then_some((live.peer, live.nonce, live.fetch_to_op))
                     });
                     let cluster = partition.consensus().cluster();
                     let self_id = partition.consensus().replica();
@@ -6327,7 +6460,15 @@ where
     /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
     #[allow(clippy::future_not_send)]
     #[allow(clippy::too_many_lines)]
-    pub async fn tick_partitions(&self, namespace_scratch: &mut Vec<IggyNamespace>)
+    /// Returns the commit fault that fenced a partition on this shard, if one
+    /// has. The pump turns it into a server shutdown: a fenced partition is
+    /// divergent from the cluster and can never advance again, so the tick
+    /// stops driving it and the node stops rather than serving a prefix the
+    /// cluster has moved past.
+    pub async fn tick_partitions(
+        &self,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) -> Option<FatalCommit>
     where
         B: MessageBus,
         MJ: JournalHandle,
@@ -6397,10 +6538,19 @@ where
         // already accepts.
         let mut transfers_inflight: Option<usize> = None;
 
+        let mut fatal: Option<FatalCommit> = None;
         for namespace in namespace_scratch.drain(..) {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
                 continue;
             };
+            // A fenced partition must not tick: its consensus would emit
+            // view-scoped sends for a log the cluster has already passed.
+            if let Some(fault) = partition.fatal() {
+                if fatal.is_none() {
+                    fatal = Some(fault.clone());
+                }
+                continue;
+            }
 
             let consensus = partition.consensus();
             // Only while a view change is live. A `Normal` tick has no consumer:
@@ -6439,9 +6589,42 @@ where
                     continue;
                 };
                 let consensus_normal = partition.consensus().is_normal();
+                let consensus_view = partition.consensus().view();
                 let commit_min = partition.consensus().commit_min();
                 let cluster = partition.consensus().cluster();
                 let self_id = partition.consensus().replica();
+                let repair_finished = partition.repair.is_some_and(|session| {
+                    if !consensus_normal || consensus_view != session.view {
+                        return true;
+                    }
+                    // Floored at the LIVE commit point, like `complete_repair`:
+                    // committing past `commit_to_op` evicts exactly the suffix
+                    // headers this shape would look for, and ops at or below
+                    // `commit_min` are committed and applied, a monotone fact
+                    // the flush cannot erase.
+                    let fetch_complete = session.fetch_to_op <= session.commit_to_op
+                        || partition
+                            .log
+                            .journal()
+                            .inner
+                            .repaired_window_shape(
+                                session.commit_to_op.max(commit_min),
+                                session.fetch_to_op,
+                            )
+                            .complete;
+                    commit_min >= session.commit_to_op && fetch_complete
+                });
+                if repair_finished {
+                    partition.repair = None;
+                    tracing::info!(
+                        shard = self.id,
+                        namespace_raw = namespace.inner(),
+                        commit_min,
+                        consensus_view,
+                        "partition journal repair completed or was superseded"
+                    );
+                    continue;
+                }
                 partition.repair.as_mut().and_then(|session| {
                     if !consensus_normal {
                         return None;
@@ -6454,8 +6637,8 @@ where
                     Some((
                         session.peer,
                         session.nonce,
-                        commit_min + 1,
-                        session.to_op,
+                        commit_min.saturating_add(1),
+                        session.fetch_to_op,
                         cluster,
                         self_id,
                     ))
@@ -6571,6 +6754,8 @@ where
                 }
             }
         }
+
+        fatal
     }
 
     /// Flush every owned partition's committed journal prefix to segment
@@ -6597,11 +6782,16 @@ where
                 .flush_committed_messages(partitions.config())
                 .await
             {
-                tracing::warn!(
+                tracing::error!(
                     namespace_raw = namespace.inner(),
                     %error,
                     "failed to flush partition journal on shutdown"
                 );
+                // The bytes left behind are cluster-committed, so the pump
+                // must not let this exit report clean (it re-scans for faults
+                // after this flush). A partition already fenced by the commit
+                // path keeps its original fault.
+                partition.fence_flush_failure();
             }
         }
     }
@@ -7367,22 +7557,48 @@ where
         B: MessageBus,
     {
         let consensus = partition.consensus();
-        if !consensus.is_normal()
-            || consensus.is_transferring()
-            || consensus.commit_min() >= consensus.commit_max()
-            || partition.repair.is_some()
-        {
+        if !consensus.is_normal() || consensus.is_transferring() || partition.repair.is_some() {
+            return;
+        }
+        // The window ends at the group head when suffix bodies are missing,
+        // not at the commit point. A backup that adopted a StartView holds
+        // suffix HEADERS above `commit_max` whose bodies it may never have
+        // received: its ack for them is withheld until the body is journaled,
+        // and the primary's retransmit is dropped by the backup gap check
+        // because adoption already advanced the sequencer to the head. With a
+        // commit-bounded window nothing ever delivers those bodies, the
+        // primary cannot gather quorum for the suffix, and the group wedges
+        // one op below its head with the client write never confirmed.
+        let commit_to_op = consensus.commit_max();
+        let commit_lag = consensus.commit_min() < commit_to_op;
+        let head = consensus.sequencer().current_sequence();
+        if !commit_lag && head <= commit_to_op {
+            return;
+        }
+        let canonical_suffix = consensus
+            .with_pending_view_log(|pending| pending_covers_suffix(pending, commit_to_op, head))
+            .unwrap_or(false);
+        let missing_suffix = canonical_suffix
+            && !partition
+                .log
+                .journal()
+                .inner
+                .repaired_window_shape(commit_to_op, head)
+                .complete;
+        if !commit_lag && !missing_suffix {
             return;
         }
         let nonce = iggy_common::random_id::get_uuid();
         let from_op = consensus.commit_min() + 1;
-        let to_op = consensus.commit_max();
+        let fetch_to_op = if missing_suffix { head } else { commit_to_op };
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
         let namespace = consensus.group();
         partition.repair = Some(partitions::RepairSession {
             nonce,
-            to_op,
+            view: consensus.view(),
+            commit_to_op,
+            fetch_to_op,
             floor: None,
             peer,
             first_batch_offset: None,
@@ -7392,11 +7608,20 @@ where
             shard = self.id,
             namespace_raw = namespace,
             from_op,
-            to_op,
+            commit_to_op,
+            fetch_to_op,
             "partition behind the group frontier; requesting repair"
         );
-        self.send_request_prepares(cluster, self_id, peer, nonce, from_op, to_op, namespace)
-            .await;
+        self.send_request_prepares(
+            cluster,
+            self_id,
+            peer,
+            nonce,
+            from_op,
+            fetch_to_op,
+            namespace,
+        )
+        .await;
     }
 
     /// Receiver side of a partition descriptor: accept the manifest, adopt
@@ -8648,6 +8873,27 @@ fn repair_serve_ceiling(requested_to_op: u64, commit_max: u64, head: u64) -> u64
     requested_to_op.min(commit_max.max(head))
 }
 
+/// Whether the parked `StartView` log names every op in the uncommitted
+/// suffix `(commit_max, head]`, in descending order. Only this canonical list
+/// makes fetching bodies above the commit point safe.
+fn pending_covers_suffix(pending: &MergedLog, commit_max: u64, head: u64) -> bool {
+    if head <= commit_max || pending.commit_max != commit_max || pending.op_head != head {
+        return false;
+    }
+    let mut expected = head;
+    for header in pending
+        .headers
+        .iter()
+        .filter(|header| header.op > commit_max)
+    {
+        if header.op != expected {
+            return false;
+        }
+        expected -= 1;
+    }
+    expected == commit_max
+}
+
 /// Read this replica's uncommitted suffix out of the metadata journal, for the
 /// window `commit..=op`.
 ///
@@ -9417,8 +9663,9 @@ mod persist_gate_tests {
 mod repair_scope_tests {
     //! Who parked the log decides what it means.
 
-    use super::{MergedLog, repair_op_in_scope, repair_serve_ceiling};
     use iggy_binary_protocol::{Command, PrepareHeader};
+
+    use super::{MergedLog, pending_covers_suffix, repair_op_in_scope, repair_serve_ceiling};
 
     fn header(op: u64) -> PrepareHeader {
         PrepareHeader {
@@ -9488,6 +9735,20 @@ mod repair_scope_tests {
         assert_eq!(repair_serve_ceiling(90, 40, 90), 90);
         // `commit_max` above the local head still counts: heartbeats outrun prepares.
         assert_eq!(repair_serve_ceiling(u64::MAX, 120, 90), 120);
+    }
+
+    #[test]
+    fn given_a_parked_view_when_fetching_above_commit_should_require_dense_canonical_suffix() {
+        let pending = parked();
+        assert!(pending_covers_suffix(&pending, 98, 100));
+
+        let mut missing = pending.clone();
+        missing.headers.retain(|header| header.op != 99);
+        assert!(!pending_covers_suffix(&missing, 98, 100));
+
+        let mut wrong_frontier = pending;
+        wrong_frontier.commit_max = 97;
+        assert!(!pending_covers_suffix(&wrong_frontier, 98, 100));
     }
 }
 

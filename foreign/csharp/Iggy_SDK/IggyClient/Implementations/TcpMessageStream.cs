@@ -608,7 +608,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 "Reconnection is enabled without auto login: a lost session can only be restored once the client has signed in at least once");
         }
 
-        return ConnectAsync(true, token);
+        return ConnectAsync(true, true, token);
     }
 
     /// <inheritdoc />
@@ -817,6 +817,15 @@ public sealed partial class TcpMessageStream : IIggyClient
     /// </summary>
     private async Task ConnectAsync(bool autoLogin, CancellationToken token)
     {
+        await ConnectAsync(autoLogin, true, token);
+    }
+
+    /// <summary>
+    ///     Connects and optionally leaves an authenticated roster walk on the endpoint it reached instead of
+    ///     settling it back onto the metadata leader.
+    /// </summary>
+    private async Task ConnectAsync(bool autoLogin, bool settleOnLeader, CancellationToken token)
+    {
         if (State is ConnectionState.Connected
             or ConnectionState.Authenticating
             or ConnectionState.Authenticated)
@@ -847,7 +856,7 @@ public sealed partial class TcpMessageStream : IIggyClient
             }
 
             SetConnectionState(ConnectionState.Connecting);
-            await TryEstablishConnectionAsync(autoLogin, token);
+            await TryEstablishConnectionAsync(autoLogin, settleOnLeader, token);
 
             // Dispose is synchronous and cannot take the sending semaphore, so a Dispose that ran while this
             // connect was dialing already read a connection that did not exist yet. Reading the flag after the
@@ -1029,7 +1038,7 @@ public sealed partial class TcpMessageStream : IIggyClient
         };
     }
 
-    private async Task TryEstablishConnectionAsync(bool autoLogin, CancellationToken token)
+    private async Task TryEstablishConnectionAsync(bool autoLogin, bool settleOnLeader, CancellationToken token)
     {
         var retryCount = 0;
         var redirects = 0;
@@ -1057,8 +1066,15 @@ public sealed partial class TcpMessageStream : IIggyClient
             try
             {
                 socket = new Socket(ServerAddress.AddressFamilyOf(host), SocketType.Stream, ProtocolType.Tcp);
-                socket.SendBufferSize = _configuration.SendBufferSize;
-                socket.ReceiveBufferSize = _configuration.ReceiveBufferSize;
+                if (_configuration.SendBufferSize.HasValue)
+                {
+                    socket.SendBufferSize = _configuration.SendBufferSize.Value;
+                }
+
+                if (_configuration.ReceiveBufferSize.HasValue)
+                {
+                    socket.ReceiveBufferSize = _configuration.ReceiveBufferSize.Value;
+                }
 
                 // The protocol is request/reply, so a write is always the last one before
                 // the client blocks on the answer and Nagle has nothing to coalesce it with - it only delays the
@@ -1118,7 +1134,7 @@ public sealed partial class TcpMessageStream : IIggyClient
                 {
                     await AutoLoginAsync(signInSettings, token);
 
-                    if (await RedirectAsync(token))
+                    if (settleOnLeader && await RedirectAsync(token))
                     {
                         await BackoffOrThrowAsync();
                         continue;

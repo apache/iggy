@@ -771,6 +771,29 @@ pub fn panic_if_hash_chain_would_break_in_same_view(
     }
 }
 
+/// Resolve a repair's contiguous head and the checksum of the entry sitting at it.
+///
+/// A view change can put the sequencer above holes that repair later backfills.
+/// Such a lower entry changes durable coverage, but not the head the next prepare
+/// must parent: taking its checksum would rewind the chain while leaving the
+/// sequencer ahead of it. `None` until the journal holds the entry at the head.
+pub fn repaired_frontier_update(
+    previous_frontier: u64,
+    mut header_at: impl FnMut(u64) -> Option<PrepareHeader>,
+) -> Option<(u64, u128)> {
+    let mut frontier = previous_frontier;
+    // Re-anchored on the head the journal can prove, not only on an advance:
+    // `handle_start_view` moves the sequencer to the announced head without
+    // touching the checksum, so the frame that finally delivers that head is
+    // the only chance to make the pair agree again.
+    let mut checksum = header_at(frontier).map(|header| header.checksum);
+    while let Some(header) = header_at(frontier + 1) {
+        frontier += 1;
+        checksum = Some(header.checksum);
+    }
+    checksum.map(|checksum| (frontier, checksum))
+}
+
 /// Ack a prepare back to its primary once the owning plane vouches for it.
 ///
 /// `is_persisted` is the caller's journal-containment verdict for `header`:
@@ -854,8 +877,9 @@ mod tests {
     use aligned_vec::{AVec, ConstAlign};
     use iggy_binary_protocol::{ConsensusHeader, Operation, StartViewChangeHeader};
     use iggy_common::calculate_checksum;
-    use message_bus::SendError;
+    use message_bus::{BusMessage, SendError};
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
+    use std::collections::BTreeMap;
 
     /// `PrepareHeader`'s alignment, which every suffix body has to satisfy.
     const BODY_ALIGN: usize = align_of::<PrepareHeader>();
@@ -872,7 +896,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }
@@ -1918,7 +1942,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }
@@ -2021,5 +2045,43 @@ mod tests {
             "deny reply body must be empty"
         );
         assert!(header.validate().is_ok());
+    }
+
+    fn header_with_checksum(op: u64, checksum: u128) -> PrepareHeader {
+        PrepareHeader {
+            command: Command::Prepare,
+            op,
+            checksum,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn given_lower_backfill_when_resolving_repaired_frontier_should_not_rewind() {
+        let headers = BTreeMap::from([
+            (169, header_with_checksum(169, 1690)),
+            (170, header_with_checksum(170, 1700)),
+            (171, header_with_checksum(171, 1710)),
+        ]);
+
+        let update = repaired_frontier_update(171, |op| headers.get(&op).copied());
+
+        // Not a rewind: the frontier does not move, and the checksum re-anchors
+        // on the entry the sequencer already points at rather than on the
+        // backfill that just arrived below it.
+        assert_eq!(update, Some((171, 1710)));
+    }
+
+    #[test]
+    fn given_gap_closure_when_resolving_repaired_frontier_should_use_new_head_checksum() {
+        let headers = BTreeMap::from([
+            (170, header_with_checksum(170, 1700)),
+            (171, header_with_checksum(171, 1710)),
+            (172, header_with_checksum(172, 1720)),
+        ]);
+
+        let update = repaired_frontier_update(169, |op| headers.get(&op).copied());
+
+        assert_eq!(update, Some((172, 1720)));
     }
 }

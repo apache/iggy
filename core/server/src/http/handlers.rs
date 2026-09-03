@@ -118,17 +118,18 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
-use crate::auth::{verify_login_credentials, verify_pat_credentials};
+use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
+use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::dispatch::{
-    resolve_consumer_offset_request, resolve_poll_request, validate_option_keys,
-    validate_topic_bounds, validate_topic_size_floor, warn_unenforceable_topic_size,
-    warn_unenforceable_topic_size_on_partition_add,
+    validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
+    warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
 };
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
 };
 use crate::http::extractor::{Authenticated, Identity};
+use crate::http::metrics::gauge_value;
 use crate::http::reads::{
     authorize_data_plane, authorize_read, read_local, resolve_gate_stream, resolve_gate_topic,
     resolve_gate_topic_ids, resolve_gate_user,
@@ -598,6 +599,72 @@ pub(in crate::http) async fn get_stats(
     let response = StatsResponse::decode_from(&bytes)
         .map_err(|_| ReadError::Rejected(IggyError::InvalidCommand))?;
     Ok(Json(Stats::from(response)))
+}
+
+/// `GET <http.metrics.endpoint>`: the metric set in prometheus text
+/// exposition. Auth-only, like `/stats`: the `Identity` extractor rejects a
+/// missing or invalid bearer with 401, and any authenticated user may scrape
+/// (no RBAC rule guards it). Scrapers present a JWT or a raw PAT the same way
+/// every read route accepts them.
+///
+/// The entity gauges sample the same reads `/stats` serves: the metadata STM
+/// stream and user maps plus the stats-registry rollups, whose partition-plane
+/// increments are relaxed, so scraped values are approximate while writes are
+/// in flight. The clients count scatter-gathers the per-shard session managers
+/// exactly like `GET /clients` and turns partial when a shard misses the reply
+/// deadline.
+pub(in crate::http) async fn get_metrics(
+    State(state): State<HttpState>,
+    _identity: Identity,
+) -> String {
+    let (streams_count, topics_count, partitions_count, segments_count, messages_count) = state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .read(|streams| {
+            let mut topics_count = 0u64;
+            let mut partitions_count = 0u64;
+            let mut segments_count = 0u64;
+            let mut messages_count = 0u64;
+            for (_, stream) in &streams.items {
+                topics_count = topics_count.saturating_add(stream.topics.len() as u64);
+                segments_count = segments_count
+                    .saturating_add(u64::from(stream.stats.segments_count_inconsistent()));
+                messages_count =
+                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
+                for (_, topic) in &stream.topics {
+                    partitions_count =
+                        partitions_count.saturating_add(topic.partitions.len() as u64);
+                }
+            }
+            (
+                streams.items.len() as u64,
+                topics_count,
+                partitions_count,
+                segments_count,
+                messages_count,
+            )
+        });
+    let users_count = state
+        .shard
+        .plane
+        .metadata()
+        .mux_stm
+        .users()
+        .read(|users| users.items.len() as u64);
+    let clients_count = SendWrapper::new(state.shard.list_all_clients()).await.len() as u64;
+
+    let metrics = &state.metrics;
+    metrics.streams.set(gauge_value(streams_count));
+    metrics.topics.set(gauge_value(topics_count));
+    metrics.partitions.set(gauge_value(partitions_count));
+    metrics.segments.set(gauge_value(segments_count));
+    metrics.messages.set(gauge_value(messages_count));
+    metrics.users.set(gauge_value(users_count));
+    metrics.clients.set(gauge_value(clients_count));
+    metrics.formatted_output()
 }
 
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP
