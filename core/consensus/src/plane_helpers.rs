@@ -877,7 +877,7 @@ mod tests {
     use aligned_vec::{AVec, ConstAlign};
     use iggy_binary_protocol::{ConsensusHeader, Operation, StartViewChangeHeader};
     use iggy_common::calculate_checksum;
-    use message_bus::SendError;
+    use message_bus::{BusMessage, SendError};
     use server_common::{MESSAGE_ALIGN, iobuf::Frozen};
     use std::collections::BTreeMap;
 
@@ -896,7 +896,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }
@@ -1942,7 +1942,7 @@ mod tests {
         async fn send_to_client(
             &self,
             _client_id: u128,
-            _data: Frozen<MESSAGE_ALIGN>,
+            _data: impl Into<BusMessage>,
         ) -> Result<(), SendError> {
             Ok(())
         }

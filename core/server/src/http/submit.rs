@@ -28,16 +28,13 @@ use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
-use message_bus::BusMessage;
 use metadata::impls::metadata::StreamsFrontend;
-use server_common::Message;
+use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
-use crate::bootstrap::ServerShard;
-use crate::dispatch::{
-    dispatch_partition_request, resolve_delete_segments_truncate, submit_client_request_on_owner,
-    submit_logout_on_owner,
-};
+use crate::dispatch::partition::{dispatch_partition_request, resolve_delete_segments_truncate};
+use crate::dispatch::session_ops::submit_logout_on_owner;
+use crate::dispatch::submit::submit_client_request_on_owner;
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::http::reply::{
@@ -47,6 +44,7 @@ use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
 use crate::http::wire::build_request_message;
 use crate::pat::rewrite_pat_request_for_user;
+use crate::shell::ServerShard;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 
@@ -370,7 +368,7 @@ pub(in crate::http) async fn partition_write_replicated(
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
-) -> Result<(BusMessage, ReplyHeader), PartitionWriteError> {
+) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
     // Admission sits here rather than before body decode: axum's extractors
     // already buffered and deserialized the body (bounded by the router-wide
     // `DefaultBodyLimit`) before the handler ran, so the caps gate what is
@@ -379,7 +377,13 @@ pub(in crate::http) async fn partition_write_replicated(
     // timeout. Held across every exit below; released by `Drop`.
     let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
     ensure_in_process_reply_target(state, session);
-    let request_id = session.next_data_request_id();
+    // Held from the mint until `dispatch_partition_request` returns, which is
+    // past the owning shard's inbox: the ids of this session's writes must
+    // reach the partition in mint order or the watermark absorbs the overtaken
+    // one. Released before the commit wait so writes still overlap there.
+    let mut next_data_request_id = session.data_gate.lock().await;
+    let request_id = *next_data_request_id;
+    *next_data_request_id += 1;
     let message = build_request_message(
         operation,
         session.client_id,
@@ -409,12 +413,16 @@ pub(in crate::http) async fn partition_write_replicated(
         Some(session.user_id),
     )
     .await;
+    drop(next_data_request_id);
     let outcome = compio::time::timeout(PARTITION_WRITE_REPLY_TIMEOUT, receiver).await;
     // Removes the slot unless the reply already fired, so a late commit
     // reply after a timeout sheds at the bus instead of leaking a waiter.
     drop(guard);
     match outcome {
-        Ok(Ok(reply)) => classify_partition_reply(&reply).map(|header| (reply, header)),
+        Ok(Ok(reply)) => {
+            let reply = reply.into_contiguous();
+            classify_partition_reply(&reply).map(|header| (reply, header))
+        }
         // Cancelled (reply target torn down by session eviction mid-wait) or
         // elapsed: same caller contract either way - outcome unknown, 504.
         Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),
@@ -441,7 +449,10 @@ pub(in crate::http) async fn produce_unacked(
     body: &[u8],
 ) -> Result<(), PartitionWriteError> {
     let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
-    let request_id = session.next_data_request_id();
+    // Same gate as the acked path, for the same ordering reason.
+    let mut next_data_request_id = session.data_gate.lock().await;
+    let request_id = *next_data_request_id;
+    *next_data_request_id += 1;
     let message = build_request_message(
         Operation::SendMessages,
         session.client_id,
@@ -458,6 +469,7 @@ pub(in crate::http) async fn produce_unacked(
         Some(session.user_id),
     )
     .await;
+    drop(next_data_request_id);
     Ok(())
 }
 

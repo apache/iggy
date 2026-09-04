@@ -27,6 +27,7 @@ using Apache.Iggy.IggyClient;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.Vsr;
 using Microsoft.Extensions.Logging.Abstractions;
+using static Apache.Iggy.Tests.VsrTests.MockFrames;
 
 namespace Apache.Iggy.Tests.VsrTests;
 
@@ -37,26 +38,6 @@ namespace Apache.Iggy.Tests.VsrTests;
 /// </summary>
 public sealed class EndpointFailoverTests
 {
-    private const int HeaderSize = 256;
-    private const int SizeOffset = 48;
-    private const int CommandOffset = 60;
-    private const int RequestIdOffset = 168;
-    private const int RequestOperationOffset = 176;
-    private const int RequestReservedOffset = 196;
-    private const int ReplyRequestIdOffset = 200;
-    private const int ReplyOperationOffset = 208;
-    private const int ReplyStatusOffset = 216;
-
-    private const byte CommandReply = 8;
-    private const byte CommandEviction = 13;
-    private const int EvictionReasonOffset = 255;
-    private const byte EvictionStaleClient = 13;
-    private const byte OperationRegister = 1;
-    private const byte OperationNonReplicated = 2;
-    private const int GetClusterMetadataCode = 12;
-    private const int PingCode = 1;
-    private const uint TransientNotAccepted = 58;
-
     [Fact]
     public async Task ResumesOnASurvivorAfterTheSignedInNodeDies()
     {
@@ -65,11 +46,11 @@ public sealed class EndpointFailoverTests
 
         // The primary leads, so the sign-in settles there and the roster is only remembered - not acted on -
         // until the node dies.
-        primary.Serve(request => request.Code == GetClusterMetadataCode
-            ? Reply(OperationNonReplicated, ClusterMetadata(primary.Port, survivor.Port, primary.Port))
+        primary.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
+            ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, primary.Port))
             : Answer(request));
-        survivor.Serve(request => request.Code == GetClusterMetadataCode
-            ? Reply(OperationNonReplicated, ClusterMetadata(primary.Port, survivor.Port, survivor.Port))
+        survivor.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
+            ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivor.Port, survivor.Port))
             : Answer(request));
 
         var configuration = new IggyClientConfigurator
@@ -114,13 +95,13 @@ public sealed class EndpointFailoverTests
 
         metadataLeader.Serve(request => request.Code switch
         {
-            GetClusterMetadataCode => Reply(OperationNonReplicated,
+            GET_CLUSTER_METADATA_CODE => Reply(OPERATION_NON_REPLICATED,
                 ThreeNodeClusterMetadata(metadataLeader.Port, follower.Port, partitionPrimary.Port)),
-            (int)commandCode => Reply(request.Operation, [], TransientNotAccepted),
+            (int)commandCode => Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED),
             _ => Answer(request)
         });
         follower.Serve(request => request.Code == (int)commandCode
-            ? Reply(request.Operation, [], TransientNotAccepted)
+            ? Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED)
             : Answer(request));
         partitionPrimary.Serve(Answer);
 
@@ -166,12 +147,12 @@ public sealed class EndpointFailoverTests
         byte[] Refuse(MockRequest request)
         {
             return request.Code == (int)commandCode
-                ? Reply(request.Operation, [], TransientNotAccepted)
+                ? Reply(request.Operation, [], TRANSIENT_NOT_ACCEPTED)
                 : Answer(request);
         }
 
-        metadataLeader.Serve(request => request.Code == GetClusterMetadataCode
-            ? Reply(OperationNonReplicated, RosterMetadata(metadataLeader.Port, roster))
+        metadataLeader.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
+            ? Reply(OPERATION_NON_REPLICATED, RosterMetadata(metadataLeader.Port, roster))
             : Refuse(request));
         second.Serve(Refuse);
         third.Serve(Refuse);
@@ -212,18 +193,18 @@ public sealed class EndpointFailoverTests
         var evict = false;
         node.Serve(request =>
         {
-            if (request.Operation == OperationRegister)
+            if (request.Operation == OPERATION_REGISTER)
             {
-                return Reply(OperationRegister, RegisterBody(session: 128));
+                return Reply(OPERATION_REGISTER, RegisterBody(session: 128));
             }
 
             if (evict)
             {
                 evict = false;
-                return EvictionFrame(EvictionStaleClient);
+                return EvictionFrame(EVICTION_STALE_CLIENT);
             }
 
-            return Reply(OperationNonReplicated, request.Code == GetClusterMetadataCode
+            return Reply(OPERATION_NON_REPLICATED, request.Code == GET_CLUSTER_METADATA_CODE
                 ? ClusterMetadata(node.Port, node.Port, node.Port)
                 : []);
         });
@@ -268,18 +249,18 @@ public sealed class EndpointFailoverTests
         var evict = false;
         node.Serve(request =>
         {
-            if (request.Operation == OperationRegister)
+            if (request.Operation == OPERATION_REGISTER)
             {
-                return Reply(OperationRegister, RegisterBody(session: 128));
+                return Reply(OPERATION_REGISTER, RegisterBody(session: 128));
             }
 
             if (evict)
             {
                 evict = false;
-                return EvictionFrame(EvictionStaleClient);
+                return EvictionFrame(EVICTION_STALE_CLIENT);
             }
 
-            return Reply(OperationNonReplicated, request.Code == GetClusterMetadataCode
+            return Reply(OPERATION_NON_REPLICATED, request.Code == GET_CLUSTER_METADATA_CODE
                 ? ClusterMetadata(node.Port, node.Port, node.Port)
                 : []);
         });
@@ -331,8 +312,8 @@ public sealed class EndpointFailoverTests
         probe.Stop();
 
         using var primary = new MockNode();
-        primary.Serve(request => request.Code == GetClusterMetadataCode
-            ? Reply(OperationNonReplicated, ClusterMetadata(primary.Port, survivorPort, primary.Port))
+        primary.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
+            ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivorPort, primary.Port))
             : Answer(request));
 
         var configuration = new IggyClientConfigurator
@@ -364,8 +345,8 @@ public sealed class EndpointFailoverTests
         {
             await Task.Delay(300, TestContext.Current.CancellationToken);
             survivor = new MockNode(survivorPort);
-            survivor.Serve(request => request.Code == GetClusterMetadataCode
-                ? Reply(OperationNonReplicated, ClusterMetadata(primary.Port, survivorPort, survivorPort))
+            survivor.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
+                ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(primary.Port, survivorPort, survivorPort))
                 : Answer(request));
         }, TestContext.Current.CancellationToken);
 
@@ -386,10 +367,10 @@ public sealed class EndpointFailoverTests
 
     private static byte[] EvictionFrame(byte reason)
     {
-        var frame = new byte[HeaderSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(SizeOffset, 4), HeaderSize);
-        frame[CommandOffset] = CommandEviction;
-        frame[EvictionReasonOffset] = reason;
+        var frame = new byte[HEADER_SIZE];
+        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(SIZE_OFFSET, 4), HEADER_SIZE);
+        frame[COMMAND_OFFSET] = COMMAND_EVICTION;
+        frame[EVICTION_REASON_OFFSET] = reason;
         return frame;
     }
 
@@ -397,8 +378,8 @@ public sealed class EndpointFailoverTests
     public async Task FailsFastWhenNothingEverSignedIn()
     {
         using var node = new MockNode();
-        node.Serve(request => request.Code == GetClusterMetadataCode
-            ? Reply(OperationNonReplicated, ClusterMetadata(node.Port, node.Port, node.Port))
+        node.Serve(request => request.Code == GET_CLUSTER_METADATA_CODE
+            ? Reply(OPERATION_NON_REPLICATED, ClusterMetadata(node.Port, node.Port, node.Port))
             : Answer(request));
 
         var configuration = new IggyClientConfigurator
@@ -457,49 +438,6 @@ public sealed class EndpointFailoverTests
         return (false, lastError);
     }
 
-    /// <summary>A reply for anything the roster read does not claim: a register, or an empty read.</summary>
-    private static byte[] Answer(MockRequest request)
-    {
-        return request.Operation == OperationRegister
-            ? Reply(OperationRegister, RegisterBody(session: 128))
-            : Reply(OperationNonReplicated, []);
-    }
-
-    private static byte[] Reply(byte operation, byte[] body)
-    {
-        return Reply(operation, body, 0);
-    }
-
-    private static byte[] Reply(byte operation, byte[] body, uint status)
-    {
-        var frame = new byte[HeaderSize + body.Length];
-        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(SizeOffset, 4), (uint)frame.Length);
-        frame[CommandOffset] = CommandReply;
-        frame[ReplyOperationOffset] = operation;
-        BinaryPrimitives.WriteUInt32LittleEndian(frame.AsSpan(ReplyStatusOffset, 4), status);
-        body.CopyTo(frame.AsSpan(HeaderSize));
-
-        return frame;
-    }
-
-    /// <summary>
-    ///     A register reply carries a committed result section, so its four leading zero bytes announce zero
-    ///     entries and the typed payload starts right after them. A non-replicated read carries none.
-    /// </summary>
-    private static byte[] RegisterBody(ulong session)
-    {
-        var serverVersion = Encoding.UTF8.GetBytes("0.0.0");
-        var body = new byte[4 + 17 + serverVersion.Length];
-        var payload = body.AsSpan(4);
-        BinaryPrimitives.WriteUInt32LittleEndian(payload[..4], 7);
-        BinaryPrimitives.WriteUInt64LittleEndian(payload[4..12], session);
-        BinaryPrimitives.WriteUInt32LittleEndian(payload[12..16], 11 << 10);
-        payload[16] = (byte)serverVersion.Length;
-        serverVersion.CopyTo(payload[17..]);
-
-        return body;
-    }
-
     private static byte[] ClusterMetadata(ushort primaryPort, ushort survivorPort, ushort leaderPort)
     {
         var body = new List<byte>();
@@ -553,150 +491,5 @@ public sealed class EndpointFailoverTests
         var bytes = Encoding.UTF8.GetBytes(value);
         body.AddRange(BitConverter.GetBytes((uint)bytes.Length));
         body.AddRange(bytes);
-    }
-
-    private readonly record struct MockRequest(byte Operation, int Code, ulong RequestId);
-
-    /// <summary>
-    ///     A loopback VSR node. Killing it drops the live sockets and stops accepting, so a redial is refused the
-    ///     way a dead process refuses one.
-    /// </summary>
-    private sealed class MockNode : IDisposable
-    {
-        private readonly TcpListener _listener;
-        private readonly List<TcpClient> _accepted = [];
-        private volatile bool _killed;
-        private int _connections;
-        private int _pings;
-        private int _registrations;
-
-        /// <param name="port">
-        ///     A port to bind, for a node that has to come up on an address the client already knows. Zero
-        ///     takes whatever the OS hands out.
-        /// </param>
-        public MockNode(ushort port = 0)
-        {
-            _listener = new TcpListener(IPAddress.Loopback, port);
-            _listener.Start();
-            Port = (ushort)((IPEndPoint)_listener.LocalEndpoint).Port;
-        }
-
-        public ushort Port { get; }
-
-        public int Pings => Volatile.Read(ref _pings);
-
-        public int Registrations => Volatile.Read(ref _registrations);
-
-        public int Connections
-        {
-            get
-            {
-                lock (_accepted)
-                {
-                    return _connections;
-                }
-            }
-        }
-
-        public void Serve(Func<MockRequest, byte[]> handler)
-        {
-            _ = Task.Run(async () =>
-            {
-                while (!_killed)
-                {
-                    TcpClient connection;
-                    try
-                    {
-                        connection = await _listener.AcceptTcpClientAsync();
-                    }
-                    catch (Exception)
-                    {
-                        return;
-                    }
-
-                    lock (_accepted)
-                    {
-                        _accepted.Add(connection);
-                        _connections++;
-                    }
-
-                    _ = Task.Run(() => Exchange(connection, handler));
-                }
-            });
-        }
-
-        public void Kill()
-        {
-            _killed = true;
-            lock (_accepted)
-            {
-                foreach (var connection in _accepted)
-                {
-                    connection.Close();
-                }
-
-                _accepted.Clear();
-            }
-
-            _listener.Stop();
-        }
-
-        public void Dispose()
-        {
-            Kill();
-        }
-
-        private async Task Exchange(TcpClient connection, Func<MockRequest, byte[]> handler)
-        {
-            try
-            {
-                await using var stream = connection.GetStream();
-                var header = new byte[HeaderSize];
-                while (!_killed)
-                {
-                    await ReadExactly(stream, header);
-                    var size = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(SizeOffset, 4));
-                    var body = new byte[size - HeaderSize];
-                    await ReadExactly(stream, body);
-
-                    var request = new MockRequest(header[RequestOperationOffset],
-                        BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(RequestReservedOffset, 4)),
-                        BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(RequestIdOffset, 8)));
-                    if (request.Operation == OperationRegister)
-                    {
-                        Interlocked.Increment(ref _registrations);
-                    }
-                    else if (request.Code == PingCode)
-                    {
-                        Interlocked.Increment(ref _pings);
-                    }
-
-                    var reply = handler(request);
-                    BinaryPrimitives.WriteUInt64LittleEndian(reply.AsSpan(ReplyRequestIdOffset, 8),
-                        request.RequestId);
-                    await stream.WriteAsync(reply);
-                    await stream.FlushAsync();
-                }
-            }
-            catch (Exception)
-            {
-                // A killed node and a client that went away look the same here.
-            }
-        }
-
-        private static async Task ReadExactly(NetworkStream stream, byte[] buffer)
-        {
-            var read = 0;
-            while (read < buffer.Length)
-            {
-                var chunk = await stream.ReadAsync(buffer.AsMemory(read));
-                if (chunk == 0)
-                {
-                    throw new EndOfStreamException("Connection closed");
-                }
-
-                read += chunk;
-            }
-        }
     }
 }

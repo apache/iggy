@@ -41,6 +41,13 @@ pub use consumer_group_client_state::ConsumerGroupClientState;
 /// a genuine end-of-partition empty poll, which echoes the real partition id.
 pub const RESYNC_REQUIRED_PARTITION_SENTINEL: u32 = u32::MAX;
 
+/// Client-side `partition_id` of an empty poll reply for a consumer-group
+/// member that currently holds no partitions. The server never sends it: the
+/// transport fills it in when the synced assignment is empty, so a caller can
+/// tell "nothing assigned" from a genuine empty poll, which echoes the real
+/// partition id. Same value as the Go and Node SDKs use for that case.
+pub const NO_ASSIGNED_PARTITION: u32 = u32::MAX - 1;
+
 /// Frozen ceiling on the widest batch record any admission path can persist.
 /// Two knobs bound admission and both are validated against this at boot:
 /// `message_bus.max_message_size` caps every bus-framed wire message, and

@@ -15,3 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
+namespace Apache.Iggy.Enums;
+
+/// <summary>
+///     Transport a connected client reached the server through, as reported by the server.
+/// </summary>
+public enum ClientTransport : byte
+{
+    /// <summary>
+    ///     Transport this SDK does not recognize, or one newer than this SDK.
+    /// </summary>
+    Unknown = 0,
+
+    /// <summary>
+    ///     Custom binary protocol over TCP.
+    /// </summary>
+    Tcp = 1,
+
+    /// <summary>
+    ///     QUIC.
+    /// </summary>
+    Quic = 2,
+
+    /// <summary>
+    ///     HTTP REST.
+    /// </summary>
+    Http = 3,
+
+    /// <summary>
+    ///     WebSocket.
+    /// </summary>
+    WebSocket = 4
+}
