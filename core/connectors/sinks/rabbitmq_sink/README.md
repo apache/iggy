@@ -27,8 +27,10 @@ Publishes are confirmed via `ConfirmSelect`. With `mandatory = true`, a message 
 timeouts) are retried within a single `consume()` call up to `max_retries`, resuming at the first unconfirmed
 message. Publishes are pipelined (all messages sent, then confirmed in order), so a failure mid-batch can already
 have delivered the in-flight tail; resuming re-publishes those, so delivery is **at-least-once within a batch**.
-However, the connectors runtime commits the consumer offset at poll time and discards `consume()`'s return value,
-so there is no cross-poll redrive or DLQ: a failure that outlives the retry budget, or a crash mid-batch, is
+Because lapin does not attribute a `Basic.Return` to a specific in-flight publish, any returned message fails the
+whole batch and the connection is re-established before the next poll, so a channel with unresolved confirms is
+never reused. The connectors runtime commits the consumer offset at poll time and discards `consume()`'s return
+value, so there is no cross-poll redrive or DLQ: a failure that outlives the retry budget, or a crash mid-batch, is
 **at-most-once** across polls.
 
 ```toml

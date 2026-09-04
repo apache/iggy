@@ -29,7 +29,7 @@ use lapin::{
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -56,7 +56,7 @@ pub struct RabbitMQSink {
     delivery_mode: u8,
     timeout: Duration,
     state: Mutex<Option<RabbitMqState>>,
-    reconnecting: AtomicBool,
+    reconnect_lock: Mutex<()>,
     max_retries: u32,
     retry_delay: Duration,
     max_retry_delay: Duration,
@@ -111,6 +111,13 @@ fn default_timeout_secs() -> Option<u64> {
     Some(30)
 }
 
+fn append_connection_timeout(amqp_url: &SecretString, timeout_secs: u64) -> SecretString {
+    let timeout_ms = timeout_secs * 1000;
+    let url = amqp_url.expose_secret();
+    let separator = if url.contains('?') { '&' } else { '?' };
+    SecretString::from(format!("{url}{separator}connection_timeout={timeout_ms}"))
+}
+
 fn default_true() -> Option<bool> {
     Some(true)
 }
@@ -138,9 +145,19 @@ impl RabbitMQSink {
             }
             None => 2,
         };
+        let timeout_secs = match config.timeout_secs {
+            Some(0) | None => {
+                if config.timeout_secs == Some(0) {
+                    warn!("timeout_secs must be >= 1, defaulting to 30 for connector ID: {id}");
+                }
+                30
+            }
+            Some(secs) => secs,
+        };
+        let amqp_url = append_connection_timeout(&config.amqp_url, timeout_secs);
         RabbitMQSink {
             id,
-            amqp_url: config.amqp_url,
+            amqp_url,
             exchange: config.exchange.unwrap_or_else(|| "iggy_events".into()),
             exchange_type: config.exchange_type.unwrap_or_else(|| "topic".into()),
             routing_key: config.routing_key.unwrap_or_else(|| "iggy.messages".into()),
@@ -148,9 +165,9 @@ impl RabbitMQSink {
             verbose: config.verbose_logging.unwrap_or(false),
             durable_exchange: config.durable_exchange.unwrap_or(true),
             delivery_mode,
-            timeout: Duration::from_secs(config.timeout_secs.unwrap_or(30)),
+            timeout: Duration::from_secs(timeout_secs),
             state: Mutex::new(None),
-            reconnecting: AtomicBool::new(false),
+            reconnect_lock: Mutex::new(()),
             max_retries: config.max_retries.unwrap_or(3),
             retry_delay: Duration::from_secs(config.retry_delay_secs.unwrap_or(1)),
             max_retry_delay: Duration::from_secs(config.max_retry_delay_secs.unwrap_or(5)),
@@ -181,32 +198,50 @@ impl RabbitMQSink {
         let mut confirmed: usize = 0;
 
         loop {
-            let channel = {
-                let guard = self.state.lock().await;
-                match guard.as_ref() {
-                    Some(state) => state.channel.clone(),
-                    None => {
-                        drop(guard);
-                        self.reconnect().await?;
-                        self.state
-                            .lock()
-                            .await
-                            .as_ref()
-                            .map(|s| s.channel.clone())
-                            .ok_or_else(|| Error::Connection("RabbitMQ not connected".into()))?
+            let channel = match self
+                .state
+                .lock()
+                .await
+                .as_ref()
+                .map(|state| state.channel.clone())
+            {
+                Some(channel) => channel,
+                None => {
+                    let error = Error::Connection("RabbitMQ not connected".into());
+                    attempts += 1;
+                    if attempts >= self.max_retries {
+                        self.publish_errors
+                            .fetch_add((messages.len() - confirmed) as u64, Ordering::Relaxed);
+                        return Err(error);
                     }
+                    if let Err(reconnect_error) = self.reconnect().await {
+                        self.publish_errors
+                            .fetch_add((messages.len() - confirmed) as u64, Ordering::Relaxed);
+                        return Err(Error::Connection(format!(
+                            "failed to reconnect: {reconnect_error}"
+                        )));
+                    }
+                    let delay = jitter(exponential_backoff(
+                        self.retry_delay,
+                        attempts.saturating_sub(1),
+                        self.max_retry_delay,
+                    ));
+                    warn!(
+                        "RabbitMQ not connected for connector ID: {} (attempt {attempts}/{}). Retrying in {:?}.",
+                        self.id, self.max_retries, delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
                 }
             };
 
             let mut last_error: Option<Error> = None;
             let mut last_retryable = false;
-            let mut in_flight: Vec<(PublisherConfirm, u64)> =
+            let mut in_flight: Vec<PublisherConfirm> =
                 Vec::with_capacity(messages.len() - confirmed);
             for message in &messages[confirmed..] {
                 let body = message.payload.try_to_bytes()?;
-                let mut props = BasicProperties::default()
-                    .with_delivery_mode(self.delivery_mode)
-                    .with_message_id(ShortString::from(message.offset.to_string()));
+                let mut props = BasicProperties::default().with_delivery_mode(self.delivery_mode);
                 let headers = self.build_headers(topic_metadata, messages_metadata, message);
                 if !headers.inner().is_empty() {
                     props = props.with_headers(headers);
@@ -237,30 +272,35 @@ impl RabbitMQSink {
                     Err(_) => {
                         last_error = Some(Error::CannotStoreData("publish timed out".into()));
                         last_retryable = true;
+                        self.clear_state().await;
                         break;
                     }
                 };
-                in_flight.push((confirm, message.offset));
+                in_flight.push(confirm);
             }
 
-            // Confirms resolve in publish order over already-overlapped RTTs; returns are
-            // matched by message_id (lapin's Return-to-confirm FIFO has no delivery tag), so a
-            // post-publish failure re-publishes the already-delivered tail (at-least-once in batch).
-            for (confirm, offset) in in_flight {
+            // Confirms resolve in publish order over already-overlapped RTTs.
+            // lapin staples a Basic.Return to whichever confirm resolves next, so under
+            // multiple-ack the returned message is not attributable to a specific publish:
+            // on any return the whole batch fails and the channel is cleared so a channel
+            // with unresolved confirms is never reused (a later batch could otherwise
+            // swallow the return and count the unroutable message as delivered).
+            for confirm in in_flight {
                 match timeout(self.timeout, confirm).await {
                     Ok(Ok(Confirmation::Ack(None))) => confirmed += 1,
-                    Ok(Ok(Confirmation::Ack(Some(returned)))) => {
-                        let returned_id = returned.delivery.properties.message_id();
-                        last_error = Some(Error::InvalidRecordValue(format!(
-                            "message offset {offset} (id {returned_id:?}) returned as unroutable by RabbitMQ"
-                        )));
+                    Ok(Ok(Confirmation::Ack(Some(_)))) => {
+                        last_error = Some(Error::InvalidRecordValue(
+                            "message returned as unroutable by RabbitMQ".into(),
+                        ));
                         last_retryable = false;
+                        self.clear_state().await;
                         break;
                     }
                     Ok(Ok(Confirmation::Nack(_))) => {
                         last_error =
                             Some(Error::CannotStoreData("message nack'd by RabbitMQ".into()));
                         last_retryable = true;
+                        self.clear_state().await;
                         break;
                     }
                     Ok(Ok(Confirmation::NotRequested)) => {
@@ -268,6 +308,7 @@ impl RabbitMQSink {
                             "publisher confirms not enabled".into(),
                         ));
                         last_retryable = false;
+                        self.clear_state().await;
                         break;
                     }
                     Ok(Err(e)) => {
@@ -281,6 +322,7 @@ impl RabbitMQSink {
                             "publisher confirmation timed out".into(),
                         ));
                         last_retryable = true;
+                        self.clear_state().await;
                         break;
                     }
                 }
@@ -370,83 +412,38 @@ impl RabbitMQSink {
     }
 
     async fn reconnect(&self) -> Result<(), Error> {
-        if self
-            .reconnecting
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            tokio::time::sleep(self.retry_delay).await;
+        let _guard = self.reconnect_lock.lock().await;
+        if self.state.lock().await.is_some() {
             return Ok(());
         }
-
         warn!("Reconnecting RabbitMQ sink ID: {}", self.id);
-        let result = async {
-            let conn = timeout(
-                self.timeout,
-                Connection::connect(
-                    self.amqp_url.expose_secret(),
-                    ConnectionProperties::default(),
-                ),
-            )
-            .await
-            .map_err(|_| Error::Connection("connection timed out".into()))?
-            .map_err(|e| Error::Connection(e.to_string()))?;
-            let channel = conn
-                .create_channel()
-                .await
-                .map_err(|e| Error::Connection(e.to_string()))?;
-            channel
-                .confirm_select(ConfirmSelectOptions::default())
-                .await
-                .map_err(|e| Error::Connection(e.to_string()))?;
-            let exchange_kind = self.exchange_kind()?;
-            channel
-                .exchange_declare(
-                    &self.exchange,
-                    exchange_kind,
-                    ExchangeDeclareOptions {
-                        durable: self.durable_exchange,
-                        ..Default::default()
-                    },
-                    FieldTable::default(),
-                )
-                .await
-                .map_err(|e| Error::Connection(e.to_string()))?;
-            *self.state.lock().await = Some(RabbitMqState {
-                connection: conn,
-                channel,
-            });
-            Ok::<(), Error>(())
-        }
-        .await;
-        self.reconnecting.store(false, Ordering::Release);
-        result
+        let state = self.connect_with_timeout().await?;
+        *self.state.lock().await = Some(state);
+        Ok(())
     }
-}
 
-#[async_trait]
-impl Sink for RabbitMQSink {
-    async fn open(&mut self) -> Result<(), Error> {
-        let exchange_kind = self.exchange_kind()?;
-        let conn = timeout(
-            self.timeout,
-            Connection::connect(
-                self.amqp_url.expose_secret(),
-                ConnectionProperties::default(),
-            ),
+    async fn connect_with_timeout(&self) -> Result<RabbitMqState, Error> {
+        timeout(self.timeout, self.establish_connection())
+            .await
+            .map_err(|_| Error::Connection("connection setup timed out".into()))?
+    }
+
+    async fn establish_connection(&self) -> Result<RabbitMqState, Error> {
+        let connection = Connection::connect(
+            self.amqp_url.expose_secret(),
+            ConnectionProperties::default(),
         )
         .await
-        .map_err(|_| Error::Connection("connection timed out".into()))?
         .map_err(|e| Error::Connection(e.to_string()))?;
-        let channel = conn
+        let channel = connection
             .create_channel()
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
         channel
-            .confirm_select(lapin::options::ConfirmSelectOptions::default())
+            .confirm_select(ConfirmSelectOptions::default())
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
-
+        let exchange_kind = self.exchange_kind()?;
         channel
             .exchange_declare(
                 &self.exchange,
@@ -459,10 +456,19 @@ impl Sink for RabbitMQSink {
             )
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
-        *self.state.get_mut() = Some(RabbitMqState {
-            connection: conn,
+        Ok(RabbitMqState {
+            connection,
             channel,
-        });
+        })
+    }
+}
+
+#[async_trait]
+impl Sink for RabbitMQSink {
+    async fn open(&mut self) -> Result<(), Error> {
+        self.exchange_kind()?;
+        let state = self.connect_with_timeout().await?;
+        *self.state.get_mut() = Some(state);
         info!(
             "Opened RabbitMQ sink ID: {}, connected to exchange: {}",
             self.id, self.exchange
@@ -717,12 +723,25 @@ mod tests {
     }
 
     #[test]
+    fn given_zero_timeout_secs_when_new_should_default_to_30() {
+        let mut config = test_config();
+        config.timeout_secs = Some(0);
+        let sink = test_sink(config);
+        assert_eq!(sink.timeout, Duration::from_secs(30));
+        assert!(
+            sink.amqp_url
+                .expose_secret()
+                .ends_with("connection_timeout=30000")
+        );
+    }
+
+    #[test]
     fn given_minimal_config_when_deserialized_should_apply_defaults() {
         let config: RabbitMQSinkConfig = serde_json::from_str("{}").unwrap();
         let sink = RabbitMQSink::new(1, config);
         assert_eq!(
             sink.amqp_url.expose_secret(),
-            "amqp://guest:guest@localhost:5672"
+            "amqp://guest:guest@localhost:5672?connection_timeout=30000"
         );
         assert_eq!(sink.exchange, "iggy_events");
         assert_eq!(sink.exchange_type, "topic");
