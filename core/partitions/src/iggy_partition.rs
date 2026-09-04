@@ -261,16 +261,6 @@ where
     /// cost nothing. Kept apart from [`Self::durable_offset_frontier`]: see
     /// `consensus::VsrState::offset_reserved`.
     durable_offset_reserved: Cell<u64>,
-    /// A send arrived for a partition with no reservation on disk yet, and was
-    /// bounced so the shard tick could claim the first block off the request
-    /// path. Cleared by the write it asks for.
-    ///
-    /// The trigger the tick consults is otherwise gated on a partition that has
-    /// already minted, deliberately: arming every idle partition at boot would
-    /// write a superblock per partition for nothing. This bit is what separates
-    /// "idle" from "wanted", so the cost falls only on partitions someone
-    /// actually produced to.
-    offset_reservation_wanted: Cell<bool>,
     /// Offsets the append fence claims per superblock write; installed by boot
     /// from `PartitionsConfig`.
     offset_reservation_lease: u64,
@@ -540,7 +530,6 @@ where
             purge_deferred: false,
             durable_offset_frontier: Cell::new(0),
             durable_offset_reserved: Cell::new(0),
-            offset_reservation_wanted: Cell::new(false),
             offset_reservation_lease: u64::from(crate::DEFAULT_OFFSET_RESERVATION_LEASE),
             transfer: None,
             transfer_attempts: 0,
@@ -1425,18 +1414,14 @@ where
     /// costs nothing but offset space, while arriving late puts the write back on
     /// the append path. Floored at 1, since validation admits a lease of 1 and
     /// `1 / 2` would never trigger, leaving every append to pay the inline claim.
-    /// A partition that has never minted is skipped unless a send has already
-    /// been bounced for it (`should_defer_first_reservation`): extending
-    /// every idle partition at boot would write a superblock per partition for
-    /// nothing, while a partition someone is producing to needs its first block
-    /// claimed off the request path like every later one.
+    /// A partition that has never minted is skipped: extending every idle
+    /// partition at boot would write a superblock per partition for nothing, and
+    /// the first block is already claimed where the partition is created, on a
+    /// path that pays for a superblock write anyway.
     #[must_use]
     pub fn needs_offset_reservation_extension(&self) -> bool {
         if self.consensus.replica_count() > 1 || self.superblock.is_none() {
             return false;
-        }
-        if self.offset_reservation_wanted.get() {
-            return true;
         }
         if !self.offset_space.append_live {
             return false;
@@ -1446,38 +1431,6 @@ where
             .get()
             .saturating_sub(self.mint_frontier());
         headroom < (self.offset_reservation_lease / 2).max(1)
-    }
-
-    /// Whether this send should be BOUNCED so the shard tick claims the
-    /// partition's first block, rather than paying for it inline.
-    ///
-    /// Without this the first append to every untouched solo partition awaits a
-    /// create, write, file fsync, rename and directory fsync inside the shard's
-    /// request pump, where the consensus tick is a sibling arm. A
-    /// high-cardinality first-write burst serializes those fences and delays
-    /// unrelated group work and heartbeats on the same core.
-    ///
-    /// One retry, once in a partition's life: the bounce is
-    /// `TransientNotAccepted`, which admitted nothing, and by the time the client
-    /// re-sends, the tick has claimed the block and the fence takes its fast
-    /// path.
-    ///
-    /// `false` once a claim covers the batch, and `false` for a first batch wider
-    /// than the whole lease -- the tick's claim would not cover that one either,
-    /// so bouncing it would bounce the same request forever.
-    ///
-    /// `false` with no store attached, for the same reason. A storeless partition
-    /// (in-memory, simulated) reserves nothing at all, and
-    /// [`Self::needs_offset_reservation_extension`] skips it, so nothing would
-    /// ever clear the bounce: every first send would be denied for the life of
-    /// the partition. The gates here and there must agree on which partitions the
-    /// tick can serve.
-    #[must_use]
-    const fn should_defer_first_reservation(&self, end_offset: u64) -> bool {
-        self.superblock.is_some()
-            && !self.offset_space.append_live
-            && self.durable_offset_reserved.get() <= end_offset
-            && end_offset < self.offset_reservation_lease
     }
 
     /// Extend the reservation a full block past the CEILING already on disk.
@@ -1504,14 +1457,7 @@ where
         }
         let _superblock_guard = self.superblock_lock.acquire().await;
         let ceiling = self.durable_offset_reserved.get().max(self.mint_frontier());
-        let written = self.write_claim_from(superblock.as_ref(), ceiling).await;
-        if written {
-            // Only on success: a failed write leaves the bounce standing so the
-            // next tick retries it, rather than dropping the partition back to
-            // paying inline.
-            self.offset_reservation_wanted.set(false);
-        }
-        written
+        self.write_claim_from(superblock.as_ref(), ceiling).await
     }
 
     /// Upper bound on the offsets a pending `SendMessages` request will mint, for
@@ -1602,6 +1548,9 @@ where
     /// serving. At the mint the op already has its number and its ack is already
     /// skipped, so `commit_max` can never pass it and nothing later can commit
     /// either: `on_replicate` fences the partition there and takes the node down.
+    /// At CREATE (`build_partition_fresh`) nothing has been externalised at all,
+    /// so a refusal only drops the partition back to claiming its first block
+    /// inline on the append path.
     #[allow(clippy::future_not_send)]
     #[must_use = "the bool is the fence verdict; dropping it lets the append escape unreserved"]
     pub async fn reserve_offsets_through(&self, end_offset: u64) -> bool {
@@ -1659,9 +1608,8 @@ where
     /// and must go no further: the client holds a `TransientNotAccepted`, which
     /// admitted nothing, so it may re-issue anywhere without double-apply risk.
     ///
-    /// Three ways to come back `false`, none of them reaching the mint: a bounced
-    /// first send, an open superblock backoff window, and a claim that was
-    /// attempted and failed.
+    /// Two ways to come back `false`, neither reaching the mint: an open
+    /// superblock backoff window, and a claim that was attempted and failed.
     ///
     /// `waiter` is the submit's in-process reply channel, taken only on a
     /// refusal: the deny goes there because `header.client` is then the VSR
@@ -1678,16 +1626,6 @@ where
         let Some(ceiling) = self.request_mint_ceiling(message) else {
             return true;
         };
-        if self.should_defer_first_reservation(ceiling) {
-            self.offset_reservation_wanted.set(true);
-            self.deny_unreserved_send(
-                message.header(),
-                "bouncing a partition's first send so the tick claims its offset block",
-                waiter.take(),
-            )
-            .await;
-            return false;
-        }
         if !self.reserve_offsets_through_retryable(ceiling).await {
             self.deny_unreserved_send(
                 message.header(),
@@ -6865,78 +6803,24 @@ mod tests {
         }
     }
 
-    /// The first send to an untouched partition is BOUNCED so the tick claims the
-    /// block, rather than awaiting a create, write, fsync, rename and directory
-    /// fsync inside the shard's request pump.
-    #[compio::test]
-    async fn given_an_untouched_partition_when_a_send_arrives_should_bounce_it_to_the_tick() {
-        let store = Rc::new(RecordingSuperblock::default());
-        let mut partition = solo_recording_partition();
-        partition.set_superblock(store.clone(), None);
-        partition.set_offset_reservation_lease(test_lease(16));
-
-        assert!(
-            partition.should_defer_first_reservation(0),
-            "a first send with no claim on disk must not pay for one inline"
-        );
-        assert!(
-            !partition.should_defer_first_reservation(16),
-            "a first batch wider than the whole lease must not be bounced: the \
-             tick's claim would not cover it either, so it would bounce forever"
-        );
-
-        // Arming is what the bounce does; the tick then writes, off this path.
-        partition.offset_reservation_wanted.set(true);
-        assert!(
-            partition.needs_offset_reservation_extension(),
-            "an armed partition needs the write even though it has never minted"
-        );
-        assert!(partition.extend_offset_reservation().await);
-        assert_eq!(store.attempts.get(), 1);
-        assert!(
-            !partition.needs_offset_reservation_extension(),
-            "the write it asked for disarms it"
-        );
-
-        // The retry finds the block already claimed and writes nothing.
-        assert!(!partition.should_defer_first_reservation(0));
-        assert!(partition.reserve_offsets_through(0).await);
-        assert_eq!(
-            store.attempts.get(),
-            1,
-            "the bounced send's retry takes the fence's fast path"
-        );
-    }
-
-    /// A storeless partition reserves nothing, and the tick skips it, so a bounce
-    /// there is a send denied for the life of the partition with nothing able to
-    /// clear it. The two gates have to agree on which partitions the tick serves.
+    /// A storeless partition (in-memory, simulated) reserves nothing at all, so
+    /// the tick must never reach a write for one.
     #[test]
-    fn given_a_storeless_partition_when_a_send_arrives_should_not_bounce_it() {
+    fn given_a_storeless_partition_when_ticking_should_not_extend() {
         let mut partition = solo_recording_partition();
         partition.set_offset_reservation_lease(test_lease(16));
         assert!(partition.superblock.is_none(), "the premise: no store");
-        assert!(!partition.offset_space.append_live);
-
-        assert!(
-            !partition.should_defer_first_reservation(0),
-            "nothing would ever claim the block this bounce waits for"
-        );
-        assert!(
-            !partition.needs_offset_reservation_extension(),
-            "and the tick agrees it has nothing to do here"
-        );
+        assert!(!partition.needs_offset_reservation_extension());
     }
 
-    /// Idle partitions stay idle: arming is what separates a partition someone
-    /// produced to from one boot merely materialized, and without that a node
-    /// with many partitions writes a superblock per partition for nothing.
+    /// Idle partitions stay idle: the first block is claimed where the partition
+    /// is created, and a node with many partitions must not write a superblock
+    /// per partition at boot for nothing.
     #[test]
-    fn given_an_unarmed_untouched_partition_when_ticking_should_still_not_extend() {
+    fn given_an_untouched_partition_when_ticking_should_not_extend() {
         let mut partition = solo_recording_partition();
         partition.set_superblock(Rc::new(RecordingSuperblock::default()), None);
         assert!(!partition.offset_space.append_live);
-        assert!(!partition.offset_reservation_wanted.get());
         assert!(!partition.needs_offset_reservation_extension());
     }
 

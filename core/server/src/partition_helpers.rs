@@ -1116,8 +1116,9 @@ fn hydrate_reopen_error(
 /// Steps performed (all idempotent on retry after a partial failure):
 /// 1. Create directory hierarchy on disk.
 /// 2. Build per-partition VSR consensus group, resuming any superblock-recorded view.
-/// 3. Configure empty consumer-offset storage with the on-disk paths set.
-/// 4. Provision the initial segment + writers (offset 0).
+/// 3. Claim the group's first offset-reservation block (solo groups with a store).
+/// 4. Configure empty consumer-offset storage with the on-disk paths set.
+/// 5. Provision the initial segment + writers (offset 0).
 ///
 /// The namespace arrives packed, so its components are in range by
 /// construction. Metadata admission is what bounds them.
@@ -1296,6 +1297,31 @@ pub async fn build_partition_fresh(
     // frontier before quarantining, and the boot-path chain refusal to carry
     // the refused chain's max `end_offset` on its error.
     partition.restore_offset_frontier(recovered_state.as_ref());
+
+    // Claim the first offset-reservation block HERE, where this path is already
+    // paying for a superblock write, so no send ever pays the create, write,
+    // file fsync, rename and directory fsync of a first claim inline in the
+    // shard's request pump, where the consensus tick is a sibling arm. No-op
+    // above one replica and with no store attached, where nothing is reserved,
+    // and no-op on a rebuild whose record already covers the next mint.
+    //
+    // The shard tick takes over from the first mint onward
+    // (`needs_offset_reservation_extension`), which stays gated on a partition
+    // that has minted so boot cannot write a superblock per idle partition.
+    if !partition
+        .reserve_offsets_through(partition.mint_frontier())
+        .await
+    {
+        // Degraded, not fatal: the fence on the append path still claims
+        // inline, so the first send pays for the block instead of the create.
+        warn!(
+            stream_id,
+            topic_id,
+            partition_id,
+            "could not claim the partition's first offset reservation; its first send \
+             will claim one inline"
+        );
+    }
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;

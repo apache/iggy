@@ -735,6 +735,95 @@ async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &Te
     }
 }
 
+/// The FIRST send to a partition that has never minted an offset, on both
+/// produce routes, against the only cluster shape where the offset reservation
+/// runs at all.
+///
+/// `cluster_nodes = 1` is load-bearing, not a speed-up: `request_mint_ceiling`
+/// returns `None` above one replica, so this suite's three-node default leaves
+/// the whole reservation path as dead code and proves nothing here.
+///
+/// The reservation writes the partition's superblock before it hands out an
+/// offset, and a first send is where that claim is missing. Neither HTTP route
+/// can carry a retryable refusal back to the caller: the acked route has no
+/// transient replay loop, and `?ack=none` never reads a reply at all, so a
+/// refusal there would answer 202 and drop the message. Both partitions are
+/// produced to exactly once, so a per-partition regression cannot hide behind a
+/// second send.
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_a_solo_topic_when_producing_its_first_http_messages_should_commit_them(
+    harness: &TestHarness,
+) {
+    const ACKED_PARTITION: u32 = 0;
+    const UNACKED_PARTITION: u32 = 1;
+
+    let http = HttpClient::login_root(harness).await;
+    http.create_stream_and_topic("http-first-send", "first", 2)
+        .await;
+
+    let response = http
+        .produce(
+            "http-first-send",
+            "first",
+            ACKED_PARTITION,
+            vec![text_message(1, "first-acked".to_string())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "the first acked send to a never-minted partition must commit, not be refused"
+    );
+    let polled = http
+        .poll("http-first-send", "first", ACKED_PARTITION, 0, 10)
+        .await;
+    assert_eq!(polled.messages.len(), 1, "the first acked send is durable");
+    assert_eq!(
+        polled.messages[0].payload,
+        bytes::Bytes::from("first-acked")
+    );
+
+    let response = http
+        .produce_with_query(
+            "http-first-send",
+            "first",
+            UNACKED_PARTITION,
+            vec![text_message(2, "first-unacked".to_string())],
+            "?ack=none",
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "ack=none must answer before the commit"
+    );
+
+    // 202 says nothing about the commit, which is the whole hazard: a refusal
+    // on this route is answered the same way and leaves no trace. Only the poll
+    // proves the message survived.
+    let deadline = Instant::now() + ASYNC_COMMIT_TIMEOUT;
+    loop {
+        if let Some(polled) = http
+            .try_poll("http-first-send", "first", UNACKED_PARTITION, 0, 10)
+            .await
+            && !polled.messages.is_empty()
+        {
+            assert_eq!(polled.messages.len(), 1, "exactly one message was produced");
+            assert_eq!(
+                polled.messages[0].payload,
+                bytes::Bytes::from("first-unacked"),
+                "the first ack=none send to a never-minted partition must not be dropped"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first ack=none send never became pollable within {ASYNC_COMMIT_TIMEOUT:?}"
+        );
+        sleep(ASYNC_COMMIT_RETRY_INTERVAL).await;
+    }
+}
+
 /// End-to-end RBAC proof: an ungranted user is 403 on a metadata read and on a
 /// data-plane produce, root stays 200/201, and the auth-only cluster-metadata
 /// route is never gated. Exercises the HTTP per-op gates (read + partition
