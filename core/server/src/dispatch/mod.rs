@@ -693,7 +693,7 @@ async fn handle_client_request<B, MJ, S, SB>(
                 transport_client_id,
                 transport_client_id,
                 EvictionReason::NoSession,
-                "unbound replicated request",
+                "unbound_replicated_request",
             )
             .await;
         }

@@ -347,7 +347,7 @@ async fn surface_login_failure<B, MJ, S, SB>(
             transport_client_id,
             request_header,
             &transient_login_code(error),
-            "login transient replay hint",
+            "login_transient_replay_hint",
         )
         .await;
     }

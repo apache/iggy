@@ -1141,7 +1141,7 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
                 transport_client_id,
                 template.header(),
                 &IggyError::TransientNotAccepted,
-                "delete_segments transient rejection",
+                "delete_segments_transient_rejection",
             )
             .await;
             return;
