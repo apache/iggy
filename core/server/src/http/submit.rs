@@ -23,12 +23,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use consensus::MetadataHandle;
 use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
-use metadata::impls::metadata::StreamsFrontend;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
@@ -41,10 +39,9 @@ use crate::http::reply::{classify_partition_reply, committed_payload, eviction_e
 use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
 use crate::http::wire::build_request_message;
-use crate::pat::rewrite_pat_request_for_user;
 use crate::responses::transient_code;
+use crate::rewrite::http_chain;
 use crate::shell::ServerShard;
-use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 
 /// Bound on a partition write's (produce / consumer-offset write) wait for its
@@ -217,22 +214,8 @@ async fn submit_gated(
         request_id,
         body,
     );
-    let (message, raw_token) = rewrite_pat_request_for_user(
-        session.user_id,
-        max_tokens_per_user,
-        |user_id| {
-            shard
-                .plane
-                .metadata()
-                .mux_stm
-                .users()
-                .read(|users| users.pat_count_of(user_id))
-        },
-        message,
-    )
-    .map_err(WriteError::Rejected)?;
-    let message =
-        maybe_rewrite_user_password_request(shard, message).map_err(WriteError::Rejected)?;
+    let (message, raw_token) = http_chain(shard, session.user_id, max_tokens_per_user, message)
+        .map_err(WriteError::Rejected)?;
     // `DeleteSegments` is not itself a consensus op: resolve it to the metadata
     // `TruncatePartition` that commits the trim before it reaches consensus,
     // mirroring the TCP dispatch. The truncate rides this session's burned

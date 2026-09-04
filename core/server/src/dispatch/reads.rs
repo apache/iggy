@@ -26,9 +26,11 @@
 //! the HTTP layer), never in the builder.
 
 use crate::cluster_meta::ClusterRoster;
-use crate::dispatch::authz::{authorize_default_read, authorize_uid, send_non_replicated_deny};
+use crate::dispatch::authz::{authorize_default_read, authorize_uid};
+use crate::dispatch::failure::{
+    FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
+};
 use crate::dispatch::partition::{handle_get_consumer_offset, handle_poll_messages};
-use crate::dispatch::send_non_replicated_bytes;
 use crate::responses::{
     build_empty_reply, build_get_me_response, build_get_personal_access_tokens_response,
     build_non_replicated_response, connected_client_to_response, current_metadata_commit,
@@ -67,7 +69,7 @@ use metadata::permissioner::Permissioner;
 use server_common::Message;
 use std::cell::RefCell;
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -96,6 +98,7 @@ async fn handle_get_personal_access_tokens<B, MJ, S, SB>(
         request,
         transport_client_id,
         response.to_bytes(),
+        FrameChannel::Reply,
         "get_personal_access_tokens",
     )
     .await;
@@ -123,6 +126,7 @@ async fn handle_get_me<B, MJ, S, SB>(
         request,
         transport_client_id,
         response.to_bytes(),
+        FrameChannel::Reply,
         "get_me",
     )
     .await;
@@ -340,6 +344,13 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     system_config: &Arc<ServerSystemConfig>,
     transport_client_id: u128,
     request: Message<RoutedRequestHeader>,
+    // Acting user, peer address and read-your-writes floor for the read gates
+    // below, resolved by the funnel in the same connection lookup as the
+    // heartbeat. `user_id` is `None` only on the pre-auth path (PING), which
+    // serves ungated codes; the gated arms fail closed on it. An unknown
+    // connection arrives with a floor of `0`: it was promised nothing, so its
+    // reads wait for nothing.
+    (user_id, client_address, watermark): (Option<u32>, Option<SocketAddr>, u64),
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -349,16 +360,10 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
 {
     const CODE_RANGE: std::ops::Range<usize> = 0..4;
     let code = u32::from_le_bytes(request.header().reserved[CODE_RANGE].try_into().unwrap());
-    // Acting user, peer address and read-your-writes floor for the gates
-    // below, resolved in one connection lookup. `user_id` is `None` only on the
-    // pre-auth path (PING), which serves ungated codes; the gated arms fail
-    // closed on it.
-    let (user_id, client_address, watermark) = sessions.borrow().read_context(transport_client_id);
     match code {
         PING_CODE => {
-            // A ping is the client's liveness proof; reset its staleness clock
-            // so the heartbeat verifier doesn't evict an active connection.
-            sessions.borrow_mut().record_heartbeat(transport_client_id);
+            // No `record_heartbeat` here: the funnel records one for EVERY
+            // frame before classification, so a ping is already covered.
             let commit = current_metadata_commit(shard);
             let reply = build_empty_reply(
                 request.header(),
@@ -366,17 +371,14 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 request.header().session,
                 commit,
             );
-            if let Err(error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    "failed to send non-replicated ping reply"
-                );
-            }
+            send_host_frame(
+                &shard.bus,
+                transport_client_id,
+                reply.into_generic().into_frozen(),
+                FrameChannel::Reply,
+                "ping_reply",
+            )
+            .await;
         }
         GET_ME_CODE => {
             // Self-scoped, so no permissioner rule -- but the consumer-group
@@ -421,6 +423,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 &request,
                 transport_client_id,
                 response.to_bytes(),
+                FrameChannel::Reply,
                 "get_clients",
             )
             .await;
@@ -469,8 +472,15 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 }
                 .to_bytes()
             });
-            send_non_replicated_bytes(shard, &request, transport_client_id, bytes, "get_client")
-                .await;
+            send_non_replicated_bytes(
+                shard,
+                &request,
+                transport_client_id,
+                bytes,
+                FrameChannel::Reply,
+                "get_client",
+            )
+            .await;
         }
         GET_SNAPSHOT_FILE_CODE => {
             handle_get_snapshot(shard, system_config, transport_client_id, &request, user_id).await;
@@ -544,6 +554,27 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     })
     .await
     {
+        // Same line as the builder-`Err` branch below: `send_non_replicated_deny`
+        // logs only on send FAILURE, so a refusal that reaches the client would
+        // otherwise leave nothing server-side - including the refusal this gate
+        // now issues for every armless or unknown non-replicated code.
+        // The frontier wait reaches here through the same `Err` and has
+        // already counted and logged itself, so it stays at `debug!`: a durably
+        // lagging node refuses every held read of every client for as long as
+        // it lags, and warning here would be a line per refusal.
+        if matches!(error, IggyError::TransientNotAccepted) {
+            debug!(
+                transport_client_id,
+                code, "denying non-replicated VSR request; read frontier unreached"
+            );
+        } else {
+            warn!(
+                transport_client_id,
+                code,
+                error = %error,
+                "denying non-replicated VSR request"
+            );
+        }
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
@@ -571,18 +602,14 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
                 request.header().session,
                 commit,
             );
-            if let Err(error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    code,
-                    error = %error,
-                    "failed to send non-replicated VSR reply"
-                );
-            }
+            send_host_frame(
+                &shard.bus,
+                transport_client_id,
+                reply.into_generic().into_frozen(),
+                FrameChannel::Reply,
+                "non_replicated_reply",
+            )
+            .await;
         }
         Err(error) => {
             // Surface the builder's typed error (unsupported op, undecodable
@@ -659,6 +686,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
                 request,
                 transport_client_id,
                 GetSnapshotResponse { data: archive }.to_bytes(),
+                FrameChannel::Reply,
                 "get_snapshot",
             )
             .await;
@@ -732,6 +760,7 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
         request,
         transport_client_id,
         body,
+        FrameChannel::Reply,
         "sync_consumer_group",
     )
     .await;

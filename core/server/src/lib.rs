@@ -45,6 +45,7 @@ pub(crate) mod consumer_group;
 pub(crate) mod dispatch;
 pub(crate) mod pat;
 pub(crate) mod responses;
+pub(crate) mod rewrite;
 pub mod session_manager;
 pub mod shell;
 
