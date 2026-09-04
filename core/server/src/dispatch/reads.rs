@@ -558,14 +558,23 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         // logs only on send FAILURE, so a refusal that reaches the client would
         // otherwise leave nothing server-side - including the refusal this gate
         // now issues for every armless or unknown non-replicated code.
-        // `error` separates an authz denial from the frontier wait's own
-        // `TransientNotAccepted`, which reaches here through the same `Err`.
-        warn!(
-            transport_client_id,
-            code,
-            error = %error,
-            "denying non-replicated VSR request"
-        );
+        // The frontier wait reaches here through the same `Err` and has
+        // already counted and logged itself, so it stays at `debug!`: a durably
+        // lagging node refuses every held read of every client for as long as
+        // it lags, and warning here would be a line per refusal.
+        if matches!(error, IggyError::TransientNotAccepted) {
+            debug!(
+                transport_client_id,
+                code, "denying non-replicated VSR request; read frontier unreached"
+            );
+        } else {
+            warn!(
+                transport_client_id,
+                code,
+                error = %error,
+                "denying non-replicated VSR request"
+            );
+        }
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
