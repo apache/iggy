@@ -28,6 +28,7 @@ use configs::sharding::{
     INBOX_CAPACITY_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX,
 };
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
+use metadata::AppliedFrontier;
 use partitions::FatalCommit;
 use server_common::executor::create_shard_executor;
 use shard::metrics::ShardMetrics;
@@ -426,6 +427,7 @@ pub(in crate::boot) fn run_shard_thread(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     roster_cells: RosterCells,
+    metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
@@ -469,6 +471,7 @@ pub(in crate::boot) fn run_shard_thread(
             barrier,
             owner_table,
             roster_cells,
+            metadata_applied_frontier,
             shard_metrics_all,
         ))
         .await

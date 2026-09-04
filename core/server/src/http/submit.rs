@@ -34,16 +34,15 @@ use tracing::warn;
 
 use crate::dispatch::partition::{dispatch_partition_request, resolve_delete_segments_truncate};
 use crate::dispatch::session_ops::submit_logout_on_owner;
-use crate::dispatch::submit::submit_client_request_on_owner;
+use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
-use crate::http::reply::{
-    classify_partition_reply, committed_payload, eviction_error, transient_code,
-};
+use crate::http::reply::{classify_partition_reply, committed_payload, eviction_error};
 use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
 use crate::http::wire::build_request_message;
 use crate::pat::rewrite_pat_request_for_user;
+use crate::responses::transient_code;
 use crate::shell::ServerShard;
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
@@ -106,6 +105,7 @@ pub(in crate::http) async fn submit_committed(
     let (result_slot, committed) = oneshot::channel();
     let shard = Rc::clone(&state.shard);
     let task_session = Rc::clone(session);
+    let watermarks = Rc::clone(&state.metadata_watermarks);
     let body = body.to_vec();
     let max_tokens_per_user = state.max_tokens_per_user;
     // Detached so a client disconnect cannot abandon the gate mid-submit;
@@ -113,6 +113,25 @@ pub(in crate::http) async fn submit_committed(
     compio::runtime::spawn(async move {
         let result =
             submit_gated(&shard, &task_session, operation, max_tokens_per_user, &body).await;
+        // Recorded here rather than after the await below, for the same reason
+        // the submit is detached: a caller that disconnected mid-write still
+        // committed the op, and its next request as this user must not be
+        // served state older than what committed. Ordered before the wake, so a
+        // read issued the instant the response lands already sees the mark.
+        //
+        // A follower with HTTP forwarding ON never runs this task: the
+        // middleware relays the write and records the floor from the serving
+        // primary's applied op instead (`http::forward::record_relayed_floor`).
+        // One gap survives that split - a relayed 503 carrying
+        // `TransientNotCommitted` is passed through untouched rather than
+        // retried, because its op may still commit, and only a 2xx records a
+        // floor. A write that did commit behind that code therefore leaves
+        // none, until this caller's next committed write raises it.
+        if let Ok((_, reply, _)) = &result
+            && let Some(commit) = committed_reply_commit(reply)
+        {
+            watermarks.record(task_session.user_id, commit);
+        }
         // A failed send means the handler died mid-await; the submit itself
         // already completed, which is the invariant that matters.
         let _ = result_slot.send(result);

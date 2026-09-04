@@ -6744,13 +6744,13 @@ where
                 self.note_metadata_transfer_progress();
                 self.metadata_transfer_decode_failures.set(None);
                 if outcome.pairing_durable {
-                    // `applied_frontier`, not the transferred snapshot's op: the install
+                    // `installed_frontier`, not the transferred snapshot's op: the install
                     // returns `max(snapshot_seq, local_applied)`, which differs whenever a
                     // serving peer offers a snapshot BEHIND this replica (checkpoints are
                     // node-local) and the local state machine is kept instead.
                     tracing::info!(
                         shard = self.id,
-                        applied_frontier = outcome.applied_frontier,
+                        installed_frontier = outcome.installed_frontier,
                         commit_op,
                         table_frontier,
                         "metadata state transfer installed; handing tail to journal repair"
@@ -6761,7 +6761,7 @@ where
                     // let every one of them pass on the degraded path.
                     tracing::warn!(
                         shard = self.id,
-                        applied_frontier = outcome.applied_frontier,
+                        installed_frontier = outcome.installed_frontier,
                         commit_op,
                         table_frontier,
                         "metadata state transfer landed WITHOUT a durable checkpoint \
