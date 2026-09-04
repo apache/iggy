@@ -92,6 +92,7 @@ impl EndpointRegistry {
 
         let mut restored = 0;
         let mut tombstones = 0;
+        let mut dropped_static = 0;
         for (endpoint_id, mut endpoint) in persisted.endpoints {
             endpoint.submitted = true;
             let revoked = !endpoint.is_active();
@@ -118,6 +119,17 @@ impl EndpointRegistry {
                 }
                 Entry::Occupied(_) => {}
                 Entry::Vacant(vacant) => {
+                    // A static entry reaches this arm only when TOML no longer
+                    // declares it. Restoring an active one resurrects an
+                    // endpoint the operator decommissioned by deleting it, and
+                    // `rotate_secret` then refuses it as static and points at a
+                    // TOML entry that is gone, so there is no way back. Its
+                    // tombstone still has to survive: re-adding the id to TOML
+                    // later must not undo a revocation.
+                    if !revoked && endpoint.origin == EndpointOrigin::Static {
+                        dropped_static += 1;
+                        continue;
+                    }
                     vacant.insert(endpoint);
                     if revoked {
                         tombstones += 1;
@@ -126,6 +138,13 @@ impl EndpointRegistry {
                     }
                 }
             }
+        }
+        // Loud on purpose: these were serving before the restart, and the only
+        // trace of them left is this line.
+        if dropped_static > 0 {
+            warn!(
+                "Dropped {dropped_static} persisted static endpoint(s) for {CONNECTOR_NAME} connector ID: {connector_id} that the TOML config no longer declares; they no longer serve"
+            );
         }
         info!(
             "Restored registry for {CONNECTOR_NAME} connector ID: {connector_id}, static endpoints: {static_count}, dynamic endpoints: {restored}, revoked: {tombstones}"
@@ -281,6 +300,15 @@ mod tests {
             origin: EndpointOrigin::Dynamic,
             state: EndpointState::Active,
             submitted: false,
+        }
+    }
+
+    /// A static endpoint as it appears *in the state file*, which is where a
+    /// TOML-declared endpoint ends up once any flush has run.
+    fn persisted_static_endpoint(raw_id: &str) -> Endpoint {
+        Endpoint {
+            origin: EndpointOrigin::Static,
+            ..dynamic_endpoint(raw_id)
         }
     }
 
@@ -567,6 +595,45 @@ mod tests {
             endpoint.auth_type,
             EndpointAuthType::HmacSha256,
             "editing TOML and restarting is the documented way to change a static endpoint"
+        );
+    }
+
+    #[test]
+    fn given_static_endpoint_removed_from_config_when_restored_should_not_resurrect_it() {
+        // Deleting the block from TOML is how an operator decommissions a
+        // static endpoint. The state file still holds it, so restoring it
+        // would keep serving a secret the operator believes is gone, and
+        // rotate_secret would refuse it as static and point at TOML that no
+        // longer describes it.
+        let mut persisted = EndpointRegistry::default();
+        assert!(persisted.insert(persisted_static_endpoint(ENDPOINT_ONE)));
+
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1)
+            .expect("the registry must restore");
+
+        assert!(
+            restored.endpoint(ENDPOINT_ONE).is_none(),
+            "a static endpoint deleted from TOML must not come back from the state file"
+        );
+    }
+
+    #[test]
+    fn given_revoked_static_endpoint_absent_from_config_when_restored_should_keep_the_tombstone() {
+        // The other half of the rule above: dropping the entry entirely would
+        // mean re-adding the id to TOML later silently undoes the revocation.
+        let mut persisted = EndpointRegistry::default();
+        assert!(persisted.insert(persisted_static_endpoint(ENDPOINT_ONE)));
+        assert!(persisted.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
+
+        let restored = EndpointRegistry::restore(&[], Some(registry_state(&persisted)), 1)
+            .expect("the registry must restore");
+
+        let endpoint = restored
+            .endpoint(ENDPOINT_ONE)
+            .expect("the tombstone must survive");
+        assert!(
+            !endpoint.is_active(),
+            "a revoked static endpoint must stay revoked even once TOML stops declaring it"
         );
     }
 
