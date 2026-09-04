@@ -333,11 +333,9 @@ const _: () =
     assert!(consensus::DVC_HEADERS_MAX == iggy_binary_protocol::consensus::DVC_HEADERS_MAX);
 const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
 
-/// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count.
-/// Retries pin at the backoff cap after warmup, so the window divided by
-/// [`journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS`] bounds how
-/// long a wedged replica may limp before it fail-stops. Zero stays zero
-/// (fail-stop disabled).
+/// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count,
+/// which is the only shape the shard's `superblock_wedged` can compare. Zero
+/// stays zero (fail-stop disabled).
 fn superblock_wedged_fatal_failures(config: &ServerConfig) -> u64 {
     superblock_window_to_failures(
         config
@@ -347,12 +345,44 @@ fn superblock_wedged_fatal_failures(config: &ServerConfig) -> u64 {
     )
 }
 
+/// The failure count whose arrival time is the first at or past `window`.
+///
+/// Walks the real retry schedule rather than dividing by the backoff cap. Only
+/// the retries past warmup pin at the cap: the first six wait 20, 40, 80, 160,
+/// 320 and 640 ms, so they spend 1.26 s of the window where a flat division
+/// charges them six. The default 2 m window came out as 120 failures, which
+/// arrive after about 114.26 s -- the fail-stop firing almost six seconds before
+/// the window the operator configured.
 fn superblock_window_to_failures(window: Duration) -> u64 {
     if window.is_zero() {
         return 0;
     }
-    let cap_micros = u128::from(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
-    u64::try_from((window.as_micros() / cap_micros).max(1)).unwrap_or(u64::MAX)
+    // `write_superblock_inner` records failure N and only then arms the wait
+    // that follows it, so failure N ARRIVES at the sum of the N-1 waits before
+    // it -- the first arrives at zero. The loop sums forward until the window is
+    // covered, and the count that satisfies it is one past the last wait summed.
+    let window_micros = window.as_micros();
+    let mut elapsed = 0u128;
+    let mut waits = 0u64;
+    while elapsed < window_micros {
+        waits += 1;
+        elapsed += u128::from(superblock_retry_backoff_micros(waits));
+    }
+    // A window shorter than the very first retry lands here with one wait
+    // summed, giving two: a threshold of one would fail-stop on the first
+    // failure, before any of the window had elapsed at all.
+    waits.saturating_add(1)
+}
+
+/// The wait `IggyPartition`'s superblock writer arms after its `failures`-th
+/// consecutive failure.
+///
+/// Mirrors that arithmetic exactly. A divergence here does not fail a test, it
+/// moves the fail-stop to a time no operator asked for.
+fn superblock_retry_backoff_micros(failures: u64) -> u64 {
+    journal::superblock::SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS
+        .saturating_mul(1 << failures.min(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT))
+        .min(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS)
 }
 
 /// Floor for the post-restart read-recovery deadline (see
@@ -592,14 +622,51 @@ mod tests {
         );
         assert_eq!(
             superblock_window_to_failures(Duration::from_mins(2)),
-            120,
-            "past warmup one retry rides each 1s backoff cap"
+            126,
+            "the six warmup retries spend 1.26s, not 6s: 120 would fire at ~114.26s"
+        );
+        assert_eq!(
+            superblock_window_to_failures(Duration::from_secs(30)),
+            36,
+            "the configured floor for a nonzero window"
         );
         assert_eq!(
             superblock_window_to_failures(Duration::from_micros(500)),
-            1,
-            "a sub-cap window still needs one failure to fire"
+            2,
+            "a window shorter than the first retry must not fail-stop on the \
+             very first failure, before any of it elapsed"
         );
+    }
+
+    /// The threshold is a floor on elapsed time, never a ceiling: the failure it
+    /// names must arrive at or after the configured window, and its predecessor
+    /// must arrive before it. Walked against the writer's own schedule.
+    #[test]
+    fn given_a_fatal_window_when_converted_should_never_fire_before_it_elapses() {
+        for window in [
+            Duration::from_secs(30),
+            Duration::from_secs(45),
+            Duration::from_mins(2),
+            Duration::from_mins(10),
+        ] {
+            let threshold = superblock_window_to_failures(window);
+            // Failure N arrives at the sum of the N-1 waits before it.
+            let arrival = |count: u64| -> u128 {
+                (1..count)
+                    .map(|wait| u128::from(superblock_retry_backoff_micros(wait)))
+                    .sum()
+            };
+            assert!(
+                arrival(threshold) >= window.as_micros(),
+                "{window:?}: failure {threshold} arrives at {}us, inside the window",
+                arrival(threshold)
+            );
+            assert!(
+                arrival(threshold - 1) < window.as_micros(),
+                "{window:?}: failure {} already covers the window, so {threshold} is late",
+                threshold - 1
+            );
+        }
     }
 
     #[test]
@@ -846,6 +913,21 @@ mod tests {
             config_default as u64,
             shard::REPAIR_CHUNK_MAX,
             "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn default_offset_reservation_lease_matches_partitions_constant() {
+        // `IggyPartition::new` falls back to the partitions constant (simulator,
+        // unit tests) while boot installs this one, so drift would have the
+        // fence write at a different rate in the simulator than in production.
+        let config_default =
+            configs::partition::PartitionConfig::default().offset_reservation_lease;
+        assert_eq!(
+            config_default.get(),
+            partitions::DEFAULT_OFFSET_RESERVATION_LEASE,
+            "[partition] offset_reservation_lease default drifted from \
+             partitions::DEFAULT_OFFSET_RESERVATION_LEASE"
         );
     }
 

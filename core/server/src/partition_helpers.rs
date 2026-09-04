@@ -46,7 +46,9 @@ use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
 use metadata::stm::stream::Partition;
 use metadata::{IdentityField, ReplicaIdentity};
-use partitions::{IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, Segment};
+use partitions::{
+    IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionsConfig, Segment,
+};
 use server_common::SegmentStorage;
 use server_common::fs_utils::remove_dir_all;
 use server_common::sharding::IggyNamespace;
@@ -143,15 +145,16 @@ pub async fn create_partition_file_hierarchy(
 /// Populate `partition` with consumer-offset / consumer-group-offset storage.
 ///
 /// Hydrates from on-disk state if files exist (recovery path) or
-/// configures empty maps (fresh partition path). `current_offset` bounds
-/// recovered offsets so a partition that lost its tail does not surface
-/// consumer offsets ahead of its current log head.
+/// configures empty maps (fresh partition path). Recovered offsets are bounded
+/// so a partition that lost its tail does not surface consumer offsets ahead of
+/// an offset it never handed out, and `current_offset` is where a bounded one
+/// lands.
 ///
 /// # Errors
 ///
 /// Returns [`ServerError::ConsumerOffsetsLoad`] when the on-disk files
-/// exist but fail to decode. A stored offset ahead of `current_offset` is
-/// clamped (with a warning), not an error.
+/// exist but fail to decode. A stored offset past the offset space is clamped
+/// to `current_offset` (with a warning), not an error.
 pub fn configure_consumer_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
@@ -169,6 +172,17 @@ pub fn configure_consumer_offsets(
         config
             .system
             .get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+    // The bound is the offset space this replica could have MINTED, not the data
+    // it can still serve. A boot re-anchor leaves the append point a lease block
+    // above the recovered chain, so on the restart after a crash that took
+    // acked-but-unflushed messages, a position stored before that crash names a
+    // real offset sitting under an empty chain -- confirmed to a client, and not
+    // "past the log" the way a torn offset file is. Bounding it by the data head
+    // instead walks a committed consumer position BACKWARD across the restart,
+    // which is the silent re-read the reservation exists to prevent.
+    // `mint_frontier` is one past the next mint, and reads 0 on the fresh-build
+    // path, where the max leaves `current_offset` in charge as before.
+    let offset_space_ceiling = current_offset.max(partition.mint_frontier().saturating_sub(1));
 
     let loaded_consumer_offsets = load_partition_consumer_offsets(
         &consumer_offsets_path,
@@ -182,7 +196,7 @@ pub fn configure_consumer_offsets(
         let guard = consumer_offsets.pin();
         for offset in loaded_consumer_offsets {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
-            if recovered_offset > current_offset {
+            if recovered_offset > offset_space_ceiling {
                 // A crash can persist an offset ahead of the flushed data
                 // (offsets are stored eagerly, messages flush later). Clamp to
                 // the recovered head so the consumer resumes instead of being
@@ -191,6 +205,7 @@ pub fn configure_consumer_offsets(
                     consumer_id = offset.consumer_id,
                     recovered_offset,
                     current_offset,
+                    offset_space_ceiling,
                     stream_id,
                     topic_id,
                     partition_id,
@@ -213,11 +228,12 @@ pub fn configure_consumer_offsets(
         let guard = consumer_group_offsets.pin();
         for (group_id, offset) in loaded_group_offsets {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
-            if recovered_offset > current_offset {
+            if recovered_offset > offset_space_ceiling {
                 warn!(
                     consumer_group_id = group_id.0,
                     recovered_offset,
                     current_offset,
+                    offset_space_ceiling,
                     stream_id,
                     topic_id,
                     partition_id,
@@ -328,7 +344,7 @@ pub async fn ensure_initial_segment(
     // `rposition(|s| s.start_offset <= offset)` routes every poll for `0..N-1`
     // into it, the next boot makes that shape durable, and this replica starts
     // offering peers a segment that claims `[0..N]`.
-    let start_offset = partition.offset_frontier();
+    let start_offset = partition.mint_frontier();
     let messages_path =
         config
             .system
@@ -535,6 +551,7 @@ pub async fn load_partition_or_fence(
     // outgrow clippy's `large_futures` cap, and this runs once per partition.
     match Box::pin(load_partition(
         config,
+        partitions.config(),
         namespace,
         Arc::clone(&partition_stats),
         partition_metadata,
@@ -708,6 +725,7 @@ pub async fn load_partition_or_fence(
 #[allow(clippy::too_many_arguments)]
 async fn load_partition(
     config: &ServerConfig,
+    partitions_config: &PartitionsConfig,
     namespace: IggyNamespace,
     stats: Arc<PartitionStats>,
     partition_metadata: &Partition,
@@ -798,6 +816,7 @@ async fn load_partition(
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
     partition.set_dedup_clients_max(config.partition.dedup_clients_max);
+    partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir.clone());
     // Before the hydrate: the durable record is keyed by incarnation, so a
     // `purge.gen` left behind by a previous life of this namespace reads 0.
@@ -813,6 +832,28 @@ async fn load_partition(
     )
     .await?;
 
+    partition.created_at = partition_metadata.created_at;
+    restore_partition_offsets(&mut partition, partitions_config, recovered_state.as_ref()).await?;
+    let current_offset = partition.offset.load(Ordering::Acquire);
+
+    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
+    ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
+
+    Ok(partition)
+}
+
+/// Restore the offset counter of a recovered partition from what boot could
+/// prove about its offset space, then put the next append point where the
+/// recovery walk can read it back.
+///
+/// Three carriers, weakest last: the sized segments' end offset, an empty
+/// chain's file name (a state-transfer install at the group frontier), and the
+/// superblock's durable frontier as a lower bound over both.
+async fn restore_partition_offsets(
+    partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+    partitions_config: &PartitionsConfig,
+    recovered_state: Option<&VsrState>,
+) -> Result<(), ServerError> {
     let sized_end = partition
         .log
         .segments()
@@ -825,15 +866,23 @@ async fn load_partition(
     // frontier after the origin GC'd everything: the file name carries the
     // frontier, and re-minting offsets from 0 here would fork this
     // replica's batch stamps from the rest of the group after a restart.
+    //
+    // Bounded by the durable frontier: an install writes it at the group
+    // frontier, so the name is corroborated, while the boot re-anchor and
+    // `ensure_initial_segment` plant at `mint_frontier()`, a RESERVATION that
+    // names no data and leaves the frontier far below. Without the bound two
+    // crashes under the flush threshold promote 65537 to committed on a
+    // partition holding nothing, and `store_consumer_offset` admits the hole.
+    let durable_frontier = recovered_state.map_or(0, |state| state.offset_frontier);
     let empty_frontier = partition
         .log
         .segments()
         .iter()
         .map(|segment| segment.start_offset)
         .max()
+        .map(|start| start.min(durable_frontier))
         .filter(|&start| sized_end.is_none() && start > 0);
     let current_offset = sized_end.or_else(|| empty_frontier.map(|start| start - 1));
-    partition.created_at = partition_metadata.created_at;
     partition.recovered_durable_offset = sized_end;
     // The OFFSET COUNTER is restored from that file name (above), but the
     // `installed_frontier` CLAIM deliberately is not: the claim says "everything
@@ -851,18 +900,27 @@ async fn load_partition(
     let counter = current_offset.unwrap_or(0);
     partition.offset.store(counter, Ordering::Release);
     partition.dirty_offset.store(counter, Ordering::Relaxed);
-    partition.should_increment_offset = current_offset.is_some();
+    partition.set_offset_space_used(current_offset.is_some());
     // The durable frontier is a LOWER BOUND on top of what the segments proved:
     // it is the only carrier left when the segments that named the frontier are
     // gone (an all-GC'd origin's install, a crash inside the swap window), and
     // taking the max means real recovered data always wins.
-    partition.restore_offset_frontier(recovered_state.as_ref());
-    let current_offset = partition.offset.load(Ordering::Acquire);
-
-    configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
-    ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
-
-    Ok(partition)
+    partition.restore_offset_frontier(recovered_state);
+    // Minting from the reservation leaves a hole between the recovered chain
+    // and the new append point, and the recovery walk REFUSES a hole inside a
+    // segment (tombstoning the partition on the solo arm), so put it on a
+    // segment boundary instead.
+    //
+    // Solo only, in step with the reservation itself: a replicated group's
+    // segment boundaries must be a function of the batches alone or the
+    // reconciler's offset-keyed segment GC never converges.
+    if partition.consensus().replica_count() == 1 {
+        partition
+            .reanchor_to_offset_frontier(partitions_config)
+            .await
+            .map_err(|error| ServerError::Iggy(Box::new(error)))?;
+    }
+    Ok(())
 }
 
 /// Recover this partition's persisted segment chain, stamping each segment
@@ -887,26 +945,18 @@ async fn recover_partition_segments(
     let enforce_fsync = runtime_options
         .enforce_fsync
         .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
-    load_persisted_segments(
-        config,
-        stream_id,
-        topic_id,
-        partition_id,
-        segment_size,
-        enforce_fsync,
-        stats,
-    )
-    .await
-    .map_err(|source| {
-        error!(
-            stream_id,
-            topic_id,
-            partition_id,
-            error = %source,
-            "failed to load partition log during server bootstrap"
-        );
-        source
-    })
+    load_persisted_segments(config, namespace, segment_size, enforce_fsync, stats)
+        .await
+        .map_err(|source| {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id,
+                error = %source,
+                "failed to load partition log during server bootstrap"
+            );
+            source
+        })
 }
 
 /// Reopen writers over a recovered segment chain.
@@ -1078,9 +1128,9 @@ fn hydrate_reopen_error(
 /// `seed_view` comment below for why a group left at view 0 is unreachable. A
 /// restart materialization ignores it and probes for the live view instead.
 ///
-/// The returned partition's `offset` / `dirty_offset` are `0` and
-/// `should_increment_offset` is `false`, mirroring a clean append starting
-/// at the empty segment.
+/// The returned partition's `offset` / `dirty_offset` are `0` and its
+/// `OffsetSpace` is unused, mirroring a clean append starting at the empty
+/// segment.
 ///
 /// # Errors
 ///
@@ -1212,6 +1262,7 @@ pub async fn build_partition_fresh(
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
     partition.set_dedup_clients_max(config.partition.dedup_clients_max);
+    partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir);
     // Fresh dirs read generation 0; a dir surviving from a crashed process
     // (this "fresh" build races repair re-materialization) reads the last
@@ -1224,7 +1275,7 @@ pub async fn build_partition_fresh(
     partition.created_at = IggyTimestamp::now();
     partition.offset.store(0, Ordering::Release);
     partition.dirty_offset.store(0, Ordering::Relaxed);
-    partition.should_increment_offset = false;
+    partition.set_offset_space_used(false);
     debug_assert!(
         !partition.log.has_segments(),
         "fresh partition must not carry recovered segments"
@@ -1312,6 +1363,7 @@ pub async fn delete_partitions_from_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use configs::server::ServerSystemConfig;
     use journal::superblock::SuperblockStore;
 
     const CLUSTER: u128 = 7;
@@ -1329,6 +1381,19 @@ mod tests {
             checkpoint_op: 0,
             checkpoint_checksum: 0,
             offset_frontier: 0,
+            offset_reserved: 0,
+        }
+    }
+
+    /// The solo shape the reservation is scoped to, with a claim already
+    /// recorded and nothing flushed behind it.
+    fn reserved_solo_state(reserved: u64) -> VsrState {
+        VsrState {
+            replica_id: 0,
+            replica_count: 1,
+            commit_max: 0,
+            offset_reserved: reserved,
+            ..recorded_state(0, 0)
         }
     }
 
@@ -1342,6 +1407,83 @@ mod tests {
             replica_id: REPLICA,
             replica_count: REPLICAS,
         }
+    }
+
+    /// A rebuild that reads a reservation back must NAME its planted segment for
+    /// the append point. Named 0, the segment takes the first append's
+    /// `base_offset` of N instead, `rposition(|s| s.start_offset <= offset)`
+    /// routes every poll for `0..N-1` into it, and the next boot makes that
+    /// durable.
+    #[compio::test]
+    async fn given_a_recorded_reservation_when_building_fresh_should_plant_at_the_append_point() {
+        const RESERVED: u64 = 65_537;
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = ServerConfig {
+            system: Arc::new(ServerSystemConfig {
+                path: root.path().to_string_lossy().into_owned(),
+                ..ServerSystemConfig::default()
+            }),
+            ..ServerConfig::default()
+        };
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let dir = config.system.get_partition_path(1, 1, 0);
+
+        let identity = ReplicaIdentity {
+            cluster: CLUSTER,
+            replica_id: 0,
+            replica_count: 1,
+        };
+        let (store, recovered) = open_partition_superblock(&dir, identity)
+            .await
+            .expect("open a fresh partition superblock");
+        assert!(recovered.is_none());
+        store
+            .write(&reserved_solo_state(RESERVED).to_bytes())
+            .await
+            .expect("record the reservation");
+        drop(store);
+
+        let partition = build_partition_fresh(
+            &config,
+            namespace,
+            Arc::new(PartitionStats::default()),
+            0,
+            TopicRuntimeOptions::default(),
+            CLUSTER,
+            0,
+            1,
+            0,
+            Rc::new(IggyMessageBus::new(0)),
+        )
+        .await
+        .expect("rebuild the partition over its recorded reservation");
+
+        assert_eq!(
+            partition.mint_frontier(),
+            RESERVED,
+            "the append point must resume above every offset the reservation covered"
+        );
+        assert_eq!(
+            partition.offset_frontier(),
+            0,
+            "nothing was flushed, so the committed frontier names no data"
+        );
+
+        let planted: Vec<String> = std::fs::read_dir(&dir)
+            .expect("list the partition dir")
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                (path.extension()? == "log")
+                    .then(|| path.file_name()?.to_str().map(str::to_owned))
+                    .flatten()
+            })
+            .collect();
+        assert_eq!(
+            planted,
+            vec![format!("{RESERVED:0>20}.log")],
+            "the initial segment must be named for the append point, not offset 0"
+        );
     }
 
     #[compio::test]

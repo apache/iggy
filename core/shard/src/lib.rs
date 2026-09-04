@@ -936,6 +936,16 @@ impl<M> RestorableMetadataStm for M where
 /// so the bounded per-peer bus queue can never drop a burst tail. Clamped
 /// against the live bus ceiling by
 /// [`IggyShard::state_chunk_len_max`] rather than assumed to fit.
+/// Superblock writes issued at once when a whole shard's groups need one in the
+/// same pass: a node-wide view change, or a graceful stop collapsing every
+/// partition's offset reservation.
+///
+/// Each write is a create + write + 2 fsyncs. Serial, a few hundred groups on
+/// ordinary storage overrun the view-change escalation window (and, on the stop
+/// path, a supervisor's kill timeout); unbounded, they dump the whole burst of
+/// fds and fsyncs onto the reactor in one pass.
+const SUPERBLOCK_FAN_OUT: usize = 16;
+
 const STATE_CHUNK_LEN: u32 = 256 * 1024;
 
 /// Bus frame ceiling assumed before bootstrap overrides it. Matches the
@@ -3990,11 +4000,10 @@ where
         }
         // Retained log before the frontier restore, so the restore maxes against
         // the offsets the log proved rather than the zeroes of an empty one.
-        // `restore_offset_frontier` STORES `recovered_end` once past its guard, so
-        // it can lower `dirty_offset`; harmless only because `write_superblock`
-        // maxes the recorded frontier against `offset_frontier()`. The order also
-        // keeps that restore's precondition (`should_increment_offset` already set
-        // by a recovered offset space) meaningful.
+        // `restore_offset_frontier` takes each counter's own max against what is
+        // already loaded, so neither can be lowered here -- but only if the log is
+        // adopted first, or those maxes are taken against the zeroes of a
+        // partition that has not got its offsets back yet.
         if let Some(state) = retained {
             partition.adopt_retained_log(state);
             // OPT-IN, off by default: it models durability Iggy does not have.
@@ -4027,6 +4036,12 @@ where
         // the restore at all, a simulator replica rebuilt against a retained
         // store resumes minting at 0 while its group is at N.
         partition.restore_offset_frontier(recovered_state.as_ref());
+        // And the chain transition that restore obliges, which production's boot
+        // does through `reanchor_to_offset_frontier`. A restored counter can sit
+        // a lease block above the chain, and leaving the tail named below it puts
+        // the next mint inside a segment -- a shape boot never produces, so the
+        // harness would be modelling something the server cannot reach.
+        partition.reanchor_in_memory_to_mint_frontier(partitions.config().segment_size);
         partitions.insert(namespace, partition);
         if self.redispatch_parked_frames(namespace, epoch) {
             // This mutation occurs outside the pump, unlike production's
@@ -6817,40 +6832,49 @@ where
         // partitions-plane borrow is held across the tick `.await`.
         namespace_scratch.extend(partitions.namespaces().copied());
 
-        // Pre-pass: issue every group's pending superblock persist
-        // CONCURRENTLY. A cluster-wide view change makes every group on
-        // this shard need one in the same tick, and each `atomic_replace`
-        // is a create + write + 2 fsyncs; run serially, a few hundred
-        // groups on ordinary storage exceed the 5s view-change escalation
-        // and loop elections. The persists are independent (each group owns
-        // its store, lock, and failure bookkeeping, all behind `&self`),
-        // and the per-group loop below re-checks the gate on its lock-free
-        // fast path, so gating semantics are unchanged.
+        // Pre-pass: issue every group's pending superblock write CONCURRENTLY.
+        // A cluster-wide view change makes every group on this shard need one in
+        // the same tick, and each `atomic_replace` is a create + write + 2
+        // fsyncs; run serially, a few hundred groups on ordinary storage exceed
+        // the 5s view-change escalation and loop elections. The writes are
+        // independent (each group owns its store, lock, and failure bookkeeping,
+        // all behind `&self`), and the per-group loop below re-checks the persist
+        // gate on its lock-free fast path, so gating semantics are unchanged.
+        //
+        // The offset-reservation extension rides the same pre-pass, which is the
+        // whole point of it being here: the append fence writes the superblock
+        // INLINE in this pump, where those two fsyncs delay the tick above for
+        // every group on the core. Extending at half a block of headroom keeps
+        // the fence on its lock-free fast path under load, so the write happens
+        // here instead of in front of a produce. Ordered BEFORE the persist
+        // because any write marks the view durable, so one write can satisfy
+        // both and the persist gate below then finds nothing to do.
         let pending_persists: Vec<_> = namespace_scratch
             .iter()
             .copied()
             .filter(|namespace| {
-                partitions
-                    .get_by_ns(namespace)
-                    .is_some_and(|partition| partition.consensus().needs_superblock_persist())
+                partitions.get_by_ns(namespace).is_some_and(|partition| {
+                    partition.consensus().needs_superblock_persist()
+                        || partition.needs_offset_reservation_extension()
+                })
             })
             .map(|namespace| async move {
                 if let Some(partition) = partitions.get_by_ns(&namespace) {
-                    // The only dropped durability verdict in the tree: this pre-pass
-                    // exists to coalesce the writes, and the per-group loop below re-runs
-                    // the same gate on its lock-free fast path and withholds every
-                    // view-scoped send when it fails, so the verdict here is redundant
-                    // rather than ignored.
+                    // Verdicts dropped on purpose. The reservation is backstopped
+                    // by the fence at the mint, which refuses the append if the
+                    // ceiling never caught up; and the persist gate is re-run by
+                    // the per-group loop below on its lock-free fast path, which
+                    // withholds every view-scoped send when it fails.
+                    if partition.needs_offset_reservation_extension() {
+                        let _ = partition.extend_offset_reservation().await;
+                    }
                     let _ = partition.persist_superblock_if_needed().await;
                 }
             })
             .collect();
-        // Capped fan-out: each persist is a create + write + 2 fsyncs, and a
-        // node-wide view change over many partitions must not dump an
-        // unbounded fd/fsync burst onto the reactor in one tick.
         let mut pending_persists = pending_persists.into_iter();
         loop {
-            let chunk: Vec<_> = pending_persists.by_ref().take(16).collect();
+            let chunk: Vec<_> = pending_persists.by_ref().take(SUPERBLOCK_FAN_OUT).collect();
             if chunk.is_empty() {
                 break;
             }
@@ -6879,6 +6903,27 @@ where
                     fatal = Some(fault.clone());
                 }
                 continue;
+            }
+            // Same bound the metadata plane fail-stops on, applied per group,
+            // and it exits the NODE rather than fencing the group: a partition
+            // whose superblock keeps refusing withholds every view-scoped send,
+            // and on a solo group refuses every append too, so it serves nothing
+            // while the process still reports healthy.
+            let superblock_failures = partition.superblock_write_failures();
+            if superblock_wedged(
+                superblock_failures,
+                self.superblock_wedged_fatal_failures.get(),
+            ) {
+                consensus::fatal(
+                    FatalReason::SuperblockWedged,
+                    &format!(
+                        "partition superblock persist failed {superblock_failures} consecutive \
+                         times for namespace {}, past the [cluster] \
+                         superblock_wedged_fatal_timeout window; exiting so a supervisor handles \
+                         the wedge instead of the replica limping fenced",
+                        namespace.inner()
+                    ),
+                );
             }
 
             let consensus = partition.consensus();
@@ -7103,6 +7148,7 @@ where
             partitions = namespaces.len(),
             "shutdown flush: draining committed journals to segment storage"
         );
+        let mut collapse_pending = Vec::new();
         for namespace in namespaces {
             let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                 continue;
@@ -7121,7 +7167,45 @@ where
                 // after this flush). A partition already fenced by the commit
                 // path keeps its original fault.
                 partition.fence_flush_failure();
+                // The collapse claims the segments account for every confirmed
+                // offset, which a failed flush is exactly the case against, so
+                // leave the reservation standing.
+                continue;
             }
+            collapse_pending.push(namespace);
+        }
+
+        // Collapsed CONCURRENTLY, for the same reason the tick coalesces its view
+        // persists: see [`SUPERBLOCK_FAN_OUT`]. Each group owns its store, lock
+        // and failure bookkeeping, all behind `&self`.
+        //
+        // The flushes above stay serial: they take `&mut`, and the writers they
+        // drive are the shard's, not the partition's.
+        let mut pending = collapse_pending
+            .into_iter()
+            .map(|namespace| async move {
+                // The segments now prove where the offset space ends, so the
+                // reservation has nothing left to witness. Without the collapse
+                // every clean stop would leave a lease-block-wide hole.
+                let Some(partition) = partitions.get_by_ns(&namespace) else {
+                    return;
+                };
+                if !partition.collapse_offset_reservation().await {
+                    tracing::warn!(
+                        namespace_raw = namespace.inner(),
+                        "could not collapse the offset reservation on shutdown; the restart \
+                         will resume above it and leave a gap in the offset space"
+                    );
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+        loop {
+            let chunk: Vec<_> = pending.by_ref().take(SUPERBLOCK_FAN_OUT).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            futures::future::join_all(chunk).await;
         }
     }
 

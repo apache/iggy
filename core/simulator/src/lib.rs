@@ -1324,6 +1324,43 @@ impl Simulator {
         Some(u64::from(partition.consensus().view()))
     }
 
+    /// Claim the first offset block for every live replica's copy of a
+    /// materialised solo partition, standing in for the shard tick that does it
+    /// in production.
+    ///
+    /// The append fence BOUNCES the first send to a partition with no claim on
+    /// disk, so the superblock write lands on the tick rather than inside the
+    /// request pump. A real client retries that `TransientNotAccepted`; the
+    /// simulator has no retry loop, so a scenario that produces to a freshly
+    /// materialised partition and expects the send to commit has to claim the
+    /// block first.
+    ///
+    /// Not folded into [`Self::init_partition`]: materialising a partition is not
+    /// the same event as producing to one, and arming every materialised
+    /// partition would model a superblock write per idle partition that
+    /// production deliberately does not make.
+    ///
+    /// # Panics
+    /// If the simulated superblock refuses the claim, which no scenario injects:
+    /// a silent skip would leave the caller's next send bounced with nothing to
+    /// say why.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn claim_partition_offset_block(&self, namespace: IggyNamespace) {
+        for (index, replica) in self.replicas.iter().enumerate() {
+            if self.crashed.contains(&(index as u8)) {
+                continue;
+            }
+            let shard = replica.partition_shard(namespace);
+            let Some(partition) = shard.plane.partitions().get_by_ns(&namespace) else {
+                continue;
+            };
+            assert!(
+                futures::executor::block_on(partition.extend_offset_reservation()),
+                "the simulated superblock must accept the first offset claim"
+            );
+        }
+    }
+
     /// One replica's view of a partition group's consensus, or `None` when it does
     /// not host the namespace. Read by the quiesce oracle to decide whether a group
     /// has settled into one view, which its leader-relative checks depend on once
@@ -2638,6 +2675,10 @@ mod tests {
         );
 
         sim.init_partition(namespace);
+        // The tick's job in production. Without it the append fence bounces this
+        // first send so the superblock write stays off the request pump, and the
+        // simulator has no client to retry the bounce.
+        sim.claim_partition_offset_block(namespace);
         assert_eq!(
             shard.redispatched_frame_count(),
             1,
