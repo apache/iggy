@@ -146,6 +146,8 @@ line in a regular PR comment (not an inline review reply):
 | `/ready`                            | author or maintainer                | mark `S-waiting-on-review`                                   |
 | `/author`                           | maintainer or returning contributor | mark `S-waiting-on-author`                                   |
 | `/request-review @user-or-team ...` | author or maintainer                | request review from the listed `@user` / `@org/team` handles |
+| `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
+| `/unpin`                            | author or maintainer                | remove `pinned`                                              |
 
 Some labels move on their own: opening or marking a non-draft PR ready sets
 `S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;
