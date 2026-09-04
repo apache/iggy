@@ -121,10 +121,6 @@ use shard::{PartitionRead, PartitionReadReply};
 
 use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
-use crate::dispatch::{
-    validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
-    warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
-};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
@@ -149,6 +145,10 @@ use crate::http::wire::{
 };
 use crate::responses::{
     build_polled_messages_body, build_raw_pat_reply, connected_client_to_response,
+};
+use crate::rewrite::{
+    validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
+    warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
 };
 use crate::snapshot;
 
@@ -1335,8 +1335,9 @@ pub(in crate::http) async fn get_consumer_offset(
     .await?;
     let wire =
         consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
-    let (namespace, partition_id, consumer) =
-        resolve_consumer_offset_request(&state.shard, &wire).map_err(|_| ReadError::NotFound)?;
+    let (namespace, partition_id, consumer) = resolve_consumer_offset_request(&state.shard, &wire)
+        .map_err(|_| ReadError::NotFound)?
+        .ok_or(ReadError::NotFound)?;
     let reply = SendWrapper::new(
         state
             .shard

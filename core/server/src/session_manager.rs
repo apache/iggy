@@ -26,12 +26,35 @@
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
 use crate::cluster_meta::ClusterRoster;
+use ahash::AHashMap;
 use message_bus::installer::conn_info::ClientTransportKind;
 use shard::ConnectedClientInfo;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+/// What the request funnel resolves from one `connections` lookup per frame.
+///
+/// The bound consensus session, the acting user, the transport peer address
+/// and the read-your-writes floor. `Default` (everything absent, no address,
+/// floor `0`) stands for a connection neither this map nor the bus knows.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ConnectionContext {
+    /// `(client_id, session)` once register committed, `None` before.
+    pub bound: Option<(u128, u64)>,
+    /// Acting user from `login`, `None` while still `Connected`.
+    pub user_id: Option<u32>,
+    /// Peer address recorded by [`SessionManager::ensure_connection`]; the
+    /// non-replicated reads pick the advertised address from it, and
+    /// `None` degrades to the catch-all address.
+    pub address: Option<SocketAddr>,
+    /// Read-your-writes floor: the metadata commit this connection's own
+    /// writes have reached, which its reads must not be served below.
+    ///
+    /// A connection this map does not know reads as `0` -- it was promised
+    /// nothing, so its reads wait for nothing.
+    pub metadata_watermark: u64,
+}
 
 /// Connection lifecycle states.
 ///
@@ -107,10 +130,14 @@ pub struct Connection {
 ///   per consensus session). If a client reconnects with the same `client_id`,
 ///   the old connection must be evicted first.
 pub struct SessionManager {
-    connections: HashMap<u128, Connection>,
+    /// `ahash` over `std`: connection and client ids are server-minted, so
+    /// there is no `HashDoS` surface, and both maps sit on the per-frame path.
+    /// Neither is order-sensitive (`iter_clients` and `collect_stale` both
+    /// consume the whole map).
+    connections: AHashMap<u128, Connection>,
     /// Reverse index: `client_id` → `connection_id` for fast lookup when
     /// a consensus reply arrives and needs routing to the right connection.
-    client_to_connection: HashMap<u128, u128>,
+    client_to_connection: AHashMap<u128, u128>,
     /// This shard's copy of the configured cluster roster, served by the
     /// `GetClusterMetadata` read. Lives here because it is the
     /// per-shard context already threaded to the non-replicated read path;
@@ -122,8 +149,8 @@ impl SessionManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            connections: HashMap::new(),
-            client_to_connection: HashMap::new(),
+            connections: AHashMap::new(),
+            client_to_connection: AHashMap::new(),
             cluster_roster: Rc::new(ClusterRoster::disabled()),
         }
     }
@@ -157,12 +184,31 @@ impl SessionManager {
             });
     }
 
-    /// Record a liveness heartbeat (`ping`) for a connection, resetting its
-    /// staleness clock. No-op for an unknown connection.
-    pub fn record_heartbeat(&mut self, connection_id: u128) {
-        if let Some(conn) = self.connections.get_mut(&connection_id) {
-            conn.last_heartbeat = Instant::now();
-        }
+    /// The request funnel's per-frame view of a connection: stamp the
+    /// liveness clock and read back everything the dispatch arms resolve
+    /// from it, in ONE map lookup.
+    ///
+    /// `None` means the connection is not registered yet, which happens
+    /// only on a transport's first frame; the caller installs it from the
+    /// bus metadata ([`Self::ensure_connection`]) and asks again.
+    pub(crate) fn touch_connection(&mut self, connection_id: u128) -> Option<ConnectionContext> {
+        let conn = self.connections.get_mut(&connection_id)?;
+        conn.last_heartbeat = Instant::now();
+        let (bound, user_id) = match conn.state {
+            ConnectionState::Bound {
+                user_id,
+                client_id,
+                session,
+            } => (Some((client_id, session)), Some(user_id)),
+            ConnectionState::Authenticated { user_id } => (None, Some(user_id)),
+            ConnectionState::Connected => (None, None),
+        };
+        Some(ConnectionContext {
+            bound,
+            user_id,
+            address: Some(conn.address),
+            metadata_watermark: conn.metadata_watermark,
+        })
     }
 
     /// Connection ids whose last heartbeat is older than `max_age` -- the
@@ -331,7 +377,11 @@ impl SessionManager {
 
     /// Look up the consensus session for a connection.
     ///
-    /// Returns `(client_id, session)` if the connection is `Bound`, `None` otherwise.
+    /// Returns `(client_id, session)` if the connection is `Bound`, `None`
+    /// otherwise. The request funnel reads it through the crate-private
+    /// `touch_connection` instead, which resolves it in the same lookup as
+    /// the heartbeat; this is for the session-op paths that only need the
+    /// binding.
     #[must_use]
     pub fn get_session(&self, connection_id: u128) -> Option<(u128, u64)> {
         let conn = self.connections.get(&connection_id)?;
@@ -341,38 +391,6 @@ impl SessionManager {
             } => Some((client_id, session)),
             _ => None,
         }
-    }
-
-    /// The transport-level peer address a connection arrived from, recorded by
-    /// [`Self::ensure_connection`] for every transport. The non-replicated
-    /// read path uses it to pick the advertised address a client is told
-    /// about; `None` (unknown connection) degrades to the catch-all address.
-    #[must_use]
-    pub fn connection_address(&self, connection_id: u128) -> Option<SocketAddr> {
-        self.connections
-            .get(&connection_id)
-            .map(|conn| conn.address)
-    }
-
-    /// Acting user, transport peer address and metadata watermark for a
-    /// connection, in one map lookup: the non-replicated dispatch path needs
-    /// all three per request, and the separate accessors would walk the
-    /// connection map (and take the shared borrow) once each.
-    ///
-    /// An unknown connection reads as a watermark of `0`: it was promised
-    /// nothing, so its reads wait for nothing.
-    #[must_use]
-    pub fn read_context(&self, connection_id: u128) -> (Option<u32>, Option<SocketAddr>, u64) {
-        let Some(conn) = self.connections.get(&connection_id) else {
-            return (None, None, 0);
-        };
-        let user_id = match conn.state {
-            ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
-                Some(user_id)
-            }
-            ConnectionState::Connected => None,
-        };
-        (user_id, Some(conn.address), conn.metadata_watermark)
     }
 
     /// Look up the authenticated user id for a connection.

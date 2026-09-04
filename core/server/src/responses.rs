@@ -595,10 +595,15 @@ where
         // than let the catch-all's empty-ok attest an artifact that was never
         // produced.
         GET_SNAPSHOT_FILE_CODE => Err(IggyError::InvalidCommand),
+        // Sequenced AFTER the named arms above, so flush keeps answering
+        // `FeatureUnavailable`. A table-listed non-replicated code with no arm
+        // is a routing bug and an unknown code is a client bug; the empty-ok
+        // that used to cover both attested a read that never ran. Only the
+        // named arms return `Empty`, and there it means "resolved to nothing"
+        // (the 404 the HTTP path maps).
         _ => match iggy_binary_protocol::dispatch::lookup_command(code) {
-            Some(meta) if !meta.is_replicated() => Ok(NonReplicatedResponse::Empty),
-            Some(_) => Err(IggyError::FeatureUnavailable),
-            None => Err(IggyError::InvalidCommand),
+            Some(meta) if meta.is_replicated() => Err(IggyError::FeatureUnavailable),
+            _ => Err(IggyError::InvalidCommand),
         },
     }
 }

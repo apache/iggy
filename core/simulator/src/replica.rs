@@ -362,7 +362,7 @@ pub fn new_shard(
             // every op above the floor must mutate the table. A frontier only fences a
             // LIVE table a state transfer just replaced.
             apply_committed_prepare(
-                &metadata.mux_stm,
+                &*metadata.mux_stm,
                 &metadata.client_table,
                 true,
                 |_| {},

@@ -23,7 +23,8 @@ use crate::partition_helpers::load_partition_or_fence;
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
 use crate::shell::{
-    ServerMetadata, ServerShard, ShellHandlers, consensus_timers, repair_retry_ticks,
+    ServerMetadata, ServerShard, ShellHandlers, ShellShardHandle, consensus_timers,
+    repair_retry_ticks,
 };
 use configs::server::ServerConfig;
 use consensus::{
@@ -35,6 +36,7 @@ use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::PingPongSuperblock;
 use message_bus::IggyMessageBus;
+use message_bus::client_listener::RequestHandler;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use partitions::{IggyPartitions, PartitionsConfig};
@@ -52,6 +54,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+/// A shard built for its thread, with what `shard_main` wires after the
+/// build: the session manager its request plane shares, the shard's one
+/// client-request handler (shard 0 hands the same instance to its local
+/// transports), and the weak self-reference the deferred handlers
+/// upgrade per frame, already backfilled.
+pub(in crate::boot) struct ShardBuild {
+    pub shard: Rc<ServerShard>,
+    pub sessions: Rc<RefCell<SessionManager>>,
+    pub on_client_request: RequestHandler,
+    pub shard_handle: ShellShardHandle<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>,
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(in crate::boot) async fn build_shard_for_thread(
     shard_id: u16,
@@ -65,7 +79,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     roster_cells: &RosterCells,
-) -> Result<(Rc<ServerShard>, Rc<RefCell<SessionManager>>), ServerError> {
+) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
         inner
@@ -243,7 +257,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         ShardIdentity::new(shard_id, shard_name),
         Rc::clone(&bus),
         on_replica_message,
-        on_client_request,
+        Rc::clone(&on_client_request),
         on_metadata_submit,
         on_list_clients,
         on_partition_read,
@@ -289,7 +303,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
         usize::try_from(config.message_bus.max_message_size.as_bytes_u64()).unwrap_or(usize::MAX),
     );
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
-    Ok((shard, sessions))
+    Ok(ShardBuild {
+        shard,
+        sessions,
+        on_client_request,
+        shard_handle,
+    })
 }
 
 // Pin the configs-crate default literals (duplicated there to avoid a

@@ -20,7 +20,9 @@
 //! The tree: [`session_ops`] (login/register/logout and their replica
 //! forwards), [`partition`] (the partition data plane, both mesh ends),
 //! [`reads`] (the non-replicated read router), [`submit`] (the shard-0
-//! metadata-submit RPC), `authz` (the wire-path authorization gates).
+//! metadata-submit RPC), `authz` (the wire-path authorization gates),
+//! `failure` (the wire failure channels and the one send exit for
+//! host-built frames).
 //!
 //! Deliberate asymmetry (the two authz gates): replicated metadata ops are
 //! authorized in-apply by the STM, in committed order on every replica;
@@ -30,6 +32,7 @@
 //! error contract (404-before-403) is pinned client-visible behavior.
 
 mod authz;
+mod failure;
 pub mod login_error;
 pub mod partition;
 pub mod reads;
@@ -39,61 +42,44 @@ pub mod submit;
 mod test_support;
 
 use crate::consumer_group::maybe_rewrite_consumer_group_request;
-use crate::dispatch::authz::{send_deny_reply, send_unbound_deny_reply};
+use crate::dispatch::failure::{
+    FrameChannel, send_deny_reply, send_eviction, send_host_frame, send_pre_consensus_deny,
+    send_unbound_deny_reply,
+};
 use crate::dispatch::partition::{dispatch_partition_request, handle_delete_segments_request};
 use crate::dispatch::reads::handle_non_replicated_request;
 use crate::dispatch::session_ops::{
-    handle_login_register_request, handle_logout_request, send_login_eviction,
-    send_unauthenticated_eviction, submit_disconnect_logout,
+    handle_login_register_request, handle_logout_request, submit_disconnect_logout,
 };
 use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
-use crate::pat::maybe_rewrite_pat_request;
-use crate::responses::{
-    NonReplicatedResponse, build_deny_reply, build_raw_pat_reply, current_metadata_commit,
-};
-use crate::segment_cleaner::UNENFORCEABLE_TOPIC_SIZE_WARN;
-use crate::session_manager::SessionManager;
+use crate::responses::build_raw_pat_reply;
+use crate::rewrite::{RewriteDeny, RewriteStage, tcp_chain};
+use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
-use crate::users::maybe_rewrite_user_password_request;
-use crate::wire::{request_body, verify_request_checksum};
-use bytes::Bytes;
+use crate::wire::verify_request_checksum;
+use ahash::{AHashMap, AHashSet};
 use configs::server::ServerSystemConfig;
-use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codes::{
-    GET_CLUSTER_METADATA_CODE, LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
+    LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, PING_CODE,
 };
-use iggy_binary_protocol::requests::partitions::{
-    CreatePartitionsRequest, DeletePartitionsRequest,
-};
-use iggy_binary_protocol::requests::streams::{CreateStreamRequest, UpdateStreamRequest};
-use iggy_binary_protocol::requests::topics::{CreateTopicRequest, UpdateTopicRequest};
-use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdateUserRequest};
 use iggy_binary_protocol::{
-    EvictionReason, GenericHeader, MAX_PARTITIONS_PER_REQUEST, Operation, RequestHeader,
-    RoutedRequestHeader, WireDecode, WireIdentifier, WireOptions,
+    EvictionReason, GenericHeader, Operation, RequestHeader, RoutedRequestHeader,
 };
-use iggy_common::{
-    IggyByteSize, IggyError, MaxTopicSize, TopicCreateOptions, UPDATABLE_STREAM_OPTION_KEYS,
-    UPDATABLE_TOPIC_OPTION_KEYS, UPDATABLE_USER_OPTION_KEYS, validate_preallocated_topic_bytes,
-    validate_topic_segment_size,
-};
+use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::BusMessage;
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::listener::MessageHandler;
-use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::Streams;
 use server_common::Message;
 use shard::{ConnectedClientInfo, ListClientsHandler};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
-type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
+type ClientRequestQueues = Rc<RefCell<AHashMap<u128, VecDeque<Message<GenericHeader>>>>>;
 
 /// Requests one client may have queued behind a request this shard has not
 /// answered yet.
@@ -109,50 +95,7 @@ type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHead
 /// re-issue it anywhere, including here once the queue drains. Sized far above
 /// any SDK's in-flight window, so it only ever fires under a genuine stall.
 const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
-type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
-
-pub fn make_client_request_handler<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    sessions: &Rc<RefCell<SessionManager>>,
-    system_config: Arc<ServerSystemConfig>,
-    max_tokens_per_user: u32,
-) -> RequestHandler
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let shard = Rc::clone(shard);
-    let sessions = Rc::clone(sessions);
-    let queues: ClientRequestQueues = Rc::new(RefCell::new(HashMap::new()));
-    let active: ActiveClientRequests = Rc::new(RefCell::new(HashSet::new()));
-    let sessions_for_disconnect = Rc::clone(&sessions);
-    let shard_for_disconnect = Rc::clone(&shard);
-    shard
-        .bus
-        .set_client_connection_lost_fn(Rc::new(move |client_id| {
-            if let Some((vsr_client_id, session)) = sessions_for_disconnect
-                .borrow_mut()
-                .remove_connection(client_id)
-            {
-                submit_disconnect_logout(Rc::clone(&shard_for_disconnect), vsr_client_id, session);
-            }
-        }));
-    Rc::new(move |client_id, message| {
-        enqueue_client_request(
-            Rc::clone(&shard),
-            Rc::clone(&sessions),
-            Arc::clone(&system_config),
-            max_tokens_per_user,
-            Rc::clone(&queues),
-            Rc::clone(&active),
-            client_id,
-            message,
-        );
-    })
-}
+type ActiveClientRequests = Rc<RefCell<AHashSet<u128>>>;
 
 /// Build the per-shard [`ListClientsHandler`]: on a `ListClients`
 /// broadcast, serialize this shard's locally-homed connected clients from
@@ -187,6 +130,12 @@ where
     })
 }
 
+/// Build the shard's one client-request handler: per-client FIFO queues
+/// drained one task per client, and the bus connection-lost hook that
+/// logs a dropped connection out. Every transport on the shard must
+/// share the instance (shard 0 hands it to its local QUIC, TCP-TLS and
+/// WSS listeners as well), or a client's ordering guarantee and the
+/// disconnect hook split by transport.
 pub fn make_deferred_client_request_handler<B, MJ, S, SB>(
     bus: &B,
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
@@ -203,50 +152,55 @@ where
 {
     let shard_handle = Rc::clone(shard_handle);
     let sessions = Rc::clone(sessions);
-    let queues: ClientRequestQueues = Rc::new(RefCell::new(HashMap::new()));
-    let active: ActiveClientRequests = Rc::new(RefCell::new(HashSet::new()));
+    let queues: ClientRequestQueues = Rc::new(RefCell::new(AHashMap::new()));
+    let active: ActiveClientRequests = Rc::new(RefCell::new(AHashSet::new()));
+    let queues_for_disconnect = Rc::clone(&queues);
     let sessions_for_disconnect = Rc::clone(&sessions);
     let shard_handle_for_disconnect = Rc::clone(&shard_handle);
     let bus_for_spawn = (*bus).clone();
     bus.set_client_connection_lost_fn(Rc::new(move |client_id| {
+        // The socket is gone, so nothing will drain what a live drain task
+        // left queued. The active slot is NOT released here: the transport
+        // task runs this hook while a drain may be suspended at an `.await`,
+        // and clearing the slot would let a frame the dispatch task still has
+        // buffered spawn a second drain over the same queue. The drain task's
+        // own guard covers every exit, the panic compio catches included.
+        queues_for_disconnect.borrow_mut().remove(&client_id);
+        // Upgrade FIRST: `remove_connection` strips the `SessionManager`
+        // entry, so running it ahead of a failed upgrade would drop the
+        // binding without ever submitting the replicated `Logout`, leaking
+        // the `ClientTable` entry and its consumer-group memberships. The
+        // window is pre-build / post-runtime-drop only.
+        let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect) else {
+            // Nothing reaps what stays behind: the heartbeat verifier is
+            // optional and only collects `Bound` / `Authenticated` sessions,
+            // so a `Connected` row survives to process exit.
+            error!(
+                client_id,
+                "client connection lost with no live shard; session and client-table entries \
+                 leak until process exit"
+            );
+            return;
+        };
         if let Some((vsr_client_id, session)) = sessions_for_disconnect
             .borrow_mut()
             .remove_connection(client_id)
-            && let Some(shard) = upgrade_shard_handle(&shard_handle_for_disconnect)
         {
             submit_disconnect_logout(shard, vsr_client_id, session);
         }
     }));
     Rc::new(move |client_id, message| {
-        let shard_handle = Rc::clone(&shard_handle);
-        let sessions = Rc::clone(&sessions);
-        let system_config = Arc::clone(&system_config);
-        let queues = Rc::clone(&queues);
-        let active = Rc::clone(&active);
-        queues
-            .borrow_mut()
-            .entry(client_id)
-            .or_default()
-            .push_back(message);
-        if !active.borrow_mut().insert(client_id) {
-            return;
-        }
-        bus_for_spawn.spawn(async move {
-            let Some(shard) = upgrade_shard_handle(&shard_handle) else {
-                active.borrow_mut().remove(&client_id);
-                return;
-            };
-            drain_client_requests(
-                shard,
-                sessions,
-                system_config,
-                max_tokens_per_user,
-                queues,
-                active,
-                client_id,
-            )
-            .await;
-        });
+        enqueue_client_request(
+            &bus_for_spawn,
+            &shard_handle,
+            &sessions,
+            &system_config,
+            max_tokens_per_user,
+            &queues,
+            &active,
+            client_id,
+            message,
+        );
     })
 }
 
@@ -290,12 +244,13 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_client_request<B, MJ, S, SB>(
-    shard: Rc<ShellShard<B, MJ, S, SB>>,
-    sessions: Rc<RefCell<SessionManager>>,
-    system_config: Arc<ServerSystemConfig>,
+    bus: &B,
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
+    sessions: &Rc<RefCell<SessionManager>>,
+    system_config: &Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
-    queues: ClientRequestQueues,
-    active: ActiveClientRequests,
+    queues: &ClientRequestQueues,
+    active: &ActiveClientRequests,
     client_id: u128,
     message: Message<GenericHeader>,
 ) where
@@ -312,7 +267,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
             // Borrow released before the deny, which spawns onto this same
             // task and would otherwise re-enter the table.
             drop(queues);
-            deny_overflowing_client_request(&shard, client_id, message);
+            deny_overflowing_client_request(shard_handle, client_id, message);
             return;
         }
         queue.push_back(message);
@@ -321,15 +276,25 @@ fn enqueue_client_request<B, MJ, S, SB>(
         return;
     }
 
-    let bus = shard.bus.clone();
+    let shard_handle = Rc::clone(shard_handle);
+    let sessions = Rc::clone(sessions);
+    let system_config = Arc::clone(system_config);
+    let queues = Rc::clone(queues);
+    let active = Rc::clone(active);
     bus.spawn(async move {
+        let _slot = ActiveDrainSlot { active, client_id };
+        // The handle is set once the shard is built. A frame that beats it
+        // stays queued and the client's next frame drains both, which needs
+        // the slot released on this path too - the guard above does it.
+        let Some(shard) = upgrade_shard_handle(&shard_handle) else {
+            return;
+        };
         drain_client_requests(
             shard,
             sessions,
             system_config,
             max_tokens_per_user,
             queues,
-            active,
             client_id,
         )
         .await;
@@ -340,10 +305,12 @@ fn enqueue_client_request<B, MJ, S, SB>(
 /// [`MAX_QUEUED_CLIENT_REQUESTS`] with the retryable transient denial.
 ///
 /// Spawned rather than awaited: the enqueue path is sync (it runs straight off
-/// frame arrival) and the reply goes out on the bus. A frame whose header will
-/// not even cast is dropped instead, exactly as the drain loop drops it.
+/// frame arrival) and the reply goes out on the bus. Two shapes are dropped
+/// rather than answered: a frame whose header will not even cast, exactly as
+/// the drain loop drops it, and a frame that arrives before the shard is
+/// built, which leaves nothing to render a reply from.
 fn deny_overflowing_client_request<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     transport_client_id: u128,
     message: Message<GenericHeader>,
 ) where
@@ -353,6 +320,17 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    // Unreachable in practice: a listener binds only after the build backfills
+    // the weak self-reference, which `crate::boot` pins with a `debug_assert`.
+    // Dropped rather than admitted past the cap -- the cap exists to refuse
+    // this frame, and the deny itself needs the shard for its metric and reply.
+    let Some(shard) = upgrade_shard_handle(shard_handle) else {
+        warn!(
+            transport_client_id,
+            "dropping over-queue client request received before the shard was built"
+        );
+        return;
+    };
     shard.metrics().record_client_request_denied_queue_full();
     let Ok(request) = message.try_into_typed::<RequestHeader>() else {
         warn!(
@@ -368,7 +346,6 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
         queued = MAX_QUEUED_CLIENT_REQUESTS,
         "denying client request retryable: this connection's request queue is full"
     );
-    let shard = Rc::clone(shard);
     let bus = shard.bus.clone();
     bus.spawn(async move {
         send_deny_reply(
@@ -381,6 +358,24 @@ fn deny_overflowing_client_request<B, MJ, S, SB>(
     });
 }
 
+/// Holds a client's one drain slot for as long as its drain task lives.
+///
+/// Releasing from the task's own `Drop` covers every exit, the panic compio
+/// catches included: a slot left taken with no live drain queues every later
+/// frame for that client forever. It also keeps the release out of the
+/// connection-lost hook, which fires from the transport task and could
+/// otherwise clear the slot under a drain suspended at an `.await`.
+struct ActiveDrainSlot {
+    active: ActiveClientRequests,
+    client_id: u128,
+}
+
+impl Drop for ActiveDrainSlot {
+    fn drop(&mut self) {
+        self.active.borrow_mut().remove(&self.client_id);
+    }
+}
+
 #[allow(clippy::future_not_send)]
 async fn drain_client_requests<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
@@ -388,7 +383,6 @@ async fn drain_client_requests<B, MJ, S, SB>(
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
     queues: ClientRequestQueues,
-    active: ActiveClientRequests,
     client_id: u128,
 ) where
     B: ShellBus,
@@ -398,7 +392,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     loop {
-        let Some(message) = pop_next_client_request(&queues, &active, client_id) else {
+        let Some(message) = pop_next_client_request(&queues, client_id) else {
             return;
         };
         handle_client_request(
@@ -415,211 +409,110 @@ async fn drain_client_requests<B, MJ, S, SB>(
 
 fn pop_next_client_request(
     queues: &ClientRequestQueues,
-    active: &ActiveClientRequests,
     client_id: u128,
 ) -> Option<Message<GenericHeader>> {
+    // Freed as soon as it drains empty. Keeping it would cost the connection
+    // one `VecDeque` (at its peak depth, since `pop_front` never gives
+    // capacity back), and the connection-lost hook cannot be the sole owner:
+    // the dispatch task can still deliver a buffered frame after the hook
+    // ran, and `client_id` is never reused, so that entry would live until
+    // process exit.
     let mut queues = queues.borrow_mut();
-    let Some(queue) = queues.get_mut(&client_id) else {
-        active.borrow_mut().remove(&client_id);
-        return None;
-    };
+    let queue = queues.get_mut(&client_id)?;
     let message = queue.pop_front();
     if queue.is_empty() {
         queues.remove(&client_id);
     }
-    if message.is_none() {
-        active.borrow_mut().remove(&client_id);
-    }
     message
 }
 
-/// Per-request partitions-count cap, shared by create-topic, create-partitions
-/// and delete-partitions admission. Runs pre-consensus like
-/// [`validate_topic_bounds`]: an oversized count must not burn a replicated
-/// log entry (create-partitions admission would also allocate that many
-/// consensus-group ids before replicating).
+/// Where the funnel routes a client request. Derived by [`classify`], which
+/// IS the routing: [`handle_client_request`] matches on its result. The
+/// variant ORDER mirrors the order of the checks inside [`classify`], and
+/// that order is semantics (documented there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::dispatch) enum RequestClass {
+    /// Legacy pre-register login code: rejected with a typed
+    /// `MalformedLogin` eviction before the session gate.
+    LegacyLogin,
+    /// Non-replicated code other than PING on an unbound transport:
+    /// denied `Unauthenticated` (plain deny reply, never an eviction).
+    UnauthenticatedRead,
+    /// Non-replicated read for the reads router.
+    NonReplicatedRead,
+    /// The register handshake (`session == 0 && request == 0`).
+    LoginRegister,
+    Logout,
+    /// Replicated operation on an unbound transport: `Eviction(NoSession)`.
+    UnboundReplicated,
+    /// Neither a partition nor a metadata consensus op: resolved to a
+    /// replicated `TruncatePartition` by the owning shard.
+    DeleteSegments,
+    /// Partition-plane operation.
+    Partition,
+    /// Everything else: replicated metadata consensus.
+    ReplicatedMetadata,
+}
+
+/// Route a client request: [`handle_client_request`] matches on the result,
+/// so this function IS the routing and the order of the checks below is the
+/// semantics. Pure: `bound` stands for
+/// `sessions.get_session(transport_client_id).is_some()`, the only session
+/// fact the checks consult.
 ///
-/// Zero passes here because a zero-partition TOPIC is legal (legacy
-/// `create_topic` admits `0..=MAX`); the add/remove requests reject it in
-/// [`validate_partitions_change_count`].
-const fn validate_partitions_count(partitions_count: u32) -> Result<(), IggyError> {
-    if partitions_count > MAX_PARTITIONS_PER_REQUEST {
-        return Err(IggyError::TooManyPartitions);
-    }
-    Ok(())
-}
-
-/// [`validate_partitions_count`] plus the zero rejection that create-partitions
-/// and delete-partitions carry: adding or removing zero partitions is a no-op
-/// that would still burn a replicated log entry, bump `Streams::revision` and
-/// force every shard through a rebalance pass. Legacy rejects it with
-/// `TooManyPartitions` in both handlers (`1..=MAX` on create, `== 0` on
-/// delete), so the code matches rather than inventing a new one.
-const fn validate_partitions_change_count(partitions_count: u32) -> Result<(), IggyError> {
-    if partitions_count == 0 {
-        return Err(IggyError::TooManyPartitions);
-    }
-    validate_partitions_count(partitions_count)
-}
-
-/// Static create-topic bounds shared by the TCP and HTTP ingresses. Runs
-/// pre-consensus: a rejected request must not burn a replicated log entry,
-/// and `prepare_request` errors evict the session instead of denying typed.
-/// `ServerDefault` is exempt from the size floor (it resolves against server
-/// config at admission, matching legacy); `Unlimited` passes numerically.
-/// `segment_size_bytes` is the topic's RESOLVED segment size (explicit
-/// option, else this node's default), so a per-topic segment above the
-/// global default still floors the topic cap.
-pub fn validate_topic_bounds(
-    partitions_count: u32,
-    max_topic_size: MaxTopicSize,
-    segment_size_bytes: u64,
-) -> Result<(), IggyError> {
-    validate_partitions_count(partitions_count)?;
-    validate_topic_size_floor(max_topic_size, segment_size_bytes)
-}
-
-/// A topic cap below one segment can never be enforced: the first segment
-/// already exceeds it. Split out of [`validate_topic_bounds`] because update
-/// admission checks the cap without a partitions count to check.
-pub fn validate_topic_size_floor(
-    max_topic_size: MaxTopicSize,
-    segment_size_bytes: u64,
-) -> Result<(), IggyError> {
-    if !matches!(max_topic_size, MaxTopicSize::ServerDefault)
-        && max_topic_size.as_bytes_u64() < segment_size_bytes
-    {
-        return Err(IggyError::InvalidTopicSize(
-            max_topic_size,
-            IggyByteSize::from(segment_size_bytes),
-        ));
-    }
-    Ok(())
-}
-
-/// Announce an accepted `max_topic_size` the server cannot enforce as written.
-///
-/// [`validate_topic_size_floor`] admits any cap of one segment or more, but
-/// retention runs PER PARTITION and floors each partition's share at one SEALED
-/// segment, which reaches up to one maximum bus frame past `segment_size`. A cap
-/// between the two is stored and echoed back verbatim while the server actually
-/// keeps `(segment_size + max_message_size) * partitions_count`, so the only
-/// moment an operator can be told is the one where they set it.
-///
-/// Warns rather than rejects: which caps are accepted is client-visible wire
-/// behavior, and tightening it would break topics that already exist.
-pub fn warn_unenforceable_topic_size(
-    max_topic_size: MaxTopicSize,
-    segment_size_bytes: u64,
-    max_message_size_bytes: usize,
-    partitions_count: u32,
-) {
-    let MaxTopicSize::Custom(configured) = max_topic_size else {
-        return;
-    };
-    let max_message_size_bytes = u64::try_from(max_message_size_bytes).unwrap_or(u64::MAX);
-    let per_partition_floor = segment_size_bytes.saturating_add(max_message_size_bytes);
-    let topic_floor = per_partition_floor.saturating_mul(u64::from(partitions_count));
-    if configured.as_bytes_u64() >= topic_floor {
-        return;
-    }
-    warn!(
-        max_topic_size = configured.as_bytes_u64(),
-        partitions_count,
-        segment_size = segment_size_bytes,
-        enforced_per_partition = per_partition_floor,
-        "{UNENFORCEABLE_TOPIC_SIZE_WARN}"
-    );
-}
-
-/// Announce the same unenforceable cap when partitions are ADDED to a topic.
-///
-/// The cap is topic-wide but enforcement is per partition, so every added
-/// partition shrinks the share: a cap that cleared the floor when the topic was
-/// created can stop clearing it here. The request carries only the delta, so
-/// the stored cap, segment size and current partition count come from metadata.
-pub fn warn_unenforceable_topic_size_on_partition_add(
-    streams: &Streams,
-    stream_id: &WireIdentifier,
-    topic_id: &WireIdentifier,
-    max_message_size_bytes: usize,
-    added_partitions_count: u32,
-) {
-    let Some(((stream_slab, topic_slab), _)) = streams.partition_count_context(stream_id, topic_id)
-    else {
-        return;
-    };
-    let Some((_, max_topic_size, partitions_count, segment_size)) =
-        streams.topic_retention_config(stream_slab, topic_slab)
-    else {
-        return;
-    };
-    warn_unenforceable_topic_size(
-        max_topic_size,
-        segment_size.map_or(iggy_common::DEFAULT_SEGMENT_SIZE, |segment_size| {
-            segment_size.as_bytes_u64()
-        }),
-        max_message_size_bytes,
-        u32::try_from(partitions_count)
-            .unwrap_or(u32::MAX)
-            .saturating_add(added_partitions_count),
-    );
-}
-
-/// Reject option keys outside the resource's catalog, pre-consensus. Unknown
-/// keys are rejected rather than skipped: a silently ignored knob would hand
-/// the client server defaults without it ever learning. Streams and users
-/// have no catalog keys yet, so `known` is empty for both until one lands.
-pub fn validate_option_keys(options: &WireOptions, known: &[&str]) -> Result<(), IggyError> {
-    for entry in options {
-        // Wire validation already enforced UTF-8 string keys.
-        let key = String::from_utf8_lossy(entry.key);
-        if !known.contains(&key.as_ref()) {
-            return Err(IggyError::UnsupportedOptionKey(key.into_owned()));
+/// The pins, in check order:
+/// - the legacy-login rejection precedes the session gate: a legacy code
+///   must get the typed `MalformedLogin` eviction, not the generic
+///   unauthenticated deny;
+/// - the pre-auth allowlist is PING only; `GET_CLUSTER_METADATA` is
+///   deliberately NOT pre-auth (see the funnel's auth-bypass guard);
+/// - poll-messages and consumer-offset reads are non-replicated CODES, not
+///   partition operations: they classify
+///   [`RequestClass::NonReplicatedRead`] and route inside the reads router;
+/// - a `Register` with `session != 0` or `request != 0` falls through to
+///   the default. Those rows are classify-only: `RequestHeader::validate`
+///   rejects such a header before the funnel sees it, so no mid-session
+///   register ever reaches consensus;
+/// - `DeleteSegments` is neither a partition nor a metadata op, so its
+///   check sits before `is_partition`;
+/// - the checksum and heartbeat pre-gates run BEFORE classification in the
+///   funnel.
+pub(in crate::dispatch) fn classify(header: &RoutedRequestHeader, bound: bool) -> RequestClass {
+    if header.operation == Operation::NonReplicated {
+        let nr_code = non_replicated_code(header);
+        if matches!(
+            nr_code,
+            LOGIN_USER_CODE | LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
+        ) {
+            return RequestClass::LegacyLogin;
         }
+        if nr_code != PING_CODE && !bound {
+            return RequestClass::UnauthenticatedRead;
+        }
+        return RequestClass::NonReplicatedRead;
     }
-    Ok(())
+    if header.operation == Operation::Register && header.session == 0 && header.request == 0 {
+        return RequestClass::LoginRegister;
+    }
+    if header.operation == Operation::Logout {
+        return RequestClass::Logout;
+    }
+    if !bound {
+        return RequestClass::UnboundReplicated;
+    }
+    if header.operation == Operation::DeleteSegments {
+        return RequestClass::DeleteSegments;
+    }
+    if header.operation.is_partition() {
+        return RequestClass::Partition;
+    }
+    RequestClass::ReplicatedMetadata
 }
 
-/// Reject a request before it reaches consensus: warn, then send the typed
-/// deny reply. A silent drop would wedge every later request on the
-/// connection until the socket read timeout. `context` labels the rejection
-/// site in both log lines.
-#[allow(clippy::future_not_send)]
-async fn send_pre_consensus_deny<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    header: &RoutedRequestHeader,
-    transport_client_id: u128,
-    error: &IggyError,
-    context: &'static str,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    warn!(
-        transport_client_id,
-        error = %error,
-        operation = ?header.operation,
-        context,
-        "denying request pre-consensus"
-    );
-    let commit = current_metadata_commit(shard);
-    let reply = build_deny_reply(header, transport_client_id, 0, commit, error.as_code());
-    if let Err(send_error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %send_error,
-            context,
-            "failed to send pre-consensus deny reply"
-        );
-    }
+/// The command code a `NonReplicated` header carries in its first four
+/// reserved bytes.
+fn non_replicated_code(header: &RoutedRequestHeader) -> u32 {
+    u32::from_le_bytes(header.reserved[..4].try_into().unwrap())
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -673,69 +566,66 @@ async fn handle_client_request<B, MJ, S, SB>(
         return;
     }
 
-    ensure_transport_connection(shard, sessions, transport_client_id);
+    // ONE `connections` walk for the whole prologue. Any request is liveness
+    // proof, not just PING: an idle-but-active client (e.g. an admin issuing
+    // reads between long sleeps) must not be evicted by the heartbeat
+    // verifier. A genuinely dead connection sends nothing, so the intended
+    // stale-client eviction still fires.
+    // Bound, not matched: a `match` on `borrow_mut()` would hold the guard
+    // across the arm that borrows again.
+    let mut touched = sessions.borrow_mut().touch_connection(transport_client_id);
+    if touched.is_none() {
+        // A transport's first frame: the peer address and transport kind live
+        // on the bus, so only this path pays that lookup.
+        ensure_transport_connection(shard, sessions, transport_client_id);
+        touched = sessions.borrow_mut().touch_connection(transport_client_id);
+    }
+    let ConnectionContext {
+        bound,
+        user_id,
+        address: client_address,
+        metadata_watermark,
+    } = touched.unwrap_or_default();
 
-    // Any request is liveness proof, not just PING: an idle-but-active client
-    // (e.g. an admin issuing reads between long sleeps) must not be evicted by
-    // the heartbeat verifier. A genuinely dead connection sends nothing, so the
-    // intended stale-client eviction still fires. No-ops for an unbound client.
-    sessions.borrow_mut().record_heartbeat(transport_client_id);
-
-    let header = *request.header();
-    if header.operation == Operation::NonReplicated {
-        // Auth bypass guard: `PING`, the liveness probe, is the only pre-auth
-        // code, on every roster shape. `GET_CLUSTER_METADATA` describes the
-        // private replica network and is not something an unauthenticated
-        // caller gets to read; a client that dialed a backup no longer needs
-        // it to find the leader, because the backup authenticates the login
-        // locally and forwards only the consensus proposal
-        // (`submit_register_local_or_forward`). Every other non-replicated
-        // code MUST go through Register first, which binds the acting user
-        // the per-op authz gates resolve.
-        let nr_code = u32::from_le_bytes(request.header().reserved[..4].try_into().unwrap());
-        // Legacy (pre-register) login codes. The server authenticates only via
-        // the Register handshake (LOGIN_REGISTER / LOGIN_REGISTER_WITH_PAT,
-        // Operation::Register); the vsr SDK funnels both logins there and never
-        // emits these. Reject them uniformly with a typed MalformedLogin (the
-        // SDK maps it to InvalidFormat) before the session gate, so a legacy or
-        // foreign client fails fast instead of getting the generic
-        // Unauthenticated deny the pre-auth guard would send unbound, or the
-        // silent empty-ok Reply the bound non-replicated path would send.
-        if matches!(
-            nr_code,
-            LOGIN_USER_CODE | LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
-        ) {
+    // Borrowed, not copied: the 256-byte header is only worth a by-value
+    // snapshot where an arm rewrites it (`ReplicatedMetadata`) and still has
+    // to echo the client's original fields on a deny.
+    let header = request.header();
+    match classify(header, bound.is_some()) {
+        RequestClass::LegacyLogin => {
+            // Legacy (pre-register) login codes. The server authenticates only via
+            // the Register handshake (LOGIN_REGISTER / LOGIN_REGISTER_WITH_PAT,
+            // Operation::Register); the vsr SDK funnels both logins there and never
+            // emits these. Reject them uniformly with a typed MalformedLogin (the
+            // SDK maps it to InvalidFormat) before the session gate, so a legacy or
+            // foreign client fails fast instead of getting the generic
+            // Unauthenticated deny the pre-auth guard would send unbound, or the
+            // silent empty-ok Reply the bound non-replicated path would send.
+            let nr_code = non_replicated_code(header);
             warn!(
                 transport_client_id,
                 code = nr_code,
                 "rejecting legacy login code; server requires the register handshake"
             );
-            send_login_eviction(
+            send_eviction(
                 shard,
                 transport_client_id,
                 header.client,
                 EvictionReason::MalformedLogin,
+                "legacy_login_rejection",
             )
             .await;
-            return;
         }
-        let allowed_pre_auth = nr_code == PING_CODE;
-        if !allowed_pre_auth && sessions.borrow().get_session(transport_client_id).is_none() {
-            // Foreign SDKs still probe `GET_CLUSTER_METADATA` before login
-            // until they are fixed, so that rejection is routine traffic and
-            // logs at debug rather than warn.
-            if nr_code == GET_CLUSTER_METADATA_CODE {
-                debug!(
-                    transport_client_id,
-                    "denying pre-auth cluster-metadata read with Unauthenticated"
-                );
-            } else {
-                warn!(
-                    transport_client_id,
-                    code = nr_code,
-                    "denying pre-auth non-replicated read with Unauthenticated"
-                );
-            }
+        RequestClass::UnauthenticatedRead => {
+            let nr_code = non_replicated_code(header);
+            // No per-code exemption: every in-tree SDK reads the roster only
+            // after login, so an unauthenticated roster read is a real event
+            // and not something to hide at debug.
+            warn!(
+                transport_client_id,
+                code = nr_code,
+                "denying pre-auth non-replicated read with Unauthenticated"
+            );
             // A plain deny Reply, not an Eviction: there is no session to
             // evict, and an Eviction is session-terminal by wire contract,
             // so SDKs would tear down the very connection their login is
@@ -748,360 +638,203 @@ async fn handle_client_request<B, MJ, S, SB>(
                 IggyError::Unauthenticated.as_code(),
             )
             .await;
-            return;
         }
-        handle_non_replicated_request(shard, sessions, system_config, transport_client_id, request)
-            .await;
-        return;
-    }
-
-    if header.operation == Operation::Register && header.session == 0 && header.request == 0 {
-        handle_login_register_request(shard, sessions, transport_client_id, request).await;
-        return;
-    }
-
-    if header.operation == Operation::Logout {
-        handle_logout_request(shard, sessions, transport_client_id, request).await;
-        return;
-    }
-
-    let bound = sessions.borrow().get_session(transport_client_id);
-    if bound.is_none() {
-        // Replicated request on an unbound transport. Without this short-
-        // circuit, the rewrite below overwrites `header.client` with
-        // `transport_client_id` and dispatches; the request_preflight then
-        // rejects with `NoSession`/`Fenced` and the failure disappears
-        // silently, wedging the SDK until the socket timeout. A typed
-        // `Eviction(NoSession)` is right here, unlike the pre-auth read
-        // guard above: a replicated request implies the client believes it
-        // has a session, and that session is gone, so it must register
-        // again. An empty status-0 Reply is not safe here, because
-        // SendMessages is the one replicated operation without a result
-        // section, and its decoder would read the empty body as a
-        // successful send.
-        warn!(
-            transport_client_id,
-            operation = ?header.operation,
-            "rejecting replicated request from unbound transport with Eviction(NoSession)"
-        );
-        send_unauthenticated_eviction(shard, transport_client_id).await;
-        return;
-    }
-
-    // DeleteSegments is neither a partition nor a metadata consensus op: the
-    // owning shard resolves the requested count to a concrete offset, then a
-    // `TruncatePartition` is replicated through metadata (Option A). Each
-    // replica's reconciler trims to the committed watermark. Handle it here,
-    // ahead of the partition/metadata routing below.
-    if header.operation == Operation::DeleteSegments {
-        handle_delete_segments_request(shard, transport_client_id, bound, &request).await;
-        return;
-    }
-
-    if header.operation.is_partition() {
-        // `bound` is Some here (unbound transports returned above).
-        let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
-        // `get_session` discards the acting user id the partition gate needs;
-        // resolve it from the same bound connection. A bound transport always
-        // has one, but the gate fails closed on `None` rather than trust that.
-        let acting_user_id = sessions.borrow().get_user_id(transport_client_id);
-        dispatch_partition_request(
-            shard,
-            request,
-            vsr_client_id,
-            bound_session,
-            transport_client_id,
-            acting_user_id,
-        )
-        .await;
-        return;
-    }
-
-    let request = request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
-        *new_header = header;
-        // Metadata-plane ops route by operation: stamp the sentinel group.
-        new_header.group = server_common::sharding::METADATA_GROUP;
-        // `bound` is always Some here (unbound transports early-return above);
-        // this sets the consensus client id + session for the replicated op.
-        if let Some((bound_client_id, bound_session)) = bound {
-            new_header.client = bound_client_id;
-            new_header.session = bound_session;
-        }
-    });
-    let (request, raw_pat_token) = match maybe_rewrite_pat_request(
-        sessions,
-        transport_client_id,
-        max_tokens_per_user,
-        |user_id| {
-            shard
-                .plane
-                .metadata()
-                .mux_stm
-                .users()
-                .read(|users| users.pat_count_of(user_id))
-        },
-        request,
-    ) {
-        Ok(rewritten) => rewritten,
-        Err(error) => {
-            // Token cap reached, malformed body, or a lost session binding.
-            send_pre_consensus_deny(
+        RequestClass::NonReplicatedRead => {
+            // The auth-bypass guard is `classify`'s `UnauthenticatedRead` class:
+            // `PING`, the liveness probe, is the only pre-auth code, on every
+            // roster shape. `GET_CLUSTER_METADATA` describes the private replica
+            // network and is not something an unauthenticated caller gets to
+            // read; a client that dialed a backup no longer needs it to find the
+            // leader, because the backup authenticates the login locally and
+            // forwards only the consensus proposal
+            // (`submit_register_local_or_forward`). Every other non-replicated
+            // code MUST go through Register first, which binds the acting user
+            // the per-op authz gates resolve.
+            handle_non_replicated_request(
                 shard,
-                &header,
+                sessions,
+                system_config,
                 transport_client_id,
-                &error,
-                "personal-access-token",
+                request,
+                (user_id, client_address, metadata_watermark),
             )
             .await;
-            return;
         }
-    };
-    // Hash raw passwords and, for ChangePassword, verify the current password
-    // on the primary before replication; see `crate::users`. Replicas store the
-    // hash directly. A wrong current password is not denied here: it rides
-    // consensus and applies as a committed InvalidCredentials no-op, so the only
-    // Err returned is a malformed body.
-    let request = match maybe_rewrite_user_password_request(shard, request) {
-        Ok(rewritten) => rewritten,
-        Err(error) => {
-            // Malformed body: deny fast with InvalidCommand.
-            send_pre_consensus_deny(shard, &header, transport_client_id, &error, "user-password")
-                .await;
-            return;
+        RequestClass::LoginRegister => {
+            handle_login_register_request(shard, sessions, transport_client_id, request).await;
         }
-    };
-    // Static bounds run pre-consensus so a rejected request burns no
-    // replicated log entry; HTTP covers the same bounds via
-    // `command.validate()`. A body that fails to decode denies typed too
-    // (`InvalidCommand`), instead of riding consensus just to fail there.
-    let bounds = match header.operation {
-        Operation::CreateTopic => CreateTopicRequest::decode_from(request_body(&request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|create_topic| {
-                // `parse` doubles as the catalog gate: an unknown key or a
-                // malformed value denies typed here, pre-consensus.
-                let options = TopicCreateOptions::parse(&create_topic.options)?;
-                if let Some(segment_size) = options.segment_size {
-                    validate_topic_segment_size(
-                        segment_size.as_bytes_u64(),
-                        iggy_common::MAX_TOPIC_SEGMENT_SIZE,
-                    )?;
-                }
-                let segment_size = options.segment_size.map_or_else(
-                    || iggy_common::DEFAULT_SEGMENT_SIZE,
-                    |segment_size| segment_size.as_bytes_u64(),
-                );
-                if options
-                    .preallocate_segments
-                    .unwrap_or(iggy_common::DEFAULT_PREALLOCATE_SEGMENTS)
-                {
-                    validate_preallocated_topic_bytes(segment_size, create_topic.partitions_count)?;
-                }
-                let max_topic_size = options
-                    .max_topic_size
-                    .unwrap_or(MaxTopicSize::ServerDefault);
-                validate_topic_bounds(create_topic.partitions_count, max_topic_size, segment_size)?;
-                warn_unenforceable_topic_size(
-                    max_topic_size,
-                    segment_size,
-                    shard.bus_max_message_size(),
-                    create_topic.partitions_count,
-                );
-                Ok(())
-            }),
-        Operation::CreatePartitions => CreatePartitionsRequest::decode_from(request_body(&request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|create_partitions| {
-                validate_partitions_change_count(create_partitions.partitions_count)?;
-                let metadata = shard.plane.metadata();
-                warn_unenforceable_topic_size_on_partition_add(
-                    metadata.mux_stm.streams(),
-                    &create_partitions.stream_id,
-                    &create_partitions.topic_id,
-                    shard.bus_max_message_size(),
-                    create_partitions.partitions_count,
-                );
-                Ok(())
-            }),
-        Operation::DeletePartitions => DeletePartitionsRequest::decode_from(request_body(&request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|delete_partitions| {
-                validate_partitions_change_count(delete_partitions.partitions_count)
-            }),
-        // Only the updatable subset: the create-time knobs are pushed to
-        // partitions when the topic is built and nothing re-pushes them, so
-        // accepting one here would store a value no partition ever sees.
-        Operation::UpdateTopic => UpdateTopicRequest::decode_from(request_body(&request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|update_topic| {
-                validate_option_keys(&update_topic.options, UPDATABLE_TOPIC_OPTION_KEYS)?;
-                let options = TopicCreateOptions::parse(&update_topic.options)?;
-                let Some(max_topic_size) = options.max_topic_size else {
-                    return Ok(());
-                };
-                // An update can lower the cap below one segment just as a
-                // create can, and the stored map would then report a size the
-                // topic can never enforce. The floor is this topic's own
-                // segment size, since that key is create-only.
-                let metadata = shard.plane.metadata();
-                let streams = metadata.mux_stm.streams();
-                let segment_size = streams
-                    .topic_segment_size(&update_topic.stream_id, &update_topic.topic_id)
-                    .map_or_else(
-                        || iggy_common::DEFAULT_SEGMENT_SIZE,
-                        |segment_size| segment_size.as_bytes_u64(),
-                    );
-                validate_topic_size_floor(max_topic_size, segment_size)?;
-                let partitions_count = streams
-                    .topic_partitions_count(&update_topic.stream_id, &update_topic.topic_id)
-                    .unwrap_or(0);
-                warn_unenforceable_topic_size(
-                    max_topic_size,
-                    segment_size,
-                    shard.bus_max_message_size(),
-                    u32::try_from(partitions_count).unwrap_or(u32::MAX),
-                );
-                Ok(())
-            }),
-        Operation::UpdateStream => UpdateStreamRequest::decode_from(request_body(&request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|update_stream| {
-                validate_option_keys(&update_stream.options, UPDATABLE_STREAM_OPTION_KEYS)
-            }),
-        Operation::UpdateUser => UpdateUserRequest::decode_from(request_body(&request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|update_user| {
-                validate_option_keys(&update_user.options, UPDATABLE_USER_OPTION_KEYS)
-            }),
-        Operation::CreateStream => CreateStreamRequest::decode_from(request_body(&request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|create_stream| validate_option_keys(&create_stream.options, &[])),
-        Operation::CreateUser => CreateUserRequest::decode_from(request_body(&request))
-            .map_err(|_| IggyError::InvalidCommand)
-            .and_then(|create_user| validate_option_keys(&create_user.options, &[])),
-        _ => Ok(()),
-    };
-    if let Err(error) = bounds {
-        send_pre_consensus_deny(shard, &header, transport_client_id, &error, "static-bounds").await;
-        return;
-    }
-    // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
-    // partition count for Join) before replication; see `crate::consumer_group`.
-    let request = match maybe_rewrite_consumer_group_request(shard, request).await {
-        Ok(rewritten) => rewritten,
-        Err(error) => {
+        RequestClass::Logout => {
+            handle_logout_request(shard, sessions, transport_client_id, request).await;
+        }
+        RequestClass::UnboundReplicated => {
+            // Replicated request on an unbound transport. Without this short-
+            // circuit, the rewrite below overwrites `header.client` with
+            // `transport_client_id` and dispatches; the request_preflight then
+            // rejects with `NoSession`/`Fenced` and the failure disappears
+            // silently, wedging the SDK until the socket timeout. A typed
+            // `Eviction(NoSession)` is right here, unlike the plain deny of
+            // `UnauthenticatedRead`: a replicated request implies the client
+            // believes it has a session, and that session is gone, so it must
+            // register again. An empty status-0 Reply is not safe here, because
+            // SendMessages is the one replicated operation without a result
+            // section, and its decoder would read the empty body as a
+            // successful send.
             warn!(
                 transport_client_id,
-                error = %error,
                 operation = ?header.operation,
-                "dropping consumer-group request with invalid payload"
+                "rejecting replicated request from unbound transport with Eviction(NoSession)"
             );
-            return;
+            // The eviction context is best-effort off the metadata consensus
+            // (peer shards have none; zeroes are cosmetic -- the SDK only
+            // reads the reason), and the evicted id is the transport id: no
+            // VSR session exists to name.
+            send_eviction(
+                shard,
+                transport_client_id,
+                transport_client_id,
+                EvictionReason::NoSession,
+                "unbound_replicated_request",
+            )
+            .await;
         }
-    };
-    let request_header = *request.header();
-    // Replicated request: run consensus on the metadata owner (shard 0) and
-    // bring the committed reply back here. This shard owns the connection,
-    // so it writes the reply to the socket via the transport client id --
-    // shard 0 can't route by the consensus client id (no home-shard bits).
-    match submit_client_request_on_owner(shard, request).await {
-        Some(reply) => {
-            // Recorded before the reply reaches the socket, so a read the client
-            // sends the instant it decodes this frame already sees the mark.
-            if let Some(commit) = committed_reply_commit(&reply) {
-                sessions
-                    .borrow_mut()
-                    .record_metadata_watermark(transport_client_id, commit);
-            }
-            // The raw PAT token never enters consensus (it is non-deterministic
-            // and secret), so the committed reply body is empty. Substitute the
-            // raw-token response here, on the minting client's home shard, using
-            // the confirmed commit position from the committed reply.
-            let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
-                Ok(reply) => reply,
-                Err(error) => {
-                    warn!(
-                        transport_client_id,
-                        error = %error,
-                        "failed to build raw PAT reply"
-                    );
+        RequestClass::DeleteSegments => {
+            // DeleteSegments is neither a partition nor a metadata consensus op: the
+            // owning shard resolves the requested count to a concrete offset, then a
+            // `TruncatePartition` is replicated through metadata (Option A). Each
+            // replica's reconciler trims to the committed watermark. `classify`
+            // names it ahead of the partition and metadata classes.
+            handle_delete_segments_request(shard, transport_client_id, bound, &request).await;
+        }
+        RequestClass::Partition => {
+            // `bound` is Some here: `classify` sends unbound transports to
+            // `UnboundReplicated`.
+            let (vsr_client_id, bound_session) = bound.unwrap_or((0, 0));
+            // The acting user comes from the prologue's lookup. A bound
+            // transport always has one, but the gate below fails closed on
+            // `None` rather than trust that.
+            dispatch_partition_request(
+                shard,
+                request,
+                vsr_client_id,
+                bound_session,
+                transport_client_id,
+                user_id,
+            )
+            .await;
+        }
+        RequestClass::ReplicatedMetadata => {
+            // The one arm that needs the by-value copy: the rewrite below
+            // stamps the consensus client / session / group over the header,
+            // and a pre-consensus deny still has to echo what the client sent.
+            let header = *header;
+            let request =
+                request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
+                    *new_header = header;
+                    // Metadata-plane ops route by operation: stamp the sentinel group.
+                    new_header.group = server_common::sharding::METADATA_GROUP;
+                    // `bound` is always Some here (`classify` sends unbound transports to
+                    // `UnboundReplicated`); this sets the consensus client id + session
+                    // for the replicated op.
+                    if let Some((bound_client_id, bound_session)) = bound {
+                        new_header.client = bound_client_id;
+                        new_header.session = bound_session;
+                    }
+                });
+            let (request, raw_pat_token) = match tcp_chain(
+                shard,
+                sessions,
+                transport_client_id,
+                max_tokens_per_user,
+                request,
+            ) {
+                Ok(rewritten) => rewritten,
+                Err(RewriteDeny { stage, error }) => {
+                    send_pre_consensus_deny(shard, transport_client_id, &header, &error, stage)
+                        .await;
                     return;
                 }
             };
-            if let Err(error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %error,
-                    operation = ?header.operation,
-                    "failed to deliver committed reply to client"
-                );
+            // Enrich consumer-group Join/Leave with the client's VSR id (+ topic
+            // partition count for Join) before replication; see `crate::consumer_group`.
+            let request = match maybe_rewrite_consumer_group_request(shard, request).await {
+                Ok(rewritten) => rewritten,
+                Err(error) => {
+                    // Both of the rewrite's own failures are `InvalidCommand`
+                    // decode errors, so a replay cannot help: deny typed
+                    // instead of leaving the lockstep connection to its read
+                    // timeout. (Its third error path needs a body past
+                    // `u32::MAX` against a 64 MiB message cap, so no client
+                    // frame reaches it; the deny is correct there too.)
+                    send_pre_consensus_deny(
+                        shard,
+                        transport_client_id,
+                        &header,
+                        &error,
+                        RewriteStage::ConsumerGroup,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let request_header = *request.header();
+            // Replicated request: run consensus on the metadata owner (shard 0) and
+            // bring the committed reply back here. This shard owns the connection,
+            // so it writes the reply to the socket via the transport client id --
+            // shard 0 can't route by the consensus client id (no home-shard bits).
+            match submit_client_request_on_owner(shard, request).await {
+                Some(reply) => {
+                    // Recorded before the reply reaches the socket, so a read the client
+                    // sends the instant it decodes this frame already sees the mark.
+                    if let Some(commit) = committed_reply_commit(&reply) {
+                        sessions
+                            .borrow_mut()
+                            .record_metadata_watermark(transport_client_id, commit);
+                    }
+                    // The raw PAT token never enters consensus (it is non-deterministic
+                    // and secret), so the committed reply body is empty. Substitute the
+                    // raw-token response here, on the minting client's home shard, using
+                    // the confirmed commit position from the committed reply.
+                    let reply = match build_raw_pat_reply(&request_header, reply, raw_pat_token) {
+                        Ok(reply) => reply,
+                        Err(error) => {
+                            warn!(
+                                transport_client_id,
+                                error = %error,
+                                "failed to build raw PAT reply"
+                            );
+                            // The op COMMITTED; only the reply could not be
+                            // rendered. A typed deny is still the right frame:
+                            // silence wedges the lockstep connection on a
+                            // request that succeeded server-side. The raw
+                            // token is unrecoverable either way -- it lives in
+                            // that one reply and a retry dedups to the empty
+                            // committed body -- so the caller must delete the
+                            // token and mint a new one.
+                            send_deny_reply(shard, transport_client_id, &header, error.as_code())
+                                .await;
+                            return;
+                        }
+                    };
+                    send_host_frame(
+                        &shard.bus,
+                        transport_client_id,
+                        reply.into_frozen(),
+                        FrameChannel::Reply,
+                        "committed_reply",
+                    )
+                    .await;
+                }
+                None => {
+                    // Transient submit failure (not primary / not caught up / dedup
+                    // absorbed). Stay silent; the SDK read-timeout replays.
+                    warn!(
+                        transport_client_id,
+                        operation = ?header.operation,
+                        "replicated request not committed (transient); client will replay"
+                    );
+                }
             }
         }
-        None => {
-            // Transient submit failure (not primary / not caught up / dedup
-            // absorbed). Stay silent; the SDK read-timeout replays.
-            warn!(
-                transport_client_id,
-                operation = ?header.operation,
-                "replicated request not committed (transient); client will replay"
-            );
-        }
-    }
-}
-
-/// Send a non-replicated reply body to a client, stamping the current
-/// metadata commit. Shared by the `get_me` / `get_clients` / `get_client`
-/// arms.
-#[allow(clippy::future_not_send)]
-async fn send_non_replicated_bytes<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: &Message<RoutedRequestHeader>,
-    transport_client_id: u128,
-    bytes: Bytes,
-    label: &'static str,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let commit = current_metadata_commit(shard);
-    let reply = NonReplicatedResponse::Bytes(bytes).into_reply(
-        request.header(),
-        request.header().client,
-        request.header().session,
-        commit,
-    );
-    send_reply_frame(
-        shard,
-        transport_client_id,
-        reply.into_generic().into_frozen(),
-        label,
-    )
-    .await;
-}
-
-/// Hand a built reply frame to the bus for `transport_client_id`.
-#[allow(clippy::future_not_send)]
-async fn send_reply_frame<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
-    frame: impl Into<BusMessage>,
-    label: &'static str,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    if let Err(error) = shard.bus.send_to_client(transport_client_id, frame).await {
-        warn!(transport_client_id, label, error = %error, "failed to send non-replicated reply");
     }
 }
 
@@ -1146,7 +879,13 @@ mod tests {
     use crate::cluster_meta::ClusterRoster;
     use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestMux, TestShard, test_shard};
     use iggy_binary_protocol::Command;
+    use iggy_binary_protocol::codes::{
+        GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE, POLL_MESSAGES_CODE,
+    };
+    use iggy_binary_protocol::{EvictionHeader, ReplyHeader};
+    use journal::prepare_journal::PrepareJournal;
     use metadata::IggyMetadata;
+    use metadata::impls::metadata::IggySnapshot;
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MESSAGE_ALIGN;
     use server_common::sharding::ShardId;
@@ -1299,7 +1038,6 @@ mod tests {
     #[compio::test]
     async fn pre_auth_cluster_metadata_denied_on_every_roster() {
         use configs::cluster::{ClusterNodeConfig, TransportPorts};
-        use iggy_binary_protocol::codes::GET_CLUSTER_METADATA_CODE;
         use iggy_binary_protocol::{GenericHeader, ReplyHeader};
 
         const TRANSPORT: u128 = 91;
@@ -1400,89 +1138,467 @@ mod tests {
         }
     }
 
-    #[test]
-    fn create_topic_bounds_deny_pre_consensus() {
-        let segment_size = iggy_common::DEFAULT_SEGMENT_SIZE;
-        assert!(segment_size > 0, "default segment size must be nonzero");
+    /// Client-wire frame for the funnel tests, shaped like the SDK sends it
+    /// (the funnel promotes it to the routed shape itself).
+    fn wire_request(
+        operation: Operation,
+        client: u128,
+        session: u64,
+        request: u64,
+        body: &[u8],
+    ) -> Message<RequestHeader> {
+        let header_size = size_of::<RequestHeader>();
+        let total = header_size + body.len();
+        let mut message = Message::<RequestHeader>::new(total);
+        {
+            let slice = message.as_mut_slice();
+            slice[header_size..total].copy_from_slice(body);
+            let header =
+                bytemuck::checked::from_bytes_mut::<RequestHeader>(&mut slice[..header_size]);
+            *header = RequestHeader {
+                command: Command::Request,
+                operation,
+                size: u32::try_from(total).expect("test request fits u32"),
+                client,
+                session,
+                request,
+                ..Default::default()
+            };
+        }
+        message
+    }
 
-        assert!(
-            validate_topic_bounds(
-                MAX_PARTITIONS_PER_REQUEST,
-                MaxTopicSize::ServerDefault,
-                segment_size
+    fn non_replicated_request(client: u128, nr_code: u32) -> Message<GenericHeader> {
+        let mut message = wire_request(Operation::NonReplicated, client, 0, 0, &[]);
+        {
+            let header_size = size_of::<RequestHeader>();
+            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut message.as_mut_slice()[..header_size],
+            );
+            header.reserved[..4].copy_from_slice(&nr_code.to_le_bytes());
+        }
+        message.into_generic()
+    }
+
+    const fn frame_command(frame: &[u8]) -> u8 {
+        frame[std::mem::offset_of!(GenericHeader, command)]
+    }
+
+    const fn eviction_reason_byte(frame: &[u8]) -> u8 {
+        frame[std::mem::offset_of!(EvictionHeader, reason)]
+    }
+
+    fn reply_status(frame: &[u8]) -> u32 {
+        const STATUS_OFFSET: usize = std::mem::offset_of!(ReplyHeader, status);
+        u32::from_le_bytes(frame[STATUS_OFFSET..STATUS_OFFSET + 4].try_into().unwrap())
+    }
+
+    /// The classifier is the funnel's probe chain as data: every row pins
+    /// one routing decision, and the labeled rows pin the probe ORDERINGS
+    /// the funnel relies on.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn classify_pins_probe_order() {
+        fn routed(operation: Operation, session: u64, request: u64) -> RoutedRequestHeader {
+            RoutedRequestHeader {
+                command: Command::Request,
+                operation,
+                client: 7,
+                session,
+                request,
+                ..Default::default()
+            }
+        }
+        fn nr(nr_code: u32) -> RoutedRequestHeader {
+            let mut header = routed(Operation::NonReplicated, 0, 0);
+            header.reserved[..4].copy_from_slice(&nr_code.to_le_bytes());
+            header
+        }
+        let table = [
+            (
+                "legacy login beats the session gate (unbound)",
+                nr(LOGIN_USER_CODE),
+                false,
+                RequestClass::LegacyLogin,
+            ),
+            (
+                "legacy login beats the bound reads route",
+                nr(LOGIN_USER_CODE),
+                true,
+                RequestClass::LegacyLogin,
+            ),
+            (
+                "legacy PAT login beats the session gate (unbound)",
+                nr(LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE),
+                false,
+                RequestClass::LegacyLogin,
+            ),
+            (
+                "legacy PAT login beats the bound reads route",
+                nr(LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE),
+                true,
+                RequestClass::LegacyLogin,
+            ),
+            (
+                "ping is the only pre-auth code",
+                nr(PING_CODE),
+                false,
+                RequestClass::NonReplicatedRead,
+            ),
+            (
+                "cluster metadata is not pre-auth",
+                nr(GET_CLUSTER_METADATA_CODE),
+                false,
+                RequestClass::UnauthenticatedRead,
+            ),
+            (
+                "poll-messages is a non-replicated code, not a partition op",
+                nr(POLL_MESSAGES_CODE),
+                true,
+                RequestClass::NonReplicatedRead,
+            ),
+            (
+                "consumer-offset read is a non-replicated code, not a partition op",
+                nr(GET_CONSUMER_OFFSET_CODE),
+                true,
+                RequestClass::NonReplicatedRead,
+            ),
+            (
+                "the register handshake",
+                routed(Operation::Register, 0, 0),
+                false,
+                RequestClass::LoginRegister,
+            ),
+            (
+                "register with a session falls to the default",
+                routed(Operation::Register, 1, 0),
+                true,
+                RequestClass::ReplicatedMetadata,
+            ),
+            (
+                "register with a request number falls to the default",
+                routed(Operation::Register, 0, 1),
+                true,
+                RequestClass::ReplicatedMetadata,
+            ),
+            (
+                "logout, bound",
+                routed(Operation::Logout, 1, 1),
+                true,
+                RequestClass::Logout,
+            ),
+            (
+                "logout beats the session gate",
+                routed(Operation::Logout, 1, 1),
+                false,
+                RequestClass::Logout,
+            ),
+            (
+                "unbound metadata op",
+                routed(Operation::CreateStream, 1, 1),
+                false,
+                RequestClass::UnboundReplicated,
+            ),
+            (
+                "the session gate beats the delete-segments probe",
+                routed(Operation::DeleteSegments, 1, 1),
+                false,
+                RequestClass::UnboundReplicated,
+            ),
+            (
+                "the session gate beats the partition probe",
+                routed(Operation::SendMessages, 1, 1),
+                false,
+                RequestClass::UnboundReplicated,
+            ),
+            (
+                "delete-segments is neither partition nor metadata",
+                routed(Operation::DeleteSegments, 1, 1),
+                true,
+                RequestClass::DeleteSegments,
+            ),
+            (
+                "send-messages is partition-plane",
+                routed(Operation::SendMessages, 1, 1),
+                true,
+                RequestClass::Partition,
+            ),
+            (
+                "store-consumer-offset is partition-plane",
+                routed(Operation::StoreConsumerOffset, 1, 1),
+                true,
+                RequestClass::Partition,
+            ),
+            (
+                "create-topic is replicated metadata",
+                routed(Operation::CreateTopic, 1, 1),
+                true,
+                RequestClass::ReplicatedMetadata,
+            ),
+        ];
+        for (label, header, bound, expected) in table {
+            assert_eq!(classify(&header, bound), expected, "{label}");
+        }
+    }
+
+    /// A legacy login code must get the typed `MalformedLogin` eviction
+    /// BEFORE the session gate runs: an unbound sender must not fall into
+    /// the generic Unauthenticated deny the pre-auth guard sends for other
+    /// codes.
+    #[compio::test]
+    async fn legacy_login_codes_evicted_before_session_gate() {
+        const TRANSPORT: u128 = 94;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let system_config = Arc::new(ServerSystemConfig::default());
+
+        for code in [LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE] {
+            handle_client_request(
+                &shard,
+                &sessions,
+                &system_config,
+                1,
+                TRANSPORT,
+                non_replicated_request(TRANSPORT, code),
             )
-            .is_ok(),
-            "the partition cap itself is admissible"
+            .await;
+            let replies = bus.client_replies.borrow();
+            assert_eq!(replies.len(), 1, "code {code} must produce one frame");
+            let (client, frame) = &replies[0];
+            assert_eq!(*client, TRANSPORT);
+            assert_eq!(
+                frame_command(frame),
+                Command::Eviction as u8,
+                "legacy code {code} must be evicted, not denied"
+            );
+            assert_eq!(
+                eviction_reason_byte(frame),
+                EvictionReason::MalformedLogin as u8,
+                "legacy code {code} must carry MalformedLogin"
+            );
+            drop(replies);
+            bus.client_replies.borrow_mut().clear();
+        }
+    }
+
+    /// A replicated op from an unbound transport must get the typed
+    /// `Eviction(NoSession)`: the client believes it has a session and that
+    /// session is gone, so a silent drop or an empty Reply would wedge or
+    /// mislead it.
+    #[compio::test]
+    async fn unbound_replicated_request_gets_no_session_eviction() {
+        const TRANSPORT: u128 = 95;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let system_config = Arc::new(ServerSystemConfig::default());
+
+        handle_client_request(
+            &shard,
+            &sessions,
+            &system_config,
+            1,
+            TRANSPORT,
+            wire_request(Operation::CreateStream, TRANSPORT, 1, 1, &[]).into_generic(),
+        )
+        .await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "unbound replicated op must be answered");
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT);
+        assert_eq!(
+            frame_command(frame),
+            Command::Eviction as u8,
+            "unbound replicated op must be evicted, not denied or dropped"
         );
-        assert!(
-            matches!(
-                validate_topic_bounds(
-                    MAX_PARTITIONS_PER_REQUEST + 1,
-                    MaxTopicSize::ServerDefault,
-                    segment_size
-                ),
-                Err(IggyError::TooManyPartitions)
-            ),
-            "one past the partition cap must deny"
-        );
-        // ServerDefault is numerically 0 yet exempt from the segment-size
-        // floor: it resolves against server config, matching legacy.
-        assert!(validate_topic_bounds(1, MaxTopicSize::ServerDefault, segment_size).is_ok());
-        assert!(validate_topic_bounds(1, MaxTopicSize::Unlimited, segment_size).is_ok());
-        let below_floor = MaxTopicSize::Custom((segment_size - 1).into());
-        assert!(
-            matches!(
-                validate_topic_bounds(1, below_floor, segment_size),
-                Err(IggyError::InvalidTopicSize(size, floor))
-                    if size == below_floor && floor == IggyByteSize::from(segment_size)
-            ),
-            "custom size below the segment size must deny with the bounds"
-        );
-        let at_floor = MaxTopicSize::Custom(IggyByteSize::from(segment_size));
-        assert!(
-            validate_topic_bounds(1, at_floor, segment_size).is_ok(),
-            "a topic exactly one segment large is admissible"
+        assert_eq!(
+            eviction_reason_byte(frame),
+            EvictionReason::NoSession as u8,
+            "the eviction must carry NoSession"
         );
     }
 
-    #[test]
-    fn partitions_count_cap_denies_pre_consensus() {
-        assert!(
-            validate_partitions_count(MAX_PARTITIONS_PER_REQUEST).is_ok(),
-            "the cap itself is admissible"
+    /// PING is the one pre-auth code: an unbound transport's ping must get a
+    /// normal status-0 Reply, not an eviction and not a deny.
+    #[compio::test]
+    async fn pre_auth_ping_allowed() {
+        const TRANSPORT: u128 = 96;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let system_config = Arc::new(ServerSystemConfig::default());
+
+        handle_client_request(
+            &shard,
+            &sessions,
+            &system_config,
+            1,
+            TRANSPORT,
+            non_replicated_request(TRANSPORT, PING_CODE),
+        )
+        .await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "pre-auth ping must be answered");
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT);
+        assert_eq!(
+            frame_command(frame),
+            Command::Reply as u8,
+            "pre-auth ping must get a Reply, not an eviction"
         );
-        assert!(
-            matches!(
-                validate_partitions_count(MAX_PARTITIONS_PER_REQUEST + 1),
-                Err(IggyError::TooManyPartitions)
-            ),
-            "one past the cap must deny"
-        );
-        // Zero passes the shared cap because a zero-partition TOPIC is legal
-        // (legacy `create_topic` admits `0..=MAX`).
-        assert!(validate_partitions_count(0).is_ok());
+        assert_eq!(reply_status(frame), 0, "pre-auth ping must succeed");
     }
 
-    #[test]
-    fn zero_partitions_change_denies_pre_consensus() {
-        // Adding or removing zero partitions is a no-op that would still burn
-        // a replicated log entry and force a rebalance. Legacy rejects it with
-        // `TooManyPartitions` in both handlers, so the code matches.
-        assert!(
-            matches!(
-                validate_partitions_change_count(0),
-                Err(IggyError::TooManyPartitions)
-            ),
-            "adding or removing zero partitions must deny"
+    /// The request-checksum gate runs before every probe: a replicated op
+    /// from an UNBOUND transport with a bad stamp must get the checksum deny
+    /// Reply, not the `Eviction(NoSession)` the session gate would send.
+    #[compio::test]
+    async fn checksum_mismatch_denies_before_everything() {
+        const TRANSPORT: u128 = 97;
+        const BODY: &[u8] = b"stream-body";
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        let system_config = Arc::new(ServerSystemConfig::default());
+
+        let mut message = wire_request(Operation::CreateStream, TRANSPORT, 1, 1, BODY);
+        {
+            let header_size = size_of::<RequestHeader>();
+            let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut message.as_mut_slice()[..header_size],
+            );
+            // Nonzero (zero means unstamped and skips the check) and never
+            // the body's real checksum.
+            header.request_checksum = u128::from(iggy_common::calculate_checksum(BODY)) + 1;
+        }
+        handle_client_request(
+            &shard,
+            &sessions,
+            &system_config,
+            1,
+            TRANSPORT,
+            message.into_generic(),
+        )
+        .await;
+        let replies = bus.client_replies.borrow();
+        assert_eq!(replies.len(), 1, "bad stamp must be answered");
+        let (client, frame) = &replies[0];
+        assert_eq!(*client, TRANSPORT);
+        assert_eq!(
+            frame_command(frame),
+            Command::Reply as u8,
+            "a bad stamp must get the checksum deny, not the NoSession eviction"
         );
-        assert!(validate_partitions_change_count(1).is_ok());
-        assert!(validate_partitions_change_count(MAX_PARTITIONS_PER_REQUEST).is_ok());
+        assert_eq!(
+            reply_status(frame),
+            IggyError::InvalidFormat.as_code(),
+            "the deny status must carry the checksum error"
+        );
+    }
+
+    /// The late-bound self-reference as the shard build creates it: unset
+    /// until the shard exists.
+    fn unset_shard_handle() -> ShellShardHandle<SpyBus, PrepareJournal, IggySnapshot> {
+        Rc::new(RefCell::new(None))
+    }
+
+    /// Yield so the drain task the enqueue spawned on the bus can run.
+    async fn run_spawned_tasks() {
+        compio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    /// One handler per shard means one connection-lost hook on its bus: a
+    /// second install would overwrite the first and orphan the sessions
+    /// the first one bound.
+    #[test]
+    fn deferred_handler_installs_one_connection_lost_hook() {
+        let bus = SpyBus::default();
+        let _handler = make_deferred_client_request_handler(
+            &bus,
+            &unset_shard_handle(),
+            &Rc::new(RefCell::new(SessionManager::new())),
+            Arc::new(ServerSystemConfig::default()),
+            1,
+        );
+        assert_eq!(
+            bus.connection_lost_hooks.get(),
+            1,
+            "one factory call must install exactly one connection-lost hook"
+        );
+    }
+
+    /// The handler is built before the shard it serves. A frame that
+    /// arrives while the self-reference is still unset stays queued, and
+    /// the enqueue must release the client's active slot: otherwise every
+    /// later frame for that client finds the slot taken and nothing is
+    /// ever drained, the stranded frame included.
+    #[compio::test]
+    async fn deferred_handler_drains_after_the_shard_handle_is_set() {
+        const TRANSPORT: u128 = 98;
+        let bus = SpyBus::default();
+        let shard_handle = unset_shard_handle();
+        let handler = make_deferred_client_request_handler(
+            &bus,
+            &shard_handle,
+            &Rc::new(RefCell::new(SessionManager::new())),
+            Arc::new(ServerSystemConfig::default()),
+            1,
+        );
+
+        handler(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));
+        run_spawned_tasks().await;
         assert!(
-            matches!(
-                validate_partitions_change_count(MAX_PARTITIONS_PER_REQUEST + 1),
-                Err(IggyError::TooManyPartitions)
-            ),
-            "the cap still applies"
+            bus.client_replies.borrow().is_empty(),
+            "nothing can be served before the shard exists"
+        );
+
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+        handler(TRANSPORT, non_replicated_request(TRANSPORT, PING_CODE));
+        for _ in 0..500 {
+            if bus.client_replies.borrow().len() == 2 {
+                break;
+            }
+            run_spawned_tasks().await;
+        }
+
+        let replies = bus.client_replies.borrow();
+        assert_eq!(
+            replies.len(),
+            2,
+            "the stranded ping and the new one must both be served once the shard exists"
+        );
+        for (client, frame) in replies.iter() {
+            assert_eq!(*client, TRANSPORT);
+            assert_eq!(frame_command(frame), Command::Reply as u8);
+            assert_eq!(reply_status(frame), 0, "a served ping succeeds");
+        }
+    }
+
+    /// The per-client queue entry goes with its last frame. The
+    /// connection-lost hook cannot be its only owner: the dispatch task still
+    /// delivers frames it had buffered when the socket closed, which re-create
+    /// the entry after the hook ran, and `client_id` is monotonic - so an
+    /// entry nothing frees again lives until process exit.
+    #[test]
+    fn draining_a_client_queue_frees_its_entry() {
+        const CLIENT: u128 = 7;
+        let queues: ClientRequestQueues = Rc::new(RefCell::new(AHashMap::new()));
+        queues
+            .borrow_mut()
+            .entry(CLIENT)
+            .or_default()
+            .push_back(non_replicated_request(CLIENT, PING_CODE));
+
+        assert!(pop_next_client_request(&queues, CLIENT).is_some());
+        assert!(
+            queues.borrow().is_empty(),
+            "the entry must be freed as soon as it drains empty"
+        );
+        assert!(
+            pop_next_client_request(&queues, CLIENT).is_none(),
+            "a drained client has nothing left to pop"
         );
     }
 }

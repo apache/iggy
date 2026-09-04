@@ -21,9 +21,16 @@ mod a2a_jwt;
 mod cg;
 // Flush (FLUSH_UNSAVED_BUFFER) has no the server primitive; it must deny typed.
 mod flush_vsr;
+// Raw TCP framing (connect, hand-crafted frames, root register) for the
+// server suites that send what the SDK cannot.
+pub(crate) mod raw_tcp;
 // Legacy login codes (LOGIN_USER / LOGIN_WITH_PAT) have no the server handler;
 // they must evict typed (MalformedLogin), not stall or reply empty-ok.
 mod legacy_login_vsr;
+// A non-replicated code no read serves (unknown, or table-listed without an
+// arm) must deny typed (InvalidCommand) at the read gate, not stall or reply
+// empty-ok.
+mod unknown_code_vsr;
 // A failed credential login must report the credential failure, not the
 // payload shape it fell through to.
 mod login_credentials_vsr;
