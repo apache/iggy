@@ -2,7 +2,7 @@
 
 The highly performant and modular runtime for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. Create your own Rust plugins by simply implementing either the `Source` or `Sink` trait and build custom pipelines for the data processing.
 
-The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available via `docker pull apache/iggy-connect`. It ships in two flavors: a default image with every connector plugin bundled, and a `-slim` runtime-only image (see [Docker image](#docker-image)).
 
 ## Features
 
@@ -17,6 +17,38 @@ The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, a
 - **Flexible configuration providers**: Support for local file-based and HTTP-based configuration providers for centralized configuration management.
 - **Observability**: Prometheus metrics with per-stage latency histograms, plus an opt-in per-batch tracing benchmark target.
 - **Structured logging**: Selectable text or JSON log format via `[logging]` configuration.
+
+## Docker image
+
+Published to Docker Hub as [`apache/iggy-connect`](https://hub.docker.com/r/apache/iggy-connect) in two flavors:
+
+| Tag | Contents |
+| --- | --- |
+| `edge`, `x.y.z`, `latest` | Runtime plus every bundled connector plugin (default) |
+| `edge-slim`, `x.y.z-slim`, `latest-slim` | Runtime binary only |
+
+The default (fat) image bakes every connector plugin into `/usr/local/lib`, which is on the runtime's [plugin search path](#plugin-path-resolution). A connector config can therefore load a bundled plugin by library file name alone, with no directory and no extension:
+
+```toml
+# a connector definition in your config_dir
+type = "sink"
+key = "stdout"
+name = "Stdout sink"
+path = "libiggy_connector_stdout_sink"
+```
+
+Run the runtime with a config mounted in, pointing `IGGY_CONNECTORS_CONFIG_PATH` at it:
+
+```bash
+docker run --rm \
+  -v "$PWD/my_config:/config" \
+  -e IGGY_CONNECTORS_CONFIG_PATH=/config/config.toml \
+  apache/iggy-connect
+```
+
+The mounted `config.toml` must set `[connectors].config_dir` to the connector definitions inside the container, and each definition's `path` must resolve there; bundled plugins resolve by file name as shown above.
+
+Choose a `-slim` tag when you supply your own plugins and want a smaller image with a narrower dependency surface, and mount the plugin `.so` files into one of the search-path directories (for example `/usr/local/lib`).
 
 ## Quick Start
 

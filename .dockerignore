@@ -21,6 +21,7 @@
 /scripts/ci/*
 !/scripts/ci/third-party-licenses.sh
 !/scripts/ci/render-node-licenses.mjs
+!/scripts/ci/connector-plugins.sh
 **/target
 /target
 !/target/debug/iggy
