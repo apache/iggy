@@ -212,6 +212,8 @@ pub struct ShardMetrics {
     partition_requests_denied_transient_total: Counter,
     partition_repair_serves_deferred_purge_total: Counter,
     partition_prepare_gap_drops_total: Counter,
+    metadata_read_frontier_refusals_total: Counter,
+    client_requests_denied_queue_full_total: Counter,
 }
 
 impl ShardMetrics {
@@ -237,7 +239,47 @@ impl ShardMetrics {
             partition_requests_denied_transient_total: Counter::default(),
             partition_repair_serves_deferred_purge_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
+            metadata_read_frontier_refusals_total: Counter::default(),
+            client_requests_denied_queue_full_total: Counter::default(),
         }
+    }
+
+    /// Bumped every time a client request is answered with a retryable denial
+    /// because that client already has the maximum number of requests queued
+    /// behind one the shard has not answered yet.
+    ///
+    /// The queue only grows while a client pipelines faster than its own
+    /// frames are served, so a sustained rate means one connection is stalled
+    /// on something - a held metadata read, a slow commit - while it keeps
+    /// sending.
+    pub fn record_client_request_denied_queue_full(&self) {
+        self.client_requests_denied_queue_full_total.inc();
+    }
+
+    /// Current value of [`Self::record_client_request_denied_queue_full`], for
+    /// tests that assert the denial was counted.
+    #[must_use]
+    pub fn client_requests_denied_queue_full_value(&self) -> u64 {
+        self.client_requests_denied_queue_full_total.get()
+    }
+
+    /// Bumped every time a metadata read is refused because this node's
+    /// applied frontier never reached what the caller was told committed.
+    ///
+    /// The counter is the signal, not a log line: a node that lags durably
+    /// refuses every held read of every client for as long as it lags, so the
+    /// refusal itself logs at `debug!` and this is what a dashboard alerts on.
+    /// Any sustained rate means reads on this node are failing retryable while
+    /// its commit walk stays behind.
+    pub fn record_metadata_read_frontier_refusal(&self) {
+        self.metadata_read_frontier_refusals_total.inc();
+    }
+
+    /// Current value of [`Self::record_metadata_read_frontier_refusal`], for
+    /// tests that assert a refusal was counted rather than scraping it.
+    #[must_use]
+    pub fn metadata_read_frontier_refusals_value(&self) -> u64 {
+        self.metadata_read_frontier_refusals_total.get()
     }
 
     /// Increment `frame_drops_total{variant, reason}` by 1.
@@ -530,6 +572,16 @@ impl ShardMetrics {
             "partition_prepare_gap_drops",
             "replicated prepares dropped out of order by a backup's gap check",
             self.partition_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "metadata_read_frontier_refusals",
+            "metadata reads refused because this node never applied the caller's committed op",
+            self.metadata_read_frontier_refusals_total.clone(),
+        );
+        registry.register(
+            "client_requests_denied_queue_full",
+            "client requests denied retryable because that client's request queue was full",
+            self.client_requests_denied_queue_full_total.clone(),
         );
     }
 }

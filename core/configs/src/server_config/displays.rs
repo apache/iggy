@@ -56,10 +56,11 @@ impl Display for PartitionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, evicted_ring_capacity: {}, \
-             evicted_ring_bytes_max: {}, transfer_served_cache_bytes_max: {}, \
-             transfer_artifact_bytes_max: {} }}",
+            "{{ prepare_queue_depth: {}, offset_reservation_lease: {}, \
+             evicted_ring_capacity: {}, evicted_ring_bytes_max: {}, \
+             transfer_served_cache_bytes_max: {}, transfer_artifact_bytes_max: {} }}",
             self.prepare_queue_depth,
+            self.offset_reservation_lease,
             self.evicted_ring_capacity,
             self.evicted_ring_bytes_max,
             self.transfer_served_cache_bytes_max,

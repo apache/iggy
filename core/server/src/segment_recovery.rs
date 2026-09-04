@@ -30,15 +30,17 @@
 use crate::server_error::{PartitionRecoveryRefusal, ServerError};
 use configs::server::ServerConfig;
 use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
+use partitions::segment_anchor::ANCHOR_EXTENSION;
 use partitions::state_transfer::STAGING_SUFFIX;
 use partitions::{IggyIndex, IggyIndexReader, Segment};
 use server_common::send_messages::{BatchHeader, COMMAND_HEADER_SIZE, decode_batch_slice};
+use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const LOG_EXTENSION: &str = "log";
 const INDEX_EXTENSION: &str = "index";
@@ -173,16 +175,21 @@ pub struct RecoveredSegment {
 /// makes a durable index entry evidence about the log (see
 /// [`PartitionRecoveryRefusal::FsyncedLogLoss`]), so passing it wrong either
 /// refuses healthy chains or hides previously durable data loss.
+///
+/// Takes no offset ceiling. A legitimate gap is proved by the anchor the boot
+/// re-anchor writes beside the segment it plants, not inferred from how far the
+/// superblock's reservation happens to reach.
 #[allow(clippy::too_many_lines)]
 pub async fn load_persisted_segments(
     config: &ServerConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_id: usize,
+    namespace: IggyNamespace,
     segment_size: IggyByteSize,
     enforce_fsync: bool,
     stats: &PartitionStats,
 ) -> Result<Vec<RecoveredSegment>, ServerError> {
+    let stream_id = namespace.stream_id();
+    let topic_id = namespace.topic_id();
+    let partition_id = namespace.partition_id();
     let partition_path = config
         .system
         .get_partition_path(stream_id, topic_id, partition_id);
@@ -298,9 +305,9 @@ pub async fn load_persisted_segments(
         last.segment.sealed = false;
     }
 
-    // Pass B: the chain guard reads only the planned bounds, so it can refuse
-    // BEFORE anything is truncated.
-    ensure_contiguous_chain(identity, &planned)?;
+    // Pass B: the chain guard reads the planned bounds and, for a gap, the
+    // anchor beside it, so it can refuse BEFORE anything is truncated.
+    ensure_contiguous_chain(identity, &planned).await?;
 
     // Pass C: the chain is accepted; make disk match the bounds and open
     // storage over them.
@@ -529,13 +536,35 @@ struct ScanScratch {
 /// chain and push `current_offset` past data this replica does not hold.
 /// Refuse loudly instead of serving a holed log.
 ///
+/// A FORWARD gap is admitted only when the far side carries a
+/// [`SegmentAnchor`] naming exactly the near side, which is the record the boot
+/// re-anchor writes before it plants. Nothing else legitimises a gap: an
+/// overlap, a backwards pair, or a gap with no anchor is damage.
+///
+/// The anchors are what a monotone offset ceiling could not be. A ceiling says
+/// only "some boot claimed up to N", and every plant base sits below the current
+/// N -- but so does the successor of a segment that was deleted, so a lost middle
+/// segment read as a plant. The anchor is written by the one component that
+/// creates legitimate gaps, names which segment it sealed, and is swept as soon
+/// as its segment is gone.
+///
+/// Retention needs no allowance: it removes a contiguous FRONT prefix, so the
+/// remaining chain stays contiguous and no interior gap appears.
+///
+/// # Known residual
+///
+/// An anchor whose planted segment survived while the sealed segment it names was
+/// itself lost still reads as legitimate, because the pair the anchor describes
+/// is then simply absent from the chain and the guard never examines it. Catching
+/// that needs a durable count of the chain, which this record does not carry.
+///
 /// Runs on the planned bounds alone, BEFORE any truncation, so the segment
 /// files a refusal quarantines are exactly the bytes boot found. The refusal
 /// names the partition and its directory so the caller can fence THAT group
 /// rather than abort the node's boot: the shapes it rejects are exactly what
 /// a failed quarantine leaves behind, and one damaged local chain must not
 /// take the whole node down.
-fn ensure_contiguous_chain(
+async fn ensure_contiguous_chain(
     identity: PartitionIdentity<'_>,
     planned: &[PlannedSegment],
 ) -> Result<(), ServerError> {
@@ -567,7 +596,41 @@ fn ensure_contiguous_chain(
         }
         // `checked_add`, not `+`: an end offset at u64::MAX must read as a
         // hole (no start offset can follow it), not overflow.
-        if previous.end_offset.checked_add(1) != Some(next.start_offset) {
+        if previous.end_offset.checked_add(1) == Some(next.start_offset) {
+            continue;
+        }
+        // FORWARD only, and only with the plant's own record beside it. Start
+        // offsets come off the file names so they ascend, but each end offset is
+        // walked from that file's own bytes with nothing clamping it against the
+        // next start, so a half-installed transfer or an operator copy can leave
+        // a pair that overlaps -- and no re-anchor ever plants a segment whose
+        // range a predecessor already covers.
+        // Read HERE rather than collected up front: only a gap needs an anchor,
+        // so a contiguous chain -- every chain that never crashed mid-block --
+        // opens no file at all, and the ones that do are already walking this
+        // pair. An unreadable anchor is unknown, not absent, and treating it as
+        // absent would refuse a healthy chain for as long as the fault lasts.
+        let read =
+            partitions::segment_anchor::read_anchor(identity.partition_path, next.start_offset)
+                .await
+                .map_err(|error| {
+                    error!(
+                        partition_path = identity.partition_path,
+                        start_offset = next.start_offset,
+                        %error,
+                        "failed to read a segment anchor during recovery"
+                    );
+                    ServerError::from(IggyError::CannotReadFile)
+                })?;
+        let anchored = previous.end_offset < next.start_offset
+            && read.is_some_and(|anchor| {
+                anchor.covers(
+                    next.start_offset,
+                    previous.start_offset,
+                    previous.end_offset,
+                )
+            });
+        if !anchored {
             return Err(identity.refusal(PartitionRecoveryRefusal::Hole {
                 previous_start: previous.start_offset,
                 previous_end: previous.end_offset,
@@ -575,6 +638,14 @@ fn ensure_contiguous_chain(
                 recoverable_bytes,
             }));
         }
+        info!(
+            partition_path = identity.partition_path,
+            previous_start = previous.start_offset,
+            previous_end = previous.end_offset,
+            next_start = next.start_offset,
+            "admitted a gap in the recovered segment chain: the planted segment \
+             carries the boot re-anchor's own record of it"
+        );
     }
     Ok(())
 }
@@ -636,7 +707,11 @@ fn sweep_scratch_files_and_collect_offsets(partition_path: &str) -> Result<Vec<u
                     }
                 }
             }
-            Some(INDEX_EXTENSION) => orphan_candidates.push(path),
+            // An anchor outlives nothing: it describes the gap in front of ONE
+            // segment, so once that segment is gone (retention, a failed plant
+            // that never landed) the record can only mislead a later guard into
+            // admitting a gap it never saw.
+            Some(INDEX_EXTENSION | ANCHOR_EXTENSION) => orphan_candidates.push(path),
             _ => {}
         }
     }
@@ -2407,6 +2482,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use configs::server::ServerSystemConfig;
+    use partitions::segment_anchor::SegmentAnchor;
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned, calculate_batch_checksum,
     };
@@ -2565,6 +2641,44 @@ mod tests {
         (messages_path, index_path)
     }
 
+    /// Path of the anchor beside the segment planted at `start_offset`.
+    fn anchor_fixture_path(config: &ServerConfig, start_offset: u64) -> String {
+        partitions::segment_anchor::anchor_path(
+            &config
+                .system
+                .get_partition_path(STREAM_ID, TOPIC_ID, PARTITION_ID),
+            start_offset,
+        )
+    }
+
+    /// Write the anchor a plant at `planted_start` leaves behind, naming the tail
+    /// it sealed.
+    fn write_anchor_fixture(
+        config: &ServerConfig,
+        planted_start: u64,
+        sealed_start: u64,
+        sealed_end: u64,
+    ) {
+        let anchor = SegmentAnchor {
+            planted_start,
+            sealed_start,
+            sealed_end,
+        };
+        fs::write(
+            anchor_fixture_path(config, planted_start),
+            anchor.to_bytes(),
+        )
+        .expect("write anchor fixture");
+    }
+
+    /// Recover expecting a refusal, with `context` naming what should have failed.
+    async fn refusal(config: &ServerConfig, context: &str) -> ServerError {
+        match recover(config).await {
+            Ok(recovered) => panic!("{context}, got {} segments", recovered.len()),
+            Err(error) => error,
+        }
+    }
+
     fn len_of(path: &str) -> u64 {
         fs::metadata(path).expect("stat fixture file").len()
     }
@@ -2584,18 +2698,23 @@ mod tests {
     }
 
     async fn recover(config: &ServerConfig) -> Result<Vec<RecoveredSegment>, ServerError> {
-        recover_under_fsync(config, false).await
+        recover_with(config, false).await
     }
 
     async fn recover_under_fsync(
         config: &ServerConfig,
         enforce_fsync: bool,
     ) -> Result<Vec<RecoveredSegment>, ServerError> {
+        recover_with(config, enforce_fsync).await
+    }
+
+    async fn recover_with(
+        config: &ServerConfig,
+        enforce_fsync: bool,
+    ) -> Result<Vec<RecoveredSegment>, ServerError> {
         load_persisted_segments(
             config,
-            STREAM_ID,
-            TOPIC_ID,
-            PARTITION_ID,
+            IggyNamespace::new(STREAM_ID, TOPIC_ID, PARTITION_ID),
             IggyByteSize::from(SEGMENT_MAX_SIZE),
             enforce_fsync,
             &PartitionStats::default(),
@@ -3016,6 +3135,249 @@ mod tests {
         assert_eq!(bytes_of(&first_index_path), first_index);
         assert_eq!(bytes_of(&next_messages_path), next_log);
         assert_eq!(bytes_of(&next_index_path), next_index);
+    }
+
+    /// Valid, checksum-clean anchor bytes COPIED beside a later segment must not
+    /// authorise the wider gap they now sit in front of. The record names its own
+    /// plant, and the guard matches that against the file it was found beside, so
+    /// an operator's `cp` buys nothing.
+    #[compio::test]
+    async fn given_an_anchor_copied_beside_a_later_segment_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 500, &encoded_batch(500, 1), &index_entry(500, 0));
+        // The anchor a legitimate plant at 10 would have left, moved beside the
+        // segment at 500 without touching a byte of it.
+        let stolen = fs::read({
+            write_anchor_fixture(&config, 10, 0, 2);
+            anchor_fixture_path(&config, 10)
+        })
+        .expect("read the legitimate anchor");
+        fs::remove_file(anchor_fixture_path(&config, 10)).expect("unlink the original");
+        fs::write(anchor_fixture_path(&config, 500), &stolen).expect("copy it beside 500");
+
+        let error = refusal(&config, "a copied anchor must not cover a wider gap").await;
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::Hole { .. },
+                    ..
+                }
+            ),
+            "expected a hole refusal, got {error:?}"
+        );
+    }
+
+    /// The shape the boot re-anchor leaves: a sealed tail, then the next segment
+    /// planted above it, with the anchor beside the plant naming the tail.
+    #[compio::test]
+    async fn given_an_anchored_gap_when_recovering_should_accept_the_chain() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 1), &index_entry(10, 0));
+        write_anchor_fixture(&config, 10, 0, 2);
+
+        let recovered = recover(&config)
+            .await
+            .expect("a gap the plant recorded is the re-anchor's, not damage");
+
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].segment.start_offset, 0);
+        assert_eq!(recovered[1].segment.start_offset, 10);
+    }
+
+    /// The regression this record exists to close: with no anchor the gap is a
+    /// segment that went missing, and admitting it serves a holed log silently.
+    #[compio::test]
+    async fn given_an_unanchored_gap_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 1), &index_entry(10, 0));
+
+        let error = refusal(&config, "a gap no plant recorded must refuse recovery").await;
+
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::Hole { .. },
+                    ..
+                }
+            ),
+            "expected a hole refusal, got {error:?}"
+        );
+    }
+
+    /// An anchor names WHICH segment it sealed, so one left behind by an earlier
+    /// chain cannot legitimise a gap it never saw.
+    #[compio::test]
+    async fn given_an_anchor_naming_another_segment_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 1), &index_entry(10, 0));
+        // Right shape, wrong predecessor: this anchor describes a tail ending at
+        // 5, and the chain's tail ends at 2.
+        write_anchor_fixture(&config, 10, 0, 5);
+
+        let error = refusal(&config, "an anchor for a different tail must not cover it").await;
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::Hole { .. },
+                    ..
+                }
+            ),
+            "expected a hole refusal, got {error:?}"
+        );
+    }
+
+    /// A corrupt anchor proves nothing, so the gap it would have covered stays
+    /// damage rather than becoming legitimate by default.
+    #[compio::test]
+    async fn given_a_corrupt_anchor_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 1), &index_entry(10, 0));
+        let path = anchor_fixture_path(&config, 10);
+        let mut bytes = SegmentAnchor {
+            planted_start: 10,
+            sealed_start: 0,
+            sealed_end: 2,
+        }
+        .to_bytes();
+        bytes[8] ^= 1;
+        fs::write(&path, bytes).expect("write corrupt anchor");
+
+        let error = refusal(&config, "a corrupt anchor must not cover a gap").await;
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::Hole { .. },
+                    ..
+                }
+            ),
+            "expected a hole refusal, got {error:?}"
+        );
+    }
+
+    /// Every crash cycle leaves one more re-anchor gap, and the guard runs on the
+    /// NEXT boot -- before the re-anchor -- so by the second cycle the earlier gap
+    /// is no longer the last pair. A rule keyed on the last pair alone would
+    /// refuse this, and the solo arm tombstones a chain with bytes in it, taking a
+    /// healthy partition dark from the second crash onward.
+    #[compio::test]
+    async fn given_gaps_from_several_crash_cycles_when_recovering_should_accept_the_chain() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 2), &index_entry(10, 0));
+        write_segment(&config, 20, &encoded_batch(20, 1), &index_entry(20, 0));
+        write_anchor_fixture(&config, 10, 0, 2);
+        write_anchor_fixture(&config, 20, 10, 11);
+
+        let recovered = recover(&config)
+            .await
+            .expect("anchored gaps accumulate one per crash, not one total");
+
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered[0].segment.start_offset, 0);
+        assert_eq!(recovered[1].segment.start_offset, 10);
+        assert_eq!(recovered[2].segment.start_offset, 20);
+    }
+
+    /// One lost segment in the middle of a chain whose OTHER gaps are all
+    /// anchored. The anchors say nothing about this pair, so it must still refuse
+    /// -- the shape a single monotone ceiling could not separate from a plant.
+    #[compio::test]
+    async fn given_a_lost_segment_among_anchored_gaps_when_recovering_should_refuse() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 2), &index_entry(10, 0));
+        // 20 was an ordinary rotation off 12, then went missing; 30 is a plant.
+        write_segment(&config, 30, &encoded_batch(30, 1), &index_entry(30, 0));
+        write_anchor_fixture(&config, 10, 0, 2);
+
+        let error = refusal(&config, "a lost middle segment must refuse recovery").await;
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::Hole {
+                        previous_start: 10,
+                        previous_end: 11,
+                        next_start: 30,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected a hole refusal naming the lost pair, got {error:?}"
+        );
+    }
+
+    /// No re-anchor plants a segment whose range a predecessor already covers, so
+    /// an anchor must not launder an overlap either. Reachable because each end
+    /// offset is walked from its own file with nothing clamping it against the
+    /// next start.
+    #[compio::test]
+    async fn given_overlapping_segments_when_recovering_should_refuse_even_when_anchored() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        // `0.log` walks to 0..=15 while `10.log` claims 10 onward: the pair runs
+        // backwards, which no legitimate chain does.
+        write_segment(&config, 0, &encoded_batch(0, 16), &index_entry(0, 0));
+        write_segment(&config, 10, &encoded_batch(10, 3), &index_entry(10, 0));
+        write_anchor_fixture(&config, 10, 0, 15);
+
+        let error = refusal(&config, "an overlap must refuse however it is recorded").await;
+        assert!(
+            matches!(
+                &error,
+                ServerError::PartitionRecoveryRefused {
+                    reason: PartitionRecoveryRefusal::Hole { .. },
+                    ..
+                }
+            ),
+            "expected a hole refusal, got {error:?}"
+        );
+    }
+
+    /// An anchor whose segment is gone can only mislead a later guard, so the boot
+    /// sweep collects it the way it collects an orphaned index.
+    #[compio::test]
+    async fn given_an_anchor_with_no_segment_when_recovering_should_sweep_it() {
+        let tmp = tempdir().expect("tempdir");
+        let config = test_config(&tmp);
+        prepare_partition_dir(&config);
+        write_segment(&config, 0, &encoded_batch(0, 3), &index_entry(0, 0));
+        // The window a crash between the anchor write and the plant leaves.
+        write_anchor_fixture(&config, 10, 0, 2);
+        let orphan = anchor_fixture_path(&config, 10);
+
+        let recovered = recover(&config).await.expect("recover the intact chain");
+
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            !Path::new(&orphan).exists(),
+            "an anchor naming a segment that does not exist must be swept"
+        );
     }
 
     #[compio::test]

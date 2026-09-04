@@ -30,7 +30,7 @@ use metadata::stm::mux::WithFactory;
 use metadata::stm::snapshot::RestoreSnapshot;
 use metadata::stm::stream::{Streams, StreamsInner};
 use metadata::stm::user::{Users, UsersInner};
-use metadata::{IggyMetadata, apply_committed_prepare};
+use metadata::{AppliedFrontier, IggyMetadata, apply_committed_prepare};
 use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
 use server::boot::wire_shell_handlers;
 use server::shell::{ShellHandlers, ShellShardHandle};
@@ -157,6 +157,7 @@ pub fn new_shard(
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
     seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
+    applied_frontier: Arc<AppliedFrontier>,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
     // the only writable STM; every peer shard rebuilds a reader-mode mirror from
@@ -304,7 +305,8 @@ pub fn new_shard(
         superblock,
         mux,
         data_dir,
-    );
+    )
+    .with_applied_frontier(applied_frontier);
 
     // Both halves are load-bearing: the pairing keeps a later view-change superblock
     // write from regressing to `(0, 0)`, and the folded table is the floor the replayed
@@ -368,6 +370,8 @@ pub fn new_shard(
             );
         }
     }
+    // Same seed the server bootstrap runs after its own replay.
+    metadata.seed_applied_frontier_from_consensus();
     // Mint the peers' read-side bundle AFTER reconstruction so it reflects the
     // recovered state. Shard 0 only; peers pass it back in as `reader_bundle`.
     let metadata_bundle = (shard_idx == 0).then(|| metadata.mux_stm.factory_bundle());

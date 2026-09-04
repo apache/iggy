@@ -47,6 +47,7 @@ pub(crate) mod pat;
 pub(crate) mod responses;
 pub mod session_manager;
 pub mod shell;
+
 pub(crate) mod users;
 pub(crate) mod wire;
 
