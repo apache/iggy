@@ -18,4 +18,8 @@
 pub mod container;
 pub mod sink;
 
-pub use sink::{QuestDbSinkFixture, QuestDbSinkPayloadTimestampFixture, QuestDbSinkTypedFixture};
+pub use sink::{
+    QuestDbSinkFixture, QuestDbSinkHeadersFixture, QuestDbSinkPayloadTimestampFixture,
+    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture,
+    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
+};
