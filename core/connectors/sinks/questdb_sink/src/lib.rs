@@ -206,65 +206,69 @@ impl QuestDbSink {
         // `questdb-rs` is synchronous: the QWP driver owns its own I/O thread
         // and `flush` / `wait` block. Row building is cheap but is done here
         // too, so the whole batch crosses the boundary exactly once.
-        let handle = tokio::task::spawn_blocking(
-            move || -> Result<BatchOutcome, questdb::Error> {
-                let mut sender = db.borrow_sender()?;
-                let mut buffer = sender.new_buffer();
-                let context = RowContext {
-                    stream: &stream,
-                    topic: &topic,
-                    partition_id,
+        let handle = tokio::task::spawn_blocking(move || -> Result<BatchOutcome, FlushError> {
+            let mut sender = db.borrow_sender().map_err(FlushError::publishing)?;
+            let mut buffer = sender.new_buffer();
+            let context = RowContext {
+                stream: &stream,
+                topic: &topic,
+                partition_id,
+            };
+
+            let mut outcome = BatchOutcome::default();
+            for message in &messages {
+                let reason = match mapping.append_row(&mut buffer, message, context) {
+                    Ok(()) => {
+                        outcome.rows_written += 1;
+                        continue;
+                    }
+                    Err(RowError::Invalid(reason)) => reason,
+                    Err(RowError::Client(error)) if !is_transient(&error) => error.to_string(),
+                    Err(RowError::Client(error)) => {
+                        return Err(FlushError::publishing(error));
+                    }
                 };
 
-                let mut outcome = BatchOutcome::default();
-                for message in &messages {
-                    let reason = match mapping.append_row(&mut buffer, message, context) {
-                        Ok(()) => {
-                            outcome.rows_written += 1;
-                            continue;
-                        }
-                        Err(RowError::Invalid(reason)) => reason,
-                        Err(RowError::Client(error)) if !is_transient(&error) => error.to_string(),
-                        Err(RowError::Client(error)) => return Err(error),
+                // A rejected record is unrecoverable: the runtime commits
+                // the offset before `consume` runs (#2928) and discards its
+                // result (#2927), so this log line is the only trace that
+                // survives. Log the identity needed to find the message,
+                // one line per record rather than a batch summary.
+                outcome.rejected_rows += 1;
+                if outcome.rejected_rows <= MAX_LOGGED_REJECTIONS_PER_BATCH {
+                    let payload = if log_payload {
+                        format!(", payload: {}", payload_preview(&message.payload))
+                    } else {
+                        String::new()
                     };
-
-                    // A rejected record is unrecoverable: the runtime commits
-                    // the offset before `consume` runs (#2928) and discards its
-                    // result (#2927), so this log line is the only trace that
-                    // survives. Log the identity needed to find the message,
-                    // one line per record rather than a batch summary.
-                    outcome.rejected_rows += 1;
-                    if outcome.rejected_rows <= MAX_LOGGED_REJECTIONS_PER_BATCH {
-                        let payload = if log_payload {
-                            format!(", payload: {}", payload_preview(&message.payload))
-                        } else {
-                            String::new()
-                        };
-                        error!(
-                            "{CONNECTOR_NAME} ID: {id} rejected message, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offset: {}, message_id: {}, reason: {reason}{payload}",
-                            message.offset, message.id
-                        );
-                    }
-                    outcome.last_rejection = Some(reason);
-                }
-
-                if outcome.rejected_rows > MAX_LOGGED_REJECTIONS_PER_BATCH {
                     error!(
-                        "{CONNECTOR_NAME} ID: {id} rejected {} messages in this batch, stream: {stream}, topic: {topic}, partition_id: {partition_id}; {} further rejections were not logged individually",
-                        outcome.rejected_rows,
-                        outcome.rejected_rows - MAX_LOGGED_REJECTIONS_PER_BATCH
+                        "{CONNECTOR_NAME} ID: {id} rejected message, stream: {stream}, topic: {topic}, partition_id: {partition_id}, offset: {}, message_id: {}, reason: {reason}{payload}",
+                        message.offset, message.id
                     );
                 }
+                outcome.last_rejection = Some(reason);
+            }
 
-                if outcome.rows_written > 0 {
-                    sender.flush_buffer(&mut buffer)?;
-                    if ack_level != AckLevel::Ok || flush_timeout > Duration::ZERO {
-                        sender.wait(ack_level, flush_timeout)?;
-                    }
+            if outcome.rejected_rows > MAX_LOGGED_REJECTIONS_PER_BATCH {
+                error!(
+                    "{CONNECTOR_NAME} ID: {id} rejected {} messages in this batch, stream: {stream}, topic: {topic}, partition_id: {partition_id}; {} further rejections were not logged individually",
+                    outcome.rejected_rows,
+                    outcome.rejected_rows - MAX_LOGGED_REJECTIONS_PER_BATCH
+                );
+            }
+
+            if outcome.rows_written > 0 {
+                sender
+                    .flush_buffer(&mut buffer)
+                    .map_err(FlushError::publishing)?;
+                if ack_level != AckLevel::Ok || flush_timeout > Duration::ZERO {
+                    sender
+                        .wait(ack_level, flush_timeout)
+                        .map_err(FlushError::awaiting)?;
                 }
-                Ok(outcome)
-            },
-        );
+            }
+            Ok(outcome)
+        });
 
         handle
             .await
@@ -274,10 +278,11 @@ impl QuestDbSink {
             .map_err(|error| self.map_client_error(error))
     }
 
-    fn map_client_error(&self, error: questdb::Error) -> Error {
+    fn map_client_error(&self, failure: FlushError) -> Error {
+        let FlushError { phase, error } = failure;
         let code = error.code();
         let message = format!("{CONNECTOR_NAME} ID: {}: {error}", self.id);
-        if is_transient(&error) {
+        if phase == FlushPhase::Publishing && is_transient(&error) {
             return Error::CannotStoreData(message);
         }
         match code {
@@ -476,16 +481,67 @@ fn validate_column_overlap(mapping: &Mapping) -> Result<(), Error> {
     Ok(())
 }
 
+/// Which half of the flush failed.
+///
+/// `flush_buffer` either appends the frame to the local publication log or it
+/// does not, so a failure there can be safe to re-send. By the time `wait` runs
+/// the frame is already published and the rows may already be committed, so a
+/// failure there is never safe to re-send. A durable-ACK stall against a server
+/// without replication configured is exactly this case: the rows land, only the
+/// watermark never advances.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushPhase {
+    Publishing,
+    Awaiting,
+}
+
+#[derive(Debug)]
+struct FlushError {
+    phase: FlushPhase,
+    error: questdb::Error,
+}
+
+impl FlushError {
+    fn publishing(error: questdb::Error) -> Self {
+        Self {
+            phase: FlushPhase::Publishing,
+            error,
+        }
+    }
+
+    fn awaiting(error: questdb::Error) -> Self {
+        Self {
+            phase: FlushPhase::Awaiting,
+            error,
+        }
+    }
+}
+
 /// Transport-level failures are worth retrying; server rejections are not,
 /// because a rejection is deterministic. The server refused the frame, so the
 /// same bytes will be refused again and the rows were never stored.
+///
+/// A retryable code alone is not enough. The client sets `in_doubt` when
+/// delivery is unknown, and documents that `FailoverRetry` in particular can
+/// carry it, so re-sending would duplicate rows the server may already hold.
+/// Both must hold for a failure to count as transient.
 ///
 /// Note that the runtime currently discards `Sink::consume`'s return value at
 /// the FFI boundary (#2927), so this classification only shapes logging today.
 /// It becomes load-bearing once the return value is honoured.
 fn is_transient(error: &questdb::Error) -> bool {
+    is_retryable(error.code(), error.in_doubt())
+}
+
+/// Split from [`is_transient`] so the rule can be exercised directly: the
+/// client keeps `with_in_doubt` crate-private, so a test cannot build an
+/// in-doubt `questdb::Error`.
+fn is_retryable(code: ErrorCode, in_doubt: bool) -> bool {
+    if in_doubt {
+        return false;
+    }
     matches!(
-        error.code(),
+        code,
         ErrorCode::SocketError
             | ErrorCode::ConnectTimeout
             | ErrorCode::FailoverRetry
@@ -628,6 +684,70 @@ mod tests {
         assert_eq!(sink.batch_size, 500);
         assert_eq!(sink.mapping.table, "trades");
         assert!(sink.mapping.symbol_columns.contains("side"));
+    }
+
+    #[test]
+    fn given_retryable_code_when_not_in_doubt_should_be_retryable() {
+        assert!(is_retryable(ErrorCode::FailoverRetry, false));
+        assert!(is_retryable(ErrorCode::SocketError, false));
+    }
+
+    #[test]
+    fn given_retryable_code_when_in_doubt_should_not_be_retryable() {
+        // The client documents that `FailoverRetry` in particular can carry
+        // `in_doubt`, so the code alone must not authorise a re-send.
+        assert!(!is_retryable(ErrorCode::FailoverRetry, true));
+        assert!(!is_retryable(ErrorCode::SocketError, true));
+    }
+
+    #[test]
+    fn given_server_rejection_when_classified_should_not_be_retryable() {
+        assert!(!is_retryable(ErrorCode::ServerSchemaMismatch, false));
+        assert!(!is_retryable(ErrorCode::ServerSecurityError, false));
+        assert!(!is_retryable(ErrorCode::ServerParseError, false));
+    }
+
+    #[test]
+    fn given_ack_wait_failure_when_mapped_should_be_permanent() {
+        // The rows are already published by the time `wait` runs, so even a
+        // retryable code must not produce a retryable sink error: re-sending
+        // would duplicate rows QuestDB may already hold. This is the
+        // durable-ACK stall against a server without replication.
+        let sink = QuestDbSink::new(1, config());
+        let failure = FlushError::awaiting(questdb::Error::new(
+            ErrorCode::FailoverRetry,
+            "wait(durable) timed out with no ack progress",
+        ));
+        assert!(matches!(
+            sink.map_client_error(failure),
+            Error::PermanentHttpError(_)
+        ));
+    }
+
+    #[test]
+    fn given_publish_failure_when_mapped_should_stay_retryable() {
+        let sink = QuestDbSink::new(1, config());
+        let failure = FlushError::publishing(questdb::Error::new(
+            ErrorCode::SocketError,
+            "connection reset",
+        ));
+        assert!(matches!(
+            sink.map_client_error(failure),
+            Error::CannotStoreData(_)
+        ));
+    }
+
+    #[test]
+    fn given_schema_mismatch_when_mapped_should_be_schema_error() {
+        let sink = QuestDbSink::new(1, config());
+        let failure = FlushError::publishing(questdb::Error::new(
+            ErrorCode::ServerSchemaMismatch,
+            "long arrays are not supported",
+        ));
+        assert!(matches!(
+            sink.map_client_error(failure),
+            Error::SchemaMismatch(_)
+        ));
     }
 
     #[test]
