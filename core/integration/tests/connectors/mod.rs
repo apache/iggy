@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod airflow;
 mod api;
 mod clickhouse;
 mod delta;
