@@ -46,13 +46,14 @@
 //!   drain whose epoch disagrees with that stamp answers the client instead of
 //!   serving it: recycled slab keys make the namespace byte-identical, so such a
 //!   frame would otherwise land a dead topic's write inside the topic that
-//!   replaced it. The stamp survives a second park, so a re-delivered frame
-//!   cannot be re-stamped with the incarnation that replaced its own. A frame
-//!   parked with NO stamp is served; see `redispatch_parked_frames` for why a
-//!   missing committed revision is not evidence of a prior incarnation. Delivery
-//!   is the pump's: `drain_redispatched_frames` runs before it reads the inbox
-//!   again, so a parked op is not ordered behind a later op of the same
-//!   partition already queued there, which the plane's gap check would drop.
+//!   replaced it. Production prevents a second park by ranking redispatch above
+//!   inbox work and applying incarnation changes only on the pump. Carrying the
+//!   stamp through re-delivery is defence in depth for off-pump staging such as
+//!   simulator materialisation. A frame parked with NO stamp is served; see
+//!   `redispatch_parked_frames` for why a missing committed revision is not
+//!   evidence of a prior incarnation. The redispatch select arm takes one frame
+//!   per iteration before the inbox arm, so a parked op is not ordered behind a
+//!   later op of the same partition already queued there.
 //! - `IggyShard::serves_committed_incarnation` refuses a namespace whose
 //!   committed `created_revision` disagrees with the epoch on the local row, so
 //!   a request arriving mid-teardown cannot be acked against the incarnation
@@ -66,7 +67,7 @@
 //! `shards_table` is therefore a **cache of a deterministic hash**, never a
 //! readiness proof: every shard derives the same rows from the same committed
 //! metadata, and a row may exist before its partition does. Nothing may treat
-//! presence as "the owner is ready" - `dispatch::wait_for_partition_routable`
+//! presence as "the owner is ready" - `dispatch::partition::wait_for_partition_routable`
 //! documents why the owner-readiness probe that used to live there was both
 //! unnecessary and ineffective.
 //!
@@ -88,9 +89,9 @@
 //!
 //! They apply asymmetrically, because the two frame classes fail differently. A
 //! shed request costs a retry: answered with a retriable status, re-issued by
-//! the SDK. A shed prepare is permanent loss on this replica, with no client to
-//! answer and `consensus::retransmit_targets` skipping any op that already
-//! reached quorum.
+//! the SDK. A shed prepare has no client to retry it and leaves the replica
+//! behind until a later commit heartbeat exposes the gap and arms same-view
+//! journal repair.
 //!
 //! All three bind a request: refused when admitting it would cross a byte budget
 //! or the frame cap, answered past `MAX_PARKED_PASSES`. Only the byte budgets
@@ -112,9 +113,10 @@
 //! reached quorum (`consensus::retransmit_targets` skips entries with
 //! `ok_quorum_received`), so the backup gap-stops. `tick_partitions` opens a
 //! repair session for it: its level-triggered detector arms once a partition has
-//! been gap-stopped for the repair retry interval, independently of the
+//! been gap-stopped for `[cluster] repair_gap_debounce_interval`, independently of the
 //! edge-triggered arming sites (`StartView` adoption, the commit heartbeat, the
-//! post-transfer tail), whose edges a produce stream can starve. The park policy
+//! post-transfer tail), whose edges a produce stream can starve. A repair range
+//! the primary has already evicted escalates to partition state transfer. The park policy
 //! above still shrinks the exposure to a genuinely exhausted byte budget and a
 //! namespace this shard cannot serve; the driver bounds how long either costs,
 //! and `partition_prepare_gap_drops_total` counts what reached the gap check.
@@ -124,6 +126,16 @@
 //! Recorded here because they were previously carried as a TODO on the
 //! materialization barrier this module used to promise, and the barrier is gone
 //! (see above) while these are not:
+//!
+//! A shed prepare is not retransmitted once its op reached quorum, and the
+//! commit heartbeat is no answer to it: a follower advances `commit_max` from
+//! every prepare header before the gap check drops the frame, so under produce
+//! the heartbeat lands as `Accepted` and the backstop inside that branch never
+//! runs. What closes it is the level-triggered sweep above, which means the
+//! residual exposure is its debounce (`[cluster] repair_gap_debounce_interval`,
+//! floored at 500ms) plus the arm cap under a correlated fault, during which the
+//! backup serves a short prefix. The park policy still avoids manufacturing that
+//! recovery work unless a byte budget is already spent.
 //!
 //! TODO(krishna): `serves_committed_incarnation` and the park stamp both call
 //! `Streams::created_revision_for_namespace`, now on the per-request fence path.
@@ -150,9 +162,10 @@
 //! discriminator, like `checkpoint_id` on every prepare
 //! -- `PrepareHeader.reserved` has room, but it is a `#[repr(C)]` wire change.
 
-use crate::bootstrap::ServerShard;
-use crate::cluster_meta::METADATA_VIEW_UNKNOWN;
-use crate::partition_helpers::{build_partition_fresh, delete_partitions_from_disk};
+use crate::partition_helpers::{
+    build_partition_fresh, delete_partitions_from_disk, load_partition_or_fence,
+};
+use crate::shell::ServerShard;
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
@@ -160,6 +173,7 @@ use futures::FutureExt;
 use iggy_common::{ConsumerGroupId, IggyTimestamp};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::Partition;
 use partitions::delete_persisted_offset;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -169,7 +183,6 @@ use shard::{Receiver, Sender};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
 
@@ -208,11 +221,6 @@ pub struct ReconcilerCtx {
     pub cluster_id: u128,
     pub self_replica_id: u8,
     pub replica_count: u8,
-    /// The metadata plane's view, published by shard 0 and shared with every
-    /// shard's roster. Read when materialising a partition so its consensus
-    /// group starts in the same view the roster's advertised leader comes
-    /// from; the unknown-view sentinel until the first publish.
-    pub metadata_view: Arc<AtomicU64>,
     failure_state: RefCell<AHashMap<(IggyNamespace, FailureCause), FailureRecord>>,
     /// `Streams::revision` observed at the end of the last pass that fully
     /// converged. Paired with `last_pass_noop` for the fast-skip in
@@ -232,7 +240,6 @@ impl ReconcilerCtx {
         cluster_id: u128,
         self_replica_id: u8,
         replica_count: u8,
-        metadata_view: Arc<AtomicU64>,
     ) -> Self {
         Self {
             shard,
@@ -241,46 +248,10 @@ impl ReconcilerCtx {
             cluster_id,
             self_replica_id,
             replica_count,
-            metadata_view,
             failure_state: RefCell::new(AHashMap::new()),
             last_revision: Cell::new(None),
             last_pass_noop: Cell::new(false),
         }
-    }
-
-    /// The view a partition group materialised now should start in.
-    ///
-    /// `None` means this replica has no opinion yet, NOT "start at view 0":
-    /// shard 0 publishes the unknown-view sentinel before its first tick and
-    /// for as long as it has ceded a recovered view's primaryship. Treating
-    /// that as 0 is how a single replica of a group ends up view-0 while its
-    /// peers are at V, which is the split this seed exists to close. Callers
-    /// on a replicated group defer materialising instead; see
-    /// [`Self::partition_view_seed_ready`].
-    ///
-    /// # Panics
-    /// If the published view does not fit a `u32`. The publisher writes
-    /// `u64::from(consensus.view())` or the sentinel handled above, so a value
-    /// past `u32::MAX` is memory corruption, not a state a retry can clear.
-    /// Silently falling back to `None` here would restore the view-0 start
-    /// this change exists to remove, on the one path nobody would look at.
-    fn partition_view_seed(&self) -> Option<u32> {
-        let view = self.metadata_view.load(Ordering::Relaxed);
-        if view == METADATA_VIEW_UNKNOWN {
-            return None;
-        }
-        Some(u32::try_from(view).expect("published metadata view must fit a u32"))
-    }
-
-    /// Whether a group may be materialised now.
-    ///
-    /// A solo replica is always ready: with one replica every view names it
-    /// primary, so there is no peer to disagree with and no split to cause.
-    /// A replicated group waits until this replica knows the metadata view,
-    /// so it cannot seed a view-0 group underneath peers that already moved.
-    /// The wait is one reconcile pass; shard 0 republishes every 100ms.
-    fn partition_view_seed_ready(&self) -> bool {
-        self.replica_count <= 1 || self.partition_view_seed().is_some()
     }
 
     fn is_backed_off(&self, ns: IggyNamespace, cause: FailureCause, now: Instant) -> bool {
@@ -442,12 +413,6 @@ struct PassCounters {
     /// has not applied yet. Counted so the pass does not arm the fast-skip
     /// while work is in flight; applying it bumps no revision.
     already_staged: usize,
-    /// Materialisations held back because this replica has no metadata view to
-    /// seed from yet. Counted so the pass does not arm the fast-skip: shard 0
-    /// publishing a view bumps no `Streams::revision` and does not wake the
-    /// reconciler, so an armed skip would strand every deferred group until
-    /// some unrelated commit happened to bump the revision.
-    view_unpublished: usize,
 }
 
 impl PassCounters {
@@ -464,7 +429,6 @@ impl PassCounters {
             + self.deferred
             + self.parked_reclaimed
             + self.already_staged
-            + self.view_unpublished
     }
 }
 
@@ -510,7 +474,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     }
 
     let target = snapshot_target_namespaces(ctx);
-    let target_set: AHashSet<IggyNamespace> = target.iter().map(|(ns, _)| *ns).collect();
+    let target_set: AHashSet<IggyNamespace> = target.iter().map(|partition| partition.ns).collect();
     let mut counters = PassCounters::default();
 
     reconcile_additions(ctx, target, &mut counters).await;
@@ -562,14 +526,19 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
 #[allow(clippy::too_many_lines)]
 async fn reconcile_additions(
     ctx: &ReconcilerCtx,
-    target: Vec<(IggyNamespace, u64)>,
+    target: Vec<TargetPartition>,
     counters: &mut PassCounters,
 ) {
     let shard_id = ctx.shard.id;
     let partitions = ctx.shard.plane.partitions();
     let total_shards = u32::from(ctx.total_shards);
 
-    for (ns, epoch) in target {
+    for TargetPartition {
+        ns,
+        epoch,
+        created_view,
+    } in target
+    {
         if partitions.contains(&ns) {
             // Tombstoned but still in the map. Two cases, told apart by
             // whether teardown's disk delete succeeded:
@@ -691,22 +660,6 @@ async fn reconcile_additions(
             continue;
         }
 
-        // Materialising before this replica knows the metadata view would seed
-        // the group at view 0 under peers that already elected past it. Defer
-        // the whole pass rather than the namespace: every group on this shard
-        // reads the same view, so none of them can be seeded correctly yet.
-        if !ctx.partition_view_seed_ready() {
-            debug!(
-                shard = shard_id,
-                "metadata view not published yet; deferring partition materialisation"
-            );
-            // Every remaining namespace reads the same view, so none of them
-            // can be seeded either. Counted before breaking so the pass does
-            // not read as converged, which would fast-skip the retry.
-            counters.view_unpublished += 1;
-            break;
-        }
-
         // Resolve the shared stats `Arc` only for namespaces actually
         // built, not once per committed partition every pass. A topic that
         // vanished between the target snapshot and this read defers to the
@@ -715,21 +668,52 @@ async fn reconcile_additions(
             continue;
         };
 
-        match build_partition_fresh(
-            ctx.config.as_ref(),
-            ns,
-            partition_stats,
-            epoch,
-            topic_runtime,
-            ctx.cluster_id,
-            ctx.self_replica_id,
-            ctx.replica_count,
-            ctx.partition_view_seed(),
-            Rc::clone(&ctx.shard.bus),
-        )
-        .await
-        {
-            Ok(partition) => {
+        // A directory already on disk is a prior life of this namespace. The
+        // usual shape: this replica applied the create before a crash, but its
+        // WAL watermark trails the commit by one op, so boot saw no such
+        // partition and the post-election re-commit lands here. Recover it the
+        // way boot does, segments included. Building fresh opens segment 0
+        // with truncation and throws away flushed data that no peer may still
+        // hold once the whole cluster restarted.
+        let partition_dir =
+            ctx.config
+                .system
+                .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
+        let built = if std::fs::metadata(&partition_dir).is_ok() {
+            let Some(partition_metadata) = fetch_partition_metadata(ctx, ns) else {
+                continue;
+            };
+            load_partition_or_fence(
+                ctx.config.as_ref(),
+                ns,
+                partition_stats,
+                &partition_metadata,
+                topic_runtime,
+                ctx.cluster_id,
+                ctx.self_replica_id,
+                ctx.replica_count,
+                Rc::clone(&ctx.shard.bus),
+                partitions,
+            )
+            .await
+        } else {
+            build_partition_fresh(
+                ctx.config.as_ref(),
+                ns,
+                partition_stats,
+                epoch,
+                topic_runtime,
+                ctx.cluster_id,
+                ctx.self_replica_id,
+                ctx.replica_count,
+                created_view,
+                Rc::clone(&ctx.shard.bus),
+            )
+            .await
+            .map(Some)
+        };
+        match built {
+            Ok(Some(partition)) => {
                 ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                     namespace: ns,
                     partition: Box::new(partition),
@@ -738,6 +722,9 @@ async fn reconcile_additions(
                 ctx.record_success(ns, FailureCause::Add);
                 counters.materialised += 1;
             }
+            // Tombstoned by the loader over damaged files; the gate above keeps
+            // every later pass from rebuilding over them.
+            Ok(None) => {}
             Err(err) => {
                 ctx.record_failure(ns, FailureCause::Add, now);
                 ctx.shard.metrics().record_partition_reconcile_failure();
@@ -1103,11 +1090,21 @@ fn snapshot_topic_live_groups(ctx: &ReconcilerCtx) -> AHashMap<(usize, usize), A
     })
 }
 
-/// Committed `(namespace, created_revision)` pairs. The epoch lets the
-/// additions pass detect a stale local incarnation after slab-key reuse
-/// without an `Arc<TopicStats>` clone per partition; stats are fetched
-/// lazily in [`fetch_partition_stats`] only for namespaces actually built.
-fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<(IggyNamespace, u64)> {
+/// One committed partition the additions pass has to account for.
+struct TargetPartition {
+    ns: IggyNamespace,
+    /// The committed `created_revision`. Lets the pass detect a stale local
+    /// incarnation after slab-key reuse without an `Arc<TopicStats>` clone per
+    /// partition; stats are fetched lazily in [`fetch_partition_stats`] only
+    /// for namespaces actually built.
+    epoch: u64,
+    /// The view a fresh materialisation seeds its consensus group with; see
+    /// `build_partition_fresh`.
+    created_view: u32,
+}
+
+/// Every committed partition, as the additions pass needs it.
+fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<TargetPartition> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         // TODO(krishna): O(committed partitions) per non-skipped pass (here +
         // reconcile_removals). The revision fast-skip hides this in steady
@@ -1117,8 +1114,11 @@ fn snapshot_target_namespaces(ctx: &ReconcilerCtx) -> Vec<(IggyNamespace, u64)> 
         for (_, stream) in &inner.items {
             for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
-                    let ns = IggyNamespace::new(stream.id, topic_id, partition.id);
-                    entries.push((ns, partition.created_revision));
+                    entries.push(TargetPartition {
+                        ns: IggyNamespace::new(stream.id, topic_id, partition.id),
+                        epoch: partition.created_revision,
+                        created_view: partition.created_view,
+                    });
                 }
             }
         }
@@ -1160,6 +1160,21 @@ fn fetch_partition_stats(
             ),
             iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options),
         ))
+    })
+}
+
+/// The committed [`Partition`] record for `ns`, which the disk loader needs
+/// (`created_at`, `created_revision`, `created_view`). `None` if the topic or
+/// partition vanished between the target snapshot and this read.
+fn fetch_partition_metadata(ctx: &ReconcilerCtx, ns: IggyNamespace) -> Option<Partition> {
+    ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+        let stream = inner.items.get(ns.stream_id())?;
+        let topic = stream.topics.get(ns.topic_id())?;
+        topic
+            .partitions
+            .iter()
+            .find(|partition| partition.id == ns.partition_id())
+            .cloned()
     })
 }
 
@@ -1258,8 +1273,8 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AtomicU64, FailureCause, FailureRecord, METADATA_VIEW_UNKNOWN, ReconcilerCtx,
-        build_partition_fresh, delete_partitions_from_disk, fetch_partition_stats, reconcile_once,
+        FailureCause, FailureRecord, ReconcilerCtx, build_partition_fresh,
+        delete_partitions_from_disk, fetch_partition_stats, reconcile_once,
     };
     use configs::server::{ServerConfig, ServerSystemConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
@@ -1282,6 +1297,7 @@ mod tests {
     use metadata::IggyMetadata;
     use metadata::MuxStateMachine;
     use metadata::impls::metadata::IggySnapshot;
+    use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::StateMachine;
     use metadata::stm::stream::Streams;
     use metadata::stm::user::Users;
@@ -1493,6 +1509,7 @@ mod tests {
             },
             derived_options: WireOptions::empty(),
             partitions: assignments,
+            created_view: 0,
         };
         mux.update(build_prepare(
             op,
@@ -1729,32 +1746,19 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
-            Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
         ))
     }
 
-    /// [`make_ctx`] for a REPLICATED group, sharing `metadata_view` with the
-    /// caller so a test can publish a view mid-run.
-    ///
-    /// Replica count is what decides whether materialisation waits on a
-    /// published view: a solo replica is primary in every view, so there is no
-    /// peer to disagree with and nothing to wait for. Every other test here
-    /// runs solo and takes that short circuit.
-    fn make_cluster_ctx(
-        shard: Rc<TestShard>,
-        total_shards: u16,
-        config: Rc<ServerConfig>,
-        metadata_view: Arc<AtomicU64>,
-    ) -> Rc<ReconcilerCtx> {
-        Rc::new(ReconcilerCtx::new(
-            shard,
-            total_shards,
-            config,
-            CLUSTER_ID,
-            0,
-            3,
-            metadata_view,
-        ))
+    /// The committed `created_view` of `ns`, what a reconcile pass would seed
+    /// a fresh build with.
+    fn created_view(ctx: &ReconcilerCtx, ns: IggyNamespace) -> u32 {
+        ctx.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_view_for_namespace(ns)
+            .expect("committed namespace records its creation view")
     }
 
     /// Tests run reconcile + pump-side apply inline since no real pump exists.
@@ -1899,7 +1903,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
-            None,
+            created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -1929,7 +1933,7 @@ mod tests {
             CLUSTER_ID,
             0,
             1,
-            None,
+            created_view(&ctx, ns),
             Rc::clone(&ctx.shard.bus),
         )
         .await
@@ -2053,73 +2057,6 @@ mod tests {
     /// `CreatePartitions` on an existing topic adds new namespaces; the
     /// reconciler picks them up on the next pass without touching the
     /// partitions it already materialised.
-    /// A replicated group is NOT materialised while this replica has no
-    /// metadata view to seed from, and IS once one is published.
-    ///
-    /// Seeding is a local read: shard 0 publishes the unknown sentinel before
-    /// its first tick and for as long as it has ceded a recovered view. Taking
-    /// that for view 0 would start the group naming replica 0 underneath peers
-    /// that already elected past it, which is the split the seed exists to
-    /// close, reintroduced one replica at a time. Waiting costs one reconcile
-    /// pass; the publisher reposts every 100ms.
-    #[compio::test]
-    async fn given_no_published_metadata_view_when_reconciling_should_defer_materialisation() {
-        let tmp = TempDir::new().expect("tempdir for system path");
-        let config = test_config(&tmp);
-        let mux = TestMux::default();
-        seed_stream(&mux, 1, "stream-deferred");
-        seed_topic(&mux, 2, 0, "topic-deferred", vec![assignment(0, 1)]);
-
-        let shard = build_test_shard(0, &config, mux);
-        let metadata_view = Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN));
-        let ctx = make_cluster_ctx(
-            Rc::clone(&shard),
-            1,
-            Rc::new(config),
-            Arc::clone(&metadata_view),
-        );
-
-        reconcile_pass(&ctx).await;
-        assert_eq!(
-            shard.plane.partitions().len(),
-            0,
-            "a replicated group must not materialise before this replica knows the metadata \
-             view: seeded at 0 it names replica 0 whatever the metadata plane elected"
-        );
-
-        // The publisher posts a real view; the deferred pass now converges.
-        metadata_view.store(1, Ordering::Relaxed);
-        reconcile_pass(&ctx).await;
-        assert_eq!(
-            shard.plane.partitions().len(),
-            1,
-            "once a view is published the deferred group must materialise on the next pass"
-        );
-    }
-
-    /// A SOLO replica never waits. It is primary in every view, so there is no
-    /// peer for it to disagree with, and blocking on a publisher that a
-    /// single-node deployment may never run would wedge materialisation
-    /// outright.
-    #[compio::test]
-    async fn given_a_solo_replica_when_no_view_is_published_should_still_materialise() {
-        let tmp = TempDir::new().expect("tempdir for system path");
-        let config = test_config(&tmp);
-        let mux = TestMux::default();
-        seed_stream(&mux, 1, "stream-solo");
-        seed_topic(&mux, 2, 0, "topic-solo", vec![assignment(0, 1)]);
-
-        let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
-
-        reconcile_pass(&ctx).await;
-        assert_eq!(
-            shard.plane.partitions().len(),
-            1,
-            "a solo replica must materialise without waiting on a published metadata view"
-        );
-    }
-
     #[compio::test]
     async fn reconcile_picks_up_create_partitions_increments() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -2158,6 +2095,7 @@ mod tests {
                         partitions_count: 2,
                     },
                     partitions: vec![assignment(0, 3), assignment(1, 4)],
+                    created_view: 0,
                 },
             ))
             .expect("CreatePartitions apply succeeds");
@@ -3350,6 +3288,7 @@ mod tests {
                     partitions_count: 1,
                 },
                 partitions: vec![assignment(0, 3)],
+                created_view: 0,
             },
         ))
         .expect("CreatePartitions apply succeeds");
@@ -3609,10 +3548,11 @@ mod tests {
         drop(inbox);
     }
 
-    /// The replicated-prepare shape, which no other test covers and where both
-    /// park critical are worst: a prepare has no client, so `deny_parked_frame`
-    /// no-ops on it and anything that discards it loses committed data silently,
-    /// with no normal-status repair driver to refetch it.
+    /// The replicated-prepare shape, which no other test covers and where the
+    /// park path's stakes are highest: a prepare has no client, so
+    /// `deny_parked_client_request` no-ops on it and anything that discards it
+    /// loses committed data silently, recoverable only once `tick_partitions`'
+    /// repair driver notices the gap it left.
     ///
     /// A backup receives the prepare before its own metadata commits (so the frame
     /// parks unstamped), then applies the commit and materialises. The prepare must
@@ -3708,14 +3648,20 @@ mod tests {
             1,
             "and the reject must be counted"
         );
+        assert_eq!(
+            park_dropped_count(&shard),
+            1,
+            "a rejected prepare has no client deny, so its destruction must be recorded"
+        );
     }
 
-    /// The stamp has to survive re-delivery, not just the first drain. A
-    /// materialisation stages the frame, the delete half of a recreate then
-    /// leaves the namespace un-materialised, and the drain parks it a second
-    /// time: deriving a fresh stamp there picks up the replacement's committed
-    /// revision, and the rebuild would serve a dead incarnation's op into the
-    /// topic that recycled its slab keys.
+    /// Defence-in-depth for off-pump staging: materialisation stages the frame,
+    /// the delete half of a recreate leaves the namespace unmaterialised, and
+    /// explicit test delivery parks it a second time. Production cannot take
+    /// this interleaving because every pump-side reconcile apply returns to the
+    /// higher-ranked redispatch arm before another incarnation change can run.
+    /// The carried stamp still prevents simulator or test staging from deriving
+    /// the replacement's revision on that second park.
     #[compio::test]
     async fn given_a_staged_frame_when_a_recreate_lands_before_the_drain_should_reject_it_as_stale()
     {
@@ -3762,7 +3708,10 @@ mod tests {
             "and lifted the tombstone, or the drain takes the tombstone path"
         );
 
-        shard.drain_redispatched_frames().await;
+        assert!(
+            shard.dispatch_one_redispatched_frame_for_test().await,
+            "the defence-in-depth frame must be available for explicit delivery"
+        );
         assert_eq!(
             shard.parked_frame_count(ns),
             1,
@@ -3794,8 +3743,8 @@ mod tests {
     /// ranks the consensus tick, which is where materialisation runs, above the
     /// inbox arm, so a later op of the same partition can already be queued
     /// there. Appended, the parked op lands behind it and the plane's backup gap
-    /// check drops the later one for not being `current_op + 1`, with nothing to
-    /// refetch it.
+    /// check drops the later one for not being `current_op + 1`. Same-view repair
+    /// can heal that gap later, but redispatch must not manufacture it.
     ///
     /// The pump's order is the queue, then the inbox, so the assertions below
     /// are on where each op sits at that moment. Whether the plane accepts them
@@ -3948,7 +3897,7 @@ mod tests {
         assert_eq!(
             park_dropped_count(&shard),
             0,
-            "the prepare must be retained: destroying it is unrecoverable"
+            "the prepare must be retained instead of forcing journal repair"
         );
 
         // Retained across an unbounded number of further passes.
@@ -4125,9 +4074,9 @@ mod tests {
     }
 
     /// The age bound answers requests and steps over prepares. Expiring a
-    /// prepare is permanent loss (no client, and `retransmit_targets` skips an op
-    /// already at quorum), and passes are commit-driven, so a create burst
-    /// elapses four in milliseconds across every parked namespace at once.
+    /// prepare would force same-view repair despite the bytes still being held
+    /// locally, and passes are commit-driven, so a create burst elapses four in
+    /// milliseconds across every parked namespace at once.
     #[compio::test]
     async fn aging_answers_requests_and_never_expires_a_prepare() {
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -4202,8 +4151,8 @@ mod tests {
     }
 
     /// A frame larger than the per-namespace cap failed the check even against
-    /// an empty entry, so it could never park. Unrecoverable for a prepare:
-    /// `retransmit_targets` skips an op already at quorum.
+    /// an empty entry, so it could never park. A prepare already at quorum may
+    /// no longer retransmit, so shedding it forces later same-view repair.
     #[compio::test]
     async fn a_frame_over_the_namespace_byte_cap_still_parks_into_an_empty_entry() {
         const OVER_NAMESPACE_CAP: usize = 5 * 1024 * 1024;
@@ -4591,7 +4540,7 @@ mod tests {
 
     fn reply_status(reply: &message_bus::BusMessage) -> u32 {
         bytemuck::checked::try_from_bytes::<ReplyHeader>(
-            &reply.as_ref()[..size_of::<ReplyHeader>()],
+            &reply.first().as_slice()[..size_of::<ReplyHeader>()],
         )
         .expect("deny reply carries a valid ReplyHeader")
         .status

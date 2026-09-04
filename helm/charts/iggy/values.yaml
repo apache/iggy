@@ -17,6 +17,12 @@
 
 # -- Iggy server configuration
 server:
+  # -- Client-facing address published in cluster metadata. Declaring
+  # `IGGY_NODE_ADVERTISED_ADDRESS` in `server.env` instead also works, but
+  # setting both is refused at render time. Empty falls back to the in-cluster
+  # Service DNS name. Ignored in cluster mode, where the address comes from the
+  # node's roster entry, so setting both is refused there too.
+  advertisedAddress: ""
   # -- Enable the Iggy server deployment
   enabled: true
   # -- Number of server replicas
@@ -26,15 +32,17 @@ server:
     repository: apache/iggy
     # -- Image pull policy
     pullPolicy: Always
-    # -- Server image tag (overrides chart appVersion)
-    tag: "0.7.0"
+    # -- Server image tag. Empty uses the chart appVersion.
+    tag: ""
   ports:
     # -- HTTP API port
     http: 3000
-    # -- QUIC protocol port
+    # -- QUIC protocol port (UDP)
     quic: 8080
     # -- TCP protocol port
     tcp: 8090
+    # -- WebSocket protocol port
+    websocket: 8092
 
   service:
     # -- Service type for the server
@@ -94,6 +102,115 @@ server:
     accessMode: ReadWriteOnce
     # -- PVC storage size
     size: 8Gi
+
+  # -- Server-side encryption of message payloads and state commands, using
+  # AES-256-GCM. Every node of a cluster must hold the identical key, or it
+  # cannot read data another node wrote.
+  encryption:
+    # -- Enable encryption at rest
+    enabled: false
+    # -- 32-byte key, base64 encoded. Ignored when `existingSecret.name` is set.
+    # Prefer `existingSecret` outside development: a value here is stored in the
+    # Helm release and readable by anyone who can read it.
+    key: ""
+    existingSecret:
+      # -- Name of an existing Secret holding the encryption key
+      name: ""
+      # -- Key inside that Secret
+      key: encryptionKey
+
+  # -- Secrets used to sign and validate HTTP bearer tokens. Left unset, each
+  # node generates a random secret on every start, which invalidates tokens
+  # across restarts and keeps them node-local. Setting the identical secret on
+  # every node makes bearers valid cluster-wide and activates follower to
+  # primary HTTP forwarding; `cluster.auth.enabled` derives the same thing from
+  # the replica PSK, so it is an alternative rather than an addition.
+  jwt:
+    # -- Encoding secret. Ignored when `existingSecret.name` is set.
+    encodingSecret: ""
+    # -- Decoding secret. Ignored when `existingSecret.name` is set.
+    decodingSecret: ""
+    existingSecret:
+      # -- Name of an existing Secret holding the JWT secrets
+      name: ""
+      # -- Key inside that Secret holding the encoding secret
+      encodingSecretKey: jwtEncodingSecret
+      # -- Key inside that Secret holding the decoding secret
+      decodingSecretKey: jwtDecodingSecret
+
+  cluster:
+    # -- Enable cluster (VSR consensus) mode. One Helm release per node: every
+    # release shares the same `nodes` roster and overrides only `selfReplicaId`.
+    # See the Cluster Mode section of the chart README.
+    enabled: false
+    # -- Cluster name, byte-identical on every node. Hashed into the on-disk
+    # cluster id on first boot, so changing it later means starting from an
+    # empty data directory.
+    name: iggy-cluster
+    # -- Which `nodes` entry this release runs, matched against `replicaId`.
+    selfReplicaId: 0
+    # -- Refuse to render a cluster node without `server.hostNetwork`. The
+    # replica listener binds the roster `ip` verbatim, which no pod owns on the
+    # cluster network, so the pod would die at boot with `CannotBindToSocket`.
+    # Set this to false only when the roster `ip` is an address the pod itself
+    # holds.
+    requireHostNetwork: true
+    # -- Replica-to-replica authentication on the consensus port. When enabled
+    # every peer must complete an authenticated handshake or be rejected, and a
+    # shared secret becomes mandatory. Enabling it on a running cluster is a
+    # coordinated-restart change, not a rolling one.
+    auth:
+      # -- Require the authenticated replica handshake
+      enabled: false
+      # -- Cluster-wide pre-shared key, at least 32 bytes of CSPRNG output,
+      # byte-identical on every node. Ignored when `existingSecret.name` is set.
+      sharedSecret: ""
+      # -- Retiring key, accepted for verification only while a rotation is in
+      # flight. Leave empty outside a rotation.
+      previousSharedSecret: ""
+      existingSecret:
+        # -- Name of an existing Secret holding the pre-shared keys
+        name: ""
+        # -- Key inside that Secret holding the active shared secret
+        sharedSecretKey: clusterSharedSecret
+        # -- Key inside that Secret holding the retiring shared secret
+        previousSharedSecretKey: clusterPreviousSharedSecret
+
+    # -- Cluster roster, mirroring the server's `[[cluster.nodes]]` config.
+    # Every node runs the identical list. `ip` is the replica-plane address:
+    # this node's consensus listener binds it verbatim and every peer dials it
+    # verbatim, so it must be a literal IP that the pod itself owns. With
+    # `server.hostNetwork` that is the node IP. `ports.tcpReplica` is required
+    # on every entry; the remaining ports default to `server.ports`.
+    nodes: []
+    # nodes:
+    #   - name: iggy-node-0
+    #     ip: 10.0.1.5
+    #     replicaId: 0
+    #     # -- Optional client-facing address, a literal IP or a DNS hostname.
+    #     advertisedAddress: ""
+    #     ports:
+    #       tcp: 8090
+    #       quic: 8080
+    #       http: 3000
+    #       websocket: 8092
+    #       tcpReplica: 9090
+
+  # -- Run the server pod in the host network namespace. Required for cluster
+  # mode, where the replica listener binds the roster IP verbatim.
+  hostNetwork: false
+
+  # -- Deployment update strategy. Empty lets the chart choose: `Recreate` when
+  # `hostNetwork` is set, because a rolling update would wait forever for a
+  # replacement pod that cannot bind host ports the outgoing pod still holds,
+  # and the Kubernetes default otherwise.
+  strategy: {}
+
+  # -- Extra command-line arguments appended to the server entrypoint, e.g.
+  # `["--with-default-root-credentials"]` for a throwaway development install.
+  # `--replica-id` is not one of them: the chart passes it already whenever
+  # `cluster.enabled` is set.
+  extraArgs: []
 
   # -- Environment variables for the server container
   env:
@@ -227,15 +344,3 @@ securityContext:
 
 # -- Resource limits and requests for server
 resources: {}
-
-autoscaling:
-  # -- Enable horizontal pod autoscaling
-  enabled: false
-  # -- Minimum replicas for autoscaling
-  minReplicas: 1
-  # -- Maximum replicas for autoscaling
-  maxReplicas: 100
-  # -- Target CPU utilization for autoscaling
-  targetCPUUtilizationPercentage: 80
-  # -- Target memory utilization for autoscaling (optional)
-  # targetMemoryUtilizationPercentage: 80

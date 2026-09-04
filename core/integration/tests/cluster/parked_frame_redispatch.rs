@@ -21,10 +21,11 @@
 //! `multi_shard_partition_convergence` covers the same fence on one node and
 //! says outright that it cannot tell a request served straight through from one
 //! that parked. This test pins the park path positively, and on the replica
-//! where getting it wrong is unrecoverable: a client request that never reaches
-//! the plane is answered with a retriable status and the SDK replays it, while a
-//! replicated PREPARE has no client behind it, and the partition plane has no
-//! normal-status repair driver to refetch one it dropped.
+//! where getting it wrong creates a replica gap: a client request that never
+//! reaches the plane is answered with a retriable status and the SDK replays it,
+//! while a replicated PREPARE has no client behind it: nothing re-sends it once
+//! its op has quorum, so the backup gap-stops and waits out `tick_partitions`'
+//! repair debounce before anything refetches it.
 //!
 //! What makes the window wide on a backup is the commit broadcast. A backup
 //! learns a metadata commit from the `commit` field of the next prepare on that
@@ -50,10 +51,11 @@
 //! - Every acked message is readable in dense offset order, each producer's own
 //!   sends stay in the order it made them, and all three replicas hold
 //!   byte-identical segments. A prepare lost to the gap check leaves a backup
-//!   permanently short, since the gap never closes on its own.
+//!   short until the repair driver's next pass closes the gap.
 //!
-//! `RUST_LOG` in the test process environment overrides the config level and
-//! would take the positive marker with it; the assertion says so when it fires.
+//! The harness removes an ambient `RUST_LOG` when this test supplies its explicit
+//! logging level, and the log oracle falls back from captured stdout to the
+//! server's own log file so `IGGY_TEST_VERBOSE` cannot disable it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,7 +64,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use iggy::prelude::*;
-use integration::harness::{TestHarness, disk};
+use integration::harness::{ServerHandle, TestHarness, disk};
 use integration::iggy_harness;
 use tokio::time::{Instant, sleep};
 
@@ -101,7 +103,11 @@ const DEGRADED_MARKERS: [&str; 3] = [
 /// refetched by `tick_partitions`' level-triggered repair driver, but only after
 /// its debounce interval, so a re-dispatch that trips this has already stalled
 /// the replica for ~1s and the marker still means the ordering broke.
+///
+/// The metadata plane logs the same string, so the counting below pairs it with
+/// `PARTITION_PLANE_FIELD`.
 const GAP_MARKER: &str = "dropping out-of-order prepare (gap)";
+const PARTITION_PLANE_FIELD: &str = "plane=\"partitions\"";
 
 fn topic_name(index: u32) -> String {
     format!("parked-redispatch-topic-{index}")
@@ -312,7 +318,7 @@ fn assert_backup_re_dispatched(harness: &TestHarness, leader: usize) {
         .map(|node| {
             (
                 node,
-                harness.node(node).stdout_occurrences(REDISPATCH_MARKER),
+                server_log_occurrences(harness.node(node), REDISPATCH_MARKER),
             )
         })
         .collect();
@@ -325,26 +331,40 @@ fn assert_backup_re_dispatched(harness: &TestHarness, leader: usize) {
         on_backups > 0,
         "no backup logged {REDISPATCH_MARKER:?} (leader is node {leader}, per-node counts \
          {counts:?}); either the produce never raced materialisation, in which case this test \
-         proves nothing, or `RUST_LOG` in the environment overrode the debug level the marker \
-         needs"
+         proves nothing, or the configured debug marker was not written"
     );
 }
 
 fn assert_no_degraded_park_paths(harness: &TestHarness) {
     for node in 0..harness.cluster_size() {
         let server = harness.node(node);
+        let log = server_log_plain(server);
         for marker in DEGRADED_MARKERS {
             assert_eq!(
-                server.stdout_occurrences(marker),
+                log.matches(marker).count(),
                 0,
                 "node {node} logged {marker:?}: the park buffer degraded instead of converging"
             );
         }
+        let partition_gaps = log
+            .lines()
+            .filter(|line| line.contains(GAP_MARKER) && line.contains(PARTITION_PLANE_FIELD))
+            .count();
         assert_eq!(
-            server.stdout_occurrences(GAP_MARKER),
-            0,
+            partition_gaps, 0,
             "node {node} logged {GAP_MARKER:?}: a re-dispatched prepare lost its arrival \
-             position, and the partition plane has no normal-status repair driver to refetch it"
+             position, and the op it displaced is recoverable only by waiting out the \
+             repair driver's debounce"
         );
     }
+}
+
+fn server_log_occurrences(server: &ServerHandle, marker: &str) -> usize {
+    server_log_plain(server).matches(marker).count()
+}
+
+/// The shared handle falls back to the server's own appender when
+/// `IGGY_TEST_VERBOSE` makes the child inherit stdout.
+fn server_log_plain(server: &ServerHandle) -> String {
+    server.stdout_plain()
 }

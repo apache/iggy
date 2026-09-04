@@ -30,8 +30,10 @@ use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn};
 use partitions::FatalCommit;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 
 /// How often the shard pump drives `VsrConsensus::tick`.
 ///
@@ -306,7 +308,8 @@ where
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
             // deterministic simulator cannot seed. The listed order is the
-            // intended priority anyway: stop, then tick, then frames.
+            // intended priority anyway: stop, then tick, redispatch, then
+            // newly received frames.
             futures::select_biased! {
                 _ = stop.recv().fuse() => break,
                 () = consensus_tick.as_mut() => {
@@ -346,12 +349,28 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
-                    // Before the next `inbox.recv()`, always: a materialisation
-                    // hands its parked frames back here, and the inbox may
-                    // already hold a LATER op of the same partition, which the
-                    // plane's gap check drops unless the parked one lands first.
-                    self.drain_redispatched_frames().await;
                     consensus_tick.set(rearm_tick());
+                }
+                frame = poll_fn(|_| {
+                    self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
+                }).fuse() => {
+                    // One frame per select iteration. Ranking this arm above
+                    // the inbox preserves park order without making a full
+                    // queue stall ticks and commit broadcasts for other groups.
+                    self.dispatch_redispatched_frame(frame).await;
+                    // A request handled by a solo primary self-acks here. If
+                    // loopback waited for another inbox frame, the request
+                    // would remain uncommitted indefinitely on a quiet shard.
+                    self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
+                    self.apply_reconcile_ops();
+                    // Same guaranteed reply-lane service as the inbox arm: this
+                    // arm outranks both lanes, so a deep drain would otherwise
+                    // starve forwarded client replies for its whole duration.
+                    if let Ok(reply) = self.reply_inbox.try_recv()
+                        && self.accept_frame_for_self(&reply)
+                    {
+                        self.process_frame(reply).await;
+                    }
                 }
                 frame = self.inbox.recv().fuse() => {
                     match frame {
@@ -360,8 +379,9 @@ where
                                 self.process_frame(frame).await;
                                 self.process_loopback(&mut loopback_buf, &mut namespace_scratch).await;
                                 // Tail drain catches reconcile ops whose marker was dropped.
+                                // Anything it stages is served by the arm above
+                                // on the next pass, before this arm can run again.
                                 self.apply_reconcile_ops();
-                                self.drain_redispatched_frames().await;
                             }
                             // Guaranteed reply-lane service: `select_biased!`
                             // polls the main lane first, so a saturated main
@@ -412,33 +432,9 @@ where
         // clients time out, which is what a node stopping on a durability
         // fault owes them.
         if fatal.is_none() {
-            while let Ok(frame) = self.inbox.try_recv() {
-                if self.accept_frame_for_self(&frame) {
-                    self.process_frame(frame).await;
-                    self.process_loopback(&mut loopback_buf, &mut namespace_scratch)
-                        .await;
-                    self.apply_reconcile_ops();
-                    if let Some(fault) = self.first_partition_commit_fault() {
-                        fatal = Some(fault);
-                        break;
-                    }
-                }
-            }
-            // Retired, not delivered: the pump is going away, so a staged frame
-            // has no later drain to reach the plane through. Runs before the
-            // reply-lane drain below, which is what carries the denies out.
-            self.retire_redispatched_frames();
-        }
-        if fatal.is_none() {
-            while let Ok(frame) = self.reply_inbox.try_recv() {
-                if self.accept_frame_for_self(&frame) {
-                    self.process_frame(frame).await;
-                    if let Some(fault) = self.first_partition_commit_fault() {
-                        fatal = Some(fault);
-                        break;
-                    }
-                }
-            }
+            fatal = self
+                .drain_queued_frames_for_shutdown(&mut loopback_buf, &mut namespace_scratch)
+                .await;
         }
 
         if fatal.is_some() {
@@ -467,6 +463,59 @@ where
         }
 
         fatal
+    }
+
+    /// Process queued work after the select loop has stopped. Redispatch keeps
+    /// its live-pump rank over the inbox, and every delivered frame gets its
+    /// loopback before another frame can run.
+    #[allow(clippy::future_not_send)]
+    async fn drain_queued_frames_for_shutdown(
+        &self,
+        loopback_buf: &mut Vec<Message<GenericHeader>>,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) -> Option<FatalCommit>
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        loop {
+            while let Some(frame) = self.pop_redispatched_frame() {
+                self.dispatch_redispatched_frame(frame).await;
+                self.process_loopback(loopback_buf, namespace_scratch).await;
+                self.apply_reconcile_ops();
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+            let Ok(frame) = self.inbox.try_recv() else {
+                break;
+            };
+            if self.accept_frame_for_self(&frame) {
+                self.process_frame(frame).await;
+                self.process_loopback(loopback_buf, namespace_scratch).await;
+                self.apply_reconcile_ops();
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+        }
+
+        // Retired, not delivered: the pump is going away, so a staged frame has
+        // no later arm to reach the plane through. This runs before the reply
+        // lane drain, which is what carries client denies out.
+        self.retire_redispatched_frames();
+        while let Ok(frame) = self.reply_inbox.try_recv() {
+            if self.accept_frame_for_self(&frame) {
+                self.process_frame(frame).await;
+                if let Some(fault) = self.first_partition_commit_fault() {
+                    return Some(fault);
+                }
+            }
+        }
+        None
     }
 
     /// First partition commit fault currently fenced on this shard.
@@ -671,6 +720,14 @@ where
                 // times out.
                 (self.on_partition_read)(namespace, read, reply);
             }
+            LifecycleFrame::PartitionSubmit { request, reply } => {
+                // Addressed to the shard owning the request's namespace (the
+                // sender resolved it via the shards table, same fallback as
+                // `route_typed`). Every refusal answers on `reply`, so the
+                // awaiting shard never waits out its budget on a decision
+                // already made.
+                self.on_partition_submit(request, reply).await;
+            }
             LifecycleFrame::MetadataCommitTick => {
                 // Reconciler may not yet be wired (e.g. mid-bootstrap, or
                 // single-shard tests that never enable the reconciler loop).
@@ -690,7 +747,6 @@ where
             }
             LifecycleFrame::ReconcileApply => {
                 self.apply_reconcile_ops();
-                self.drain_redispatched_frames().await;
             }
             LifecycleFrame::CleanPartition {
                 namespace,

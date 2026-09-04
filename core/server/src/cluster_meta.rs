@@ -26,15 +26,17 @@
 //! each caller derives it from its own on-shard view (`None` when the serving
 //! shard has no consensus - peer shards - in which case no node is marked
 //! leader, but the full roster is still returned). The self-synthesized single
-//! node is the cluster-disabled fallback, shared by both callers.
+//! node is the cluster-disabled fallback, shared by both callers, and the one
+//! place this node's own bound ports are reported.
 
-use configs::cluster::{ResolvedClusterNode, TransportPorts};
+use configs::ConfigurationError;
+use configs::cluster::{AdvertisedAddress, ClusterConfig, ResolvedClusterNode, TransportPorts};
 use iggy_common::{
     ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, TransportEndpoints,
 };
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// Node name reported for the synthesized self node when no roster applies.
 const SELF_NODE_NAME: &str = "iggy-node";
@@ -43,22 +45,75 @@ const SELF_NODE_NAME: &str = "iggy-node";
 /// single-node label.
 const SINGLE_NODE_CLUSTER_NAME: &str = "single-node";
 
-/// Config-derived cluster topology reported by cluster-metadata reads.
+/// Client-facing host for the cluster-disabled single node, normalized the way
+/// [`client_host`] normalizes the roster path so one address cannot publish in
+/// two spellings. Normalizing matters beyond tidiness: an SDK that brackets an
+/// IPv6 host before joining it to the port brackets a declared `[2001:db8::1]`
+/// a second time unless it guards on a leading '[', yielding an address that no
+/// longer parses. Go's `net.JoinHostPort` keys on the colon alone, so it is the
+/// one that does.
 ///
-/// Copied out of `ClusterConfig` at listener/shard start so both handlers stay
-/// synchronous and never borrow live config. `self_*` describe this node and
-/// back the cluster-disabled self-synthesis only.
+/// `NodeConfig::validate` has already accepted `declared`, so the parse only
+/// fails on a caller that skipped validation; such a value is passed through
+/// rather than dropped.
+pub fn self_advertised_address(declared: Option<&str>, bind: IpAddr) -> String {
+    declared.map_or_else(
+        || bind.to_string(),
+        |declared| {
+            declared
+                .parse::<AdvertisedAddress>()
+                .map_or_else(|_| declared.to_owned(), |address| address.to_string())
+        },
+    )
+}
+
+/// Resolve the roster a [`ClusterRoster`] serves, which is only the configured
+/// one while the cluster is enabled. Gated on the same flag the config
+/// validator gates itself on: a disabled cluster leaves `cluster.nodes`
+/// unvalidated, and a stale entry left there must not fail a boot that never
+/// consults it.
+///
+/// # Errors
+///
+/// Returns [`ConfigurationError`] when an enabled roster carries a node whose
+/// address does not parse, which boot validation rejects first.
+pub fn resolved_roster_nodes(
+    cluster: &ClusterConfig,
+) -> Result<Vec<ResolvedClusterNode>, ConfigurationError> {
+    if !cluster.enabled {
+        return Ok(Vec::new());
+    }
+    cluster
+        .nodes
+        .iter()
+        .cloned()
+        .map(ResolvedClusterNode::try_from)
+        .collect()
+}
+
+/// Cluster topology reported by cluster-metadata reads.
+///
+/// Copied out of `ClusterConfig` at shard start so both handlers stay
+/// synchronous and never borrow live config. `self_advertised` and the two
+/// port sets describe this node and back the cluster-disabled self-synthesis
+/// only.
 pub struct ClusterRoster {
     pub enabled: bool,
     pub name: String,
     /// Roster nodes with selectors parsed once at roster build, so the
     /// per-request address resolution never re-parses config strings.
     pub nodes: Vec<ResolvedClusterNode>,
-    /// This node's own address, reported for the synthesized self node.
-    pub self_ip: String,
-    /// This node's own client ports for the same self node (`None` = transport
-    /// disabled).
-    pub self_ports: TransportPorts,
+    /// This node's own client-facing address, reported for the synthesized
+    /// self node (see [`self_advertised_address`]).
+    pub self_advertised: String,
+    /// This node's own client ports for the same self node as configured
+    /// (`None` = transport disabled), reported until the bound ones are
+    /// published.
+    pub configured_ports: TransportPorts,
+    /// The same ports as the OS bound them, published by shard 0 once its
+    /// listeners are up, so a configured `:0` port resolves for the
+    /// self-synthesized node; cluster mode serves `cluster.nodes[*].ports`.
+    pub bound_ports: Arc<BoundPorts>,
     /// Metadata-group view, published by shard 0 (the only shard holding the
     /// consensus instance) so every shard's cluster-metadata read marks the
     /// current leader. `u64::MAX` until shard 0 first publishes.
@@ -68,19 +123,41 @@ pub struct ClusterRoster {
 /// Sentinel for "shard 0 has not published a view yet".
 pub const METADATA_VIEW_UNKNOWN: u64 = u64::MAX;
 
+/// Client ports as bound by shard 0's listeners. One cell per process, shared
+/// by every shard's roster: blank from bootstrap until the last listener has
+/// bound, then filled once, before the HTTP listener serves. A binary read
+/// that lands in the bind window answers the configured ports instead.
+#[derive(Default)]
+pub struct BoundPorts(OnceLock<TransportPorts>);
+
+impl BoundPorts {
+    pub fn publish(&self, ports: TransportPorts) {
+        let published = self.0.set(ports);
+        debug_assert!(published.is_ok(), "listeners bind once per process");
+    }
+}
+
 impl ClusterRoster {
-    /// A cluster-disabled roster with no self address. Used as the pre-bootstrap
-    /// default before the real roster is installed; [`Self::cluster_metadata`]
-    /// on it synthesizes a bare single node.
+    /// A cluster-disabled roster with no self address. The pre-bootstrap
+    /// placeholder a [`crate::session_manager::SessionManager`] holds until
+    /// bootstrap installs the real roster, which happens before any listener
+    /// accepts, so its blank address is never served to a client.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
             name: String::new(),
             nodes: Vec::new(),
-            self_ip: String::new(),
-            self_ports: TransportPorts::default(),
+            self_advertised: String::new(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: Arc::default(),
             metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
         }
+    }
+
+    /// This node's own client ports: the bound ones once shard 0 has
+    /// published them, the configured ones before.
+    fn self_ports(&self) -> &TransportPorts {
+        self.bound_ports.0.get().unwrap_or(&self.configured_ports)
     }
 
     /// The current metadata primary's REPLICA ID, from the shard-0-published
@@ -135,13 +212,15 @@ impl ClusterRoster {
         }
     }
 
+    /// The cluster-disabled single node, carrying the address
+    /// [`self_advertised_address`] resolved.
     fn self_metadata(&self) -> ClusterMetadata {
         ClusterMetadata {
             name: SINGLE_NODE_CLUSTER_NAME.to_owned(),
             nodes: vec![ClusterNode {
                 name: SELF_NODE_NAME.to_owned(),
-                ip: self.self_ip.clone(),
-                endpoints: ports_to_endpoints(&self.self_ports),
+                ip: self.self_advertised.clone(),
+                endpoints: ports_to_endpoints(self.self_ports()),
                 role: ClusterNodeRole::Leader,
                 status: ClusterNodeStatus::Healthy,
             }],
@@ -153,16 +232,11 @@ impl ClusterRoster {
 /// matching what boot validation compared and what redirect URLs render, so
 /// textual config variants of one address publish identical metadata. The
 /// per-client-network selectors, the catch-all `advertised_address`, and the
-/// roster `ip` are consulted in that order ([`ResolvedClusterNode::advertised_for`]).
-/// Metadata deliberately does NOT fail closed like the redirect path: a host
-/// that parses as neither IP nor hostname (the roster `ip` is only validated
-/// non-empty - Docker service names with underscores exist in the wild)
-/// publishes verbatim via [`ResolvedClusterNode::raw_advertised_fallback`].
+/// roster `ip` are consulted in that order
+/// ([`ResolvedClusterNode::advertised_for`]), which always resolves: a node
+/// whose sources do not parse never becomes a [`ResolvedClusterNode`].
 fn client_host(node: &ResolvedClusterNode, client_ip: Option<IpAddr>) -> String {
-    node.advertised_for(client_ip).map_or_else(
-        || node.raw_advertised_fallback().to_owned(),
-        ToString::to_string,
-    )
+    node.advertised_for(client_ip).to_string()
 }
 
 const fn role_for(primary_index: Option<u8>, replica_id: u8) -> ClusterNodeRole {
@@ -202,9 +276,10 @@ mod tests {
         ClusterRoster {
             enabled: true,
             name: "test-cluster".to_owned(),
-            nodes: vec![node.into()],
-            self_ip: "127.0.0.1".to_owned(),
-            self_ports: TransportPorts::default(),
+            nodes: vec![ResolvedClusterNode::try_from(node).expect("valid roster node")],
+            self_advertised: "127.0.0.1".to_owned(),
+            configured_ports: TransportPorts::default(),
+            bound_ports: Arc::default(),
             metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
         }
     }
@@ -249,16 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn cluster_metadata_passes_unparsable_replica_ip_verbatim() {
-        let mut node = node_config(None);
-        node.ip = "iggy_node".to_owned();
-
-        let metadata = roster_of(node).cluster_metadata(Some(0), None);
-
-        assert_eq!(metadata.nodes[0].ip, "iggy_node");
-    }
-
-    #[test]
     fn cluster_metadata_serves_the_selector_address_to_a_matching_client() {
         let mut node = node_config(Some("203.0.113.10".to_owned()));
         node.advertised_addresses = vec![AdvertisedAddressSelector {
@@ -292,5 +357,133 @@ mod tests {
         let metadata = roster_of(node).cluster_metadata(Some(0), Some("10.0.9.9".parse().unwrap()));
 
         assert_eq!(metadata.nodes[0].ip, "broker.internal.test");
+    }
+
+    #[test]
+    fn resolved_roster_nodes_ignores_a_roster_a_disabled_cluster_never_reads() {
+        // The shipped config carries a roster with the cluster off, so an
+        // entry that stopped parsing must not fail a boot that never serves
+        // it: the validator skips those entries for the same reason.
+        let mut cluster = ClusterConfig {
+            enabled: false,
+            ..ClusterConfig::default()
+        };
+        cluster.nodes[0].ip = "iggy-server".to_owned();
+
+        assert!(
+            resolved_roster_nodes(&cluster)
+                .expect("no roster to resolve")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolved_roster_nodes_refuses_an_enabled_roster_that_does_not_parse() {
+        let mut cluster = ClusterConfig {
+            enabled: true,
+            ..ClusterConfig::default()
+        };
+        cluster.nodes[0].ip = "iggy-server".to_owned();
+
+        assert!(resolved_roster_nodes(&cluster).is_err());
+    }
+
+    #[test]
+    fn self_advertised_address_prefers_a_declared_address() {
+        assert_eq!(
+            self_advertised_address(Some("broker-1.example.com"), "192.0.2.10".parse().unwrap()),
+            "broker-1.example.com"
+        );
+    }
+
+    #[test]
+    fn self_advertised_address_falls_back_to_the_bind_address() {
+        assert_eq!(
+            self_advertised_address(None, "192.0.2.10".parse().unwrap()),
+            "192.0.2.10"
+        );
+        assert_eq!(
+            self_advertised_address(None, "2001:db8::1".parse().unwrap()),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn self_advertised_address_normalizes_a_declared_address() {
+        let bind = "192.0.2.10".parse().unwrap();
+        // The roster path renders through the same `Display`, so a config
+        // variant must not publish differently depending on which path served
+        // it.
+        assert_eq!(
+            self_advertised_address(Some("Broker.Example.COM"), bind),
+            "broker.example.com"
+        );
+        // A client joins the published host to a port; leaving the brackets on
+        // would bracket it twice into an address that no longer parses.
+        assert_eq!(
+            self_advertised_address(Some("[2001:db8::1]"), bind),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            self_advertised_address(Some("2001:DB8::1"), bind),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn self_metadata_synthesizes_a_single_leader_node() {
+        let roster = ClusterRoster {
+            enabled: false,
+            name: String::new(),
+            nodes: Vec::new(),
+            self_advertised: "broker-1.example.com".to_owned(),
+            configured_ports: TransportPorts {
+                tcp: Some(8090),
+                ..TransportPorts::default()
+            },
+            bound_ports: Arc::default(),
+            metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
+        };
+
+        let metadata = roster.cluster_metadata(None, None);
+
+        assert_eq!(metadata.nodes.len(), 1);
+        assert_eq!(metadata.nodes[0].ip, "broker-1.example.com");
+        assert_eq!(metadata.nodes[0].endpoints.tcp, 8090);
+        assert_eq!(metadata.nodes[0].role, ClusterNodeRole::Leader);
+        assert_eq!(metadata.nodes[0].status, ClusterNodeStatus::Healthy);
+    }
+
+    #[test]
+    fn self_metadata_reports_bound_ports_once_published() {
+        let roster = ClusterRoster {
+            enabled: false,
+            name: String::new(),
+            nodes: Vec::new(),
+            self_advertised: "127.0.0.1".to_owned(),
+            configured_ports: TransportPorts {
+                tcp: Some(0),
+                http: Some(0),
+                ..TransportPorts::default()
+            },
+            bound_ports: Arc::default(),
+            metadata_view: Arc::new(AtomicU64::new(METADATA_VIEW_UNKNOWN)),
+        };
+        assert_eq!(
+            roster.cluster_metadata(None, None).nodes[0].endpoints.tcp,
+            0
+        );
+
+        roster.bound_ports.publish(TransportPorts {
+            tcp: Some(45001),
+            http: Some(45002),
+            ..TransportPorts::default()
+        });
+
+        let endpoints = roster.cluster_metadata(None, None).nodes[0]
+            .endpoints
+            .clone();
+        assert_eq!(endpoints.tcp, 45001);
+        assert_eq!(endpoints.http, 45002);
     }
 }

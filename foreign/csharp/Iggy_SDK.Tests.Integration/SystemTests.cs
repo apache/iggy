@@ -45,7 +45,7 @@ public class SystemTests
         {
             c.ClientId.ShouldNotBe(0u);
             c.Address.ShouldNotBeNullOrEmpty();
-            c.Transport.ShouldBe(Protocol.Tcp);
+            c.Transport.ShouldBe(ClientTransport.Tcp);
         }
     }
 
@@ -63,10 +63,9 @@ public class SystemTests
         response.ShouldNotBeNull();
         response.ClientId.ShouldBe(clientInfo.ClientId);
         response.UserId.ShouldNotBeNull();
-        response.UserId.Value.ShouldBeGreaterThanOrEqualTo(0u);
         response.Address.ShouldNotBeNullOrEmpty();
-        response.Transport.ShouldBe(Protocol.Tcp);
-        response.ConsumerGroupsCount.ShouldBe(0);
+        response.Transport.ShouldBe(ClientTransport.Tcp);
+        response.ConsumerGroupsCount.ShouldBe(0u);
         response.ConsumerGroups.ShouldBeEmpty();
     }
 
@@ -82,7 +81,7 @@ public class SystemTests
         me.ClientId.ShouldNotBe(0u);
         me.UserId.ShouldBe(0u);
         me.Address.ShouldNotBeNullOrEmpty();
-        me.Transport.ShouldBe(Protocol.Tcp);
+        me.Transport.ShouldBe(ClientTransport.Tcp);
     }
 
     [Test]
@@ -117,8 +116,8 @@ public class SystemTests
         var response = await client.GetClientByIdAsync(me!.ClientId);
         response.ShouldNotBeNull();
         response.Address.ShouldNotBeNullOrEmpty();
-        response.Transport.ShouldBe(Protocol.Tcp);
-        response.ConsumerGroupsCount.ShouldBe(1);
+        response.Transport.ShouldBe(ClientTransport.Tcp);
+        response.ConsumerGroupsCount.ShouldBe(1u);
         response.ConsumerGroups.ShouldNotBeEmpty();
         response.ConsumerGroups.ShouldContain(x => x.GroupId == consumerGroup!.Id);
         response.ConsumerGroups.ShouldContain(x => x.StreamId == stream!.Id);
@@ -141,21 +140,15 @@ public class SystemTests
 
         var response = await client.GetStatsAsync();
         response.ShouldNotBeNull();
-        response.ProcessId.ShouldBeGreaterThanOrEqualTo(0);
+        response.ProcessId.ShouldNotBe(0u);
         response.CpuUsage.ShouldBeGreaterThanOrEqualTo(0);
         response.TotalCpuUsage.ShouldBeGreaterThanOrEqualTo(0);
-        response.MemoryUsage.ShouldBeGreaterThanOrEqualTo(0u);
-        response.TotalMemory.ShouldBeGreaterThanOrEqualTo(0u);
         response.AvailableMemory.ShouldNotBe(0u);
-        response.RunTime.ShouldBeGreaterThanOrEqualTo(0u);
         response.StartTime.ShouldBe(DateTimeOffset.UtcNow, TimeSpan.FromMinutes(5));
-        response.ReadBytes.ShouldBeGreaterThanOrEqualTo(0u);
-        response.WrittenBytes.ShouldBeGreaterThanOrEqualTo(0u);
-        response.MessagesSizeBytes.ShouldBeGreaterThanOrEqualTo(0u);
-        response.StreamsCount.ShouldBeGreaterThanOrEqualTo(1);
-        response.TopicsCount.ShouldBeGreaterThanOrEqualTo(1);
-        response.PartitionsCount.ShouldBeGreaterThanOrEqualTo(1);
-        response.SegmentsCount.ShouldBeGreaterThanOrEqualTo(1);
+        response.StreamsCount.ShouldBeGreaterThanOrEqualTo(1u);
+        response.TopicsCount.ShouldBeGreaterThanOrEqualTo(1u);
+        response.PartitionsCount.ShouldBeGreaterThanOrEqualTo(1u);
+        response.SegmentsCount.ShouldBeGreaterThanOrEqualTo(1u);
         response.MessagesCount.ShouldBeGreaterThanOrEqualTo(1u);
         // iggy-server leaves the connected-client tally out of its stats reply, so ClientsCount goes unchecked.
         response.Hostname.ShouldNotBeNullOrEmpty();

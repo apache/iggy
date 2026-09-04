@@ -762,6 +762,30 @@ where
         headers.iter().find(|header| header.op == op).copied()
     }
 
+    /// Whether `op` is resident, in O(log n) instead of `header_by_op`'s scan.
+    /// Callers that only need presence must use this: a miss is the common case
+    /// on the residency checks, and a miss is exactly when the scan walks the
+    /// whole vec.
+    ///
+    /// It answers off `op_to_storage_offset`, so it is `header_by_op(op).is_some()`
+    /// everywhere except INSIDE [`Self::append_with_meta`], which pushes the
+    /// header before the storage write and inserts the offset after it: a task
+    /// that interleaves at that await sees the header without the offset and is
+    /// answered `false`. Both are cleared together at every clear site
+    /// ([`Self::commit`], [`Self::evict_prefix`], the restore path), so that
+    /// window is the only divergence.
+    ///
+    /// The window is unreachable for this journal: `PartitionJournalMemStorage`
+    /// writes to memory and its `write_at` never yields, so no task can observe
+    /// the half-inserted state. That is what lets `apply_repaired_prepare` lean
+    /// on this for idempotence, where a false negative would re-journal an op
+    /// the log already holds. A future yielding `Storage` has to insert the
+    /// offset before the write, or move that check back to the header vec.
+    pub fn holds_op(&self, op: u64) -> bool {
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        op_to_storage_offset.contains_key(&op)
+    }
+
     /// Presence and message-carrying shape of the repair window `(floor, to_op]`
     /// in ONE pass over the header vec.
     ///
@@ -842,27 +866,64 @@ where
     }
 
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
-    /// stopping at the first missing op. A replication gap must not be skipped:
-    /// the caller advances `commit_min` strictly by one, so a hole would break
-    /// that contract. Headers are append-ordered, which is op-ascending on a
-    /// backup, so this is a single linear scan: drop ops below `from_op`, take
-    /// while contiguous, stop at the first gap or past `commit_max`.
-    pub fn committed_headers_from(&self, from_op: u64, commit_max: u64) -> Vec<PrepareHeader> {
+    /// stopping at the first missing op and at `limit` headers. A replication
+    /// gap must not be skipped: the caller advances `commit_min` strictly by
+    /// one, so a hole would break that contract.
+    ///
+    /// `limit` bounds what one caller commits in a single pass. The run is
+    /// re-derived from the caller's own `commit_min` every time, so a truncated
+    /// answer is resumed, not lost.
+    pub fn committed_headers_from(
+        &self,
+        from_op: u64,
+        commit_max: u64,
+        limit: usize,
+    ) -> Vec<PrepareHeader> {
         // Walk by OP, not by append position: after a rejoin the journal
         // interleaves live tail ops (which arrive while repair is still
         // streaming) with repaired window ops, so append order is no longer
         // op-ascending and a positional sequential scan would break at the
         // first interleave boundary forever.
-        let mut result = Vec::new();
-        let mut op = from_op;
-        while op <= commit_max {
-            let Some(header) = self.header_by_op(op) else {
-                break;
-            };
-            result.push(header);
-            op += 1;
+        //
+        // ONE pass over the headers, like `repaired_window_shape`, not a
+        // `header_by_op` probe per op: that probe is itself a linear scan, so
+        // probing walked the window against the whole vec, and the walk this
+        // feeds runs per group per tick over a rejoin's entire backlog.
+        if from_op > commit_max {
+            return Vec::new();
         }
-        result
+        let headers = unsafe { &*self.headers.get() };
+        // Sized off the RUN the caller asked for, capped by the headers that
+        // could possibly cover it. Sizing off `headers.len()` alone would make
+        // a one-op run allocate a slot per resident header, and `commit_max` is
+        // a cluster frontier this replica may be arbitrarily far below, so
+        // neither bound can be dropped. `saturating_add` because `commit_max`
+        // is `u64::MAX` on a saturated frontier, where `+ 1` would panic in
+        // debug and wrap to an empty span (a walk that never resumes) in
+        // release.
+        let span = (commit_max - from_op)
+            .saturating_add(1)
+            .min(limit as u64)
+            .min(headers.len() as u64);
+        // `span` is a `min` of two `usize`-derived values on a 64-bit target,
+        // so the narrowing is lossless; `slot` is then compared against it as
+        // a `u64` BEFORE any cast, so nothing depends on the cast to bound it.
+        #[allow(clippy::cast_possible_truncation)]
+        let span = span as usize;
+        let mut slots: Vec<Option<PrepareHeader>> = vec![None; span];
+        for header in headers {
+            if header.op < from_op || header.op - from_op >= span as u64 {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = (header.op - from_op) as usize;
+            // First writer wins, matching the `header_by_op` probe this
+            // replaces (`find` returns the earliest match).
+            slots[slot].get_or_insert(*header);
+        }
+        // Stops at the first hole: a replication gap must not be skipped, or
+        // `advance_commit_min`'s sequential contract breaks.
+        slots.into_iter().map_while(|header| header).collect()
     }
 
     /// Oldest message offset still resident in the in-memory journal, if
@@ -1153,6 +1214,68 @@ pub fn push_selected_batch_fragments(
     *matched_messages += selection.matched_messages;
 }
 
+/// A fragment sliced from a storage buffer keeps the WHOLE allocation alive
+/// until the reply frame is written out, and a reply can sit in a
+/// per-connection mailbox for a while. Copy the matched bytes out when they
+/// cover less than this fraction of the source, so a sparse match (a
+/// `count=1` poll off a cold partition, a short poll into a large resident
+/// batch) cannot pin a ~1 MiB chunk or a whole prepare per queued reply; a
+/// dense match keeps the zero-copy path.
+///
+/// On the disk tier, the chunk allocations a poll reply keeps alive are
+/// bounded by `SPARSE_CHUNK_PIN_DIVISOR` times the record bytes it serves
+/// from disk, plus one page per compacted chunk. This is a ratio, not an
+/// absolute cap: a grown chunk can still retain tens of MiB, and it does not
+/// cover the reply's absolute size. The resident tier applies the same ratio
+/// per prepare entry but only copies up to [`RESIDENT_SPARSE_COPY_MAX_BYTES`];
+/// a sparse selection past that stays a slice and pins its prepare.
+const SPARSE_CHUNK_PIN_DIVISOR: usize = 4;
+
+/// Resident copies run inline on the shard pump (the disk walk is detached),
+/// and a poll selects at most two partial batches (its first and last), so
+/// this caps the pump's per-poll memcpy at about twice this many bytes.
+const RESIDENT_SPARSE_COPY_MAX_BYTES: usize = 64 * 1024;
+
+/// Rewrite the fragments pushed from index `pushed_from` on that slice
+/// `source` to slices of one compact copy when their combined length is a
+/// sparse fraction of `source` and at most `copy_max_bytes`. Fragments that
+/// own their bytes (rewritten batch headers) are left alone. See
+/// [`SPARSE_CHUNK_PIN_DIVISOR`].
+pub fn unpin_sparse_source(
+    fragments: &mut PollFragments<4096>,
+    pushed_from: usize,
+    source: &Frozen<4096>,
+    copy_max_bytes: usize,
+) {
+    let pushed = &mut fragments[pushed_from..];
+    let borrowed: usize = pushed
+        .iter()
+        .filter(|fragment| fragment.borrows_from(source))
+        .map(Fragment::len)
+        .sum();
+    if borrowed == 0
+        || borrowed >= source.len() / SPARSE_CHUNK_PIN_DIVISOR
+        || borrowed > copy_max_bytes
+    {
+        return;
+    }
+
+    let mut compact = Owned::<4096>::with_capacity(borrowed);
+    for fragment in pushed.iter().filter(|f| f.borrows_from(source)) {
+        compact.extend_from_slice(fragment.as_slice());
+    }
+    let compact = Frozen::from(compact);
+    let mut cursor = 0;
+    for fragment in pushed.iter_mut() {
+        if !fragment.borrows_from(source) {
+            continue;
+        }
+        let len = fragment.len();
+        *fragment = Fragment::slice(compact.clone(), cursor, cursor + len);
+        cursor += len;
+    }
+}
+
 /// Decode one resident `Frozen` entry and push its matching fragments. Shared by
 /// the live storage walk and the owned-snapshot walk so the corrupt-header skip
 /// and `SendMessages` filter live in one place. Skips (never panics) on a short
@@ -1188,6 +1311,7 @@ fn try_push_resident_entry(
     };
     // The batch's 256B header sits right after the prepare header in a resident
     // entry (see `decode_prepare_slice`), so the batch base is `PREPARE_HEADER_SIZE`.
+    let pushed_from = fragments.len();
     push_selected_batch_fragments(
         fragments,
         last_matching_offset,
@@ -1196,6 +1320,16 @@ fn try_push_resident_entry(
         PREPARE_HEADER_SIZE,
         &batch,
         selection,
+    );
+    // `evict_prefix` drains the storage on the routine commit flush, so a
+    // queued reply that still slices this prepare becomes its sole owner.
+    // Accounted per entry here; the disk walk accounts per chunk, where many
+    // batches share one allocation.
+    unpin_sparse_source(
+        fragments,
+        pushed_from,
+        prepare,
+        RESIDENT_SPARSE_COPY_MAX_BYTES,
     );
 }
 
@@ -1251,7 +1385,8 @@ mod tests {
     use journal::Journal;
     use server_common::Message;
     use server_common::send_messages::{
-        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned, decode_batch_slice,
+        BatchHeader, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+        decode_batch_slice,
     };
     use server_common::sharding::IggyNamespace;
 
@@ -1481,7 +1616,7 @@ mod tests {
 
         // Contiguous run from op 1 stops before the missing op 3 even though
         // op 4 is resident and within commit_max.
-        let run = journal.committed_headers_from(1, 4);
+        let run = journal.committed_headers_from(1, 4, usize::MAX);
         let ops: Vec<u64> = run.iter().map(|header| header.op).collect();
         assert_eq!(
             ops,
@@ -1490,8 +1625,18 @@ mod tests {
         );
 
         assert!(
-            journal.committed_headers_from(5, 4).is_empty(),
+            journal.committed_headers_from(5, 4, usize::MAX).is_empty(),
             "from_op past commit_max yields nothing"
+        );
+
+        // The limit truncates the run rather than skipping ahead in it, so the
+        // caller resumes at the op it stopped on.
+        let bounded = journal.committed_headers_from(1, 4, 1);
+        let ops: Vec<u64> = bounded.iter().map(|header| header.op).collect();
+        assert_eq!(ops, vec![1], "the limit must cut the run at its front");
+        assert!(
+            journal.committed_headers_from(1, 4, 0).is_empty(),
+            "a zero limit commits nothing"
         );
     }
 
@@ -1516,12 +1661,56 @@ mod tests {
         let mut owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
             .expect("build send_messages batch");
         owned.header.base_timestamp = base_timestamp;
-        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
+        stamped_batch_record(owned)
+    }
 
+    /// Stamp `owned`'s checksum and lay it out as the `[256B batch header][blob]`
+    /// record a batch occupies in storage.
+    fn stamped_batch_record(mut owned: SendMessagesOwned) -> Vec<u8> {
+        owned.header.batch_checksum = owned.header.checksum_for_blob(&owned.blob);
         let mut record = vec![0u8; COMMAND_HEADER_SIZE + owned.blob.len()];
         owned.header.encode_into(&mut record[..COMMAND_HEADER_SIZE]);
         record[COMMAND_HEADER_SIZE..].copy_from_slice(&owned.blob);
         record
+    }
+
+    /// A resident `SendMessages` prepare entry holding one batch of
+    /// `message_count` records with distinct `payload_len`-byte payloads, in
+    /// the `[PrepareHeader][256B batch header][blob]` layout
+    /// `try_push_resident_entry` decodes.
+    fn build_resident_prepare(message_count: usize, payload_len: usize) -> Frozen<4096> {
+        let mut messages = IggyMessages::with_capacity(message_count);
+        for index in 0..message_count {
+            let fill = u8::try_from(index % usize::from(u8::MAX)).expect("bounded by u8::MAX");
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
+                    payload_length: u32::try_from(payload_len).expect("payload_len fits u32"),
+                    ..Default::default()
+                },
+                payload: Bytes::from(vec![fill; payload_len]),
+                user_headers: None,
+            });
+        }
+        let owned = SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages)
+            .expect("build send_messages batch");
+        let record = stamped_batch_record(owned);
+
+        let mut prepare = build_prepare(1, PREPARE_HEADER_SIZE + record.len()).transmute_header(
+            |header: PrepareHeader, send_messages: &mut PrepareHeader| {
+                *send_messages = header;
+                send_messages.operation = Operation::SendMessages;
+            },
+        );
+        prepare.as_mut_slice()[PREPARE_HEADER_SIZE..].copy_from_slice(&record);
+        prepare.into_frozen()
+    }
+
+    fn offset_lookup(offset: u64, count: u32) -> MessageLookup {
+        MessageLookup::Offset {
+            offset,
+            count,
+            ceiling: u64::MAX,
+        }
     }
 
     #[test]
@@ -1560,6 +1749,127 @@ mod tests {
             )
             .is_none(),
             "poll past the broker timestamp must match nothing"
+        );
+    }
+
+    /// A short poll into a large resident batch ships a rewritten header plus
+    /// a body slice. Left as a slice of the prepare, that body would keep the
+    /// whole entry alive after `evict_prefix` drained it from the journal.
+    #[test]
+    fn resident_partial_selection_copies_out_of_a_large_prepare() {
+        let prepare = build_resident_prepare(1_000, 300);
+        let query = offset_lookup(500, 1);
+        let batch = decode_prepare_slice_trusted(prepare.as_slice()).expect("prepare decodes");
+        let selection = select_batch_slice(&batch, query, 0).expect("record 500 is selected");
+        let expected_body = &batch.blob()[selection.start..selection.end];
+        assert!(
+            expected_body.len() < prepare.len() / SPARSE_CHUNK_PIN_DIVISOR,
+            "fixture must select a sparse fraction of the prepare"
+        );
+
+        let (fragments, last_matching_offset) =
+            select_resident(std::slice::from_ref(&prepare), query).expect("one record matches");
+        assert_eq!(last_matching_offset, Some(500));
+        assert_eq!(fragments.len(), 2, "rewritten header plus body slice");
+        let (header, body) = (&fragments[0], &fragments[1]);
+        assert!(
+            !body.borrows_from(&prepare),
+            "sparse body must be copied out of the prepare"
+        );
+        assert_eq!(body.as_slice(), expected_body);
+        assert_eq!(header.len(), COMMAND_HEADER_SIZE);
+        assert!(
+            !header.borrows_from(&body.clone().into_frozen()),
+            "the owned header must stay out of the compact copy"
+        );
+        let rewritten = BatchHeader::decode(header.as_slice()).expect("rewritten header decodes");
+        assert_eq!(rewritten.message_count, 1);
+    }
+
+    #[test]
+    fn resident_whole_batch_selection_keeps_the_zero_copy_slice() {
+        let prepare = build_resident_prepare(1_000, 300);
+
+        let (fragments, last_matching_offset) =
+            select_resident(std::slice::from_ref(&prepare), offset_lookup(0, 1_000))
+                .expect("whole batch matches");
+        assert_eq!(last_matching_offset, Some(999));
+        assert_eq!(fragments.len(), 1, "a whole batch ships its original bytes");
+        assert!(
+            fragments[0].borrows_from(&prepare),
+            "dense selection keeps the zero-copy path"
+        );
+        assert_eq!(fragments[0].len(), prepare.len() - PREPARE_HEADER_SIZE);
+    }
+
+    /// The resident copy runs inline on the shard pump, so past the byte cap
+    /// a sparse selection stays a zero-copy slice even though it pins the
+    /// prepare.
+    #[test]
+    fn resident_sparse_copy_stops_at_the_byte_cap() {
+        let prepare = build_resident_prepare(2_000, 300);
+        let query = offset_lookup(0, 200);
+        let batch = decode_prepare_slice_trusted(prepare.as_slice()).expect("prepare decodes");
+        let selection = select_batch_slice(&batch, query, 0).expect("200 records are selected");
+        let selected = selection.end - selection.start;
+        assert!(
+            selected > RESIDENT_SPARSE_COPY_MAX_BYTES
+                && selected < prepare.len() / SPARSE_CHUNK_PIN_DIVISOR,
+            "fixture must select a sparse fraction that is over the copy cap"
+        );
+
+        let (fragments, _) =
+            select_resident(std::slice::from_ref(&prepare), query).expect("records match");
+        assert_eq!(fragments.len(), 2, "rewritten header plus body slice");
+        assert!(
+            fragments[1].borrows_from(&prepare),
+            "over the cap the body must stay a slice of the prepare"
+        );
+    }
+
+    /// A sparse match must not pin the whole disk chunk: the matched bytes
+    /// are copied out byte-for-byte and the fragments stop borrowing the
+    /// chunk allocation. A dense match keeps the zero-copy slices, and
+    /// fragments that already own their bytes (rewritten batch headers) are
+    /// never touched.
+    #[test]
+    fn unpin_sparse_source_bounds_chunk_retention() {
+        let chunk_len = 1 << 20;
+        let mut backing = Owned::<4096>::zeroed(chunk_len);
+        for (position, byte) in backing.as_mut_slice().iter_mut().enumerate() {
+            *byte = u8::try_from(position % 251).unwrap();
+        }
+        let chunk = Frozen::from(backing);
+
+        let mut fragments = PollFragments::<4096>::new();
+        fragments.push(Fragment::whole(Owned::<4096>::zeroed(256).into()));
+        fragments.push(Fragment::slice(chunk.clone(), 512, 512 + 600));
+        fragments.push(Fragment::slice(chunk.clone(), 4096, 4096 + 300));
+        let first = fragments[1].as_slice().to_vec();
+        let second = fragments[2].as_slice().to_vec();
+        unpin_sparse_source(&mut fragments, 0, &chunk, usize::MAX);
+        assert!(
+            !fragments[1].borrows_from(&chunk) && !fragments[2].borrows_from(&chunk),
+            "sparse slices must be copied out of the chunk"
+        );
+        assert_eq!(fragments[1].as_slice(), &first[..]);
+        assert_eq!(fragments[2].as_slice(), &second[..]);
+        assert!(
+            fragments[1].borrows_from(&fragments[2].clone().into_frozen()),
+            "copies pack into one compact allocation"
+        );
+        assert_eq!(fragments[0].len(), 256);
+
+        let mut fragments = PollFragments::<4096>::new();
+        fragments.push(Fragment::slice(
+            chunk.clone(),
+            0,
+            chunk_len / SPARSE_CHUNK_PIN_DIVISOR,
+        ));
+        unpin_sparse_source(&mut fragments, 0, &chunk, usize::MAX);
+        assert!(
+            fragments[0].borrows_from(&chunk),
+            "dense slice keeps the zero-copy path"
         );
     }
 }

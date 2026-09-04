@@ -28,6 +28,16 @@ cleaner_enabled = true
 # Interval for running the message cleaner.
 interval = "1 m"
 
+# This node's own client-facing identity, used when 'cluster.enabled' is false.
+[node]
+# A literal IP or a DNS hostname, without a port. Named to match its roster
+# counterpart 'cluster.nodes.advertised_address', which answers the same
+# question per node. The unspecified address ("0.0.0.0", "::") is rejected: it
+# is the bind address's answer to a question clients are not asking. Commented
+# out here because the shipped 'tcp.address' binds a concrete address and needs
+# no declaration.
+#advertised_address = "broker-1.example.com"
+
 # HTTP server configuration
 [http]
 # Determines if the HTTP server is active.
@@ -645,8 +655,27 @@ view_probe_attempts_max = 5
 # remaining window from the serving peer (duration). Repair frames are
 # fire-and-forget over the lossy bus, so a session with no retry wedges forever
 # on a single dropped frame. Paces both the metadata and partition repair loops;
-# must be nonzero.
+# must be nonzero. Paces streams that are already OPEN only: how long a hole
+# waits before one is opened for it is repair_gap_debounce_interval below.
 repair_retry_interval = "1s"
+
+# How long a backup must hold committed ops it cannot walk to before the shard's
+# tick opens a repair session for it (duration). The level-triggered floor under
+# every edge-triggered arming site, which a produce stream can starve; must be
+# nonzero. Paces the partition sweep and the metadata detector alike.
+#
+# Floored at 50 consensus ticks (500ms at the 10ms tick), so values under that
+# arm no sooner: one tick of lag is ordinary pipelining, and repair against it
+# would fire on healthy traffic.
+#
+# Recovery latency for one hole is max(this, 500ms) plus up to one tick of sweep
+# granularity. Under a correlated fault the partition sweep opens at most 3
+# sessions per tick and holds at most 8 at once, so the Nth group waiting on
+# this shard adds ceil(N / 3) ticks on top, and more while sessions are already
+# in flight. That cap is what keeps a node-wide rejoin from putting every
+# group's repair stream on one serving peer at once. There is one metadata group
+# per node, so its detector is not rate-capped.
+repair_gap_debounce_interval = "1s"
 
 # Prepares a peer serves per repair round before the requester walks to the next
 # chunk (integer). Each frame rides the per-peer message-bus queue, so this must
@@ -654,14 +683,24 @@ repair_retry_interval = "1s"
 # the queue and drops frames. Must be > 0 and <= 1024.
 repair_chunk_max = 128
 
-# How long the metadata superblock may stay unwritable before the replica
-# fail-stops (duration). A replica that cannot persist its view is already
-# fenced quorum-invisible and retries with capped backoff; past this window the
-# process exits with a distinct status so a supervisor restarts or replaces it
-# instead of an operator finding the wedge in logs. "0" disables the fail-stop
-# and leaves the replica fenced indefinitely. Nonzero values must be at least
-# 30s so a transient disk hiccup cannot kill the process.
+# How long a superblock may stay unwritable before the replica fail-stops
+# (duration). Applies to the metadata superblock and to each partition's own. A
+# group that cannot persist its view is already fenced quorum-invisible and
+# retries with capped backoff; past this window the process exits with a distinct
+# status so a supervisor restarts or replaces it instead of an operator finding
+# the wedge in logs. "0" disables the fail-stop and leaves the group fenced
+# indefinitely. Nonzero values must be at least 30s so a transient disk hiccup
+# cannot kill the process.
 superblock_wedged_fatal_timeout = "2m"
+
+# DOWNGRADE, every deployment: this release grew the superblock record from 66
+# to 74 bytes to carry partition.offset_reservation_lease's claim. The metadata
+# superblock is written by EVERY server, clustered or not, so upgrading rewrites
+# it at the new length on a plain single node too. A build that predates the
+# field refuses a record of that length and treats the refusal as a durability
+# violation, which fails the whole node's boot -- so rolling BACK to
+# server-0.9.0-edge.6 or earlier needs the data directory wiped on every node.
+# Upgrading needs nothing: the 66-byte record still decodes.
 
 # Replica-to-replica authentication (PSK + BLAKE3 keyed-MAC handshake).
 [cluster.auth]
@@ -712,9 +751,9 @@ key_file = ""
 # PEM trust anchor(s) the dialer verifies peer certificates against.
 # Unused when self_signed = true.
 # The dialer verifies each peer against the 'ip' string from that peer's
-# cluster.nodes entry, so a roster of literal IPs needs peer certificates
-# carrying matching IP SANs. Hostname-only certificates fail verification;
-# use hostnames in the roster if the certificates only have DNS SANs.
+# cluster.nodes entry, and that string is the TLS server name as well as a
+# literal IP, so every peer certificate needs a matching IP SAN. A
+# certificate carrying only DNS SANs fails verification.
 ca_file = ""
 
 # Shard-0 coordinator placement.
@@ -788,7 +827,7 @@ skip_shard_zero_for_clients = false
 #
 #   [[cluster.nodes]]
 #   name = "iggy-node-1"
-#   ip = "10.0.1.5"                        # replica plane + last-resort fallback
+#   ip = "10.0.1.5"                        # replica plane, literal IP only
 #   advertised_address = "203.0.113.10"    # catch-all for unmatched clients
 #   replica_id = 0
 #   ports = { tcp = 8090, http = 3000, tcp_replica = 9090 }
@@ -950,7 +989,9 @@ prepare_queue_depth = 32
 # Size of the metadata WAL's in-memory index, in slots (one committed but
 # not-yet-snapshotted op per slot). Larger values buy more headroom
 # between forced checkpoints at the cost of memory and bigger WAL
-# rewrites per checkpoint.
+# rewrites per checkpoint. Reducing this for an existing data directory is
+# refused at boot if the live WAL suffix collides in the smaller index;
+# restore the previous value to recover.
 journal_slots = 1024
 
 # Slot count of the VSR client table: how many distinct clients (TCP/QUIC/WS
@@ -972,6 +1013,32 @@ clients_table_max = 8192
 # memory. A DoViewChange describes the uncommitted suffix with one bit per op in a
 # u128 bitset, and this depth bounds that suffix.
 prepare_queue_depth = 32
+
+# Distinct clients each partition group tracks request watermarks for, so a
+# retried produce or consumer-offset write is answered instead of committing a
+# second time. At capacity the client whose newest commit is oldest is evicted;
+# that client's next replay re-executes, exactly as it would have before dedup
+# existed, so under-sizing degrades rather than breaks. Must be > 0 and <= 65536.
+#
+# Unlike [metadata] clients_table_max, this budget is PER GROUP, so worst-case
+# memory scales with partition count. Size it to the producers one partition
+# actually sees, not the node's client total.
+dedup_clients_max = 4096
+
+# How many offsets a partition claims in its superblock ahead of the mint
+# counter before it will append, so a crash-restarted replica resumes above
+# every offset it confirmed to a client instead of re-minting it for a different
+# message. One superblock write (two fsyncs) per block: lowering it raises the
+# fsync rate on the write path, raising it wastes at most one block of the u64
+# offset space per crash. Must be > 0 and <= 16777216.
+#
+# SINGLE-REPLICA groups only. A replicated group acks a send once a quorum has
+# journaled it, so re-minting there needs a full-cluster crash; it claims
+# nothing, pays no write, and ignores this value.
+#
+# DOWNGRADE: see the note on superblock_wedged_fatal_timeout in [cluster].
+# Upgrading needs nothing.
+offset_reservation_lease = 65536
 
 # Entries the evicted ring retains per multi-replica partition for journal
 # repair after a peer rejoins. Larger widens the window a restarting peer can be

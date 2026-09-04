@@ -400,6 +400,12 @@ impl iggy_common::VsrSessionControl for QuicClient {
         }
 
         consensus_session.bind(session);
+        drop(consensus_session);
+        // Every fresh client identity passes through here, including one that
+        // replaces a session the transport never reset: a connection lost
+        // mid-request can leave the old session in place until this sign-in
+        // re-mints it.
+        self.consumer_group_state.clear_session_scoped();
         Ok(())
     }
 
@@ -408,6 +414,7 @@ impl iggy_common::VsrSessionControl for QuicClient {
             .consensus_session
             .lock()
             .expect("consensus session mutex poisoned") = ConsensusSession::new();
+        self.consumer_group_state.clear_session_scoped();
         Ok(())
     }
 
@@ -919,8 +926,8 @@ impl QuicClient {
                 // construction, so replaying the SAME request header on a fresh
                 // bidi cannot double-commit), and it no longer abandons a bidi
                 // whose op is still committing. Silence therefore is NOT a
-                // retry signal: partition ops share one request id and have no
-                // reply cache, so resending a silently-unanswered request whose
+                // retry signal: the partition plane has no dedup or reply
+                // cache, so resending a silently-unanswered request whose
                 // first attempt was buffered and later commits would commit it
                 // twice (duplicate `SendMessages`, or a succeeded delete coming
                 // back as terminal `ConsumerOffsetNotFound`). A silent deadline

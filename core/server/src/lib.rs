@@ -30,28 +30,41 @@ static GLOBAL: MiMalloc = MiMalloc;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSION);
 
-pub mod auth;
-pub mod bootstrap;
-pub(crate) mod cluster_meta;
-pub mod config_writer;
-pub mod consumer_group;
-pub mod dispatch;
+// Visibility rule: `pub` = named external consumer. main.rs consumes `boot`
+// (including `boot::systemd`) and `server_error`; the simulator consumes
+// `shell`, `boot::wire_shell_handlers`, and (through `ShellHandlers.sessions`)
+// `session_manager`. Everything else is crate-internal.
+
+// boot: process entry, shard threads, recovery orchestration.
+pub mod boot;
+pub(crate) mod config_writer;
+pub(crate) mod shard_allocator;
+
+// spine: the request path - shell vocabulary, dispatch funnel, per-domain ops.
+pub(crate) mod consumer_group;
+pub(crate) mod dispatch;
+pub(crate) mod pat;
+pub(crate) mod responses;
+pub(crate) mod rewrite;
+pub mod session_manager;
+pub mod shell;
+
+pub(crate) mod users;
+pub(crate) mod wire;
+
+// http: the REST spine (role-leaf tree).
 pub(crate) mod http;
-pub mod login_register;
-pub(crate) mod offset_recovery;
-pub mod partition_helpers;
-pub mod partition_reconciler;
-pub mod pat;
+
+// background: per-shard maintenance loops.
+pub(crate) mod partition_reconciler;
 pub(crate) mod personal_access_token_cleaner;
-pub mod responses;
 pub(crate) mod segment_cleaner;
+pub(crate) mod snapshot;
+
+// support: shared plumbing and the crash-recovery readers
+// (the readers move beside their writers in core/partitions later).
+pub(crate) mod cluster_meta;
+pub(crate) mod offset_recovery;
+pub(crate) mod partition_helpers;
 pub(crate) mod segment_recovery;
 pub mod server_error;
-pub mod session_manager;
-pub(crate) mod snapshot;
-#[cfg(feature = "systemd")]
-pub mod systemd;
-pub mod users;
-#[cfg(feature = "iggy-web")]
-pub(crate) mod web;
-pub mod wire;

@@ -78,13 +78,16 @@ pub struct FrameDropLabel {
 /// `PARTITION` covers the partition plane: a frame shed because the namespace
 /// had not materialised and its park buffer was at capacity
 /// (`reason=park_overflow`), a parked frame retired with no client to answer
-/// (`reason=park_dropped`), or a routing send the target inbox refused. A shed
-/// client request is answered with a retriable status, so the client recovers.
-/// A shed *prepare* has nobody to answer and is not covered by retransmit once
-/// its op has reached quorum (`consensus::retransmit_targets` skips
-/// `ok_quorum_received`), so the backup gap-stops; `tick_partitions`' sweep is
-/// what repairs it, and `partition_prepare_gap_drops_total` is what counts the
-/// prepares that reached the gap check.
+/// (`reason=park_dropped`), an incarnation rejection, or a routing send the
+/// target inbox refused. A shed client request is answered with a retriable
+/// status, so the client recovers. A shed *prepare* has nobody to answer and is
+/// not covered by retransmit once its op has reached quorum
+/// (`consensus::retransmit_targets` skips `ok_quorum_received`), so the backup
+/// gap-stops; `tick_partitions`' sweep is what repairs it, escalating to
+/// partition state transfer when the primary has evicted the range, and
+/// `partition_prepare_gap_drops_total` is what counts the prepares that reached
+/// the gap check. The counter therefore signals a data-plane gap or recovery
+/// burden, not a requirement for a view change.
 pub mod frame_drop_variant {
     pub const CONSENSUS: &str = "consensus";
     pub const FD_TRANSFER: &str = "fd_transfer";
@@ -110,11 +113,12 @@ pub mod frame_drop_variant {
 /// `PARK_OVERFLOW` ticks when a partition frame arrives for a namespace this
 /// shard has not materialised and the per-namespace park buffer is already at
 /// its cap, so the frame is shed with no reply. `PARK_DROPPED` ticks when a
-/// frame that did park leaves unserved: its namespace became unreachable, or a
-/// request outlived `MAX_PARKED_PASSES` with no pump to take the deny. A request
-/// also bumps `partition_requests_denied_transient_total` when answered;
-/// replicated traffic has nobody to answer, so this is the only record the op
-/// was destroyed.
+/// frame that did park leaves unserved: its namespace became unreachable, its
+/// incarnation stamp was rejected, reclassification failed, or a request
+/// outlived `MAX_PARKED_PASSES` with no pump to take the deny. A request also
+/// bumps `partition_requests_denied_transient_total` when answered; replicated
+/// traffic has nobody to answer, so this is the direct record that local bytes
+/// were destroyed and repair may be required.
 pub mod frame_drop_reason {
     /// Operation discriminant unknown to this build: the sender is newer.
     ///
@@ -131,6 +135,12 @@ pub mod frame_drop_reason {
     pub const MISROUTED: &str = "misrouted";
     pub const PARK_OVERFLOW: &str = "park_overflow";
     pub const PARK_DROPPED: &str = "park_dropped";
+    /// A partition write's reply channel was dropped before a reply arrived
+    /// (view-change pipeline reset, park teardown, shutdown): the outcome is
+    /// unknown and the client is left to its read-timeout.
+    pub const SUBMIT_ABANDONED: &str = "submit_abandoned";
+    /// A partition write's reply did not arrive within the submit budget.
+    pub const SUBMIT_TIMEOUT: &str = "submit_timeout";
 }
 
 // The tables only index the lazy fast-path cache below; a `{variant, reason}`
@@ -138,7 +148,7 @@ pub mod frame_drop_reason {
 // site actually produces it, so the unreachable corners of the 7 x 9 cross
 // product never appear as permanent zero-valued series.
 const VARIANT_COUNT: usize = 7;
-const REASON_COUNT: usize = 9;
+const REASON_COUNT: usize = 11;
 
 const VARIANTS: [&str; VARIANT_COUNT] = [
     frame_drop_variant::CONSENSUS,
@@ -160,6 +170,8 @@ const REASONS: [&str; REASON_COUNT] = [
     frame_drop_reason::MISROUTED,
     frame_drop_reason::PARK_OVERFLOW,
     frame_drop_reason::PARK_DROPPED,
+    frame_drop_reason::SUBMIT_ABANDONED,
+    frame_drop_reason::SUBMIT_TIMEOUT,
 ];
 
 fn variant_index(s: &str) -> Option<usize> {
@@ -201,6 +213,8 @@ pub struct ShardMetrics {
     partition_repair_serves_deferred_purge_total: Counter,
     partition_prepare_gap_drops_total: Counter,
     metadata_prepare_gap_drops_total: Counter,
+    metadata_read_frontier_refusals_total: Counter,
+    client_requests_denied_queue_full_total: Counter,
 }
 
 impl ShardMetrics {
@@ -227,7 +241,47 @@ impl ShardMetrics {
             partition_repair_serves_deferred_purge_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
             metadata_prepare_gap_drops_total: Counter::default(),
+            metadata_read_frontier_refusals_total: Counter::default(),
+            client_requests_denied_queue_full_total: Counter::default(),
         }
+    }
+
+    /// Bumped every time a client request is answered with a retryable denial
+    /// because that client already has the maximum number of requests queued
+    /// behind one the shard has not answered yet.
+    ///
+    /// The queue only grows while a client pipelines faster than its own
+    /// frames are served, so a sustained rate means one connection is stalled
+    /// on something - a held metadata read, a slow commit - while it keeps
+    /// sending.
+    pub fn record_client_request_denied_queue_full(&self) {
+        self.client_requests_denied_queue_full_total.inc();
+    }
+
+    /// Current value of [`Self::record_client_request_denied_queue_full`], for
+    /// tests that assert the denial was counted.
+    #[must_use]
+    pub fn client_requests_denied_queue_full_value(&self) -> u64 {
+        self.client_requests_denied_queue_full_total.get()
+    }
+
+    /// Bumped every time a metadata read is refused because this node's
+    /// applied frontier never reached what the caller was told committed.
+    ///
+    /// The counter is the signal, not a log line: a node that lags durably
+    /// refuses every held read of every client for as long as it lags, so the
+    /// refusal itself logs at `debug!` and this is what a dashboard alerts on.
+    /// Any sustained rate means reads on this node are failing retryable while
+    /// its commit walk stays behind.
+    pub fn record_metadata_read_frontier_refusal(&self) {
+        self.metadata_read_frontier_refusals_total.inc();
+    }
+
+    /// Current value of [`Self::record_metadata_read_frontier_refusal`], for
+    /// tests that assert a refusal was counted rather than scraping it.
+    #[must_use]
+    pub fn metadata_read_frontier_refusals_value(&self) -> u64 {
+        self.metadata_read_frontier_refusals_total.get()
     }
 
     /// Increment `frame_drops_total{variant, reason}` by 1.
@@ -401,13 +455,29 @@ impl ShardMetrics {
     }
 
     /// Add the prepares a partition's backup gap check destroyed since the last
-    /// sweep, drained per tick from `IggyPartition::take_prepare_gap_drops`.
+    /// sweep. Drained per tick from `IggyPartition::take_prepare_gap_drops`,
+    /// and once more when `ConfirmRemove` drops the partition: a tombstoned
+    /// namespace is invisible to the sweep, so the tail it left would otherwise
+    /// go to the floor with the value.
+    ///
+    /// Counts the prepares that ARRIVED after a hole, not the holes: a gap
+    /// opened by the last prepare of a burst leaves this at zero. A nonzero
+    /// value proves the repair driver has work; a zero one proves nothing.
     ///
     /// Deliberately NOT a `frame_drops_total{variant=partition}` reason: that
     /// family means the bus or the router shed a frame, and the simulator
     /// asserts it stays at zero on runs with no injected loss. A gap drop is a
     /// protocol-ordering drop that any real loss produces, and the sweep repairs
     /// it, so folding the two would turn a routing-fault alert into noise.
+    ///
+    /// Shard-scoped, with no namespace label: a server runs hundreds of groups
+    /// per shard, so labelling by namespace is unbounded cardinality, and every
+    /// other partition counter in this file is shard-scoped for the same
+    /// reason. The per-group detail is in the arm's log line.
+    ///
+    /// The metadata plane's own gap drop is NOT counted here: it has its own
+    /// counter, and its own level-triggered driver in `tick_metadata`. See
+    /// [`Self::record_metadata_prepare_gap_drops`].
     pub fn record_partition_prepare_gap_drops(&self, drops: u64) {
         self.partition_prepare_gap_drops_total.inc_by(drops);
     }
@@ -420,11 +490,19 @@ impl ShardMetrics {
     }
 
     /// Add the prepares the metadata backup gap check destroyed since the last
-    /// tick, drained from `IggyMetadata::take_prepare_gap_drops`. A sibling of
-    /// `partition_prepare_gap_drops_total`, and NOT a `frame_drops_total`
-    /// reason for the same cause: gap drops are protocol-ordering drops that
-    /// the tick driver repairs, not routing faults, and the simulator asserts
-    /// `frame_drops_total` stays at zero on runs with no injected loss.
+    /// tick, drained from `IggyMetadata::take_prepare_gap_drops`.
+    ///
+    /// The sibling of [`Self::record_partition_prepare_gap_drops`], and it
+    /// carries every caveat that one does: it counts the prepares that ARRIVED
+    /// after a hole rather than the holes, so a nonzero value proves the
+    /// metadata repair driver has work and a zero one proves nothing. There is
+    /// one metadata group per node, so unlike the partition counter it needs no
+    /// argument about namespace cardinality.
+    ///
+    /// Deliberately NOT a `frame_drops_total` reason, for the same reason: that
+    /// family means the bus or the router shed a frame and the simulator
+    /// asserts it stays at zero on runs with no injected loss, while a gap drop
+    /// is a protocol-ordering drop the tick repairs.
     pub fn record_metadata_prepare_gap_drops(&self, drops: u64) {
         self.metadata_prepare_gap_drops_total.inc_by(drops);
     }
@@ -536,6 +614,16 @@ impl ShardMetrics {
             "metadata_prepare_gap_drops",
             "replicated metadata prepares dropped out of order by a backup's gap check",
             self.metadata_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "metadata_read_frontier_refusals",
+            "metadata reads refused because this node never applied the caller's committed op",
+            self.metadata_read_frontier_refusals_total.clone(),
+        );
+        registry.register(
+            "client_requests_denied_queue_full",
+            "client requests denied retryable because that client's request queue was full",
+            self.client_requests_denied_queue_full_total.clone(),
         );
     }
 }

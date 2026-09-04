@@ -32,12 +32,15 @@ use crate::offset_storage::{
     PURGE_GENERATION_FILE, delete_persisted_offset, persist_offset, persist_purge_generation,
 };
 use crate::segment::Segment;
+use crate::segment_anchor::ANCHOR_SUFFIX;
 use crate::types::PartitionsConfig;
 use crate::{IggyIndexWriter, IggyPartition};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use consensus::le_cursor::{LeCursor, Truncated, split_verified_trailer};
 use consensus::state_manifest::artifact_kind;
-use consensus::{ArtifactProgress, Sequencer as _, StateArtifactHasher, state_artifact_checksum};
+use consensus::{
+    ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
+};
 use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset, IggyByteSize};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -50,15 +53,26 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
-/// Framing marker for the consumer-offsets wire artifact, "ICO1".
-pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO1";
+/// Framing marker for the consumer-offsets wire artifact, "ICO2". Bumped with
+/// the version when the dedup section was appended, so the magic alone tells
+/// the two layouts apart.
+pub(crate) const CONSUMER_OFFSETS_MAGIC: [u8; 4] = *b"ICO2";
 
 /// Version byte following the magic.
 ///
 /// Any layout change bumps this, INCLUDING appended fields: the decoder
 /// deliberately fails closed on unknown versions and on trailing bytes,
 /// because a v2 field can change the meaning of fields v1 already read.
-pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 1;
+pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 2;
+
+/// The previous framing, "ICO1" at version 1: the same layout without the
+/// dedup section. Still decoded so a rolling upgrade works in both orders --
+/// an upgraded replica rejoining behind the repair floor of an un-upgraded
+/// primary installs its artifact with an empty slice (dedup for that window
+/// degrades to at-least-once, exactly the pre-dedup behaviour) instead of
+/// refusing it and re-pulling forever.
+pub(crate) const CONSUMER_OFFSETS_MAGIC_V1: [u8; 4] = *b"ICO1";
+const CONSUMER_OFFSETS_VERSION_V1: u8 = 1;
 
 /// Per-section entry ceiling for the consumer-offsets artifact.
 ///
@@ -66,6 +80,10 @@ pub(crate) const CONSUMER_OFFSETS_VERSION: u8 = 1;
 /// makes from a length field a peer sent, exactly like the manifest's own
 /// entry ceiling.
 pub(crate) const CONSUMER_OFFSETS_ENTRIES_MAX: u32 = 1 << 20;
+
+/// Wire stride of one dedup entry: client u128 + watermark u64 + commit u64 +
+/// user u32 + committed window u128.
+const DEDUP_ENTRY_LEN: usize = 2 * size_of::<u128>() + 2 * size_of::<u64>() + size_of::<u32>();
 
 /// One in-flight partition state transfer on the receiving replica.
 ///
@@ -295,13 +313,19 @@ pub(crate) struct ConsumerOffsetsWire {
     pub consumers: Vec<(u32, u64)>,
     /// `(consumer group id, offset)`, ascending by id.
     pub groups: Vec<(u32, u64)>,
+    /// This group's dedup slice, ascending by client. Carried so a replica
+    /// rejoining behind the repair floor can absorb a replay of what the group
+    /// already committed instead of re-executing it.
+    pub dedup: Vec<DedupWatermark>,
 }
 
 impl ConsumerOffsetsWire {
     /// Encode: `magic | version u8 | purge_generation u64 | next_offset u64 |
-    /// consumer_count u32 | group_count u32 | {id u32, offset u64}xN |
-    /// {id u32, offset u64}xM | XxHash3_64 trailer`. Little-endian
-    /// throughout.
+    /// consumer_count u32 | group_count u32 | dedup_count u32 |
+    /// {id u32, offset u64}xN | {id u32, offset u64}xM |
+    /// {client u128, watermark u64, latest_commit u64, user_id u32,
+    /// committed_window u128}xD |
+    /// XxHash3_64 trailer`. Little-endian throughout.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         // Size exactly rather than guess; the reservation assert keeps the
@@ -309,8 +333,9 @@ impl ConsumerOffsetsWire {
         let reserved = CONSUMER_OFFSETS_MAGIC.len()
             + size_of::<u8>()
             + 2 * size_of::<u64>()
-            + 2 * size_of::<u32>()
+            + 3 * size_of::<u32>()
             + (self.consumers.len() + self.groups.len()) * (size_of::<u32>() + size_of::<u64>())
+            + self.dedup.len() * DEDUP_ENTRY_LEN
             + size_of::<u64>();
         let mut out = Vec::with_capacity(reserved);
         out.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
@@ -321,9 +346,18 @@ impl ConsumerOffsetsWire {
         out.extend_from_slice(&(self.consumers.len() as u32).to_le_bytes());
         #[allow(clippy::cast_possible_truncation)]
         out.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        out.extend_from_slice(&(self.dedup.len() as u32).to_le_bytes());
         for (id, offset) in self.consumers.iter().chain(self.groups.iter()) {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&offset.to_le_bytes());
+        }
+        for entry in &self.dedup {
+            out.extend_from_slice(&entry.client.to_le_bytes());
+            out.extend_from_slice(&entry.watermark.to_le_bytes());
+            out.extend_from_slice(&entry.latest_commit.to_le_bytes());
+            out.extend_from_slice(&entry.user_id.to_le_bytes());
+            out.extend_from_slice(&entry.committed_window.to_le_bytes());
         }
         debug_assert_eq!(out.len() + size_of::<u64>(), reserved, "encode reservation");
         let trailer = state_artifact_checksum(&out);
@@ -351,19 +385,32 @@ impl ConsumerOffsetsWire {
         })?;
         let mut cursor = LeCursor::new(content);
         let magic = cursor.take(CONSUMER_OFFSETS_MAGIC.len())?;
-        if magic != CONSUMER_OFFSETS_MAGIC {
-            return Err(ConsumerOffsetsWireError::BadMagic);
-        }
         let version = cursor.u8()?;
-        if version != CONSUMER_OFFSETS_VERSION {
-            return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
-        }
+        let carries_dedup = if magic == CONSUMER_OFFSETS_MAGIC {
+            if version != CONSUMER_OFFSETS_VERSION {
+                return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
+            }
+            true
+        } else if magic == CONSUMER_OFFSETS_MAGIC_V1 {
+            if version != CONSUMER_OFFSETS_VERSION_V1 {
+                return Err(ConsumerOffsetsWireError::UnsupportedVersion { version });
+            }
+            false
+        } else {
+            return Err(ConsumerOffsetsWireError::BadMagic);
+        };
         let purge_generation = cursor.u64()?;
         let next_offset = cursor.u64()?;
         let consumer_count = cursor.u32()?;
         let group_count = cursor.u32()?;
+        let dedup_count = if carries_dedup { cursor.u32()? } else { 0 };
         let consumers = Self::decode_section(&mut cursor, "consumers", consumer_count)?;
         let groups = Self::decode_section(&mut cursor, "groups", group_count)?;
+        let dedup = if carries_dedup {
+            Self::decode_dedup_section(&mut cursor, dedup_count)?
+        } else {
+            Vec::new()
+        };
         if !cursor.remaining().is_empty() {
             // Distinct from `Truncated`: extra bytes point at a NEWER
             // encoder, and telling the operator the artifact is short would
@@ -377,7 +424,54 @@ impl ConsumerOffsetsWire {
             next_offset,
             consumers,
             groups,
+            dedup,
         })
+    }
+
+    /// Same guards as [`Self::decode_section`] at the dedup stride: peer count
+    /// against the ceiling, then against the bytes actually present, then
+    /// ascending-strict client order so the encoding stays canonical. Client
+    /// zero is the reserved id no ingress admits, so an artifact carrying it is
+    /// a peer bug and fails closed rather than being silently dropped at
+    /// install.
+    fn decode_dedup_section(
+        cursor: &mut LeCursor<'_>,
+        count: u32,
+    ) -> Result<Vec<DedupWatermark>, ConsumerOffsetsWireError> {
+        if count > CONSUMER_OFFSETS_ENTRIES_MAX {
+            return Err(ConsumerOffsetsWireError::TooManyEntries {
+                section: "dedup",
+                count,
+                max: CONSUMER_OFFSETS_ENTRIES_MAX,
+            });
+        }
+        if count as usize * DEDUP_ENTRY_LEN > cursor.remaining().len() {
+            return Err(ConsumerOffsetsWireError::Truncated);
+        }
+        let mut entries = Vec::with_capacity(count as usize);
+        let mut previous: Option<u128> = None;
+        for _ in 0..count {
+            let client = cursor.u128()?;
+            let watermark = cursor.u64()?;
+            let latest_commit = cursor.u64()?;
+            let user_id = cursor.u32()?;
+            let committed_window = cursor.u128()?;
+            if client == 0 {
+                return Err(ConsumerOffsetsWireError::ReservedClient);
+            }
+            if previous.is_some_and(|previous| client <= previous) {
+                return Err(ConsumerOffsetsWireError::NonAscendingClient { client });
+            }
+            previous = Some(client);
+            entries.push(DedupWatermark {
+                client,
+                user_id,
+                watermark,
+                latest_commit,
+                committed_window,
+            });
+        }
+        Ok(entries)
     }
 
     fn decode_section(
@@ -397,9 +491,12 @@ impl ConsumerOffsetsWire {
         // The count is peer input and the reservation is 12 bytes per element
         // after alignment, so it is checked against the bytes actually present
         // before allocating: a ~30 byte artifact could otherwise ask for tens of
-        // megabytes across the two sections. 12 is the wire stride below -- the
-        // groups call sees exactly `12 * count` bytes remaining, so a wider
-        // guard would reject every non-empty artifact.
+        // megabytes across the two sections. 12 is the wire stride below, and
+        // the guard is a lower bound on purpose: what trails a section varies
+        // (groups trails consumers, the dedup section trails groups and is
+        // absent from a v1 artifact), so only "at least this many bytes
+        // present" holds for both calls. Demanding that `12 * count` be all
+        // that remains would reject valid input.
         if count as usize * (size_of::<u32>() + size_of::<u64>()) > cursor.remaining().len() {
             return Err(ConsumerOffsetsWireError::Truncated);
         }
@@ -450,6 +547,14 @@ pub enum ConsumerOffsetsWireError {
         section: &'static str,
         id: u32,
     },
+    /// Dedup clients are not strictly ascending. Same encoder bug as
+    /// [`Self::NonAscendingId`], on the u128-keyed section.
+    NonAscendingClient {
+        client: u128,
+    },
+    /// A dedup entry carries client id zero, which is reserved and refused at
+    /// every ingress: a peer encoder bug.
+    ReservedClient,
 }
 
 impl From<Truncated> for ConsumerOffsetsWireError {
@@ -490,6 +595,17 @@ impl fmt::Display for ConsumerOffsetsWireError {
                 "consumer-offsets artifact {section} id {id} does not ascend \
                  (duplicate, or out of order)"
             ),
+            Self::NonAscendingClient { client } => write!(
+                f,
+                "consumer-offsets artifact dedup client {client} does not ascend \
+                 (duplicate, or out of order)"
+            ),
+            Self::ReservedClient => {
+                write!(
+                    f,
+                    "consumer-offsets artifact dedup entry carries reserved client 0"
+                )
+            }
         }
     }
 }
@@ -506,6 +622,20 @@ mod tests {
             next_offset: 43,
             consumers: vec![(1, 10), (7, 42)],
             groups: vec![(2, 5)],
+            dedup: vec![
+                dedup_entry(11, 4, 90),
+                dedup_entry(usize::MAX as u128 + 5, 9, 91),
+            ],
+        }
+    }
+
+    fn dedup_entry(client: u128, watermark: u64, latest_commit: u64) -> DedupWatermark {
+        DedupWatermark {
+            client,
+            user_id: 1,
+            watermark,
+            latest_commit,
+            committed_window: 0b1011,
         }
     }
 
@@ -525,6 +655,7 @@ mod tests {
             next_offset: 0,
             consumers: Vec::new(),
             groups: Vec::new(),
+            dedup: Vec::new(),
         };
         let encoded = empty.encode();
         assert_eq!(
@@ -585,6 +716,126 @@ mod tests {
     }
 
     #[test]
+    fn given_unordered_dedup_clients_when_decoded_should_reject() {
+        let unordered = ConsumerOffsetsWire {
+            purge_generation: 0,
+            next_offset: 0,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+            dedup: vec![dedup_entry(9, 1, 1), dedup_entry(4, 2, 2)],
+        };
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&unordered.encode()),
+            Err(ConsumerOffsetsWireError::NonAscendingClient { client: 4 })
+        );
+    }
+
+    #[test]
+    fn given_reserved_client_in_dedup_when_decoded_should_reject() {
+        let reserved = ConsumerOffsetsWire {
+            purge_generation: 0,
+            next_offset: 0,
+            consumers: Vec::new(),
+            groups: Vec::new(),
+            dedup: vec![dedup_entry(0, 1, 1), dedup_entry(4, 2, 2)],
+        };
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&reserved.encode()),
+            Err(ConsumerOffsetsWireError::ReservedClient)
+        );
+    }
+
+    #[test]
+    fn given_v1_artifact_when_decoded_should_install_empty_dedup() {
+        // An un-upgraded primary still ships "ICO1": same fields minus the
+        // dedup count and section. It must decode, with nothing to absorb.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC_V1);
+        bytes.push(CONSUMER_OFFSETS_VERSION_V1);
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&43u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        for (id, offset) in [(7u32, 42u64), (2, 5)] {
+            bytes.extend_from_slice(&id.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        let trailer = state_artifact_checksum(&bytes);
+        bytes.extend_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&bytes),
+            Ok(ConsumerOffsetsWire {
+                purge_generation: 3,
+                next_offset: 43,
+                consumers: vec![(7, 42)],
+                groups: vec![(2, 5)],
+                dedup: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn given_v1_magic_with_wrong_version_when_decoded_should_reject() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC_V1);
+        bytes.push(CONSUMER_OFFSETS_VERSION);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let trailer = state_artifact_checksum(&bytes);
+        bytes.extend_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&bytes),
+            Err(ConsumerOffsetsWireError::UnsupportedVersion {
+                version: CONSUMER_OFFSETS_VERSION
+            })
+        );
+    }
+
+    #[test]
+    fn given_dedup_count_past_ceiling_when_decoded_should_reject_before_allocating() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
+        bytes.push(CONSUMER_OFFSETS_VERSION);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
+        let trailer = state_artifact_checksum(&bytes);
+        bytes.extend_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&bytes),
+            Err(ConsumerOffsetsWireError::TooManyEntries {
+                section: "dedup",
+                count: CONSUMER_OFFSETS_ENTRIES_MAX + 1,
+                max: CONSUMER_OFFSETS_ENTRIES_MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn given_dedup_count_exceeding_bytes_when_decoded_should_reject_as_truncated() {
+        // Under the ceiling but past the bytes present: the stride guard is
+        // what stops a ~30 byte artifact reserving megabytes.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
+        bytes.push(CONSUMER_OFFSETS_VERSION);
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1_000u32.to_le_bytes());
+        let trailer = state_artifact_checksum(&bytes);
+        bytes.extend_from_slice(&trailer.to_le_bytes());
+        assert_eq!(
+            ConsumerOffsetsWire::decode(&bytes),
+            Err(ConsumerOffsetsWireError::Truncated)
+        );
+    }
+
+    #[test]
     fn given_count_past_ceiling_when_decoded_should_reject_before_allocating() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&CONSUMER_OFFSETS_MAGIC);
@@ -592,6 +843,7 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&(CONSUMER_OFFSETS_ENTRIES_MAX + 1).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         let trailer = state_artifact_checksum(&bytes);
         bytes.extend_from_slice(&trailer.to_le_bytes());
@@ -612,6 +864,7 @@ mod tests {
             next_offset: 0,
             consumers: vec![(5, 1), (5, 2)],
             groups: Vec::new(),
+            dedup: Vec::new(),
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&duplicate.encode()),
@@ -625,6 +878,7 @@ mod tests {
             next_offset: 0,
             consumers: Vec::new(),
             groups: vec![(9, 1), (4, 2)],
+            dedup: Vec::new(),
         };
         assert_eq!(
             ConsumerOffsetsWire::decode(&unordered.encode()),
@@ -1234,7 +1488,7 @@ pub async fn quarantine_segment_files(partition_dir: &str) -> std::io::Result<St
     };
     for path in segment_dir_entries(partition_dir)? {
         let quarantined = path.to_str().is_some_and(|path| {
-            [".log", ".index", STAGING_SUFFIX]
+            [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
                 .iter()
                 .any(|suffix| path.ends_with(suffix))
         });
@@ -1266,7 +1520,7 @@ pub async fn quarantine_segment_files(partition_dir: &str) -> std::io::Result<St
 /// failing either caller for. The CONVERGE sweep is deliberately not this
 /// function -- it deletes the live chain as well and must propagate its
 /// errors.
-/// Do NOT widen this predicate to the quarantine's three-suffix list if the two
+/// Do NOT widen this predicate to the quarantine's four-suffix list if the two
 /// are ever unified: the keep-lists callers pass hold staging paths only (purge
 /// passes none), so a wider filter would unlink every live `.log` and `.index`
 /// on the partition -- worst at the reuse scan, which runs at descriptor-accept
@@ -1704,11 +1958,13 @@ where
         // sealed segment while the counter stands at N, and the receiver
         // must resume minting at N either way.
         let next_offset = self.offset_frontier();
+        let dedup = self.dedup().watermarks_sorted();
         ConsumerOffsetsWire {
             purge_generation: self.applied_purge_generation,
             next_offset,
             consumers,
             groups,
+            dedup,
         }
     }
 
@@ -1994,6 +2250,13 @@ where
         let purge_advances = offsets_wire.purge_generation > committed_purge_generation
             || (self.applied_purge_generation < committed_purge_generation
                 && offsets_wire.next_offset == 0);
+        // The COMMITTED frontier, which is what an offer is comparable against:
+        // `held_offset_frontier` reads 0 for a chain installed empty at frontier
+        // N (its disk arm filters empty segments and the install clears the
+        // journal), and a 0 skips the guard below entirely, letting a stale offer
+        // rewind the counter under data this replica already claimed. The append
+        // point is not usable either -- it can stand a lease block high -- but
+        // only on a solo group, which never receives an offer.
         let local_next_offset = self.offset_frontier();
         if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
         {
@@ -2040,11 +2303,16 @@ where
         // zero `.log` files and re-seed the counter from the pre-purge frontier,
         // above a group that restarted at the offer's, and the next prepare
         // would stamp a `base_offset` and `batch_checksum` no peer shares.
+        //
+        // Identical to the advancing form on every group that can receive an
+        // offer today, since the reservation is solo-only and there equals the
+        // frontier. Spelled out because the shape is what makes it a reset, not
+        // the arithmetic that currently coincides.
         let frontier_durable = if purge_advances {
             self.reset_offset_frontier_at(offsets_wire.next_offset)
                 .await
         } else {
-            self.persist_offset_frontier_at(offsets_wire.next_offset)
+            self.install_offset_frontier_at(offsets_wire.next_offset)
                 .await
         };
         if !frontier_durable {
@@ -2156,11 +2424,19 @@ where
         // the NEWEST suffix, which is contiguous) and drop the in-memory
         // vectors in lockstep, exactly as `purge` does.
         let namespace_raw = self.consensus().group();
-        while let Some((_, mut storage)) = self.log.retire_front() {
+        while let Some((segment, mut storage)) = self.log.retire_front() {
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
             drop(storage);
-            for path in messages_path.into_iter().chain(index_path) {
+            // Anchors go with the chain they describe, as everywhere else.
+            // Unreachable for an install today, since anchors are planted only
+            // by the solo boot re-anchor, but a record outliving its segment is
+            // the one way a later gap gets admitted for free.
+            for path in messages_path
+                .into_iter()
+                .chain(index_path)
+                .chain(self.anchor_cleanup_path(segment.start_offset))
+            {
                 match compio::fs::remove_file(&path).await {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2460,6 +2736,13 @@ where
         // file put a rejoin carrying thousands of consumers on the pump for
         // thousands of sequential open + write + optional fsync round trips;
         // the tick's superblock pre-pass sets the precedent for the width.
+        // The dedup slice is memory-only, so it installs here with the maps
+        // rather than being written anywhere. No frontier fence is needed: the
+        // install lifts `commit_min` to the offer's `commit_op`, so the commit
+        // walk that follows starts strictly above everything this artifact
+        // covers, and `record_commit` is idempotent besides.
+        self.dedup_mut()
+            .install_watermarks(offsets_wire.dedup.iter().copied());
         let mut planned: Vec<PlannedOffsetWrite> =
             Vec::with_capacity(offsets_wire.consumers.len() + offsets_wire.groups.len());
         if let Some(dir) = self.consumer_offsets_path.clone() {
@@ -2543,7 +2826,7 @@ where
         let end = next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
         self.dirty_offset.store(end, Ordering::Relaxed);
-        self.should_increment_offset = next_offset > 0;
+        self.set_offset_space_used(next_offset > 0);
         self.recovered_durable_offset = installed_end;
         // Where the group's offset space starts on this replica: everything
         // below is represented by this install, so the repair floor check
@@ -2682,6 +2965,10 @@ where
         // promise rested on the caller clearing it first.
         self.segment_checksum_cache.borrow_mut().clear();
         self.reuse_scan_memo.borrow_mut().take();
+        // Degrade to at-least-once rather than keep watermarks that may now
+        // describe data this partition no longer holds: a stale entry would
+        // absorb a replay whose original was just unlinked.
+        self.dedup_mut().install_watermarks(std::iter::empty());
 
         // Sweep EVERY segment file, not the in-memory count's worth: after
         // a late failure the renamed-in new chain is on disk while the
@@ -2693,7 +2980,7 @@ where
                     .into_iter()
                     .filter(|path| {
                         path.to_str().is_some_and(|path| {
-                            [".log", ".index", STAGING_SUFFIX]
+                            [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
                                 .iter()
                                 .any(|extension| path.ends_with(extension))
                         })
@@ -2739,7 +3026,7 @@ where
         let end = minted_next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
         self.dirty_offset.store(end, Ordering::Relaxed);
-        self.should_increment_offset = minted_next_offset > 0;
+        self.set_offset_space_used(minted_next_offset > 0);
         self.recovered_durable_offset = None;
         // The frontier claims "everything below me is represented here", and the
         // repair floor check accepts any floor at or below it. Nothing was

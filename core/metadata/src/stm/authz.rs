@@ -486,6 +486,7 @@ mod tests {
 
     fn create_topic_body(stream_id: u32, name: &str) -> bytes::Bytes {
         CreateTopicWithAssignmentsRequest {
+            created_view: 0,
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
                 partitions_count: 1,
