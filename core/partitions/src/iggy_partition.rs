@@ -1549,8 +1549,8 @@ where
     /// skipped, so `commit_max` can never pass it and nothing later can commit
     /// either: `on_replicate` fences the partition there and takes the node down.
     /// At CREATE (`build_partition_fresh`) nothing has been externalised at all,
-    /// so a refusal fails the build and leaves the namespace unmaterialised: the
-    /// reconciler retries it, the loader tombstones it. Going live without the
+    /// so a refusal fails the build and leaves the namespace unmaterialised for
+    /// the reconciler to retry, boot included. Going live without the
     /// block instead would let the first send land inside the backoff the failed
     /// write just armed, where the admitted path refuses it with a transient.
     #[allow(clippy::future_not_send)]

@@ -676,7 +676,7 @@ pub async fn load_partition_or_fence(
                     return Ok(None);
                 }
             }
-            match Box::pin(build_partition_fresh(
+            Box::pin(build_partition_fresh(
                 config,
                 namespace,
                 Arc::clone(&partition_stats),
@@ -689,31 +689,7 @@ pub async fn load_partition_or_fence(
                 Rc::clone(&bus),
             ))
             .await
-            {
-                Ok(partition) => Ok(Some(partition)),
-                // Boot propagates whatever this returns, so an `Err` here costs a
-                // whole shard its start over ONE partition's failed write.
-                // Tombstoning is also the only safe answer: the failed build
-                // already quarantined the chain and planted an empty segment 0,
-                // which the next load would accept and serve as a healthy empty
-                // partition. The stats lose the segment that build counted before
-                // the claim refused.
-                Err(error @ ServerError::PartitionOffsetReservationClaim { .. }) => {
-                    error!(
-                        stream_id,
-                        topic_id,
-                        partition_id = partition_metadata.id,
-                        partition_dir,
-                        %error,
-                        "failed to claim the rebuilt partition's first offset reservation; \
-                         leaving it tombstoned rather than serving it unreserved"
-                    );
-                    partition_stats.zero_out_all();
-                    partitions.tombstone(namespace);
-                    Ok(None)
-                }
-                Err(error) => Err(error),
-            }
+            .map(Some)
         }
         // An untrustworthy superblock fences ONE group, not the node. The
         // segment files stay exactly where they are -- unlike a refused
@@ -1358,11 +1334,15 @@ pub async fn build_partition_fresh(
         // Not degraded-but-live: the failed write armed the group's superblock
         // retry backoff, and `reserve_offsets_through_retryable` refuses every
         // send arriving inside it with a transient the HTTP plane does not
-        // replay. Both callers absorb this without escalating: the reconciler
-        // backs the namespace off and its retry materialises through the loader,
-        // whose partition carries a clear backoff cell, while the loader's own
-        // fence-and-rebuild arm tombstones the partition, since boot propagates
-        // anything it returns.
+        // replay. Neither caller escalates: the reconciler backs the namespace
+        // off and its retry materialises through the loader, whose partition
+        // carries a clear backoff cell, and boot skips the partition, leaving it
+        // to that same retry.
+        //
+        // `ensure_initial_segment` folded its segment into the parent topic
+        // before the claim ran, and the retry counts the same file again while
+        // recovering it.
+        partition.stats.zero_out_all();
         return Err(ServerError::PartitionOffsetReservationClaim {
             stream_id,
             topic_id,
@@ -1633,11 +1613,13 @@ mod tests {
         );
     }
 
-    /// The loader's fence-and-rebuild arm is the claim's SECOND caller, and boot
-    /// propagates whatever the loader returns: an `Err` here costs the shard its
-    /// whole start over one partition's failed write.
+    /// The loader's fence-and-rebuild arm is the claim's SECOND caller. A
+    /// refused claim is a failed superblock write, not damage, so it has to come
+    /// back as an error every caller can retry: absorbing it into a tombstone
+    /// here would darken the namespace for the life of the process over a fault
+    /// the next attempt may not even hit.
     #[compio::test]
-    async fn given_a_failing_claim_when_rebuilding_a_fenced_chain_should_tombstone_the_partition() {
+    async fn given_a_failing_claim_when_rebuilding_a_fenced_chain_should_refuse_not_tombstone() {
         let root = tempfile::tempdir().expect("tempdir");
         let config = solo_config(&root);
         let namespace = IggyNamespace::new(1, 1, 0);
@@ -1673,22 +1655,24 @@ mod tests {
         .await;
 
         match loaded {
-            Ok(None) => {}
+            Err(ServerError::PartitionOffsetReservationClaim { .. }) => {}
+            Err(other) => panic!("expected the claim's own refusal, got {other}"),
             Ok(Some(_)) => panic!("the planted directory must fail the rebuild's claim"),
-            Err(error) => panic!("a refused claim must fence one partition, not boot: {error}"),
+            Ok(None) => panic!("a refused claim must reach the caller, not be absorbed here"),
         }
         assert!(
             std::fs::metadata(format!("{dir}.fenced.0")).is_ok(),
             "the quarantine must have run, or this asserts on the wrong arm"
         );
         assert!(
-            partitions.is_tombstoned(&namespace),
-            "an unreserved partition must stay unrouted"
+            !partitions.is_tombstoned(&namespace),
+            "a transient write failure must leave the namespace materialisable"
         );
         assert_eq!(
             stats.segments_count_inconsistent(),
             0,
-            "the rebuild counted its initial segment before the claim refused"
+            "the rebuild counted its initial segment before the claim refused, and the \
+             retry counts the same file again"
         );
     }
 

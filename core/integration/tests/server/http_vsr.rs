@@ -743,13 +743,22 @@ async fn given_ack_none_when_producing_should_return_202_and_commit(harness: &Te
 /// returns `None` above one replica, so this suite's three-node default leaves
 /// the whole reservation path as dead code and proves nothing here.
 ///
-/// The reservation writes the partition's superblock before it hands out an
-/// offset, and a first send is where that claim is missing. Neither HTTP route
-/// can carry a retryable refusal back to the caller: the acked route has no
-/// transient replay loop, and `?ack=none` never reads a reply at all, so a
-/// refusal there would answer 202 and drop the message. Both partitions are
-/// produced to exactly once, so a per-partition regression cannot hide behind a
-/// second send.
+/// What it guards is the BOUNCE REMOVAL. A first send used to be answered
+/// `TransientNotAccepted` so the shard tick would claim the block off the
+/// request pump, and neither HTTP route can carry a retryable refusal back to
+/// the caller: the acked route has no transient replay loop, and `?ack=none`
+/// never reads a reply at all, so that bounce answered 202 and dropped the
+/// message.
+///
+/// It is NOT sensitive to where the claim is taken. With the bounce gone the
+/// inline fence at the mint writes the same block on the first send, so both
+/// routes still commit with the create-time claim deleted;
+/// `given_a_fresh_solo_partition_when_building_should_record_its_first_claim`
+/// in `core/server/src/partition_helpers.rs` reads the durable record and is
+/// the test that fails without it.
+///
+/// Both partitions are produced to exactly once, so a per-partition regression
+/// cannot hide behind a second send.
 #[iggy_harness(cluster_nodes = 1)]
 async fn given_a_solo_topic_when_producing_its_first_http_messages_should_commit_them(
     harness: &TestHarness,

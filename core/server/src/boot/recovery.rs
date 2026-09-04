@@ -50,7 +50,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(in crate::boot) async fn build_shard_for_thread(
@@ -172,7 +172,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let Some(partition) = load_partition_or_fence(
+        let loaded = load_partition_or_fence(
             config,
             namespace,
             partition_stats,
@@ -184,9 +184,26 @@ pub(in crate::boot) async fn build_shard_for_thread(
             Rc::clone(&bus),
             &partitions,
         )
-        .await?
-        else {
-            continue;
+        .await;
+        let partition = match loaded {
+            Ok(Some(partition)) => partition,
+            Ok(None) => continue,
+            // A refused claim is a failed superblock write, not damage: the
+            // namespace stays materialisable, so skipping it here costs one
+            // partition its start instead of the whole shard, and the
+            // reconciler's addition pass retries it within a tick.
+            Err(error @ ServerError::PartitionOffsetReservationClaim { .. }) => {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    %error,
+                    "skipping this partition at boot; the reconciler retries its first \
+                     offset reservation claim"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         partitions.insert(namespace, partition);
         shards_table.insert(
