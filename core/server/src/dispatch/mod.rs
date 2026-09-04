@@ -32,7 +32,7 @@
 mod authz;
 pub mod login_error;
 pub mod partition;
-mod reads;
+pub mod reads;
 pub mod session_ops;
 pub mod submit;
 #[cfg(test)]
@@ -46,7 +46,7 @@ use crate::dispatch::session_ops::{
     handle_login_register_request, handle_logout_request, send_login_eviction,
     send_unauthenticated_eviction, submit_disconnect_logout,
 };
-use crate::dispatch::submit::submit_client_request_on_owner;
+use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
 use crate::pat::maybe_rewrite_pat_request;
 use crate::responses::{
     NonReplicatedResponse, build_deny_reply, build_raw_pat_reply, current_metadata_commit,
@@ -94,6 +94,21 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 type ClientRequestQueues = Rc<RefCell<HashMap<u128, VecDeque<Message<GenericHeader>>>>>;
+
+/// Requests one client may have queued behind a request this shard has not
+/// answered yet.
+///
+/// The drain loop below serves one frame per client at a time, and a frame can
+/// legitimately hold it for a while: a metadata write awaits consensus, and a
+/// read can be HELD for the read-your-writes budget (see
+/// `crate::dispatch::reads`). Without a cap, a client that keeps pipelining
+/// through such a stall grows its queue - and this node's memory - unbounded.
+///
+/// Overflow is ANSWERED, not dropped: `TransientNotAccepted` is the honest
+/// code, since the frame provably never entered any pipeline, so the SDK may
+/// re-issue it anywhere, including here once the queue drains. Sized far above
+/// any SDK's in-flight window, so it only ever fires under a genuine stall.
+const MAX_QUEUED_CLIENT_REQUESTS: usize = 1024;
 type ActiveClientRequests = Rc<RefCell<HashSet<u128>>>;
 
 pub fn make_client_request_handler<B, MJ, S, SB>(
@@ -290,11 +305,18 @@ fn enqueue_client_request<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    queues
-        .borrow_mut()
-        .entry(client_id)
-        .or_default()
-        .push_back(message);
+    {
+        let mut queues = queues.borrow_mut();
+        let queue = queues.entry(client_id).or_default();
+        if queue.len() >= MAX_QUEUED_CLIENT_REQUESTS {
+            // Borrow released before the deny, which spawns onto this same
+            // task and would otherwise re-enter the table.
+            drop(queues);
+            deny_overflowing_client_request(&shard, client_id, message);
+            return;
+        }
+        queue.push_back(message);
+    }
     if !active.borrow_mut().insert(client_id) {
         return;
     }
@@ -309,6 +331,51 @@ fn enqueue_client_request<B, MJ, S, SB>(
             queues,
             active,
             client_id,
+        )
+        .await;
+    });
+}
+
+/// Answer a request that arrived with this client's queue already at
+/// [`MAX_QUEUED_CLIENT_REQUESTS`] with the retryable transient denial.
+///
+/// Spawned rather than awaited: the enqueue path is sync (it runs straight off
+/// frame arrival) and the reply goes out on the bus. A frame whose header will
+/// not even cast is dropped instead, exactly as the drain loop drops it.
+fn deny_overflowing_client_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    transport_client_id: u128,
+    message: Message<GenericHeader>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    shard.metrics().record_client_request_denied_queue_full();
+    let Ok(request) = message.try_into_typed::<RequestHeader>() else {
+        warn!(
+            transport_client_id,
+            "dropping over-queue client request with invalid header"
+        );
+        return;
+    };
+    let request = request.into_routed();
+    debug!(
+        transport_client_id,
+        operation = ?request.header().operation,
+        queued = MAX_QUEUED_CLIENT_REQUESTS,
+        "denying client request retryable: this connection's request queue is full"
+    );
+    let shard = Rc::clone(shard);
+    let bus = shard.bus.clone();
+    bus.spawn(async move {
+        send_deny_reply(
+            &shard,
+            transport_client_id,
+            request.header(),
+            IggyError::TransientNotAccepted.as_code(),
         )
         .await;
     });
@@ -939,6 +1006,13 @@ async fn handle_client_request<B, MJ, S, SB>(
     // shard 0 can't route by the consensus client id (no home-shard bits).
     match submit_client_request_on_owner(shard, request).await {
         Some(reply) => {
+            // Recorded before the reply reaches the socket, so a read the client
+            // sends the instant it decodes this frame already sees the mark.
+            if let Some(commit) = committed_reply_commit(&reply) {
+                sessions
+                    .borrow_mut()
+                    .record_metadata_watermark(transport_client_id, commit);
+            }
             // The raw PAT token never enters consensus (it is non-deterministic
             // and secret), so the committed reply body is empty. Substitute the
             // raw-token response here, on the minting client's home shard, using

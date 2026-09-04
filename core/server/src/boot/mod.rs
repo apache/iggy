@@ -56,6 +56,7 @@ use crate::boot::threads::{
 };
 use crate::boot::topology::{RosterCells, resolve_tcp_topology};
 use crate::dispatch::partition::make_partition_read_handler;
+use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::dispatch::submit::make_metadata_submit_handler;
 use crate::dispatch::{
@@ -76,9 +77,9 @@ use journal::{Journal, JournalHandle};
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
-use metadata::ReplicaIdentity;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
+use metadata::{AppliedFrontier, ReplicaIdentity};
 use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
@@ -304,6 +305,13 @@ pub fn bootstrap(
     let mut shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerError>>)> =
         Vec::with_capacity(shards_count);
     let roster_cells = RosterCells::default();
+    // Shared applied-metadata frontier: shard 0's commit path advances it and
+    // wakes the reads parked on it, every shard's read gate reads it. Minted
+    // here, before any shard exists, because a shard holding a private cell
+    // would gate reads on a number nothing moves - and it carries the held
+    // reads' budget, which is sized from the configured commit-broadcast
+    // cadence and which a peer shard has no other way to learn.
+    let metadata_applied_frontier = Arc::new(AppliedFrontier::new(read_frontier_budget(&config)));
     // Every shard's metric handles, minted before the threads spawn: each
     // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
     // the whole set (counters are Arc-backed, so cross-thread reads see the
@@ -344,6 +352,7 @@ pub fn bootstrap(
         };
 
         let roster_cells_for_shard = roster_cells.clone();
+        let applied_frontier_for_shard = Arc::clone(&metadata_applied_frontier);
         let shard_metrics_for_shard = shard_metrics_all.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
@@ -362,6 +371,7 @@ pub fn bootstrap(
                     barrier_for_shard,
                     owner_table_for_shard,
                     roster_cells_for_shard,
+                    applied_frontier_for_shard,
                     shard_metrics_for_shard,
                 )
             }) {
@@ -429,6 +439,7 @@ async fn shard_main(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     roster_cells: RosterCells,
+    metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
@@ -580,7 +591,9 @@ async fn shard_main(
         superblock_for_metadata,
         mux_stm,
         Some(PathBuf::from(&config.system.path)),
-    );
+    )
+    .with_applied_frontier(metadata_applied_frontier);
+    metadata.seed_applied_frontier_from_consensus();
     // Size the VSR client table before listeners bind and any client registers.
     // Must precede the recovered-table install below: the setter rebuilds the
     // table from scratch, so running it afterwards would drop every resumed

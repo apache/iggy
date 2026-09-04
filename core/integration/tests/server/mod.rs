@@ -51,6 +51,9 @@ mod http_tls;
 // The iggy-view response header: on authenticated success and redirect
 // responses only, never on errors or /ping, relayed from the primary.
 mod http_view_header;
+// An unqualified REST read must not answer below what the same caller was told
+// committed, on the node that accepted the write and has not applied it yet.
+mod http_read_your_writes;
 // Binary GetClusterMetadata must serve the real roster from a VSR cluster.
 mod cluster_metadata_vsr;
 // A declared node.advertised_address outranks the bind address a
