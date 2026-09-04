@@ -120,17 +120,23 @@ impl QuestDbSinkFixture {
         Ok(columns)
     }
 
-    /// Every row of `column`, ordered by the designated timestamp.
+    /// Every value of `column`, in insertion order.
+    ///
+    /// Deliberately unordered: QuestDB cannot `ORDER BY` an array column, and
+    /// callers that care about order sort the values themselves.
     pub async fn column_values(
         &self,
         column: &str,
     ) -> Result<Vec<serde_json::Value>, TestBinaryError> {
-        let value = self
-            .exec(&format!(
-                "select \"{column}\" from '{}' order by 1",
-                self.table()
-            ))
-            .await?;
+        let query = format!("select \"{column}\" from '{}'", self.table());
+        let value = self.exec(&query).await?;
+        // Surface a query error instead of reporting it as "no rows", which
+        // otherwise looks like the sink wrote nothing.
+        if let Some(error) = value.get("error") {
+            return Err(TestBinaryError::InvalidState {
+                message: format!("QuestDB rejected `{query}`: {error}"),
+            });
+        }
         let rows = value
             .get("dataset")
             .and_then(serde_json::Value::as_array)
