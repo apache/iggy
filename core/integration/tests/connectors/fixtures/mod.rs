@@ -28,6 +28,7 @@ mod influxdb;
 mod meilisearch;
 mod mongodb;
 mod postgres;
+mod questdb;
 mod quickwit;
 mod rabbitmq;
 mod redshift;
@@ -91,6 +92,9 @@ pub use postgres::{
     PostgresSourceMarkFixture, PostgresSourceNonUniqueCleanupFixture,
     PostgresSourceNonUniqueTrackingFixture, PostgresSourceNumericTrackingFixture,
     PostgresSourceOps, PostgresSourceTextKeyFixture,
+};
+pub use questdb::{
+    QuestDbSinkFixture, QuestDbSinkPayloadTimestampFixture, QuestDbSinkTypedFixture,
 };
 pub use quickwit::{
     QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture, QuickwitRawFixture,

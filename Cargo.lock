@@ -7729,6 +7729,7 @@ version = "0.5.0-edge.4"
 dependencies = [
  "async-trait",
  "humantime",
+ "iggy",
  "iggy_common",
  "iggy_connector_sdk",
  "questdb-rs",
