@@ -116,14 +116,19 @@ async fn wait_for_sink_batch(harness: &TestHarness) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut logs = String::new();
 
+    // The per-message payload lines follow the batch header, and the log file
+    // is read while it is still being written, so waiting on the header alone
+    // can return before the payloads the assertions read.
     while Instant::now() < deadline {
         let (stdout, stderr) = runtime.collect_logs();
         logs = format!("{stdout}\n{stderr}");
-        if logs.contains("Stdout sink with ID:") && logs.contains("received:") {
+        if logs.contains("Stdout sink with ID:")
+            && logs.matches("Message offset:").count() >= MESSAGE_COUNT
+        {
             return logs;
         }
         sleep(Duration::from_millis(200)).await;
     }
 
-    panic!("the stdout sink never reported a batch. logs:\n{logs}");
+    panic!("the stdout sink never reported {MESSAGE_COUNT} messages. logs:\n{logs}");
 }

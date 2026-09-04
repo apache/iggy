@@ -715,7 +715,15 @@ async fn process_messages(
         match runs.last_mut() {
             Some((run_schema, run)) if *run_schema == schema => run.push(raw_message),
             _ => {
-                let mut run = Vec::with_capacity(remaining + 1);
+                // Only the first run is sized to the batch. Reserving what is
+                // left for every run would cost O(n^2) slots on a batch that
+                // alternates variants, and any run after the first is rare
+                // enough to be worth growing on demand.
+                let mut run = if runs.is_empty() {
+                    Vec::with_capacity(remaining + 1)
+                } else {
+                    Vec::new()
+                };
                 run.push(raw_message);
                 runs.push((schema, run));
             }
@@ -1033,9 +1041,18 @@ mod tests {
     #[tokio::test]
     async fn given_no_surviving_messages_when_batch_is_processed_should_still_call_the_sink_once() {
         let plugin_id = next_plugin_id();
-        let messages = vec![test_message(0, b"not json".to_vec())];
+        // An Avro decoder, so the fallback tag cannot be confused with
+        // `Schema::default()`.
+        let decoder = Arc::new(
+            AvroStreamDecoder::try_new(AvroConfig {
+                schema_json: Some(avro_schema().canonical_form()),
+                ..AvroConfig::default()
+            })
+            .expect("failed to build the Avro decoder"),
+        );
+        let messages = vec![test_message(0, b"not an avro datum".to_vec())];
 
-        let timing = run(plugin_id, Schema::Json.decoder(), Vec::new(), messages).await;
+        let timing = run(plugin_id, decoder, Vec::new(), messages).await;
         let batches = captured(plugin_id);
 
         assert_eq!(timing.processed_count, 0);
@@ -1043,6 +1060,6 @@ mod tests {
         assert!(batches[0].offsets.is_empty());
         // Nothing survived to read a tag from, so the stream's configured
         // schema stands in.
-        assert_eq!(batches[0].metadata_schema, Schema::Json);
+        assert_eq!(batches[0].metadata_schema, Schema::Avro);
     }
 }
