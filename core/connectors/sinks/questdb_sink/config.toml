@@ -1,0 +1,71 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "sink"
+key = "questdb"
+enabled = true
+version = 0
+name = "QuestDB sink"
+path = "<BASE_DIR>/target/release/libiggy_connector_questdb_sink"
+plugin_config_format = "toml"
+verbose = false
+
+[[streams]]
+stream = "events"
+topics = ["questdb_events"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "questdb_sink"
+
+[plugin_config]
+# QuestDB connect string. Use `wss::` for TLS. Store-and-forward is opt-in via
+# `sf_dir`: with it set, frames are persisted before being sent and replayed
+# after a disconnect or a runtime restart. See
+# https://questdb.com/docs/connect/clients/connect-string/
+connection_string = "ws::addr=localhost:9000;sf_dir=/var/lib/iggy/questdb-sf;sender_id=iggy;"
+table = "iggy_events"
+
+# message | origin | payload | server
+timestamp_source = "message"
+# Required only when timestamp_source = "payload".
+# timestamp_field = "event_time"
+# auto | seconds | millis | micros | nanos
+timestamp_unit = "auto"
+
+# Payload fields to store as SYMBOL rather than VARCHAR.
+symbol_columns = []
+# Payload fields holding canonical RFC-4122 strings to store as UUID.
+uuid_columns = []
+
+include_stream_column = true
+include_topic_column = true
+include_partition_column = false
+include_offset_column = false
+include_headers = false
+
+# ok | durable. `durable` needs QuestDB Enterprise with replication configured;
+# without it every flush waits for a durable ack that never arrives.
+ack_level = "ok"
+flush_timeout = "30s"
+batch_size = 1000
+
+# A rejected record cannot be replayed or dead-lettered, so its log line is the
+# only trace. Enable this to include a truncated payload in that line, at the
+# cost of writing user data to the log.
+log_rejected_payload = false
+verbose_logging = false
