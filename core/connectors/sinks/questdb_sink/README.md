@@ -149,8 +149,20 @@ tables that cannot tolerate duplicates.
 
 Transport failures are returned as retryable errors and server rejections as
 permanent, because a rejection is deterministic: the server refused the frame,
-so the rows were never stored and the same bytes would be refused again. Note
-that the runtime currently discards `consume()`'s return value at the FFI
+so the rows were never stored and the same bytes would be refused again.
+
+Two further rules keep a retry from duplicating data:
+
+- **A failure while waiting for the acknowledgement is never retryable**, even
+  with a retryable error code. By then the frame is already published and the
+  rows may be committed, so re-sending would duplicate them. A durable-ACK stall
+  against a server without replication configured is exactly this case: the rows
+  land and only the watermark fails to advance.
+- **A retryable code is not sufficient on its own.** The client sets `in_doubt`
+  when delivery is unknown and documents that `FailoverRetry` can carry it, so
+  the connector requires `in_doubt() == false` as well.
+
+Note that the runtime currently discards `consume()`'s return value at the FFI
 boundary ([#2927](https://github.com/apache/iggy/issues/2927)), so this
 classification affects logging only until that is fixed.
 
