@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod auth;
-pub mod leader_redirection;
-pub mod messages;
-pub mod purge;
-pub mod raw_command;
-pub mod server;
-pub mod streams;
-pub mod topics;
+pub(crate) mod common;
+pub(crate) mod helpers;
+pub(crate) mod steps;
+
+use crate::common::purge_context::PurgeContext;
+use cucumber::World;
+
+#[tokio::main]
+async fn main() {
+    PurgeContext::cucumber()
+        .fail_on_skipped()
+        .run_and_exit("../../bdd/scenarios/stream_topic_purge.feature")
+        .await;
+}
