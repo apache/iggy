@@ -16,15 +16,19 @@
 // under the License.
 
 use bytes::Bytes;
-use iggy::prelude::{IggyClient, IggyMessage, Partitioning};
+use iggy::prelude::{HeaderKey, HeaderKind, HeaderValue, IggyClient, IggyMessage, Partitioning};
 use iggy_common::{Identifier, MessageClient};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use serde_json::json;
+use std::time::Duration;
+use tokio::time::sleep;
 
 use super::TEST_MESSAGE_COUNT;
 use crate::connectors::fixtures::{
-    QuestDbSinkFixture, QuestDbSinkPayloadTimestampFixture, QuestDbSinkTypedFixture,
+    QuestDbSinkFixture, QuestDbSinkHeadersFixture, QuestDbSinkPayloadTimestampFixture,
+    QuestDbSinkServerTimestampFixture, QuestDbSinkSmallBatchFixture,
+    QuestDbSinkStoreAndForwardFixture, QuestDbSinkTextFixture, QuestDbSinkTypedFixture,
 };
 
 fn message(id: u128, payload: serde_json::Value) -> IggyMessage {
@@ -305,4 +309,225 @@ async fn given_bulk_messages_when_consumed_should_write_every_row(
         .await
         .expect("Failed to wait for QuestDB rows");
     assert!(count >= bulk_count, "expected {bulk_count}, got {count}");
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_store_and_forward_when_consumed_should_persist_a_slot_and_write_rows(
+    harness: &TestHarness,
+    fixture: QuestDbSinkStoreAndForwardFixture,
+) {
+    let fixture = &fixture.0;
+    send(
+        &harness.root_client().await.unwrap(),
+        (1..=5u32)
+            .map(|i| message(i as u128, json!({"seq": i})))
+            .collect(),
+    )
+    .await;
+
+    fixture.wait_for_rows(5).await.expect("no rows");
+
+    // The client persists frames before sending, so a slot directory must
+    // exist on disk rather than the batch living only in memory.
+    let slot = fixture.wait_for_sf_slot().await.expect("no sf slot");
+    assert!(
+        slot.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("iggy_test")),
+        "unexpected slot name: {slot:?}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_questdb_outage_when_consumed_should_buffer_and_replay_on_recovery(
+    harness: &TestHarness,
+    fixture: QuestDbSinkStoreAndForwardFixture,
+) {
+    let fixture = &fixture.0;
+    let client = harness.root_client().await.unwrap();
+
+    // Land a first batch so the table exists and the slot is established.
+    send(
+        &client,
+        (1..=5u32)
+            .map(|i| message(i as u128, json!({"seq": i})))
+            .collect(),
+    )
+    .await;
+    fixture.wait_for_rows(5).await.expect("first batch missing");
+    let slot = fixture.wait_for_sf_slot().await.expect("no sf slot");
+
+    // Freeze QuestDB. The sink keeps accepting batches from the runtime but
+    // cannot deliver them.
+    fixture.simulate_outage().await.expect("failed to pause");
+
+    // The runtime has already committed the Apache Iggy offset for these, so
+    // disk is the only thing standing between an outage and data loss.
+    send(
+        &client,
+        (6..=15u32)
+            .map(|i| message(i as u128, json!({"seq": i})))
+            .collect(),
+    )
+    .await;
+
+    // Give the sink time to poll, attempt delivery and park the frames. Without
+    // this the pause could be over before it ever tried, leaving the test
+    // asserting nothing.
+    sleep(Duration::from_secs(3)).await;
+    let segments = QuestDbSinkFixture::sf_segments(&slot);
+    assert!(
+        !segments.is_empty(),
+        "no store-and-forward segments on disk during the outage: {slot:?}"
+    );
+
+    fixture.resume().await.expect("failed to unpause");
+
+    // Everything sent during the outage must arrive once the server is back.
+    let count = fixture
+        .wait_for_rows(15)
+        .await
+        .expect("rows buffered during the outage were not replayed");
+    assert!(count >= 15, "expected 15 rows after replay, got {count}");
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_batch_size_below_message_count_when_consumed_should_write_every_chunk(
+    harness: &TestHarness,
+    fixture: QuestDbSinkSmallBatchFixture,
+) {
+    // batch_size is 7, so `consume` must drain in several chunks and the
+    // final partial chunk must not be dropped.
+    let fixture = &fixture.0;
+    let total = 100usize;
+    send(
+        &harness.root_client().await.unwrap(),
+        (0..total)
+            .map(|i| message((i + 1) as u128, json!({"seq": i})))
+            .collect(),
+    )
+    .await;
+
+    let count = fixture.wait_for_rows(total).await.expect("no rows");
+    assert_eq!(count, total, "chunking lost or duplicated rows");
+
+    // Offsets must be contiguous: an off-by-one in the drain loop would show
+    // up as a gap rather than a count mismatch.
+    let offsets = fixture.column_values("offset").await.expect("no offsets");
+    let mut offsets: Vec<i64> = offsets
+        .iter()
+        .filter_map(serde_json::Value::as_i64)
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    assert_eq!(offsets.len(), total, "offsets are not unique: {offsets:?}");
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_server_timestamp_source_when_consumed_should_let_questdb_stamp_rows(
+    harness: &TestHarness,
+    fixture: QuestDbSinkServerTimestampFixture,
+) {
+    let fixture = &fixture.0;
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![message(1, json!({"seq": 1}))],
+    )
+    .await;
+
+    fixture.wait_for_rows(1).await.expect("no rows");
+
+    let columns = fixture.column_types().await.expect("no columns");
+    assert!(columns.contains_key("timestamp"), "{columns:?}");
+    let values = fixture.column_values("timestamp").await.expect("no values");
+    assert!(
+        values[0].as_str().is_some_and(|ts| ts.starts_with("20")),
+        "server did not stamp the row: {values:?}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_text_schema_when_consumed_should_store_body_in_payload_column(
+    harness: &TestHarness,
+    fixture: QuestDbSinkTextFixture,
+) {
+    // A text payload has no field structure, so it lands whole in `payload`
+    // rather than being dropped for not being a JSON object.
+    let fixture = &fixture.0;
+    let body = "plain text body";
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![
+            IggyMessage::builder()
+                .id(1)
+                .payload(Bytes::from(body.as_bytes().to_vec()))
+                .build()
+                .expect("Failed to build message"),
+        ],
+    )
+    .await;
+
+    fixture.wait_for_rows(1).await.expect("no rows");
+
+    let columns = fixture.column_types().await.expect("no columns");
+    assert_eq!(columns.get("payload").map(String::as_str), Some("VARCHAR"));
+    let values = fixture.column_values("payload").await.expect("no values");
+    assert_eq!(values[0].as_str(), Some(body));
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/questdb/sink.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_headers_enabled_when_consumed_should_write_prefixed_columns(
+    harness: &TestHarness,
+    fixture: QuestDbSinkHeadersFixture,
+) {
+    let fixture = &fixture.0;
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        HeaderKey::from_raw(HeaderKind::String, b"source").unwrap(),
+        HeaderValue::from_raw(HeaderKind::String, b"gateway").unwrap(),
+    );
+    send(
+        &harness.root_client().await.unwrap(),
+        vec![
+            IggyMessage::builder()
+                .id(1)
+                .payload(Bytes::from(serde_json::to_vec(&json!({"seq": 1})).unwrap()))
+                .user_headers(headers)
+                .build()
+                .expect("Failed to build message"),
+        ],
+    )
+    .await;
+
+    fixture.wait_for_rows(1).await.expect("no rows");
+
+    let columns = fixture.column_types().await.expect("no columns");
+    assert_eq!(
+        columns.get("header_source").map(String::as_str),
+        Some("VARCHAR"),
+        "{columns:?}"
+    );
+    let values = fixture
+        .column_values("header_source")
+        .await
+        .expect("no values");
+    assert_eq!(values[0].as_str(), Some("gateway"));
 }

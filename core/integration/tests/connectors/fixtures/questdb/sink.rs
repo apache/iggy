@@ -25,14 +25,15 @@ use tokio::time::sleep;
 use tracing::info;
 
 use super::container::{
-    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_CONNECTION_STRING, ENV_SINK_INCLUDE_HEADERS,
-    ENV_SINK_INCLUDE_OFFSET_COLUMN, ENV_SINK_INCLUDE_PARTITION_COLUMN,
-    ENV_SINK_INCLUDE_STREAM_COLUMN, ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_LOG_REJECTED_PAYLOAD,
-    ENV_SINK_PATH, ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA,
-    ENV_SINK_STREAMS_0_STREAM, ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE,
-    ENV_SINK_TIMESTAMP_FIELD, ENV_SINK_TIMESTAMP_SOURCE, ENV_SINK_TIMESTAMP_UNIT,
-    ENV_SINK_UUID_COLUMNS, HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, QuestDbContainer,
-    QuestDbOps, create_http_client,
+    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SINK_BATCH_SIZE, ENV_SINK_CONNECTION_STRING,
+    ENV_SINK_FLUSH_TIMEOUT, ENV_SINK_INCLUDE_HEADERS, ENV_SINK_INCLUDE_OFFSET_COLUMN,
+    ENV_SINK_INCLUDE_PARTITION_COLUMN, ENV_SINK_INCLUDE_STREAM_COLUMN,
+    ENV_SINK_INCLUDE_TOPIC_COLUMN, ENV_SINK_LOG_REJECTED_PAYLOAD, ENV_SINK_PATH,
+    ENV_SINK_STREAMS_0_CONSUMER_GROUP, ENV_SINK_STREAMS_0_SCHEMA, ENV_SINK_STREAMS_0_STREAM,
+    ENV_SINK_STREAMS_0_TOPICS, ENV_SINK_SYMBOL_COLUMNS, ENV_SINK_TABLE, ENV_SINK_TIMESTAMP_FIELD,
+    ENV_SINK_TIMESTAMP_SOURCE, ENV_SINK_TIMESTAMP_UNIT, ENV_SINK_UUID_COLUMNS,
+    HEALTH_CHECK_ATTEMPTS, HEALTH_CHECK_INTERVAL_MS, QuestDbContainer, QuestDbOps,
+    create_http_client,
 };
 
 const POLL_ATTEMPTS: usize = 120;
@@ -56,12 +57,22 @@ pub struct QuestDbSinkOptions {
     pub include_offset_column: Option<bool>,
     pub include_headers: Option<bool>,
     pub log_rejected_payload: Option<bool>,
+    pub batch_size: Option<u32>,
+    pub flush_timeout: Option<String>,
+    /// Schema the runtime decodes the stream with. `None` → "json".
+    pub schema: Option<String>,
+    /// Enable QWP store-and-forward against a temp directory owned by the
+    /// fixture. The sink runs in the connectors-runtime process on the host,
+    /// so this is a plain host path rather than a container volume.
+    pub store_and_forward: bool,
 }
 
 pub struct QuestDbSinkFixture {
     container: QuestDbContainer,
     http_client: HttpClient,
     pub options: QuestDbSinkOptions,
+    /// Kept alive for the test's lifetime so the slot directory survives.
+    sf_dir: Option<tempfile::TempDir>,
 }
 
 impl QuestDbOps for QuestDbSinkFixture {
@@ -148,13 +159,83 @@ impl QuestDbSinkFixture {
             .collect())
     }
 
+    /// The QWP store-and-forward root, when the fixture enabled it.
+    pub fn sf_dir(&self) -> Option<&std::path::Path> {
+        self.sf_dir.as_ref().map(|dir| dir.path())
+    }
+
+    /// Slot directories the client has minted under the store-and-forward root.
+    /// The pooled sender names them `<sender_id>-ingest-<index>`.
+    pub fn sf_slots(&self) -> Vec<std::path::PathBuf> {
+        let Some(root) = self.sf_dir() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+
+    /// Segment files inside `slot`. The client names them `sf-*.sfa` and trims
+    /// them once the server acknowledges, so their presence means bytes are
+    /// parked on disk awaiting delivery.
+    pub fn sf_segments(slot: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(slot) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sfa"))
+            .collect()
+    }
+
+    /// Poll until at least one store-and-forward slot exists on disk.
+    pub async fn wait_for_sf_slot(&self) -> Result<std::path::PathBuf, TestBinaryError> {
+        for _ in 0..POLL_ATTEMPTS {
+            if let Some(slot) = self.sf_slots().into_iter().next() {
+                return Ok(slot);
+            }
+            sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+        Err(TestBinaryError::InvalidState {
+            message: format!(
+                "No store-and-forward slot appeared under {:?}",
+                self.sf_dir()
+            ),
+        })
+    }
+
+    pub async fn simulate_outage(&self) -> Result<(), TestBinaryError> {
+        self.container.simulate_outage().await
+    }
+
+    pub async fn resume(&self) -> Result<(), TestBinaryError> {
+        self.container.resume().await
+    }
+
     pub async fn setup_with_options(options: QuestDbSinkOptions) -> Result<Self, TestBinaryError> {
         let container = QuestDbContainer::start().await?;
         let http_client = create_http_client();
+        let sf_dir = if options.store_and_forward {
+            Some(
+                tempfile::tempdir().map_err(|e| TestBinaryError::FixtureSetup {
+                    fixture_type: "QuestDbSink".to_string(),
+                    message: format!("Failed to create store-and-forward dir: {e}"),
+                })?,
+            )
+        } else {
+            None
+        };
         let fixture = Self {
             container,
             http_client,
             options,
+            sf_dir,
         };
 
         for attempt in 0..HEALTH_CHECK_ATTEMPTS {
@@ -191,10 +272,13 @@ impl TestFixture for QuestDbSinkFixture {
 
     fn connectors_runtime_envs(&self) -> HashMap<String, String> {
         let mut envs = HashMap::new();
-        envs.insert(
-            ENV_SINK_CONNECTION_STRING.to_string(),
-            self.container.connection_string(),
-        );
+        // Store-and-forward is a connect-string concern, not a plugin config
+        // key, so it is appended here rather than exposed as its own env var.
+        let mut connection_string = self.container.connection_string();
+        if let Some(dir) = self.sf_dir() {
+            connection_string.push_str(&format!("sf_dir={};sender_id=iggy_test;", dir.display()));
+        }
+        envs.insert(ENV_SINK_CONNECTION_STRING.to_string(), connection_string);
         envs.insert(ENV_SINK_TABLE.to_string(), self.table());
         envs.insert(
             ENV_SINK_STREAMS_0_STREAM.to_string(),
@@ -204,7 +288,13 @@ impl TestFixture for QuestDbSinkFixture {
             ENV_SINK_STREAMS_0_TOPICS.to_string(),
             format!("[{DEFAULT_TEST_TOPIC}]"),
         );
-        envs.insert(ENV_SINK_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(
+            ENV_SINK_STREAMS_0_SCHEMA.to_string(),
+            self.options
+                .schema
+                .clone()
+                .unwrap_or_else(|| "json".to_string()),
+        );
         envs.insert(
             ENV_SINK_STREAMS_0_CONSUMER_GROUP.to_string(),
             "questdb_sink_cg".to_string(),
@@ -256,6 +346,12 @@ impl TestFixture for QuestDbSinkFixture {
         if let Some(value) = self.options.log_rejected_payload {
             envs.insert(ENV_SINK_LOG_REJECTED_PAYLOAD.to_string(), value.to_string());
         }
+        if let Some(value) = self.options.batch_size {
+            envs.insert(ENV_SINK_BATCH_SIZE.to_string(), value.to_string());
+        }
+        if let Some(value) = &self.options.flush_timeout {
+            envs.insert(ENV_SINK_FLUSH_TIMEOUT.to_string(), value.clone());
+        }
         envs
     }
 }
@@ -279,6 +375,104 @@ impl TestFixture for QuestDbSinkTypedFixture {
             include_partition_column: Some(true),
             include_offset_column: Some(true),
             log_rejected_payload: Some(true),
+            ..Default::default()
+        })
+        .await
+        .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+/// Store-and-forward enabled, with a flush timeout short enough that an
+/// outage surfaces quickly instead of stalling the test.
+pub struct QuestDbSinkStoreAndForwardFixture(pub QuestDbSinkFixture);
+
+#[async_trait]
+impl TestFixture for QuestDbSinkStoreAndForwardFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
+            store_and_forward: true,
+            flush_timeout: Some("5s".to_string()),
+            ..Default::default()
+        })
+        .await
+        .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+/// A batch size far below the message count, so `consume` must chunk.
+pub struct QuestDbSinkSmallBatchFixture(pub QuestDbSinkFixture);
+
+#[async_trait]
+impl TestFixture for QuestDbSinkSmallBatchFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
+            batch_size: Some(7),
+            include_offset_column: Some(true),
+            ..Default::default()
+        })
+        .await
+        .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+/// Lets QuestDB stamp the designated timestamp on arrival.
+pub struct QuestDbSinkServerTimestampFixture(pub QuestDbSinkFixture);
+
+#[async_trait]
+impl TestFixture for QuestDbSinkServerTimestampFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
+            timestamp_source: Some("server".to_string()),
+            ..Default::default()
+        })
+        .await
+        .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+/// Text-schema stream, which has no field structure and lands in `payload`.
+pub struct QuestDbSinkTextFixture(pub QuestDbSinkFixture);
+
+#[async_trait]
+impl TestFixture for QuestDbSinkTextFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
+            schema: Some("text".to_string()),
+            ..Default::default()
+        })
+        .await
+        .map(Self)
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        self.0.connectors_runtime_envs()
+    }
+}
+
+/// Writes each Apache Iggy message header as its own `header_*` column.
+pub struct QuestDbSinkHeadersFixture(pub QuestDbSinkFixture);
+
+#[async_trait]
+impl TestFixture for QuestDbSinkHeadersFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        QuestDbSinkFixture::setup_with_options(QuestDbSinkOptions {
+            include_headers: Some(true),
             ..Default::default()
         })
         .await

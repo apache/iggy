@@ -66,6 +66,8 @@ pub const ENV_SINK_INCLUDE_HEADERS: &str =
     "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_INCLUDE_HEADERS";
 pub const ENV_SINK_LOG_REJECTED_PAYLOAD: &str =
     "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_LOG_REJECTED_PAYLOAD";
+pub const ENV_SINK_BATCH_SIZE: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_BATCH_SIZE";
+pub const ENV_SINK_FLUSH_TIMEOUT: &str = "IGGY_CONNECTORS_SINK_QUESTDB_PLUGIN_CONFIG_FLUSH_TIMEOUT";
 pub const ENV_SINK_STREAMS_0_STREAM: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_STREAM";
 pub const ENV_SINK_STREAMS_0_TOPICS: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_TOPICS";
 pub const ENV_SINK_STREAMS_0_SCHEMA: &str = "IGGY_CONNECTORS_SINK_QUESTDB_STREAMS_0_SCHEMA";
@@ -75,7 +77,6 @@ pub const ENV_SINK_STREAMS_0_CONSUMER_GROUP: &str =
 // ── Container ────────────────────────────────────────────────────────────────
 
 pub struct QuestDbContainer {
-    #[allow(dead_code)]
     container: ContainerAsync<GenericImage>,
     pub base_url: String,
     pub host_port: u16,
@@ -129,6 +130,32 @@ impl QuestDbContainer {
     /// Connect string handed to the sink. QWP shares the REST port.
     pub fn connection_string(&self) -> String {
         format!("ws::addr=localhost:{};", self.host_port)
+    }
+
+    /// Freeze the server to simulate an outage.
+    ///
+    /// Pause rather than stop: the container was published with an ephemeral
+    /// host port (`-p 0:9000`), and Docker re-resolves that to a *different*
+    /// port when a stopped container is started again, which would strand both
+    /// the sink and this fixture on a dead address. Pausing leaves networking
+    /// untouched, so the port survives and the sink reconnects to the same
+    /// endpoint.
+    pub async fn simulate_outage(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .pause()
+            .await
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to pause QuestDB container: {e}"),
+            })
+    }
+
+    pub async fn resume(&self) -> Result<(), TestBinaryError> {
+        self.container
+            .unpause()
+            .await
+            .map_err(|e| TestBinaryError::InvalidState {
+                message: format!("Failed to unpause QuestDB container: {e}"),
+            })
     }
 }
 
