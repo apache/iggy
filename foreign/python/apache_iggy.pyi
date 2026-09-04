@@ -30,6 +30,8 @@ __all__ = [
     "AutoCommitAfter",
     "AutoCommitWhen",
     "AutoLogin",
+    "CacheMetrics",
+    "CacheMetricsKey",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
@@ -49,6 +51,7 @@ __all__ = [
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "Stats",
     "StreamDetails",
     "StreamPermissions",
     "TcpConfig",
@@ -288,6 +291,57 @@ class AutoLogin:
         r"""
         Log in with the given personal access token on every connect.
         """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class CacheMetrics:
+    r"""
+    Cache metrics for a specific partition.
+    """
+    @property
+    def hits(self) -> builtins.int:
+        r"""
+        Number of cache hits.
+        """
+    @property
+    def misses(self) -> builtins.int:
+        r"""
+        Number of cache misses.
+        """
+    @property
+    def hit_ratio(self) -> builtins.float:
+        r"""
+        Hit ratio (hits / (hits + misses)).
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class CacheMetricsKey:
+    r"""
+    Key identifying the partition a `CacheMetrics` entry belongs to.
+
+    Hashable and comparable, so it can key the `Stats.cache_metrics` dict.
+    """
+    @property
+    def stream_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the stream.
+        """
+    @property
+    def topic_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the topic within the stream.
+        """
+    @property
+    def partition_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the partition within the topic.
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __hash__(self) -> builtins.int: ...
+    def __new__(
+        cls, stream_id: builtins.int, topic_id: builtins.int, partition_id: builtins.int
+    ) -> CacheMetricsKey: ...
     def __repr__(self) -> builtins.str: ...
 
 class Consumer:
@@ -871,6 +925,16 @@ class IggyClient:
         r"""
         Sends a ping request to the server to check connectivity.
         Raises `RuntimeError` if the connection fails.
+        """
+    def get_stats(self) -> collections.abc.Awaitable[Stats]:
+        r"""
+        Get the statistics and details of the server and its running process.
+
+        Returns:
+            An awaitable that resolves to `Stats`.
+
+        Raises:
+            RuntimeError: If the request fails.
         """
     def describe_options(
         self, scope: builtins.str
@@ -1835,6 +1899,157 @@ class SendMessagesResponse:
         memory, not once it is fsynced. A crash-restart can stamp a later batch
         with an offset a client has already recorded.
         """
+
+@typing.final
+class Stats:
+    r"""
+    The statistics and details of the server and its running process.
+    """
+    @property
+    def process_id(self) -> builtins.int:
+        r"""
+        The unique identifier of the server process.
+        """
+    @property
+    def cpu_usage(self) -> builtins.float:
+        r"""
+        The CPU usage of the server process, in percent.
+        """
+    @property
+    def total_cpu_usage(self) -> builtins.float:
+        r"""
+        The total CPU usage of the system, in percent.
+        """
+    @property
+    def memory_usage(self) -> builtins.int:
+        r"""
+        The memory usage of the server process, in bytes.
+        """
+    @property
+    def total_memory(self) -> builtins.int:
+        r"""
+        The total memory of the system, in bytes.
+        """
+    @property
+    def available_memory(self) -> builtins.int:
+        r"""
+        The available memory of the system, in bytes.
+        """
+    @property
+    def run_time(self) -> datetime.timedelta:
+        r"""
+        The run time of the server process.
+        """
+    @property
+    def start_time(self) -> builtins.int:
+        r"""
+        The start time of the server process, in microseconds since the Unix epoch.
+        """
+    @property
+    def read_bytes(self) -> builtins.int:
+        r"""
+        The total number of bytes read.
+        """
+    @property
+    def written_bytes(self) -> builtins.int:
+        r"""
+        The total number of bytes written.
+        """
+    @property
+    def messages_size_bytes(self) -> builtins.int:
+        r"""
+        The total size of the messages, in bytes.
+        """
+    @property
+    def streams_count(self) -> builtins.int:
+        r"""
+        The total number of streams.
+        """
+    @property
+    def topics_count(self) -> builtins.int:
+        r"""
+        The total number of topics.
+        """
+    @property
+    def partitions_count(self) -> builtins.int:
+        r"""
+        The total number of partitions.
+        """
+    @property
+    def segments_count(self) -> builtins.int:
+        r"""
+        The total number of segments.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        The total number of messages.
+        """
+    @property
+    def clients_count(self) -> builtins.int:
+        r"""
+        The total number of connected clients.
+        """
+    @property
+    def consumer_groups_count(self) -> builtins.int:
+        r"""
+        The total number of consumer groups.
+        """
+    @property
+    def hostname(self) -> builtins.str:
+        r"""
+        The name of the host the server runs on.
+        """
+    @property
+    def os_name(self) -> builtins.str:
+        r"""
+        The name of the operating system.
+        """
+    @property
+    def os_version(self) -> builtins.str:
+        r"""
+        The version of the operating system.
+        """
+    @property
+    def kernel_version(self) -> builtins.str:
+        r"""
+        The version of the kernel.
+        """
+    @property
+    def iggy_server_version(self) -> builtins.str:
+        r"""
+        The version of the Iggy server.
+        """
+    @property
+    def iggy_server_semver(self) -> builtins.int | None:
+        r"""
+        The numeric semantic version of the Iggy server, or `None` when unknown.
+        E.g. 1.2.3 -> 1002003 (major * 1000000 + minor * 1000 + patch).
+        """
+    @property
+    def cache_metrics(self) -> builtins.dict[CacheMetricsKey, CacheMetrics]:
+        r"""
+        Cache metrics per partition.
+
+        Built once when the stats snapshot is created; every access returns the
+        same dict.
+        """
+    @property
+    def threads_count(self) -> builtins.int:
+        r"""
+        The number of threads in the server process.
+        """
+    @property
+    def free_disk_space(self) -> builtins.int:
+        r"""
+        The available (free) disk space for the data directory, in bytes.
+        """
+    @property
+    def total_disk_space(self) -> builtins.int:
+        r"""
+        The total disk space for the data directory, in bytes.
+        """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class StreamDetails:
