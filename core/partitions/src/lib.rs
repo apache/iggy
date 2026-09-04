@@ -61,9 +61,10 @@ pub use segment::Segment;
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use types::{
-    AppendResult, FatalCommit, Fragment, PartitionOffsets, PartitionPathLayout, PartitionsConfig,
-    PollFragments, PollQueryResult, PollingArgs, PollingConsumer, REPAIR_RETRY_TICKS,
-    RepairConclusion, RepairSession, SendMessagesResult,
+    AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
+    PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
+    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairSession,
+    SendMessagesResult,
 };
 
 /// A partition's message log, named so a caller can carry one across a rebuild.

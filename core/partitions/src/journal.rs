@@ -762,16 +762,25 @@ where
         headers.iter().find(|header| header.op == op).copied()
     }
 
-    /// Whether `op` is resident, without reading its header.
+    /// Whether `op` is resident, in O(log n) instead of `header_by_op`'s scan.
+    /// Callers that only need presence must use this: a miss is the common case
+    /// on the residency checks, and a miss is exactly when the scan walks the
+    /// whole vec.
     ///
-    /// Equivalent to `header_by_op(op).is_some()` and answers in O(log n)
-    /// instead of scanning. The two populations cannot diverge: every clear
-    /// site ([`Self::commit`], [`Self::evict_prefix`], the restore path) clears
-    /// both, and [`Self::append_with_meta`] pushes the header before the
-    /// storage write and inserts the offset after it, under the length-lock
-    /// precondition documented there. Callers that only need presence must use
-    /// this - a miss is the common case on the residency checks, and a miss is
-    /// exactly when the scan walks the whole vec.
+    /// It answers off `op_to_storage_offset`, so it is `header_by_op(op).is_some()`
+    /// everywhere except INSIDE [`Self::append_with_meta`], which pushes the
+    /// header before the storage write and inserts the offset after it: a task
+    /// that interleaves at that await sees the header without the offset and is
+    /// answered `false`. Both are cleared together at every clear site
+    /// ([`Self::commit`], [`Self::evict_prefix`], the restore path), so that
+    /// window is the only divergence.
+    ///
+    /// The window is unreachable for this journal: `PartitionJournalMemStorage`
+    /// writes to memory and its `write_at` never yields, so no task can observe
+    /// the half-inserted state. That is what lets `apply_repaired_prepare` lean
+    /// on this for idempotence, where a false negative would re-journal an op
+    /// the log already holds. A future yielding `Storage` has to insert the
+    /// offset before the write, or move that check back to the header vec.
     pub fn holds_op(&self, op: u64) -> bool {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
         op_to_storage_offset.contains_key(&op)
@@ -884,29 +893,33 @@ where
             return Vec::new();
         }
         let headers = unsafe { &*self.headers.get() };
-        // The contiguous run can never outlast the resident headers, and
-        // `commit_max` is a cluster frontier this replica may be far below, so
-        // the slot vec is sized off what is actually here.
-        // Both `min` operands are `usize`-derived, so the narrowing cannot
-        // truncate whatever `commit_max` is.
+        // Sized off the RUN the caller asked for, capped by the headers that
+        // could possibly cover it. Sizing off `headers.len()` alone would make
+        // a one-op run allocate a slot per resident header, and `commit_max` is
+        // a cluster frontier this replica may be arbitrarily far below, so
+        // neither bound can be dropped. `saturating_add` because `commit_max`
+        // is `u64::MAX` on a saturated frontier, where `+ 1` would panic in
+        // debug and wrap to an empty span (a walk that never resumes) in
+        // release.
+        let span = (commit_max - from_op)
+            .saturating_add(1)
+            .min(limit as u64)
+            .min(headers.len() as u64);
+        // `span` is a `min` of two `usize`-derived values on a 64-bit target,
+        // so the narrowing is lossless; `slot` is then compared against it as
+        // a `u64` BEFORE any cast, so nothing depends on the cast to bound it.
         #[allow(clippy::cast_possible_truncation)]
-        let span = (commit_max - from_op + 1)
-            .min(headers.len() as u64)
-            .min(limit as u64) as usize;
+        let span = span as usize;
         let mut slots: Vec<Option<PrepareHeader>> = vec![None; span];
         for header in headers {
-            if header.op < from_op {
+            if header.op < from_op || header.op - from_op >= span as u64 {
                 continue;
             }
-            // Bounded by the `span` test right below, which is itself bounded
-            // by the header count.
             #[allow(clippy::cast_possible_truncation)]
             let slot = (header.op - from_op) as usize;
-            if slot < span {
-                // First writer wins, matching the `header_by_op` probe this
-                // replaces (`find` returns the earliest match).
-                slots[slot].get_or_insert(*header);
-            }
+            // First writer wins, matching the `header_by_op` probe this
+            // replaces (`find` returns the earliest match).
+            slots[slot].get_or_insert(*header);
         }
         // Stops at the first hole: a replication gap must not be skipped, or
         // `advance_commit_min`'s sequential contract breaks.

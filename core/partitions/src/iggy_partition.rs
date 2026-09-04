@@ -30,7 +30,7 @@ use crate::poll_plan::{
 };
 use crate::segment::Segment;
 use crate::state_transfer::{PartitionTransferSession, PendingTransferRearm};
-use crate::types::{FatalCommit, RepairConclusion, RepairSession};
+use crate::types::{COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairSession};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
     PollingConsumer,
@@ -167,9 +167,12 @@ where
     /// the count, folded into `partition_prepare_gap_drops_total` there.
     /// Replicated traffic has no client to answer and retransmit skips ops that
     /// already reached quorum, so nothing else records that the frame existed.
-    /// It counts the prepares that ARRIVED after a hole, not the holes: a gap
-    /// opened by the last prepare of a burst leaves it at zero, so a nonzero
-    /// value proves the repair driver has work and a zero one proves nothing.
+    /// It counts what the ordering check destroyed, which is neither the holes
+    /// nor only them: a gap opened by the last prepare of a burst leaves it at
+    /// zero, and a duplicate delivery of an op this replica already sequenced
+    /// bumps it without any hole existing. Zero proves nothing, and nonzero is
+    /// a reason to look at the `sequence` field on the drop log, which is what
+    /// separates the two shapes.
     ///
     /// `Cell`: the shard drains it once per sweep, off the same shared borrow
     /// the rest of the tick reads the partition through, so a `&mut` here would
@@ -303,6 +306,10 @@ where
     /// [`Self::note_transfer_rearm_scheduled`]; livelock across attempts is
     /// bounded by [`Self::transfer_failures`] and its exponential backoff.
     transfer_attempts: u32,
+    /// Consecutive stalled re-requests on the live repair session, against
+    /// [`crate::types::REPAIR_MAX_STALL_RETRIES`]. Survives the session, so rotating
+    /// the peer cannot reset it; cleared by real progress.
+    repair_attempts: u32,
     /// CONSECUTIVE transfer failures of any class (decode, spill, install,
     /// peer-unavailable, stall exhaustion). Deliberately NOT keyed on the
     /// offered generation: a committing primary advances its generation
@@ -564,6 +571,7 @@ where
             offset_reservation_lease: u64::from(crate::DEFAULT_OFFSET_RESERVATION_LEASE),
             transfer: None,
             transfer_attempts: 0,
+            repair_attempts: 0,
             transfer_failures: 0,
             transfer_refusals: 0,
             transfer_rearm: None,
@@ -1765,6 +1773,25 @@ where
     #[cfg(any(test, feature = "fault-injection"))]
     pub const fn inject_commit_failure(&mut self) {
         self.injected_commit_failure = true;
+    }
+
+    /// Burn one repair stall round; `true` once the budget is exhausted and the
+    /// session should be re-armed against a different peer.
+    ///
+    /// On the PARTITION, not the session, for the same reason the transfer
+    /// budget is: the rotation mints a new session, which would otherwise reset
+    /// the count and re-target forever without ever giving up on the ring.
+    #[must_use = "the bool is the rotate verdict; dropping it disables the stall budget"]
+    pub const fn burn_repair_attempt(&mut self) -> bool {
+        self.repair_attempts += 1;
+        self.repair_attempts > crate::types::REPAIR_MAX_STALL_RETRIES
+    }
+
+    /// Real repair progress (any in-window frame from the serving peer): reset
+    /// the stall budget, so it bounds CONSECUTIVE stalls rather than the ones a
+    /// long healthy stream accumulates.
+    pub const fn note_repair_progress(&mut self) {
+        self.repair_attempts = 0;
     }
 
     /// Burn one transfer stall round; `true` once the budget is exhausted.
@@ -3550,26 +3577,26 @@ where
         }
     }
 
-    #[allow(clippy::future_not_send)]
-    pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
-        self.commit_journal_bounded(config, usize::MAX).await;
-    }
-
-    /// [`Self::commit_journal`] with a ceiling on how many journal-resident ops
-    /// one call commits.
+    /// Apply the committed prefix this replica can reach, from the pipeline if
+    /// the primary populated one and from the journal otherwise.
     ///
-    /// The walk runs on the shard pump, and `handle_committed_entries` is
-    /// uninterruptible once entered: after a rejoin the resident run is the
-    /// whole backlog, so an unbounded call turns one tick into a segment flush
-    /// per committed op with the heartbeat timer stopped behind it. Only the
-    /// journal half is bounded; the pipeline drain is the primary's own
-    /// in-flight window, which the pipeline depth already caps.
+    /// The journal half is bounded by [`COMMIT_WALK_OPS_MAX`], for EVERY caller
+    /// and not just the tick sweep: `on_commit`, `StartView` adoption, the
+    /// post-transfer tail and the post-repair walk all reach this with the same
+    /// resident backlog behind them, and all four run on the shard pump. The
+    /// pipeline half is left alone, being the primary's own in-flight window,
+    /// which the pipeline depth already caps.
     ///
     /// Nothing is lost by stopping early: the run is re-derived from
     /// `commit_min` on the next call, and the sweep's walk predicate stays true
-    /// until the group is drained, so the next tick resumes exactly here.
+    /// until the group drains, so the next tick resumes exactly here. The one
+    /// caller with no next tick is the shutdown drain, and it is covered twice
+    /// over: [`Self::flush_committed_messages`] persists the committed prefix
+    /// by bytes rather than by walk, and what stays un-applied sits above the
+    /// `commit_min` the superblock records, which is what makes the restarted
+    /// replica ask its peers for it.
     #[allow(clippy::future_not_send)]
-    pub async fn commit_journal_bounded(&mut self, config: &PartitionsConfig, max_ops: usize) {
+    pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
         if self.fatal.is_some() {
             return;
         }
@@ -3586,7 +3613,7 @@ where
         // double-count against `advance_commit_min`.
         let mut drained = drain_committable_prefix(self.consensus());
         if drained.is_empty() {
-            drained = self.collect_committable_from_journal(max_ops);
+            drained = self.collect_committable_from_journal(COMMIT_WALK_OPS_MAX);
         }
         if drained.is_empty() {
             return;
@@ -5859,9 +5886,10 @@ where
             return;
         }
         // Any in-window frame proves the stream is alive; only silence
-        // should age the stall counter.
+        // should age the stall counter or spend the rotation budget.
         if let Some(session) = self.repair.as_mut() {
             session.idle_ticks = 0;
+            self.repair_attempts = 0;
         }
         if self.log.journal().inner.holds_op(header.op) {
             return;

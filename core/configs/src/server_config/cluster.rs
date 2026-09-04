@@ -2041,6 +2041,16 @@ mod cluster_validate_tests {
     }
 
     #[test]
+    fn validate_rejects_zero_repair_gap_debounce_interval() {
+        // Same sentinel family as the retry interval above: `0`, `disabled` and
+        // `unlimited` all parse to zero, and a zero debounce would arm repair
+        // against a single reordered prepare on every partition.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_gap_debounce_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
     fn validate_rejects_zero_repair_chunk_max() {
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.repair_chunk_max = 0;

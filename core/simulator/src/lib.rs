@@ -5741,6 +5741,92 @@ mod partition_repair_driver_tests {
     }
 
     #[test]
+    fn given_a_gap_stopped_backup_when_repair_is_armed_should_spend_its_debounce() {
+        // The reset lives in `maybe_request_partition_repair`, the funnel every
+        // arming site goes through, precisely because the four edge-triggered
+        // sites never touch `gap_ticks` themselves. Driven here rather than
+        // modelled: a saturated count hands the NEXT gap an arm on its first
+        // tick, and the shape that reaches it is a repair short enough that no
+        // sweep ever observes the partition with its recovery owned.
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
+
+        /// Primary -> 2: withhold this group's commit heartbeats, so the
+        /// edge-triggered backstop cannot be what arms the repair below.
+        fn starve_commit_edge(packet: &Packet) -> bool {
+            let group = GAP_NS.load(Ordering::Relaxed);
+            if let Some(header) = prepare_for(packet, group) {
+                return header.op == WITHHELD_OP.load(Ordering::Relaxed);
+            }
+            is_commit_for(packet, group)
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0238);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+        // Short, deliberately: long enough to open the gap, well under the
+        // debounce, so the driver has not armed on its own and the sweep below
+        // is the one that does it.
+        produce(&mut sim, &client, namespace, STRAND_SENDS, "gap");
+        assert_ne!(
+            WITHHELD_OP.load(Ordering::Relaxed),
+            0,
+            "no partition prepare crossed the chain link, so the fault never armed"
+        );
+        let (_, _, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert!(
+            commit_min < commit_max && !journal_holds(&sim, LAGGING, namespace, commit_min + 1),
+            "the lagging replica is not gap-stopped (walkable to {commit_min} of \
+             {commit_max}), so the sweep has nothing to arm"
+        );
+
+        // Saturate the debounce by hand and take one sweep: the arm has to be
+        // what spends it, whatever the tick counted on the way in.
+        let shard = sim.replicas[LAGGING as usize].partition_shard(namespace);
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions
+                .get_by_ns(&namespace)
+                .expect("the replica hosts the group");
+            assert!(
+                partition.repair.is_none(),
+                "a session was already open, so this sweep would arm nothing"
+            );
+            partition.gap_ticks.set(u32::MAX);
+        }
+        let mut namespace_scratch = Vec::new();
+        futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch));
+
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_by_ns(&namespace)
+            .expect("the replica hosts the group");
+        assert!(
+            partition.repair.is_some(),
+            "the sweep never opened a session, so the reset below proves nothing"
+        );
+        assert_eq!(
+            partition.gap_ticks.get(),
+            0,
+            "the arm left the debounce saturated; a repair that completes before the \
+             next sweep would then hand the following gap an arm on its first tick"
+        );
+    }
+
+    #[test]
     fn given_a_local_commit_failure_in_the_tick_walk_when_the_partition_fences_should_return_the_fault()
      {
         static GAP_NS: AtomicU64 = AtomicU64::new(0);
