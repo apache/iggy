@@ -51,6 +51,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# Test-only feature on a crate this package already depends on: the fault
+# hooks the partition-driver tests arm must not compile into anything that
+# ships. See `partitions/Cargo.toml`.
+partitions = { workspace = true, features = ["fault-injection"] }
 tempfile = { workspace = true }
 
 [lints.clippy]
