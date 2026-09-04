@@ -119,13 +119,14 @@ pub(in crate::http) async fn submit_committed(
         // served state older than what committed. Ordered before the wake, so a
         // read issued the instant the response lands already sees the mark.
         //
-        // This node's own view only: on a follower with HTTP forwarding ON the
-        // write is relayed to the primary by the middleware and never reaches
-        // this task, so the follower's floor stays where the register left it
-        // and its read-your-writes guarantee is the register epoch's. Closing
-        // that needs the serving primary's commit op to come back with the
-        // relayed response, which nothing in it carries today (see
-        // `reads::await_metadata_read_frontier`).
+        // A follower with HTTP forwarding ON never runs this task: the
+        // middleware relays the write and records the floor from the serving
+        // primary's applied op instead (`http::forward::record_relayed_floor`).
+        // One gap survives that split - a relayed 503 carrying
+        // `TransientNotCommitted` is passed through untouched rather than
+        // retried, because its op may still commit, and only a 2xx records a
+        // floor. A write that did commit behind that code therefore leaves
+        // none, until this caller's next committed write raises it.
         if let Ok((_, reply, _)) = &result
             && let Some(commit) = committed_reply_commit(reply)
         {

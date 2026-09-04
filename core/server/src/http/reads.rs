@@ -170,10 +170,11 @@ pub(in crate::http) async fn gate_local_read(
 /// healthy backup FORWARDS a `Register` to the primary
 /// (`dispatch::submit_register_local_or_forward`) and binds the committed epoch
 /// while its own commit walk is still behind it, so the caller holds an op that
-/// node has not applied before it has issued a single write. That is the whole
-/// window on a backup: a control-plane write posted there is either relayed to
-/// the primary (forwarding on) or refused transient (forwarding off), so the
-/// epoch is the only promise a backup makes on its own.
+/// node has not applied before it has issued a single write. A control-plane
+/// write posted to a backup never commits there either: it is relayed to the
+/// primary (forwarding on) or refused transient (forwarding off), so every op a
+/// backup promises is one it learned from the primary rather than applied
+/// itself.
 ///
 /// Adjacent to `?consistency=linearizable`, not in competition with it. That
 /// asks for the freshest CLUSTER state and is answered by leaving this node
@@ -184,10 +185,13 @@ pub(in crate::http) async fn gate_local_read(
 /// a refreshed access token is a new credential for the same writer (see
 /// [`crate::http::state::MetadataWatermarks`]).
 ///
-/// Scope is this node's own view. A user whose write this node relayed over
-/// HTTP, or who wrote through a different node entirely, left no floor here;
-/// closing that needs the serving primary's commit op to reach the reading
-/// node, which nothing in the response carries today.
+/// Scope is this node's own view, which a RELAYED write is part of: the relay
+/// records the serving primary's applied op off the response header
+/// (`http::forward::record_relayed_floor`), so a caller that posted through
+/// this follower is held here too. A user who wrote through a different node
+/// entirely still leaves no floor here, and neither does a relayed write
+/// answered with the `TransientNotCommitted` 503, whose op may have committed
+/// anyway (see `http::submit::submit_committed`).
 ///
 /// The wait itself is the binary plane's [`hold_for_frontier`]: woken by the
 /// commit that advances the frontier, bounded by a `compio::time` timer like
