@@ -76,6 +76,12 @@ impl ConnectorsRuntimeHandle {
         self.context.connectors_runtime_state_path(self.server_id)
     }
 
+    /// Add an environment variable to the connectors runtime config.
+    /// Must be called before starting the runtime.
+    pub fn add_env(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.config.extra_envs.insert(key.into(), value.into());
+    }
+
     pub fn collect_logs(&self) -> (String, String) {
         common::collect_logs(&self.stdout_path, &self.stderr_path)
     }

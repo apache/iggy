@@ -7006,6 +7006,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_iggy_source"
+version = "0.5.0-edge.1"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "iggy",
+ "iggy_common",
+ "iggy_connector_sdk",
+ "rmp-serde",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_influxdb_sink"
 version = "0.5.0-edge.4"
 dependencies = [
