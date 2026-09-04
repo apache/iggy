@@ -280,12 +280,20 @@ pub fn bootstrap(
     let config = Arc::new(config);
     // One post-shutdown budget for the whole process: the main thread's
     // shard joins and shard 0's peer wait both count down this instant
-    // instead of each arming a full `shutdown_join_timeout`. The drain
-    // budget floors the peer wait so a spent join budget cannot release the
-    // metadata writer while a peer still reads through it.
+    // instead of each arming a full `shutdown_join_timeout`. The floor keeps a
+    // spent join budget from releasing the metadata writer while a peer still
+    // reads through it, so it covers a peer's whole exit: one poll interval to
+    // observe the shutdown flag, then one drain budget to drain. Flooring at
+    // the drain alone is short by a poll interval, and
+    // `shutdown_join_timeout == shutdown_drain_timeout` is a legal config.
     let shutdown_deadline = Arc::new(ShutdownDeadline::new(
         config.system.sharding.shutdown_join_timeout.get_duration(),
-        config.system.sharding.shutdown_drain_timeout.get_duration(),
+        config
+            .system
+            .sharding
+            .shutdown_drain_timeout
+            .get_duration()
+            .saturating_add(config.system.sharding.shutdown_poll_interval.get_duration()),
     ));
     // One owner table per server process, Arc-cloned into every shard's bus so
     // any shard's bus reads the same atomic slots that the owning
@@ -411,7 +419,9 @@ pub fn bootstrap(
                 // that made it; the rest are peers shard 0's exit wait would
                 // otherwise sit out its whole budget for.
                 let spawned_peers = shard_threads.len().saturating_sub(1);
-                peer_exit.peers_never_spawned(shards_count.saturating_sub(1) - spawned_peers);
+                peer_exit.peers_never_spawned(
+                    shards_count.saturating_sub(1).saturating_sub(spawned_peers),
+                );
                 join_partial_shard_survivors(shard_threads, &shutdown_deadline);
                 return Err(ServerError::ShardSpawnFailed { shard_id, source });
             }

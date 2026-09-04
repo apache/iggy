@@ -381,7 +381,8 @@ impl ShutdownDeadline {
     }
 
     /// How long shard 0 may block on its peers: what is left of the shared
-    /// budget, floored at one drain budget so a join that already spent the
+    /// budget, floored at a peer's whole exit (one poll interval to observe the
+    /// shutdown flag plus one drain budget) so a join that already spent the
     /// budget cannot release the metadata writer while a peer still reads
     /// through it. Only [`PeerExitWait::drop`]'s panic arm skips the fence.
     fn remaining_for_peer_wait(&self) -> Duration {
@@ -994,8 +995,8 @@ mod tests {
     fn peer_exit_wait_gives_up_at_the_deadline() {
         let countdown = Arc::new(PeerExitCountdown::new(1));
         let _wedged_peer = PeerExitGuard::new(Arc::clone(&countdown));
-        // Budget equal to the floor: the `join_equal_to_drain_is_accepted`
-        // config, where the floor cannot extend the wait.
+        // Degenerate budget == floor: the floor cannot extend the wait, so
+        // the abandon is bounded by the budget alone.
         let timeout = Duration::from_millis(50);
         let started = Instant::now();
         drop(PeerExitWait::new(
