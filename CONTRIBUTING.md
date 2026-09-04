@@ -166,7 +166,19 @@ PRs may be closed if:
 - Code not ran and tested locally
 - Mixed purposes or purposes not clear
 - Can't answer questions about the change
-- Inactivity for longer than 7 days
+- Inactivity, see [Stale PRs](#stale-prs) below
+
+Whoever closes leaves a comment saying why. If the thread holds a finding
+that outlives the change, open an issue for it and link it from that
+comment. The closed thread is the first place someone looks to find out
+whether anything fell through.
+
+### Stale PRs
+
+A bot labels a PR `S-stale` after 7 days without activity and closes it 7
+days after that. A push, comment, review, reopen, or ready-for-review
+clears the label. Drafts and PRs labeled `pinned` are exempt. Issues are
+never labeled or closed by it. A closed PR can be reopened.
 
 ## Questions?
 
