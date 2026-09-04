@@ -920,6 +920,26 @@ mod tests {
         );
     }
 
+    /// The floor is prose in `config.toml` ("50 consensus ticks (500ms at the
+    /// 10ms tick)"), which is the number an operator sizes
+    /// `repair_retry_interval` against. Nothing else would notice it drifting.
+    #[test]
+    fn documented_gap_debounce_floor_matches_the_shard_constant() {
+        assert_eq!(
+            shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN,
+            50,
+            "the gap debounce floor moved; core/server/config.toml states it in \
+             ticks and milliseconds under [cluster] repair_retry_interval"
+        );
+        assert_eq!(
+            u128::from(shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN)
+                * shard::CONSENSUS_TICK_INTERVAL.as_millis(),
+            500,
+            "the floor is no longer 500ms; core/server/config.toml states that \
+             figure under [cluster] repair_retry_interval"
+        );
+    }
+
     #[test]
     fn default_repair_chunk_max_matches_shard_constant() {
         // Belt and suspenders with the static assert above: that pins the

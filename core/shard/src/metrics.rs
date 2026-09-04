@@ -453,7 +453,10 @@ impl ShardMetrics {
     }
 
     /// Add the prepares a partition's backup gap check destroyed since the last
-    /// sweep, drained per tick from `IggyPartition::take_prepare_gap_drops`.
+    /// sweep, drained per tick from `IggyPartition::take_prepare_gap_drops`,
+    /// and once more when `ConfirmRemove` drops the partition: a tombstoned
+    /// namespace is invisible to the sweep, so the tail it left would otherwise
+    /// go to the floor with the value.
     ///
     /// Deliberately NOT a `frame_drops_total{variant=partition}` reason: that
     /// family means the bus or the router shed a frame, and the simulator

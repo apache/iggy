@@ -191,9 +191,12 @@ pub(crate) fn consensus_timers(config: &ServerConfig) -> ConsensusTimers {
 }
 
 /// `[cluster] repair_retry_interval` in consensus ticks: how long a stalled
-/// journal-repair stream waits before re-requesting its window. Both planes'
-/// repair loops share it, so it is applied once per shard (not per consensus
-/// group). Clamped to `u32`, the width of the session idle-tick counter.
+/// journal-repair stream waits before re-requesting its window, and how long a
+/// gap-stopped partition holds before the tick sweep opens one (that use adds a
+/// floor of its own, [`shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN`]). Both
+/// planes' repair loops share it, so it is applied once per shard (not per
+/// consensus group). Clamped to `u32`, the width of the session idle-tick
+/// counter.
 pub(crate) fn repair_retry_ticks(config: &ServerConfig) -> u32 {
     u32::try_from(duration_to_ticks(
         config.cluster.repair_retry_interval.get_duration(),

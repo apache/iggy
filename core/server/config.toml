@@ -658,10 +658,17 @@ view_probe_attempts_max = 5
 # must be nonzero.
 #
 # Also how long a gap-stopped partition backup waits before OPENING a repair
-# session, so shortening this makes the shard react to a replication hole
-# sooner as well. That second use carries its own floor
-# (PARTITION_GAP_DEBOUNCE_TICKS_MIN), because a value near the tick interval
-# would otherwise arm repair against ordinary pipelining.
+# session: the shard's tick sweep arms repair once a group has held committed
+# ops it cannot walk to for this long, so shortening the interval makes a
+# replication hole recover sooner and lengthening it delays that recovery, on
+# top of the stalled-stream retry above.
+#
+# The second use is floored at 50 consensus ticks (500ms at the 10ms tick), so
+# values under that still arm no sooner: one tick of lag is ordinary
+# pipelining, and repair against it would fire on healthy traffic. Repair
+# latency for a gap is therefore max(this, 500ms) plus up to one tick of sweep
+# granularity, and the 1s default arms at ~1s. The stalled-stream retry keeps
+# following the configured value with no floor of its own.
 repair_retry_interval = "1s"
 
 # Prepares a peer serves per repair round before the requester walks to the next

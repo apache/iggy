@@ -164,6 +164,10 @@ where
     /// skips ops that already reached quorum, so nothing else records that the
     /// frame existed.
     prepare_gap_drops: u64,
+    /// Simulator-only fault injection, armed by
+    /// [`Self::inject_commit_failure`]. No production path sets it.
+    #[cfg(any(test, feature = "simulator"))]
+    injected_commit_failure: bool,
     /// Highest message offset recovered from segments at boot (`None` when
     /// the partition booted empty). Repaired batches at or below this line
     /// are already persisted and counted; the flush and commit paths skip
@@ -526,6 +530,8 @@ where
             repair: None,
             gap_ticks: 0,
             prepare_gap_drops: 0,
+            #[cfg(any(test, feature = "simulator"))]
+            injected_commit_failure: false,
             recovered_durable_offset: None,
             installed_frontier: None,
             fatal: None,
@@ -1736,6 +1742,26 @@ where
         let drops = self.prepare_gap_drops;
         self.prepare_gap_drops = 0;
         drops
+    }
+
+    /// Read the gap-drop count without clearing it, so a test can prove the
+    /// count was still buffered on the partition at the moment it was removed.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub const fn prepare_gap_drops(&self) -> u64 {
+        self.prepare_gap_drops
+    }
+
+    /// Fail the next local commit of a committed `SendMessages` op the way a
+    /// full disk fails it, fencing the partition.
+    ///
+    /// The commit path's own fence is covered by a `/dev/full` writer in this
+    /// crate's tests, but the shard sweep that must OBSERVE the fence runs over
+    /// in-memory partitions in the simulator, where no device can be made to
+    /// fail. Simulator-only, like the other hooks above.
+    #[cfg(any(test, feature = "simulator"))]
+    pub const fn inject_commit_failure(&mut self) {
+        self.injected_commit_failure = true;
     }
 
     /// Burn one transfer stall round; `true` once the budget is exhausted.
@@ -3872,6 +3898,10 @@ where
     }
 
     async fn commit_messages(&mut self, config: &PartitionsConfig) -> Result<(), IggyError> {
+        #[cfg(any(test, feature = "simulator"))]
+        if std::mem::take(&mut self.injected_commit_failure) {
+            return Err(IggyError::CannotSaveMessagesToSegment);
+        }
         self.commit_messages_inner(config, false).await
     }
 

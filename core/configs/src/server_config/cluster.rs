@@ -264,6 +264,16 @@ pub struct ClusterConfig {
     /// partition repair loops. Sizes the retry threshold in consensus ticks.
     /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
     /// to zero) is rejected at boot.
+    ///
+    /// It also sizes the partition sweep's gap debounce: how long a backup must
+    /// hold committed ops it cannot walk to before the shard OPENS a repair
+    /// session for it. That second use is floored at
+    /// `PARTITION_GAP_DEBOUNCE_TICKS_MIN` consensus ticks, so shortening the
+    /// interval below the floor does not arm repair any sooner - one tick of
+    /// lag is ordinary pipelining. Gap recovery therefore starts after
+    /// `max(this, the floor)`, while the stalled-stream retry follows the
+    /// configured value directly. The shard crate owns the floor; `config.toml`
+    /// states its value.
     #[serde(default = "default_repair_retry_interval")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]

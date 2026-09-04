@@ -5336,6 +5336,17 @@ mod partition_repair_driver_tests {
             .partition_prepare_gap_drops_value()
     }
 
+    /// Gap drops still buffered on the partition, i.e. recorded since the sweep
+    /// last drained them into the shard counter.
+    fn buffered_gap_drops(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> u64 {
+        sim.replicas[replica as usize]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .map_or(0, partitions::IggyPartition::prepare_gap_drops)
+    }
+
     fn transfer_armed(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> bool {
         let shard = sim.replicas[replica as usize].partition_shard(namespace);
         shard
@@ -5777,6 +5788,151 @@ mod partition_repair_driver_tests {
             commit_min, commit_max,
             "the walk never resumed over resident committed ops: walkable to \
              {commit_min}, committed through {commit_max}, every op between resident"
+        );
+    }
+
+    #[test]
+    fn given_a_local_commit_failure_in_the_tick_walk_when_the_partition_fences_should_return_the_fault()
+     {
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+
+        /// Primary -> 2: withhold this group's commit heartbeats, so the last
+        /// produced op stays journaled-but-uncommitted here and the walk the
+        /// test drives below is the first one that can reach it.
+        fn starve_commit_edge(packet: &Packet) -> bool {
+            is_commit_for(packet, GAP_NS.load(Ordering::Relaxed))
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0236);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+        produce(&mut sim, &client, namespace, 1, "fence");
+
+        let (_, _, commit_min, _) = group_state(&sim, LAGGING, namespace);
+        let stranded = commit_min + 1;
+        assert!(
+            journal_holds(&sim, LAGGING, namespace, stranded),
+            "op {stranded} is not resident, so the walk below would find nothing \
+             to commit and nothing to fail on"
+        );
+
+        // The sweep is invoked DIRECTLY rather than through `sim.step()`: what
+        // is under test is the verdict of the tick whose own walk raised the
+        // fault, and a pump-driven tick would fence on one pass and be asked
+        // for its verdict on the next, where the pre-walk read already answers.
+        let shard = sim.replicas[LAGGING as usize].partition_shard(namespace);
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions
+                .get_mut_by_ns(&namespace)
+                .expect("the replica hosts the group");
+            // Committed as far as this replica knows, with the body resident:
+            // walk-stalled, which is the state the tick's backstop walks.
+            partition.consensus().advance_commit_max(stranded);
+            partition.inject_commit_failure();
+        }
+
+        let mut namespace_scratch = Vec::new();
+        let fault = futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch))
+            .expect(
+                "the tick returned clean over a partition its own walk fenced; the pump \
+                 would keep serving a divergent replica on that verdict",
+            );
+        assert_eq!(fault.namespace_raw, namespace.inner());
+        assert_eq!(
+            fault.op, stranded,
+            "the fault must name the op whose local commit failed"
+        );
+        assert!(
+            sim.replicas[LAGGING as usize]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .is_some_and(|partition| partition.fatal().is_some()),
+            "the partition must stay fenced after the tick reported the fault"
+        );
+    }
+
+    #[test]
+    fn given_buffered_gap_drops_when_the_namespace_is_removed_should_still_count_them() {
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+
+        /// Chain link 1 -> 2: swallow the first partition prepare, once. Every
+        /// prepare after it reaches the backup's gap check and is destroyed
+        /// there, which is what the counter records.
+        fn withhold_one_prepare(packet: &Packet) -> bool {
+            let Some(header) = prepare_for(packet, GAP_NS.load(Ordering::Relaxed)) else {
+                return false;
+            };
+            WITHHELD_OP
+                .compare_exchange(0, header.op, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0237);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+
+        // Stepped one at a time and stopped on the step that buffered a drop:
+        // the sweep drains the count on the following tick, and the whole point
+        // of this run is to remove the namespace while the count is still on
+        // the partition.
+        let mut buffered = 0;
+        'produce: for index in 0..GAP_SENDS {
+            let message = client.send_messages(namespace, &[Bytes::from(format!("gap-{index}"))]);
+            sim.submit_request(client.client_id(), 0, message.into_generic());
+            for _ in 0..STEPS_PER_SEND {
+                sim.step();
+                buffered = buffered_gap_drops(&sim, LAGGING, namespace);
+                if buffered > 0 {
+                    break 'produce;
+                }
+            }
+        }
+        assert!(
+            buffered > 0,
+            "no prepare reached the lagging replica's gap check, so the removal \
+             below would have nothing to lose"
+        );
+        let counted = gap_drops(&sim, LAGGING, namespace);
+
+        // The reconciler's teardown order: the tombstone lands first and the
+        // disk delete runs before `ConfirmRemove`, so from here `get_mut_by_ns`
+        // answers `None` and the sweep can never drain the count again.
+        {
+            let shard = sim.replicas[LAGGING as usize].partition_shard(namespace);
+            shard.plane.partitions().tombstone(namespace);
+            shard.enqueue_reconcile_op(shard::ReconcileOp::ConfirmRemove { namespace });
+        }
+        sim.step();
+
+        let shard = sim.replicas[LAGGING as usize].partition_shard(namespace);
+        assert!(
+            shard.plane.partitions().get_by_ns(&namespace).is_none(),
+            "ConfirmRemove must have dropped the partition, or this run proves nothing"
+        );
+        assert_eq!(
+            shard.metrics().partition_prepare_gap_drops_value(),
+            counted + buffered,
+            "the {buffered} prepare(s) buffered on the partition went to the floor \
+             with it; the drops are the only record those frames existed"
         );
     }
 }
