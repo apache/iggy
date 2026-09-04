@@ -121,10 +121,6 @@ use shard::{PartitionRead, PartitionReadReply};
 
 use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
-use crate::dispatch::{
-    validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
-    warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
-};
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
@@ -149,6 +145,10 @@ use crate::http::wire::{
 };
 use crate::responses::{
     build_polled_messages_body, build_raw_pat_reply, connected_client_to_response,
+};
+use crate::rewrite::{
+    validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
+    warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
 };
 use crate::snapshot;
 

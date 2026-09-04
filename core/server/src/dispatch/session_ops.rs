@@ -32,6 +32,9 @@
 //! two together, so logout and eviction must release BOTH -- every teardown
 //! path below pairs `remove_connection` with a replicated `Logout`.
 
+use crate::dispatch::failure::{
+    FrameChannel, send_eviction, send_host_frame, send_result_rejection,
+};
 use crate::dispatch::login_error::LoginRegisterError;
 use crate::responses::{
     build_deny_reply, build_empty_reply, build_login_register_reply, current_metadata_commit,
@@ -39,11 +42,7 @@ use crate::responses::{
 use crate::session_manager::{ClientSdkInfo, SessionManager};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::request_body;
-use consensus::{
-    Consensus, DISCONNECT_LOGOUT_REQUEST_ID, EvictionContext, MetadataHandle,
-    build_eviction_message, build_incompatible_protocol_eviction_message,
-    build_result_rejection_reply,
-};
+use consensus::{Consensus, DISCONNECT_LOGOUT_REQUEST_ID, MetadataHandle};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::{
@@ -241,10 +240,14 @@ where
         let commit = current_metadata_commit(shard).max(session);
         let reply =
             build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
-        let _ = shard
-            .bus
-            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-            .await;
+        send_host_frame(
+            &shard.bus,
+            transport_client_id,
+            reply.into_generic().into_frozen(),
+            FrameChannel::Reply,
+            "login_replay_reply",
+        )
+        .await;
         return Ok(());
     }
 
@@ -288,17 +291,14 @@ where
     // lower number would make one frame contradict itself.
     let commit = current_metadata_commit(shard).max(session);
     let reply = build_login_register_reply(request_header, vsr_client_id, session, commit, user_id);
-    let send_result = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await;
-    if let Err(error) = send_result {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send login/register reply"
-        );
-    }
+    send_host_frame(
+        &shard.bus,
+        transport_client_id,
+        reply.into_generic().into_frozen(),
+        FrameChannel::Reply,
+        "login_register_reply",
+    )
+    .await;
 
     Ok(())
 }
@@ -331,55 +331,25 @@ async fn surface_login_failure<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     if error.is_terminal() {
-        send_login_eviction(
+        send_eviction(
             shard,
             transport_client_id,
             request_header.client,
             eviction_reason_for(error),
+            "login_rejection",
         )
         .await;
     } else {
         // Which code the hint carries is what tells the client whether the
         // replay may move to another node: see `transient_login_code`.
-        send_login_transient_reply(
+        send_result_rejection(
             shard,
             transport_client_id,
             request_header,
-            transient_login_code(error),
+            &transient_login_code(error),
+            "login transient replay hint",
         )
         .await;
-    }
-}
-
-/// Result-framed transient Reply on a non-terminal failed Register. The SDK
-/// decodes the nonzero result code and replays the same login on the same
-/// connection. Only call for transient errors -- see
-/// [`surface_login_failure`].
-#[allow(clippy::future_not_send)]
-async fn send_login_transient_reply<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
-    request_header: &RoutedRequestHeader,
-    code: IggyError,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let commit = current_metadata_commit(shard);
-    let reply = build_result_rejection_reply(request_header, commit, code.as_code());
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send login transient reply"
-        );
     }
 }
 
@@ -417,53 +387,6 @@ const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
         LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
         LoginRegisterError::UserInactive => EvictionReason::UserInactive,
         _ => EvictionReason::SessionError,
-    }
-}
-
-/// Reject a replicated request from an unbound transport with a typed
-/// `Eviction(NoSession)` frame: the session the client believes it has is
-/// gone, so it must register again. Pre-auth non-replicated reads get a
-/// deny Reply instead (no session exists, so nothing is evicted).
-///
-/// The SDK's reply decoder maps eviction reasons to typed errors
-/// (`NoSession` -> `Unauthenticated`), so clients fail fast with the same
-/// error the legacy server returns instead of a body-decode failure. The
-/// eviction context is best-effort off the metadata consensus (peer shards
-/// have none; zeroes are cosmetic -- the SDK only reads the reason).
-#[allow(clippy::future_not_send)]
-pub(in crate::dispatch) async fn send_unauthenticated_eviction<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let ctx = shard.plane.metadata().consensus.as_ref().map_or(
-        consensus::EvictionContext {
-            cluster: 0,
-            view: 0,
-            replica: 0,
-        },
-        consensus::EvictionContext::from_consensus,
-    );
-    let eviction = consensus::build_eviction_message(
-        ctx,
-        transport_client_id,
-        iggy_binary_protocol::EvictionReason::NoSession,
-    );
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, eviction.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send unauthenticated eviction"
-        );
     }
 }
 
@@ -552,35 +475,21 @@ async fn evict_stale_client<B, MJ, S, SB>(
     if let Some((vsr_client_id, session)) = bound {
         submit_disconnect_logout(Rc::clone(shard), vsr_client_id, session);
     }
-    let ctx = shard.plane.metadata().consensus.as_ref().map_or(
-        consensus::EvictionContext {
-            cluster: 0,
-            view: 0,
-            replica: 0,
-        },
-        consensus::EvictionContext::from_consensus,
-    );
-    let eviction = consensus::build_eviction_message(
-        ctx,
+    // The eviction itself is done and observed at this point (session
+    // dropped, `Logout` submitted). The client notice below is best-effort
+    // and logs its own send failure, so this line must not claim it.
+    warn!(
         transport_client_id,
-        iggy_binary_protocol::EvictionReason::StaleClient,
+        "evicted stale client (missed heartbeat); sending the eviction notice"
     );
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, eviction.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send stale-client eviction"
-        );
-    } else {
-        warn!(
-            transport_client_id,
-            "evicted stale client (missed heartbeat)"
-        );
-    }
+    send_eviction(
+        shard,
+        transport_client_id,
+        transport_client_id,
+        EvictionReason::StaleClient,
+        "stale_client_eviction",
+    )
+    .await;
 }
 
 /// Answer a backup's forwarded `Register` from the node it named primary.
@@ -1180,17 +1089,14 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
         );
         let commit = current_metadata_commit(shard);
         let reply = build_empty_reply(request.header(), transport_client_id, 0, commit);
-        if let Err(error) = shard
-            .bus
-            .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-            .await
-        {
-            warn!(
-                transport_client_id,
-                error = %error,
-                "failed to send unbound logout reply"
-            );
-        }
+        send_host_frame(
+            &shard.bus,
+            transport_client_id,
+            reply.into_generic().into_frozen(),
+            FrameChannel::Reply,
+            "unbound_logout_reply",
+        )
+        .await;
         return;
     };
 
@@ -1210,17 +1116,14 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
                 commit,
                 transient_logout_code(&error).as_code(),
             );
-            if let Err(send_error) = shard
-                .bus
-                .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-                .await
-            {
-                warn!(
-                    transport_client_id,
-                    error = %send_error,
-                    "failed to send logout deny reply"
-                );
-            }
+            send_host_frame(
+                &shard.bus,
+                transport_client_id,
+                reply.into_generic().into_frozen(),
+                FrameChannel::TypedDeny,
+                "logout_transient_deny",
+            )
+            .await;
             return;
         }
     };
@@ -1228,17 +1131,14 @@ pub(in crate::dispatch) async fn handle_logout_request<B, MJ, S, SB>(
     sessions.borrow_mut().remove_connection(transport_client_id);
 
     let reply = build_empty_reply(request.header(), vsr_client_id, session, commit);
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            "failed to send logout reply"
-        );
-    }
+    send_host_frame(
+        &shard.bus,
+        transport_client_id,
+        reply.into_generic().into_frozen(),
+        FrameChannel::Reply,
+        "logout_reply",
+    )
+    .await;
 }
 
 /// Preserve the client identity when a Logout may already have entered the
@@ -1281,11 +1181,12 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             transport_client_id,
             "rejecting login: body has no decodable version prefix"
         );
-        send_login_eviction(
+        send_eviction(
             shard,
             transport_client_id,
             vsr_client_id,
             EvictionReason::MalformedLogin,
+            "login_rejection",
         )
         .await;
         return;
@@ -1298,11 +1199,12 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             sdk_version = %version_info.sdk_version,
             "rejecting login: incompatible protocol version"
         );
-        send_login_eviction(
+        send_eviction(
             shard,
             transport_client_id,
             vsr_client_id,
             EvictionReason::IncompatibleProtocol,
+            "login_rejection",
         )
         .await;
         return;
@@ -1395,11 +1297,12 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
             transport_client_id,
             "rejecting register request: invalid credentials"
         );
-        send_login_eviction(
+        send_eviction(
             shard,
             transport_client_id,
             request.header().client,
             EvictionReason::InvalidCredentials,
+            "login_rejection",
         )
         .await;
         return;
@@ -1409,59 +1312,14 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
         transport_client_id,
         "rejecting register request with unsupported payload shape"
     );
-    send_login_eviction(
+    send_eviction(
         shard,
         transport_client_id,
         request.header().client,
         EvictionReason::MalformedLogin,
+        "login_rejection",
     )
     .await;
-}
-
-/// Best-effort login-rejection eviction. Terminal one-way frame; a gone
-/// connection has nothing to recover, so the send error is logged and
-/// dropped. Consensus context (cluster/view/replica) is stamped on the
-/// metadata shard and zeroed elsewhere -- the SDK only reads the reason,
-/// plus the protocol window on `IncompatibleProtocol`.
-#[allow(clippy::future_not_send)]
-pub(in crate::dispatch) async fn send_login_eviction<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
-    vsr_client_id: u128,
-    reason: EvictionReason,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let ctx = shard.plane.metadata().consensus.as_ref().map_or(
-        EvictionContext {
-            cluster: 0,
-            view: 0,
-            replica: 0,
-        },
-        EvictionContext::from_consensus,
-    );
-    let eviction = match reason {
-        EvictionReason::IncompatibleProtocol => {
-            build_incompatible_protocol_eviction_message(ctx, vsr_client_id)
-        }
-        _ => build_eviction_message(ctx, vsr_client_id, reason),
-    };
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, eviction.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            error = %error,
-            reason = ?reason,
-            "failed to send login eviction"
-        );
-    }
 }
 
 #[cfg(test)]

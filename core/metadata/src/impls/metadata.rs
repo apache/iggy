@@ -736,8 +736,13 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// policy.
     superblock_write_failures: Cell<u64>,
     superblock_retry_after_micros: Cell<u64>,
-    /// State machine - lives on all shards
-    pub mux_stm: M,
+    /// State machine - lives on all shards.
+    ///
+    /// Shared so shard 0's bootstrap can keep a clone alive past every
+    /// fallible step that owns this struct: the peer shards read through
+    /// handles minted off this writer, and dropping it makes their
+    /// `LeftRight::read` panic. See `server/src/boot::shard_main`.
+    pub mux_stm: Rc<M>,
     pub allocator: ConsensusGroupAllocator,
     /// Snapshot coordinator - present when persistent checkpointing is configured.
     pub coordinator: Option<SnapshotCoordinator<M>>,
@@ -809,9 +814,10 @@ where
         journal: Option<J>,
         snapshot: Option<S>,
         superblock: Option<Rc<SB>>,
-        mux_stm: M,
+        mux_stm: impl Into<Rc<M>>,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        let mux_stm = mux_stm.into();
         let allocator =
             ConsensusGroupAllocator::new(mux_stm.streams().highest_partition_consensus_group_id());
         let coordinator = data_dir.map(|dir| SnapshotCoordinator::new(dir, IggySnapshot::create));
@@ -2860,7 +2866,7 @@ where
                 // Normal op: apply SM, commit_reply. `Err` is decode/corruption
                 // only; a business rejection commits as a deterministic no-op
                 // whose `code` rides the reply body, replayed on retry.
-                let apply = gated_apply(&self.mux_stm, prepare).unwrap_or_else(|err| {
+                let apply = gated_apply(&*self.mux_stm, prepare).unwrap_or_else(|err| {
                     panic!(
                         "on_ack: committed metadata op={} failed to apply: {err}",
                         prepare_header.op
@@ -3271,7 +3277,7 @@ where
         // (see the phantom-op comment at the call site).
         let client_table = self.client_table.borrow().to_snapshot();
         let checksum = match coordinator.persist_snapshot(
-            &self.mux_stm,
+            &*self.mux_stm,
             snap_op,
             created_at,
             Some(client_table),
@@ -3632,7 +3638,7 @@ where
             // table, while their state-machine effects still have to replay
             // (the snapshot sits at a lower op).
             apply_committed_prepare(
-                &self.mux_stm,
+                &*self.mux_stm,
                 &self.client_table,
                 self.client_table_mutation_allowed(header.op),
                 |operation| self.fire_commit_notifier(operation),
