@@ -655,21 +655,26 @@ view_probe_attempts_max = 5
 # remaining window from the serving peer (duration). Repair frames are
 # fire-and-forget over the lossy bus, so a session with no retry wedges forever
 # on a single dropped frame. Paces both the metadata and partition repair loops;
-# must be nonzero.
-#
-# Also how long a gap-stopped partition backup waits before OPENING a repair
-# session: the shard's tick sweep arms repair once a group has held committed
-# ops it cannot walk to for this long, so shortening the interval makes a
-# replication hole recover sooner and lengthening it delays that recovery, on
-# top of the stalled-stream retry above.
-#
-# The second use is floored at 50 consensus ticks (500ms at the 10ms tick), so
-# values under that still arm no sooner: one tick of lag is ordinary
-# pipelining, and repair against it would fire on healthy traffic. Repair
-# latency for a gap is therefore max(this, 500ms) plus up to one tick of sweep
-# granularity, and the 1s default arms at ~1s. The stalled-stream retry keeps
-# following the configured value with no floor of its own.
+# must be nonzero. Paces streams that are already OPEN only: how long a hole
+# waits before one is opened for it is repair_gap_debounce_interval below.
 repair_retry_interval = "1s"
+
+# How long a partition backup must hold committed ops it cannot walk to before
+# the shard's tick sweep opens a repair session for it (duration). The
+# level-triggered floor under every edge-triggered arming site, which a produce
+# stream can starve; must be nonzero.
+#
+# Floored at 50 consensus ticks (500ms at the 10ms tick), so values under that
+# arm no sooner: one tick of lag is ordinary pipelining, and repair against it
+# would fire on healthy traffic.
+#
+# Recovery latency for one hole is max(this, 500ms) plus up to one tick of sweep
+# granularity. Under a correlated fault the sweep opens at most 3 sessions per
+# tick and holds at most 8 at once, so the Nth group waiting on this shard adds
+# ceil(N / 3) ticks on top, and more while sessions are already in flight. That
+# cap is what keeps a node-wide rejoin from putting every group's repair stream
+# on one serving peer at once.
+repair_gap_debounce_interval = "1s"
 
 # Prepares a peer serves per repair round before the requester walks to the next
 # chunk (integer). Each frame rides the per-peer message-bus queue, so this must

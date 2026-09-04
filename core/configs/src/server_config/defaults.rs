@@ -112,6 +112,11 @@ impl Default for ClusterConfig {
                 .repair_retry_interval
                 .parse()
                 .unwrap(),
+            repair_gap_debounce_interval: SERVER_CONFIG
+                .cluster
+                .repair_gap_debounce_interval
+                .parse()
+                .unwrap(),
             repair_chunk_max: SERVER_CONFIG.cluster.repair_chunk_max as usize,
             nodes: SERVER_CONFIG
                 .cluster

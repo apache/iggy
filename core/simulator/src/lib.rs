@@ -5171,36 +5171,6 @@ mod partition_repair_driver_tests {
     /// commits just collects transient rejections and the group goes quiet.
     const TICKS_PER_SEND: usize = 4;
 
-    /// What the healthy run saw of the backup's commit lag, sampled per tick.
-    ///
-    /// Lag alone is what a naive detector reads as a gap, so the run has to
-    /// record how much of it there was AND whether the op past the frontier was
-    /// resident each time, rather than assert the lag away.
-    #[derive(Default)]
-    struct LagObservations {
-        samples: u32,
-        resident_samples: u32,
-        longest_run: u32,
-        current_run: u32,
-    }
-
-    impl LagObservations {
-        /// Fold one tick's view of `replica`'s commit frontier.
-        fn observe(&mut self, sim: &Simulator, replica: u8, namespace: IggyNamespace) {
-            let (_, _, commit_min, commit_max) = group_state(sim, replica, namespace);
-            if commit_min >= commit_max {
-                self.current_run = 0;
-                return;
-            }
-            self.current_run += 1;
-            self.longest_run = self.longest_run.max(self.current_run);
-            self.samples += 1;
-            if journal_holds(sim, replica, namespace, commit_min + 1) {
-                self.resident_samples += 1;
-            }
-        }
-    }
-
     /// Ops the healthy run must have committed for its verdict to mean anything.
     /// A produce's round trip is four one-way hops plus tick granularity, so this
     /// network commits on the order of one op per fifteen ticks however hard the
@@ -5217,6 +5187,27 @@ mod partition_repair_driver_tests {
     /// the drain, kept under `NORMAL_HEARTBEAT_TICKS` so an election cannot be
     /// the healer.
     const STRAND_QUIET_STEPS: usize = 300;
+
+    /// Defines this test's `withhold_one_prepare` chain hook over the statics it
+    /// names: swallow the FIRST partition prepare for `$namespace`, once, and
+    /// record its op in `$withheld_op`.
+    ///
+    /// A macro because link hooks are bare `fn` pointers, so the body cannot
+    /// capture, and the statics must stay per-test: the sibling tests in this
+    /// binary run in parallel and would otherwise share one fault. The statics
+    /// are still declared in each test, where its fault setup is read.
+    macro_rules! withhold_one_prepare {
+        ($namespace:ident, $withheld_op:ident) => {
+            fn withhold_one_prepare(packet: &Packet) -> bool {
+                let Some(header) = prepare_for(packet, $namespace.load(Ordering::Relaxed)) else {
+                    return false;
+                };
+                $withheld_op
+                    .compare_exchange(0, header.op, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            }
+        };
+    }
 
     /// The partition-plane prepare a packet carries, if it carries one for
     /// `group`.
@@ -5326,7 +5317,7 @@ mod partition_repair_driver_tests {
             .plane
             .partitions()
             .get_by_ns(&namespace)
-            .is_some_and(|partition| partition.log.journal().inner.header_by_op(op).is_some())
+            .is_some_and(|partition| partition.log.journal().inner.holds_op(op))
     }
 
     fn gap_drops(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> u64 {
@@ -5369,15 +5360,7 @@ mod partition_repair_driver_tests {
         static GAP_NS: AtomicU64 = AtomicU64::new(0);
         static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
 
-        /// Chain link 1 -> 2: swallow the first partition prepare, once.
-        fn withhold_one_prepare(packet: &Packet) -> bool {
-            let Some(header) = prepare_for(packet, GAP_NS.load(Ordering::Relaxed)) else {
-                return false;
-            };
-            WITHHELD_OP
-                .compare_exchange(0, header.op, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        }
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
 
         /// Primary -> 2: withhold this group's commit heartbeats, so the
         /// `Advanced` backstop can never run, and withhold retransmits of the
@@ -5482,14 +5465,7 @@ mod partition_repair_driver_tests {
         static GAP_NS: AtomicU64 = AtomicU64::new(0);
         static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
 
-        fn withhold_one_prepare(packet: &Packet) -> bool {
-            let Some(header) = prepare_for(packet, GAP_NS.load(Ordering::Relaxed)) else {
-                return false;
-            };
-            WITHHELD_OP
-                .compare_exchange(0, header.op, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        }
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
 
         fn starve_commit_edge(packet: &Packet) -> bool {
             let group = GAP_NS.load(Ordering::Relaxed);
@@ -5608,10 +5584,7 @@ mod partition_repair_driver_tests {
 
         // Sustained, not bursty: a produce every tick, for several debounce
         // intervals, so the sweep gets many chances to arm against ordinary
-        // pipelining. The backup's lag is sampled per tick, and the run asserts
-        // it went somewhere, so a green result cannot come from a workload that
-        // never loaded the group.
-        let mut observed = LagObservations::default();
+        // pipelining.
         for tick in 0..LOAD_TICKS {
             if tick % TICKS_PER_SEND == 0 {
                 let msg =
@@ -5619,11 +5592,9 @@ mod partition_repair_driver_tests {
                 sim.submit_request(client.client_id(), 0, msg.into_generic());
             }
             sim.step();
-            observed.observe(&sim, 1, namespace);
         }
         for _ in 0..QUIET_STEPS {
             sim.step();
-            observed.observe(&sim, 1, namespace);
         }
 
         let committed = group_state(&sim, 1, namespace).2;
@@ -5633,28 +5604,17 @@ mod partition_repair_driver_tests {
             "the backup committed only {committed} ops across {sends} sends, so the \
              sweep was never driven over a loaded group"
         );
-        // Lag is RECORDED, not forbidden. Asserting it away would make the
-        // repair-request assertion below unfalsifiable, since
-        // `partition_is_gap_stopped` needs `commit_min < commit_max` to fire at
-        // all. What must hold is that every lag this run saw was backed by a
-        // RESIDENT next op -- a walk waiting to run, not a hole -- which is the
-        // distinction a naive detector would miss.
+        // No per-tick lag sampling: `sim.step()` runs the pumps to quiescence, so
+        // every sample lands AFTER the tick whose walk backstop drained whatever
+        // the step's produce left, and a run that asserted something about those
+        // samples would be asserting over an empty set. The commit lag a naive
+        // detector misreads lives inside a step, and it is pinned where it can
+        // be held still: exhaustively in `gap_detector_tests`, and end to end by
+        // the walk-starvation run in this module, which strands a backup in
+        // exactly that state and proves nothing arms repair over it.
         //
-        // On a two-replica group the backup keeps pace and the tick's own
-        // walk-stalled backstop drains what little lag a step leaves, so this
-        // usually samples none and the check costs nothing. It is the guard for
-        // when that stops being true, not the proof: the predicate itself is
-        // pinned exhaustively by `gap_detector_tests`, and what this run adds is
-        // that the DRIVER sends no repair over a live, loaded group.
-        assert_eq!(
-            observed.samples,
-            observed.resident_samples,
-            "the backup lagged with a MISSING next op on {} of {} sampled ticks, so a \
-             no-loss two-replica run produced a real hole and the repair assertion \
-             below would be testing loss recovery instead of false positives",
-            observed.samples - observed.resident_samples,
-            observed.samples
-        );
+        // What this run adds is the part only a live group can show: a loaded,
+        // lossless cluster produces no repair traffic at all.
         for replica in 0..replica_count {
             let (status, view, commit_min, commit_max) = group_state(&sim, replica, namespace);
             assert_eq!(
@@ -5680,11 +5640,8 @@ mod partition_repair_driver_tests {
         assert_eq!(
             REPAIR_REQUESTS.load(Ordering::Relaxed),
             0,
-            "the tick driver requested repair on a healthy group; its gap predicate \
-             is reading ordinary commit lag as a journal hole (backup lagged on {} of \
-             the sampled ticks, longest run {})",
-            observed.samples,
-            observed.longest_run
+            "the tick driver requested repair on a healthy group across {sends} sends; \
+             its gap predicate is reading ordinary commit lag as a journal hole"
         );
     }
 
@@ -5695,15 +5652,7 @@ mod partition_repair_driver_tests {
         static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
         static WITHHELD_DONES: AtomicU64 = AtomicU64::new(0);
 
-        /// Chain link 1 -> 2: swallow the first partition prepare, once.
-        fn withhold_one_prepare(packet: &Packet) -> bool {
-            let Some(header) = prepare_for(packet, GAP_NS.load(Ordering::Relaxed)) else {
-                return false;
-            };
-            WITHHELD_OP
-                .compare_exchange(0, header.op, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        }
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
 
         /// Primary -> 2: withhold every direct prepare (live ones ride the
         /// chain, so this starves only retransmit heals), the group's commit
@@ -5866,17 +5815,9 @@ mod partition_repair_driver_tests {
         static GAP_NS: AtomicU64 = AtomicU64::new(0);
         static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
 
-        /// Chain link 1 -> 2: swallow the first partition prepare, once. Every
-        /// prepare after it reaches the backup's gap check and is destroyed
-        /// there, which is what the counter records.
-        fn withhold_one_prepare(packet: &Packet) -> bool {
-            let Some(header) = prepare_for(packet, GAP_NS.load(Ordering::Relaxed)) else {
-                return false;
-            };
-            WITHHELD_OP
-                .compare_exchange(0, header.op, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        }
+        // Every prepare after the withheld one reaches the backup's gap check
+        // and is destroyed there, which is what the counter records.
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
 
         let (mut sim, client) = cluster(0x5EED_0237);
         let namespace = IggyNamespace::new(1, 1, 0);

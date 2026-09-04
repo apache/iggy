@@ -113,7 +113,7 @@
 //! reached quorum (`consensus::retransmit_targets` skips entries with
 //! `ok_quorum_received`), so the backup gap-stops. `tick_partitions` opens a
 //! repair session for it: its level-triggered detector arms once a partition has
-//! been gap-stopped for the repair retry interval, independently of the
+//! been gap-stopped for `[cluster] repair_gap_debounce_interval`, independently of the
 //! edge-triggered arming sites (`StartView` adoption, the commit heartbeat, the
 //! post-transfer tail), whose edges a produce stream can starve. A repair range
 //! the primary has already evicted escalates to partition state transfer. The park policy
@@ -127,11 +127,15 @@
 //! materialization barrier this module used to promise, and the barrier is gone
 //! (see above) while these are not:
 //!
-//! A shed prepare is not retransmitted once its op reached quorum, but it is not
-//! stranded until a view change. A later `CommitMessage` that advances the
-//! backup's frontier runs `maybe_request_partition_repair`; an evicted repair
-//! range escalates to partition state transfer. The park policy still avoids
-//! manufacturing that recovery work unless a byte budget is already spent.
+//! A shed prepare is not retransmitted once its op reached quorum, and the
+//! commit heartbeat is no answer to it: a follower advances `commit_max` from
+//! every prepare header before the gap check drops the frame, so under produce
+//! the heartbeat lands as `Accepted` and the backstop inside that branch never
+//! runs. What closes it is the level-triggered sweep above, which means the
+//! residual exposure is its debounce (`[cluster] repair_gap_debounce_interval`,
+//! floored at 500ms) plus the arm cap under a correlated fault, during which the
+//! backup serves a short prefix. The park policy still avoids manufacturing that
+//! recovery work unless a byte budget is already spent.
 //!
 //! TODO(krishna): `serves_committed_incarnation` and the park stamp both call
 //! `Streams::created_revision_for_namespace`, now on the per-request fence path.

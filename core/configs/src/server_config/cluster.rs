@@ -170,6 +170,14 @@ fn default_repair_retry_interval() -> IggyDuration {
     SERVER_CONFIG.cluster.repair_retry_interval.parse().unwrap()
 }
 
+fn default_repair_gap_debounce_interval() -> IggyDuration {
+    SERVER_CONFIG
+        .cluster
+        .repair_gap_debounce_interval
+        .parse()
+        .unwrap()
+}
+
 /// serde fallback for configs written before the field existed; the value
 /// itself lives in `core/server/config.toml` like every other default.
 fn default_repair_chunk_max() -> usize {
@@ -265,19 +273,27 @@ pub struct ClusterConfig {
     /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
     /// to zero) is rejected at boot.
     ///
-    /// It also sizes the partition sweep's gap debounce: how long a backup must
-    /// hold committed ops it cannot walk to before the shard OPENS a repair
-    /// session for it. That second use is floored at
-    /// `PARTITION_GAP_DEBOUNCE_TICKS_MIN` consensus ticks, so shortening the
-    /// interval below the floor does not arm repair any sooner - one tick of
-    /// lag is ordinary pipelining. Gap recovery therefore starts after
-    /// `max(this, the floor)`, while the stalled-stream retry follows the
-    /// configured value directly. The shard crate owns the floor; `config.toml`
-    /// states its value.
+    /// Paces streams that are already open only. How long a hole waits before a
+    /// stream is opened for it is `repair_gap_debounce_interval`.
     #[serde(default = "default_repair_retry_interval")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub repair_retry_interval: IggyDuration,
+    /// How long a partition backup must hold committed ops it cannot walk to
+    /// before the shard sweep OPENS a repair session for it.
+    ///
+    /// Separate from `repair_retry_interval`, which paces an already-open
+    /// stream: this one decides how long a replication hole stays open, so
+    /// raising the retry interval to quiet repair chatter must not widen it.
+    /// Floored at `PARTITION_GAP_DEBOUNCE_TICKS_MIN` consensus ticks, since one
+    /// tick of lag is ordinary pipelining and repair against it would fire on
+    /// healthy traffic; the shard crate owns the floor and `config.toml` states
+    /// its value. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
+    /// all parse to zero) is rejected at boot.
+    #[serde(default = "default_repair_gap_debounce_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub repair_gap_debounce_interval: IggyDuration,
     /// Prepares a peer serves per repair round before the requester walks to
     /// the next chunk. Each frame rides the per-peer message-bus queue, so this
     /// must stay below `message_bus.peer_queue_capacity` or a full round
@@ -1012,6 +1028,13 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         // The repair retry interval sizes a tick threshold that has to advance;
         // `0` / `disabled` / `unlimited` all collapse to zero and would wedge
         // every stalled repair stream - reject them.
+        if self.repair_gap_debounce_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.repair_gap_debounce_interval must be \
+                 nonzero (it debounces the partition sweep's repair arm)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.repair_retry_interval.get_duration().is_zero() {
             eprintln!(
                 "Invalid cluster configuration: cluster.repair_retry_interval must be nonzero \
@@ -1481,6 +1504,7 @@ mod tests {
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
             repair_retry_interval: default_repair_retry_interval(),
+            repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
             superblock_wedged_fatal_timeout: default_superblock_wedged_fatal_timeout(),
             nodes: Vec::new(),
@@ -1888,6 +1912,7 @@ mod cluster_validate_tests {
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
             repair_retry_interval: default_repair_retry_interval(),
+            repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
             superblock_wedged_fatal_timeout: default_superblock_wedged_fatal_timeout(),
             nodes,

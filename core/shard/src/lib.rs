@@ -1486,14 +1486,19 @@ where
     /// `[cluster] repair_retry_interval` at bootstrap.
     repair_retry_ticks: Cell<u32>,
 
-    /// Namespace the next partition sweep starts from: the first group a
-    /// per-tick cap turned away last pass, or 0 to start at the front.
+    /// Live gap debounce in consensus ticks: how long a partition holds a hole
+    /// before the sweep opens a repair session for it. Defaults to
+    /// [`partitions::REPAIR_RETRY_TICKS`]; the server overrides it from
+    /// `[cluster] repair_gap_debounce_interval` at bootstrap.
+    partition_gap_debounce_ticks: Cell<u32>,
+
+    /// Namespace the next partition sweep starts from: the first group the
+    /// per-tick WALK budget turned away last pass, `None` to start at the front.
     ///
     /// The sweep visits namespaces in `BTreeMap` order, so without a carried
-    /// cursor the leading groups would spend the whole per-tick budget on every
-    /// pass and the tail would never be reached. See
-    /// [`rotate_sweep_to_cursor`].
-    partition_sweep_cursor: Cell<u64>,
+    /// cursor the leading groups would spend the whole budget on every pass and
+    /// the tail would never be reached. See [`rotate_sweep_to_cursor`].
+    partition_walk_cursor: Cell<Option<IggyNamespace>>,
 
     /// Consecutive metadata superblock write failures tolerated before the
     /// process fail-stops. Defaults to 0 (disabled) so the simulator and tests
@@ -1676,7 +1681,8 @@ where
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
-            partition_sweep_cursor: Cell::new(0),
+            partition_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
+            partition_walk_cursor: Cell::new(None),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
@@ -1689,6 +1695,14 @@ where
     /// tests keep the compile-time [`partitions::REPAIR_RETRY_TICKS`] default.
     pub fn set_repair_retry_ticks(&self, ticks: u32) {
         self.repair_retry_ticks.set(ticks);
+    }
+
+    /// Override the partition sweep's gap debounce (consensus ticks) from
+    /// configuration. Called once per shard at bootstrap; the simulator and
+    /// tests keep the compile-time [`partitions::REPAIR_RETRY_TICKS`] default.
+    /// [`PARTITION_GAP_DEBOUNCE_TICKS_MIN`] still floors whatever is set.
+    pub fn set_partition_gap_debounce_ticks(&self, ticks: u32) {
+        self.partition_gap_debounce_ticks.set(ticks);
     }
 
     /// Arm the superblock fail-stop bound (consecutive write failures).
@@ -2123,7 +2137,8 @@ where
             partition_artifact_len_max: Cell::new(PARTITION_ARTIFACT_LEN_DEFAULT),
             repair_chunk_max: Cell::new(REPAIR_CHUNK_MAX),
             repair_retry_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
-            partition_sweep_cursor: Cell::new(0),
+            partition_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
+            partition_walk_cursor: Cell::new(None),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
@@ -2424,16 +2439,14 @@ where
                     self.discard_parked_partition_frames(namespace);
                     self.metrics.record_partition_removed();
                     confirmed_remove = true;
-                    if let Some(mut partition) = removed {
+                    if let Some(partition) = removed {
                         // Tail of the gap-drop count. The tick sweep drains it
-                        // per pass, but `get_mut_by_ns` stops answering the
-                        // moment the reconciler tombstones the namespace, so
-                        // whatever the last pass before the tombstone left
-                        // would go to the floor with the partition value.
-                        let gap_drops = partition.take_prepare_gap_drops();
-                        if gap_drops > 0 {
-                            self.metrics.record_partition_prepare_gap_drops(gap_drops);
-                        }
+                        // per pass, but `get_by_ns` stops answering the moment
+                        // the reconciler tombstones the namespace, so whatever
+                        // the last pass before the tombstone left would go to
+                        // the floor with the partition value.
+                        self.metrics
+                            .record_partition_prepare_gap_drops(partition.take_prepare_gap_drops());
                     } else {
                         tracing::trace!(
                             shard = self_shard_id,
@@ -6848,15 +6861,16 @@ where
         );
         let partitions = self.plane.partitions();
         let repair_retry_ticks = self.repair_retry_ticks.get();
+        let gap_debounce_ticks = self.partition_gap_debounce_ticks.get();
         // Fan out over every group (each partition's heartbeat/retransmit timer
         // must advance), so the keyed single-namespace lookup the control-frame
         // handlers use does not apply here. The namespaces are snapshotted into
         // the pump's owned scratch (as `process_loopback` does) so no
         // partitions-plane borrow is held across the tick `.await`.
         namespace_scratch.extend(partitions.namespaces().copied());
-        // Resume where the last sweep ran out of per-tick budget, so the caps
-        // below spread over every group instead of replaying the same prefix.
-        rotate_sweep_to_cursor(namespace_scratch, self.partition_sweep_cursor.get());
+        // Resume where the last sweep ran out of walk budget, so the cap below
+        // spreads over every group instead of replaying the same prefix.
+        rotate_sweep_to_cursor(namespace_scratch, self.partition_walk_cursor.get());
 
         // Pre-pass: issue every group's pending superblock write CONCURRENTLY.
         // A cluster-wide view change makes every group on this shard need one in
@@ -6916,39 +6930,46 @@ where
         // mid-sweep is seen on the next tick, the same latency a capped arm
         // already accepts.
         let mut transfers_inflight: Option<usize> = None;
+        // Live repair sessions on this shard, counted the same way and for the
+        // same reason: the scan borrows every partition, so it runs once per
+        // sweep and only when a group is due.
+        let mut repairs_inflight: Option<usize> = None;
         // Repair sessions this sweep has opened, against
         // `PARTITION_REPAIR_ARMS_PER_TICK_MAX`.
         let mut repair_arms = 0usize;
         // Commit walks this sweep has run, against
         // `PARTITION_WALKS_PER_TICK_MAX`.
         let mut walks = 0usize;
-        // First group either cap turned away, which becomes the next sweep's
-        // starting point. Recorded per SWEEP, not per group: the cursor only
-        // has to name where the budget ran out, and every group after it is
-        // reached on the next pass by the rotation above.
+        // First group the WALK budget turned away, which becomes the next
+        // sweep's starting point. Recorded per SWEEP, not per group: the cursor
+        // only has to name where the budget ran out, and every group after it
+        // is reached on the next pass by the rotation above.
         //
-        // It always advances: both budgets are fresh at the group the sweep
+        // The walk cap alone, because only its eligible set regenerates: a
+        // walked group is walk-stalled again on the next produce, so a fixed
+        // start would re-spend the budget on the same prefix forever. An ARMED
+        // group leaves the gap-stopped set for the life of its session, so the
+        // arm cap drains its own queue in namespace order with no cursor, and
+        // letting an arm deferral move this one would pull the walk's resume
+        // point backwards and break the `ceil(groups / cap)` bound below.
+        //
+        // It always advances: the walk budget is fresh at the group the sweep
         // starts on, so the first group can never be the deferred one, and a
         // cursor that stood still would re-skip the same tail forever.
-        let mut deferred_cursor: Option<u64> = None;
+        let mut walk_cursor: Option<IggyNamespace> = None;
 
         let mut fatal: Option<FatalCommit> = None;
         for namespace in namespace_scratch.drain(..) {
-            {
-                // Ahead of the fence check and every `continue` below: the
-                // count is the only record those prepares existed, and a
-                // partition that fences here never ticks again.
-                let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
-                    continue;
-                };
-                let gap_drops = partition.take_prepare_gap_drops();
-                if gap_drops > 0 {
-                    self.metrics.record_partition_prepare_gap_drops(gap_drops);
-                }
-            }
             let Some(partition) = partitions.get_by_ns(&namespace) else {
                 continue;
             };
+            // Ahead of the fence check and every `continue` below: the count is
+            // the only record those prepares existed, and a partition that
+            // fences here never ticks again.
+            let gap_drops = partition.take_prepare_gap_drops();
+            if gap_drops > 0 {
+                self.metrics.record_partition_prepare_gap_drops(gap_drops);
+            }
             // A fenced partition must not tick: its consensus would emit
             // view-scoped sends for a log the cluster has already passed.
             if let Some(fault) = partition.fatal() {
@@ -7102,70 +7123,104 @@ where
             // under produce load the heartbeat lands as `Accepted` and the gap
             // wedges until an unrelated view change. Those edges stay the fast
             // path; this is the ~1s floor under them.
-            let walk_stalled = {
-                let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+            //
+            // Runs entirely on the shared borrow: the in-flight scan below reads
+            // every partition on the shard, so it must not run under a `&mut`,
+            // and `gap_ticks` is a `Cell` for exactly that reason.
+            let (walk_stalled, arm_peer) = {
+                let Some(partition) = partitions.get_by_ns(&namespace) else {
                     continue;
                 };
                 let probe = partition_gap_probe(partition);
                 let walk_stalled = partition_is_walk_stalled(&probe);
-                match drive_partition_gap_debounce(
+                // Both budgets, resolved before the debounce so a refusal keeps
+                // the group due rather than spending its arm. The in-flight
+                // count is a full scan, so it is taken only once a group is
+                // actually gap-stopped, and then once per sweep.
+                let may_arm = partition_is_gap_stopped(&probe)
+                    && repair_arms < PARTITION_REPAIR_ARMS_PER_TICK_MAX
+                    && *repairs_inflight.get_or_insert_with(|| self.partition_repairs_inflight())
+                        < PARTITION_REPAIRS_INFLIGHT_MAX;
+                let mut gap_ticks = partition.gap_ticks.get();
+                let verdict = drive_partition_gap_debounce(
                     &probe,
-                    &mut partition.gap_ticks,
-                    repair_retry_ticks,
-                    repair_arms,
-                ) {
-                    GapArm::NotDue => {}
-                    GapArm::Deferred => {
-                        deferred_cursor.get_or_insert_with(|| namespace.inner());
-                    }
+                    &mut gap_ticks,
+                    gap_debounce_ticks,
+                    may_arm,
+                );
+                partition.gap_ticks.set(gap_ticks);
+                let arm_peer = match verdict {
+                    GapArm::NotDue | GapArm::Deferred => None,
                     GapArm::Arm => {
                         let consensus = partition.consensus();
                         let self_id = consensus.replica();
-                        let peer = consensus.primary_index(consensus.view());
-                        let commit_min = consensus.commit_min();
-                        let commit_max = consensus.commit_max();
+                        let primary = consensus.primary_index(consensus.view());
+                        // A gap-stopped PRIMARY cannot ask itself, and leaving
+                        // it to warn wedged the group: no edge-triggered site
+                        // re-drives a primary's own hole, and the next op to
+                        // commit walks `advance_commit_min` into its sequential
+                        // assert. Any replica in `Normal` or `ViewChange` serves
+                        // `RequestPrepares`, and a primary's window is its
+                        // COMMITTED prefix (the suffix widening needs a pending
+                        // view log, which a settled primary has none of), so a
+                        // peer holding those ops holds them identically.
+                        //
+                        // The pick is positional, not liveness-aware: a dead
+                        // choice leaves the session re-requesting on the stall
+                        // timer, which is where a repair abandon budget (what
+                        // `burn_transfer_attempt` gives transfers) would rotate
+                        // it. Still strictly better than the warn this replaced,
+                        // which recovered nothing at all.
+                        let peer = if primary == self_id {
+                            next_transfer_peer(
+                                self_id,
+                                self_id,
+                                self.partition_consensus.replica_count,
+                                primary,
+                            )
+                        } else {
+                            primary
+                        };
                         if peer == self_id {
-                            // The primary is its own repair source, so there is
-                            // nobody to ask: the send would fail (no self entry
-                            // in the replica registry) AFTER the session was
-                            // recorded, and a session nothing can answer blocks
-                            // this detector and every edge-triggered arming site
-                            // until a view change. The accepted arm already
-                            // restarted the debounce, so the warning repeats at
-                            // its interval rather than every tick.
+                            // Solo group: the rotation had nobody to return.
+                            // Restart the debounce so this repeats at its
+                            // interval rather than every tick.
+                            partition.gap_ticks.set(0);
                             tracing::warn!(
                                 shard = self.id,
                                 namespace_raw = namespace.inner(),
-                                commit_min,
-                                commit_max,
-                                "partition primary is gap-stopped below its own commit frontier; \
-                                 repair has no peer to request from"
+                                commit_min = probe.commit_min,
+                                commit_max = probe.commit_max,
+                                "partition is gap-stopped below its own commit frontier with no \
+                                 peer to repair from"
                             );
+                            None
                         } else {
-                            tracing::debug!(
-                                shard = self.id,
-                                namespace_raw = namespace.inner(),
-                                commit_min,
-                                commit_max,
-                                peer,
-                                recovery = ?probe.recovery,
-                                "partition gap-stopped past the debounce; arming repair from the primary"
-                            );
-                            self.maybe_request_partition_repair(partition, peer).await;
-                            repair_arms += 1;
+                            Some(peer)
                         }
                     }
-                }
-                walk_stalled
+                };
+                (walk_stalled, arm_peer)
             };
+            if let Some(peer) = arm_peer {
+                let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                    continue;
+                };
+                // Logged by `maybe_request_partition_repair` at info, with the
+                // same fields plus the window it settled on.
+                self.maybe_request_partition_repair(partition, peer).await;
+                repair_arms += 1;
+                repairs_inflight = repairs_inflight.map(|inflight| inflight + 1);
+            }
 
             // Capped like the repair arm, and for the same reason: a node-wide
             // rejoin leaves every group on the shard walk-stalled in the same
             // tick, and each walk reaches a segment flush. Undebounced, though
-            // -- the predicate guarantees the walk finds at least the next op
-            // (it and `collect_committable_from_journal` read the same journal
-            // index), so it cannot spin, and a deferred group is re-evaluated
-            // unchanged on the pass that resumes at it.
+            // -- the predicate guarantees the walk finds at least the next op,
+            // so it cannot spin: `partition_is_walk_stalled` reads residency off
+            // `op_to_storage_offset` while the walk reads `headers`, and those
+            // two are written and cleared together (see `Journal::holds_op`), so
+            // a group the predicate admits has an op for the walk to take.
             if walk_stalled {
                 if walks >= PARTITION_WALKS_PER_TICK_MAX {
                     // Deferred, not dropped: this group becomes the next
@@ -7174,7 +7229,7 @@ where
                     // the leading groups would take the whole budget every
                     // pass and the tail would keep its committed ops resident
                     // indefinitely.
-                    deferred_cursor.get_or_insert_with(|| namespace.inner());
+                    walk_cursor.get_or_insert(namespace);
                 } else {
                     let config = partitions.config();
                     let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
@@ -7192,7 +7247,9 @@ where
                         commit_max = consensus.commit_max(),
                         "partition commit walk parked over resident committed ops; resuming"
                     );
-                    partition.commit_journal(config).await;
+                    partition
+                        .commit_journal_bounded(config, PARTITION_WALK_OPS_MAX)
+                        .await;
                     walks += 1;
                     // Re-read, because the aggregate above was sampled BEFORE
                     // this walk: a local commit failure fences the partition
@@ -7296,11 +7353,11 @@ where
             }
         }
 
-        // The first group a cap turned away is where the next sweep enters the
-        // group set; a sweep that turned nobody away resets to the front,
-        // since a stale cursor would keep re-entering at a point no cap chose.
-        self.partition_sweep_cursor
-            .set(deferred_cursor.unwrap_or_default());
+        // The first group the walk cap turned away is where the next sweep
+        // enters the group set; a sweep that turned nobody away resets to the
+        // front, since a stale cursor would keep re-entering at a point no cap
+        // chose.
+        self.partition_walk_cursor.set(walk_cursor);
 
         fatal
     }
@@ -7912,6 +7969,23 @@ where
     /// node-wide view change or rejoin, and capped arms reschedule on the flat
     /// retry interval, so the losers stay phase-locked and the sweep repeats
     /// every interval for the whole rejoin.
+    /// Live journal-repair sessions on this shard, for
+    /// [`PARTITION_REPAIRS_INFLIGHT_MAX`]. Same shape and same caution as
+    /// [`Self::partition_transfers_inflight`]: it borrows every partition, so
+    /// callers count BEFORE forming a `&mut`.
+    fn partition_repairs_inflight(&self) -> usize {
+        let partitions = self.plane.partitions();
+        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
+        namespaces
+            .iter()
+            .filter(|namespace| {
+                partitions
+                    .get_by_ns(namespace)
+                    .is_some_and(|partition| partition.repair.is_some())
+            })
+            .count()
+    }
+
     fn partition_transfers_inflight(&self) -> usize {
         let partitions = self.plane.partitions();
         let namespaces: Vec<_> = partitions.namespaces().copied().collect();
@@ -8170,16 +8244,7 @@ where
         if !commit_lag && head <= commit_to_op {
             return;
         }
-        let canonical_suffix = consensus
-            .with_pending_view_log(|pending| pending_covers_suffix(pending, commit_to_op, head))
-            .unwrap_or(false);
-        let missing_suffix = canonical_suffix
-            && !partition
-                .log
-                .journal()
-                .inner
-                .repaired_window_shape(commit_to_op, head)
-                .complete;
+        let missing_suffix = partition_missing_suffix(partition);
         if !commit_lag && !missing_suffix {
             return;
         }
@@ -8189,6 +8254,11 @@ where
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
         let namespace = consensus.group();
+        // Every arming site funnels here, which is why the debounce is spent
+        // here and not in the sweep: the four edge-triggered sites never touch
+        // it, so a short edge-armed repair would leave the count saturated and
+        // hand the next real gap an arm on its first tick.
+        partition.gap_ticks.set(0);
         partition.repair = Some(partitions::RepairSession {
             nonce,
             view: consensus.view(),
@@ -9482,13 +9552,32 @@ fn repair_serve_ceiling(requested_to_op: u64, commit_max: u64, head: u64) -> u64
 /// on the following pass rather than queueing behind the same prefix.
 const PARTITION_REPAIR_ARMS_PER_TICK_MAX: usize = 3;
 
+/// Live repair sessions this shard will hold at once.
+///
+/// The concurrency ceiling the rate cap above is not: without it a node-wide
+/// rejoin puts every group's stream in flight within `groups / arms` ticks, and
+/// each one is a window the SERVING peer walks on its own pump, so the cost
+/// lands on a node that has nothing wrong with it. Sized at twice
+/// [`IggyShard::PARTITION_TRANSFERS_INFLIGHT_MAX`]: a repair streams journal
+/// entries the peer already holds resident, where a transfer reads and hashes
+/// whole segments, so more of them fit in the same serving budget.
+///
+/// Over-cap groups stay gap-stopped with their debounce satisfied, so they arm
+/// as sessions complete.
+const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
+
 /// Commit walks the partition tick sweep will RUN per pass.
 ///
 /// Same correlated-fan-out argument as the repair arm, and the walk is the
 /// costlier half: `commit_journal` reaches `commit_messages`, which flushes a
-/// segment and fsyncs under `enforce_fsync`. Run serially over every group on
-/// the shard in one tick body, a node-wide rejoin exceeds the view-change
-/// escalation window the superblock pre-pass already chunks to stay inside.
+/// segment and fsyncs under `enforce_fsync`.
+///
+/// The two caps together are what bound the tick: this one bounds how many
+/// groups a sweep walks, [`PARTITION_WALK_OPS_MAX`] bounds how far each walk
+/// goes, and the product is the sweep's worst case. Deliberately NOT the
+/// superblock pre-pass's number: that one runs its fan-out CONCURRENTLY under
+/// `join_all` and drains every group in the same body, while these walks are
+/// serial and what is over budget waits for the next tick.
 ///
 /// Capping cannot starve a partition: the walk carries no debounce counter and
 /// clears its own predicate (a walk either advances `commit_min` or fences the
@@ -9497,39 +9586,49 @@ const PARTITION_REPAIR_ARMS_PER_TICK_MAX: usize = 3;
 /// `ceil(groups / cap)` ticks however many groups are owed at once.
 const PARTITION_WALKS_PER_TICK_MAX: usize = 16;
 
+/// Committed ops one tick-driven walk commits before yielding the pump.
+///
+/// The cap above counts walks, not work: `collect_committable_from_journal`
+/// returns the whole resident `(commit_min, commit_max]` run and
+/// `handle_committed_entries` walks all of it without an await the pump can
+/// interleave, so after a rejoin one "walk" is the entire backlog and the
+/// heartbeat timer sits behind it.
+///
+/// The group stays walk-stalled at the op the bound stopped on, so the next
+/// sweep resumes there through the same cursor that spreads the walks
+/// themselves. Sized as a batch big enough that an idle-ish group drains in one
+/// tick and small enough that a full one cannot hold the pump for the
+/// view-change escalation window.
+const PARTITION_WALK_OPS_MAX: usize = 64;
+
 /// Floor under the gap detector's debounce, in ticks.
 ///
-/// The debounce reads `repair_retry_interval`, whose primary meaning is how
-/// long a STALLED repair stream waits before re-requesting. `duration_to_ticks`
-/// floors that at one tick, and one tick of lag is ordinary pipelining, so
-/// without a floor of its own an operator shortening the retry interval would
-/// also arm repair against a single reordered prepare.
+/// The debounce reads `[cluster] repair_gap_debounce_interval`, and
+/// `duration_to_ticks` floors that at one tick. One tick of lag is ordinary
+/// pipelining, so without a floor of its own a shortened interval would arm
+/// repair against a single reordered prepare.
 ///
 /// Public because it bounds what that operator knob can do: gap recovery starts
-/// after `max(repair_retry_interval, this)`, which the `[cluster]`
+/// after `max(repair_gap_debounce_interval, this)`, which the `[cluster]`
 /// documentation states.
 pub const PARTITION_GAP_DEBOUNCE_TICKS_MIN: u32 = 50;
-
-/// What already owns a partition's recovery, if anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryOwner {
-    /// Nothing owns it: the sweep may arm repair.
-    Nobody,
-    Repair,
-    Transfer,
-    /// A scheduled transfer re-arm counting down. Arming repair over it would
-    /// defeat its backoff, as `arm_partition_transfer` documents.
-    TransferRearm,
-}
 
 /// What the tick sweep reads off one partition to decide whether it is
 /// gap-stopped. Split out so the guards, the debounce and the per-tick cap are
 /// testable without a shard, a bus, or a journal.
+///
+/// The flags are independent readings of one instant, not states of one
+/// machine, and the exhaustive predicate test below enumerates them as such, so
+/// the lint's two-variant enums would only rename `true` and `false`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 struct GapProbe {
     normal: bool,
     transferring: bool,
-    recovery: RecoveryOwner,
+    /// Whether a repair session, a transfer, or a scheduled transfer re-arm
+    /// already owns this partition's recovery. Arming a second one would race
+    /// it, or defeat the re-arm's backoff as `arm_partition_transfer` documents.
+    recovery_owned: bool,
     commit_min: u64,
     commit_max: u64,
     /// Whether `commit_min + 1` is resident in the local journal.
@@ -9539,6 +9638,12 @@ struct GapProbe {
     /// answered without touching the journal at all. See
     /// [`partition_gap_probe`].
     next_op_resident: bool,
+    /// Whether this replica adopted suffix headers above `commit_max` whose
+    /// bodies never arrived. Its own recovery shape, disjoint from the lag
+    /// below the frontier: the group cannot gather quorum for that suffix until
+    /// the bodies land, and the only other site that notices is the single
+    /// `on_start_view` edge that adopted them. See [`partition_missing_suffix`].
+    missing_suffix: bool,
 }
 
 /// Whether this replica holds committed ops it cannot walk to, because the op
@@ -9551,17 +9656,23 @@ struct GapProbe {
 const fn partition_is_gap_stopped(probe: &GapProbe) -> bool {
     probe.normal
         && !probe.transferring
-        && matches!(probe.recovery, RecoveryOwner::Nobody)
-        && probe.commit_min < probe.commit_max
-        && !probe.next_op_resident
+        && !probe.recovery_owned
+        && ((probe.commit_min < probe.commit_max && !probe.next_op_resident)
+            || probe.missing_suffix)
 }
 
-/// The gap predicate's disjoint sibling, not its complement: everything the
-/// walk needs is resident, it just never ran (a heartbeat carrying a known
-/// commit is `Accepted`, and an idle group offers no other edge). The two split
-/// on `next_op_resident`, so they cannot both hold, but both are false whenever
-/// a shared guard fails. Not gated on `RecoveryOwner`: repair fetches bodies
-/// without walking them, so gating parks the walk all session.
+/// The gap predicate's sibling: everything the walk needs is resident, it just
+/// never ran (a heartbeat carrying a known commit is `Accepted`, and an idle
+/// group offers no other edge).
+///
+/// The two split on `next_op_resident` BELOW the commit frontier, so the
+/// classic hole and a parked walk cannot both hold. A missing suffix is the one
+/// overlap, and it is deliberate: those two windows are disjoint (the walk
+/// takes `(commit_min, commit_max]`, the fetch takes `(commit_max, head]`), and
+/// serialising them would park the resident prefix behind a fetch that needs a
+/// quorum the prefix is not blocking. Not gated on `recovery_owned` for the
+/// same reason: repair fetches bodies without walking them, so gating parks the
+/// walk all session.
 const fn partition_is_walk_stalled(probe: &GapProbe) -> bool {
     probe.normal
         && !probe.transferring
@@ -9590,18 +9701,18 @@ enum GapArm {
 /// gap check drops them, so the heartbeat lands as `Accepted` and the gap wedges
 /// until an unrelated view change.
 ///
-/// An accepted arm restarts the debounce, and a capped-out one keeps it
-/// satisfied. The asymmetry is the point: a deferred group must arm on the next
-/// pass with a slot free, while a group whose session is open has spent its
-/// debounce. Leaving it saturated would hand the NEXT gap an arm on its first
-/// tick, and a short repair reaches exactly that shape -- it completes before
-/// any sweep observes the partition with its recovery owned, so no other site
-/// resets the count.
+/// `budget_available` folds both ceilings the sweep applies, the per-tick arm
+/// rate and the live-session count. A refused arm keeps its debounce satisfied
+/// rather than starting over, so the group arms on the next pass with a slot
+/// free. Spending it is `maybe_request_partition_repair`'s job, which resets
+/// `gap_ticks` for EVERY arming site, not just this one: an edge-armed repair
+/// that completes before the next sweep would otherwise leave the count
+/// saturated and hand the next gap an arm on its first tick.
 const fn drive_partition_gap_debounce(
     probe: &GapProbe,
     gap_ticks: &mut u32,
     debounce_ticks: u32,
-    arms_this_tick: usize,
+    budget_available: bool,
 ) -> GapArm {
     if !partition_is_gap_stopped(probe) {
         *gap_ticks = 0;
@@ -9616,11 +9727,11 @@ const fn drive_partition_gap_debounce(
     if *gap_ticks < debounce_ticks {
         return GapArm::NotDue;
     }
-    if arms_this_tick >= PARTITION_REPAIR_ARMS_PER_TICK_MAX {
-        return GapArm::Deferred;
+    if budget_available {
+        GapArm::Arm
+    } else {
+        GapArm::Deferred
     }
-    *gap_ticks = 0;
-    GapArm::Arm
 }
 
 /// Rotate a sweep's namespace snapshot so it resumes at `cursor`.
@@ -9632,21 +9743,55 @@ const fn drive_partition_gap_debounce(
 /// served within `ceil(groups / cap)` sweeps.
 ///
 /// A cursor whose namespace was removed meanwhile resumes at its successor, and
-/// one past the last namespace wraps to the front. `0` means the previous sweep
-/// turned nobody away; it also happens to be the correct resume point for the
-/// lowest namespace, which sorts first either way.
-fn rotate_sweep_to_cursor(namespaces: &mut [IggyNamespace], cursor: u64) {
-    if cursor == 0 {
+/// one past the last namespace wraps to the front. `None` means the previous
+/// sweep turned nobody away.
+fn rotate_sweep_to_cursor(namespaces: &mut [IggyNamespace], cursor: Option<IggyNamespace>) {
+    let Some(cursor) = cursor else {
         return;
-    }
+    };
     debug_assert!(
         namespaces.is_sorted(),
         "the sweep snapshot must be in namespace order for the cursor to resume in it",
     );
-    let resume_at = namespaces.partition_point(|namespace| namespace.inner() < cursor);
-    if resume_at < namespaces.len() {
-        namespaces.rotate_left(resume_at);
+    // `partition_point` answers in `0..=len`, and `rotate_left(len)` is the
+    // no-op that wraps a cursor past the last namespace back to the front.
+    namespaces.rotate_left(namespaces.partition_point(|namespace| *namespace < cursor));
+}
+
+/// Whether this replica holds adopted suffix HEADERS above `commit_max` whose
+/// bodies never arrived.
+///
+/// The shape `maybe_request_partition_repair` widens its window for, read here
+/// so the sweep's detector and the arm agree by construction. A backup that
+/// adopted a `StartView` withholds its ack for those ops until the body is
+/// journaled, and the primary's retransmit is dropped by the backup gap check
+/// because adoption already advanced the sequencer to the head: nothing else
+/// delivers them, and the group wedges one op below its head.
+///
+/// Ordered cheapest-first, because it runs per group per tick: no suffix at all
+/// is one comparison, and a suffix nobody adopted is one `Option` check. Only a
+/// group that has both pays the header-vec walk.
+fn partition_missing_suffix<B, SB>(partition: &IggyPartition<B, SB>) -> bool
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    let consensus = partition.consensus();
+    let commit_max = consensus.commit_max();
+    let head = consensus.sequencer().current_sequence();
+    if head <= commit_max {
+        return false;
     }
+    let canonical_suffix = consensus
+        .with_pending_view_log(|pending| pending_covers_suffix(pending, commit_max, head))
+        .unwrap_or(false);
+    canonical_suffix
+        && !partition
+            .log
+            .journal()
+            .inner
+            .repaired_window_shape(commit_max, head)
+            .complete
 }
 
 /// Read the gap probe off a live partition.
@@ -9658,17 +9803,9 @@ where
     let consensus = partition.consensus();
     let commit_min = consensus.commit_min();
     let commit_max = consensus.commit_max();
-    // Transfer first: it supersedes repair, so naming it is the truthful
-    // diagnostic when both happen to be set.
-    let recovery = if partition.transfer.is_some() {
-        RecoveryOwner::Transfer
-    } else if partition.transfer_rearm.is_some() {
-        RecoveryOwner::TransferRearm
-    } else if partition.repair.is_some() {
-        RecoveryOwner::Repair
-    } else {
-        RecoveryOwner::Nobody
-    };
+    let recovery_owned = partition.transfer.is_some()
+        || partition.transfer_rearm.is_some()
+        || partition.repair.is_some();
     let normal = consensus.is_normal();
     let transferring = consensus.is_transferring();
     // Residency last, and only once the guards both predicates share already
@@ -9683,13 +9820,19 @@ where
             .journal()
             .inner
             .holds_op(commit_min.saturating_add(1));
+    // Same discipline, one guard deeper: the suffix test walks the header vec,
+    // so it runs only for a group that HAS an unfinished suffix and already
+    // owes nothing else.
+    let missing_suffix =
+        normal && !transferring && !recovery_owned && partition_missing_suffix(partition);
     GapProbe {
         normal,
         transferring,
-        recovery,
+        recovery_owned,
         commit_min,
         commit_max,
         next_op_resident,
+        missing_suffix,
     }
 }
 
@@ -10933,16 +11076,32 @@ mod sweep_scheduler_tests {
     //!
     //! The caps exist so a node-wide rejoin cannot put every group's walk (each
     //! reaching a segment flush) into one tick body. They are only ACCEPTABLE
-    //! because the sweep resumes where the budget ran out: the snapshot is in
-    //! ascending namespace order, so a fixed start would spend every pass on the
-    //! same leading groups and leave the tail holding committed ops it can never
-    //! walk to.
+    //! because the sweep resumes where the WALK budget ran out: the snapshot is
+    //! in ascending namespace order, so a fixed start would spend every pass on
+    //! the same leading groups and leave the tail holding committed ops it can
+    //! never walk to.
+    //!
+    //! Both budgets are modelled, because they share the sweep: the arm cap
+    //! runs first and can turn groups away ahead of the walks, and the walk
+    //! fairness bound has to survive that. What keeps them independent is that
+    //! the arm cap moves no cursor, which is the property these runs pin.
 
-    use super::{IggyNamespace, PARTITION_WALKS_PER_TICK_MAX, rotate_sweep_to_cursor};
+    use super::{
+        IggyNamespace, PARTITION_REPAIR_ARMS_PER_TICK_MAX, PARTITION_WALKS_PER_TICK_MAX,
+        rotate_sweep_to_cursor,
+    };
 
     /// Comfortably past `PARTITION_WALKS_PER_TICK_MAX`, and deliberately not a
     /// multiple of it, so the wrap lands mid-snapshot on most passes.
     const GROUPS: usize = 40;
+
+    /// Every third group is gap-stopped rather than walk-stalled. The two
+    /// predicates are disjoint below the commit frontier, so a group is in one
+    /// set or the other, and this spreads the arm-capped ones through the
+    /// snapshot instead of parking them in one block.
+    const fn is_gap_stopped(partition: usize) -> bool {
+        partition.is_multiple_of(3)
+    }
 
     fn namespaces() -> Vec<IggyNamespace> {
         (0..GROUPS)
@@ -10950,44 +11109,77 @@ mod sweep_scheduler_tests {
             .collect()
     }
 
-    /// One sweep: rotate to `cursor`, walk the snapshot spending at most
-    /// `PARTITION_WALKS_PER_TICK_MAX` walks, and return the cursor the sweep
-    /// leaves behind. Models `tick_partitions` over a shard where EVERY group is
-    /// eligible on every pass, which is the shape the cap starves.
-    fn sweep(cursor: u64, served: &mut [u32]) -> u64 {
+    #[derive(Default)]
+    struct Served {
+        walks: Vec<u32>,
+        arms: Vec<u32>,
+    }
+
+    impl Served {
+        fn new() -> Self {
+            Self {
+                walks: vec![0; GROUPS],
+                arms: vec![0; GROUPS],
+            }
+        }
+    }
+
+    /// One sweep of `tick_partitions`' scheduling: rotate to the carried walk
+    /// cursor, spend both budgets in snapshot order, and answer with the cursor
+    /// this sweep leaves behind.
+    ///
+    /// `armed` is the model's stand-in for `recovery_owned`: an armed group
+    /// leaves the gap-stopped set for the life of its session, which is why the
+    /// arm cap needs no cursor of its own.
+    fn sweep(
+        cursor: Option<IggyNamespace>,
+        served: &mut Served,
+        armed: &mut [bool],
+    ) -> Option<IggyNamespace> {
         let mut snapshot = namespaces();
         rotate_sweep_to_cursor(&mut snapshot, cursor);
         let mut walks = 0;
-        let mut deferred: Option<u64> = None;
+        let mut arms = 0;
+        let mut walk_deferred = None;
         for namespace in snapshot {
+            let partition = namespace.partition_id();
+            if is_gap_stopped(partition) {
+                if armed[partition] || arms >= PARTITION_REPAIR_ARMS_PER_TICK_MAX {
+                    continue;
+                }
+                served.arms[partition] += 1;
+                armed[partition] = true;
+                arms += 1;
+                continue;
+            }
             if walks < PARTITION_WALKS_PER_TICK_MAX {
-                served[namespace.partition_id()] += 1;
+                served.walks[partition] += 1;
                 walks += 1;
             } else {
-                deferred.get_or_insert_with(|| namespace.inner());
+                walk_deferred.get_or_insert(namespace);
             }
         }
-        deferred.unwrap_or_default()
+        walk_deferred
     }
 
     #[test]
     fn given_more_eligible_groups_than_the_walk_budget_when_swept_should_reach_every_one() {
-        let mut served = vec![0u32; GROUPS];
-        let mut cursor = 0;
-        let passes = GROUPS.div_ceil(PARTITION_WALKS_PER_TICK_MAX);
+        let mut served = Served::new();
+        let mut armed = vec![false; GROUPS];
+        let mut cursor = None;
+        let walk_eligible = (0..GROUPS).filter(|p| !is_gap_stopped(*p)).count();
+        let passes = walk_eligible.div_ceil(PARTITION_WALKS_PER_TICK_MAX);
         for _ in 0..passes {
-            cursor = sweep(cursor, &mut served);
+            cursor = sweep(cursor, &mut served, &mut armed);
         }
-        let unserved: Vec<_> = served
-            .iter()
-            .enumerate()
-            .filter_map(|(partition, count)| (*count == 0).then_some(partition))
+        let unserved: Vec<_> = (0..GROUPS)
+            .filter(|partition| !is_gap_stopped(*partition) && served.walks[*partition] == 0)
             .collect();
         assert!(
             unserved.is_empty(),
-            "{} of {GROUPS} groups never had their walk run in {passes} sweeps \
-             (partitions {unserved:?}); the budget is being spent on the same \
-             leading groups every pass",
+            "{} of {walk_eligible} walk-eligible groups never had their walk run in \
+             {passes} sweeps (partitions {unserved:?}); the budget is being spent on \
+             the same leading groups every pass",
             unserved.len()
         );
     }
@@ -10996,15 +11188,21 @@ mod sweep_scheduler_tests {
     fn given_a_sustained_backlog_when_swept_should_keep_every_group_within_one_walk() {
         // Sustained, because the starvation this guards against only shows over
         // many passes: one sweep serves the head no matter how the cursor moves.
-        // Every group stays eligible throughout, so a fair scheduler owes them
-        // walks in round-robin and no group may drift a full round behind.
-        let mut served = vec![0u32; GROUPS];
-        let mut cursor = 0;
+        // Walk-eligible groups stay eligible throughout (a walked group is
+        // walk-stalled again on the next produce), so a fair scheduler owes them
+        // walks in round-robin and none may drift a full round behind.
+        let mut served = Served::new();
+        let mut armed = vec![false; GROUPS];
+        let mut cursor = None;
         for _ in 0..10 * GROUPS {
-            cursor = sweep(cursor, &mut served);
+            cursor = sweep(cursor, &mut served, &mut armed);
         }
-        let most = served.iter().max().copied().unwrap_or_default();
-        let fewest = served.iter().min().copied().unwrap_or_default();
+        let walks: Vec<u32> = (0..GROUPS)
+            .filter(|partition| !is_gap_stopped(*partition))
+            .map(|partition| served.walks[partition])
+            .collect();
+        let most = walks.iter().max().copied().unwrap_or_default();
+        let fewest = walks.iter().min().copied().unwrap_or_default();
         assert!(
             most - fewest <= 1,
             "walks are not spread evenly: one group got {most}, another {fewest}"
@@ -11012,12 +11210,38 @@ mod sweep_scheduler_tests {
     }
 
     #[test]
+    fn given_a_capped_arm_backlog_when_swept_should_arm_every_gap_stopped_group() {
+        // The arm cap carries no cursor because arming REMOVES a group from the
+        // eligible set: the front of the queue drains, so the tail is reached
+        // without one. If that ever stops holding, this run wedges.
+        let mut served = Served::new();
+        let mut armed = vec![false; GROUPS];
+        let mut cursor = None;
+        let gap_stopped = (0..GROUPS).filter(|p| is_gap_stopped(*p)).count();
+        for _ in 0..gap_stopped.div_ceil(PARTITION_REPAIR_ARMS_PER_TICK_MAX) {
+            cursor = sweep(cursor, &mut served, &mut armed);
+        }
+        let unarmed: Vec<_> = (0..GROUPS)
+            .filter(|partition| is_gap_stopped(*partition) && served.arms[*partition] == 0)
+            .collect();
+        assert!(
+            unarmed.is_empty(),
+            "gap-stopped groups {unarmed:?} never armed; the arm cap is queueing \
+             behind the same prefix and needs a cursor after all"
+        );
+        assert!(
+            served.arms.iter().all(|arms| *arms <= 1),
+            "a group armed twice while its first session was still open"
+        );
+    }
+
+    #[test]
     fn given_a_cursor_naming_a_removed_namespace_when_rotating_should_resume_at_its_successor() {
-        // The group a cap turned away can be deleted before the next sweep; the
-        // resume point is then the next namespace above it, not the front.
+        // The group the cap turned away can be deleted before the next sweep;
+        // the resume point is then the next namespace above it, not the front.
         let mut snapshot = namespaces();
         let removed = snapshot.remove(20);
-        rotate_sweep_to_cursor(&mut snapshot, removed.inner());
+        rotate_sweep_to_cursor(&mut snapshot, Some(removed));
         assert_eq!(
             snapshot.first().copied(),
             Some(IggyNamespace::new(1, 1, 21))
@@ -11027,14 +11251,14 @@ mod sweep_scheduler_tests {
     #[test]
     fn given_a_cursor_past_every_namespace_when_rotating_should_wrap_to_the_front() {
         let mut snapshot = namespaces();
-        rotate_sweep_to_cursor(&mut snapshot, IggyNamespace::new(1, 1, GROUPS).inner());
+        rotate_sweep_to_cursor(&mut snapshot, Some(IggyNamespace::new(1, 1, GROUPS)));
         assert_eq!(snapshot, namespaces());
     }
 
     #[test]
     fn given_no_deferral_last_pass_when_rotating_should_start_at_the_front() {
         let mut snapshot = namespaces();
-        rotate_sweep_to_cursor(&mut snapshot, 0);
+        rotate_sweep_to_cursor(&mut snapshot, None);
         assert_eq!(snapshot, namespaces());
     }
 }
@@ -11048,9 +11272,8 @@ mod gap_detector_tests {
     //! it off healthy traffic are the parts worth pinning.
 
     use super::{
-        GapArm, GapProbe, PARTITION_GAP_DEBOUNCE_TICKS_MIN, PARTITION_REPAIR_ARMS_PER_TICK_MAX,
-        RecoveryOwner, drive_partition_gap_debounce, partition_is_gap_stopped,
-        partition_is_walk_stalled,
+        GapArm, GapProbe, PARTITION_GAP_DEBOUNCE_TICKS_MIN, drive_partition_gap_debounce,
+        partition_is_gap_stopped, partition_is_walk_stalled,
     };
 
     const DEBOUNCE: u32 = 100;
@@ -11061,10 +11284,11 @@ mod gap_detector_tests {
         GapProbe {
             normal: true,
             transferring: false,
-            recovery: RecoveryOwner::Nobody,
+            recovery_owned: false,
             commit_min: 5,
             commit_max: 10,
             next_op_resident: false,
+            missing_suffix: false,
         }
     }
 
@@ -11077,6 +11301,16 @@ mod gap_detector_tests {
         }
     }
 
+    /// A follower level with its commit frontier that holds adopted suffix
+    /// headers whose bodies never arrived.
+    fn missing_suffix() -> GapProbe {
+        GapProbe {
+            commit_min: 10,
+            missing_suffix: true,
+            ..gap_stopped()
+        }
+    }
+
     #[test]
     fn given_a_lagging_follower_with_the_next_op_resident_when_probed_should_not_be_gap_stopped() {
         // The half that keeps the predicate honest. A follower advances
@@ -11084,11 +11318,7 @@ mod gap_detector_tests {
         // commit_max is transiently true on any pipelined tick; without the
         // journal-hole test the driver would request repair against ordinary
         // produce, on every partition, forever.
-        let healthy = GapProbe {
-            next_op_resident: true,
-            ..gap_stopped()
-        };
-        assert!(!partition_is_gap_stopped(&healthy));
+        assert!(!partition_is_gap_stopped(&walk_stalled()));
         assert!(partition_is_gap_stopped(&gap_stopped()));
     }
 
@@ -11102,37 +11332,46 @@ mod gap_detector_tests {
     }
 
     #[test]
+    fn given_adopted_suffix_headers_without_bodies_when_probed_should_be_gap_stopped() {
+        // The shape a commit-frontier test alone misses: both marks sit below
+        // the head, so there is no lag to see, and the only other site that
+        // notices is the single `on_start_view` edge that adopted the headers.
+        // Left out, that class hangs until an unrelated view change.
+        assert!(partition_is_gap_stopped(&missing_suffix()));
+        assert!(
+            !partition_is_gap_stopped(&GapProbe {
+                missing_suffix: false,
+                ..missing_suffix()
+            }),
+            "a caught-up replica with a complete suffix has nothing to repair"
+        );
+    }
+
+    #[test]
     fn given_a_replica_outside_normal_status_when_probed_should_not_be_gap_stopped() {
         // A view change owns the log while it runs, and `maybe_request_partition_repair`
         // refuses outside Normal anyway; arming here would only burn a nonce.
-        let electing = GapProbe {
-            normal: false,
-            ..gap_stopped()
-        };
-        assert!(!partition_is_gap_stopped(&electing));
-
-        let installing = GapProbe {
-            transferring: true,
-            ..gap_stopped()
-        };
-        assert!(!partition_is_gap_stopped(&installing));
+        for probe in [gap_stopped(), missing_suffix()] {
+            assert!(!partition_is_gap_stopped(&GapProbe {
+                normal: false,
+                ..probe
+            }));
+            assert!(!partition_is_gap_stopped(&GapProbe {
+                transferring: true,
+                ..probe
+            }));
+        }
     }
 
     #[test]
     fn given_recovery_already_owned_when_probed_should_not_be_gap_stopped() {
-        for owner in [
-            RecoveryOwner::Repair,
-            RecoveryOwner::Transfer,
-            RecoveryOwner::TransferRearm,
-        ] {
-            let owned = GapProbe {
-                recovery: owner,
-                ..gap_stopped()
-            };
-            assert!(
-                !partition_is_gap_stopped(&owned),
-                "{owner:?} owns the recovery; a second session would race it"
-            );
+        // A session, a transfer, or a scheduled transfer re-arm all own the
+        // recovery; a second one would race it or defeat the re-arm's backoff.
+        for probe in [gap_stopped(), missing_suffix()] {
+            assert!(!partition_is_gap_stopped(&GapProbe {
+                recovery_owned: true,
+                ..probe
+            }));
         }
     }
 
@@ -11142,45 +11381,45 @@ mod gap_detector_tests {
         let mut gap_ticks = 0;
         for tick in 1..DEBOUNCE {
             assert_eq!(
-                drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, 0),
+                drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, true),
                 GapArm::NotDue,
                 "armed at tick {tick}, before the debounce elapsed"
             );
         }
         assert_eq!(
-            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, 0),
+            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, true),
             GapArm::Arm
         );
     }
 
     #[test]
-    fn given_an_accepted_arm_when_a_second_gap_opens_should_serve_a_fresh_debounce() {
-        // Back-to-back short repairs: the session opened below completes before
-        // the next sweep runs, so `repair_finished` clears it and that sweep
-        // `continue`s past this detector entirely. No tick ever observes the
-        // partition with its recovery owned, which is the only other place the
-        // count is reset -- so the arm itself has to be what spends it, or the
-        // second gap arms on its first tick with no debounce at all.
+    fn given_an_armed_repair_when_a_second_gap_opens_should_serve_a_fresh_debounce() {
+        // Back-to-back short repairs. The session `maybe_request_partition_repair`
+        // opens completes before the next sweep, so `repair_finished` clears it
+        // and that sweep `continue`s past this detector: no tick ever observes
+        // the partition with its recovery owned, and the reset inside the
+        // arming site is the only thing that spends the count. Modelled here,
+        // because a saturated count arms the second gap on its first tick.
         let probe = gap_stopped();
         let mut gap_ticks = 0;
         for _ in 1..DEBOUNCE {
-            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, 0);
+            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, true);
         }
         assert_eq!(
-            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, 0),
+            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, true),
             GapArm::Arm
         );
-        assert_eq!(gap_ticks, 0, "an accepted arm must spend its debounce");
+        gap_ticks = 0;
 
         for tick in 1..DEBOUNCE {
             assert_eq!(
-                drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, 0),
+                drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, true),
                 GapArm::NotDue,
                 "the second gap armed at tick {tick}, inheriting the first one's count"
             );
         }
         assert_eq!(
-            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, 0),
+            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, true),
             GapArm::Arm
         );
     }
@@ -11194,17 +11433,17 @@ mod gap_detector_tests {
         };
         let mut gap_ticks = 0;
         for _ in 0..DEBOUNCE - 1 {
-            drive_partition_gap_debounce(&stopped, &mut gap_ticks, DEBOUNCE, 0);
+            drive_partition_gap_debounce(&stopped, &mut gap_ticks, DEBOUNCE, true);
         }
         assert_eq!(gap_ticks, DEBOUNCE - 1);
 
         assert_eq!(
-            drive_partition_gap_debounce(&walkable, &mut gap_ticks, DEBOUNCE, 0),
+            drive_partition_gap_debounce(&walkable, &mut gap_ticks, DEBOUNCE, true),
             GapArm::NotDue
         );
         assert_eq!(gap_ticks, 0, "progress must restart the debounce");
         assert_eq!(
-            drive_partition_gap_debounce(&stopped, &mut gap_ticks, DEBOUNCE, 0),
+            drive_partition_gap_debounce(&stopped, &mut gap_ticks, DEBOUNCE, true),
             GapArm::NotDue,
             "a fresh gap must serve its own debounce, not inherit the old count"
         );
@@ -11250,44 +11489,31 @@ mod gap_detector_tests {
         // Deliberate: `apply_repaired_prepare` journals without walking, so a
         // gated walk would sit parked for the whole session while the resident
         // prefix is already applicable.
-        for owner in [
-            RecoveryOwner::Repair,
-            RecoveryOwner::Transfer,
-            RecoveryOwner::TransferRearm,
-        ] {
-            let owned = GapProbe {
-                recovery: owner,
-                ..walk_stalled()
-            };
-            assert!(
-                partition_is_walk_stalled(&owned),
-                "{owner:?} owns the fetch, not the resident prefix"
-            );
-        }
+        assert!(partition_is_walk_stalled(&GapProbe {
+            recovery_owned: true,
+            ..walk_stalled()
+        }));
     }
 
     #[test]
-    fn given_any_probe_when_evaluated_should_never_be_both_gap_stopped_and_walk_stalled() {
-        // The two halves split on `next_op_resident`; if they ever overlap, one
-        // tick both arms repair and walks the window it is fetching.
-        let owners = [
-            RecoveryOwner::Nobody,
-            RecoveryOwner::Repair,
-            RecoveryOwner::Transfer,
-            RecoveryOwner::TransferRearm,
-        ];
+    fn given_a_lag_below_the_frontier_when_evaluated_should_pick_exactly_one_predicate() {
+        // Below the commit frontier the two split on `next_op_resident`: if they
+        // ever overlap there, one tick both arms repair and walks the window it
+        // is fetching. A missing suffix is the deliberate exception, covered
+        // below, because those two windows do not touch.
         for normal in [false, true] {
             for transferring in [false, true] {
-                for recovery in owners {
+                for recovery_owned in [false, true] {
                     for (commit_min, commit_max) in [(5, 10), (10, 10)] {
                         for next_op_resident in [false, true] {
                             let probe = GapProbe {
                                 normal,
                                 transferring,
-                                recovery,
+                                recovery_owned,
                                 commit_min,
                                 commit_max,
                                 next_op_resident,
+                                missing_suffix: false,
                             };
                             assert!(
                                 !(partition_is_gap_stopped(&probe)
@@ -11302,31 +11528,34 @@ mod gap_detector_tests {
     }
 
     #[test]
-    fn given_the_per_tick_cap_reached_when_debouncing_should_defer_without_losing_the_debounce() {
+    fn given_a_missing_suffix_over_resident_committed_ops_when_evaluated_should_claim_both() {
+        // The walk takes `(commit_min, commit_max]`, the fetch takes
+        // `(commit_max, head]`. Serialising them would park a resident prefix
+        // behind a fetch that needs a quorum the prefix is not blocking.
+        let probe = GapProbe {
+            missing_suffix: true,
+            ..walk_stalled()
+        };
+        assert!(partition_is_gap_stopped(&probe));
+        assert!(partition_is_walk_stalled(&probe));
+    }
+
+    #[test]
+    fn given_the_arm_budget_spent_when_debouncing_should_defer_without_losing_the_debounce() {
         let probe = gap_stopped();
         let mut gap_ticks = DEBOUNCE;
         assert_eq!(
-            drive_partition_gap_debounce(
-                &probe,
-                &mut gap_ticks,
-                DEBOUNCE,
-                PARTITION_REPAIR_ARMS_PER_TICK_MAX
-            ),
+            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, false),
             GapArm::Deferred,
-            "the cap must refuse the arm"
+            "a spent budget must refuse the arm"
         );
         assert!(
             gap_ticks > DEBOUNCE,
-            "a capped-out group stays due; restarting its debounce would push the \
+            "a refused group stays due; restarting its debounce would push the \
              arm a whole interval out per contended tick"
         );
         assert_eq!(
-            drive_partition_gap_debounce(
-                &probe,
-                &mut gap_ticks,
-                DEBOUNCE,
-                PARTITION_REPAIR_ARMS_PER_TICK_MAX - 1
-            ),
+            drive_partition_gap_debounce(&probe, &mut gap_ticks, DEBOUNCE, true),
             GapArm::Arm,
             "the same group arms on the next pass with a slot free"
         );
@@ -11343,13 +11572,13 @@ mod gap_detector_tests {
         let mut gap_ticks = 0;
         for tick in 1..PARTITION_GAP_DEBOUNCE_TICKS_MIN {
             assert_eq!(
-                drive_partition_gap_debounce(&probe, &mut gap_ticks, 1, 0),
+                drive_partition_gap_debounce(&probe, &mut gap_ticks, 1, true),
                 GapArm::NotDue,
                 "a 1-tick debounce armed at tick {tick}, under the floor"
             );
         }
         assert_eq!(
-            drive_partition_gap_debounce(&probe, &mut gap_ticks, 1, 0),
+            drive_partition_gap_debounce(&probe, &mut gap_ticks, 1, true),
             GapArm::Arm
         );
     }

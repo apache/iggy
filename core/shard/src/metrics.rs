@@ -453,10 +453,14 @@ impl ShardMetrics {
     }
 
     /// Add the prepares a partition's backup gap check destroyed since the last
-    /// sweep, drained per tick from `IggyPartition::take_prepare_gap_drops`,
+    /// sweep. Drained per tick from `IggyPartition::take_prepare_gap_drops`,
     /// and once more when `ConfirmRemove` drops the partition: a tombstoned
     /// namespace is invisible to the sweep, so the tail it left would otherwise
     /// go to the floor with the value.
+    ///
+    /// Counts the prepares that ARRIVED after a hole, not the holes: a gap
+    /// opened by the last prepare of a burst leaves this at zero. A nonzero
+    /// value proves the repair driver has work; a zero one proves nothing.
     ///
     /// Deliberately NOT a `frame_drops_total{variant=partition}` reason: that
     /// family means the bus or the router shed a frame, and the simulator
@@ -467,8 +471,12 @@ impl ShardMetrics {
     /// Shard-scoped, with no namespace label: a server runs hundreds of groups
     /// per shard, so labelling by namespace is unbounded cardinality, and every
     /// other partition counter in this file is shard-scoped for the same
-    /// reason. The per-group detail is in the arm's log line. The metadata
-    /// plane's own gap drop is NOT counted here - it has its own recovery path.
+    /// reason. The per-group detail is in the arm's log line.
+    ///
+    /// The metadata plane's own gap drop is NOT counted here, and has no
+    /// counter of its own: its repair is armed by the same edge-triggered sites
+    /// this plane's sweep exists to backstop, so that plane is starvable in the
+    /// same way and is simply not instrumented for it yet.
     pub fn record_partition_prepare_gap_drops(&self, drops: u64) {
         self.partition_prepare_gap_drops_total.inc_by(drops);
     }

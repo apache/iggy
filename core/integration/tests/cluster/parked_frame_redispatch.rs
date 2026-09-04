@@ -104,9 +104,9 @@ const DEGRADED_MARKERS: [&str; 3] = [
 /// its debounce interval, so a re-dispatch that trips this has already stalled
 /// the replica for ~1s and the marker still means the ordering broke.
 ///
-/// Names its plane: the metadata plane logs its own gap drop at `warn`, which
-/// passes this test's `info` filter, and the counting below matches substrings.
-const GAP_MARKER: &str = "dropping out-of-order partition prepare (gap)";
+/// The metadata plane logs the same string, so the counting below pairs it with
+/// `PARTITION_PLANE_FIELD`.
+const GAP_MARKER: &str = "dropping out-of-order prepare (gap)";
 const PARTITION_PLANE_FIELD: &str = "plane=\"partitions\"";
 
 fn topic_name(index: u32) -> String {

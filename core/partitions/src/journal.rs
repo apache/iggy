@@ -765,12 +765,13 @@ where
     /// Whether `op` is resident, without reading its header.
     ///
     /// Equivalent to `header_by_op(op).is_some()` and answers in O(log n)
-    /// instead of scanning: `append` writes `headers` and
-    /// `op_to_storage_offset` together and every clear site
-    /// ([`Self::commit`], [`Self::evict_prefix`], the restore path) clears
-    /// both, so the two populations cannot diverge. Callers that only need
-    /// presence must use this - a miss is the common case on the residency
-    /// checks, and a miss is exactly when the scan walks the whole vec.
+    /// instead of scanning. The two populations cannot diverge: every clear
+    /// site ([`Self::commit`], [`Self::evict_prefix`], the restore path) clears
+    /// both, and [`Self::append_with_meta`] pushes the header before the
+    /// storage write and inserts the offset after it, under the length-lock
+    /// precondition documented there. Callers that only need presence must use
+    /// this - a miss is the common case on the residency checks, and a miss is
+    /// exactly when the scan walks the whole vec.
     pub fn holds_op(&self, op: u64) -> bool {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
         op_to_storage_offset.contains_key(&op)
@@ -856,27 +857,60 @@ where
     }
 
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
-    /// stopping at the first missing op. A replication gap must not be skipped:
-    /// the caller advances `commit_min` strictly by one, so a hole would break
-    /// that contract. Headers are append-ordered, which is op-ascending on a
-    /// backup, so this is a single linear scan: drop ops below `from_op`, take
-    /// while contiguous, stop at the first gap or past `commit_max`.
-    pub fn committed_headers_from(&self, from_op: u64, commit_max: u64) -> Vec<PrepareHeader> {
+    /// stopping at the first missing op and at `limit` headers. A replication
+    /// gap must not be skipped: the caller advances `commit_min` strictly by
+    /// one, so a hole would break that contract.
+    ///
+    /// `limit` bounds what one caller commits in a single pass. The run is
+    /// re-derived from the caller's own `commit_min` every time, so a truncated
+    /// answer is resumed, not lost.
+    pub fn committed_headers_from(
+        &self,
+        from_op: u64,
+        commit_max: u64,
+        limit: usize,
+    ) -> Vec<PrepareHeader> {
         // Walk by OP, not by append position: after a rejoin the journal
         // interleaves live tail ops (which arrive while repair is still
         // streaming) with repaired window ops, so append order is no longer
         // op-ascending and a positional sequential scan would break at the
         // first interleave boundary forever.
-        let mut result = Vec::new();
-        let mut op = from_op;
-        while op <= commit_max {
-            let Some(header) = self.header_by_op(op) else {
-                break;
-            };
-            result.push(header);
-            op += 1;
+        //
+        // ONE pass over the headers, like `repaired_window_shape`, not a
+        // `header_by_op` probe per op: that probe is itself a linear scan, so
+        // probing walked the window against the whole vec, and the walk this
+        // feeds runs per group per tick over a rejoin's entire backlog.
+        if from_op > commit_max {
+            return Vec::new();
         }
-        result
+        let headers = unsafe { &*self.headers.get() };
+        // The contiguous run can never outlast the resident headers, and
+        // `commit_max` is a cluster frontier this replica may be far below, so
+        // the slot vec is sized off what is actually here.
+        // Both `min` operands are `usize`-derived, so the narrowing cannot
+        // truncate whatever `commit_max` is.
+        #[allow(clippy::cast_possible_truncation)]
+        let span = (commit_max - from_op + 1)
+            .min(headers.len() as u64)
+            .min(limit as u64) as usize;
+        let mut slots: Vec<Option<PrepareHeader>> = vec![None; span];
+        for header in headers {
+            if header.op < from_op {
+                continue;
+            }
+            // Bounded by the `span` test right below, which is itself bounded
+            // by the header count.
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = (header.op - from_op) as usize;
+            if slot < span {
+                // First writer wins, matching the `header_by_op` probe this
+                // replaces (`find` returns the earliest match).
+                slots[slot].get_or_insert(*header);
+            }
+        }
+        // Stops at the first hole: a replication gap must not be skipped, or
+        // `advance_commit_min`'s sequential contract breaks.
+        slots.into_iter().map_while(|header| header).collect()
     }
 
     /// Oldest message offset still resident in the in-memory journal, if
@@ -1569,7 +1603,7 @@ mod tests {
 
         // Contiguous run from op 1 stops before the missing op 3 even though
         // op 4 is resident and within commit_max.
-        let run = journal.committed_headers_from(1, 4);
+        let run = journal.committed_headers_from(1, 4, usize::MAX);
         let ops: Vec<u64> = run.iter().map(|header| header.op).collect();
         assert_eq!(
             ops,
@@ -1578,8 +1612,18 @@ mod tests {
         );
 
         assert!(
-            journal.committed_headers_from(5, 4).is_empty(),
+            journal.committed_headers_from(5, 4, usize::MAX).is_empty(),
             "from_op past commit_max yields nothing"
+        );
+
+        // The limit truncates the run rather than skipping ahead in it, so the
+        // caller resumes at the op it stopped on.
+        let bounded = journal.committed_headers_from(1, 4, 1);
+        let ops: Vec<u64> = bounded.iter().map(|header| header.op).collect();
+        assert_eq!(ops, vec![1], "the limit must cut the run at its front");
+        assert!(
+            journal.committed_headers_from(1, 4, 0).is_empty(),
+            "a zero limit commits nothing"
         );
     }
 
