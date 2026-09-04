@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::duration::iggy_duration_to_py_delta;
 use iggy::prelude::{
     CacheMetrics as RustCacheMetrics, CacheMetricsKey as RustCacheMetricsKey, Stats as RustStats,
 };
 use pyo3::prelude::*;
+use pyo3::types::{PyDelta, PyDict};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
-use std::collections::HashMap;
 
 /// Key identifying the partition a `CacheMetrics` entry belongs to.
 ///
@@ -53,6 +54,15 @@ impl From<&RustCacheMetricsKey> for CacheMetricsKey {
 #[gen_stub_pymethods]
 #[pymethods]
 impl CacheMetricsKey {
+    #[new]
+    fn new(stream_id: u32, topic_id: u32, partition_id: u32) -> Self {
+        Self {
+            stream_id,
+            topic_id,
+            partition_id,
+        }
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "CacheMetricsKey(stream_id={}, topic_id={}, partition_id={})",
@@ -102,11 +112,25 @@ impl CacheMetrics {
 #[pyclass]
 pub struct Stats {
     pub(crate) inner: RustStats,
+    /// Converted once here so that every `cache_metrics` access returns the
+    /// same dict instead of re-collecting the whole map.
+    cache_metrics: Py<PyDict>,
 }
 
 impl From<RustStats> for Stats {
     fn from(stats: RustStats) -> Self {
-        Self { inner: stats }
+        let cache_metrics = Python::attach(|py| {
+            let dict = PyDict::new(py);
+            for (key, metrics) in &stats.cache_metrics {
+                dict.set_item(CacheMetricsKey::from(key), CacheMetrics::from(metrics))
+                    .expect("insert cache metrics entry");
+            }
+            dict.unbind()
+        });
+        Self {
+            inner: stats,
+            cache_metrics,
+        }
     }
 }
 
@@ -149,10 +173,11 @@ impl Stats {
         self.inner.available_memory.as_bytes_u64()
     }
 
-    /// The run time of the server process, in microseconds.
+    /// The run time of the server process.
     #[getter]
-    pub fn run_time(&self) -> u64 {
-        self.inner.run_time.as_micros()
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    pub fn run_time<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.run_time)
     }
 
     /// The start time of the server process, in microseconds since the Unix epoch.
@@ -252,21 +277,21 @@ impl Stats {
     }
 
     /// The numeric semantic version of the Iggy server, or `None` when unknown.
-    /// E.g. 1.2.3 -> 100200300 (major * 1000000 + minor * 1000 + patch).
+    /// E.g. 1.2.3 -> 1002003 (major * 1000000 + minor * 1000 + patch).
     #[getter]
-    #[gen_stub(override_return_type(type_repr = "int | None"))]
+    #[gen_stub(override_return_type(type_repr = "builtins.int | None"))]
     pub fn iggy_server_semver(&self) -> Option<u32> {
         self.inner.iggy_server_semver
     }
 
     /// Cache metrics per partition.
+    ///
+    /// Built once when the stats snapshot is created; every access returns the
+    /// same dict.
     #[getter]
-    pub fn cache_metrics(&self) -> HashMap<CacheMetricsKey, CacheMetrics> {
-        self.inner
-            .cache_metrics
-            .iter()
-            .map(|(key, metrics)| (CacheMetricsKey::from(key), CacheMetrics::from(metrics)))
-            .collect()
+    #[gen_stub(override_return_type(type_repr = "builtins.dict[CacheMetricsKey, CacheMetrics]"))]
+    pub fn cache_metrics(&self, py: Python<'_>) -> Py<PyDict> {
+        self.cache_metrics.clone_ref(py)
     }
 
     /// The number of threads in the server process.
@@ -285,5 +310,19 @@ impl Stats {
     #[getter]
     pub fn total_disk_space(&self) -> u64 {
         self.inner.total_disk_space.as_bytes_u64()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Stats(hostname='{}', iggy_server_version='{}', streams_count={}, \
+             topics_count={}, partitions_count={}, messages_count={}, clients_count={})",
+            self.inner.hostname,
+            self.inner.iggy_server_version,
+            self.inner.streams_count,
+            self.inner.topics_count,
+            self.inner.partitions_count,
+            self.inner.messages_count,
+            self.inner.clients_count
+        )
     }
 }

@@ -339,6 +339,9 @@ class CacheMetricsKey:
         """
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __hash__(self) -> builtins.int: ...
+    def __new__(
+        cls, stream_id: builtins.int, topic_id: builtins.int, partition_id: builtins.int
+    ) -> CacheMetricsKey: ...
     def __repr__(self) -> builtins.str: ...
 
 class Consumer:
@@ -1933,9 +1936,9 @@ class Stats:
         The available memory of the system, in bytes.
         """
     @property
-    def run_time(self) -> builtins.int:
+    def run_time(self) -> datetime.timedelta:
         r"""
-        The run time of the server process, in microseconds.
+        The run time of the server process.
         """
     @property
     def start_time(self) -> builtins.int:
@@ -2018,15 +2021,18 @@ class Stats:
         The version of the Iggy server.
         """
     @property
-    def iggy_server_semver(self) -> int | None:
+    def iggy_server_semver(self) -> builtins.int | None:
         r"""
         The numeric semantic version of the Iggy server, or `None` when unknown.
-        E.g. 1.2.3 -> 100200300 (major * 1000000 + minor * 1000 + patch).
+        E.g. 1.2.3 -> 1002003 (major * 1000000 + minor * 1000 + patch).
         """
     @property
     def cache_metrics(self) -> builtins.dict[CacheMetricsKey, CacheMetrics]:
         r"""
         Cache metrics per partition.
+
+        Built once when the stats snapshot is created; every access returns the
+        same dict.
         """
     @property
     def threads_count(self) -> builtins.int:
@@ -2043,6 +2049,7 @@ class Stats:
         r"""
         The total disk space for the data directory, in bytes.
         """
+    def __repr__(self) -> builtins.str: ...
 
 @typing.final
 class StreamDetails:

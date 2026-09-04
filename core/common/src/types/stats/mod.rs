@@ -70,7 +70,7 @@ pub struct Stats {
     pub kernel_version: String,
     /// The version of the Iggy server.
     pub iggy_server_version: String,
-    /// The semantic version of the Iggy server in the numeric format e.g. 1.2.3 -> 100200300 (major * 1000000 + minor * 1000 + patch).
+    /// The semantic version of the Iggy server in the numeric format e.g. 1.2.3 -> 1002003 (major * 1000000 + minor * 1000 + patch).
     pub iggy_server_semver: Option<u32>,
     /// Cache metrics per partition
     #[serde(with = "cache_metrics_serializer")]

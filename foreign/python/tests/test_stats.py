@@ -15,6 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import datetime
+
 import pytest
 
 from apache_iggy import CacheMetrics, CacheMetricsKey, IggyClient
@@ -44,9 +46,11 @@ class TestStats:
 
         stats = await iggy_client.get_stats()
 
-        assert stats.streams_count == stats_before.streams_count + 1
-        assert stats.topics_count == stats_before.topics_count + 1
-        assert stats.partitions_count == stats_before.partitions_count + 1
+        # `>=` rather than exact equality: the counters are server-global, so
+        # concurrently running tests (e.g. under pytest-xdist) may bump them too.
+        assert stats.streams_count >= stats_before.streams_count + 1
+        assert stats.topics_count >= stats_before.topics_count + 1
+        assert stats.partitions_count >= stats_before.partitions_count + 1
         assert stats.messages_count >= stats_before.messages_count + 3
         assert stats.clients_count >= 1
 
@@ -57,17 +61,43 @@ class TestStats:
         assert stats.total_memory > 0
         assert stats.total_disk_space > 0
 
+        assert isinstance(stats.run_time, datetime.timedelta)
+        assert stats.run_time >= stats_before.run_time
+
+        assert f"streams_count={stats.streams_count}" in repr(stats)
+        assert stats.hostname in repr(stats)
+
     @pytest.mark.asyncio
     async def test_get_stats_cache_metrics_dict(self, iggy_client: IggyClient):
-        """cache_metrics is a dict keyed by hashable CacheMetricsKey."""
+        """cache_metrics is a dict keyed by CacheMetricsKey, and repeated
+        accesses return the same dict rather than rebuilding it."""
         stats = await iggy_client.get_stats()
 
         assert isinstance(stats.cache_metrics, dict)
+        # The getter must not re-collect the map on every access.
+        assert stats.cache_metrics is stats.cache_metrics
+        # The server does not populate cache metrics yet (`GetStats` replies
+        # with an empty map), so entries are only checked when present.
         for key, metrics in stats.cache_metrics.items():
             assert isinstance(key, CacheMetricsKey)
             assert isinstance(metrics, CacheMetrics)
-            # The key round-trips through a dict lookup.
-            assert stats.cache_metrics[key] is not None
-            assert key.stream_id >= 0
-            assert metrics.hits >= 0
-            assert metrics.misses >= 0
+
+    def test_cache_metrics_key_is_constructible_and_hashable(self):
+        """A key built in Python can address a cache_metrics dict entry."""
+        key = CacheMetricsKey(stream_id=1, topic_id=2, partition_id=3)
+
+        assert key.stream_id == 1
+        assert key.topic_id == 2
+        assert key.partition_id == 3
+        assert repr(key) == "CacheMetricsKey(stream_id=1, topic_id=2, partition_id=3)"
+
+        equal_key = CacheMetricsKey(stream_id=1, topic_id=2, partition_id=3)
+        other_key = CacheMetricsKey(stream_id=1, topic_id=2, partition_id=4)
+        assert key == equal_key
+        assert key != other_key
+        assert hash(key) == hash(equal_key)
+
+        # An equal key constructed independently hits the same dict slot.
+        metrics_by_key = {key: "metrics"}
+        assert metrics_by_key[equal_key] == "metrics"
+        assert other_key not in metrics_by_key
