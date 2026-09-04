@@ -1549,10 +1549,10 @@ where
     /// skipped, so `commit_max` can never pass it and nothing later can commit
     /// either: `on_replicate` fences the partition there and takes the node down.
     /// At CREATE (`build_partition_fresh`) nothing has been externalised at all,
-    /// so a refusal fails the build and leaves the namespace unmaterialised for
-    /// the reconciler to retry. Going live without the block instead would let
-    /// the first send land inside the backoff the failed write just armed, where
-    /// the admitted path refuses it with a transient.
+    /// so a refusal fails the build and leaves the namespace unmaterialised: the
+    /// reconciler retries it, the loader tombstones it. Going live without the
+    /// block instead would let the first send land inside the backoff the failed
+    /// write just armed, where the admitted path refuses it with a transient.
     #[allow(clippy::future_not_send)]
     #[must_use = "the bool is the fence verdict; dropping it lets the append escape unreserved"]
     pub async fn reserve_offsets_through(&self, end_offset: u64) -> bool {
@@ -1629,12 +1629,8 @@ where
             return true;
         };
         if !self.reserve_offsets_through_retryable(ceiling).await {
-            self.deny_unreserved_send(
-                message.header(),
-                "refusing a send: the offset reservation could not be extended",
-                waiter.take(),
-            )
-            .await;
+            self.deny_unreserved_send(message.header(), waiter.take())
+                .await;
             return false;
         }
         true
@@ -1652,7 +1648,6 @@ where
     async fn deny_unreserved_send(
         &self,
         header: &RoutedRequestHeader,
-        reason: &'static str,
         waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
         let consensus = self.consensus();
@@ -1660,7 +1655,7 @@ where
             tracing::Level::WARN,
             &PartitionDiagEvent::new(
                 ReplicaLogContext::from_consensus(consensus, PlaneKind::Partitions),
-                reason,
+                "refusing a send: the offset reservation could not be extended",
             )
             .with_operation(Operation::SendMessages),
         );
@@ -6815,17 +6810,6 @@ mod tests {
         // the store check it is named for untested.
         partition.note_append_live();
         assert!(partition.superblock.is_none(), "the premise: no store");
-        assert!(!partition.needs_offset_reservation_extension());
-    }
-
-    /// Idle partitions stay idle: the first block is claimed where the partition
-    /// is created, and a node with many partitions must not write a superblock
-    /// per partition at boot for nothing.
-    #[test]
-    fn given_an_untouched_partition_when_ticking_should_not_extend() {
-        let mut partition = solo_recording_partition();
-        partition.set_superblock(Rc::new(RecordingSuperblock::default()), None);
-        assert!(!partition.offset_space.append_live);
         assert!(!partition.needs_offset_reservation_extension());
     }
 

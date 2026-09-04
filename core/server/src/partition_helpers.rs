@@ -676,10 +676,10 @@ pub async fn load_partition_or_fence(
                     return Ok(None);
                 }
             }
-            Box::pin(build_partition_fresh(
+            match Box::pin(build_partition_fresh(
                 config,
                 namespace,
-                partition_stats,
+                Arc::clone(&partition_stats),
                 partition_metadata.created_revision,
                 topic_runtime,
                 cluster_id,
@@ -689,7 +689,31 @@ pub async fn load_partition_or_fence(
                 Rc::clone(&bus),
             ))
             .await
-            .map(Some)
+            {
+                Ok(partition) => Ok(Some(partition)),
+                // Boot propagates whatever this returns, so an `Err` here costs a
+                // whole shard its start over ONE partition's failed write.
+                // Tombstoning is also the only safe answer: the failed build
+                // already quarantined the chain and planted an empty segment 0,
+                // which the next load would accept and serve as a healthy empty
+                // partition. The stats lose the segment that build counted before
+                // the claim refused.
+                Err(error @ ServerError::PartitionOffsetReservationClaim { .. }) => {
+                    error!(
+                        stream_id,
+                        topic_id,
+                        partition_id = partition_metadata.id,
+                        partition_dir,
+                        %error,
+                        "failed to claim the rebuilt partition's first offset reservation; \
+                         leaving it tombstoned rather than serving it unreserved"
+                    );
+                    partition_stats.zero_out_all();
+                    partitions.tombstone(namespace);
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
         }
         // An untrustworthy superblock fences ONE group, not the node. The
         // segment files stay exactly where they are -- unlike a refused
@@ -1334,8 +1358,11 @@ pub async fn build_partition_fresh(
         // Not degraded-but-live: the failed write armed the group's superblock
         // retry backoff, and `reserve_offsets_through_retryable` refuses every
         // send arriving inside it with a transient the HTTP plane does not
-        // replay. The reconciler backs the namespace off; the retry materialises
-        // through the loader, whose partition carries a clear backoff cell.
+        // replay. Both callers absorb this without escalating: the reconciler
+        // backs the namespace off and its retry materialises through the loader,
+        // whose partition carries a clear backoff cell, while the loader's own
+        // fence-and-rebuild arm tombstones the partition, since boot propagates
+        // anything it returns.
         return Err(ServerError::PartitionOffsetReservationClaim {
             stream_id,
             topic_id,
@@ -1408,6 +1435,8 @@ mod tests {
     use super::*;
     use configs::server::ServerSystemConfig;
     use journal::superblock::SuperblockStore;
+    use partitions::PartitionPathLayout;
+    use server_common::sharding::ShardId;
 
     const CLUSTER: u128 = 7;
     const REPLICA: u8 = 1;
@@ -1488,6 +1517,24 @@ mod tests {
             Rc::new(IggyMessageBus::new(0)),
         )
         .await
+    }
+
+    /// The container the loader tombstones into. Its config is never read on the
+    /// paths under test, which stop before `restore_partition_offsets`.
+    fn solo_partitions() -> IggyPartitions<Rc<IggyMessageBus>> {
+        IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: IggyByteSize::from(1024_u64),
+                enforce_fsync: false,
+                validate_checksum: true,
+                segment_size: IggyByteSize::from(1_048_576_u64),
+                preallocate_segments: false,
+                encryptor: None,
+                path_layout: PartitionPathLayout::default(),
+            },
+        )
     }
 
     /// The reservation the partition left on disk, which is the only copy a
@@ -1583,6 +1630,65 @@ mod tests {
             RESERVED,
             "a rebuild resumes ON its recorded reservation, so re-claiming here would \
              burn a lease block and two fsyncs per rebuild"
+        );
+    }
+
+    /// The loader's fence-and-rebuild arm is the claim's SECOND caller, and boot
+    /// propagates whatever the loader returns: an `Err` here costs the shard its
+    /// whole start over one partition's failed write.
+    #[compio::test]
+    async fn given_a_failing_claim_when_rebuilding_a_fenced_chain_should_tombstone_the_partition() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let dir = config.system.get_partition_path(1, 1, 0);
+        std::fs::create_dir_all(&dir).expect("partition dir");
+        // Two empty segments make the first a NON-tail empty, the refusal a solo
+        // group rebuilds through (zero recoverable bytes) instead of tombstoning
+        // where it stands.
+        for start_offset in [0, 1] {
+            std::fs::File::create(config.system.get_messages_file_path(1, 1, 0, start_offset))
+                .expect("empty segment log");
+        }
+        // The rebuild's claim is this group's first superblock write, so it
+        // targets slot A. A directory where its temp file goes fails the atomic
+        // replace and nothing else: the slot reads still find the store empty,
+        // and the quarantine moves segment files only.
+        std::fs::create_dir(Path::new(&dir).join("superblock.a.tmp")).expect("block slot A");
+
+        let stats = Arc::new(PartitionStats::default());
+        let partitions = solo_partitions();
+        let loaded = load_partition_or_fence(
+            &config,
+            namespace,
+            Arc::clone(&stats),
+            &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0),
+            TopicRuntimeOptions::default(),
+            CLUSTER,
+            0,
+            1,
+            Rc::new(IggyMessageBus::new(0)),
+            &partitions,
+        )
+        .await;
+
+        match loaded {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("the planted directory must fail the rebuild's claim"),
+            Err(error) => panic!("a refused claim must fence one partition, not boot: {error}"),
+        }
+        assert!(
+            std::fs::metadata(format!("{dir}.fenced.0")).is_ok(),
+            "the quarantine must have run, or this asserts on the wrong arm"
+        );
+        assert!(
+            partitions.is_tombstoned(&namespace),
+            "an unreserved partition must stay unrouted"
+        );
+        assert_eq!(
+            stats.segments_count_inconsistent(),
+            0,
+            "the rebuild counted its initial segment before the claim refused"
         );
     }
 
