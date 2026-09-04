@@ -6811,8 +6811,8 @@ mod tests {
     fn given_a_storeless_partition_when_ticking_should_not_extend() {
         let mut partition = solo_recording_partition();
         partition.set_offset_reservation_lease(test_lease(16));
-        // Without this the untouched offset space would satisfy the gate on its
-        // own and the store check would go untested.
+        // Without this the assert would pass on `!append_live` alone, leaving
+        // the store check it is named for untested.
         partition.note_append_live();
         assert!(partition.superblock.is_none(), "the premise: no store");
         assert!(!partition.needs_offset_reservation_extension());

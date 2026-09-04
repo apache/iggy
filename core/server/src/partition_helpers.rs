@@ -1113,7 +1113,8 @@ fn hydrate_reopen_error(
 /// already on disk is routed through the loader instead, so a prior
 /// life's segments are hydrated rather than built over.
 ///
-/// Steps performed (all idempotent on retry after a partial failure):
+/// Steps performed. 1 to 4 are idempotent on retry after a partial failure; the
+/// claim is last precisely because it is not (see its own comment):
 /// 1. Create directory hierarchy on disk.
 /// 2. Build per-partition VSR consensus group, resuming any superblock-recorded view.
 /// 3. Configure empty consumer-offset storage with the on-disk paths set.
@@ -1311,26 +1312,34 @@ pub async fn build_partition_fresh(
     // the reconciler's addition loop, so it lengthens the window a produce
     // arriving with the create spends parked.
     //
-    // LAST of the steps, so the rest stay idempotent on retry: a failure between
-    // the claim and the return would burn a lease block per reconciler pass.
+    // LAST of the steps, because a claim written before a step that then fails
+    // outlives the create. The reconciler routes any namespace whose directory
+    // exists to `load_partition_or_fence`, and step 1 made that directory, so
+    // the retry comes back through the loader: `restore_offset_frontier` there
+    // resumes the append point at the recorded reservation and holes every
+    // offset below it on a partition that never took a write.
     //
-    // No-op above one replica and with no store attached, where nothing is
-    // reserved. Skipped once the offset space is live (`mint_frontier` reads 0
-    // only while it is not): a rebuild resumes its append point exactly ON the
-    // reservation it recovered, never above it, so an unconditional claim would
-    // write and burn a block every time. It pays one inline fence on its first
-    // send instead, which is what a graceful stop and boot already costs.
+    // `0`, not `mint_frontier()`: a rebuild recovers its append point exactly ON
+    // the reservation it recorded, so asking to cover the frontier would fail
+    // the callee's strict `>` and rewrite the record on every rebuild. Asking
+    // only for offset 0 leaves that same check to skip every partition already
+    // carrying a reservation, which pays one inline fence on its first send
+    // instead, the cost a graceful stop and boot already carries. No-op above
+    // one replica and with no store attached, where nothing is reserved.
     //
     // The shard tick takes over from the first mint onward
     // (`needs_offset_reservation_extension`), which stays gated on a partition
     // that has minted so boot cannot write a superblock per idle partition.
-    if partition.mint_frontier() == 0 && !partition.reserve_offsets_through(0).await {
+    if !partition.reserve_offsets_through(0).await {
         // Not degraded-but-live: the failed write armed the group's superblock
         // retry backoff, and `reserve_offsets_through_retryable` refuses every
         // send arriving inside it with a transient the HTTP plane does not
-        // replay. The reconciler backs the namespace off and retries with a
-        // fresh partition, whose backoff cell starts clear.
+        // replay. The reconciler backs the namespace off; the retry materialises
+        // through the loader, whose partition carries a clear backoff cell.
         return Err(ServerError::PartitionOffsetReservationClaim {
+            stream_id,
+            topic_id,
+            partition_id,
             namespace_raw: namespace.inner(),
         });
     }
