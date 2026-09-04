@@ -485,7 +485,308 @@ fn parse_uuid(text: &str) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use iggy::prelude::{HeaderKey, HeaderKind, HeaderValue};
+    use questdb::ingress::ProtocolVersion;
+
     use super::*;
+
+    /// `Buffer::new` yields an ILP buffer, which is what makes these tests
+    /// possible: ILP is inspectable through `as_bytes`, so the exact wire
+    /// output can be asserted. The `Buffer` API, the symbol-before-column
+    /// state machine and the marker/rewind path are shared with QWP. Only
+    /// `column_uuid` and typed arrays are QWP-only, so those are covered by
+    /// the integration suite instead.
+    /// V1 is the all-text InfluxDB-compatible encoding. V2 and V3 write
+    /// doubles as binary, which would make `as_bytes` unreadable here.
+    fn buffer() -> Buffer {
+        Buffer::new(ProtocolVersion::V1)
+    }
+
+    fn mapping() -> Mapping {
+        Mapping {
+            table: "events".to_owned(),
+            symbol_columns: HashSet::new(),
+            uuid_columns: HashSet::new(),
+            timestamp_source: TimestampSource::Message,
+            timestamp_field: None,
+            timestamp_unit: TimestampUnit::Auto,
+            include_stream_column: false,
+            include_topic_column: false,
+            include_partition_column: false,
+            include_offset_column: false,
+            include_headers: false,
+        }
+    }
+
+    fn context() -> RowContext<'static> {
+        RowContext {
+            stream: "user_events",
+            topic: "trades",
+            partition_id: 3,
+        }
+    }
+
+    fn json_message(json: &str) -> ConsumedMessage {
+        let mut bytes = json.as_bytes().to_vec();
+        ConsumedMessage {
+            id: 7,
+            offset: 42,
+            checksum: 0,
+            timestamp: 1_788_523_200_000_000,
+            origin_timestamp: 1_700_000_000_000_000,
+            headers: None,
+            payload: Payload::Json(simd_json::to_owned_value(&mut bytes).unwrap()),
+        }
+    }
+
+    fn rendered(buffer: &Buffer) -> String {
+        String::from_utf8_lossy(buffer.as_bytes()).into_owned()
+    }
+
+    #[test]
+    fn given_symbol_columns_when_appending_should_emit_symbols_before_columns() {
+        let mut mapping = mapping();
+        mapping.symbol_columns.insert("side".to_owned());
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"side":"buy","price":1.5}"#),
+                context(),
+            )
+            .unwrap();
+
+        let line = rendered(&buffer);
+        let symbol_at = line.find("side=buy").expect("symbol missing");
+        let column_at = line.find("price=").expect("column missing");
+        assert!(
+            symbol_at < column_at,
+            "symbol must precede column, got: {line}"
+        );
+    }
+
+    #[test]
+    fn given_metadata_flags_when_appending_should_add_stream_topic_partition_offset() {
+        let mut mapping = mapping();
+        mapping.include_stream_column = true;
+        mapping.include_topic_column = true;
+        mapping.include_partition_column = true;
+        mapping.include_offset_column = true;
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(&mut buffer, &json_message(r#"{"price":1.5}"#), context())
+            .unwrap();
+
+        let line = rendered(&buffer);
+        assert!(line.contains("stream=user_events"), "{line}");
+        assert!(line.contains("topic=trades"), "{line}");
+        assert!(line.contains("partition_id=3i"), "{line}");
+        assert!(line.contains("offset=42i"), "{line}");
+    }
+
+    #[test]
+    fn given_null_field_when_appending_should_omit_the_column() {
+        let mut buffer = buffer();
+        mapping()
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"price":1.5,"missing":null}"#),
+                context(),
+            )
+            .unwrap();
+
+        let line = rendered(&buffer);
+        assert!(line.contains("price="), "{line}");
+        assert!(
+            !line.contains("missing"),
+            "null must be omitted, got: {line}"
+        );
+    }
+
+    #[test]
+    fn given_nested_object_when_appending_should_store_json_text() {
+        let mut buffer = buffer();
+        mapping()
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"meta":{"venue":"nyse"}}"#),
+                context(),
+            )
+            .unwrap();
+
+        assert!(rendered(&buffer).contains("venue"), "{}", rendered(&buffer));
+    }
+
+    #[test]
+    fn given_message_timestamp_source_when_appending_should_use_message_timestamp() {
+        let mut buffer = buffer();
+        mapping()
+            .append_row(&mut buffer, &json_message(r#"{"price":1.5}"#), context())
+            .unwrap();
+
+        // Message timestamp is microseconds; ILP renders nanoseconds.
+        assert!(
+            rendered(&buffer).contains("1788523200000000000"),
+            "{}",
+            rendered(&buffer)
+        );
+    }
+
+    #[test]
+    fn given_origin_timestamp_source_when_appending_should_use_origin_timestamp() {
+        let mut mapping = mapping();
+        mapping.timestamp_source = TimestampSource::Origin;
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(&mut buffer, &json_message(r#"{"price":1.5}"#), context())
+            .unwrap();
+
+        assert!(
+            rendered(&buffer).contains("1700000000000000000"),
+            "{}",
+            rendered(&buffer)
+        );
+    }
+
+    #[test]
+    fn given_payload_timestamp_source_when_appending_should_consume_the_field() {
+        let mut mapping = mapping();
+        mapping.timestamp_source = TimestampSource::Payload;
+        mapping.timestamp_field = Some("event_time".to_owned());
+        mapping.timestamp_unit = TimestampUnit::Micros;
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"event_time":1788523200000000,"price":1.5}"#),
+                context(),
+            )
+            .unwrap();
+
+        let line = rendered(&buffer);
+        assert!(line.contains("1788523200000000000"), "{line}");
+        assert!(
+            !line.contains("event_time="),
+            "timestamp field must not double as a column, got: {line}"
+        );
+    }
+
+    #[test]
+    fn given_missing_payload_timestamp_when_appending_should_reject_row() {
+        let mut mapping = mapping();
+        mapping.timestamp_source = TimestampSource::Payload;
+        mapping.timestamp_field = Some("event_time".to_owned());
+        let mut buffer = buffer();
+
+        let error = mapping
+            .append_row(&mut buffer, &json_message(r#"{"price":1.5}"#), context())
+            .unwrap_err();
+
+        assert!(matches!(error, RowError::Invalid(_)));
+        assert!(buffer.is_empty(), "rejected row must leave nothing behind");
+    }
+
+    #[test]
+    fn given_non_object_payload_when_appending_should_reject_row() {
+        let mut buffer = buffer();
+        let error = mapping()
+            .append_row(&mut buffer, &json_message("[1,2,3]"), context())
+            .unwrap_err();
+
+        assert!(matches!(error, RowError::Invalid(_)));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn given_mid_row_failure_when_appending_should_rewind_and_keep_batch_usable() {
+        // The bad UUID is reached only after the table, a symbol and a column
+        // are already encoded, so this exercises the rewind rather than an
+        // up-front rejection.
+        let mut mapping = mapping();
+        mapping.symbol_columns.insert("side".to_owned());
+        mapping.uuid_columns.insert("trade_id".to_owned());
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"side":"buy","price":1.0}"#),
+                context(),
+            )
+            .unwrap();
+        let after_good = rendered(&buffer);
+
+        let error = mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"side":"sell","price":2.0,"trade_id":"not-a-uuid"}"#),
+                context(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, RowError::Invalid(_)));
+        assert_eq!(
+            rendered(&buffer),
+            after_good,
+            "rejected row must be rewound exactly"
+        );
+
+        // The buffer is still usable for the next record.
+        mapping
+            .append_row(
+                &mut buffer,
+                &json_message(r#"{"side":"buy","price":3.0}"#),
+                context(),
+            )
+            .unwrap();
+        assert_eq!(buffer.row_count(), 2);
+    }
+
+    #[test]
+    fn given_headers_enabled_when_appending_should_prefix_header_columns() {
+        let mut mapping = mapping();
+        mapping.include_headers = true;
+        let mut message = json_message(r#"{"price":1.5}"#);
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            HeaderKey::from_raw(HeaderKind::String, b"source").unwrap(),
+            HeaderValue::from_raw(HeaderKind::String, b"gateway").unwrap(),
+        );
+        message.headers = Some(headers);
+        let mut buffer = buffer();
+
+        mapping
+            .append_row(&mut buffer, &message, context())
+            .unwrap();
+
+        assert!(
+            rendered(&buffer).contains("header_source="),
+            "{}",
+            rendered(&buffer)
+        );
+    }
+
+    #[test]
+    fn given_text_payload_when_appending_should_store_it_in_payload_column() {
+        let mut buffer = buffer();
+        let mut message = json_message(r#"{"unused":1}"#);
+        message.payload = Payload::Text("raw body".to_owned());
+
+        mapping()
+            .append_row(&mut buffer, &message, context())
+            .unwrap();
+
+        assert!(
+            rendered(&buffer).contains("payload="),
+            "{}",
+            rendered(&buffer)
+        );
+    }
 
     #[test]
     fn given_canonical_uuid_when_parsed_should_use_java_uuid_halves() {

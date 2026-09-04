@@ -29,6 +29,7 @@ mod meilisearch;
 mod mongodb;
 mod mqtt;
 mod postgres;
+mod questdb;
 mod quickwit;
 mod rabbitmq;
 mod random;
