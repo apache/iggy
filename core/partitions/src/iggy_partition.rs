@@ -1416,8 +1416,8 @@ where
     /// `1 / 2` would never trigger, leaving every append to pay the inline claim.
     /// A partition that has never minted is skipped: extending every idle
     /// partition at boot would write a superblock per partition for nothing, and
-    /// the first block is already claimed where the partition is created, on a
-    /// path that pays for a superblock write anyway.
+    /// the first block is already claimed where the partition is created, off
+    /// the append path.
     #[must_use]
     pub fn needs_offset_reservation_extension(&self) -> bool {
         if self.consensus.replica_count() > 1 || self.superblock.is_none() {
@@ -1549,8 +1549,10 @@ where
     /// skipped, so `commit_max` can never pass it and nothing later can commit
     /// either: `on_replicate` fences the partition there and takes the node down.
     /// At CREATE (`build_partition_fresh`) nothing has been externalised at all,
-    /// so a refusal only drops the partition back to claiming its first block
-    /// inline on the append path.
+    /// so a refusal fails the build and leaves the namespace unmaterialised for
+    /// the reconciler to retry. Going live without the block instead would let
+    /// the first send land inside the backoff the failed write just armed, where
+    /// the admitted path refuses it with a transient.
     #[allow(clippy::future_not_send)]
     #[must_use = "the bool is the fence verdict; dropping it lets the append escape unreserved"]
     pub async fn reserve_offsets_through(&self, end_offset: u64) -> bool {
@@ -6809,6 +6811,9 @@ mod tests {
     fn given_a_storeless_partition_when_ticking_should_not_extend() {
         let mut partition = solo_recording_partition();
         partition.set_offset_reservation_lease(test_lease(16));
+        // Without this the untouched offset space would satisfy the gate on its
+        // own and the store check would go untested.
+        partition.note_append_live();
         assert!(partition.superblock.is_none(), "the premise: no store");
         assert!(!partition.needs_offset_reservation_extension());
     }

@@ -1116,9 +1116,9 @@ fn hydrate_reopen_error(
 /// Steps performed (all idempotent on retry after a partial failure):
 /// 1. Create directory hierarchy on disk.
 /// 2. Build per-partition VSR consensus group, resuming any superblock-recorded view.
-/// 3. Claim the group's first offset-reservation block (solo groups with a store).
-/// 4. Configure empty consumer-offset storage with the on-disk paths set.
-/// 5. Provision the initial segment + writers (offset 0).
+/// 3. Configure empty consumer-offset storage with the on-disk paths set.
+/// 4. Provision the initial segment + writers (offset 0).
+/// 5. Claim the group's first offset-reservation block (solo groups with a store).
 ///
 /// The namespace arrives packed, so its components are in range by
 /// construction. Metadata admission is what bounds them.
@@ -1135,8 +1135,8 @@ fn hydrate_reopen_error(
 ///
 /// # Errors
 ///
-/// Returns [`ServerError`] when directory creation, superblock recovery, or
-/// segment provisioning fails.
+/// Returns [`ServerError`] when directory creation, superblock recovery,
+/// segment provisioning, or the first offset-reservation claim fails.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_partition_fresh(
     config: &ServerConfig,
@@ -1298,34 +1298,42 @@ pub async fn build_partition_fresh(
     // the refused chain's max `end_offset` on its error.
     partition.restore_offset_frontier(recovered_state.as_ref());
 
-    // Claim the first offset-reservation block HERE, where this path is already
-    // paying for a superblock write, so no send ever pays the create, write,
-    // file fsync, rename and directory fsync of a first claim inline in the
-    // shard's request pump, where the consensus tick is a sibling arm. No-op
-    // above one replica and with no store attached, where nothing is reserved,
-    // and no-op on a rebuild whose record already covers the next mint.
-    //
-    // The shard tick takes over from the first mint onward
-    // (`needs_offset_reservation_extension`), which stays gated on a partition
-    // that has minted so boot cannot write a superblock per idle partition.
-    if !partition
-        .reserve_offsets_through(partition.mint_frontier())
-        .await
-    {
-        // Degraded, not fatal: the fence on the append path still claims
-        // inline, so the first send pays for the block instead of the create.
-        warn!(
-            stream_id,
-            topic_id,
-            partition_id,
-            "could not claim the partition's first offset reservation; its first send \
-             will claim one inline"
-        );
-    }
     let current_offset = partition.offset.load(Ordering::Acquire);
 
     configure_consumer_offsets(&mut partition, config, namespace, current_offset)?;
     ensure_initial_segment(&mut partition, config, stream_id, topic_id, partition_id).await?;
+
+    // Claim the first offset-reservation block HERE so no send ever pays the
+    // create, write, file fsync, rename and directory fsync of a first claim
+    // inline in the shard's request pump, where the consensus tick is a sibling
+    // arm. It is a NEW write on a path that otherwise only READS the superblock:
+    // one atomic replace per created partition, serialised with its siblings in
+    // the reconciler's addition loop, so it lengthens the window a produce
+    // arriving with the create spends parked.
+    //
+    // LAST of the steps, so the rest stay idempotent on retry: a failure between
+    // the claim and the return would burn a lease block per reconciler pass.
+    //
+    // No-op above one replica and with no store attached, where nothing is
+    // reserved. Skipped once the offset space is live (`mint_frontier` reads 0
+    // only while it is not): a rebuild resumes its append point exactly ON the
+    // reservation it recovered, never above it, so an unconditional claim would
+    // write and burn a block every time. It pays one inline fence on its first
+    // send instead, which is what a graceful stop and boot already costs.
+    //
+    // The shard tick takes over from the first mint onward
+    // (`needs_offset_reservation_extension`), which stays gated on a partition
+    // that has minted so boot cannot write a superblock per idle partition.
+    if partition.mint_frontier() == 0 && !partition.reserve_offsets_through(0).await {
+        // Not degraded-but-live: the failed write armed the group's superblock
+        // retry backoff, and `reserve_offsets_through_retryable` refuses every
+        // send arriving inside it with a transient the HTTP plane does not
+        // replay. The reconciler backs the namespace off and retries with a
+        // fresh partition, whose backoff cell starts clear.
+        return Err(ServerError::PartitionOffsetReservationClaim {
+            namespace_raw: namespace.inner(),
+        });
+    }
 
     Ok(partition)
 }
@@ -1435,43 +1443,32 @@ mod tests {
         }
     }
 
-    /// A rebuild that reads a reservation back must NAME its planted segment for
-    /// the append point. Named 0, the segment takes the first append's
-    /// `base_offset` of N instead, `rposition(|s| s.start_offset <= offset)`
-    /// routes every poll for `0..N-1` into it, and the next boot makes that
-    /// durable.
-    #[compio::test]
-    async fn given_a_recorded_reservation_when_building_fresh_should_plant_at_the_append_point() {
-        const RESERVED: u64 = 65_537;
-        let root = tempfile::tempdir().expect("tempdir");
-        let config = ServerConfig {
+    /// The offset reservation is solo-only, so every test that touches it builds
+    /// under this identity.
+    const fn solo_identity() -> ReplicaIdentity {
+        ReplicaIdentity {
+            cluster: CLUSTER,
+            replica_id: 0,
+            replica_count: 1,
+        }
+    }
+
+    fn solo_config(root: &tempfile::TempDir) -> ServerConfig {
+        ServerConfig {
             system: Arc::new(ServerSystemConfig {
                 path: root.path().to_string_lossy().into_owned(),
                 ..ServerSystemConfig::default()
             }),
             ..ServerConfig::default()
-        };
-        let namespace = IggyNamespace::new(1, 1, 0);
-        let dir = config.system.get_partition_path(1, 1, 0);
+        }
+    }
 
-        let identity = ReplicaIdentity {
-            cluster: CLUSTER,
-            replica_id: 0,
-            replica_count: 1,
-        };
-        let (store, recovered) = open_partition_superblock(&dir, identity)
-            .await
-            .expect("open a fresh partition superblock");
-        assert!(recovered.is_none());
-        store
-            .write(&reserved_solo_state(RESERVED).to_bytes())
-            .await
-            .expect("record the reservation");
-        drop(store);
-
-        let partition = build_partition_fresh(
-            &config,
-            namespace,
+    async fn build_solo_partition(
+        config: &ServerConfig,
+    ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
+        build_partition_fresh(
+            config,
+            IggyNamespace::new(1, 1, 0),
             Arc::new(PartitionStats::default()),
             0,
             TopicRuntimeOptions::default(),
@@ -1482,7 +1479,67 @@ mod tests {
             Rc::new(IggyMessageBus::new(0)),
         )
         .await
-        .expect("rebuild the partition over its recorded reservation");
+    }
+
+    /// The reservation the partition left on disk, which is the only copy a
+    /// restart or a first send can read.
+    async fn recorded_reservation(dir: &str) -> u64 {
+        let (_store, recorded) = open_partition_superblock(dir, solo_identity())
+            .await
+            .expect("reopen the partition superblock");
+        recorded
+            .expect("a partition that recorded a reservation")
+            .offset_reserved
+    }
+
+    /// The create claims the first lease block, so the DURABLE record covers the
+    /// first send before it arrives. Asserting on the returned partition alone
+    /// would pass with no claim at all: the inline fence at the mint writes the
+    /// same block on the first send, which is exactly what this moves off the
+    /// append path.
+    #[compio::test]
+    async fn given_a_fresh_solo_partition_when_building_should_record_its_first_claim() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = solo_config(&root);
+        let dir = config.system.get_partition_path(1, 1, 0);
+
+        let partition = build_solo_partition(&config)
+            .await
+            .expect("build a fresh partition");
+        drop(partition);
+
+        assert_eq!(
+            recorded_reservation(&dir).await,
+            1 + u64::from(config.partition.offset_reservation_lease.get()),
+            "the create must leave a full lease block covering offset 0 on disk"
+        );
+    }
+
+    /// A rebuild that reads a reservation back must NAME its planted segment for
+    /// the append point. Named 0, the segment takes the first append's
+    /// `base_offset` of N instead, `rposition(|s| s.start_offset <= offset)`
+    /// routes every poll for `0..N-1` into it, and the next boot makes that
+    /// durable.
+    #[compio::test]
+    async fn given_a_recorded_reservation_when_building_fresh_should_plant_at_the_append_point() {
+        const RESERVED: u64 = 65_537;
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = solo_config(&root);
+        let dir = config.system.get_partition_path(1, 1, 0);
+
+        let (store, recovered) = open_partition_superblock(&dir, solo_identity())
+            .await
+            .expect("open a fresh partition superblock");
+        assert!(recovered.is_none());
+        store
+            .write(&reserved_solo_state(RESERVED).to_bytes())
+            .await
+            .expect("record the reservation");
+        drop(store);
+
+        let partition = build_solo_partition(&config)
+            .await
+            .expect("rebuild the partition over its recorded reservation");
 
         assert_eq!(
             partition.mint_frontier(),
@@ -1509,6 +1566,14 @@ mod tests {
             planted,
             vec![format!("{RESERVED:0>20}.log")],
             "the initial segment must be named for the append point, not offset 0"
+        );
+
+        drop(partition);
+        assert_eq!(
+            recorded_reservation(&dir).await,
+            RESERVED,
+            "a rebuild resumes ON its recorded reservation, so re-claiming here would \
+             burn a lease block and two fsyncs per rebuild"
         );
     }
 

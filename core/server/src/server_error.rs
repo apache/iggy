@@ -201,6 +201,13 @@ pub enum ServerError {
         partition_id: usize,
         reason: PartitionRecoveryRefusal,
     },
+    /// Fails the create rather than letting the partition go live without its
+    /// first reservation: the failed write arms the group's superblock retry
+    /// backoff, and a send arriving inside that window is refused with a
+    /// transient the HTTP plane does not replay. `namespace_raw` joins this to
+    /// the write's own `iggy.partitions.diag` line, which carries the cause.
+    #[error("partition namespace {namespace_raw} could not claim its first offset reservation")]
+    PartitionOffsetReservationClaim { namespace_raw: u64 },
     #[error(
         "shard {shard_id} aborted while waiting for shard-0 to broadcast the metadata \
          factory bundle; shard 0 dropped its sender (most likely it failed to recover)"
