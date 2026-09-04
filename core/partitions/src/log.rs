@@ -192,8 +192,9 @@ where
     }
 
     /// Mutable segment views. Length mutation lives in
-    /// [`Self::add_persisted_segment`] / [`Self::retire_front`] only, so the
-    /// parallel vecs cannot desync from the outside.
+    /// [`Self::add_persisted_segment`] / [`Self::retire_front`] /
+    /// [`Self::retire_back`] only, so the parallel vecs cannot desync from the
+    /// outside.
     pub fn segments_mut(&mut self) -> &mut [Segment] {
         &mut self.segments
     }
@@ -309,6 +310,28 @@ where
         self.messages_writers.remove(0);
         self.index_writers.remove(0);
         self.sealed_read_state.remove(0);
+        self.sealed_lru
+            .retain(|&offset| offset != segment.start_offset);
+        Some((segment, storage))
+    }
+
+    /// Retire the NEWEST segment, the mirror of [`Self::retire_front`].
+    ///
+    /// Boot re-anchor only, and only for an EMPTY tail named below the re-seeded
+    /// counter, which would otherwise claim a range it does not hold. Nothing
+    /// else may take from the back: a sized tail is the only copy of its
+    /// messages.
+    pub fn retire_back(&mut self) -> Option<(Segment, SegmentStorage)> {
+        if self.segments.is_empty() {
+            return None;
+        }
+        self.debug_assert_lockstep();
+        let segment = self.segments.pop()?;
+        let storage = self.storage.pop()?;
+        self.indexes.pop();
+        self.messages_writers.pop();
+        self.index_writers.pop();
+        self.sealed_read_state.pop();
         self.sealed_lru
             .retain(|&offset| offset != segment.start_offset);
         Some((segment, storage))
