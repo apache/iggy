@@ -18,7 +18,7 @@
 use crate::configs::connectors::{ConnectorsConfigProvider, create_connectors_config_provider};
 use ::configs::ConfigProvider;
 use clap::Parser;
-use configs::connectors::ConfigFormat;
+use configs::connectors::{ConfigFormat, OffsetCommitMode};
 use configs::runtime::ConnectorsRuntimeConfig;
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
@@ -421,6 +421,7 @@ struct SinkConnectorPlugin {
     error: Option<String>,
     verbose: bool,
     benchmark: bool,
+    offset_commit: OffsetCommitMode,
 }
 
 struct SinkConnectorConsumer {
