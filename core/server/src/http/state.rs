@@ -20,17 +20,18 @@
 //! `State` newtype and the per-response view-header stamp.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::Response;
+use configs::external_auth::ExternalAuthConfig;
 use configs::server::ServerSystemConfig;
 use consensus::{MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
-use iggy_common::{ClusterMetadata, IggyTimestamp};
+use iggy_common::{ClusterMetadata, IggyTimestamp, Permissions};
 use message_bus::InstanceToken;
 use metadata::MetadataSubmitError;
 use send_wrapper::SendWrapper;
@@ -122,6 +123,17 @@ pub(in crate::http) struct HttpInner {
     /// Legacy-parity metric registry served by the scrape route; the router's
     /// counting layer holds a clone of its request counter.
     pub(in crate::http) metrics: HttpMetrics,
+    /// External authentication callout config. Shared across all handlers.
+    pub(in crate::http) external_auth: Arc<ExternalAuthConfig>,
+    /// Session-scoped permissions for synthetic user IDs (external auth
+    /// inline-grant sessions). Keyed by synthetic `user_id`. Cleaned up on
+    /// session expiry sweep.
+    pub(in crate::http) synthetic_permissions: RefCell<HashMap<u32, Permissions>>,
+    /// Shared counter for minting synthetic user IDs. All transports draw
+    /// from the same sequence so no two can mint the same ID.
+    pub(in crate::http) synthetic_counter: crate::external_auth::SyntheticUserIdCounter,
+    /// Freed synthetic user IDs available for reuse.
+    pub(in crate::http) free_synthetic_ids: RefCell<BTreeSet<u32>>,
 }
 
 impl HttpInner {
@@ -208,21 +220,18 @@ impl HttpInner {
                     // Resample after the await: the pre-await stamp is stale for
                     // the expiry sweep and cap check below.
                     let now = IggyTimestamp::now().to_secs();
-                    let (admitted, torn) = {
+                    let (admitted, torn, expired_user_ids) = {
                         let mut table = self.sessions.borrow_mut();
-                        let torn = sweep_expired(&mut table, now);
+                        let (torn, expired_user_ids) = sweep_expired(&mut table, now);
                         if table.len() >= self.max_http_sessions {
-                            // Still full after dropping expired entries: too many
-                            // genuinely live sessions. Refuse rather than evict a
-                            // live one (its `fresh` client id is orphaned on the
-                            // peers until they evict it - a rare at-cap cost).
-                            (None, torn)
+                            (None, torn, expired_user_ids)
                         } else {
                             table.insert(key.clone(), Rc::clone(&fresh));
-                            (Some(fresh), torn)
+                            (Some(fresh), torn, expired_user_ids)
                         }
                     };
                     self.teardown_reply_targets(torn);
+                    self.sweep_synthetic_permissions(&expired_user_ids);
                     return admitted.ok_or(AuthError::SessionUnavailable);
                 }
             }
@@ -373,6 +382,41 @@ impl HttpInner {
         }))
     }
 
+    /// Mint a synthetic user ID for an external auth inline-grant session.
+    /// Reuses a previously freed ID when available, otherwise draws from the
+    /// shared counter. Returns `None` when the synthetic ID space is exhausted.
+    pub(in crate::http) fn mint_synthetic_user_id(&self) -> Option<u32> {
+        if let Some(id) = self.free_synthetic_ids.borrow_mut().pop_last() {
+            return Some(id);
+        }
+        self.synthetic_counter.mint()
+    }
+
+    /// Return a synthetic user ID to the free list without removing a session.
+    pub(in crate::http) fn reclaim_synthetic_user_id(&self, id: u32) {
+        self.free_synthetic_ids.borrow_mut().insert(id);
+    }
+
+    /// Look up session-scoped permissions for a synthetic user ID. Returns
+    /// `None` for non-synthetic users or when no permissions are stored.
+    pub(in crate::http) fn get_synthetic_permissions(&self, user_id: u32) -> Option<Permissions> {
+        self.synthetic_permissions.borrow().get(&user_id).cloned()
+    }
+
+    /// Remove `synthetic_permissions` entries for the given expired user IDs.
+    /// Only cleans up IDs explicitly passed in (from swept expired sessions)
+    /// so freshly-minted IDs whose JWT has not been presented yet are never
+    /// removed prematurely.
+    pub(in crate::http) fn sweep_synthetic_permissions(&self, expired_user_ids: &[u32]) {
+        let mut perms = self.synthetic_permissions.borrow_mut();
+        let mut free = self.free_synthetic_ids.borrow_mut();
+        for &uid in expired_user_ids {
+            if perms.remove(&uid).is_some() {
+                free.insert(uid);
+            }
+        }
+    }
+
     /// Drop the session table entry for `session`, but only if it is still the
     /// current occupant of its key (pointer-fenced, so a later re-registration
     /// under the same key is never purged). Also tears down its in-process
@@ -382,6 +426,15 @@ impl HttpInner {
     /// request re-register cleanly through the barrier.
     pub(in crate::http) fn forget_session(&self, session: &Rc<HttpSession>) {
         let torn = forget_if_same(&mut self.sessions.borrow_mut(), session);
+        if torn.is_some()
+            && self
+                .synthetic_permissions
+                .borrow_mut()
+                .remove(&session.user_id)
+                .is_some()
+        {
+            self.free_synthetic_ids.borrow_mut().insert(session.user_id);
+        }
         self.teardown_reply_targets(torn.into_iter().collect());
     }
 

@@ -42,7 +42,7 @@ use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::{
     Operation, PrepareHeader, RoutedRequestHeader, WireDecode, WireIdentifier,
 };
-use iggy_common::IggyError;
+use iggy_common::{IggyError, Permissions};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
@@ -50,22 +50,147 @@ use metadata::permissioner::Permissioner;
 use server_common::Message;
 use tracing::warn;
 
+use crate::external_auth::is_synthetic_user_id;
 use crate::responses::{
     build_deny_reply, current_metadata_commit, resolve_stream_id, resolve_topic_id,
 };
 use crate::shell::{ShellBus, ShellShard};
+
+/// Check session-scoped permissions for a synthetic user. Returns
+/// `Some(Ok(()))` if permitted, `Some(Err(Unauthorized))` if denied, or `None`
+/// if the user is not synthetic (caller falls through to the Permissioner).
+pub(super) fn check_session_permission(
+    user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
+    check: impl FnOnce(&Permissions) -> bool,
+) -> Option<Result<(), IggyError>> {
+    let user_id = user_id?;
+    if !is_synthetic_user_id(user_id) {
+        return None;
+    }
+    match session_perms {
+        Some(perms) if check(perms) => Some(Ok(())),
+        _ => Some(Err(IggyError::Unauthorized)),
+    }
+}
+
+/// Check if inline permissions allow sending messages to (stream, topic),
+/// mirroring the `Permissioner::append_messages` inheritance chain.
+pub fn can_send_messages(perms: &Permissions, stream_id: usize, topic_id: usize) -> bool {
+    let g = &perms.global;
+    if g.send_messages || g.manage_streams || g.manage_topics {
+        return true;
+    }
+    if let Some(sp) = perms.streams.as_ref().and_then(|s| s.get(&stream_id)) {
+        if sp.send_messages || sp.manage_stream || sp.manage_topics {
+            return true;
+        }
+        if sp
+            .topics
+            .as_ref()
+            .and_then(|t| t.get(&topic_id))
+            .is_some_and(|tp| tp.send_messages || tp.manage_topic)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if inline permissions allow polling messages from (stream, topic),
+/// mirroring the `Permissioner::poll_messages` inheritance chain.
+pub fn can_poll_messages(perms: &Permissions, stream_id: usize, topic_id: usize) -> bool {
+    let g = &perms.global;
+    if g.poll_messages || g.read_topics || g.manage_topics || g.read_streams || g.manage_streams {
+        return true;
+    }
+    if let Some(sp) = perms.streams.as_ref().and_then(|s| s.get(&stream_id)) {
+        if sp.poll_messages
+            || sp.read_topics
+            || sp.manage_topics
+            || sp.read_stream
+            || sp.manage_stream
+        {
+            return true;
+        }
+        if sp
+            .topics
+            .as_ref()
+            .and_then(|t| t.get(&topic_id))
+            .is_some_and(|tp| tp.poll_messages || tp.read_topic || tp.manage_topic)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if inline permissions allow reading a specific stream.
+pub fn can_read_stream(perms: &Permissions, stream_id: usize) -> bool {
+    let g = &perms.global;
+    if g.manage_streams || g.read_streams {
+        return true;
+    }
+    perms
+        .streams
+        .as_ref()
+        .and_then(|s| s.get(&stream_id))
+        .is_some_and(|sp| sp.manage_stream || sp.read_stream)
+}
+
+/// Check if inline permissions allow listing topics in a specific stream.
+/// Mirrors `Permissioner::get_topics`: stream-level read OR topic-level
+/// read/manage grants are sufficient (no per-topic ID needed).
+pub fn can_list_topics(perms: &Permissions, stream_id: usize) -> bool {
+    let g = &perms.global;
+    if g.read_streams || g.manage_streams || g.manage_topics || g.read_topics {
+        return true;
+    }
+    perms
+        .streams
+        .as_ref()
+        .and_then(|s| s.get(&stream_id))
+        .is_some_and(|sp| sp.manage_stream || sp.read_stream || sp.manage_topics || sp.read_topics)
+}
+
+/// Check if inline permissions allow reading a specific topic.
+pub fn can_read_topic(perms: &Permissions, stream_id: usize, topic_id: usize) -> bool {
+    let g = &perms.global;
+    if g.read_streams || g.manage_streams || g.manage_topics || g.read_topics {
+        return true;
+    }
+    if let Some(sp) = perms.streams.as_ref().and_then(|s| s.get(&stream_id)) {
+        if sp.manage_stream || sp.read_stream || sp.manage_topics || sp.read_topics {
+            return true;
+        }
+        if sp
+            .topics
+            .as_ref()
+            .and_then(|t| t.get(&topic_id))
+            .is_some_and(|tp| tp.manage_topic || tp.read_topic)
+        {
+            return true;
+        }
+    }
+    false
+}
 
 /// Authorize a partition-plane op on its resolved (stream, topic) for the
 /// acting user, returning the deny status code or `None` to proceed. The
 /// namespace already resolved, so the entity exists; a `None` user id (which
 /// the bound-session gate should preclude) fails closed with `Unauthenticated`
 /// rather than allow an unattributed write.
+///
+/// When `session_perms` is provided and the user is synthetic (external auth
+/// inline-grant), checks the inline permissions directly instead of the
+/// Permissioner.
 pub(in crate::dispatch) fn authorize_partition_op<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     operation: Operation,
     user_id: Option<u32>,
     stream_id: usize,
     topic_id: usize,
+    session_perms: Option<&Permissions>,
 ) -> Option<u32>
 where
     B: ShellBus,
@@ -77,6 +202,17 @@ where
     let Some(user_id) = user_id else {
         return Some(IggyError::Unauthenticated.as_code());
     };
+    if let Some(result) =
+        check_session_permission(Some(user_id), session_perms, |perms| match operation {
+            Operation::SendMessages => can_send_messages(perms, stream_id, topic_id),
+            Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset => {
+                can_poll_messages(perms, stream_id, topic_id)
+            }
+            _ => false,
+        })
+    {
+        return result.err().map(|e| e.as_code());
+    }
     let decision =
         shard
             .plane
@@ -202,10 +338,15 @@ pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
 
 /// Run an unscoped non-replicated-read rule for the acting user. A `None` user
 /// id (only the pre-auth path, which serves ungated codes) fails closed.
+///
+/// When `session_perms` is provided and the user is synthetic, runs
+/// `session_check` against the inline permissions instead of the Permissioner.
 pub(in crate::dispatch) fn authorize_uid<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     user_id: Option<u32>,
     rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
+    session_perms: Option<&Permissions>,
+    session_check: impl FnOnce(&Permissions) -> bool,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -215,6 +356,9 @@ where
     SB: SuperblockStore + 'static,
 {
     let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+    if let Some(result) = check_session_permission(Some(user_id), session_perms, session_check) {
+        return result;
+    }
     shard
         .plane
         .metadata()
@@ -227,12 +371,16 @@ where
 /// (stream, topic). `None` proceeds (allowed, or a resolution miss the caller's
 /// own not-found path handles); `Some(status)` denies. A `None` user id fails
 /// closed.
+///
+/// When `session_perms` is provided and the user is synthetic, checks the
+/// inline permissions directly (`poll_messages` inheritance chain).
 pub(in crate::dispatch) fn authorize_partition_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
     user_id: Option<u32>,
     rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+    session_perms: Option<&Permissions>,
 ) -> Option<u32>
 where
     B: ShellBus,
@@ -245,6 +393,11 @@ where
         return Some(IggyError::Unauthenticated.as_code());
     };
     let (stream_id, topic_id) = resolve_topic_scope(shard, stream_id, topic_id)?;
+    if let Some(result) = check_session_permission(Some(user_id), session_perms, |perms| {
+        can_poll_messages(perms, stream_id, topic_id)
+    }) {
+        return result.err().map(|e| e.as_code());
+    }
     shard
         .plane
         .metadata()
@@ -263,11 +416,14 @@ where
 /// topic]) against committed state first. The PAT list is self-scoped, so
 /// authentication is its whole rule, and `GET_CLUSTER_METADATA` -- which
 /// describes the private replica network -- is gated the same way.
+/// When `session_perms` is provided and the user is synthetic, checks inline
+/// permissions instead of the Permissioner.
 pub(in crate::dispatch) fn authorize_default_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
     body: &[u8],
     user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -279,9 +435,21 @@ where
     // A `u32` match cannot be exhaustive: every gated code is named explicitly,
     // and the final arm is the ungated set the builder serves without a rule.
     match code {
-        GET_STATS_CODE => authorize_uid(shard, user_id, Permissioner::get_stats),
-        GET_USERS_CODE => authorize_uid(shard, user_id, Permissioner::get_users),
-        GET_USER_CODE => gate_user_scoped(shard, user_id, body),
+        GET_STATS_CODE => authorize_uid(
+            shard,
+            user_id,
+            Permissioner::get_stats,
+            session_perms,
+            |p| p.global.manage_servers || p.global.read_servers,
+        ),
+        GET_USERS_CODE => authorize_uid(
+            shard,
+            user_id,
+            Permissioner::get_users,
+            session_perms,
+            |p| p.global.manage_users || p.global.read_users,
+        ),
+        GET_USER_CODE => gate_user_scoped(shard, user_id, body, session_perms),
         // Self-scoped: lists only the caller's own tokens, so there is no
         // permissioner rule to run (legacy runs none either).
         GET_PERSONAL_ACCESS_TOKENS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
@@ -292,13 +460,21 @@ where
         // transport with an `Unauthenticated` Reply before it reaches the
         // builder, so this arm only ever fires if that gate is bypassed.
         GET_CLUSTER_METADATA_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
-        GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
+        GET_STREAMS_CODE => authorize_uid(
+            shard,
+            user_id,
+            Permissioner::get_streams,
+            session_perms,
+            |p| p.global.manage_streams || p.global.read_streams,
+        ),
         GET_STREAM_CODE => gate_stream_scoped::<GetStreamRequest, _, _, _, _>(
             shard,
             user_id,
             body,
             |request| &request.stream_id,
             Permissioner::get_stream,
+            session_perms,
+            can_read_stream,
         ),
         GET_TOPICS_CODE => gate_stream_scoped::<GetTopicsRequest, _, _, _, _>(
             shard,
@@ -306,6 +482,8 @@ where
             body,
             |request| &request.stream_id,
             Permissioner::get_topics,
+            session_perms,
+            can_list_topics,
         ),
         GET_TOPIC_CODE => gate_topic_scoped::<GetTopicRequest, _, _, _, _>(
             shard,
@@ -313,6 +491,7 @@ where
             body,
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_topic,
+            session_perms,
         ),
         GET_CONSUMER_GROUP_CODE => gate_topic_scoped::<GetConsumerGroupRequest, _, _, _, _>(
             shard,
@@ -320,6 +499,7 @@ where
             body,
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_consumer_group,
+            session_perms,
         ),
         GET_CONSUMER_GROUPS_CODE => gate_topic_scoped::<GetConsumerGroupsRequest, _, _, _, _>(
             shard,
@@ -327,6 +507,7 @@ where
             body,
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_consumer_groups,
+            session_perms,
         ),
         _ => Ok(()),
     }
@@ -382,6 +563,7 @@ fn gate_user_scoped<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     user_id: Option<u32>,
     body: &[u8],
+    session_perms: Option<&Permissions>,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -405,7 +587,9 @@ where
     if user_id.is_some_and(|caller_id| caller_id as usize == target_id) {
         return Ok(());
     }
-    authorize_uid(shard, user_id, Permissioner::get_user)
+    authorize_uid(shard, user_id, Permissioner::get_user, session_perms, |p| {
+        p.global.manage_users || p.global.read_users
+    })
 }
 
 /// Gate a stream-scoped read: decode the request, project its wire stream id,
@@ -418,6 +602,8 @@ fn gate_stream_scoped<T: WireDecode, B, MJ, S, SB>(
     body: &[u8],
     stream_id: impl FnOnce(&T) -> &WireIdentifier,
     rule: impl FnOnce(&Permissioner, u32, usize) -> Result<(), IggyError>,
+    session_perms: Option<&Permissions>,
+    session_rule: impl FnOnce(&Permissions, usize) -> bool,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -432,9 +618,13 @@ where
     let Some(stream_id) = resolve_stream_scope(shard, stream_id(&request)) else {
         return Ok(());
     };
-    authorize_uid(shard, user_id, |permissioner, uid| {
-        rule(permissioner, uid, stream_id)
-    })
+    authorize_uid(
+        shard,
+        user_id,
+        |permissioner, uid| rule(permissioner, uid, stream_id),
+        session_perms,
+        |p| session_rule(p, stream_id),
+    )
 }
 
 /// Gate a topic-scoped read: decode the request, project its wire (stream,
@@ -447,6 +637,7 @@ fn gate_topic_scoped<T: WireDecode, B, MJ, S, SB>(
     body: &[u8],
     ids: impl FnOnce(&T) -> (&WireIdentifier, &WireIdentifier),
     rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+    session_perms: Option<&Permissions>,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -462,9 +653,13 @@ where
     let Some((stream_id, topic_id)) = resolve_topic_scope(shard, stream_id, topic_id) else {
         return Ok(());
     };
-    authorize_uid(shard, user_id, |permissioner, uid| {
-        rule(permissioner, uid, stream_id, topic_id)
-    })
+    authorize_uid(
+        shard,
+        user_id,
+        |permissioner, uid| rule(permissioner, uid, stream_id, topic_id),
+        session_perms,
+        |p| can_read_topic(p, stream_id, topic_id),
+    )
 }
 
 /// Resolve a wire stream identifier to its committed slab id, or `None` on a

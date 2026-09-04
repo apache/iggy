@@ -1085,3 +1085,35 @@ close_grace = "2 s"
 # connecting.await + accept_bi.await) so a slowloris peer cannot pin
 # per-conn channels + registry slot + spawned task indefinitely.
 handshake_grace = "10 s"
+
+# External authentication callout. When enabled, login attempts are forwarded
+# to an external HTTP service before built-in credential verification. The
+# service receives a JSON POST with credential_type, credential (when
+# forward_credentials is true), username, transport, and client_address.
+#
+# The service responds with one of three decisions:
+#   - "iggy_user":    map the login to an existing Iggy user by user_id.
+#                     The user must exist, be active, and not be root (ID 0).
+#   - "inline_grant": create a session-scoped identity with explicit permissions
+#                     and an optional expires_at (unix seconds). The session is
+#                     restricted to data-plane ops (send/poll messages, consumer
+#                     offsets, consumer group join/leave). Token refresh is not
+#                     available; the client must re-authenticate when the token
+#                     expires.
+#   - "deny":         reject the login with an optional reason (logged
+#                     server-side only, never forwarded to the client).
+#
+# on_error controls behavior when the callout itself fails (timeout, network
+# error, non-2xx, malformed response):
+#   - "deny":     fail the login (default, fail-closed)
+#   - "fallback": fall through to built-in credential verification
+#
+# The url must start with http:// or https://. Plain HTTP logs a warning at
+# startup since credentials may be sent in cleartext. The response body is
+# capped at 1 MiB.
+[external_auth]
+enabled = false
+url = ""
+timeout = "5 s"
+on_error = "deny"
+forward_credentials = true

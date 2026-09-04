@@ -29,7 +29,7 @@
 //! HTTP spine keeps its own equivalent gates (see `crate::http`) because its
 //! error contract (404-before-403) is pinned client-visible behavior.
 
-mod authz;
+pub mod authz;
 pub mod login_error;
 pub mod partition;
 mod reads;
@@ -57,6 +57,7 @@ use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::{request_body, verify_request_checksum};
 use bytes::Bytes;
+use configs::external_auth::ExternalAuthConfig;
 use configs::server::ServerSystemConfig;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
@@ -101,6 +102,7 @@ pub fn make_client_request_handler<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<ExternalAuthConfig>,
 ) -> RequestHandler
 where
     B: ShellBus,
@@ -131,6 +133,7 @@ where
             Rc::clone(&sessions),
             Arc::clone(&system_config),
             max_tokens_per_user,
+            Arc::clone(&external_auth),
             Rc::clone(&queues),
             Rc::clone(&active),
             client_id,
@@ -178,6 +181,7 @@ pub fn make_deferred_client_request_handler<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<ExternalAuthConfig>,
 ) -> RequestHandler
 where
     B: ShellBus,
@@ -206,6 +210,7 @@ where
         let shard_handle = Rc::clone(&shard_handle);
         let sessions = Rc::clone(&sessions);
         let system_config = Arc::clone(&system_config);
+        let external_auth = Arc::clone(&external_auth);
         let queues = Rc::clone(&queues);
         let active = Rc::clone(&active);
         queues
@@ -226,6 +231,7 @@ where
                 sessions,
                 system_config,
                 max_tokens_per_user,
+                external_auth,
                 queues,
                 active,
                 client_id,
@@ -279,6 +285,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<ExternalAuthConfig>,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
     client_id: u128,
@@ -306,6 +313,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
             sessions,
             system_config,
             max_tokens_per_user,
+            external_auth,
             queues,
             active,
             client_id,
@@ -314,12 +322,13 @@ fn enqueue_client_request<B, MJ, S, SB>(
     });
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_arguments)]
 async fn drain_client_requests<B, MJ, S, SB>(
     shard: Rc<ShellShard<B, MJ, S, SB>>,
     sessions: Rc<RefCell<SessionManager>>,
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<ExternalAuthConfig>,
     queues: ClientRequestQueues,
     active: ActiveClientRequests,
     client_id: u128,
@@ -339,6 +348,7 @@ async fn drain_client_requests<B, MJ, S, SB>(
             &sessions,
             &system_config,
             max_tokens_per_user,
+            &external_auth,
             client_id,
             message,
         )
@@ -561,6 +571,7 @@ async fn handle_client_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     system_config: &Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: &Arc<ExternalAuthConfig>,
     transport_client_id: u128,
     message: Message<iggy_binary_protocol::GenericHeader>,
 ) where
@@ -689,7 +700,8 @@ async fn handle_client_request<B, MJ, S, SB>(
     }
 
     if header.operation == Operation::Register && header.session == 0 && header.request == 0 {
-        handle_login_register_request(shard, sessions, transport_client_id, request).await;
+        handle_login_register_request(shard, sessions, transport_client_id, request, external_auth)
+            .await;
         return;
     }
 
@@ -738,6 +750,9 @@ async fn handle_client_request<B, MJ, S, SB>(
         // resolve it from the same bound connection. A bound transport always
         // has one, but the gate fails closed on `None` rather than trust that.
         let acting_user_id = sessions.borrow().get_user_id(transport_client_id);
+        let session_perms = acting_user_id
+            .filter(|&uid| crate::external_auth::is_synthetic_user_id(uid))
+            .and_then(|uid| sessions.borrow().session_permissions_for_user(uid).cloned());
         dispatch_partition_request(
             shard,
             request,
@@ -745,6 +760,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             bound_session,
             transport_client_id,
             acting_user_id,
+            session_perms.as_ref(),
         )
         .await;
         return;
@@ -1268,6 +1284,7 @@ mod tests {
         let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
         let sessions = Rc::new(RefCell::new(SessionManager::new()));
         let system_config = Arc::new(ServerSystemConfig::default());
+        let external_auth = Arc::new(ExternalAuthConfig::default());
 
         let multi_node = Rc::new(ClusterRoster {
             enabled: true,
@@ -1296,6 +1313,7 @@ mod tests {
                 &sessions,
                 &system_config,
                 1,
+                &external_auth,
                 TRANSPORT,
                 metadata_read(),
             )

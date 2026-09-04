@@ -41,7 +41,7 @@ mod web;
 mod wire;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -206,6 +206,8 @@ pub fn start(
     system_config: Arc<ServerSystemConfig>,
     roster: Rc<ClusterRoster>,
     shard_metrics_all: &[shard::metrics::ShardMetrics],
+    external_auth: Arc<configs::external_auth::ExternalAuthConfig>,
+    synthetic_counter: crate::external_auth::SyntheticUserIdCounter,
 ) -> Result<(), ServerError> {
     let BoundHttp {
         listener,
@@ -232,6 +234,10 @@ pub fn start(
         in_flight_writes: Cell::new(0),
         forward,
         metrics: metrics::HttpMetrics::init(shard_metrics_all),
+        external_auth,
+        synthetic_permissions: RefCell::new(HashMap::new()),
+        synthetic_counter,
+        free_synthetic_ids: RefCell::new(BTreeSet::new()),
     }));
     let app = router(
         state,

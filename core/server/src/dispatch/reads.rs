@@ -55,7 +55,7 @@ use iggy_binary_protocol::responses::clients::get_clients::GetClientsResponse;
 use iggy_binary_protocol::responses::consumer_groups::SyncConsumerGroupResponse;
 use iggy_binary_protocol::responses::system::get_snapshot::GetSnapshotResponse;
 use iggy_binary_protocol::{HEADER_SIZE, RoutedRequestHeader, WireDecode, WireEncode};
-use iggy_common::{IggyError, SnapshotCompression, SystemSnapshotType};
+use iggy_common::{IggyError, Permissions, SnapshotCompression, SystemSnapshotType};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::framing::MAX_MESSAGE_SIZE;
@@ -142,6 +142,9 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
     // connection lookup. `user_id` is `None` only on the pre-auth path
     // (PING), which serves ungated codes; the gated arms fail closed on it.
     let (user_id, client_address) = sessions.borrow().read_context(transport_client_id);
+    let session_perms = user_id
+        .filter(|&uid| crate::external_auth::is_synthetic_user_id(uid))
+        .and_then(|uid| sessions.borrow().session_permissions_for_user(uid).cloned());
     match code {
         PING_CODE => {
             // A ping is the client's liveness proof; reset its staleness clock
@@ -173,7 +176,13 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             handle_get_personal_access_tokens(shard, sessions, transport_client_id, &request).await;
         }
         GET_CLIENTS_CODE => {
-            if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_clients) {
+            if let Err(error) = authorize_uid(
+                shard,
+                user_id,
+                Permissioner::get_clients,
+                session_perms.as_ref(),
+                |p| p.global.manage_servers || p.global.read_servers,
+            ) {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
                 return;
@@ -197,7 +206,13 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             .await;
         }
         GET_CLIENT_CODE => {
-            if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_client) {
+            if let Err(error) = authorize_uid(
+                shard,
+                user_id,
+                Permissioner::get_client,
+                session_perms.as_ref(),
+                |p| p.global.manage_servers || p.global.read_servers,
+            ) {
                 send_non_replicated_deny(shard, &request, transport_client_id, error.as_code())
                     .await;
                 return;
@@ -240,13 +255,35 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 .await;
         }
         GET_SNAPSHOT_FILE_CODE => {
-            handle_get_snapshot(shard, system_config, transport_client_id, &request, user_id).await;
+            handle_get_snapshot(
+                shard,
+                system_config,
+                transport_client_id,
+                &request,
+                user_id,
+                session_perms.as_ref(),
+            )
+            .await;
         }
         POLL_MESSAGES_CODE => {
-            handle_poll_messages(shard, transport_client_id, &request, user_id).await;
+            handle_poll_messages(
+                shard,
+                transport_client_id,
+                &request,
+                user_id,
+                session_perms.as_ref(),
+            )
+            .await;
         }
         GET_CONSUMER_OFFSET_CODE => {
-            handle_get_consumer_offset(shard, transport_client_id, &request, user_id).await;
+            handle_get_consumer_offset(
+                shard,
+                transport_client_id,
+                &request,
+                user_id,
+                session_perms.as_ref(),
+            )
+            .await;
         }
         SYNC_CONSUMER_GROUP_CODE => {
             // Self-scoped: serves the caller's own assignment keyed by the
@@ -271,6 +308,7 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 user_id,
                 &roster,
                 client_ip,
+                session_perms.as_ref(),
             )
             .await;
         }
@@ -286,6 +324,7 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     user_id: Option<u32>,
     roster: &ClusterRoster,
     client_ip: Option<IpAddr>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -296,7 +335,9 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     // Gate by command code before the shared builder runs. The builder stays
     // authz-free (it is byte-shared with the HTTP read path, which gates
     // separately); a denial replies status!=0 with an empty body.
-    if let Err(error) = authorize_default_read(shard, code, request_body(request), user_id) {
+    if let Err(error) =
+        authorize_default_read(shard, code, request_body(request), user_id, session_perms)
+    {
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }
@@ -364,6 +405,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -371,7 +413,13 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    if let Err(error) = authorize_uid(shard, user_id, Permissioner::get_snapshot) {
+    if let Err(error) = authorize_uid(
+        shard,
+        user_id,
+        Permissioner::get_snapshot,
+        session_perms,
+        |p| p.global.manage_servers || p.global.read_servers,
+    ) {
         send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
         return;
     }

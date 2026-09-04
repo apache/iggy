@@ -414,6 +414,8 @@ pub fn new_shard(
             // Default-config PAT cap, like the system config above, so sim
             // ingress admits exactly what a default-configured server does.
             PersonalAccessTokenConfig::default().max_tokens_per_user,
+            Arc::new(configs::external_auth::ExternalAuthConfig::default()),
+            server::external_auth::SyntheticUserIdCounter::new(),
         )
     } else {
         ShellHandlers::noop()

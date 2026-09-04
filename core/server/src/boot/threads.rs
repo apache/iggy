@@ -427,6 +427,7 @@ pub(in crate::boot) fn run_shard_thread(
     owner_table: Arc<ReplicaOwnerTable>,
     roster_cells: RosterCells,
     shard_metrics_all: Vec<ShardMetrics>,
+    synthetic_counter: crate::external_auth::SyntheticUserIdCounter,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
     // unwind here must flip `shutdown_flag` so sibling watchdogs drive
@@ -470,6 +471,7 @@ pub(in crate::boot) fn run_shard_thread(
             owner_table,
             roster_cells,
             shard_metrics_all,
+            synthetic_counter,
         ))
         .await
     });

@@ -262,6 +262,8 @@ pub enum ServerError {
         min: usize,
         max: usize,
     },
+    #[error("invalid external_auth config: {reason}")]
+    InvalidExternalAuthConfig { reason: String },
     #[error("--fresh could not remove the system path at {path}")]
     FreshWipeFailed {
         path: PathBuf,

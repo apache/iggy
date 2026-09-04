@@ -25,12 +25,13 @@ use consensus::MetadataHandle;
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codes::GET_STATS_CODE;
 use iggy_common::wire_conversions::identifier_to_wire;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, Permissions};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use send_wrapper::SendWrapper;
 use std::rc::Rc;
 
+use crate::external_auth::is_synthetic_user_id;
 use crate::http::error::{Consistency, ReadError};
 use crate::http::extractor::Identity;
 use crate::http::state::HttpInner;
@@ -57,15 +58,25 @@ pub(in crate::http) fn authorize_read(
     identity: &Identity,
     consistency: Consistency,
     rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
+    synthetic_check: impl FnOnce(&Permissions) -> bool,
 ) -> Result<(), ReadError> {
-    state
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .users()
-        .authorize(|permissioner| rule(permissioner, identity.user_id))
-        .map_err(ReadError::Rejected)?;
+    if is_synthetic_user_id(identity.user_id) {
+        let perms = state
+            .get_synthetic_permissions(identity.user_id)
+            .ok_or(ReadError::Rejected(IggyError::Unauthorized))?;
+        if !synthetic_check(&perms) {
+            return Err(ReadError::Rejected(IggyError::Unauthorized));
+        }
+    } else {
+        state
+            .shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .authorize(|permissioner| rule(permissioner, identity.user_id))
+            .map_err(ReadError::Rejected)?;
+    }
     if consistency == Consistency::Linearizable && !state.is_metadata_primary() {
         return Err(state.not_primary_read_error(&identity.path_and_query, identity.client_ip));
     }
@@ -92,9 +103,10 @@ pub(in crate::http) async fn read_local(
     code: u32,
     body: &[u8],
     rule: impl FnOnce(&Permissioner, u32) -> Result<(), IggyError>,
+    synthetic_check: impl FnOnce(&Permissions) -> bool,
 ) -> Result<Bytes, ReadError> {
     await_recovery_barrier(&state.shard).await?;
-    authorize_read(state, identity, consistency, rule)?;
+    authorize_read(state, identity, consistency, rule, synthetic_check)?;
     let clients_count = if code == GET_STATS_CODE {
         u32::try_from(SendWrapper::new(state.shard.list_all_clients()).await.len())
             .unwrap_or(u32::MAX)
@@ -270,7 +282,26 @@ pub(in crate::http) fn authorize_data_plane(
     stream_id: &Identifier,
     topic_id: &Identifier,
     rule: impl FnOnce(&Permissioner, u32, usize, usize) -> Result<(), IggyError>,
+    synthetic_check: impl FnOnce(&Permissions, usize, usize) -> bool,
 ) -> Result<(), IggyError> {
+    if is_synthetic_user_id(user_id) {
+        let perms = state
+            .get_synthetic_permissions(user_id)
+            .ok_or(IggyError::Unauthorized)?;
+        let (Ok(wire_stream), Ok(wire_topic)) =
+            (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
+        else {
+            return Ok(());
+        };
+        let Some((sid, tid)) = resolve_gate_topic(state, &wire_stream, &wire_topic) else {
+            return Ok(());
+        };
+        return if synthetic_check(&perms, sid, tid) {
+            Ok(())
+        } else {
+            Err(IggyError::Unauthorized)
+        };
+    }
     let (Ok(wire_stream), Ok(wire_topic)) =
         (identifier_to_wire(stream_id), identifier_to_wire(topic_id))
     else {

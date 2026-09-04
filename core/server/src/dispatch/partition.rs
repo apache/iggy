@@ -57,7 +57,7 @@ use iggy_binary_protocol::{
     AckLevel, Command, KIND_CONSUMER_GROUP, Operation, RoutedRequestHeader, WireDecode, WireEncode,
     WireIdentifier,
 };
-use iggy_common::{IggyError, PollingStrategy};
+use iggy_common::{IggyError, Permissions, PollingStrategy};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
@@ -364,6 +364,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     bound_session: u64,
     transport_client_id: u128,
     acting_user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -424,6 +425,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
         acting_user_id,
         scope.stream_id(),
         scope.topic_id(),
+        session_perms,
     ) {
         warn!(
             transport_client_id,
@@ -589,6 +591,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -620,6 +623,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         |permissioner, uid, stream_id, topic_id| {
             permissioner.poll_messages(uid, stream_id, topic_id)
         },
+        session_perms,
     ) {
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
@@ -717,6 +721,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     transport_client_id: u128,
     request: &Message<RoutedRequestHeader>,
     user_id: Option<u32>,
+    session_perms: Option<&Permissions>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -744,6 +749,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         |permissioner, uid, stream_id, topic_id| {
             permissioner.get_consumer_offset(uid, stream_id, topic_id)
         },
+        session_perms,
     ) {
         send_non_replicated_deny(shard, request, transport_client_id, status).await;
         return;
@@ -1411,6 +1417,7 @@ mod tests {
             SESSION,
             TRANSPORT,
             Some(DEFAULT_ROOT_USER_ID),
+            None,
         )
         .await;
 
