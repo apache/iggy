@@ -179,6 +179,22 @@ the transform chain, so the original bytes no longer exist to preserve. A
 dead-letter topic belongs in the runtime, where those bytes are still available
 and one implementation would serve every sink.
 
+**Rejections are not visible in the runtime's Prometheus metrics.** The runtime
+counts every message it hands across the FFI as processed, and increments
+`iggy_connector_errors_total` only for drops it performs itself, such as decode
+and transform failures. A record the sink rejects is therefore counted as a
+success: `errors_total` stays at zero while `messages_processed` overcounts.
+
+This is not fixable from the plugin. A sink is a separate shared library with no
+handle on the runtime's metrics, and its `consume()` return value is discarded
+at the FFI boundary in any case. Closing it needs a change in
+`core/connectors/sdk` — either a metrics callback alongside the existing
+`LogCallback`, or an FFI return carrying the written and rejected counts.
+
+Until then, **alert on the connector's logs rather than on
+`iggy_connector_errors_total`**. Every rejection is logged at `error` with the
+stream, topic, partition, offset and message ID.
+
 Rejections come in two granularities, and only one of them names a record:
 
 - **Client-side, before the wire.** A payload that is not a JSON object, a
