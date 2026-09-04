@@ -36,9 +36,28 @@ use std::collections::btree_map::Entry;
 use std::str::FromStr;
 use tracing::{info, warn};
 
-use crate::routes::{Endpoint, EndpointOrigin};
+use crate::routes::{Endpoint, EndpointOrigin, EndpointState};
 use crate::types::EndpointId;
 use crate::{CONNECTOR_NAME, EndpointAuthType, StaticEndpointConfig};
+
+/// Ceiling on how many endpoints one instance's registry will hold.
+///
+/// Bounds the state file and the per-mutation registry clone against a caller
+/// who can register but never has to stop. Far above any real deployment: the
+/// README sizes this connector at hundreds of endpoints.
+pub const MAX_ENDPOINTS: usize = 10_000;
+
+/// Why a registration was accepted or refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Inserted,
+    /// The generated id already exists. 128 bits of entropy makes this
+    /// unreachable in practice; refusing is what stops a collision silently
+    /// retargeting live traffic.
+    Collision,
+    /// At [`MAX_ENDPOINTS`] with nothing reclaimable left.
+    Full,
+}
 
 /// Every secret-path endpoint one instance owns, static and dynamic alike.
 ///
@@ -167,14 +186,64 @@ impl EndpointRegistry {
 
     /// Registers a new endpoint, refusing to overwrite an existing one so a
     /// generated-id collision can never silently retarget live traffic.
+    ///
+    /// Kept for callers that only care whether the registry changed.
     pub fn insert(&mut self, endpoint: Endpoint) -> bool {
-        match self.endpoints.entry(endpoint.endpoint_id.clone()) {
-            Entry::Occupied(_) => false,
-            Entry::Vacant(vacant) => {
-                vacant.insert(endpoint);
-                true
+        self.try_insert(endpoint) == InsertOutcome::Inserted
+    }
+
+    /// Registers a new endpoint, reporting why it was refused.
+    ///
+    /// Nothing evicts tombstones on its own and every mutation clones the whole
+    /// registry, so without a ceiling a caller holding the management token can
+    /// grow the state file and the per-mutation cost without limit. At the
+    /// ceiling the oldest revoked *dynamic* entries are reclaimed first: such an
+    /// endpoint exists only here, so dropping it leaves its path answering 404
+    /// exactly as its tombstone did. A revoked static one is never reclaimed,
+    /// because its tombstone is what outranks a TOML entry that still declares
+    /// it.
+    ///
+    /// Either the whole thing succeeds or nothing is touched, so a refusal
+    /// cannot leave the registry partially reclaimed and arm a flush for it.
+    pub fn try_insert(&mut self, endpoint: Endpoint) -> InsertOutcome {
+        if self.endpoints.contains_key(&endpoint.endpoint_id) {
+            return InsertOutcome::Collision;
+        }
+        if self.endpoints.len() >= MAX_ENDPOINTS {
+            let wanted = self.endpoints.len() - MAX_ENDPOINTS + 1;
+            let mut reclaimable = self.reclaimable_tombstones();
+            if reclaimable.len() < wanted {
+                return InsertOutcome::Full;
+            }
+            reclaimable.truncate(wanted);
+            for endpoint_id in reclaimable {
+                self.endpoints.remove(&endpoint_id);
             }
         }
+        self.endpoints
+            .insert(endpoint.endpoint_id.clone(), endpoint);
+        InsertOutcome::Inserted
+    }
+
+    /// Revoked dynamic entries, oldest revocation first.
+    fn reclaimable_tombstones(&self) -> Vec<EndpointId> {
+        let mut tombstones: Vec<(u64, EndpointId)> = self
+            .endpoints
+            .iter()
+            .filter_map(|(endpoint_id, endpoint)| match &endpoint.state {
+                EndpointState::Revoked { revoked_at, .. }
+                    if endpoint.origin == EndpointOrigin::Dynamic =>
+                {
+                    Some((*revoked_at, endpoint_id.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        tombstones.sort_unstable();
+        tombstones
+            .into_iter()
+            .map(|(_, endpoint_id)| endpoint_id)
+            .collect()
     }
 
     /// Drops an endpoint outright, as opposed to tombstoning it. Only for
@@ -645,6 +714,65 @@ mod tests {
         assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
         assert!(!registry.revoke(ENDPOINT_ONE, "again".to_string(), 43));
         assert!(!registry.revoke(ENDPOINT_TWO, "unknown".to_string(), 44));
+    }
+
+    /// Fills the registry with revoked entries of the given origin, so a test
+    /// can reach the ceiling without caring about ids.
+    fn fill_with_tombstones(registry: &mut EndpointRegistry, count: usize, origin: EndpointOrigin) {
+        for index in 0..count {
+            let raw_id = format!("{index:032x}");
+            let mut endpoint = Endpoint {
+                origin,
+                ..dynamic_endpoint(ENDPOINT_ONE)
+            };
+            endpoint.endpoint_id = endpoint_id(&raw_id);
+            endpoint.revoke("filler".to_string(), index as u64);
+            assert_eq!(
+                registry.try_insert(endpoint),
+                InsertOutcome::Inserted,
+                "filling must not hit the ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn given_ceiling_reached_with_dynamic_tombstones_when_inserted_should_reclaim_the_oldest() {
+        let mut registry = EndpointRegistry::default();
+        fill_with_tombstones(&mut registry, MAX_ENDPOINTS, EndpointOrigin::Dynamic);
+
+        assert_eq!(
+            registry.try_insert(dynamic_endpoint(ENDPOINT_ONE)),
+            InsertOutcome::Inserted,
+            "a revoked dynamic endpoint exists only here, so reclaiming it leaves its path answering 404 exactly as its tombstone did"
+        );
+        assert_eq!(
+            registry.endpoints.len(),
+            MAX_ENDPOINTS,
+            "reclaiming must hold the registry at the ceiling, not grow past it"
+        );
+        assert!(
+            registry.endpoint(&format!("{:032x}", 0)).is_none(),
+            "the oldest revocation must be the one reclaimed"
+        );
+    }
+
+    #[test]
+    fn given_ceiling_reached_with_only_static_tombstones_when_inserted_should_refuse() {
+        // A static tombstone is what outranks a TOML entry that still declares
+        // the endpoint, so reclaiming one would resurrect it on the next
+        // restart. Refusing the registration is the cheaper failure.
+        let mut registry = EndpointRegistry::default();
+        fill_with_tombstones(&mut registry, MAX_ENDPOINTS, EndpointOrigin::Static);
+
+        assert_eq!(
+            registry.try_insert(dynamic_endpoint(ENDPOINT_ONE)),
+            InsertOutcome::Full
+        );
+        assert_eq!(
+            registry.endpoints.len(),
+            MAX_ENDPOINTS,
+            "a refusal must not leave the registry partially reclaimed, or it would arm a flush for a change the caller was told did not happen"
+        );
     }
 
     #[test]

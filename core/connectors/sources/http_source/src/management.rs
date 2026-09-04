@@ -42,6 +42,7 @@ use tracing::{error, info, warn};
 use crate::auth::{secrets_match, strip_bearer};
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState};
 use crate::server::{ServerState, error_response, refresh_routes};
+use crate::state::{InsertOutcome, MAX_ENDPOINTS};
 use crate::types::{EndpointId, unix_now_seconds};
 use crate::{CONNECTOR_NAME, EndpointAuthType, SharedState};
 
@@ -154,17 +155,35 @@ async fn register_endpoint(
         submitted: false,
     };
 
-    if !instance
-        .mutate_registry(|registry| registry.insert(endpoint))
-        .await
-    {
-        // 128 bits of entropy makes this unreachable in practice; refusing to
-        // overwrite is what keeps it from silently retargeting live traffic.
-        warn!(
-            "Generated a colliding endpoint id for {CONNECTOR_NAME} connector ID: {instance_id}, refusing the registration",
-            instance_id = instance.id
-        );
-        return error_response(StatusCode::CONFLICT, "endpoint id collision");
+    let mut outcome = InsertOutcome::Collision;
+    instance
+        .mutate_registry(|registry| {
+            outcome = registry.try_insert(endpoint);
+            outcome == InsertOutcome::Inserted
+        })
+        .await;
+    match outcome {
+        InsertOutcome::Inserted => {}
+        InsertOutcome::Collision => {
+            // 128 bits of entropy makes this unreachable in practice; refusing
+            // to overwrite is what keeps it from silently retargeting live
+            // traffic.
+            warn!(
+                "Generated a colliding endpoint id for {CONNECTOR_NAME} connector ID: {instance_id}, refusing the registration",
+                instance_id = instance.id
+            );
+            return error_response(StatusCode::CONFLICT, "endpoint id collision");
+        }
+        InsertOutcome::Full => {
+            warn!(
+                "Registry for {CONNECTOR_NAME} connector ID: {instance_id} holds {MAX_ENDPOINTS} endpoints with no reclaimable tombstones, refusing the registration",
+                instance_id = instance.id
+            );
+            return error_response(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "endpoint registry is full",
+            );
+        }
     }
     if let Some(failure) = republish(&state).await {
         // Undo the insert. Left in place it would be persisted on the next
