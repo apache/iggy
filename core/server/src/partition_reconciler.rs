@@ -109,17 +109,33 @@
 //! `park_dropped` when it parked and then lost its namespace. A prepare has
 //! nobody to answer, so the counter is the only record it existed.
 //!
+//! A shed or discarded *prepare* is not recovered by retransmit once its op has
+//! reached quorum (`consensus::retransmit_targets` skips entries with
+//! `ok_quorum_received`), so the backup gap-stops. `tick_partitions` opens a
+//! repair session for it: its level-triggered detector arms once a partition has
+//! been gap-stopped for `[cluster] repair_gap_debounce_interval`, independently of the
+//! edge-triggered arming sites (`StartView` adoption, the commit heartbeat, the
+//! post-transfer tail), whose edges a produce stream can starve. A repair range
+//! the primary has already evicted escalates to partition state transfer. The park policy
+//! above still shrinks the exposure to a genuinely exhausted byte budget and a
+//! namespace this shard cannot serve; the driver bounds how long either costs,
+//! and `partition_prepare_gap_drops_total` counts what reached the gap check.
+//!
 //! # Known gaps
 //!
-//! Recorded here because both were previously carried as a TODO on the
+//! Recorded here because they were previously carried as a TODO on the
 //! materialization barrier this module used to promise, and the barrier is gone
 //! (see above) while these are not:
 //!
-//! A shed prepare is not retransmitted once its op reached quorum, but it is not
-//! stranded until a view change. A later `CommitMessage` that advances the
-//! backup's frontier runs `maybe_request_partition_repair`; an evicted repair
-//! range escalates to partition state transfer. The park policy still avoids
-//! manufacturing that recovery work unless a byte budget is already spent.
+//! A shed prepare is not retransmitted once its op reached quorum, and the
+//! commit heartbeat is no answer to it: a follower advances `commit_max` from
+//! every prepare header before the gap check drops the frame, so under produce
+//! the heartbeat lands as `Accepted` and the backstop inside that branch never
+//! runs. What closes it is the level-triggered sweep above, which means the
+//! residual exposure is its debounce (`[cluster] repair_gap_debounce_interval`,
+//! floored at 500ms) plus the arm cap under a correlated fault, during which the
+//! backup serves a short prefix. The park policy still avoids manufacturing that
+//! recovery work unless a byte budget is already spent.
 //!
 //! TODO(krishna): `serves_committed_incarnation` and the park stamp both call
 //! `Streams::created_revision_for_namespace`, now on the per-request fence path.
@@ -3669,9 +3685,11 @@ mod tests {
         drop(inbox);
     }
 
-    /// The replicated-prepare shape, which no other test covers and where both
-    /// park critical are worst: a prepare has no client, so discarding it forces
-    /// the backup to wait for a later commit heartbeat and journal repair.
+    /// The replicated-prepare shape, which no other test covers and where the
+    /// park path's stakes are highest: a prepare has no client, so
+    /// `deny_parked_client_request` no-ops on it and anything that discards it
+    /// loses committed data silently, recoverable only once `tick_partitions`'
+    /// repair driver notices the gap it left.
     ///
     /// A backup receives the prepare before its own metadata commits (so the frame
     /// parks unstamped), then applies the commit and materialises. The prepare must
@@ -3711,7 +3729,7 @@ mod tests {
             shard.redispatched_frame_count(),
             1,
             "the parked prepare must be staged for re-dispatch; discarding it is \
-             an avoidable gap, since a prepare has no client to retry it"
+             silent committed-data loss, since a prepare has no client to answer"
         );
         let (served, answered) = drain_inbox(&inbox);
         assert_eq!(

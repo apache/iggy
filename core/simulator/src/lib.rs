@@ -395,6 +395,10 @@ impl Simulator {
             // reader-mode mirror from it and reads committed metadata through the
             // shared handle. Built in index order, so shard 0's bundle exists first.
             let mut metadata_bundle: Option<replica::SimMetadataBundle> = None;
+            // One applied-metadata frontier per REPLICA, shared by its shards,
+            // as the server bootstrap mints one per process. Volatile: a restart
+            // below builds a fresh cell, matching a rebooted node.
+            let metadata_applied_frontier = Arc::<metadata::AppliedFrontier>::default();
             for shard_idx in 0..shards_per_replica {
                 let inbox = inboxes[usize::from(shard_idx)]
                     .take()
@@ -429,6 +433,7 @@ impl Simulator {
                     (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
                     // Fresh boot: `init_partition` seeds later, before any workload.
                     &[],
+                    Arc::clone(&metadata_applied_frontier),
                 );
                 if shard_idx == 0 {
                     metadata_bundle = Some(
@@ -1077,6 +1082,7 @@ impl Simulator {
     /// # Panics
     /// If the replica is not crashed, or its shard count does not fit `u16`; mesh
     /// construction caps it.
+    #[allow(clippy::too_many_lines)]
     pub fn replica_restart(&mut self, replica_index: u8) {
         assert!(
             self.crashed.contains(&replica_index),
@@ -1131,6 +1137,7 @@ impl Simulator {
         let mut stop_txs = Vec::with_capacity(usize::from(shards_per_replica));
         let mut pump_tasks = Vec::with_capacity(usize::from(shards_per_replica));
         let mut metadata_bundle: Option<replica::SimMetadataBundle> = None;
+        let metadata_applied_frontier = Arc::<metadata::AppliedFrontier>::default();
         for shard_idx in 0..shards_per_replica {
             let inbox = inboxes[usize::from(shard_idx)]
                 .take()
@@ -1162,6 +1169,7 @@ impl Simulator {
                 metadata_incarnation,
                 (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
                 &seed_namespaces,
+                Arc::clone(&metadata_applied_frontier),
             );
             if shard_idx == 0 {
                 metadata_bundle =
@@ -5095,5 +5103,1312 @@ mod repair_frontier_tests {
             "the rejoined replica never repaired an op below its own head, so \
              nothing about the repair frontier was exercised"
         );
+    }
+}
+
+#[cfg(test)]
+mod partition_repair_driver_tests {
+    //! A backup that missed a committed partition prepare recovers in Normal
+    //! status, without waiting for a view change.
+    //!
+    //! Every edge-triggered arming site is starvable. A follower advances
+    //! `commit_max` from each prepare header in `replicate_preflight`, before
+    //! the gap check drops the prepare, so under produce the primary's commit
+    //! heartbeat lands as `CommitOutcome::Accepted` and the backstop that would
+    //! arm repair on `Advanced` never runs. These tests starve that edge
+    //! outright (no commit heartbeat for the group reaches the lagging replica)
+    //! so nothing but the level-triggered detector in `tick_partitions` can
+    //! close the gap.
+
+    use super::*;
+    use bytes::Bytes;
+    use consensus::Status;
+    use iggy_binary_protocol::{
+        CommitHeader, PrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader,
+    };
+    use packet::Packet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Chain replication runs 0 -> 1 -> 2 and stops before the primary, so
+    /// replica 2 forwards to nobody: it is the only replica whose losses do not
+    /// also starve its successor, and therefore the group, of quorum.
+    const LAGGING: u8 = 2;
+
+    const CLIENT_ID: u128 = 1;
+
+    /// Ops that replicate cleanly before the fault, so the gap opens above a
+    /// committed prefix rather than at the group's first op.
+    const WARMUP_SENDS: usize = 3;
+
+    /// Ticks stepped after each produce. Keeps one send's round trip inside its
+    /// own window so the workload is legible tick by tick.
+    const STEPS_PER_SEND: usize = 12;
+
+    /// Produces issued with the fault standing. `partitions::REPAIR_RETRY_TICKS`
+    /// is 100, so this must carry the run past the debounce while prepares keep
+    /// consuming the `commit_max` advance the heartbeat backstop needs.
+    const GAP_SENDS: usize = 12;
+
+    /// Quiet ticks after the produce stops, for the repair stream to land.
+    ///
+    /// Budgeted against `NORMAL_HEARTBEAT_TICKS` (500): with this group's commit
+    /// heartbeats withheld, the lagging replica elects once that timer fires, and
+    /// an election would heal the gap through `on_start_view` instead. Every
+    /// phase after the fault is installed has to fit inside it.
+    const QUIET_STEPS: usize = 160;
+
+    /// Budget for the group to settle once the fault is lifted. Generous rather
+    /// than tuned: the drain loop breaks on convergence, and the tail above the
+    /// repaired window waits on whichever interval-driven site picks it up.
+    const DRAIN_STEPS: usize = 600;
+
+    /// Ticks of healthy load in the no-false-positive test, several debounce
+    /// intervals' worth so the sweep gets many chances to arm.
+    const LOAD_TICKS: usize = 4 * partitions::REPAIR_RETRY_TICKS as usize;
+
+    /// Paced at a round trip rather than one submit per tick: the pipeline caps
+    /// at `PIPELINE_PREPARE_QUEUE_MAX`, so submitting faster than the group
+    /// commits just collects transient rejections and the group goes quiet.
+    const TICKS_PER_SEND: usize = 4;
+
+    /// Ops the healthy run must have committed for its verdict to mean anything.
+    /// A produce's round trip is four one-way hops plus tick granularity, so this
+    /// network commits on the order of one op per fifteen ticks however hard the
+    /// client pushes; the floor only has to prove the group was live across
+    /// several debounce intervals, not that it was saturated.
+    const COMMITTED_MIN: u64 = 20;
+
+    /// Produces issued with the fault standing in the walk-starvation test: few
+    /// enough that the gap debounce fires only after produce stops, so the
+    /// repair window closes at the last carried commit and lands fully resident.
+    const STRAND_SENDS: usize = 3;
+
+    /// Quiet budget for the walk-starvation test: debounce, repair stream, then
+    /// the drain, kept under `NORMAL_HEARTBEAT_TICKS` so an election cannot be
+    /// the healer.
+    const STRAND_QUIET_STEPS: usize = 300;
+
+    /// Defines this test's `withhold_one_prepare` chain hook over the statics it
+    /// names: swallow the FIRST partition prepare for `$namespace`, once, and
+    /// record its op in `$withheld_op`.
+    ///
+    /// A macro because link hooks are bare `fn` pointers, so the body cannot
+    /// capture, and the statics must stay per-test: the sibling tests in this
+    /// binary run in parallel and would otherwise share one fault. The statics
+    /// are still declared in each test, where its fault setup is read.
+    macro_rules! withhold_one_prepare {
+        ($namespace:ident, $withheld_op:ident) => {
+            fn withhold_one_prepare(packet: &Packet) -> bool {
+                let Some(header) = prepare_for(packet, $namespace.load(Ordering::Relaxed)) else {
+                    return false;
+                };
+                $withheld_op
+                    .compare_exchange(0, header.op, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            }
+        };
+    }
+
+    /// The partition-plane prepare a packet carries, if it carries one for
+    /// `group`.
+    fn prepare_for(packet: &Packet, group: u64) -> Option<PrepareHeader> {
+        if packet.message.header().command != Command::Prepare {
+            return None;
+        }
+        let header: &PrepareHeader =
+            bytemuck::checked::from_bytes(&packet.message.as_slice()[..size_of::<PrepareHeader>()]);
+        (header.group == group).then_some(*header)
+    }
+
+    /// Whether a packet is a commit heartbeat for `group`.
+    fn is_commit_for(packet: &Packet, group: u64) -> bool {
+        if packet.message.header().command != Command::Commit {
+            return false;
+        }
+        let header: &CommitHeader =
+            bytemuck::checked::from_bytes(&packet.message.as_slice()[..size_of::<CommitHeader>()]);
+        header.group == group
+    }
+
+    /// Whether a packet is a repair request for `group`.
+    fn is_request_prepares_for(packet: &Packet, group: u64) -> bool {
+        if packet.message.header().command != Command::RequestPrepares {
+            return false;
+        }
+        let header: &RequestPreparesHeader = bytemuck::checked::from_bytes(
+            &packet.message.as_slice()[..size_of::<RequestPreparesHeader>()],
+        );
+        header.group == group
+    }
+
+    /// Whether a packet is a repair stream terminator for `group`.
+    fn is_repair_done_for(packet: &Packet, group: u64) -> bool {
+        if packet.message.header().command != Command::RepairDone {
+            return false;
+        }
+        let header: &RepairRangeReplyHeader = bytemuck::checked::from_bytes(
+            &packet.message.as_slice()[..size_of::<RepairRangeReplyHeader>()],
+        );
+        header.group == group
+    }
+
+    fn cluster(seed: u64) -> (Simulator, SimClient) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let replica_count: u8 = 3;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(CLIENT_ID),
+            network_opts,
+        );
+        (sim, SimClient::new(CLIENT_ID))
+    }
+
+    /// Submit `sends` produces against `namespace`, stepping between each.
+    fn produce(
+        sim: &mut Simulator,
+        client: &SimClient,
+        namespace: IggyNamespace,
+        sends: usize,
+        tag: &str,
+    ) {
+        for index in 0..sends {
+            let msg = client.send_messages(namespace, &[Bytes::from(format!("{tag}-{index}"))]);
+            sim.submit_request(client.client_id(), 0, msg.into_generic());
+            for _ in 0..STEPS_PER_SEND {
+                sim.step();
+            }
+        }
+    }
+
+    /// `(status, view, commit_min, commit_max)` of one replica's partition group.
+    fn group_state(
+        sim: &Simulator,
+        replica: u8,
+        namespace: IggyNamespace,
+    ) -> (Status, u32, u64, u64) {
+        let shard = sim.replicas[replica as usize].partition_shard(namespace);
+        let partition = shard
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .expect("the replica hosts the group");
+        let consensus = partition.consensus();
+        (
+            consensus.status(),
+            consensus.view(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        )
+    }
+
+    fn journal_holds(sim: &Simulator, replica: u8, namespace: IggyNamespace, op: u64) -> bool {
+        let shard = sim.replicas[replica as usize].partition_shard(namespace);
+        shard
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .is_some_and(|partition| partition.log.journal().inner.holds_op(op))
+    }
+
+    fn gap_drops(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> u64 {
+        sim.replicas[replica as usize]
+            .partition_shard(namespace)
+            .metrics()
+            .partition_prepare_gap_drops_value()
+    }
+
+    /// Gap drops still buffered on the partition, i.e. recorded since the sweep
+    /// last drained them into the shard counter.
+    fn buffered_gap_drops(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> u64 {
+        sim.replicas[replica as usize]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .map_or(0, partitions::IggyPartition::prepare_gap_drops)
+    }
+
+    fn transfer_armed(sim: &Simulator, replica: u8, namespace: IggyNamespace) -> bool {
+        let shard = sim.replicas[replica as usize].partition_shard(namespace);
+        shard
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .is_some_and(|partition| {
+                partition.transfer.is_some()
+                    || partition.consensus().state_transfer_stage()
+                        != consensus::StateTransferStage::Idle
+            })
+    }
+
+    #[test]
+    fn given_a_backup_that_dropped_a_committed_prepare_when_heartbeat_advances_are_starved_should_repair_in_normal_status()
+     {
+        // Statics, not captures: the link hooks are bare `fn` pointers. Declared
+        // inside the test because the sibling tests in this binary run in
+        // parallel and would otherwise share them.
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
+
+        /// Primary -> 2: withhold this group's commit heartbeats, so the
+        /// `Advanced` backstop can never run, and withhold retransmits of the
+        /// dropped op. The retransmit half stands in for production behaviour
+        /// rather than adding a fault: `consensus::retransmit_targets` skips an
+        /// op that already reached quorum, and this op reaches quorum on 0 and 1
+        /// alone. Without it the retry timer could heal the gap and the test
+        /// would pass with no repair driver at all.
+        fn starve_commit_edge(packet: &Packet) -> bool {
+            let group = GAP_NS.load(Ordering::Relaxed);
+            if let Some(header) = prepare_for(packet, group) {
+                return header.op == WITHHELD_OP.load(Ordering::Relaxed);
+            }
+            is_commit_for(packet, group)
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0232);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+        let (_, _, warm_commit_min, _) = group_state(&sim, LAGGING, namespace);
+        assert!(
+            warm_commit_min > 0,
+            "the lagging replica committed nothing before the fault, so the gap \
+             below would open at the group's first op"
+        );
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+
+        produce(&mut sim, &client, namespace, GAP_SENDS, "gap");
+
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no partition prepare crossed the chain link, so the fault never armed"
+        );
+        assert!(
+            gap_drops(&sim, LAGGING, namespace) > 0,
+            "the lagging replica never reached its backup gap check, so the \
+             prepares after the withheld op were not dropped as a gap"
+        );
+
+        for _ in 0..QUIET_STEPS {
+            sim.step();
+        }
+
+        // Judged with the blockade still standing, so the tick driver is the only
+        // thing that can have armed the repair: no commit heartbeat for this
+        // group has reached the replica since the gap opened, and `on_commit` is
+        // where the `Advanced` backstop lives.
+        let (status, view, commit_min, _) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(
+            view, 0,
+            "a view change healed the gap instead of the repair driver; the test \
+             proves nothing about normal status"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        assert!(
+            journal_holds(&sim, LAGGING, namespace, withheld),
+            "op {withheld} was never repaired back into the lagging replica's journal"
+        );
+        assert!(
+            commit_min >= withheld,
+            "the commit walk never crossed the repaired hole: stopped at \
+             {commit_min}, the withheld op is {withheld}"
+        );
+
+        // Lift the blockade and let the group settle. The commit walk is driven
+        // by arriving frames, so with this group's heartbeats withheld the tail
+        // above the repaired window has nothing to advance it; that is the
+        // injected fault, not the gap under test.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) = None;
+        for _ in 0..DRAIN_STEPS {
+            sim.step();
+            let (_, _, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+            if commit_min == commit_max {
+                break;
+            }
+        }
+        let (status, view, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert_eq!((status, view), (Status::Normal, 0));
+        assert_eq!(
+            commit_min, commit_max,
+            "the lagging replica is still gap-stopped: committed through \
+             {commit_max} but walkable only to {commit_min}"
+        );
+    }
+
+    #[test]
+    fn given_a_repair_armed_by_the_tick_driver_when_the_range_is_evicted_should_convert_to_state_transfer()
+     {
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
+
+        fn starve_commit_edge(packet: &Packet) -> bool {
+            let group = GAP_NS.load(Ordering::Relaxed);
+            if let Some(header) = prepare_for(packet, group) {
+                return header.op == WITHHELD_OP.load(Ordering::Relaxed);
+            }
+            is_commit_for(packet, group)
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0233);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+
+        produce(&mut sim, &client, namespace, GAP_SENDS, "gap");
+        assert_ne!(
+            WITHHELD_OP.load(Ordering::Relaxed),
+            0,
+            "no partition prepare crossed the chain link, so the fault never armed"
+        );
+
+        // Compact the serving side past the gap. This plane's journal is
+        // memory-only, so wiping it IS its retention floor moving: the serve
+        // path reads `repair_retained_from` as `None` and reports eviction from
+        // its own commit frontier, which is exactly what a peer that
+        // checkpointed past the requested window answers.
+        {
+            let primary = sim.replicas[0].partition_shard(namespace);
+            let partition = primary
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .expect("the primary hosts the group");
+            partition.log.journal().inner.clear_all();
+        }
+
+        for _ in 0..QUIET_STEPS {
+            sim.step();
+            if transfer_armed(&sim, LAGGING, namespace) {
+                break;
+            }
+        }
+
+        let (status, view, ..) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(
+            view, 0,
+            "a view change armed the recovery instead of the tick-armed repair session"
+        );
+        assert!(
+            transfer_armed(&sim, LAGGING, namespace),
+            "the tick-armed repair session hit an evicted range but never converted \
+             to a state transfer (status {status:?})"
+        );
+    }
+
+    #[test]
+    fn given_healthy_pipelined_traffic_when_no_gap_exists_should_not_arm_repair() {
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static REPAIR_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+        /// Observer, not a fault: counts this group's repair requests and passes
+        /// every packet through.
+        fn count_repair_requests(packet: &Packet) -> bool {
+            if is_request_prepares_for(packet, GAP_NS.load(Ordering::Relaxed)) {
+                REPAIR_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        // TWO replicas, so quorum spans both: no op can commit without the
+        // backup's ack, every reordering-induced gap therefore blocks quorum, and
+        // `consensus::retransmit_targets` refills it. At three, the network's
+        // per-tick delivery shuffle lets an op commit on the primary and its
+        // first chain hop while the last replica loses it for good, which is the
+        // very fault the sibling tests inject -- it would then be repaired here,
+        // correctly, and this assertion would fire on a healthy driver.
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let replica_count: u8 = 2;
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(CLIENT_ID),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                seed: 0x5EED_0234,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(CLIENT_ID);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        REPAIR_REQUESTS.store(0, Ordering::Relaxed);
+
+        for (from, to) in [(0u8, 1u8), (1, 0)] {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) =
+                Some(count_repair_requests);
+        }
+
+        // Sustained, not bursty: a produce every tick, for several debounce
+        // intervals, so the sweep gets many chances to arm against ordinary
+        // pipelining.
+        for tick in 0..LOAD_TICKS {
+            if tick % TICKS_PER_SEND == 0 {
+                let msg =
+                    client.send_messages(namespace, &[Bytes::from(format!("healthy-{tick}"))]);
+                sim.submit_request(client.client_id(), 0, msg.into_generic());
+            }
+            sim.step();
+        }
+        for _ in 0..QUIET_STEPS {
+            sim.step();
+        }
+
+        let committed = group_state(&sim, 1, namespace).2;
+        let sends = LOAD_TICKS / TICKS_PER_SEND;
+        assert!(
+            committed >= COMMITTED_MIN,
+            "the backup committed only {committed} ops across {sends} sends, so the \
+             sweep was never driven over a loaded group"
+        );
+        // No per-tick lag sampling: `sim.step()` runs the pumps to quiescence, so
+        // every sample lands AFTER the tick whose walk backstop drained whatever
+        // the step's produce left, and a run that asserted something about those
+        // samples would be asserting over an empty set. The commit lag a naive
+        // detector misreads lives inside a step, and it is pinned where it can
+        // be held still: exhaustively in `gap_detector_tests`, and end to end by
+        // the walk-starvation run in this module, which strands a backup in
+        // exactly that state and proves nothing arms repair over it.
+        //
+        // What this run adds is the part only a live group can show: a loaded,
+        // lossless cluster produces no repair traffic at all.
+        for replica in 0..replica_count {
+            let (status, view, commit_min, commit_max) = group_state(&sim, replica, namespace);
+            assert_eq!(
+                (status, view),
+                (Status::Normal, 0),
+                "replica {replica} left view 0 / Normal, so a view change could \
+                 account for repair traffic"
+            );
+            // Residual lag is transient at worst: a heartbeat carrying a commit
+            // the replica already knows is `CommitOutcome::Accepted`, so a backup
+            // can sit with committed-but-unwalked ops until the tick sweep's
+            // walk-stalled backstop resumes the walk. Every one of them is
+            // RESIDENT, which is what separates it from a gap.
+            if commit_min < commit_max {
+                assert!(
+                    journal_holds(&sim, replica, namespace, commit_min + 1),
+                    "replica {replica} lags at {commit_min} of {commit_max} with op \
+                     {} missing, so a no-loss run produced a real hole",
+                    commit_min + 1
+                );
+            }
+        }
+        assert_eq!(
+            REPAIR_REQUESTS.load(Ordering::Relaxed),
+            0,
+            "the tick driver requested repair on a healthy group across {sends} sends; \
+             its gap predicate is reading ordinary commit lag as a journal hole"
+        );
+    }
+
+    #[test]
+    fn given_a_backup_holding_resident_committed_ops_when_every_walk_edge_is_starved_should_drain_in_normal_status()
+     {
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_DONES: AtomicU64 = AtomicU64::new(0);
+
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
+
+        /// Primary -> 2: withhold every direct prepare (live ones ride the
+        /// chain, so this starves only retransmit heals), the group's commit
+        /// heartbeats, and its repair terminators. The repaired ops themselves
+        /// pass, so the window lands resident while `complete_repair`, the walk
+        /// the terminator would run, never fires.
+        fn starve_walk_edges(packet: &Packet) -> bool {
+            let group = GAP_NS.load(Ordering::Relaxed);
+            if prepare_for(packet, group).is_some() {
+                return true;
+            }
+            if is_repair_done_for(packet, group) {
+                WITHHELD_DONES.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            is_commit_for(packet, group)
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0235);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+        WITHHELD_DONES.store(0, Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+        let (_, _, warm_commit_min, _) = group_state(&sim, LAGGING, namespace);
+        assert!(
+            warm_commit_min > 0,
+            "the lagging replica committed nothing before the fault, so the gap \
+             below would open at the group's first op"
+        );
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_walk_edges);
+
+        produce(&mut sim, &client, namespace, STRAND_SENDS, "strand");
+
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no partition prepare crossed the chain link, so the fault never armed"
+        );
+
+        for _ in 0..STRAND_QUIET_STEPS {
+            sim.step();
+            let (_, view, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+            if view != 0 || (commit_min >= withheld && commit_min == commit_max) {
+                break;
+            }
+        }
+
+        assert!(
+            WITHHELD_DONES.load(Ordering::Relaxed) > 0,
+            "no repair terminator was withheld, so the walk was never starved and \
+             a green run would not prove the tick backstop"
+        );
+        assert!(
+            journal_holds(&sim, LAGGING, namespace, withheld),
+            "op {withheld} was never repaired back into the lagging replica's journal"
+        );
+        let (status, view, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert_eq!(
+            view, 0,
+            "a view change drained the walk instead of the tick backstop; the test \
+             proves nothing about normal status"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        for op in commit_min + 1..=commit_max {
+            assert!(
+                journal_holds(&sim, LAGGING, namespace, op),
+                "op {op} is not resident, so this run stranded on a repair gap, \
+                 not a parked walk"
+            );
+        }
+        assert_eq!(
+            commit_min, commit_max,
+            "the walk never resumed over resident committed ops: walkable to \
+             {commit_min}, committed through {commit_max}, every op between resident"
+        );
+    }
+
+    #[test]
+    fn given_a_gap_stopped_backup_when_repair_is_armed_should_spend_its_debounce() {
+        // The reset lives in `maybe_request_partition_repair`, the funnel every
+        // arming site goes through, precisely because the four edge-triggered
+        // sites never touch `gap_ticks` themselves. Driven here rather than
+        // modelled: a saturated count hands the NEXT gap an arm on its first
+        // tick, and the shape that reaches it is a repair short enough that no
+        // sweep ever observes the partition with its recovery owned.
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
+
+        /// Primary -> 2: withhold this group's commit heartbeats, so the
+        /// edge-triggered backstop cannot be what arms the repair below.
+        fn starve_commit_edge(packet: &Packet) -> bool {
+            let group = GAP_NS.load(Ordering::Relaxed);
+            if let Some(header) = prepare_for(packet, group) {
+                return header.op == WITHHELD_OP.load(Ordering::Relaxed);
+            }
+            is_commit_for(packet, group)
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0238);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+        // Short, deliberately: long enough to open the gap, well under the
+        // debounce, so the driver has not armed on its own and the sweep below
+        // is the one that does it.
+        produce(&mut sim, &client, namespace, STRAND_SENDS, "gap");
+        assert_ne!(
+            WITHHELD_OP.load(Ordering::Relaxed),
+            0,
+            "no partition prepare crossed the chain link, so the fault never armed"
+        );
+        let (_, _, commit_min, commit_max) = group_state(&sim, LAGGING, namespace);
+        assert!(
+            commit_min < commit_max && !journal_holds(&sim, LAGGING, namespace, commit_min + 1),
+            "the lagging replica is not gap-stopped (walkable to {commit_min} of \
+             {commit_max}), so the sweep has nothing to arm"
+        );
+
+        // Saturate the debounce by hand and take one sweep: the arm has to be
+        // what spends it, whatever the tick counted on the way in.
+        let shard = sim.replicas[LAGGING as usize].partition_shard(namespace);
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions
+                .get_by_ns(&namespace)
+                .expect("the replica hosts the group");
+            assert!(
+                partition.repair.is_none(),
+                "a session was already open, so this sweep would arm nothing"
+            );
+            partition.gap_ticks.set(u32::MAX);
+        }
+        let mut namespace_scratch = Vec::new();
+        futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch));
+
+        let partitions = shard.plane.partitions();
+        let partition = partitions
+            .get_by_ns(&namespace)
+            .expect("the replica hosts the group");
+        assert!(
+            partition.repair.is_some(),
+            "the sweep never opened a session, so the reset below proves nothing"
+        );
+        assert_eq!(
+            partition.gap_ticks.get(),
+            0,
+            "the arm left the debounce saturated; a repair that completes before the \
+             next sweep would then hand the following gap an arm on its first tick"
+        );
+    }
+
+    #[test]
+    fn given_a_local_commit_failure_in_the_tick_walk_when_the_partition_fences_should_return_the_fault()
+     {
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+
+        /// Primary -> 2: withhold this group's commit heartbeats, so the last
+        /// produced op stays journaled-but-uncommitted here and the walk the
+        /// test drives below is the first one that can reach it.
+        fn starve_commit_edge(packet: &Packet) -> bool {
+            is_commit_for(packet, GAP_NS.load(Ordering::Relaxed))
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0236);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+        produce(&mut sim, &client, namespace, 1, "fence");
+
+        let (_, _, commit_min, _) = group_state(&sim, LAGGING, namespace);
+        let stranded = commit_min + 1;
+        assert!(
+            journal_holds(&sim, LAGGING, namespace, stranded),
+            "op {stranded} is not resident, so the walk below would find nothing \
+             to commit and nothing to fail on"
+        );
+
+        // The sweep is invoked DIRECTLY rather than through `sim.step()`: what
+        // is under test is the verdict of the tick whose own walk raised the
+        // fault, and a pump-driven tick would fence on one pass and be asked
+        // for its verdict on the next, where the pre-walk read already answers.
+        let shard = sim.replicas[LAGGING as usize].partition_shard(namespace);
+        {
+            let partitions = shard.plane.partitions();
+            let partition = partitions
+                .get_mut_by_ns(&namespace)
+                .expect("the replica hosts the group");
+            // Committed as far as this replica knows, with the body resident:
+            // walk-stalled, which is the state the tick's backstop walks.
+            partition.consensus().advance_commit_max(stranded);
+            partition.inject_commit_failure();
+        }
+
+        let mut namespace_scratch = Vec::new();
+        let fault = futures::executor::block_on(shard.tick_partitions(&mut namespace_scratch))
+            .expect(
+                "the tick returned clean over a partition its own walk fenced; the pump \
+                 would keep serving a divergent replica on that verdict",
+            );
+        assert_eq!(fault.namespace_raw, namespace.inner());
+        assert_eq!(
+            fault.op, stranded,
+            "the fault must name the op whose local commit failed"
+        );
+        assert!(
+            sim.replicas[LAGGING as usize]
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_by_ns(&namespace)
+                .is_some_and(|partition| partition.fatal().is_some()),
+            "the partition must stay fenced after the tick reported the fault"
+        );
+    }
+
+    #[test]
+    fn given_buffered_gap_drops_when_the_namespace_is_removed_should_still_count_them() {
+        static GAP_NS: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+
+        // Every prepare after the withheld one reaches the backup's gap check
+        // and is destroyed there, which is what the counter records.
+        withhold_one_prepare!(GAP_NS, WITHHELD_OP);
+
+        let (mut sim, client) = cluster(0x5EED_0237);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(namespace);
+        sim.register_client_with_primary(&client);
+        GAP_NS.store(namespace.inner(), Ordering::Relaxed);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+
+        produce(&mut sim, &client, namespace, WARMUP_SENDS, "warmup");
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+
+        // Stepped one at a time and stopped on the step that buffered a drop:
+        // the sweep drains the count on the following tick, and the whole point
+        // of this run is to remove the namespace while the count is still on
+        // the partition.
+        let mut buffered = 0;
+        'produce: for index in 0..GAP_SENDS {
+            let message = client.send_messages(namespace, &[Bytes::from(format!("gap-{index}"))]);
+            sim.submit_request(client.client_id(), 0, message.into_generic());
+            for _ in 0..STEPS_PER_SEND {
+                sim.step();
+                buffered = buffered_gap_drops(&sim, LAGGING, namespace);
+                if buffered > 0 {
+                    break 'produce;
+                }
+            }
+        }
+        assert!(
+            buffered > 0,
+            "no prepare reached the lagging replica's gap check, so the removal \
+             below would have nothing to lose"
+        );
+        let counted = gap_drops(&sim, LAGGING, namespace);
+
+        // The reconciler's teardown order: the tombstone lands first and the
+        // disk delete runs before `ConfirmRemove`, so from here `get_mut_by_ns`
+        // answers `None` and the sweep can never drain the count again.
+        {
+            let shard = sim.replicas[LAGGING as usize].partition_shard(namespace);
+            shard.plane.partitions().tombstone(namespace);
+            shard.enqueue_reconcile_op(shard::ReconcileOp::ConfirmRemove { namespace });
+        }
+        sim.step();
+
+        let shard = sim.replicas[LAGGING as usize].partition_shard(namespace);
+        assert!(
+            shard.plane.partitions().get_by_ns(&namespace).is_none(),
+            "ConfirmRemove must have dropped the partition, or this run proves nothing"
+        );
+        assert_eq!(
+            shard.metrics().partition_prepare_gap_drops_value(),
+            counted + buffered,
+            "the {buffered} prepare(s) buffered on the partition went to the floor \
+             with it; the drops are the only record those frames existed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_read_frontier_tests {
+    //! A client that committed a metadata write and then re-homed onto a
+    //! lagging backup must never be served the pre-write state.
+    //!
+    //! The window is not peer shards on one node: a committed reply is only
+    //! produced after `gated_apply` published, and every shard reads the same
+    //! left-right buffers. It is a node whose commit walk trails the epoch the
+    //! client already holds. Register forwarding is the supported way to get
+    //! there -- a backup verifies the credentials itself, forwards only the
+    //! consensus proposal, and binds the committed session while its own
+    //! `commit_journal` is still behind that op (see
+    //! `server::dispatch::session_ops`).
+    //!
+    //! Blocking replication INTO one backup while the quorum commits without
+    //! it produces the lag deterministically, and the login still completes
+    //! because `ForwardRegister` / `ForwardRegisterResult` are left flowing.
+    //!
+    //! One shard per replica for the end-to-end read, deliberately. The harness
+    //! homes each inbound client packet on a seeded-random shard while every
+    //! shard owns its own `SessionManager`, so on a multi-shard replica a bound
+    //! session cannot reliably receive its own follow-up requests -- and the lag
+    //! under test is the node's, not a shard's.
+    //!
+    //! The second test is the other half: peer shards are not the WINDOW, but
+    //! they are how a peer-homed read learns the node's position at all, and
+    //! sharing one frontier cell across a replica's shards is what makes that
+    //! work. It runs multi-shard and drives the cell directly, so it needs no
+    //! session and dodges the homing problem entirely.
+
+    use super::*;
+    use crate::client::SimClient;
+    use iggy_binary_protocol::responses::streams::get_stream::GetStreamResponse;
+    use iggy_binary_protocol::{Command, RoutedRequestHeader, WireDecode};
+
+    /// Replica 0 leads the metadata plane at view 0, so this one is a backup
+    /// for the whole run and is the node the client re-homes onto.
+    const LAGGING: u8 = 1;
+
+    /// The gate's own budget, in `sim.step()`s: one step advances the virtual
+    /// clock by one consensus tick, so the tick count of the budget IS the step
+    /// count a held read survives.
+    ///
+    /// The simulator's replicas carry the frontier's built-in default, since
+    /// they are built without a `[cluster]` config to size it from.
+    #[allow(clippy::cast_possible_truncation)]
+    const BUDGET_STEPS: u32 = (metadata::AppliedFrontier::DEFAULT_READ_BUDGET.as_millis()
+        / shard::CONSENSUS_TICK_INTERVAL.as_millis()) as u32;
+
+    /// Steps the read is given while the backup is still cut off. A server that
+    /// answers a metadata read from an unconverged state answers within a
+    /// couple of these; the gate must hold the read past all of them.
+    ///
+    /// A fifth of the budget, so expiry cannot masquerade as a held read and
+    /// the convergence phase below still has most of the budget left.
+    const STALE_WINDOW_STEPS: u32 = BUDGET_STEPS / 5;
+
+    /// Steps the convergence phase spends waiting for the held read.
+    ///
+    /// Deliberately PAST the budget rather than exactly up to it: repair that
+    /// lands one tick late would otherwise flip this test onto the expiry path
+    /// and fail on the status assertion, which reads as "the gate is broken"
+    /// when it means "convergence was slow". Overshooting instead lets the
+    /// expired read be reported as what it is. Expiry has its own case, which
+    /// never restores replication at all.
+    const CONVERGE_STEPS: u32 = BUDGET_STEPS - STALE_WINDOW_STEPS + BUDGET_STEPS / 2;
+
+    /// The frames that would let the backup learn the committed writes. Journal
+    /// repair and `StartView` adoption are cut with the same knife as live
+    /// replication: any one of them left open closes the lag this exercises.
+    const REPLICATION_FRAMES: [Command; 5] = [
+        Command::Prepare,
+        Command::Commit,
+        Command::RepairPrepare,
+        Command::RepairDone,
+        Command::StartView,
+    ];
+
+    /// Both cases below need the same shape: a stream created everywhere, then
+    /// deleted on a quorum that excludes `LAGGING` while the client re-homes
+    /// onto it, so the client holds a committed epoch above a delete that
+    /// backup has not applied. Returns the sim, the re-homed client, and the
+    /// op the delete committed at.
+    ///
+    /// Replication into `LAGGING` is left CUT: each case decides whether to
+    /// restore it.
+    fn backup_behind_a_deleted_stream(
+        seed: u64,
+        stream_name: &str,
+        client_id: u128,
+    ) -> (Simulator, SimClient, u64) {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replica_count),
+            1,
+            std::iter::once(client_id),
+            network_opts,
+        );
+
+        let client = SimClient::new(client_id);
+        sim.shell_login(&client);
+
+        // The create lands on every replica: the backup has to HOLD the stream
+        // for the read to be able to serve a stale one.
+        let created = commit_write(&mut sim, client_id, 0, client.create_stream(stream_name));
+        step_until_applied(&mut sim, LAGGING, created);
+
+        // Cut replication into the backup, so the delete commits on the quorum
+        // formed by the primary and the remaining replica and never reaches it.
+        // Journal repair and `StartView` adoption go with it: any one of them
+        // left open closes the lag this exercises.
+        set_replication(&mut sim, LAGGING, false);
+
+        let deleted = commit_write(&mut sim, client_id, 0, client.delete_stream(stream_name));
+        assert!(
+            deleted > created,
+            "the delete must commit above the create, else the read cannot \
+             distinguish the two states"
+        );
+
+        // Re-home the same client onto the backup. The login is forwarded, so
+        // the session it binds IS a committed op above the delete while the
+        // backup's own applied frontier is still below it.
+        sim.shell_login_via(&client, LAGGING);
+        assert!(
+            sim.network.delivered_any(Command::ForwardRegister),
+            "no ForwardRegister crossed the wire: the backup answered the login \
+             itself, so the client never re-homed"
+        );
+        let lagging_commit = metadata_commit(&sim, usize::from(LAGGING));
+        assert!(
+            (created..deleted).contains(&lagging_commit),
+            "the backup applied up to op {lagging_commit}, outside the window \
+             [{created}, {deleted}) these tests need: it must hold the create and \
+             miss the delete"
+        );
+        assert_eq!(
+            read_stream_name_on(&sim, LAGGING, stream_name),
+            Some(stream_name.to_string()),
+            "the backup no longer holds the deleted stream, so a read cannot \
+             serve a stale one and the assertions prove nothing"
+        );
+        (sim, client, deleted)
+    }
+
+    /// A stream deleted before the client re-homed must not come back on the
+    /// backup that has not applied the delete yet.
+    #[test]
+    fn given_backup_behind_the_client_epoch_when_reading_a_deleted_stream_should_not_serve_it() {
+        let stream_name = "read-your-writes";
+        let client_id: u128 = 1;
+        let (mut sim, client, deleted) =
+            backup_behind_a_deleted_stream(0x1A7E_0F31, stream_name, client_id);
+
+        let read = client.get_stream(stream_name);
+        let request_id = read.header().request;
+        sim.submit_request(client_id, LAGGING, read.into_generic());
+
+        // Phase 1: still cut off. Any answer here is served from state that
+        // predates the delete the client already saw committed.
+        let mut early = None;
+        for _ in 0..STALE_WINDOW_STEPS {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                early = Some(reply);
+                break;
+            }
+        }
+        if let Some(reply) = early {
+            panic!(
+                "the backup answered a metadata read while its applied frontier \
+                 ({}) was below the client's committed epoch ({deleted}): status={}, \
+                 stream={:?}",
+                metadata_commit(&sim, usize::from(LAGGING)),
+                reply.header().status,
+                read_stream_name(&reply),
+            );
+        }
+
+        // Phase 2: restore replication. The held read must answer from the
+        // converged state, which no longer holds the stream.
+        set_replication(&mut sim, LAGGING, true);
+        for step in 0..CONVERGE_STEPS {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                assert_eq!(
+                    reply.header().status,
+                    0,
+                    "the read was refused rather than answered {step} steps into a \
+                     restored link: the gate expired at its {BUDGET_STEPS}-step budget, \
+                     of which phase 1 spent {STALE_WINDOW_STEPS}, so repair was slower \
+                     than the budget rather than the gate being wrong"
+                );
+                assert_eq!(
+                    read_stream_name(&reply),
+                    None,
+                    "the converged backup still serves the deleted stream"
+                );
+                return;
+            }
+        }
+        panic!(
+            "no answer to the held metadata read within {CONVERGE_STEPS} steps of \
+             restored replication; backup applied frontier {}, client epoch {deleted}",
+            metadata_commit(&sim, usize::from(LAGGING)),
+        );
+    }
+
+    /// The other half of the bound: a backup that NEVER catches up must refuse
+    /// the held read rather than serve the state the client already saw
+    /// replaced, and it must do so inside the budget rather than hanging.
+    ///
+    /// Same setup as the test above with replication left cut, so the only
+    /// possible outcomes are the refusal this asserts or a stale answer.
+    #[test]
+    fn given_a_backup_that_never_converges_when_reading_should_refuse_inside_the_budget() {
+        let stream_name = "read-your-writes-expiry";
+        let client_id: u128 = 1;
+        let (mut sim, client, deleted) =
+            backup_behind_a_deleted_stream(0x1A7E_0F32, stream_name, client_id);
+
+        let read = client.get_stream(stream_name);
+        let request_id = read.header().request;
+        sim.submit_request(client_id, LAGGING, read.into_generic());
+
+        // Overshoot the budget: the refusal must land inside it, and a read
+        // still unanswered after it is a hang, which the panic below names.
+        for _ in 0..(BUDGET_STEPS + BUDGET_STEPS / 2) {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                assert_ne!(
+                    reply.header().status,
+                    0,
+                    "the cut-off backup answered a read below the client's committed \
+                     epoch ({deleted}) instead of refusing it: stream={:?}",
+                    read_stream_name(&reply),
+                );
+                assert_eq!(read_stream_name(&reply), None, "a refusal carries no body");
+                return;
+            }
+        }
+        panic!(
+            "the held read neither answered nor expired within {} steps; backup applied \
+             frontier {}, client epoch {deleted}",
+            BUDGET_STEPS + BUDGET_STEPS / 2,
+            metadata_commit(&sim, usize::from(LAGGING)),
+        );
+    }
+
+    /// Shards per replica for the sharing test below. Two is the whole
+    /// population that matters: shard 0 and one peer.
+    const SHARED_FRONTIER_SHARDS: u16 = 2;
+
+    /// Advance applied to shard 0, chosen above whatever recovery seeded so a
+    /// peer reading the pre-advance value cannot pass by accident.
+    const SHARED_FRONTIER_ADVANCE: u64 = 7;
+
+    /// A peer shard owns no metadata consensus, so `commit_min` -- the number
+    /// the pre-existing read barrier gates on -- does not exist there at all.
+    /// The applied frontier is the only thing its read gate can consult, and it
+    /// arrives by being ONE cell per process rather than one per shard.
+    ///
+    /// Nothing else in the system observes that. A private cell per shard still
+    /// compiles, still serves every read, and its only symptom is that each
+    /// metadata read homed on a peer shard parks for the whole deadline and
+    /// then fails retryable -- a latency cliff behind a warning, not an error.
+    /// So the invariant is asserted directly rather than through a request: a
+    /// peer must see an advance it did not make.
+    #[test]
+    fn given_a_peer_shard_when_shard_zero_advances_the_frontier_should_observe_it() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x5EED_5A11,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let sim = Simulator::with_shards(
+            usize::from(replica_count),
+            SHARED_FRONTIER_SHARDS,
+            std::iter::once(1u128),
+            network_opts,
+        );
+
+        let shards = &sim.replicas[0].shards;
+        assert_eq!(
+            shards.len(),
+            usize::from(SHARED_FRONTIER_SHARDS),
+            "the replica did not build the peer shard this test needs"
+        );
+        for (shard_idx, shard) in shards.iter().enumerate().skip(1) {
+            assert!(
+                shard.plane.metadata().consensus.is_none(),
+                "shard {shard_idx} owns consensus, so it is not the peer whose \
+                 only source for the frontier is shard 0's cell"
+            );
+        }
+
+        let advanced =
+            shards[0].plane.metadata().applied_frontier().get() + SHARED_FRONTIER_ADVANCE;
+        shards[0]
+            .plane
+            .metadata()
+            .advance_applied_frontier(advanced);
+
+        for (shard_idx, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard.plane.metadata().applied_frontier().get(),
+                advanced,
+                "shard {shard_idx} did not observe shard 0's advance: the \
+                 applied-frontier cell is per shard, not per process, so every \
+                 metadata read homed here parks until its deadline"
+            );
+        }
+    }
+
+    /// Open or close every replication route from the primary into `replica`.
+    fn set_replication(sim: &mut Simulator, replica: u8, open: bool) {
+        for frame in REPLICATION_FRAMES {
+            let filter = sim
+                .network
+                .link_filter_mut(ProcessId::Replica(0), ProcessId::Replica(replica));
+            if open {
+                filter.insert(frame);
+            } else {
+                filter.remove(frame);
+            }
+        }
+    }
+
+    /// Step until `replica` has applied `op`, so the state the read sees is the
+    /// one this test set up rather than whatever the last reply happened to
+    /// leave behind.
+    fn step_until_applied(sim: &mut Simulator, replica: u8, op: u64) {
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if metadata_commit(sim, usize::from(replica)) >= op {
+                return;
+            }
+            sim.step();
+        }
+        panic!(
+            "replica {replica} never applied op {op} (stuck at {})",
+            metadata_commit(sim, usize::from(replica)),
+        );
+    }
+
+    /// Read `name` straight out of a replica's committed metadata, bypassing
+    /// the read path under test.
+    fn read_stream_name_on(sim: &Simulator, replica: u8, name: &str) -> Option<String> {
+        sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| {
+                inner
+                    .items
+                    .iter()
+                    .find(|(_, stream)| &*stream.name == name)
+                    .map(|(_, stream)| stream.name.to_string())
+            })
+    }
+
+    /// Submit one replicated metadata write to `target`, step until its reply
+    /// lands, and return the op it committed at.
+    fn commit_write(
+        sim: &mut Simulator,
+        client_id: u128,
+        target: u8,
+        request: Message<RoutedRequestHeader>,
+    ) -> u64 {
+        let request_id = request.header().request;
+        sim.submit_request(client_id, target, request.into_generic());
+        for _ in 0..SETUP_TOTAL_STEPS {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                assert_eq!(
+                    reply.header().status,
+                    0,
+                    "metadata write {request_id} was refused"
+                );
+                assert!(
+                    !setup_reply_is_transient(&reply),
+                    "metadata write {request_id} was rejected in transit, so it never \
+                     committed and cannot anchor the read below"
+                );
+                return reply.header().commit;
+            }
+        }
+        panic!("metadata write {request_id} never committed");
+    }
+
+    /// The stream name a `GetStream` reply carries, or `None` for the
+    /// empty-body not-found answer.
+    fn read_stream_name(reply: &Message<ReplyHeader>) -> Option<String> {
+        let body = reply
+            .as_slice()
+            .get(size_of::<ReplyHeader>()..reply.header().size as usize)
+            .unwrap_or_default();
+        if body.is_empty() {
+            return None;
+        }
+        let (response, _) = GetStreamResponse::decode(body)
+            .expect("a non-empty GetStream reply must decode as GetStreamResponse");
+        Some(response.stream.name.as_str().to_string())
+    }
+
+    /// Committed metadata op on a replica's shard 0.
+    fn metadata_commit(sim: &Simulator, replica_idx: usize) -> u64 {
+        sim.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus")
+            .commit_min()
     }
 }

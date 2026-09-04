@@ -197,10 +197,17 @@ Connector runtime has an optional HTTP API that can be enabled by setting the `e
 ```toml
 [http] # Optional HTTP API configuration
 enabled = true
+# Loopback on purpose: the configuration endpoints return plugin credentials in
+# plaintext and also accept writes. Set api_key in the same edit if you move
+# this off loopback, and http.tls unless cleartext is acceptable.
 address = "127.0.0.1:8081"
-api_key = "" # Optional API key for authentication to be passed as `api-key` header
+api_key = "" # Optional API key for authentication to be passed as `api-key` header; empty disables authentication
 
 [http.cors] # Optional CORS configuration for HTTP API
+# Enabling this with the shipped allowed_origins = ["*"] lets any page the
+# operator visits read these endpoints cross-origin, whatever address is bound.
+# Pin the origins you own, or set api_key, before turning it on.
+# "*" is honored only as the first entry; anywhere else it panics at startup.
 enabled = false
 allowed_methods = ["GET", "POST", "PUT", "DELETE"]
 allowed_origins = ["*"]
@@ -219,29 +226,104 @@ cert_file = "core/certs/iggy_cert.pem"
 key_file = "core/certs/iggy_key.pem"
 ```
 
+> [!IMPORTANT]
+> **Treat this API as privileged. It reads and it writes.**
+>
+> The configuration endpoints return plugin configuration exactly as stored,
+> credentials included - a database connection string, an S3 secret key, a
+> webhook signing secret. Nothing redacts them on the way out. The runtime
+> masks the `api-key` in its own logs and redacts the state-store headers when
+> it serializes them, but no such path exists for plugin configuration.
+>
+> The exposure is not limited to disclosure. Publishing a configuration with
+> `POST /{sinks,sources}/{key}/configs` and then calling `POST .../restart` is
+> enough to repoint a connector at a destination of the caller's choosing,
+> because `restart` re-reads the stored configuration and starts the connector
+> from it - on the local provider that is whatever version was published last,
+> with no activation step in between. The runtime then forwards the operator's
+> topic data using its own Iggy credentials. `PUT .../configs/active` and
+> `DELETE .../configs` sit behind the same key.
+>
+> A rewritten plugin `path` is not loaded by the restart. `start_connector`
+> reuses the container `dlopen`ed at boot and only re-runs the plugin's init
+> with the new configuration, so a hostile path sits in the stored config until
+> the next time the runtime process starts, which makes it deferred code
+> execution rather than immediate.
+>
+> `api_key` is empty by default, which means authentication is **off** by
+> default. Only `/` and `/health` are exempt once it is set, so everything above
+> sits behind that one empty string, and the loopback default `address` is what
+> confines it to local processes.
+>
+> Three edits take that containment away:
+>
+> - **Moving `address` off loopback.** Set `api_key` in the same edit. The
+>   runtime warns at startup when the address resolves beyond loopback with no
+>   key configured, but nothing prevents it.
+> - **Enabling `[http.cors]` with the shipped `allowed_origins = ["*"]`.** That
+>   becomes `AllowOrigin::any()`, and the CORS layer wraps *outside*
+>   authentication, so tower-http answers the preflight before `resolve_api_key`
+>   runs. A browser is a local process, so with a wildcard origin and no key any
+>   page the operator visits gets a green preflight for a configuration `POST`
+>   and can then read *and rewrite* configuration cross-origin - the whole
+>   publish-then-restart repoint above, not just disclosure. The rewrite half
+>   needs the method on `allowed_methods` and `content-type` on
+>   `allowed_headers`, both of which the shipped block grants.
+>
+>   Setting `api_key` closes it, since an attacker's page cannot supply the
+>   header. Pinning `allowed_origins` to origins the operator owns closes the
+>   cross-origin *read*, and no startup warning fires for that case. One fires
+>   for `null`, which is narrower than `*` but not owned by anyone: a browser
+>   sends it from a sandboxed iframe, a `data:` URL and a `file://` page, all of
+>   which an attacker can produce, so pinning it buys nothing. No origin setting
+>   closes the CORS-simple route below; `api_key` does.
+> - **Leaving `http.tls.enabled = false`.** It ships disabled, so the `api-key`
+>   header and the credential-bearing responses both travel in cleartext. Enable
+>   TLS alongside `api_key` whenever this API leaves loopback. The runtime warns
+>   at startup whenever the address resolves beyond loopback with TLS off, and
+>   keeps warning after `api_key` is set, because the key crosses in the clear
+>   too. Terminating TLS at an ingress or a service mesh is a valid answer to
+>   that warning; the runtime cannot see it, so the line stays.
+>
+> And one that needs no edit at all. `POST .../restart` carries no body and no
+> content type, which makes it a CORS-simple request: a page can issue it with
+> `mode: 'no-cors'` and the browser sends it whatever `[http.cors]` says,
+> because CORS gates reading a response rather than issuing a request. So on the
+> shipped keyless default, any page the operator visits can restart any
+> connector, and no startup warning covers it because it is true of the defaults
+> rather than of an edit. Chrome's private network access blocks the
+> public-origin case; Firefox and Safari do not, a page served from a local
+> origin bypasses it everywhere, and setting `allow_private_network = true`
+> hands back the case Chrome would otherwise block. `api_key` is what closes
+> this one.
+
 Currently, it does expose the following endpoints:
 
 - `GET /`: welcome message.
 - `GET /health`: health status of the runtime.
 - `GET /stats`: runtime statistics including process info, memory/CPU usage, and connector status.
-- `GET /metrics`: Prometheus-formatted metrics (when `http.metrics.enabled` is `true`).
+- `GET {http.metrics.endpoint}` (default `/metrics`): Prometheus-formatted metrics, when `http.metrics.enabled` is `true`.
 - `GET /sinks`: list of sinks.
 - `GET /sinks/{key}`: sink details.
 - `GET /sinks/{key}/configs`: list of configuration versions for the sink.
 - `POST /sinks/{key}/configs`: add a new configuration version for the sink.
+- `DELETE /sinks/{key}/configs`: delete one configuration version for the sink - the `version` query parameter, or on the local provider the active version when it is omitted.
 - `GET /sinks/{key}/configs/{version}`: configuration details for a specific version.
 - `GET /sinks/{key}/configs/active`: active configuration details.
 - `PUT /sinks/{key}/configs/active`: activate a specific configuration version for the sink.
 - `GET /sinks/{key}/configs/plugin`: sink plugin config, including the optional `format` query parameter to specify the config format.
+- `POST /sinks/{key}/restart`: stop the sink and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sinks/{key}/transforms`: sink transforms to be applied to the fields.
 - `GET /sources`: list of sources.
 - `GET /sources/{key}`: source details.
 - `GET /sources/{key}/configs`: list of configuration versions for the source.
 - `POST /sources/{key}/configs`: add a new configuration version for the source.
+- `DELETE /sources/{key}/configs`: delete one configuration version for the source - the `version` query parameter, or on the local provider the active version when it is omitted.
 - `GET /sources/{key}/configs/{version}`: configuration details for a specific version.
 - `GET /sources/{key}/configs/active`: active configuration details.
 - `PUT /sources/{key}/configs/active`: activate a specific configuration version for the source.
 - `GET /sources/{key}/configs/plugin`: source plugin config, including the optional `format` query parameter to specify the config format.
+- `POST /sources/{key}/restart`: stop the source and start it again from its highest stored configuration version, which on the local provider is not necessarily the active one ([#3848](https://github.com/apache/iggy/issues/3848)).
 - `GET /sources/{key}/transforms`: source transforms to be applied to the fields.
 
 ## Telemetry
