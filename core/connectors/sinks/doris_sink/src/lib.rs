@@ -1098,8 +1098,9 @@ impl Sink for DorisSink {
         //
         // The lone hard-abort is a non-JSON payload (via `?`): a stream-wide
         // schema-contract violation, not a transient chunk failure. Under the
-        // documented `schema = "json"` config the SDK drops non-JSON before
-        // consume() is called, so this stands as a defensive guard.
+        // documented `schema = "json"` config the runtime's JSON decoder drops
+        // non-JSON bytes before consume() is called, so this stands as a
+        // defensive guard unless a format-converting transform is configured.
         for chunk in messages.chunks(batch_size) {
             let json_values: Vec<&simd_json::OwnedValue> = chunk
                 .iter()

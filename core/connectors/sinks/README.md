@@ -249,6 +249,8 @@ for message in messages {
 
 While the schema of messages (that will be consumed from the Iggy stream), cannot be controlled by the sink connector itself, the built-in configuration allows to decide what's the expected format of the messages (the particular `StreamDecoder` will be used).
 
+`messages_metadata.schema` names the variant each `Payload` in the batch actually holds, which is not always the stream's `schema` setting. A decoder may return a different form than the wire format it reads: with `schema = "avro"` the Avro decoder extracts to JSON by default, so the batch arrives as `Payload::Json`. A configured transform can change the variant again. Match on the `Payload` itself and treat `messages_metadata.schema` as a description of what arrived, not of how the stream was configured.
+
 Keep in mind, that it might be sometimes difficult/impossible e.g. to transform one format to another e.g. JSON to SBE or so, and in such a case, the consumed messages will be ignored.
 
 Eventually, compile the source code and create a separate connector configuration file in the connectors directory (as specified in the main runtime `config.toml`).  Make sure that `path` points to the existing plugin.

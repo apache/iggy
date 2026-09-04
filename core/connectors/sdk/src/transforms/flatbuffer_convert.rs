@@ -99,18 +99,6 @@ impl FlatBufferConvert {
             "unsupported FlatBuffer conversion: {source} -> {target}"
         )))
     }
-
-    fn payload_matches_source_format(source_format: Schema, payload: &Payload) -> bool {
-        matches!(
-            (source_format, payload),
-            (Schema::Json, Payload::Json(_))
-                | (Schema::Raw, Payload::Raw(_))
-                | (Schema::Text, Payload::Text(_))
-                | (Schema::Proto, Payload::Proto(_))
-                | (Schema::FlatBuffer, Payload::FlatBuffer(_))
-                | (Schema::Avro, Payload::Avro(_))
-        )
-    }
 }
 
 impl Transform for FlatBufferConvert {
@@ -123,7 +111,7 @@ impl Transform for FlatBufferConvert {
         _metadata: &TopicMetadata,
         mut message: DecodedMessage,
     ) -> Result<Option<DecodedMessage>, Error> {
-        if !Self::payload_matches_source_format(self.config.source_format, &message.payload) {
+        if message.payload.schema() != self.config.source_format {
             return Err(Error::InvalidConfigValue(format!(
                 "expected {} payload",
                 self.config.source_format

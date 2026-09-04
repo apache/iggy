@@ -156,11 +156,13 @@ Create the stream and topic, then start the runtime from the repository root:
 IGGY_CONNECTORS_CONFIG_PATH=connectors.toml ./target/release/iggy-connectors
 ```
 
-The source sends 100 records, then continues polling without new messages. Stdout logs message offsets and the serialized JSON envelope bytes, containing `type_url` and base64 `value`. The sink's `raw` schema also determines how the plugin receives those transformed bytes.
+The source sends 100 records, then continues polling without new messages. Stdout logs message offsets and the serialized JSON envelope bytes, containing `type_url` and base64 `value`. The batch handed to the plugin is tagged with the payload's own schema rather than the stream's configured `raw`: `proto_convert` leaves a `Payload::Json`, so the plugin receives a `json` batch.
 
 The format-conversion transforms define no per-key defaults. Every non-optional key shown above must be present, or the configuration fails to deserialize (`schema_path`, `message_type`, `field_mappings`, and `descriptor_set` are optional).
 
 The two `[[streams]]` shapes differ: a source produces to a single `topic` and can tune batching via `batch_length` and `linger_time`, while a sink consumes from a list of `topics` and can additionally set `batch_length`, `poll_interval`, and `consumer_group`.
+
+Transforms are keyed by type, so one connector configures at most one `proto_convert`.
 
 ### Key Configuration Options
 
@@ -175,7 +177,7 @@ These are SDK configuration fields, not Random or Stdout `plugin_config` keys. T
 #### Transform Options
 
 - **`proto_convert`**: Transform for converting between protobuf and other formats
-- **`source_format`** / **`target_format`**: Formats to convert between - any schema value (`json`, `raw`, `text`, `proto`, `flat_buffer`, `avro`)
+- **`source_format`** / **`target_format`**: Formats to convert between - any schema value (`json`, `raw`, `text`, `proto`, `flat_buffer`, `avro`). `source_format` must match the variant the decoder or a preceding transform actually produced, or the message is rejected
 - **`preserve_unknown_fields`**: Accepted by `proto_convert`, but currently has no effect
 - **`include_paths`**: Additional directories searched for imported `.proto` files
 - **`field_mappings`**: Renames fields in a JSON input object before conversion (e.g., `"old_field" = "new_field"`)

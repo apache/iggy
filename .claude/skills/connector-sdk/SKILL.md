@@ -72,13 +72,14 @@ The `Schema` enum (in `lib.rs`) is `#[repr(C)]` - it crosses FFI. Touch points t
 2. `Payload` enum: add a matching variant carrying the deserialized form.
 3. `Payload::try_into_vec` - consuming bytes-out path.
 4. `Payload::try_to_bytes` - **borrowing** bytes-out path. For non-trivial payloads (parsed trees), implement a no-clone serialization, not a `clone() + serialize`. See the `Payload::Json` arm for the canonical optimization.
-5. `Payload::Display`.
-6. `Schema::try_into_payload` - bytes → `Payload`.
-7. `Schema::decoder()` - factory returning `Arc<dyn StreamDecoder>`.
-8. `Schema::encoder()` - factory returning `Arc<dyn StreamEncoder>`.
-9. New `decoders/<name>.rs` and `encoders/<name>.rs`.
-10. Update `sdk/README.md` and `core/connectors/README.md` schema list.
-11. Tests: round-trip encode/decode, error paths.
+5. `Payload::schema()` - variant → `Schema`. The runtime tags every sink batch from this, so a missing arm will not compile but a wrong one silently mislabels the batch.
+6. `Payload::Display`.
+7. `Schema::try_into_payload` - bytes → `Payload`.
+8. `Schema::decoder()` - factory returning `Arc<dyn StreamDecoder>`.
+9. `Schema::encoder()` - factory returning `Arc<dyn StreamEncoder>`.
+10. New `decoders/<name>.rs` and `encoders/<name>.rs`.
+11. Update `sdk/README.md` and `core/connectors/README.md` schema list.
+12. Tests: round-trip encode/decode, error paths. `Payload::schema()` must round-trip through `Schema::try_into_payload` unless the variant is deliberately lossy (`Proto` is, and is tested as such).
 
 Miss any of these → silent failures at runtime (typically `Error::InvalidPayloadType` or surprising decoder behavior in plugin code).
 

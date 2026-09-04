@@ -80,6 +80,7 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
+apache-avro = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 

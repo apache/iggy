@@ -6957,6 +6957,7 @@ dependencies = [
 name = "iggy-connectors"
 version = "0.5.0"
 dependencies = [
+ "apache-avro 0.22.0",
  "async-trait",
  "axum",
  "axum-server",
@@ -7764,6 +7765,7 @@ checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 name = "integration"
 version = "0.0.1"
 dependencies = [
+ "apache-avro 0.22.0",
  "arrow",
  "assert_cmd",
  "async-trait",
