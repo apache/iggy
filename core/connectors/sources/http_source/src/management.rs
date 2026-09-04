@@ -48,6 +48,10 @@ use crate::{CONNECTOR_NAME, EndpointAuthType, SharedState};
 /// Bytes of entropy behind a generated endpoint id. The URL is the bearer
 /// token for a secret-path endpoint, so it carries the whole secret.
 const ENDPOINT_ID_BYTES: usize = 16;
+/// A revoke reason rides the tombstone, and tombstones are never evicted,
+/// so an uncapped one is an authenticated caller writing to the state file
+/// without limit.
+const MAX_REVOKE_REASON_LEN: usize = 256;
 
 pub(crate) fn router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
     if state.management_token.is_none() {
@@ -109,6 +113,14 @@ async fn register_endpoint(
         return error_response(
             StatusCode::BAD_REQUEST,
             "a non-empty auth_secret is required",
+        );
+    }
+    // `authorize` never reads a secret for an unauthenticated endpoint, so
+    // accepting one only persists a credential nothing will ever check.
+    if request.auth_type == EndpointAuthType::None && request.auth_secret.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "auth_type 'none' takes no auth_secret",
         );
     }
     if request
@@ -217,18 +229,30 @@ async fn rotate_secret(
     let Some(instance) = owner_of(&state, &endpoint_id) else {
         return error_response(StatusCode::NOT_FOUND, "not found");
     };
-    // Restoring prefers TOML over any still-active persisted entry, so a
-    // rotated static secret would silently revert on the next restart and the
-    // operator would believe a leaked secret had been replaced.
-    if instance
+    let rejection = instance
         .registry()
         .endpoint(&endpoint_id)
-        .is_some_and(|endpoint| endpoint.origin == EndpointOrigin::Static)
-    {
-        return error_response(
-            StatusCode::CONFLICT,
-            "a static endpoint's secret lives in TOML; edit auth_secret there and restart the instance",
-        );
+        .and_then(|endpoint| {
+            if endpoint.origin == EndpointOrigin::Static {
+                // Restoring prefers TOML over any still-active persisted
+                // entry, so a rotated static secret would silently revert on
+                // the next restart and the operator would believe a leaked
+                // secret had been replaced.
+                Some("a static endpoint's secret lives in TOML; edit auth_secret there and restart the instance")
+            } else if endpoint.auth_type == EndpointAuthType::None {
+                // Nothing reads it, so a 200 would report a rotation that
+                // changes no behaviour while persisting the new secret.
+                Some("auth_type 'none' has no secret to rotate")
+            } else if endpoint.is_expired(unix_now_seconds()) {
+                // is_active() is state only, so without this an expired
+                // endpoint answers 200 for a path that already 404s.
+                Some("endpoint has expired; register a replacement")
+            } else {
+                None
+            }
+        });
+    if let Some(message) = rejection {
+        return error_response(StatusCode::CONFLICT, message);
     }
 
     let rotated = instance
@@ -270,6 +294,9 @@ async fn revoke_endpoint(
     let reason = body
         .and_then(|Json(request)| request.reason)
         .unwrap_or_else(|| "unspecified".to_string());
+    if reason.len() > MAX_REVOKE_REASON_LEN {
+        return error_response(StatusCode::BAD_REQUEST, "reason is longer than 256 bytes");
+    }
     let Some(instance) = owner_of(&state, &endpoint_id) else {
         return error_response(StatusCode::NOT_FOUND, "not found");
     };
@@ -1029,6 +1056,85 @@ mod tests {
         let response = fixture
             .register(json!({"instance": "http_github", "auth_type": "hmac-sha256"}))
             .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_secret_with_auth_type_none_when_registered_should_reject() {
+        // `authorize` never reads it, so accepting one would persist a
+        // credential into the state file that nothing ever checks.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+
+        let response = fixture
+            .register(json!({
+                "instance": "http_github",
+                "auth_type": "none",
+                "auth_secret": "whsec_unused"
+            }))
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_unauthenticated_endpoint_when_rotated_should_reject() {
+        // Rotation only checked `is_active()`, so this answered 200 and
+        // persisted a secret that changes no behaviour.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+        let registered = fixture
+            .register(json!({"instance": "http_github", "auth_type": "none"}))
+            .await;
+        assert_eq!(registered.status(), StatusCode::CREATED);
+        let endpoint_id = registered
+            .json::<Value>()
+            .await
+            .expect("the response must be json")["endpoint_id"]
+            .as_str()
+            .expect("the response must carry the endpoint id")
+            .to_string();
+
+        let rotated = client()
+            .patch(format!("{}/admin/endpoints/{endpoint_id}", fixture.admin))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .json(&json!({"auth_secret": "whsec_rotated"}))
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
+
+        assert_eq!(
+            rotated.status(),
+            StatusCode::CONFLICT,
+            "an endpoint with no auth has no secret to rotate"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_oversized_reason_when_revoked_should_reject() {
+        // Tombstones are never evicted, so an uncapped reason is unbounded
+        // state written by an authenticated caller.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+        let registered = fixture
+            .register(json!({"instance": "http_github", "auth_type": "none"}))
+            .await;
+        let endpoint_id = registered
+            .json::<Value>()
+            .await
+            .expect("the response must be json")["endpoint_id"]
+            .as_str()
+            .expect("the response must carry the endpoint id")
+            .to_string();
+
+        let response = client()
+            .delete(format!("{}/admin/endpoints/{endpoint_id}", fixture.admin))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .json(&json!({"reason": "x".repeat(MAX_REVOKE_REASON_LEN + 1)}))
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         fixture.close().await;
