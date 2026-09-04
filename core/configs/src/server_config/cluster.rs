@@ -276,10 +276,11 @@ pub struct ClusterConfig {
     /// be > 0 and <= `MAX_REPAIR_CHUNK_MAX`.
     #[serde(default = "default_repair_chunk_max")]
     pub repair_chunk_max: usize,
-    /// How long the metadata superblock may stay unwritable before the replica
-    /// fail-stops. While wedged the replica is already fenced quorum-invisible
-    /// and peers elect around it; this converts the log-only limp into a
-    /// distinct exit status a supervisor can act on. Zero (and the `0` /
+    /// How long a superblock may stay unwritable before the replica fail-stops.
+    /// Applies per plane: the metadata superblock, and each PARTITION's own. While
+    /// wedged the group is already fenced quorum-invisible and peers elect around
+    /// it; this converts the log-only limp into a distinct exit status a
+    /// supervisor can act on. Zero (and the `0` /
     /// `disabled` / `unlimited` sentinels, which all parse to zero) disables
     /// the fail-stop; nonzero values below
     /// `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are rejected at boot.

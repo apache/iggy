@@ -32,6 +32,7 @@ use crate::offset_storage::{
     PURGE_GENERATION_FILE, delete_persisted_offset, persist_offset, persist_purge_generation,
 };
 use crate::segment::Segment;
+use crate::segment_anchor::ANCHOR_SUFFIX;
 use crate::types::PartitionsConfig;
 use crate::{IggyIndexWriter, IggyPartition};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
@@ -1487,7 +1488,7 @@ pub async fn quarantine_segment_files(partition_dir: &str) -> std::io::Result<St
     };
     for path in segment_dir_entries(partition_dir)? {
         let quarantined = path.to_str().is_some_and(|path| {
-            [".log", ".index", STAGING_SUFFIX]
+            [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
                 .iter()
                 .any(|suffix| path.ends_with(suffix))
         });
@@ -1519,7 +1520,7 @@ pub async fn quarantine_segment_files(partition_dir: &str) -> std::io::Result<St
 /// failing either caller for. The CONVERGE sweep is deliberately not this
 /// function -- it deletes the live chain as well and must propagate its
 /// errors.
-/// Do NOT widen this predicate to the quarantine's three-suffix list if the two
+/// Do NOT widen this predicate to the quarantine's four-suffix list if the two
 /// are ever unified: the keep-lists callers pass hold staging paths only (purge
 /// passes none), so a wider filter would unlink every live `.log` and `.index`
 /// on the partition -- worst at the reuse scan, which runs at descriptor-accept
@@ -2249,6 +2250,13 @@ where
         let purge_advances = offsets_wire.purge_generation > committed_purge_generation
             || (self.applied_purge_generation < committed_purge_generation
                 && offsets_wire.next_offset == 0);
+        // The COMMITTED frontier, which is what an offer is comparable against:
+        // `held_offset_frontier` reads 0 for a chain installed empty at frontier
+        // N (its disk arm filters empty segments and the install clears the
+        // journal), and a 0 skips the guard below entirely, letting a stale offer
+        // rewind the counter under data this replica already claimed. The append
+        // point is not usable either -- it can stand a lease block high -- but
+        // only on a solo group, which never receives an offer.
         let local_next_offset = self.offset_frontier();
         if !purge_advances && local_next_offset > 0 && offsets_wire.next_offset < local_next_offset
         {
@@ -2295,11 +2303,16 @@ where
         // zero `.log` files and re-seed the counter from the pre-purge frontier,
         // above a group that restarted at the offer's, and the next prepare
         // would stamp a `base_offset` and `batch_checksum` no peer shares.
+        //
+        // Identical to the advancing form on every group that can receive an
+        // offer today, since the reservation is solo-only and there equals the
+        // frontier. Spelled out because the shape is what makes it a reset, not
+        // the arithmetic that currently coincides.
         let frontier_durable = if purge_advances {
             self.reset_offset_frontier_at(offsets_wire.next_offset)
                 .await
         } else {
-            self.persist_offset_frontier_at(offsets_wire.next_offset)
+            self.install_offset_frontier_at(offsets_wire.next_offset)
                 .await
         };
         if !frontier_durable {
@@ -2411,11 +2424,19 @@ where
         // the NEWEST suffix, which is contiguous) and drop the in-memory
         // vectors in lockstep, exactly as `purge` does.
         let namespace_raw = self.consensus().group();
-        while let Some((_, mut storage)) = self.log.retire_front() {
+        while let Some((segment, mut storage)) = self.log.retire_front() {
             let (messages_path, index_path) = storage.segment_and_index_paths();
             let _ = storage.shutdown();
             drop(storage);
-            for path in messages_path.into_iter().chain(index_path) {
+            // Anchors go with the chain they describe, as everywhere else.
+            // Unreachable for an install today, since anchors are planted only
+            // by the solo boot re-anchor, but a record outliving its segment is
+            // the one way a later gap gets admitted for free.
+            for path in messages_path
+                .into_iter()
+                .chain(index_path)
+                .chain(self.anchor_cleanup_path(segment.start_offset))
+            {
                 match compio::fs::remove_file(&path).await {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2805,7 +2826,7 @@ where
         let end = next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
         self.dirty_offset.store(end, Ordering::Relaxed);
-        self.should_increment_offset = next_offset > 0;
+        self.set_offset_space_used(next_offset > 0);
         self.recovered_durable_offset = installed_end;
         // Where the group's offset space starts on this replica: everything
         // below is represented by this install, so the repair floor check
@@ -2959,7 +2980,7 @@ where
                     .into_iter()
                     .filter(|path| {
                         path.to_str().is_some_and(|path| {
-                            [".log", ".index", STAGING_SUFFIX]
+                            [".log", ".index", STAGING_SUFFIX, ANCHOR_SUFFIX]
                                 .iter()
                                 .any(|extension| path.ends_with(extension))
                         })
@@ -3005,7 +3026,7 @@ where
         let end = minted_next_offset.saturating_sub(1);
         self.offset.store(end, Ordering::Release);
         self.dirty_offset.store(end, Ordering::Relaxed);
-        self.should_increment_offset = minted_next_offset > 0;
+        self.set_offset_space_used(minted_next_offset > 0);
         self.recovered_durable_offset = None;
         // The frontier claims "everything below me is represented here", and the
         // repair floor check accepts any floor at or below it. Nothing was
