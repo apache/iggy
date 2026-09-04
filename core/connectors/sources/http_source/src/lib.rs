@@ -44,6 +44,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use crate::auth::HmacAlgorithm;
+use crate::server::{INSTANCE_HEADER, RECEIVED_AT_HEADER, REMOTE_ADDR_HEADER};
 use crate::state::EndpointRegistry;
 use crate::types::{EndpointId, QueuedMessage, unix_now_seconds};
 
@@ -477,6 +478,18 @@ impl HttpSourceConfig {
             ) {
                 return Err(Error::InvalidConfigValue(format!(
                     "forward_headers entry '{header}' would copy a credential onto every message"
+                )));
+            }
+            // `message_headers` writes the gateway's own metadata into the
+            // same map first, so forwarding a request header under one of
+            // these keys lets the sender overwrite a value the pipeline
+            // treats as trusted.
+            if matches!(
+                header.to_ascii_lowercase().as_str(),
+                INSTANCE_HEADER | REMOTE_ADDR_HEADER | RECEIVED_AT_HEADER
+            ) {
+                return Err(Error::InvalidConfigValue(format!(
+                    "forward_headers entry '{header}' is reserved for the gateway's own metadata"
                 )));
             }
             if HeaderName::from_str(header).is_err() {
@@ -1205,6 +1218,31 @@ mod tests {
                     Err(Error::InvalidConfigValue(message)) if message.contains("credential")
                 ),
                 "{header} would be copied onto every message and persisted in the log"
+            );
+        }
+    }
+
+    #[test]
+    fn given_reserved_metadata_forward_header_when_validated_should_reject() {
+        // `message_headers` inserts the metadata first and forwarded headers
+        // into the same map, so without this the sender picks the value the
+        // pipeline trusts. Mixed case because HTTP header names are
+        // case-insensitive and the sender chooses the casing.
+        for header in [
+            INSTANCE_HEADER,
+            REMOTE_ADDR_HEADER,
+            RECEIVED_AT_HEADER,
+            "IGGY_HTTP_REMOTE_ADDR",
+        ] {
+            let config = parse(&format!(
+                r#"{{"listen_addr": "0.0.0.0:9090", "forward_headers": ["{header}"]}}"#
+            ));
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(Error::InvalidConfigValue(message)) if message.contains("reserved")
+                ),
+                "{header} would let the sender overwrite the gateway's own metadata"
             );
         }
     }
