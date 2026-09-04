@@ -30,7 +30,7 @@ use crate::poll_plan::{
 };
 use crate::segment::Segment;
 use crate::state_transfer::{PartitionTransferSession, PendingTransferRearm};
-use crate::types::{FatalCommit, RepairConclusion, RepairSession};
+use crate::types::{COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairSession};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollQueryResult, PollingArgs,
     PollingConsumer,
@@ -154,6 +154,36 @@ where
     /// set when the recovery handshake finds this replica behind the group's
     /// commit frontier, cleared when `RepairDone` completes the walk.
     pub repair: Option<RepairSession>,
+    /// Consecutive shard-sweep ticks this partition has been seen gap-stopped
+    /// (committed ops it cannot walk to, because the op at its commit frontier
+    /// plus one is missing). Debounces the sweep's level-triggered repair arm,
+    /// and is spent by whichever site opens the repair session.
+    ///
+    /// `Cell` for the same reason as [`Self::prepare_gap_drops`]: the sweep
+    /// drives it from the shared borrow it probes the partition through, so the
+    /// in-flight scan the arm budget needs can run without a `&mut` outstanding.
+    pub gap_ticks: Cell<u32>,
+    /// Prepares the backup gap check destroyed since the shard last drained
+    /// the count, folded into `partition_prepare_gap_drops_total` there.
+    /// Replicated traffic has no client to answer and retransmit skips ops that
+    /// already reached quorum, so nothing else records that the frame existed.
+    /// It counts what the ordering check destroyed, which is neither the holes
+    /// nor only them: a gap opened by the last prepare of a burst leaves it at
+    /// zero, and a duplicate delivery of an op this replica already sequenced
+    /// bumps it without any hole existing. Zero proves nothing, and nonzero is
+    /// a reason to look at the `sequence` field on the drop log, which is what
+    /// separates the two shapes.
+    ///
+    /// `Cell`: the shard drains it once per sweep, off the same shared borrow
+    /// the rest of the tick reads the partition through, so a `&mut` here would
+    /// buy a second lookup of the same group per tick.
+    prepare_gap_drops: Cell<u64>,
+    /// Fault injection for the harness, armed by
+    /// [`Self::inject_commit_failure`]. Behind a feature only the simulator's
+    /// DEV-dependencies turn on, so no build that ships this crate compiles the
+    /// branch it gates.
+    #[cfg(any(test, feature = "fault-injection"))]
+    injected_commit_failure: bool,
     /// Highest message offset recovered from segments at boot (`None` when
     /// the partition booted empty). Repaired batches at or below this line
     /// are already persisted and counted; the flush and commit paths skip
@@ -276,6 +306,10 @@ where
     /// [`Self::note_transfer_rearm_scheduled`]; livelock across attempts is
     /// bounded by [`Self::transfer_failures`] and its exponential backoff.
     transfer_attempts: u32,
+    /// Consecutive stalled re-requests on the live repair session, against
+    /// [`crate::types::REPAIR_MAX_STALL_RETRIES`]. Survives the session, so rotating
+    /// the peer cannot reset it; cleared by real progress.
+    repair_attempts: u32,
     /// CONSECUTIVE transfer failures of any class (decode, spill, install,
     /// peer-unavailable, stall exhaustion). Deliberately NOT keyed on the
     /// offered generation: a committing primary advances its generation
@@ -514,6 +548,10 @@ where
             consumer_offset_enforce_fsync: false,
             runtime_options: TopicRuntimeOptions::default(),
             repair: None,
+            gap_ticks: Cell::new(0),
+            prepare_gap_drops: Cell::new(0),
+            #[cfg(any(test, feature = "fault-injection"))]
+            injected_commit_failure: false,
             recovered_durable_offset: None,
             installed_frontier: None,
             fatal: None,
@@ -533,6 +571,7 @@ where
             offset_reservation_lease: u64::from(crate::DEFAULT_OFFSET_RESERVATION_LEASE),
             transfer: None,
             transfer_attempts: 0,
+            repair_attempts: 0,
             transfer_failures: 0,
             transfer_refusals: 0,
             transfer_rearm: None,
@@ -1708,6 +1747,51 @@ where
     async fn write_claim_from(&self, superblock: &SB, exclusive: u64) -> bool {
         let claim = exclusive.saturating_add(self.offset_reservation_lease);
         self.write_superblock_advancing(superblock, 0, claim).await
+    }
+
+    /// Take and clear the gap-drop count ([`Self::prepare_gap_drops`]).
+    #[must_use = "dropping the count loses the only record those prepares existed"]
+    pub const fn take_prepare_gap_drops(&self) -> u64 {
+        self.prepare_gap_drops.replace(0)
+    }
+
+    /// Read the gap-drop count without clearing it, so a test can prove the
+    /// count was still buffered on the partition at the moment it was removed.
+    #[cfg(any(test, feature = "fault-injection"))]
+    #[must_use]
+    pub const fn prepare_gap_drops(&self) -> u64 {
+        self.prepare_gap_drops.get()
+    }
+
+    /// Fail the next local commit of a committed `SendMessages` op the way a
+    /// full disk fails it, fencing the partition.
+    ///
+    /// The commit path's own fence is covered by a `/dev/full` writer in this
+    /// crate's tests, but the shard sweep that must OBSERVE the fence runs over
+    /// in-memory partitions in the simulator, where no device can be made to
+    /// fail.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub const fn inject_commit_failure(&mut self) {
+        self.injected_commit_failure = true;
+    }
+
+    /// Burn one repair stall round; `true` once the budget is exhausted and the
+    /// session should be re-armed against a different peer.
+    ///
+    /// On the PARTITION, not the session, for the same reason the transfer
+    /// budget is: the rotation mints a new session, which would otherwise reset
+    /// the count and re-target forever without ever giving up on the ring.
+    #[must_use = "the bool is the rotate verdict; dropping it disables the stall budget"]
+    pub const fn burn_repair_attempt(&mut self) -> bool {
+        self.repair_attempts += 1;
+        self.repair_attempts > crate::types::REPAIR_MAX_STALL_RETRIES
+    }
+
+    /// Real repair progress (any in-window frame from the serving peer): reset
+    /// the stall budget, so it bounds CONSECUTIVE stalls rather than the ones a
+    /// long healthy stream accumulates.
+    pub const fn note_repair_progress(&mut self) {
+        self.repair_attempts = 0;
     }
 
     /// Burn one transfer stall round; `true` once the budget is exhausted.
@@ -3159,7 +3243,7 @@ where
             return;
         }
 
-        let journal_holds_op = self.log.journal().inner.header_by_op(header.op).is_some();
+        let journal_holds_op = self.log.journal().inner.holds_op(header.op);
         if journal_holds_op {
             // Retransmit after downstream flap: durable here but commit
             // hasn't caught up. Re-forward + re-ACK so primary's view of
@@ -3251,6 +3335,10 @@ where
         let is_backup = self.consensus().is_follower();
         if is_backup {
             if header.op != current_op + 1 {
+                // `sequence` is what separates the two shapes this line covers:
+                // a forward gap (op above the sequencer, the hole the repair
+                // driver closes) and a retransmit of an op this replica already
+                // sequenced. Without it they read identically.
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
@@ -3258,8 +3346,11 @@ where
                         "dropping out-of-order prepare (gap)",
                     )
                     .with_operation(header.operation)
-                    .with_op(header.op),
+                    .with_op(header.op)
+                    .with_sequence(current_op),
                 );
+                self.prepare_gap_drops
+                    .set(self.prepare_gap_drops.get().saturating_add(1));
                 return;
             }
         } else {
@@ -3486,6 +3577,24 @@ where
         }
     }
 
+    /// Apply the committed prefix this replica can reach, from the pipeline if
+    /// the primary populated one and from the journal otherwise.
+    ///
+    /// The journal half is bounded by [`COMMIT_WALK_OPS_MAX`], for EVERY caller
+    /// and not just the tick sweep: `on_commit`, `StartView` adoption, the
+    /// post-transfer tail and the post-repair walk all reach this with the same
+    /// resident backlog behind them, and all four run on the shard pump. The
+    /// pipeline half is left alone, being the primary's own in-flight window,
+    /// which the pipeline depth already caps.
+    ///
+    /// Nothing is lost by stopping early: the run is re-derived from
+    /// `commit_min` on the next call, and the sweep's walk predicate stays true
+    /// until the group drains, so the next tick resumes exactly here. The one
+    /// caller with no next tick is the shutdown drain, and it is covered twice
+    /// over: [`Self::flush_committed_messages`] persists the committed prefix
+    /// by bytes rather than by walk, and what stays un-applied sits above the
+    /// `commit_min` the superblock records, which is what makes the restarted
+    /// replica ask its peers for it.
     #[allow(clippy::future_not_send)]
     pub async fn commit_journal(&mut self, config: &PartitionsConfig) {
         if self.fatal.is_some() {
@@ -3504,7 +3613,7 @@ where
         // double-count against `advance_commit_min`.
         let mut drained = drain_committable_prefix(self.consensus());
         if drained.is_empty() {
-            drained = self.collect_committable_from_journal();
+            drained = self.collect_committable_from_journal(COMMIT_WALK_OPS_MAX);
         }
         if drained.is_empty() {
             return;
@@ -3529,13 +3638,13 @@ where
     /// the journal keeps its committed entries until they are flushed
     /// (`commit_messages` drains only the committed prefix), so this read finds
     /// every committed op while the uncommitted tail stays resident.
-    fn collect_committable_from_journal(&self) -> Vec<PipelineEntry> {
+    fn collect_committable_from_journal(&self, max_ops: usize) -> Vec<PipelineEntry> {
         let from_op = self.consensus.commit_min() + 1;
         let commit_max = self.consensus.commit_max();
         self.log
             .journal()
             .inner
-            .committed_headers_from(from_op, commit_max)
+            .committed_headers_from(from_op, commit_max, max_ops)
             .into_iter()
             .map(PipelineEntry::new)
             .collect()
@@ -3843,6 +3952,10 @@ where
     }
 
     async fn commit_messages(&mut self, config: &PartitionsConfig) -> Result<(), IggyError> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if std::mem::take(&mut self.injected_commit_failure) {
+            return Err(IggyError::CannotSaveMessagesToSegment);
+        }
         self.commit_messages_inner(config, false).await
     }
 
@@ -5773,11 +5886,12 @@ where
             return;
         }
         // Any in-window frame proves the stream is alive; only silence
-        // should age the stall counter.
+        // should age the stall counter or spend the rotation budget.
         if let Some(session) = self.repair.as_mut() {
             session.idle_ticks = 0;
+            self.repair_attempts = 0;
         }
-        if self.log.journal().inner.header_by_op(header.op).is_some() {
+        if self.log.journal().inner.holds_op(header.op) {
             return;
         }
         let applied = if header.operation == Operation::SendMessages {

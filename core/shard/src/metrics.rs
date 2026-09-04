@@ -80,11 +80,14 @@ pub struct FrameDropLabel {
 /// (`reason=park_overflow`), a parked frame retired with no client to answer
 /// (`reason=park_dropped`), an incarnation rejection, or a routing send the
 /// target inbox refused. A shed client request is answered with a retriable
-/// status. A shed prepare may no longer be covered by retransmit once its op
-/// reached quorum, but a later `CommitMessage` that advances the backup's
-/// frontier arms same-view journal repair. If the primary evicted the range,
-/// repair escalates to partition state transfer. The counter therefore signals
-/// a data-plane gap or recovery burden, not a requirement for a view change.
+/// status, so the client recovers. A shed *prepare* has nobody to answer and is
+/// not covered by retransmit once its op has reached quorum
+/// (`consensus::retransmit_targets` skips `ok_quorum_received`), so the backup
+/// gap-stops; `tick_partitions`' sweep is what repairs it, escalating to
+/// partition state transfer when the primary has evicted the range, and
+/// `partition_prepare_gap_drops_total` is what counts the prepares that reached
+/// the gap check. The counter therefore signals a data-plane gap or recovery
+/// burden, not a requirement for a view change.
 pub mod frame_drop_variant {
     pub const CONSENSUS: &str = "consensus";
     pub const FD_TRANSFER: &str = "fd_transfer";
@@ -208,6 +211,7 @@ pub struct ShardMetrics {
     partition_frames_rejected_ahead_total: Counter,
     partition_requests_denied_transient_total: Counter,
     partition_repair_serves_deferred_purge_total: Counter,
+    partition_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
 }
@@ -234,6 +238,7 @@ impl ShardMetrics {
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_requests_denied_transient_total: Counter::default(),
             partition_repair_serves_deferred_purge_total: Counter::default(),
+            partition_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
         }
@@ -447,6 +452,42 @@ impl ShardMetrics {
         self.partition_repair_serves_deferred_purge_total.get()
     }
 
+    /// Add the prepares a partition's backup gap check destroyed since the last
+    /// sweep. Drained per tick from `IggyPartition::take_prepare_gap_drops`,
+    /// and once more when `ConfirmRemove` drops the partition: a tombstoned
+    /// namespace is invisible to the sweep, so the tail it left would otherwise
+    /// go to the floor with the value.
+    ///
+    /// Counts the prepares that ARRIVED after a hole, not the holes: a gap
+    /// opened by the last prepare of a burst leaves this at zero. A nonzero
+    /// value proves the repair driver has work; a zero one proves nothing.
+    ///
+    /// Deliberately NOT a `frame_drops_total{variant=partition}` reason: that
+    /// family means the bus or the router shed a frame, and the simulator
+    /// asserts it stays at zero on runs with no injected loss. A gap drop is a
+    /// protocol-ordering drop that any real loss produces, and the sweep repairs
+    /// it, so folding the two would turn a routing-fault alert into noise.
+    ///
+    /// Shard-scoped, with no namespace label: a server runs hundreds of groups
+    /// per shard, so labelling by namespace is unbounded cardinality, and every
+    /// other partition counter in this file is shard-scoped for the same
+    /// reason. The per-group detail is in the arm's log line.
+    ///
+    /// The metadata plane's own gap drop is NOT counted here, and has no
+    /// counter of its own: its repair is armed by the same edge-triggered sites
+    /// this plane's sweep exists to backstop, so that plane is starvable in the
+    /// same way and is simply not instrumented for it yet.
+    pub fn record_partition_prepare_gap_drops(&self, drops: u64) {
+        self.partition_prepare_gap_drops_total.inc_by(drops);
+    }
+
+    /// Snapshot of `partition_prepare_gap_drops_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_prepare_gap_drops_value(&self) -> u64 {
+        self.partition_prepare_gap_drops_total.get()
+    }
+
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
     /// accessor, readable from any crate under those cfgs so the crates that
     /// drive the reconciler can assert a reject did not happen.
@@ -537,6 +578,11 @@ impl ShardMetrics {
             "partition_repair_serves_deferred_purge",
             "partition repair serves or completions deferred until a committed purge applies",
             self.partition_repair_serves_deferred_purge_total.clone(),
+        );
+        registry.register(
+            "partition_prepare_gap_drops",
+            "replicated prepares dropped out of order by a backup's gap check",
+            self.partition_prepare_gap_drops_total.clone(),
         );
         registry.register(
             "metadata_read_frontier_refusals",

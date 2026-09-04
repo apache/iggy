@@ -24,7 +24,7 @@ use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
 use crate::shell::{
     ServerMetadata, ServerShard, ShellHandlers, ShellShardHandle, consensus_timers,
-    repair_retry_ticks,
+    repair_gap_debounce_ticks, repair_retry_ticks,
 };
 use configs::server::ServerConfig;
 use consensus::{
@@ -285,6 +285,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_partition_gap_debounce_ticks(repair_gap_debounce_ticks(config));
     shard.set_superblock_wedged_fatal_failures(superblock_wedged_fatal_failures(config));
     shard.set_served_segment_cache_bytes_max(
         config
@@ -936,6 +937,45 @@ mod tests {
             config_default, built_in,
             "[cluster] repair_retry_interval default drifted from \
              partitions::REPAIR_RETRY_TICKS"
+        );
+    }
+
+    /// The floor is prose in `config.toml` ("50 consensus ticks (500ms at the
+    /// 10ms tick)"), which is the number an operator sizes
+    /// `repair_gap_debounce_interval` against. Nothing else would notice it
+    /// drifting.
+    #[test]
+    fn documented_gap_debounce_floor_matches_the_shard_constant() {
+        assert_eq!(
+            shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN,
+            50,
+            "the gap debounce floor moved; core/server/config.toml states it in \
+             ticks and milliseconds under [cluster] repair_gap_debounce_interval"
+        );
+        assert_eq!(
+            u128::from(shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN)
+                * shard::CONSENSUS_TICK_INTERVAL.as_millis(),
+            500,
+            "the floor is no longer 500ms; core/server/config.toml states that \
+             figure under [cluster] repair_gap_debounce_interval"
+        );
+    }
+
+    #[test]
+    fn default_repair_gap_debounce_interval_matches_partitions_constant() {
+        // Same lockstep the retry interval keeps: the shipped config.toml value
+        // is what an un-configured replica and the simulator run on, and the
+        // shard's own default is the compile-time constant.
+        let config_default = configs::cluster::ClusterConfig::default()
+            .repair_gap_debounce_interval
+            .get_duration()
+            .as_millis();
+        let built_in =
+            u128::from(partitions::REPAIR_RETRY_TICKS) * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] repair_gap_debounce_interval default drifted from the shard's \
+             compile-time debounce"
         );
     }
 
