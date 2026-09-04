@@ -17,6 +17,7 @@
 
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
+use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::node::NodeConfig;
@@ -126,6 +127,8 @@ pub struct ServerConfig {
     pub metadata: MetadataConfig,
     pub partition: PartitionConfig,
     pub message_bus: MessageBusConfig,
+    #[serde(default)]
+    pub external_auth: ExternalAuthConfig,
 }
 
 /// One client-facing listener, as the client-facing address derivation and

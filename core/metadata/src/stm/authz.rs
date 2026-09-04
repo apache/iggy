@@ -54,7 +54,7 @@ use iggy_binary_protocol::requests::topics::{
 };
 use iggy_binary_protocol::requests::users::ChangePasswordRequest;
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier};
-use iggy_common::{IggyError, variadic};
+use iggy_common::{IggyError, SYNTHETIC_USER_ID_THRESHOLD, variadic};
 use server_common::Message;
 
 /// Gate a committed prepare, then apply it. A denial commits as an
@@ -136,6 +136,11 @@ pub(crate) fn authorize(
     if user_id == ROOT_USER_ID {
         return None;
     }
+
+    if user_id > SYNTHETIC_USER_ID_THRESHOLD {
+        return Some(ApplyReply::err(IggyError::Unauthorized.as_code()));
+    }
+
     let body = prepare.body();
 
     match header.operation {

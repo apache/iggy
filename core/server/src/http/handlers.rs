@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Local;
@@ -118,12 +118,20 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 use shard::{PartitionRead, PartitionReadReply};
 
+use crate::dispatch::authz::{
+    can_poll_messages, can_read_stream, can_read_topic, can_send_messages,
+};
 use crate::dispatch::partition::{resolve_consumer_offset_request, resolve_poll_request};
 use crate::dispatch::session_ops::{verify_login_credentials, verify_pat_credentials};
 use crate::dispatch::{
     validate_option_keys, validate_topic_bounds, validate_topic_size_floor,
     warn_unenforceable_topic_size, warn_unenforceable_topic_size_on_partition_add,
 };
+use crate::external_auth::{
+    CredentialType, ExternalAuthDecision, ExternalAuthRequest, is_synthetic_user_id,
+    try_external_auth,
+};
+use crate::http::ClientAddr;
 use crate::http::error::{
     Consistency, ConsistencyQuery, CustomError, PartitionWriteError, ProduceAck, ProduceQuery,
     ReadError, WriteError,
@@ -187,6 +195,7 @@ pub(in crate::http) async fn ping(State(_state): State<HttpState>) -> &'static s
 
 pub(in crate::http) async fn login_user(
     State(state): State<HttpState>,
+    ConnectInfo(ClientAddr(peer)): ConnectInfo<ClientAddr>,
     Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     // Credential verification is a consensus-free STM read; hold it while a
@@ -198,6 +207,18 @@ pub(in crate::http) async fn login_user(
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
         .map_err(|_| IggyError::TransientNotCommitted)?;
+    if state.external_auth.enabled
+        && let Some(result) = SendWrapper::new(try_external_auth_http_login(
+            &state,
+            CredentialType::Password,
+            &command.username,
+            command.password.expose_secret(),
+            &peer.to_string(),
+        ))
+        .await
+    {
+        return result;
+    }
     let user_id = verify_login_credentials(
         &state.shard,
         &command.username,
@@ -209,6 +230,7 @@ pub(in crate::http) async fn login_user(
 
 pub(in crate::http) async fn login_with_personal_access_token(
     State(state): State<HttpState>,
+    ConnectInfo(ClientAddr(peer)): ConnectInfo<ClientAddr>,
     Json(command): Json<LoginWithPersonalAccessToken>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     // Same recovery-barrier wait and retryable-503-on-expiry mapping as
@@ -216,6 +238,18 @@ pub(in crate::http) async fn login_with_personal_access_token(
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
         .map_err(|_| IggyError::TransientNotCommitted)?;
+    if state.external_auth.enabled
+        && let Some(result) = SendWrapper::new(try_external_auth_http_login(
+            &state,
+            CredentialType::PersonalAccessToken,
+            "",
+            command.token.expose_secret(),
+            &peer.to_string(),
+        ))
+        .await
+    {
+        return result;
+    }
     let user_id = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
     issue_identity(&state, user_id)
@@ -252,6 +286,11 @@ pub(in crate::http) async fn refresh_token(
         .sub
         .parse::<u32>()
         .map_err(|_| IggyError::Unauthenticated)?;
+    // Synthetic users must re-authenticate through their external auth service;
+    // refreshing would bypass the original `expires_at` cap.
+    if is_synthetic_user_id(user_id) {
+        return Err(IggyError::Unauthenticated.into());
+    }
     issue_identity(&state, user_id)
 }
 
@@ -290,6 +329,7 @@ pub(in crate::http) async fn describe_options(
         DESCRIBE_OPTIONS_CODE,
         &body,
         |_, _| Ok(()),
+        |_| true,
     ))
     .await?;
     let response = DescribeOptionsResponse::decode_from(&bytes)
@@ -314,6 +354,7 @@ pub(in crate::http) async fn get_streams(
         GET_STREAMS_CODE,
         &body,
         Permissioner::get_streams,
+        |p| p.global.manage_streams || p.global.read_streams,
     ))
     .await?;
     let response = GetStreamsResponse::decode_from(&bytes)
@@ -350,6 +391,7 @@ pub(in crate::http) async fn get_stream(
         |permissioner, uid| {
             scope.map_or(Ok(()), |stream_id| permissioner.get_stream(uid, stream_id))
         },
+        |p| scope.is_none_or(|sid| can_read_stream(p, sid)),
     ))
     .await?;
     let response = GetStreamResponse::decode_from(&bytes)
@@ -384,6 +426,7 @@ pub(in crate::http) async fn get_topics(
         |permissioner, uid| {
             scope.map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
         },
+        |p| scope.is_none_or(|sid| can_read_stream(p, sid)),
     ))
     .await?;
     let response = GetTopicsResponse::decode_from(&bytes)
@@ -423,6 +466,7 @@ pub(in crate::http) async fn get_topic(
                 permissioner.get_topic(uid, stream_id, topic_id)
             })
         },
+        |p| scope.is_none_or(|(sid, tid)| can_read_topic(p, sid, tid)),
     ))
     .await?;
     let response = GetTopicResponse::decode_from(&bytes)
@@ -447,6 +491,7 @@ pub(in crate::http) async fn get_users(
         GET_USERS_CODE,
         &body,
         Permissioner::get_users,
+        |p| p.global.manage_users || p.global.read_users,
     ))
     .await?;
     let response = GetUsersResponse::decode_from(&bytes)
@@ -491,6 +536,7 @@ pub(in crate::http) async fn get_user(
                 permissioner.get_user(uid)
             }
         },
+        |p| is_self || p.global.manage_users || p.global.read_users,
     ))
     .await?;
     let response = UserDetailsResponse::decode_from(&bytes)
@@ -530,6 +576,7 @@ pub(in crate::http) async fn get_cgs(
                 permissioner.get_consumer_groups(uid, stream_id, topic_id)
             })
         },
+        |p| scope.is_none_or(|(sid, tid)| can_read_topic(p, sid, tid)),
     ))
     .await?;
     let response = GetConsumerGroupsResponse::decode_from(&bytes)
@@ -570,6 +617,7 @@ pub(in crate::http) async fn get_cg(
                 permissioner.get_consumer_group(uid, stream_id, topic_id)
             })
         },
+        |p| scope.is_none_or(|(sid, tid)| can_read_topic(p, sid, tid)),
     ))
     .await?;
     let response = ConsumerGroupDetailsResponse::decode_from(&bytes)
@@ -594,6 +642,7 @@ pub(in crate::http) async fn get_stats(
         GET_STATS_CODE,
         &body,
         Permissioner::get_stats,
+        |p| p.global.manage_servers || p.global.read_servers,
     ))
     .await?;
     let response = StatsResponse::decode_from(&bytes)
@@ -680,9 +729,13 @@ pub(in crate::http) async fn get_snapshot(
     Query(query): Query<ConsistencyQuery>,
     Json(command): Json<GetSnapshot>,
 ) -> Result<(HeaderMap, Body), ReadError> {
-    authorize_read(&state, &identity, query.consistency, |permissioner, uid| {
-        permissioner.get_snapshot(uid)
-    })?;
+    authorize_read(
+        &state,
+        &identity,
+        query.consistency,
+        Permissioner::get_snapshot,
+        |p| p.global.manage_servers || p.global.read_servers,
+    )?;
     let archive = snapshot::collect(
         Arc::clone(&state.system_config),
         command.compression,
@@ -736,9 +789,13 @@ pub(in crate::http) async fn get_clients(
     identity: Identity,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<Vec<ClientInfo>>, ReadError> {
-    authorize_read(&state, &identity, query.consistency, |permissioner, uid| {
-        permissioner.get_clients(uid)
-    })?;
+    authorize_read(
+        &state,
+        &identity,
+        query.consistency,
+        Permissioner::get_clients,
+        |p| p.global.manage_servers || p.global.read_servers,
+    )?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
     let response = GetClientsResponse {
         clients: infos
@@ -763,9 +820,13 @@ pub(in crate::http) async fn get_client(
     Path(client_id): Path<u32>,
     Query(query): Query<ConsistencyQuery>,
 ) -> Result<Json<ClientInfoDetails>, ReadError> {
-    authorize_read(&state, &identity, query.consistency, |permissioner, uid| {
-        permissioner.get_client(uid)
-    })?;
+    authorize_read(
+        &state,
+        &identity,
+        query.consistency,
+        Permissioner::get_client,
+        |p| p.global.manage_servers || p.global.read_servers,
+    )?;
     let infos = SendWrapper::new(state.shard.list_all_clients()).await;
     // The wire client id is the u32 seq tail of the u128 transport id.
     #[allow(clippy::cast_possible_truncation)]
@@ -1226,6 +1287,7 @@ pub(in crate::http) async fn poll_messages(
                 permissioner.poll_messages(uid, stream_id, topic_id)
             })
         },
+        |p| scope.is_none_or(|(sid, tid)| can_poll_messages(p, sid, tid)),
     )?;
     let wire = poll_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
     let (namespace, partition_id, consumer, args) =
@@ -1305,6 +1367,7 @@ pub(in crate::http) async fn get_consumer_offset(
                 permissioner.get_consumer_offset(uid, stream_id, topic_id)
             })
         },
+        |p| scope.is_none_or(|(sid, tid)| can_poll_messages(p, sid, tid)),
     )?;
     let wire =
         consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
@@ -1368,6 +1431,7 @@ pub(in crate::http) async fn send_messages(
         &stream_id,
         &topic_id,
         Permissioner::append_messages,
+        can_send_messages,
     )
     .map_err(PartitionWriteError::Rejected)?;
     // Rejects an oversized partitioning key and an empty or oversized batch.
@@ -1433,6 +1497,7 @@ pub(in crate::http) async fn store_consumer_offset(
         &stream_id,
         &topic_id,
         Permissioner::store_consumer_offset,
+        can_poll_messages,
     )
     .map_err(PartitionWriteError::Rejected)?;
     let request = store_offset_wire_request(&stream_id, &topic_id, &command)
@@ -1471,6 +1536,7 @@ pub(in crate::http) async fn delete_consumer_offset(
         &stream_id,
         &topic_id,
         Permissioner::delete_consumer_offset,
+        can_poll_messages,
     )
     .map_err(PartitionWriteError::Rejected)?;
     // `Consumer::new` fixes the kind to `Consumer`, exactly as the legacy
@@ -1722,6 +1788,7 @@ pub(in crate::http) async fn get_pats(
         GET_PERSONAL_ACCESS_TOKENS_CODE,
         &body,
         |_, _| Ok(()),
+        |_| true,
     ))
     .await?;
     let response = GetPersonalAccessTokensResponse::decode_from(&bytes)
@@ -1799,11 +1866,123 @@ pub(in crate::http) async fn delete_pat(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Try external auth for an HTTP login. Returns `Some(result)` when the
+/// external service responded (grant or deny) or when a callout failure
+/// produces a terminal deny. Returns `None` when the caller should fall
+/// through to built-in credential verification.
+async fn try_external_auth_http_login(
+    state: &HttpInner,
+    credential_type: CredentialType,
+    username: &str,
+    credential_value: &str,
+    client_address: &str,
+) -> Option<Result<Json<IdentityInfo>, CustomError>> {
+    use configs::external_auth::ExternalAuthErrorStrategy;
+
+    let credential = state
+        .external_auth
+        .forward_credentials
+        .then(|| credential_value.to_owned());
+    let request = ExternalAuthRequest {
+        credential_type,
+        credential,
+        username: username.to_owned(),
+        transport: "http".to_owned(),
+        client_address: client_address.to_owned(),
+    };
+    let decision = match try_external_auth(&state.external_auth, request).await {
+        Ok(Some(decision)) => decision,
+        Ok(None) => return None,
+        Err(_) => {
+            return match state.external_auth.on_error {
+                ExternalAuthErrorStrategy::Fallback => None,
+                ExternalAuthErrorStrategy::Deny => Some(Err(IggyError::Unauthenticated.into())),
+            };
+        }
+    };
+    Some(handle_http_auth_decision(state, decision))
+}
+
+fn handle_http_auth_decision(
+    state: &HttpInner,
+    decision: ExternalAuthDecision,
+) -> Result<Json<IdentityInfo>, CustomError> {
+    use consensus::MetadataHandle;
+
+    match decision {
+        ExternalAuthDecision::IggyUser { user_id } => {
+            if user_id == 0 {
+                tracing::warn!("external auth attempted to map login to root user");
+                return Err(IggyError::Unauthenticated.into());
+            }
+            if is_synthetic_user_id(user_id) {
+                tracing::warn!(
+                    user_id,
+                    "external auth returned synthetic user_id in IggyUser response"
+                );
+                return Err(IggyError::Unauthenticated.into());
+            }
+            let user_valid = state.shard.plane.metadata().mux_stm.users().read(|users| {
+                users
+                    .items
+                    .get(user_id as usize)
+                    .is_some_and(|u| u.status == iggy_common::UserStatus::Active)
+            });
+            if !user_valid {
+                return Err(IggyError::Unauthenticated.into());
+            }
+            issue_identity(state, user_id)
+        }
+        ExternalAuthDecision::InlineGrant {
+            principal: _,
+            permissions,
+            expires_at,
+        } => {
+            let Some(synthetic_user_id) = state.mint_synthetic_user_id() else {
+                tracing::error!("synthetic user ID space exhausted");
+                return Err(IggyError::Unauthenticated.into());
+            };
+            state
+                .synthetic_permissions
+                .borrow_mut()
+                .insert(synthetic_user_id, permissions);
+            let result = issue_identity_capped(state, synthetic_user_id, expires_at);
+            if result.is_err() {
+                state
+                    .synthetic_permissions
+                    .borrow_mut()
+                    .remove(&synthetic_user_id);
+                state.reclaim_synthetic_user_id(synthetic_user_id);
+            }
+            result
+        }
+        ExternalAuthDecision::Deny { reason } => {
+            tracing::info!(reason, "external auth denied HTTP login");
+            Err(IggyError::Unauthenticated.into())
+        }
+    }
+}
+
 /// Issue a fresh access token for `user_id` and wrap it in the exact
 /// `IdentityInfo` shape the SDKs pin: numeric `user_id` plus an `access_token`
 /// carrying the token string and its unix-seconds expiry.
 fn issue_identity(inner: &HttpInner, user_id: u32) -> Result<Json<IdentityInfo>, CustomError> {
     let generated = inner.jwt.generate(user_id)?;
+    Ok(Json(IdentityInfo {
+        user_id: generated.user_id,
+        access_token: Some(TokenInfo {
+            token: generated.access_token,
+            expiry: generated.access_token_expiry,
+        }),
+    }))
+}
+
+fn issue_identity_capped(
+    inner: &HttpInner,
+    user_id: u32,
+    max_expiry_secs: u64,
+) -> Result<Json<IdentityInfo>, CustomError> {
+    let generated = inner.jwt.generate_capped(user_id, max_expiry_secs)?;
     Ok(Json(IdentityInfo {
         user_id: generated.user_id,
         access_token: Some(TokenInfo {

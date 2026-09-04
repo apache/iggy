@@ -18,3 +18,13 @@
 pub(crate) mod user_identity_info;
 pub(crate) mod user_info;
 pub(crate) mod user_status;
+
+/// User IDs above this threshold are synthetic (minted for external auth
+/// inline-grant sessions). The slab allocator starts at 0 and grows upward,
+/// so collisions require billions of persisted users.
+pub const SYNTHETIC_USER_ID_THRESHOLD: u32 = u32::MAX - 1_000_000;
+
+#[must_use]
+pub const fn is_synthetic_user_id(user_id: u32) -> bool {
+    user_id > SYNTHETIC_USER_ID_THRESHOLD
+}

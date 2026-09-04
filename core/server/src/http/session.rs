@@ -201,8 +201,9 @@ impl Drop for RegistrationGuard<'_> {
 pub(in crate::http) fn sweep_expired(
     table: &mut HashMap<String, Rc<HttpSession>>,
     now_secs: u64,
-) -> Vec<(u128, InstanceToken)> {
+) -> (Vec<(u128, InstanceToken)>, Vec<u32>) {
     let mut torn = Vec::new();
+    let mut expired_user_ids = Vec::new();
     table.retain(|_, session| {
         if session.expiry > now_secs {
             return true;
@@ -210,9 +211,10 @@ pub(in crate::http) fn sweep_expired(
         if let Some(token) = session.registry_token.get() {
             torn.push((session.client_id, token));
         }
+        expired_user_ids.push(session.user_id);
         false
     });
-    torn
+    (torn, expired_user_ids)
 }
 
 /// Remove `session` from the table only if it is still the current occupant of
@@ -352,9 +354,14 @@ mod tests {
         table.insert(stale.key.clone(), Rc::clone(&stale));
 
         // now = 100: live.expiry(1000) > now stays, stale.expiry(10) <= now goes.
-        let torn = sweep_expired(&mut table, 100);
+        let (torn, expired_user_ids) = sweep_expired(&mut table, 100);
 
         assert!(torn.is_empty(), "fixtures install no reply target");
+        assert_eq!(
+            expired_user_ids,
+            vec![DEFAULT_ROOT_USER_ID],
+            "swept session user_id collected"
+        );
         assert!(table.contains_key("jwt:live"), "live session retained");
         assert!(!table.contains_key("jwt:stale"), "expired session swept");
     }
@@ -369,8 +376,9 @@ mod tests {
             let session = fake_session(&format!("jwt:{client_id}"), client_id, 1_000);
             table.insert(session.key.clone(), session);
         }
-        let torn = sweep_expired(&mut table, 100);
+        let (torn, expired_user_ids) = sweep_expired(&mut table, 100);
         assert!(torn.is_empty());
+        assert!(expired_user_ids.is_empty());
         assert_eq!(table.len(), 8, "no live session is evicted to make room");
     }
 

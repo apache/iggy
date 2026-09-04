@@ -25,6 +25,7 @@ use super::system::{
     EncryptionConfig, LoggingConfig, PartitionConfig, RecoveryConfig, RuntimeConfig, SegmentConfig,
     StreamConfig, SystemConfig, TopicConfig,
 };
+use crate::server_config::external_auth::{ExternalAuthConfig, ExternalAuthErrorStrategy};
 use configs::ConfigEnvMappings;
 
 static_toml::static_toml! {
@@ -323,6 +324,21 @@ impl Default for TelemetryTracesConfig {
         TelemetryTracesConfig {
             transport: SERVER_CONFIG.telemetry.traces.transport.parse().unwrap(),
             endpoint: SERVER_CONFIG.telemetry.traces.endpoint.parse().unwrap(),
+        }
+    }
+}
+
+impl Default for ExternalAuthConfig {
+    fn default() -> ExternalAuthConfig {
+        ExternalAuthConfig {
+            enabled: SERVER_CONFIG.external_auth.enabled,
+            url: SERVER_CONFIG.external_auth.url.parse().unwrap(),
+            timeout: SERVER_CONFIG.external_auth.timeout.parse().unwrap(),
+            on_error: match SERVER_CONFIG.external_auth.on_error {
+                "fallback" => ExternalAuthErrorStrategy::Fallback,
+                _ => ExternalAuthErrorStrategy::Deny,
+            },
+            forward_credentials: SERVER_CONFIG.external_auth.forward_credentials,
         }
     }
 }

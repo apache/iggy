@@ -35,6 +35,7 @@ use tracing::warn;
 use crate::dispatch::partition::{dispatch_partition_request, resolve_delete_segments_truncate};
 use crate::dispatch::session_ops::submit_logout_on_owner;
 use crate::dispatch::submit::submit_client_request_on_owner;
+use crate::external_auth::is_synthetic_user_id;
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::http::reply::{
@@ -398,6 +399,9 @@ pub(in crate::http) async fn partition_write_replicated(
             );
             PartitionWriteError::Unavailable
         })?;
+    let session_perms = is_synthetic_user_id(session.user_id)
+        .then(|| state.get_synthetic_permissions(session.user_id))
+        .flatten();
     dispatch_partition_request(
         &state.shard,
         message,
@@ -405,6 +409,7 @@ pub(in crate::http) async fn partition_write_replicated(
         session.session,
         session.client_id,
         Some(session.user_id),
+        session_perms.as_ref(),
     )
     .await;
     let outcome = compio::time::timeout(PARTITION_WRITE_REPLY_TIMEOUT, receiver).await;
@@ -450,6 +455,9 @@ pub(in crate::http) async fn produce_unacked(
         request_id,
         body,
     );
+    let session_perms = is_synthetic_user_id(session.user_id)
+        .then(|| state.get_synthetic_permissions(session.user_id))
+        .flatten();
     dispatch_partition_request(
         &state.shard,
         message,
@@ -457,6 +465,7 @@ pub(in crate::http) async fn produce_unacked(
         session.session,
         session.client_id,
         Some(session.user_id),
+        session_perms.as_ref(),
     )
     .await;
     Ok(())

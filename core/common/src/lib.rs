@@ -149,6 +149,7 @@ pub use types::topic::*;
 pub use types::user::user_identity_info::*;
 pub use types::user::user_info::*;
 pub use types::user::user_status::*;
+pub use types::user::{SYNTHETIC_USER_ID_THRESHOLD, is_synthetic_user_id};
 pub use utils::byte_size::IggyByteSize;
 pub use utils::checksum::*;
 pub use utils::crypto::*;

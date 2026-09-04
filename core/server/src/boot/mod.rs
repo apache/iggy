@@ -106,6 +106,8 @@ pub fn wire_shell_handlers<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
     system_config: Arc<ServerSystemConfig>,
     max_tokens_per_user: u32,
+    external_auth: Arc<configs::external_auth::ExternalAuthConfig>,
+    synthetic_counter: crate::external_auth::SyntheticUserIdCounter,
 ) -> ShellHandlers
 where
     B: ShellBus,
@@ -114,7 +116,9 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let sessions = Rc::new(RefCell::new(SessionManager::new()));
+    let sessions = Rc::new(RefCell::new(SessionManager::with_counter(
+        synthetic_counter,
+    )));
     ShellHandlers {
         on_replica_message: make_deferred_replica_message_handler(shard_handle),
         on_client_request: make_deferred_client_request_handler(
@@ -123,6 +127,7 @@ where
             &sessions,
             system_config,
             max_tokens_per_user,
+            external_auth,
         ),
         on_metadata_submit: make_metadata_submit_handler(shard_handle),
         on_list_clients: make_list_clients_handler(&sessions),
@@ -254,6 +259,8 @@ pub fn bootstrap(
     // run this bootstrap; after this line those are no-ops.
     install_default_crypto_provider();
     validate_root_credentials_env(&config)?;
+    crate::external_auth::validate_config(&config.external_auth)?;
+    crate::external_auth::warn_insecure_url(&config.external_auth);
     warm_dummy_password_hash();
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
@@ -308,6 +315,7 @@ pub fn bootstrap(
     // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
     // the whole set (counters are Arc-backed, so cross-thread reads see the
     // owning shard's bumps).
+    let synthetic_counter = crate::external_auth::SyntheticUserIdCounter::new();
     let shard_metrics_all: Vec<ShardMetrics> = (0..shards_count)
         .map(|_| ShardMetrics::for_shard())
         .collect();
@@ -345,6 +353,7 @@ pub fn bootstrap(
 
         let roster_cells_for_shard = roster_cells.clone();
         let shard_metrics_for_shard = shard_metrics_all.clone();
+        let synthetic_counter_for_shard = synthetic_counter.clone();
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -363,6 +372,7 @@ pub fn bootstrap(
                     owner_table_for_shard,
                     roster_cells_for_shard,
                     shard_metrics_for_shard,
+                    synthetic_counter_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -430,6 +440,7 @@ async fn shard_main(
     owner_table: Arc<ReplicaOwnerTable>,
     roster_cells: RosterCells,
     shard_metrics_all: Vec<ShardMetrics>,
+    synthetic_counter: crate::external_auth::SyntheticUserIdCounter,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -612,6 +623,7 @@ async fn shard_main(
     // Heap-pin like `run_shard_thread` pins `shard_main`: the builder future
     // carries the whole shard construction state machine and outgrew clippy's
     // `large_futures` cap; one allocation per shard startup.
+    let external_auth_config = Arc::new(config.external_auth.clone());
     let (shard, sessions) = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
@@ -624,6 +636,8 @@ async fn shard_main(
         reply_inbox,
         shard_metrics,
         &roster_cells,
+        Arc::clone(&external_auth_config),
+        synthetic_counter.clone(),
     ))
     .await?;
 
@@ -884,6 +898,7 @@ async fn shard_main(
             &sessions,
             Arc::clone(&config.system),
             config.personal_access_token.max_tokens_per_user,
+            Arc::clone(&external_auth_config),
         );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
@@ -899,6 +914,8 @@ async fn shard_main(
             dialed_replica,
             accepted_client,
             &shard_metrics_all,
+            external_auth_config,
+            synthetic_counter,
         )
         .await
         {

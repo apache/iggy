@@ -25,13 +25,17 @@
 //! in the consensus layer. This module tracks the binding between a
 //! transport connection and the consensus-level `(client_id, session)` pair.
 
-use crate::cluster_meta::ClusterRoster;
-use message_bus::installer::conn_info::ClientTransportKind;
-use shard::ConnectedClientInfo;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+use iggy_common::Permissions;
+use message_bus::installer::conn_info::ClientTransportKind;
+use shard::ConnectedClientInfo;
+
+use crate::cluster_meta::ClusterRoster;
+use crate::external_auth::{SessionPermissions, SyntheticUserIdCounter, is_synthetic_user_id};
 
 /// Connection lifecycle states.
 ///
@@ -79,6 +83,10 @@ pub struct Connection {
     pub last_heartbeat: Instant,
     /// Recorded at login; `None` until the connection authenticates.
     pub sdk: Option<ClientSdkInfo>,
+    /// Session-scoped permissions from an external auth inline grant.
+    /// Present only for connections authenticated via the external auth
+    /// callout with an `inline_grant` response.
+    pub session_permissions: Option<SessionPermissions>,
 }
 
 /// Bridges transport connections to consensus sessions.
@@ -104,15 +112,31 @@ pub struct SessionManager {
     /// per-shard context already threaded to the non-replicated read path;
     /// installed once at bootstrap, disabled until then.
     cluster_roster: Rc<ClusterRoster>,
+    /// Shared counter for minting synthetic user IDs. All transports draw
+    /// from the same sequence so no two can mint the same ID.
+    synthetic_counter: SyntheticUserIdCounter,
+    /// Freed synthetic user IDs available for reuse.
+    free_synthetic_ids: BTreeSet<u32>,
+    /// Reverse index: synthetic `user_id` -> `connection_id` for permission
+    /// lookup by the dispatch-time authorization layer.
+    synthetic_user_to_connection: HashMap<u32, u128>,
 }
 
 impl SessionManager {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_counter(SyntheticUserIdCounter::new())
+    }
+
+    #[must_use]
+    pub fn with_counter(counter: SyntheticUserIdCounter) -> Self {
         Self {
             connections: HashMap::new(),
             client_to_connection: HashMap::new(),
             cluster_roster: Rc::new(ClusterRoster::disabled()),
+            synthetic_counter: counter,
+            free_synthetic_ids: BTreeSet::new(),
+            synthetic_user_to_connection: HashMap::new(),
         }
     }
 
@@ -141,6 +165,7 @@ impl SessionManager {
                 state: ConnectionState::Connected,
                 last_heartbeat: Instant::now(),
                 sdk: None,
+                session_permissions: None,
             });
     }
 
@@ -192,10 +217,21 @@ impl SessionManager {
     /// one, so the caller can submit a session-matched `Logout` (the committed
     /// apply releases the client-table slot cluster-wide).
     pub fn remove_connection(&mut self, connection_id: u128) -> Option<(u128, u64)> {
-        if let Some(conn) = self.connections.remove(&connection_id)
-            && let ConnectionState::Bound {
-                client_id, session, ..
-            } = conn.state
+        let conn = self.connections.remove(&connection_id)?;
+        let user_id = match conn.state {
+            ConnectionState::Authenticated { user_id } | ConnectionState::Bound { user_id, .. } => {
+                Some(user_id)
+            }
+            ConnectionState::Connected => None,
+        };
+        if let Some(uid) = user_id.filter(|&uid| is_synthetic_user_id(uid))
+            && self.synthetic_user_to_connection.remove(&uid).is_some()
+        {
+            self.free_synthetic_ids.insert(uid);
+        }
+        if let ConnectionState::Bound {
+            client_id, session, ..
+        } = conn.state
         {
             self.client_to_connection.remove(&client_id);
             return Some((client_id, session));
@@ -302,6 +338,13 @@ impl SessionManager {
             .map(|conn| conn.address)
     }
 
+    /// Borrow the raw connection record. Used by the external auth callout
+    /// to read transport kind and peer address before authentication.
+    #[must_use]
+    pub fn get_connection(&self, connection_id: u128) -> Option<&Connection> {
+        self.connections.get(&connection_id)
+    }
+
     /// Acting user and transport peer address for a connection, in one map
     /// lookup: the non-replicated dispatch path needs both, and the separate
     /// accessors would walk the connection map twice per request.
@@ -350,6 +393,88 @@ impl SessionManager {
         self.connections
             .iter()
             .map(|(&id, conn)| record_from(id, conn))
+    }
+
+    /// Mint a synthetic user ID for an external auth inline-grant session.
+    /// Reuses a previously freed ID when available, otherwise draws from the
+    /// shared counter. Returns `None` when the synthetic ID space is exhausted.
+    pub fn mint_synthetic_user_id(&mut self) -> Option<u32> {
+        if let Some(id) = self.free_synthetic_ids.pop_last() {
+            return Some(id);
+        }
+        self.synthetic_counter.mint()
+    }
+
+    /// Store session-scoped permissions on a connection and index by synthetic
+    /// user ID for dispatch-time authorization lookups.
+    pub fn set_session_permissions(
+        &mut self,
+        connection_id: u128,
+        user_id: u32,
+        perms: SessionPermissions,
+    ) {
+        if let Some(conn) = self.connections.get_mut(&connection_id) {
+            conn.session_permissions = Some(perms);
+            self.synthetic_user_to_connection
+                .insert(user_id, connection_id);
+        }
+    }
+
+    /// Remove session-scoped permissions and reclaim the synthetic user ID.
+    /// Used to roll back an inline-grant when `complete_login_register` fails.
+    /// Always reclaims the ID regardless of whether it was registered in the
+    /// reverse index (it may not be if the failure happened before
+    /// `set_session_permissions` populated the index, or if the connection
+    /// disappeared between mint and set).
+    pub fn clear_session_permissions(&mut self, connection_id: u128, user_id: u32) {
+        if let Some(conn) = self.connections.get_mut(&connection_id) {
+            conn.session_permissions = None;
+        }
+        self.synthetic_user_to_connection.remove(&user_id);
+        if is_synthetic_user_id(user_id) {
+            self.free_synthetic_ids.insert(user_id);
+        }
+    }
+
+    /// Look up session-scoped permissions by synthetic user ID.
+    /// Used by the dispatch-time authorization layer. Returns `None` when
+    /// the session has expired (checked against the current wall clock),
+    /// which the authorization layer treats as `Unauthorized`.
+    #[must_use]
+    pub fn session_permissions_for_user(&self, user_id: u32) -> Option<&Permissions> {
+        let &conn_id = self.synthetic_user_to_connection.get(&user_id)?;
+        let conn = self.connections.get(&conn_id)?;
+        conn.session_permissions.as_ref().and_then(|sp| {
+            let now_secs = iggy_common::IggyTimestamp::now().to_secs();
+            if sp.expires_at <= now_secs {
+                return None;
+            }
+            Some(&sp.permissions)
+        })
+    }
+
+    /// Connection IDs whose session permissions have expired. The heartbeat
+    /// verifier or a periodic sweep evicts these.
+    #[must_use]
+    pub fn collect_expired_sessions(&self, now_secs: u64) -> Vec<u128> {
+        self.connections
+            .iter()
+            .filter(|(_, conn)| {
+                conn.session_permissions
+                    .as_ref()
+                    .is_some_and(|sp| sp.expires_at <= now_secs)
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Check if a specific connection's session permissions have expired.
+    #[must_use]
+    pub fn is_session_expired(&self, connection_id: u128, now_secs: u64) -> bool {
+        self.connections
+            .get(&connection_id)
+            .and_then(|conn| conn.session_permissions.as_ref())
+            .is_some_and(|sp| sp.expires_at <= now_secs)
     }
 }
 

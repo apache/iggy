@@ -65,7 +65,7 @@ use server_common::Message;
 use server_common::crypto;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::warn;
 
@@ -413,7 +413,9 @@ const fn transient_login_code(error: &LoginRegisterError) -> IggyError {
 /// `SessionError`; the SDK maps it to `Unauthenticated`.
 const fn eviction_reason_for(error: &LoginRegisterError) -> EvictionReason {
     match error {
-        LoginRegisterError::InvalidCredentials => EvictionReason::InvalidCredentials,
+        LoginRegisterError::InvalidCredentials | LoginRegisterError::ExternalAuthDenied(_) => {
+            EvictionReason::InvalidCredentials
+        }
         LoginRegisterError::InvalidToken => EvictionReason::InvalidToken,
         LoginRegisterError::UserInactive => EvictionReason::UserInactive,
         _ => EvictionReason::SessionError,
@@ -1259,6 +1261,7 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     sessions: &Rc<RefCell<SessionManager>>,
     transport_client_id: u128,
     request: Message<RoutedRequestHeader>,
+    external_auth: &Arc<configs::external_auth::ExternalAuthConfig>,
 ) where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1309,6 +1312,192 @@ pub(in crate::dispatch) async fn handle_login_register_request<B, MJ, S, SB>(
     }
 
     let body_tail = &body[prefix_len..];
+
+    if external_auth.enabled {
+        let ext_request = if let Ok((wire_request, _)) =
+            LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
+        {
+            crate::external_auth::ExternalAuthRequest {
+                credential_type: crate::external_auth::CredentialType::Password,
+                credential: if external_auth.forward_credentials {
+                    Some(wire_request.password.expose_secret().to_owned())
+                } else {
+                    None
+                },
+                username: wire_request.username.to_string(),
+                transport: "binary".to_owned(),
+                client_address: sessions
+                    .borrow()
+                    .connection_address(transport_client_id)
+                    .map_or_else(String::new, |a| a.to_string()),
+            }
+        } else if let Ok((wire_request, _)) =
+            LoginRegisterWithPatRequest::decode_after_prefix(version_info.clone(), body_tail)
+        {
+            crate::external_auth::ExternalAuthRequest {
+                credential_type: crate::external_auth::CredentialType::PersonalAccessToken,
+                credential: if external_auth.forward_credentials {
+                    Some(wire_request.token.expose_secret().to_owned())
+                } else {
+                    None
+                },
+                username: String::new(),
+                transport: "binary".to_owned(),
+                client_address: sessions
+                    .borrow()
+                    .connection_address(transport_client_id)
+                    .map_or_else(String::new, |a| a.to_string()),
+            }
+        } else {
+            warn!(
+                transport_client_id,
+                "rejecting register request with unsupported payload shape"
+            );
+            send_login_eviction(
+                shard,
+                transport_client_id,
+                vsr_client_id,
+                EvictionReason::MalformedLogin,
+            )
+            .await;
+            return;
+        };
+
+        match crate::external_auth::try_external_auth(external_auth, ext_request).await {
+            Ok(Some(crate::external_auth::ExternalAuthDecision::IggyUser { user_id })) => {
+                if user_id == 0 {
+                    warn!(
+                        transport_client_id,
+                        "external auth attempted to map login to root user"
+                    );
+                    send_login_eviction(
+                        shard,
+                        transport_client_id,
+                        vsr_client_id,
+                        EvictionReason::InvalidCredentials,
+                    )
+                    .await;
+                    return;
+                }
+                if crate::external_auth::is_synthetic_user_id(user_id) {
+                    warn!(
+                        transport_client_id,
+                        user_id, "external auth returned synthetic user_id; rejecting"
+                    );
+                    send_login_eviction(
+                        shard,
+                        transport_client_id,
+                        vsr_client_id,
+                        EvictionReason::InvalidCredentials,
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(error) = complete_login_register(
+                    shard,
+                    sessions,
+                    transport_client_id,
+                    vsr_client_id,
+                    request.header(),
+                    user_id,
+                    &version_info,
+                )
+                .await
+                {
+                    warn!(transport_client_id, error = %error, "external auth login failed");
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
+                }
+                return;
+            }
+            Ok(Some(crate::external_auth::ExternalAuthDecision::InlineGrant {
+                principal,
+                permissions,
+                expires_at,
+            })) => {
+                let synthetic_id = sessions.borrow_mut().mint_synthetic_user_id();
+                let Some(synthetic_id) = synthetic_id else {
+                    warn!(
+                        transport_client_id,
+                        "synthetic user id pool exhausted; rejecting external auth login"
+                    );
+                    send_login_eviction(
+                        shard,
+                        transport_client_id,
+                        vsr_client_id,
+                        EvictionReason::InvalidCredentials,
+                    )
+                    .await;
+                    return;
+                };
+                // Set permissions BEFORE binding the session so that any
+                // request arriving immediately after bind already sees the
+                // grants. On bind failure we roll back.
+                sessions.borrow_mut().set_session_permissions(
+                    transport_client_id,
+                    synthetic_id,
+                    crate::external_auth::SessionPermissions {
+                        principal,
+                        permissions,
+                        expires_at,
+                    },
+                );
+                if let Err(error) = complete_login_register(
+                    shard,
+                    sessions,
+                    transport_client_id,
+                    vsr_client_id,
+                    request.header(),
+                    synthetic_id,
+                    &version_info,
+                )
+                .await
+                {
+                    warn!(transport_client_id, error = %error, "external auth inline grant login failed");
+                    sessions
+                        .borrow_mut()
+                        .clear_session_permissions(transport_client_id, synthetic_id);
+                    surface_login_failure(shard, transport_client_id, request.header(), &error)
+                        .await;
+                }
+                return;
+            }
+            Ok(Some(crate::external_auth::ExternalAuthDecision::Deny { reason })) => {
+                warn!(
+                    transport_client_id,
+                    reason = reason,
+                    "external auth denied login"
+                );
+                surface_login_failure(
+                    shard,
+                    transport_client_id,
+                    request.header(),
+                    &LoginRegisterError::ExternalAuthDenied(reason),
+                )
+                .await;
+                return;
+            }
+            Ok(None) => {
+                // on_error = fallback: fall through to built-in credential check
+            }
+            Err(error) => {
+                warn!(
+                    transport_client_id,
+                    error = %error,
+                    "external auth callout failed with on_error=deny"
+                );
+                surface_login_failure(
+                    shard,
+                    transport_client_id,
+                    request.header(),
+                    &LoginRegisterError::ExternalAuthDenied(error.to_string()),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
     let mut credentials_rejected = false;
     if let Ok((wire_request, _)) =
         LoginRegisterRequest::decode_after_prefix(version_info.clone(), body_tail)
