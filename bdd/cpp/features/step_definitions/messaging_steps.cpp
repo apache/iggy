@@ -150,7 +150,7 @@ WHEN("^I poll messages from stream ([0-9]+), topic ([0-9]+), partition ([0-9]+) 
     const auto polled           = context->client->poll_messages(
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(stream_id)),
         bdd::make_numeric_identifier(static_cast<std::uint32_t>(topic_id)), static_cast<std::uint32_t>(partition_id),
-        "consumer", bdd::make_numeric_identifier(1), std::string(polling_strategy.PollingStrategyKind()),
+        iggy::Consumer::Single(1), std::string(polling_strategy.PollingStrategyKind()),
         polling_strategy.PollingStrategyValue(), 100, false);
 
     context->polled.count = polled.count;

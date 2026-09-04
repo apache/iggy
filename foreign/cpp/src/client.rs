@@ -42,14 +42,6 @@ use std::sync::Arc;
 /// reserve `u32::MAX` as the sentinel for `partition_id`.
 const ANY_PARTITION_ID: u32 = u32::MAX;
 
-fn resolve_consumer(consumer_kind: &str, consumer_id: RustIdentifier) -> Result<Consumer, String> {
-    match consumer_kind {
-        "consumer" => Ok(Consumer::new(consumer_id)),
-        "consumer_group" => Ok(Consumer::group(consumer_id)),
-        _ => Err(format!("invalid consumer kind: {consumer_kind}")),
-    }
-}
-
 fn opt_partition(partition_id: u32) -> Option<u32> {
     if partition_id == ANY_PARTITION_ID {
         None
@@ -391,8 +383,7 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         partition_id: u32,
-        consumer_kind: String,
-        consumer_id: ffi::Identifier,
+        consumer: ffi::Consumer,
         polling_strategy_kind: String,
         polling_strategy_value: u64,
         count: u32,
@@ -402,9 +393,7 @@ impl Client {
             .map_err(|error| format!("Could not poll messages: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
             .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
-            .map_err(|error| format!("Could not poll messages: {error}"))?;
-        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+        let rust_consumer = Consumer::try_from(consumer)
             .map_err(|error| format!("Could not poll messages: {error}"))?;
 
         let strategy = match polling_strategy_kind.as_str() {
@@ -427,7 +416,7 @@ impl Client {
                     &rust_stream_id,
                     &rust_topic_id,
                     opt_partition(partition_id),
-                    &consumer,
+                    &rust_consumer,
                     &strategy,
                     count,
                     auto_commit,
@@ -911,23 +900,20 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         partition_id: u32,
-        consumer_kind: String,
-        consumer_id: ffi::Identifier,
+        consumer: ffi::Consumer,
         offset: u64,
     ) -> Result<(), String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not store consumer offset: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
             .map_err(|error| format!("Could not store consumer offset: {error}"))?;
-        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
-            .map_err(|error| format!("Could not store consumer offset: {error}"))?;
-        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+        let rust_consumer = Consumer::try_from(consumer)
             .map_err(|error| format!("Could not store consumer offset: {error}"))?;
 
         RUNTIME.block_on(async {
             self.inner
                 .store_consumer_offset(
-                    &consumer,
+                    &rust_consumer,
                     &rust_stream_id,
                     &rust_topic_id,
                     opt_partition(partition_id),
@@ -948,23 +934,20 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         partition_id: u32,
-        consumer_kind: String,
-        consumer_id: ffi::Identifier,
+        consumer: ffi::Consumer,
     ) -> Result<ffi::ConsumerOffsetInfo, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not get consumer offset: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
             .map_err(|error| format!("Could not get consumer offset: {error}"))?;
-        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
-            .map_err(|error| format!("Could not get consumer offset: {error}"))?;
-        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+        let rust_consumer = Consumer::try_from(consumer)
             .map_err(|error| format!("Could not get consumer offset: {error}"))?;
 
         RUNTIME.block_on(async {
             let offset = self
                 .inner
                 .get_consumer_offset(
-                    &consumer,
+                    &rust_consumer,
                     &rust_stream_id,
                     &rust_topic_id,
                     opt_partition(partition_id),
@@ -988,22 +971,19 @@ impl Client {
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         partition_id: u32,
-        consumer_kind: String,
-        consumer_id: ffi::Identifier,
+        consumer: ffi::Consumer,
     ) -> Result<(), String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
             .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
-        let rust_consumer_id = RustIdentifier::try_from(consumer_id)
-            .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
-        let consumer = resolve_consumer(&consumer_kind, rust_consumer_id)
+        let rust_consumer = Consumer::try_from(consumer)
             .map_err(|error| format!("Could not delete consumer offset: {error}"))?;
 
         RUNTIME.block_on(async {
             self.inner
                 .delete_consumer_offset(
-                    &consumer,
+                    &rust_consumer,
                     &rust_stream_id,
                     &rust_topic_id,
                     opt_partition(partition_id),

@@ -1048,8 +1048,8 @@ TEST_F(LowLevelE2E_Topic, UpdateTopicDoesNotChangeMessages) {
 
     ASSERT_NO_THROW({
         const auto polled = client->poll_messages(make_numeric_identifier(created_stream.id),
-                                                  make_string_identifier(updated_topic_name), 0, "consumer",
-                                                  make_numeric_identifier(1), "offset", 0, 10, false);
+                                                  make_string_identifier(updated_topic_name), 0,
+                                                  iggy::Consumer::Single(1), "offset", 0, 10, false);
         ASSERT_EQ(polled.count, 1u);
         ASSERT_EQ(polled.messages.size(), 1u);
         const std::string actual(polled.messages[0].payload.begin(), polled.messages[0].payload.end());
