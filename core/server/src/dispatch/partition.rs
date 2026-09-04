@@ -622,9 +622,9 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         return;
     };
     // Gate on (stream, topic) before touching the partition plane. A resolution
-    // miss falls through to the resolve path below (empty-poll / not-found); a
-    // denial replies status!=0 with an empty body, distinct from the empty-poll
-    // "0 messages" shape.
+    // miss denies typed on the resolve path below; a denial here replies
+    // status!=0 with an empty body, distinct from the empty-poll "0 messages"
+    // shape.
     if let Some(status) = authorize_partition_read(
         shard,
         &wire.stream_id,
@@ -807,7 +807,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         return;
     }
     let body = match resolve_consumer_offset_request(shard, &wire) {
-        Ok((namespace, partition_id, consumer)) => {
+        Ok(Some((namespace, partition_id, consumer))) => {
             match shard
                 .partition_read(namespace, PartitionRead::ConsumerOffset { consumer })
                 .await
@@ -819,33 +819,24 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
                 _ => Bytes::new(),
             }
         }
-        // An unresolved stream, topic, or partition is a client addressing
-        // error, the same set the poll path denies typed. An empty body decodes
-        // as `None` -- indistinguishable from "this consumer has no stored
-        // offset yet" -- so the caller could not tell a typo'd or deleted
-        // target from a fresh consumer, and would resume from its configured
-        // default and reprocess with no error anywhere. The same read over REST
-        // 404s.
-        Err(
-            error @ (IggyError::PartitionNotFound(..)
-            | IggyError::StreamIdNotFound(_)
-            | IggyError::TopicIdNotFound(..)),
-        ) => {
-            warn!(
-                transport_client_id,
-                error = %error,
-                "get_consumer_offset rejected: target not found"
-            );
-            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
-            return;
-        }
+        // An unresolved group has no offset to report, the one thing the
+        // empty body may mean.
+        Ok(None) => Bytes::new(),
+        // Everything the resolve rejects is a client error: an unresolved
+        // stream, topic, or partition, or `resolve_partition_namespace`'s
+        // generic rejection. All must surface typed -- an empty body decodes as
+        // `None`, indistinguishable from "no stored offset yet", so a typo'd or
+        // deleted target would read back as a fresh consumer and resume from
+        // its configured default with no error anywhere. The same read over
+        // REST 404s.
         Err(error) => {
             warn!(
                 transport_client_id,
                 error = %error,
-                "get_consumer_offset request rejected; replying empty"
+                "get_consumer_offset rejected; replying denied"
             );
-            Bytes::new()
+            send_non_replicated_deny(shard, request, transport_client_id, error.as_code()).await;
+            return;
         }
     };
     send_non_replicated_bytes(
@@ -994,10 +985,15 @@ where
 /// namespace, partition, and polling consumer. Shared by the TCP dispatch and
 /// the HTTP route; needs no client id because offset reads are not fenced
 /// (any client may read a group's offset, member or not).
+///
+/// `Ok(None)` is the one outcome that means "no offset exists to report" (an
+/// unresolved group). It is a separate outcome rather than an error code
+/// because [`resolve_partition_namespace`] also rejects an addressing miss
+/// with `InvalidIdentifier`, and the caller must deny that one typed.
 pub fn resolve_consumer_offset_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     wire: &GetConsumerOffsetRequest,
-) -> Result<(IggyNamespace, u32, PollingConsumer), IggyError>
+) -> Result<Option<(IggyNamespace, u32, PollingConsumer)>, IggyError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -1014,19 +1010,21 @@ where
     // it, member or not), the same key the write path is rewritten to. An
     // unresolved group (e.g. deleted) has no offset, so the read reports None.
     let consumer = if wire.consumer.kind == KIND_CONSUMER_GROUP {
-        let group_id = shard
+        let Some(group_id) = shard
             .plane
             .metadata()
             .mux_stm
             .streams()
             .resolve_consumer_group_id(&wire.stream_id, &wire.topic_id, &wire.consumer.id)
-            .ok_or(IggyError::InvalidIdentifier)?;
+        else {
+            return Ok(None);
+        };
         #[allow(clippy::cast_possible_truncation)]
         PollingConsumer::ConsumerGroup(group_id as usize, partition_id as usize)
     } else {
         polling_consumer_from_wire(&wire.consumer, partition_id)?
     };
-    Ok((namespace, partition_id, consumer))
+    Ok(Some((namespace, partition_id, consumer)))
 }
 
 fn polling_consumer_from_wire(
