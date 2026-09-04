@@ -187,6 +187,7 @@ pub struct Simulator {
     /// [`shard::IggyShard::deliver_client_request`]) instead of raw `dispatch`
     /// routing. Set at construction by [`Simulator::with_shards_shell`].
     shell: bool,
+    consumer_offsets_max: usize,
 }
 
 impl Simulator {
@@ -487,7 +488,47 @@ impl Simulator {
             deferred_client_replies: Vec::new(),
             seed,
             shell,
+            consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
         }
+    }
+
+    /// Configure the per-kind offset limit used by partitions materialised
+    /// after this call.
+    ///
+    /// # Panics
+    /// Panics when `consumer_offsets_max` is zero.
+    pub fn set_consumer_offsets_max(&mut self, consumer_offsets_max: usize) {
+        assert!(
+            consumer_offsets_max > 0,
+            "consumer offset limit must be nonzero"
+        );
+        self.consumer_offsets_max = consumer_offsets_max;
+    }
+
+    #[must_use]
+    pub const fn consumer_offsets_max(&self) -> usize {
+        self.consumer_offsets_max
+    }
+
+    #[must_use]
+    /// # Panics
+    /// Panics when `replica_idx` is outside the simulated roster.
+    pub fn partition_consumer_offset_counts(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+        kind: iggy_common::ConsumerKind,
+    ) -> Option<(usize, usize)> {
+        self.replicas[replica_idx]
+            .partition_shard(namespace)
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                (
+                    partition.durable_consumer_offset_count(kind),
+                    partition.consumer_offset_map_count(kind),
+                )
+            })
     }
 
     /// Init a partition with its own consensus group on every live replica.
@@ -518,6 +559,7 @@ impl Simulator {
                 namespace,
                 self.restore_partition_frontier,
                 created_view,
+                self.consumer_offsets_max,
             );
         }
     }
@@ -1212,6 +1254,7 @@ impl Simulator {
                 namespace,
                 self.restore_partition_frontier,
                 created_view,
+                self.consumer_offsets_max,
             );
         }
 
@@ -1249,6 +1292,10 @@ impl Simulator {
             retained.insert(
                 namespace,
                 RetainedPartitionState {
+                    consumer_offsets: partition
+                        .retained_consumer_offsets(iggy_common::ConsumerKind::Consumer),
+                    consumer_group_offsets: partition
+                        .retained_consumer_offsets(iggy_common::ConsumerKind::ConsumerGroup),
                     log: std::mem::take(&mut partition.log),
                     durable_offset: offsets.commit_offset,
                     write_offset: offsets.write_offset,
@@ -1303,7 +1350,8 @@ impl Simulator {
         };
         // Partitions are driven directly, so a poll's auto-commit is never
         // replicated (the serving shard's job in the real server). Offset discarded.
-        let (fragments, _commit_offset, _auto_commit) = futures::executor::block_on(plan.execute());
+        let (fragments, _commit_offset, _auto_commit) = futures::executor::block_on(plan.execute())
+            .map_err(|_| IggyError::TooManyConsumerOffsets)?;
         Ok(fragments)
     }
 
@@ -1431,6 +1479,7 @@ fn materialise_partition(
     namespace: IggyNamespace,
     restore_frontier: bool,
     created_view: u32,
+    consumer_offsets_max: usize,
 ) {
     let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
     let owner = calculate_shard_assignment(&namespace, shard_count);
@@ -1479,6 +1528,7 @@ fn materialise_partition(
         retained,
         restore_frontier,
         PartitionMaterialisation::new(epoch, created_view),
+        consumer_offsets_max,
     );
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -1495,7 +1545,165 @@ mod tests {
     use crate::workload::apply_sim_commands;
     use bytes::Bytes;
     use consensus::Status;
+    use iggy_binary_protocol::{AckLevel, RoutedRequestHeader};
+    use iggy_common::ConsumerKind;
     use server_common::sharding::IggyNamespace;
+
+    fn submit_and_wait_for_reply(
+        sim: &mut Simulator,
+        client_id: u128,
+        target: u8,
+        request: Message<RoutedRequestHeader>,
+    ) -> Message<ReplyHeader> {
+        let request_id = request.header().request;
+        sim.submit_request(client_id, target, request.into_generic());
+        for _ in 0..100 {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request_id)
+            {
+                return reply;
+            }
+        }
+        panic!("request {request_id} did not receive a reply");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn given_small_offset_limit_when_using_quorum_and_no_ack_should_bound_every_replica() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let replica_count = 3u8;
+        let client_id = 1u128;
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                seed: 0xC0FF_EE01,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        sim.set_consumer_offsets_max(2);
+        sim.init_partition(namespace);
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+
+        let produced = submit_and_wait_for_reply(
+            &mut sim,
+            client_id,
+            0,
+            client.send_messages(namespace, &[Bytes::from_static(b"offset-cap")]),
+        );
+        assert_eq!(produced.header().status, 0);
+
+        for (consumer_id, ack) in [(1, AckLevel::Quorum), (2, AckLevel::NoAck)] {
+            let reply = submit_and_wait_for_reply(
+                &mut sim,
+                client_id,
+                0,
+                client.store_consumer_offset(namespace, 1, consumer_id, 0, ack),
+            );
+            assert_eq!(reply.header().status, 0);
+        }
+
+        let denied = submit_and_wait_for_reply(
+            &mut sim,
+            client_id,
+            0,
+            client.store_consumer_offset(namespace, 1, 3, 0, AckLevel::NoAck),
+        );
+        assert_eq!(
+            denied.header().status,
+            IggyError::TooManyConsumerOffsets.as_code()
+        );
+
+        let deleted = submit_and_wait_for_reply(
+            &mut sim,
+            client_id,
+            0,
+            client.delete_consumer_offset(namespace, 1, 1, AckLevel::NoAck),
+        );
+        assert_eq!(deleted.header().status, 0);
+        let replacement = submit_and_wait_for_reply(
+            &mut sim,
+            client_id,
+            0,
+            client.store_consumer_offset(namespace, 1, 3, 0, AckLevel::Quorum),
+        );
+        assert_eq!(replacement.header().status, 0);
+
+        sim.replica_crash(0);
+        let new_primary = (0..800)
+            .find_map(|_| {
+                sim.step();
+                (1..replica_count).find(|replica_id| {
+                    sim.partition_consensus_state(usize::from(*replica_id), namespace)
+                        .is_some_and(|state| {
+                            state.is_primary
+                                && state.status == Status::Normal
+                                && sim
+                                    .partition_consumer_offset_counts(
+                                        usize::from(*replica_id),
+                                        namespace,
+                                        ConsumerKind::Consumer,
+                                    )
+                                    .is_some_and(|counts| counts.0 == 2)
+                        })
+                })
+            })
+            .expect("surviving replicas elect a new partition primary");
+        let denied_after_failover = submit_and_wait_for_reply(
+            &mut sim,
+            client_id,
+            new_primary,
+            client.store_consumer_offset(namespace, 1, 4, 0, AckLevel::Quorum),
+        );
+        assert_eq!(
+            denied_after_failover.header().status,
+            IggyError::TooManyConsumerOffsets.as_code(),
+            "the promoted primary must preserve the durable admission bound"
+        );
+
+        for _ in 0..100 {
+            sim.step();
+        }
+        for replica_id in 0..sim.replicas.len() {
+            let counts = sim
+                .partition_consumer_offset_counts(replica_id, namespace, ConsumerKind::Consumer)
+                .expect("partition is materialised");
+            assert!(
+                counts.0 <= 2,
+                "replica {replica_id} durable count {counts:?}"
+            );
+            assert!(counts.1 <= 4, "replica {replica_id} map count {counts:?}");
+        }
+
+        sim.replica_restart(0);
+        let recovered = sim
+            .partition_consumer_offset_counts(0, namespace, ConsumerKind::Consumer)
+            .expect("restarted replica rematerialises the partition");
+        assert_eq!(recovered.0, 2, "restart must retain durable offset keys");
+        for _ in 0..200 {
+            sim.step();
+        }
+        for replica_id in 0..sim.replicas.len() {
+            let counts = sim
+                .partition_consumer_offset_counts(replica_id, namespace, ConsumerKind::Consumer)
+                .expect("partition remains materialised after rejoin");
+            assert!(
+                counts.0 <= 2,
+                "replica {replica_id} durable count {counts:?}"
+            );
+            assert!(counts.1 <= 4, "replica {replica_id} map count {counts:?}");
+        }
+    }
 
     /// Crashing the primary in a 5-node cluster: 4 survivors detect via
     /// heartbeat timeout and elect a new primary via view change.
@@ -2053,8 +2261,11 @@ mod tests {
         // together remap every stream; and partition ops drawing from the one shared
         // request counter instead of a separate sequence based at `1<<63`, which
         // renumbers every partition request id and so every reply header in the trace.
+        // Multi-replica consumer-offset requests carrying `NoAck` now enter
+        // VSR, so their scheduling and committed replies contribute to the
+        // deterministic trace instead of taking the primary-local fast path.
         assert_eq!(
-            h1, 0x5C2B_6057_2DA9_908B,
+            h1, 0x31C2_ADA9_9411_FCD4,
             "workload reply hash drifted from locked baseline"
         );
     }
@@ -2482,6 +2693,7 @@ mod tests {
     /// prepares. A third prepare is withheld from it, then placed on its inbox
     /// after simulator materialisation stages the parked prefix. Running the pump
     /// without advancing its tick forces the inbox arm to drain the prefix first.
+    #[allow(clippy::too_many_lines)]
     fn parked_prepare_redispatch_trace(seed: u64) -> (usize, Vec<PartitionOffsets>, u64) {
         const CLIENT_ID: u128 = 1;
 
@@ -2504,8 +2716,20 @@ mod tests {
 
         // Replica 0 is the view-0 primary. Replica 2 supplies quorum while
         // replica 1 has committed metadata but no local partition yet.
-        materialise_partition(&sim.replicas[0], namespace, false, created_view);
-        materialise_partition(&sim.replicas[2], namespace, false, created_view);
+        materialise_partition(
+            &sim.replicas[0],
+            namespace,
+            false,
+            created_view,
+            sim.consumer_offsets_max,
+        );
+        materialise_partition(
+            &sim.replicas[2],
+            namespace,
+            false,
+            created_view,
+            sim.consumer_offsets_max,
+        );
 
         let client = SimClient::new(CLIENT_ID);
         sim.shell_login(&client);
@@ -2557,7 +2781,13 @@ mod tests {
         let later_prepare = retained_prepare(&sim, 0, namespace, 3);
         sim.network.process_enable(ProcessId::Replica(1));
 
-        materialise_partition(&sim.replicas[1], namespace, false, created_view);
+        materialise_partition(
+            &sim.replicas[1],
+            namespace,
+            false,
+            created_view,
+            sim.consumer_offsets_max,
+        );
         assert_eq!(lagging_shard.parked_frame_count(namespace), 0);
         assert_eq!(
             lagging_shard.redispatched_frame_count(),
@@ -2829,6 +3059,7 @@ mod tests {
                     None,
                     false,
                     PartitionMaterialisation::new(0, 0),
+                    partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
                 );
             });
             executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
@@ -2871,6 +3102,7 @@ mod tests {
                 None,
                 false,
                 PartitionMaterialisation::new(0, 0),
+                partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
             );
         });
         executor.run_until_stalled(POLL_BUDGET);

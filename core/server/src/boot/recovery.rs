@@ -331,6 +331,14 @@ const _: () = assert!(
 const _: () = assert!(
     configs::partition::PARTITION_DEDUP_CLIENTS_DEFAULT == consensus::PARTITION_DEDUP_CLIENTS_MAX
 );
+const _: () = assert!(
+    configs::partition::PARTITION_CONSUMER_OFFSETS_DEFAULT
+        == partitions::DEFAULT_CONSUMER_OFFSETS_MAX
+);
+const _: () = assert!(
+    2 * configs::partition::PARTITION_CONSUMER_OFFSETS_CEILING
+        <= partitions::CONSUMER_OFFSETS_ENTRIES_MAX as usize
+);
 const _: () =
     assert!(configs::metadata::DEFAULT_METADATA_CLIENTS_TABLE_MAX == consensus::CLIENTS_TABLE_MAX);
 const _: () =

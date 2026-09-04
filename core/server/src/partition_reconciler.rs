@@ -170,11 +170,17 @@ use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use futures::FutureExt;
+use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
+use iggy_binary_protocol::{
+    AckLevel, Command, Operation, ReplyHeader, RoutedRequestHeader, WireConsumer, WireEncode,
+    WireIdentifier,
+};
 use iggy_common::{ConsumerGroupId, IggyTimestamp};
+use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::Partition;
-use partitions::delete_persisted_offset;
+use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
 use shard::ReconcileOp;
@@ -184,7 +190,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
@@ -386,6 +392,9 @@ struct PassCounters {
     /// Consumer-group offsets reclaimed for groups deleted while their topic
     /// survived (a bare `DeleteConsumerGroup`, not a topic/stream delete).
     cg_offsets_purged: usize,
+    /// Consumer-group offset files whose unlink failed and remain queued for
+    /// the next pass. Counted so the revision fast-skip cannot strand them.
+    cg_offsets_pending: usize,
     /// Committed delete watermarks not yet fully enforced on local segments.
     /// Counted so the pass does not arm the fast-skip: the pump can be
     /// blocked by a consumer barrier or by a rejoin whose offsets land via
@@ -424,6 +433,7 @@ impl PassCounters {
             + self.backoff_skipped
             + self.stale
             + self.cg_offsets_purged
+            + self.cg_offsets_pending
             + self.trims_pending
             + self.purges_staged
             + self.deferred
@@ -465,6 +475,15 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         && ctx.last_pass_noop.get()
         && ctx.failure_state.borrow().is_empty()
         && !ctx.shard.has_parked_partition_frames()
+        && !ctx.shard.plane.partitions().namespaces().any(|namespace| {
+            ctx.shard
+                .plane
+                .partitions()
+                .with_partition(namespace, |partition| {
+                    partition.consumer_group_offsets_reconcile_needed()
+                })
+                .unwrap_or(false)
+        })
     {
         trace!(
             shard = shard_id,
@@ -511,6 +530,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
             parked_reclaimed = counters.parked_reclaimed,
             purges_staged = counters.purges_staged,
             trims_pending = counters.trims_pending,
+            cg_offsets_pending = counters.cg_offsets_pending,
             "partition reconciler pass complete"
         );
     } else {
@@ -960,45 +980,83 @@ async fn tear_down_owned_partition(
     counters.removed_local += 1;
 }
 
-/// Reclaim consumer-group offsets left behind by a `DeleteConsumerGroup` whose
-/// topic still exists (a topic/stream delete already drops the whole partition
-/// directory, offsets included). For each owned partition, any stored
-/// consumer-group offset whose group id is no longer present in the topic's
-/// committed metadata is removed (in-memory entry + persisted file). Monotonic,
-/// never-reused group ids make this purely reclamation -- a recreated group
-/// gets a fresh id and never reads a dead group's offset -- so it is safe to do
-/// lazily on the reconcile pass rather than synchronously on delete.
+/// Reclaim deleted groups through ordered offset deletes. Replicas must see
+/// each delete before a replacement store can reuse its durable slot.
 async fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let live_groups = snapshot_topic_live_groups(ctx);
     let partitions = ctx.shard.plane.partitions();
     let owned: Vec<IggyNamespace> = partitions.namespaces().copied().collect();
-    for ns in owned {
-        let live = live_groups.get(&(ns.stream_id(), ns.topic_id()));
-        // Take the in-memory removes + owned unlink paths under a closure-scoped
-        // borrow that cannot escape into the await below. Holding a raw
-        // `&IggyPartition` across `delete_persisted_offset().await` would let the
-        // pump task realloc the partitions vec underneath us (a UAF).
-        let paths = partitions.with_partition(&ns, |partition| {
-            partition.reclaim_dead_group_offsets(|group_id| {
-                live.is_some_and(|set| set.contains(&group_id))
+    for namespace in owned {
+        let live = live_groups.get(&(namespace.stream_id(), namespace.topic_id()));
+        let dead = partitions
+            .with_partition(&namespace, |partition| {
+                partition.dead_consumer_group_offset_ids(|group_id| {
+                    live.is_some_and(|set| set.contains(&group_id))
+                })
             })
-        });
-        let Some(paths) = paths else {
-            continue;
-        };
-        for path in paths {
-            if let Err(err) = delete_persisted_offset(&path).await {
-                warn!(
-                    shard = ctx.shard.id,
-                    ns_raw = ns.inner(),
-                    error = %err,
-                    "reconciler failed to reclaim deleted consumer-group offset"
-                );
-                continue;
+            .unwrap_or_default();
+        // Bound work per pass so a historical directory cannot monopolize the
+        // reconciler. Unprocessed keys keep the partition's dirty flag armed.
+        let mut tickets = Vec::with_capacity(dead.len().min(32));
+        for consumer_id in dead.into_iter().take(32) {
+            counters.cg_offsets_pending += 1;
+            let request = group_offset_delete_request(namespace, consumer_id);
+            if let Ok(ticket) = ctx.shard.partition_submit(namespace, request) {
+                tickets.push(ticket);
             }
-            counters.cg_offsets_purged += 1;
+        }
+        let replies = futures::future::join_all(
+            tickets
+                .into_iter()
+                .map(|ticket| ctx.shard.await_partition_submit(ticket)),
+        )
+        .await;
+        for reply in replies {
+            let Some(reply) = reply else {
+                continue;
+            };
+            let header = reply
+                .as_slice()
+                .get(..size_of::<ReplyHeader>())
+                .and_then(|bytes| bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok());
+            if header.is_some_and(|header| header.status == 0) {
+                counters.cg_offsets_purged += 1;
+            }
         }
     }
+}
+
+fn group_offset_delete_request(
+    namespace: IggyNamespace,
+    consumer_id: u32,
+) -> Message<RoutedRequestHeader> {
+    let body = DeleteConsumerOffsetRequest {
+        consumer: WireConsumer::consumer_group(WireIdentifier::Numeric(consumer_id)),
+        stream_id: WireIdentifier::Numeric(
+            u32::try_from(namespace.stream_id()).expect("stream id fits u32"),
+        ),
+        topic_id: WireIdentifier::Numeric(
+            u32::try_from(namespace.topic_id()).expect("topic id fits u32"),
+        ),
+        partition_id: Some(u32::try_from(namespace.partition_id()).expect("partition id fits u32")),
+        ack: AckLevel::Quorum,
+    }
+    .to_bytes();
+    let size = size_of::<RoutedRequestHeader>() + body.len();
+    let mut request = Message::<RoutedRequestHeader>::new(size);
+    request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+    request.transmute_header(|_, header: &mut RoutedRequestHeader| {
+        *header = RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::DeleteConsumerOffset,
+            size: u32::try_from(size).expect("offset request fits u32"),
+            client: AUTO_COMMIT_CLIENT_ID,
+            session: 1,
+            request: 1,
+            group: namespace.inner(),
+            ..Default::default()
+        };
+    })
 }
 
 /// Complete cooperative consumer-group revocations whose source member has
@@ -3181,11 +3239,10 @@ mod tests {
         );
     }
 
-    /// A bare `DeleteConsumerGroup` (topic survives) leaves the group's offsets
-    /// on the partition. The reconciler must reclaim a deleted group's offset
-    /// while leaving a still-live group's offset untouched.
+    /// Failed delivery must leave the offset and its quota slot intact for a
+    /// later replicated delete. This fixture deliberately has no running pump.
     #[compio::test]
-    async fn reconcile_reclaims_offsets_of_deleted_consumer_group() {
+    async fn given_deleted_group_when_cleanup_submit_fails_should_preserve_state_for_retry() {
         use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
 
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -3235,9 +3292,14 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(
             ids,
-            vec![u64::from(live_key)],
-            "deleted group's offset reclaimed; live group's offset retained"
+            vec![u64::from(dead_key), u64::from(live_key)],
+            "failed submission must not unlink or remove either offset"
         );
+        assert_eq!(
+            partition.dead_consumer_group_offset_ids(|id| id == u64::from(live_key)),
+            vec![dead_key]
+        );
+        assert!(!ctx.last_pass_noop.get(), "failed cleanup must be retried");
     }
 
     /// A partition-count change must re-run consumer-group assignment: a new

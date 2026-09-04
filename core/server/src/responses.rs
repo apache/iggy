@@ -278,12 +278,15 @@ where
         return Ok(());
     }
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    let streams = shard.plane.metadata().mux_stm.streams();
+    if streams
+        .resolve_consumer_group_id(stream_id, topic_id, &consumer.id)
+        .is_none()
+    {
+        return Err(IggyError::InvalidIdentifier);
+    }
     #[allow(clippy::cast_possible_truncation)]
-    shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
+    streams
         // Commit fence: allow a pending-revoked partition (the source commits it
         // to drain the cooperative handoff), so `require_pollable = false`.
         .consumer_group_fence(

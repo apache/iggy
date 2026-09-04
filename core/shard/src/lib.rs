@@ -358,6 +358,7 @@ pub enum PartitionReadReply {
         stored: Option<u64>,
         current_offset: u64,
     },
+    Rejected(IggyError),
     /// Reply to [`PartitionRead::GroupOffsetState`]: the group's last-polled and
     /// committed offsets on this partition (each `None` if absent).
     GroupOffsetState {
@@ -3965,6 +3966,7 @@ where
     // and `adopt_retained_log` are configured out and the crate does not compile.
     // The feature forwards to `partitions/simulator` instead.
     #[cfg(feature = "simulator")]
+    #[allow(clippy::too_many_arguments)]
     pub fn init_partition(
         &self,
         namespace: IggyNamespace,
@@ -3973,6 +3975,7 @@ where
         retained: Option<partitions::RetainedPartitionState>,
         restore_frontier: bool,
         materialisation: PartitionMaterialisation,
+        consumer_offsets_max: usize,
     ) where
         B: MessageBus + Clone + 'static,
         T: ShardsTable,
@@ -4040,6 +4043,7 @@ where
             partitions.config().segment_size,
             partitions.config().enforce_fsync,
         );
+        partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state.as_ref());
         }

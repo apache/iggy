@@ -775,6 +775,10 @@
   fields:
     - name: Path
       type: string
+- name: TooManyConsumerOffsets
+  code: 3024
+  format: "too many consumer offsets"
+  fields: []
 - name: PartitionIdSpaceExhausted
   code: 3013
   format: "partition id space exhausted for this topic"

@@ -226,16 +226,18 @@ where
     let body = request_body(&request);
     // The store/delete ops differ only in the decode type; this collapses
     // their identical decode -> resolve group id -> rewrite consumer id ->
-    // re-encode bodies. A non-group consumer or unresolved group returns the
-    // request untouched (the apply/read path handles the miss).
+    // re-encode bodies. Individual consumers pass through. A group identifier
+    // that metadata cannot resolve is rejected before it can create a raw file
+    // in the group-offset directory.
     macro_rules! rewrite_group_offset {
         ($ty:ty) => {{
             let mut wire = <$ty>::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            let Some(group_id) =
-                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
-            else {
+            if wire.consumer.kind != KIND_CONSUMER_GROUP {
                 return Ok(request);
-            };
+            }
+            let group_id =
+                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
+                    .ok_or(IggyError::InvalidIdentifier)?;
             // The partition-plane group-offset key is u32 (see the documented
             // ceiling on `Topic::next_consumer_group_id`). Clamp on the
             // ~4-billion-creates overflow rather than panic this live
@@ -255,9 +257,7 @@ where
     rewrite_request_body(&request, &rewritten)
 }
 
-/// Resolve the monotonic group id for a group consumer-offset op, or `None` for
-/// an individual consumer (kind != 2) / unresolved group (leave the body as-is;
-/// the apply / read path handle the miss).
+/// Resolve the monotonic group id for a group consumer-offset op.
 fn resolve_group_offset_id<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     consumer: &WireConsumer,

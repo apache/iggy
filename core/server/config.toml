@@ -1024,6 +1024,12 @@ prepare_queue_depth = 32
 # actually sees, not the node's client total.
 dedup_clients_max = 4096
 
+# Distinct durable consumer-offset keys a partition primary admits per kind.
+# Standalone consumers and consumer groups are counted separately. Existing
+# keys remain writable at the limit. A new key is rejected before consensus.
+# Must be > 0 and <= 262144.
+consumer_offsets_max = 4096
+
 # How many offsets a partition claims in its superblock ahead of the mint
 # counter before it will append, so a crash-restarted replica resumes above
 # every offset it confirmed to a client instead of re-minting it for a different

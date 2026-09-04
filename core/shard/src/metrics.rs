@@ -42,6 +42,8 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
 use std::sync::{Arc, OnceLock};
 
+use iggy_common::ConsumerKind;
+
 /// Label for `frame_drops_total`.
 ///
 /// `variant` describes the dropped frame class; `reason` is `"full"` or
@@ -60,6 +62,11 @@ use std::sync::{Arc, OnceLock};
 pub struct FrameDropLabel {
     pub variant: &'static str,
     pub reason: &'static str,
+}
+
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct ConsumerOffsetKindLabel {
+    pub kind: &'static str,
 }
 
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
@@ -214,6 +221,8 @@ pub struct ShardMetrics {
     partition_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
+    partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter>,
+    consumer_offset_denied_counters: [Counter; 2],
 }
 
 impl ShardMetrics {
@@ -226,6 +235,21 @@ impl ShardMetrics {
         let cached_counters = Arc::new(std::array::from_fn(|_| {
             std::array::from_fn(|_| OnceLock::new())
         }));
+        let partition_consumer_offsets_denied_total: Family<ConsumerOffsetKindLabel, Counter> =
+            Family::default();
+        let consumer_denied = {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel { kind: "consumer" })
+                .clone()
+        };
+        let consumer_group_denied = {
+            partition_consumer_offsets_denied_total
+                .get_or_create(&ConsumerOffsetKindLabel {
+                    kind: "consumer_group",
+                })
+                .clone()
+        };
+        let consumer_offset_denied_counters = [consumer_denied, consumer_group_denied];
         Self {
             frame_drops_total,
             cached_counters,
@@ -241,7 +265,27 @@ impl ShardMetrics {
             partition_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
+            partition_consumer_offsets_denied_total,
+            consumer_offset_denied_counters,
         }
+    }
+
+    pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {
+        let index = match kind {
+            ConsumerKind::Consumer => 0,
+            ConsumerKind::ConsumerGroup => 1,
+        };
+        self.consumer_offset_denied_counters[index].inc();
+    }
+
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn consumer_offset_denied_value(&self, kind: ConsumerKind) -> u64 {
+        let index = match kind {
+            ConsumerKind::Consumer => 0,
+            ConsumerKind::ConsumerGroup => 1,
+        };
+        self.consumer_offset_denied_counters[index].get()
     }
 
     /// Bumped every time a client request is answered with a retryable denial
@@ -594,6 +638,11 @@ impl ShardMetrics {
             "client requests denied retryable because that client's request queue was full",
             self.client_requests_denied_queue_full_total.clone(),
         );
+        registry.register(
+            "partition_consumer_offsets_denied",
+            "consumer offset creations denied at the per-partition admission limit",
+            self.partition_consumer_offsets_denied_total.clone(),
+        );
     }
 }
 
@@ -673,6 +722,35 @@ mod tests {
             })
             .get();
         assert_eq!(from_family, 5);
+    }
+
+    #[test]
+    fn consumer_offset_denials_use_two_cached_kind_series() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
+        metrics.record_consumer_offset_denied(ConsumerKind::Consumer);
+        metrics.record_consumer_offset_denied(ConsumerKind::ConsumerGroup);
+
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::Consumer),
+            2
+        );
+        assert_eq!(
+            metrics.consumer_offset_denied_value(ConsumerKind::ConsumerGroup),
+            1
+        );
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry)
+            .expect("scrape encoding succeeds");
+        assert_eq!(
+            buffer
+                .lines()
+                .filter(|line| line.starts_with("partition_consumer_offsets_denied_total"))
+                .count(),
+            2
+        );
     }
 
     #[test]

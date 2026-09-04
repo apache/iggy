@@ -139,6 +139,23 @@ pub const PARTITION_DEDUP_CLIENTS_DEFAULT: usize = 4096;
 /// bytes`: a 112-byte slot entry plus its index-map slot.
 pub const PARTITION_DEDUP_CLIENTS_CEILING: usize = 1 << 16;
 
+/// Shipped per-kind consumer-offset cardinality limit for one partition.
+///
+/// Mirrors `partitions::DEFAULT_CONSUMER_OFFSETS_MAX`. The server crate pins
+/// the duplicated literals because configs must not depend on partitions.
+pub const PARTITION_CONSUMER_OFFSETS_DEFAULT: usize = 4096;
+
+/// Configuration typo guard for the per-kind consumer-offset limit.
+///
+/// The runtime state-transfer decoder accepts `1 << 20` entries per section.
+/// Keeping the configurable ceiling at one quarter leaves room for recovered
+/// over-limit state while the shipped default remains much smaller.
+pub const PARTITION_CONSUMER_OFFSETS_CEILING: usize = 1 << 18;
+
+fn default_consumer_offsets_max() -> usize {
+    PARTITION_CONSUMER_OFFSETS_DEFAULT
+}
+
 /// Capacity tunables for the per-partition consensus plane.
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct PartitionConfig {
@@ -160,6 +177,11 @@ pub struct PartitionConfig {
     /// worst case scales with partition count: size it to the producers a
     /// single partition actually sees, not the node's client total.
     pub dedup_clients_max: usize,
+
+    /// Distinct durable consumer-offset keys admitted per kind by one
+    /// partition primary. Existing keys remain writable at the limit.
+    #[serde(default = "default_consumer_offsets_max")]
+    pub consumer_offsets_max: usize,
 
     /// Offsets claimed in the superblock ahead of the mint counter before an
     /// append, so a crash-restarted replica resumes above what it confirmed.
@@ -241,6 +263,16 @@ impl Validatable<ConfigurationError> for PartitionConfig {
                 "{COMPONENT} partition.dedup_clients_max ({}) must be > 0 and <= \
                  {PARTITION_DEDUP_CLIENTS_CEILING}",
                 self.dedup_clients_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.consumer_offsets_max == 0
+            || self.consumer_offsets_max > PARTITION_CONSUMER_OFFSETS_CEILING
+        {
+            eprintln!(
+                "{COMPONENT} partition.consumer_offsets_max ({}) must be > 0 and <= \
+                 {PARTITION_CONSUMER_OFFSETS_CEILING}",
+                self.consumer_offsets_max
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -338,6 +370,34 @@ mod tests {
     }
 
     #[test]
+    fn shipped_consumer_offsets_default_matches_constant() {
+        assert_eq!(
+            PartitionConfig::default().consumer_offsets_max,
+            PARTITION_CONSUMER_OFFSETS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_consumer_offsets_max() {
+        for value in [0, PARTITION_CONSUMER_OFFSETS_CEILING + 1] {
+            let config = PartitionConfig {
+                consumer_offsets_max: value,
+                ..PartitionConfig::default()
+            };
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_consumer_offsets_max_at_ceiling() {
+        let config = PartitionConfig {
+            consumer_offsets_max: PARTITION_CONSUMER_OFFSETS_CEILING,
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn rejects_out_of_range_dedup_clients_max() {
         for value in [0, PARTITION_DEDUP_CLIENTS_CEILING + 1] {
             let config = PartitionConfig {
@@ -419,6 +479,10 @@ mod tests {
         assert_eq!(
             config.offset_reservation_lease.get(),
             DEFAULT_OFFSET_RESERVATION_LEASE
+        );
+        assert_eq!(
+            config.consumer_offsets_max,
+            PARTITION_CONSUMER_OFFSETS_DEFAULT
         );
         assert!(config.validate().is_ok());
     }

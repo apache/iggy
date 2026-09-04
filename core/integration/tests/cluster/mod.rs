@@ -17,6 +17,7 @@
 
 mod client_table_adversarial;
 mod client_table_restart;
+mod consumer_offset_quota;
 mod crash_durability;
 mod crash_offset_reuse;
 mod crash_recovery_corruption;
