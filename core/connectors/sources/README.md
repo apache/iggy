@@ -12,6 +12,7 @@ Source connectors are responsible for ingesting data from external sources into 
 | **influxdb_source** | Polls InfluxDB with cursor-based timestamp tracking; supports V2 (Flux, annotated CSV) and V3 (SQL, JSONL) |
 | **postgres_source** | Reads rows from PostgreSQL tables with multiple strategies: delete after read, mark as processed, or timestamp tracking |
 | **random_source** | Generates random test messages (useful for testing and development) |
+| **source_template** | Fill-in-the-blank starting point for a new source; framework/security plumbing done, two `TODO(ConnectorDeveloper)` spots left |
 
 The source is represented by the single `Source` trait, which defines the basic interface for all source connectors. It provides methods for initializing the source, reading data from it, and closing the source.
 

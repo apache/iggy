@@ -17,6 +17,7 @@ Sink connectors are responsible for writing data from Iggy streams to external s
 | **quickwit_sink** | Indexes messages in Quickwit search engine for log analytics |
 | **redshift_sink** | Stores messages in Redshift warehouse tables with configurable schemas vis S3 as staging |
 | **s3_sink** | Writes messages to Amazon S3 and S3-compatible stores (MinIO, R2, B2, DO Spaces) |
+| **sink_template** | Fill-in-the-blank starting point for a new sink; framework/security plumbing done, one `TODO(ConnectorDeveloper)` spot left |
 | **stdout_sink** | Prints messages to standard output (useful for debugging and development) |
 | **surrealdb_sink** | Writes messages into SurrealDB with deterministic record IDs for idempotent replay |
 
