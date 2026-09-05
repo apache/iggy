@@ -339,9 +339,6 @@ public final class BytesSerializer {
      */
     private static byte[] encodedMessageId(MessageId id) {
         if (id.toBigInteger().signum() == 0) {
-            // A zero id is filled with random bytes directly (fast, non-crypto):
-            // the id is opaque, not keyed on, and 128 bits keeps collisions far
-            // below the birthday bound at any realistic message rate.
             byte[] minted = new byte[16];
             ThreadLocalRandom.current().nextBytes(minted);
             return minted;

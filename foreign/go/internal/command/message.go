@@ -96,9 +96,6 @@ func (s *SendMessages) AppendBinary(b []byte) ([]byte, error) {
 		// The id sits under the frame checksum, so it must exist before the
 		// frame is hashed; the server never mints ids.
 		if message.Header.Id == (iggcon.MessageID{}) {
-			// A zero id is filled with random bytes directly (fast, non-crypto):
-			// the id is opaque, not keyed on, and 128 bits keeps collisions far
-			// below the birthday bound at any realistic message rate.
 			binary.LittleEndian.PutUint64(message.Header.Id[0:8], rand.Uint64())
 			binary.LittleEndian.PutUint64(message.Header.Id[8:16], rand.Uint64())
 		}
