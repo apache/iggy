@@ -206,7 +206,7 @@ pub(crate) fn repair_retry_ticks(config: &ServerConfig) -> u32 {
 /// plane. Deliberately NOT the retry interval above: that one paces an open
 /// stream, and pairing them means quieting retry chatter also widens how long a
 /// replication hole stays open. The shard applies
-/// [`shard::GAP_DEBOUNCE_TICKS_MIN`] as a floor on top.
+/// [`shard::REPAIR_GAP_DEBOUNCE_TICKS_MIN`] as a floor on top.
 pub(crate) fn repair_gap_debounce_ticks(config: &ServerConfig) -> u32 {
     u32::try_from(duration_to_ticks(
         config.cluster.repair_gap_debounce_interval.get_duration(),

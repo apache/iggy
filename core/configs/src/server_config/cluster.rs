@@ -287,7 +287,7 @@ pub struct ClusterConfig {
     /// Separate from `repair_retry_interval`, which paces an already-open
     /// stream: this one decides how long a replication hole stays open, so
     /// raising the retry interval to quiet repair chatter must not widen it.
-    /// Floored at `GAP_DEBOUNCE_TICKS_MIN` consensus ticks, since one
+    /// Floored at `REPAIR_GAP_DEBOUNCE_TICKS_MIN` consensus ticks, since one
     /// tick of lag is ordinary pipelining and repair against it would fire on
     /// healthy traffic; the shard crate owns the floor and `config.toml` states
     /// its value. Zero (and the `0` / `disabled` / `unlimited` sentinels, which

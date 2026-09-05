@@ -5212,6 +5212,10 @@ mod partition_repair_driver_tests {
     /// The prepare a packet carries, if it carries one for `group`. Keyed on
     /// the group, so `metadata_repair_driver_tests` reads the metadata plane's
     /// prepares with the same helper.
+    ///
+    /// `pub`, not `pub(super)`, in this and the helpers below: the module is
+    /// private and `#[cfg(test)]`, so both spell the same reach, and
+    /// `clippy::redundant_pub_crate` refuses the narrower one.
     pub fn prepare_for(packet: &Packet, group: u64) -> Option<PrepareHeader> {
         if packet.message.header().command != Command::Prepare {
             return None;
@@ -6432,15 +6436,18 @@ mod metadata_repair_driver_tests {
             "the backup committed only {committed} ops across {sends} sends, so the \
              driver was never ticked over a loaded group"
         );
-        // Recorded, not load-bearing: the tail walk in `on_replicate` keeps a
-        // healthy backup caught up at quiescence, so a naive lag detector has
-        // nothing to misread here; `gap_detector_tests` pins the predicate.
+        // Asserted, not merely recorded: on this plane the tail walk in
+        // `on_replicate` leaves a healthy backup caught up at every quiescence
+        // point, so any lag at all is a change in that behaviour rather than
+        // ordinary pipelining. The predicate itself is pinned by
+        // `gap_detector_tests`; what this holds is the premise the repair check
+        // below rests on.
         assert_eq!(
             longest_lag_run, 0,
             "healthy two-replica metadata traffic left the backup lagging for \
-             {longest_lag_run} consecutive ticks; if this ever becomes non-zero \
-             the predicate's journal-hole half is load-bearing HERE too and this \
-             test should assert against it rather than record it"
+             {longest_lag_run} consecutive ticks; the run below then proves nothing \
+             about false positives, and this test should sample residency the way \
+             the partition twin's walk-starvation run does"
         );
         for replica in 0..replica_count {
             let (status, view, commit_min, commit_max) = metadata_state(&sim, replica);

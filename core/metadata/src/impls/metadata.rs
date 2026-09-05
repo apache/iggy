@@ -218,6 +218,20 @@ impl IggySnapshot {
 /// accepted (unverified, loudly) while a PRESENT but mismatching one refuses boot. A
 /// bare checksum could not tell those apart, and guessing wrong in either direction is
 /// unacceptable: silently accepting corruption, or bricking a healthy node.
+/// Committed ops one [`IggyMetadata::commit_journal`] call applies before
+/// returning to the pump.
+///
+/// The twin of `partitions::COMMIT_WALK_OPS_MAX`, and needed for the same
+/// reason: the walk reads a WAL body and applies it per op with no await the
+/// pump can interleave, and the resident `(commit_min, commit_max]` run is the
+/// whole backlog after a repair or a rejoin, not the pipeline depth.
+///
+/// Every caller is re-driven, so a truncated walk resumes rather than losing
+/// anything: `tick_metadata`'s walk backstop covers a follower and
+/// `resume_stranded_commits` covers the primary, both level-triggered on
+/// `commit_min < commit_max` every tick.
+const COMMIT_WALK_OPS_MAX: usize = 64;
+
 const SNAPSHOT_TRAILER_MAGIC: u32 = 0x4953_4E50;
 
 /// `magic` + the payload's [`checkpoint_checksum`].
@@ -776,20 +790,15 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// whole snapshot on shard 0's pump, and hands each requester its own
     /// multi-MB copy.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
-    /// Prepares the backup gap check destroyed since the shard last drained
-    /// the count, folded into `metadata_prepare_gap_drops_total` there.
-    /// Replicated traffic has no client to answer and retransmit skips ops that
-    /// already reached quorum, so nothing else records that the frame existed.
+    /// Prepares the backup gap check destroyed since `tick_metadata` last
+    /// drained the count into `metadata_prepare_gap_drops_total`. What it does
+    /// and does not prove is `IggyPartition::prepare_gap_drops`, verbatim; what
+    /// differs is the frontier the check runs against, the journal head rather
+    /// than the sequencer, so this also counts the ops that fall outside what
+    /// metadata repair can refill (an interior hole below the head, a forward
+    /// gap above `commit_max`).
     ///
-    /// It counts what the ordering check destroyed, which is neither the holes
-    /// nor only them: a gap opened by the last prepare of a burst leaves it at
-    /// zero, and a duplicate delivery of an op this replica already sequenced
-    /// bumps it without any hole existing. Zero proves nothing, and nonzero is
-    /// a reason to look at the drop log. The partition twin is
-    /// `IggyPartition::prepare_gap_drops`.
-    ///
-    /// `Cell`: `tick_metadata` drains it once per tick off the same shared
-    /// borrow the rest of the tick reads the plane through.
+    /// `Cell` because every method on this type takes `&self`.
     prepare_gap_drops: Cell<u64>,
     /// Highest metadata op whose apply has been PUBLISHED on this node, plus
     /// the reads parked on it. Shared by every shard; see
@@ -860,14 +869,7 @@ where
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
-    /// Record one prepare destroyed by the backup gap check
-    /// ([`Self::prepare_gap_drops`]).
-    pub fn note_prepare_gap_drop(&self) {
-        self.prepare_gap_drops
-            .set(self.prepare_gap_drops.get().saturating_add(1));
-    }
-
-    /// Take and clear the gap-drop count ([`Self::prepare_gap_drops`]).
+    /// Take and clear the gap-drop count (`prepare_gap_drops`).
     #[must_use = "dropping the count loses the only record those prepares existed"]
     pub const fn take_prepare_gap_drops(&self) -> u64 {
         self.prepare_gap_drops.replace(0)
@@ -1309,7 +1311,8 @@ where
                     sequencer_op = current_op,
                     "on_replicate: dropping out-of-order prepare (gap)"
                 );
-                self.note_prepare_gap_drop();
+                self.prepare_gap_drops
+                    .set(self.prepare_gap_drops.get().saturating_add(1));
                 return;
             }
         } else {
@@ -3638,7 +3641,16 @@ where
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
+        let mut applied = 0usize;
         while consensus.commit_min() < consensus.commit_max() {
+            if applied == COMMIT_WALK_OPS_MAX {
+                debug!(
+                    "commit_journal: stopping at op={} after {applied} ops; resuming next tick",
+                    consensus.commit_min()
+                );
+                break;
+            }
+            applied += 1;
             let op = consensus.commit_min() + 1;
 
             let Some(header) = journal.handle().header(op as usize) else {
@@ -4290,8 +4302,7 @@ mod tests {
         let md = peer_metadata();
         assert_eq!(md.take_prepare_gap_drops(), 0);
 
-        md.note_prepare_gap_drop();
-        md.note_prepare_gap_drop();
+        md.prepare_gap_drops.set(2);
         assert_eq!(md.take_prepare_gap_drops(), 2);
         assert_eq!(
             md.take_prepare_gap_drops(),
