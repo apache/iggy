@@ -32,7 +32,7 @@ import {
 /** Size of the message ID in bytes (u128) */
 const MESSAGE_ID_SIZE = 16;
 
-/** Exclusive upper bound for a numeric message ID: it must be < 2^(size*8). */
+/** Exclusive upper bound for a numeric message ID: it must be < 2^128 */
 const MESSAGE_ID_UPPER_BOUND = 1n << BigInt((MESSAGE_ID_SIZE * 8));
 
 /** Largest representable frame timestamp delta (u32, microseconds) */
