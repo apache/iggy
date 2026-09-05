@@ -974,12 +974,16 @@ class IggyClient:
 
         Requires authentication only, unlike `get_client` and `get_clients`.
 
+        Unimplemented over the HTTP transport: it always raises, unlike
+        `get_client` and `get_clients`, which do work over HTTP.
+
         Returns:
             An awaitable that resolves to the `ClientInfoDetails` of this
             connection.
 
         Raises:
-            RuntimeError: If the request fails.
+            RuntimeError: `Feature is unavailable` unconditionally over HTTP,
+                or if the request fails.
         """
     def get_client(
         self, client_id: builtins.int
@@ -990,13 +994,17 @@ class IggyClient:
         Requires the `read_servers` or `manage_servers` global permission.
 
         Args:
-            client_id: Client identifier as `int`.
+            client_id: Client identifier as `int`. Converted to the wire's u32
+                before the awaitable exists, so a value outside that range
+                raises `OverflowError` synchronously rather than surfacing as
+                a `RuntimeError` from the request itself.
 
         Returns:
             An awaitable that resolves to `ClientInfoDetails` if the client is
             connected, or `None` otherwise.
 
         Raises:
+            OverflowError: If `client_id` is outside the u32 range.
             RuntimeError: `Unauthorized` when the user holds neither
                 `read_servers` nor `manage_servers`, or if the request fails.
         """

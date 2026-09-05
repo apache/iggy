@@ -137,11 +137,17 @@ class TestGetClients:
 
         assert all(isinstance(client, ClientInfo) for client in clients)
 
-        matching = [client for client in clients if client.client_id == me.client_id]
-        assert len(matching) == 1
-        assert matching[0].address == me.address
-        assert matching[0].transport == me.transport
-        assert matching[0].user_id == me.user_id
+        # get_clients() is a best-effort scatter-gather across shards: one
+        # that misses the server's LIST_CLIENTS_GATHER_TIMEOUT (3s) budget is
+        # dropped from the result rather than failing the whole read. This
+        # test server is unloaded and single-node, so every shard replies
+        # well within budget and the caller's own entry is always present;
+        # that would not hold under load or across a busier cluster.
+        mine = next((c for c in clients if c.client_id == me.client_id), None)
+        assert mine is not None
+        assert mine.address == me.address
+        assert mine.transport == me.transport
+        assert mine.user_id == me.user_id
 
 
 class TestGetClient:
@@ -165,6 +171,20 @@ class TestGetClient:
 
         assert await iggy_client.get_client(unused_client_id(clients)) is None
 
+    @pytest.mark.parametrize("out_of_range", [-1, 2**32], ids=["negative", "above-u32"])
+    @pytest.mark.asyncio
+    async def test_get_client_out_of_range_id_raises_overflow_error(
+        self, iggy_client: IggyClient, out_of_range: int
+    ):
+        """Test a client_id outside the u32 wire range raises OverflowError.
+
+        pyo3 converts the argument to u32 before the awaitable exists, so this
+        fails synchronously with OverflowError rather than surfacing as a
+        RuntimeError from the request itself.
+        """
+        with pytest.raises(OverflowError):
+            iggy_client.get_client(out_of_range)
+
 
 class TestServerInfoPermission:
     """Test the read_servers gate on get_client and get_clients."""
@@ -186,6 +206,9 @@ class TestServerInfoPermission:
         me = await client.get_me()
 
         clients = await client.get_clients()
+        # Best-effort scatter-gather across shards, see the completeness note
+        # on test_get_clients_contains_this_client; holds here for the same
+        # reason.
         assert any(other.client_id == me.client_id for other in clients)
         assert (await client.get_client(me.client_id)) is not None
 
