@@ -2456,6 +2456,17 @@ where
                         // the floor with the partition value.
                         self.metrics
                             .record_partition_prepare_gap_drops(partition.take_prepare_gap_drops());
+                        // Roll whatever this partition still counts out of its
+                        // parent topic and stream. Here and not in the
+                        // reconciler's teardown: a handler suspended mid-append
+                        // holds its own `Arc` past the tombstone, and an earlier
+                        // settle leaves its increment in the parents with the
+                        // partition already gone. This is the drop point, so
+                        // nothing can add through that handle afterwards. The
+                        // rollback clamps, so the usual case -- the metadata
+                        // apply already zeroed these counters at commit -- takes
+                        // nothing.
+                        partition.stats.zero_out_all();
                     } else {
                         tracing::trace!(
                             shard = self_shard_id,

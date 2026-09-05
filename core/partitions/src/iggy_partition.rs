@@ -5169,16 +5169,13 @@ where
                 }
             }
 
-            let segment_size = segment.size.as_bytes_u64();
             // The removal loop above only reaches sealed segments, which always
             // hold at least one message, so the count is inclusive end..=start.
             // A one-message sealed segment has `start_offset == end_offset`, so
             // the `+ 1` is required (a `start == end -> 0` special case would
             // undercount it).
             let messages_in_segment = segment.end_offset - segment.start_offset + 1;
-            self.stats.decrement_size_bytes(segment_size);
-            self.stats.decrement_segments_count(1);
-            self.stats.decrement_messages_count(messages_in_segment);
+            settle_cleaned_segment(&self.stats, namespace, &segment, messages_in_segment);
 
             removal.segments += 1;
             removal.messages += messages_in_segment;
@@ -6412,6 +6409,39 @@ pub struct SegmentRemoval {
     pub segments: u64,
     pub messages: u64,
     pub budget_spent: bool,
+}
+
+/// Roll one cleaned-up segment out of the partition counters, naming the
+/// partition when the rollback could not be covered.
+///
+/// Retention is the likeliest source of a clamped rollback: a partition on its
+/// way out keeps serving cleanup passes after the delete already settled its
+/// counters into the parents. The `stats_rollup_underflows` metric says a
+/// divergence happened and carries no ids; this says which partition and which
+/// segment, which is what an operator needs to act on it.
+fn settle_cleaned_segment(
+    stats: &PartitionStats,
+    namespace: IggyNamespace,
+    segment: &Segment,
+    messages_count: u64,
+) {
+    let size_shortfall = stats.decrement_size_bytes(segment.size.as_bytes_u64());
+    let segments_shortfall = stats.decrement_segments_count(1);
+    let messages_shortfall = stats.decrement_messages_count(messages_count);
+    if size_shortfall == 0 && segments_shortfall == 0 && messages_shortfall == 0 {
+        return;
+    }
+    warn!(
+        target: "iggy.partitions.diag",
+        plane = "partitions",
+        namespace_raw = namespace.inner(),
+        start_offset = segment.start_offset,
+        size_shortfall,
+        segments_shortfall,
+        messages_shortfall,
+        "segment cleanup gave back more than the partition counters held; the parent totals \
+         are now low by the shortfall until a rebuild or a restart"
+    );
 }
 
 /// Highest `end_offset` among the leading run of expired sealed segments, or

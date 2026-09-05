@@ -28,34 +28,75 @@ use tracing::warn;
 /// `parent >= sum(children)` somewhere upstream. The counters are unsigned, so
 /// without a clamp that subtraction wraps to ~1.8e19 and every reader
 /// (`get_stream`, `get_topic`, `/stats`, `/metrics`) serves the wrapped value
-/// until the process restarts. Clamping keeps the total merely low, which the
-/// next write corrects; this counter plus the `warn!` below is what tells an
-/// operator the divergence happened at all.
+/// until the process restarts.
+///
+/// Clamping trades that for a total that is merely low, and low is where it
+/// stays: increments are `fetch_add`, so every later write stacks on the
+/// clamped base and carries the shortfall with it. Only a rebuild
+/// (`rebuild_parent_totals`) or a restart puts the total back. This counter
+/// plus the `warn!` below is what tells an operator the divergence happened,
+/// and that the aggregate needs a rebuild rather than time.
 static ROLLUP_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic count of clamped rollup decrements. Surfaced on `/metrics` so the
 /// clamp is alertable rather than log-grep-able.
+///
+/// Hidden from the docs: `iggy_common` re-exports this module at its root, and
+/// a server-only diagnostic has no business in the published SDK surface.
+#[doc(hidden)]
 #[must_use]
 pub fn rollup_underflows() -> u64 {
     ROLLUP_UNDERFLOWS.load(Ordering::Relaxed)
 }
 
-fn report_rollup_underflow(scope: &'static str, counter: &'static str, shortfall: u64) {
-    let total = ROLLUP_UNDERFLOWS.fetch_add(1, Ordering::Relaxed) + 1;
-    // One line for the first, then at powers of two. A skewed tree emits up to
-    // three of these per counter per rollback, and a bulk delete would turn a
-    // diagnostic into a log flood that buries the first one. The counter above
-    // stays exact, and it is what an alert reads.
-    if total.is_power_of_two() {
-        warn!(
+/// One scope/counter pair's clamp state: the labels an operator reads, plus the
+/// count the log throttle keys on.
+struct UnderflowSite {
+    scope: &'static str,
+    counter: &'static str,
+    clamped: AtomicU64,
+}
+
+impl UnderflowSite {
+    const fn new(scope: &'static str, counter: &'static str) -> Self {
+        Self {
             scope,
             counter,
-            shortfall,
-            total,
-            "rollup decrement exceeded the total it was subtracted from; clamped at zero"
-        );
+            clamped: AtomicU64::new(0),
+        }
+    }
+
+    /// Count the clamp globally, then log this pair's first and every power of
+    /// two after it.
+    ///
+    /// The throttle is per pair, not global: a skewed tree emits up to three
+    /// lines per counter per rollback and a bulk delete turns that into a
+    /// flood, so a shared count would hold a quiet pair's first-ever
+    /// divergence back for up to 1023 events behind a noisy one.
+    fn report(&self, shortfall: u64) {
+        ROLLUP_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+        let clamped = self.clamped.fetch_add(1, Ordering::Relaxed) + 1;
+        if clamped.is_power_of_two() {
+            warn!(
+                scope = self.scope,
+                counter = self.counter,
+                shortfall,
+                clamped,
+                "rollup decrement exceeded the total it was subtracted from; clamped at zero"
+            );
+        }
     }
 }
+
+static STREAM_SIZE_BYTES: UnderflowSite = UnderflowSite::new("stream", "size_bytes");
+static STREAM_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("stream", "messages_count");
+static STREAM_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("stream", "segments_count");
+static TOPIC_SIZE_BYTES: UnderflowSite = UnderflowSite::new("topic", "size_bytes");
+static TOPIC_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("topic", "messages_count");
+static TOPIC_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("topic", "segments_count");
+static PARTITION_SIZE_BYTES: UnderflowSite = UnderflowSite::new("partition", "size_bytes");
+static PARTITION_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("partition", "messages_count");
+static PARTITION_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("partition", "segments_count");
 
 /// Subtract `amount`, clamping at zero instead of wrapping. Returns what was
 /// actually taken, which is what the caller passes on to its parent.
@@ -64,41 +105,24 @@ fn report_rollup_underflow(scope: &'static str, counter: &'static str, shortfall
 /// written from the metadata shard and from whichever shard owns the partition,
 /// so a separate load leaves a window where the clamp reads one value and
 /// subtracts from another.
-fn clamped_sub_u64(
-    counter: &AtomicU64,
-    amount: u64,
-    scope: &'static str,
-    name: &'static str,
-) -> u64 {
-    // The closure always yields `Some`, so `Err` carries the same previous
-    // value `Ok` would; recovering it keeps the result exact either way.
-    let previous = counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            Some(current.saturating_sub(amount))
-        })
-        .unwrap_or_else(|previous| previous);
-    if previous < amount {
-        report_rollup_underflow(scope, name, amount - previous);
-    }
-    previous.min(amount)
+macro_rules! clamped_sub {
+    ($name:ident, $counter:ty, $amount:ty) => {
+        fn $name(counter: &$counter, amount: $amount, site: &'static UnderflowSite) -> $amount {
+            let previous = counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(amount))
+                })
+                .unwrap_or_else(|previous| previous);
+            if previous < amount {
+                site.report(u64::from(amount - previous));
+            }
+            previous.min(amount)
+        }
+    };
 }
 
-fn clamped_sub_u32(
-    counter: &AtomicU32,
-    amount: u32,
-    scope: &'static str,
-    name: &'static str,
-) -> u32 {
-    let previous = counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            Some(current.saturating_sub(amount))
-        })
-        .unwrap_or_else(|previous| previous);
-    if previous < amount {
-        report_rollup_underflow(scope, name, u64::from(amount - previous));
-    }
-    previous.min(amount)
-}
+clamped_sub!(clamped_sub_u64, AtomicU64, u64);
+clamped_sub!(clamped_sub_u32, AtomicU32, u32);
 
 #[derive(Default, Debug)]
 pub struct StreamStats {
@@ -122,26 +146,21 @@ impl StreamStats {
             .fetch_add(segments_count, Ordering::AcqRel);
     }
 
-    pub fn decrement_size_bytes(&self, size_bytes: u64) {
-        let _ = clamped_sub_u64(&self.size_bytes, size_bytes, "stream", "size_bytes");
+    /// Returns the shortfall -- how much of `size_bytes` this counter did not
+    /// hold -- so a caller that knows the ids can name where the divergence is.
+    /// Zero whenever the decrement was covered.
+    pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
+        size_bytes - clamped_sub_u64(&self.size_bytes, size_bytes, &STREAM_SIZE_BYTES)
     }
 
-    pub fn decrement_messages_count(&self, messages_count: u64) {
-        let _ = clamped_sub_u64(
-            &self.messages_count,
-            messages_count,
-            "stream",
-            "messages_count",
-        );
+    pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
+        messages_count
+            - clamped_sub_u64(&self.messages_count, messages_count, &STREAM_MESSAGES_COUNT)
     }
 
-    pub fn decrement_segments_count(&self, segments_count: u32) {
-        let _ = clamped_sub_u32(
-            &self.segments_count,
-            segments_count,
-            "stream",
-            "segments_count",
-        );
+    pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
+        segments_count
+            - clamped_sub_u32(&self.segments_count, segments_count, &STREAM_SEGMENTS_COUNT)
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -257,29 +276,26 @@ impl TopicStats {
     // this subtree, so the ancestors do not hold them either -- passing the
     // full amount up would take them out of a sibling's live data instead.
     // Under `parent == sum(children)` the two are equal and nothing changes.
-    pub fn decrement_size_bytes(&self, size_bytes: u64) {
-        let taken = clamped_sub_u64(&self.size_bytes, size_bytes, "topic", "size_bytes");
+    //
+    // Each returns this level's shortfall -- how much of the amount it did not
+    // hold, zero when the decrement was covered -- so a caller that knows the
+    // ids can name where the divergence is.
+    pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
+        let taken = clamped_sub_u64(&self.size_bytes, size_bytes, &TOPIC_SIZE_BYTES);
         self.decrement_parent_size_bytes(taken);
+        size_bytes - taken
     }
 
-    pub fn decrement_messages_count(&self, messages_count: u64) {
-        let taken = clamped_sub_u64(
-            &self.messages_count,
-            messages_count,
-            "topic",
-            "messages_count",
-        );
+    pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
+        let taken = clamped_sub_u64(&self.messages_count, messages_count, &TOPIC_MESSAGES_COUNT);
         self.decrement_parent_messages_count(taken);
+        messages_count - taken
     }
 
-    pub fn decrement_segments_count(&self, segments_count: u32) {
-        let taken = clamped_sub_u32(
-            &self.segments_count,
-            segments_count,
-            "topic",
-            "segments_count",
-        );
+    pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
+        let taken = clamped_sub_u32(&self.segments_count, segments_count, &TOPIC_SEGMENTS_COUNT);
         self.decrement_parent_segments_count(taken);
+        segments_count - taken
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -388,29 +404,34 @@ impl PartitionStats {
     // this subtree, so the ancestors do not hold them either -- passing the
     // full amount up would take them out of a sibling's live data instead.
     // Under `parent == sum(children)` the two are equal and nothing changes.
-    pub fn decrement_size_bytes(&self, size_bytes: u64) {
-        let taken = clamped_sub_u64(&self.size_bytes, size_bytes, "partition", "size_bytes");
+    //
+    // Each returns this level's shortfall -- how much of the amount it did not
+    // hold, zero when the decrement was covered -- so a caller that knows the
+    // ids can name where the divergence is.
+    pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
+        let taken = clamped_sub_u64(&self.size_bytes, size_bytes, &PARTITION_SIZE_BYTES);
         self.decrement_parent_size_bytes(taken);
+        size_bytes - taken
     }
 
-    pub fn decrement_messages_count(&self, messages_count: u64) {
+    pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
         let taken = clamped_sub_u64(
             &self.messages_count,
             messages_count,
-            "partition",
-            "messages_count",
+            &PARTITION_MESSAGES_COUNT,
         );
         self.decrement_parent_messages_count(taken);
+        messages_count - taken
     }
 
-    pub fn decrement_segments_count(&self, segments_count: u32) {
+    pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
         let taken = clamped_sub_u32(
             &self.segments_count,
             segments_count,
-            "partition",
-            "segments_count",
+            &PARTITION_SEGMENTS_COUNT,
         );
         self.decrement_parent_segments_count(taken);
+        segments_count - taken
     }
 
     pub fn decrement_parent_size_bytes(&self, size_bytes: u64) {

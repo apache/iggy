@@ -173,7 +173,7 @@ use futures::FutureExt;
 use iggy_common::{ConsumerGroupId, IggyTimestamp};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::Partition;
+use metadata::stm::stream::{Partition, StatsRegistry};
 use partitions::delete_persisted_offset;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -221,6 +221,12 @@ pub struct ReconcilerCtx {
     pub cluster_id: u128,
     pub self_replica_id: u8,
     pub replica_count: u8,
+    /// The shared per-entity stats registry, cloned once at construction. It is
+    /// minted during metadata bootstrap and never re-minted, and a topic delete
+    /// settles one namespace per partition, so reading it out of the STM per
+    /// teardown would open a reader epoch per partition for a clone that cannot
+    /// change.
+    stats_registry: Arc<StatsRegistry>,
     failure_state: RefCell<AHashMap<(IggyNamespace, FailureCause), FailureRecord>>,
     /// `Streams::revision` observed at the end of the last pass that fully
     /// converged. Paired with `last_pass_noop` for the fast-skip in
@@ -241,6 +247,12 @@ impl ReconcilerCtx {
         self_replica_id: u8,
         replica_count: u8,
     ) -> Self {
+        let stats_registry = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| Arc::clone(&inner.stats_registry));
         Self {
             shard,
             total_shards,
@@ -248,6 +260,7 @@ impl ReconcilerCtx {
             cluster_id,
             self_replica_id,
             replica_count,
+            stats_registry,
             failure_state: RefCell::new(AHashMap::new()),
             last_revision: Cell::new(None),
             last_pass_noop: Cell::new(false),
@@ -926,21 +939,16 @@ async fn tear_down_owned_partition(
     // on_replicate / on_ack frames that haven't observed the queued
     // tombstone yet. Idempotent on retry: already-tombstoned namespace
     // stays tombstoned; already-removed shards_table row is a no-op.
-    // Take the counters handle BEFORE the tombstone (every partition accessor
-    // is tombstone-gated) and settle it AFTER, once the tombstone has stopped
-    // new frames from resolving the partition. The metadata apply already
-    // rolled it out at commit time, so what is left here is whatever landed in
-    // the window between the two: in-flight appends adding to parents that
-    // outlive the partition, and a retention tick subtracting from counters the
-    // apply had already zeroed. A frame already past the gate can still land
-    // after this settle, which is why the rollback clamps rather than trusting
-    // the amount it is handed.
-    let live_stats = partitions.with_partition(&ns, |partition| Arc::clone(&partition.stats));
     if !partitions.is_tombstoned(&ns) {
         partitions.tombstone(ns);
     }
     shards_table.remove(&ns);
-    settle_partition_stats(ctx, ns, live_stats.as_ref());
+    // Registry entry only. The mounted partition's OWN counters are settled by
+    // the `ConfirmRemove` arm, which is the point where the partition value is
+    // dropped: a handler suspended mid-append resumes and increments through
+    // its cached handle, and anything settled before that drop leaves the
+    // increment in the parent totals with nothing left to roll it back.
+    settle_partition_stats(ctx, ns);
 
     if let Err(err) = delete_partitions_from_disk(
         ns.stream_id(),
@@ -1104,8 +1112,8 @@ struct TargetPartition {
     ns: IggyNamespace,
     /// The committed `created_revision`. Lets the pass detect a stale local
     /// incarnation after slab-key reuse without an `Arc<TopicStats>` clone per
-    /// partition; stats are fetched lazily in [`fetch_partition_stats`] only
-    /// for namespaces actually built.
+    /// partition: [`fetch_partition_build_inputs`] re-reads committed metadata
+    /// for the namespaces actually built, and takes the stats there.
     epoch: u64,
     /// The view a fresh materialisation seeds its consensus group with; see
     /// `build_partition_fresh`.
@@ -1146,35 +1154,21 @@ fn current_revision(ctx: &ReconcilerCtx) -> u64 {
         .read(|inner| inner.revision)
 }
 
-/// Roll a torn-down partition's counters out of its parent topic and stream,
-/// and drop its registry entry.
+/// Roll a torn-down partition out of its parent topic and stream by dropping
+/// its registry entry.
 ///
-/// Two handles, because they can differ. The registry entry is usually gone
-/// already (the metadata apply evicts it on the commit that acked the delete),
-/// but a stale incarnation being torn down after a slab-key reuse still has
-/// one, and it must not survive into the rebuild: `partition` is a
-/// get-or-create, so the rebuild would inherit the dead incarnation's counters
-/// and its `purged_generation`. `live` is the mounted partition's own handle,
-/// which is the only place the post-commit residue lives. When both name the
-/// same `Arc` the second zeroing rolls back 0.
-fn settle_partition_stats(
-    ctx: &ReconcilerCtx,
-    ns: IggyNamespace,
-    live: Option<&Arc<iggy_common::PartitionStats>>,
-) {
-    // Registry cloned out rather than mutated inside the read closure: the
-    // rollback cascades into parent totals, which the STM read has no part in.
-    let registry = ctx
-        .shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .read(|inner| Arc::clone(&inner.stats_registry));
-    registry.remove_partition(ns.stream_id(), ns.topic_id(), ns.partition_id());
-    if let Some(stats) = live {
-        stats.zero_out_all();
-    }
+/// Usually a no-op: the metadata apply evicts the entry on the commit that
+/// acked the delete. What is left for this call is a stale incarnation being
+/// torn down after a slab-key reuse, whose entry the apply never named. It must
+/// not survive into the rebuild -- `StatsRegistry::partition` is a
+/// get-or-create, so the rebuild would inherit the dead incarnation's counters.
+/// (Its `purged_generation` no longer rides along either way: a fresh entry
+/// seeds that gate from the committed partition.)
+///
+/// The mounted partition's own handle is settled later, on `ConfirmRemove`.
+fn settle_partition_stats(ctx: &ReconcilerCtx, ns: IggyNamespace) {
+    ctx.stats_registry
+        .remove_partitions(ns.stream_id(), ns.topic_id(), &[ns.partition_id()]);
 }
 
 /// Everything one namespace's build needs out of committed metadata: the shared
@@ -1214,7 +1208,7 @@ fn fetch_partition_build_inputs(
             inner.stats_registry.partition(
                 ns.stream_id(),
                 ns.topic_id(),
-                ns.partition_id(),
+                &partition,
                 topic.stats.clone(),
             ),
             iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options),
@@ -1931,6 +1925,58 @@ mod tests {
             stream_size(&ctx),
             0,
             "teardown must settle what landed after the commit that acked the delete"
+        );
+    }
+
+    /// The eviction half of the teardown settle, which the test above cannot
+    /// reach: there the metadata apply had already dropped the entry, so the
+    /// rollback came from the mounted partition's own handle. A stale
+    /// incarnation left by a slab-key reuse still holds an entry the apply
+    /// never named, and it has to go, or the rebuild's get-or-create inherits
+    /// the dead incarnation's counters.
+    #[compio::test]
+    async fn teardown_evicts_a_registry_entry_the_metadata_delete_never_named() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        reconcile_once(&ctx).await;
+        ctx.shard.apply_reconcile_ops();
+        let (stats, _, partition) =
+            fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        let topic_stats = stats.parent();
+
+        seed_delete_topic(&ctx.shard.plane.metadata().mux_stm, 3, 0, 0);
+        assert!(
+            registry(&ctx).partition_get(0, 0, 0).is_none(),
+            "the apply evicts the entry it named, which is what leaves this test something else \
+             to prove"
+        );
+        // The entry a stale incarnation carries into the teardown, counting
+        // into parents that outlive it. Minted here rather than left behind by
+        // a slab-key reuse, which no in-crate fixture can stage.
+        registry(&ctx)
+            .partition(0, 0, &partition, topic_stats)
+            .increment_size_bytes(100);
+        assert_eq!(stream_size(&ctx), 100);
+
+        reconcile_once(&ctx).await;
+        ctx.shard.apply_reconcile_ops();
+
+        assert!(
+            registry(&ctx).partition_get(0, 0, 0).is_none(),
+            "an entry surviving teardown hands the rebuild the dead incarnation's counters"
+        );
+        assert_eq!(
+            stream_size(&ctx),
+            0,
+            "and evicting without the rollback strands its bytes in the stream total"
         );
     }
 

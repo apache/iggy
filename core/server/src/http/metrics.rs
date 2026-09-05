@@ -48,12 +48,26 @@ pub(in crate::http) struct HttpMetrics {
     /// Not a legacy-parity metric: the running count of rollup decrements that
     /// had to be clamped at zero. Non-zero means a topic or stream total was
     /// asked to give back more than it held, so the aggregate it now reports is
-    /// low. Alert on any increase.
+    /// low, and stays low until a rebuild or a restart.
+    ///
+    /// Not "alert on any increase". A delete, a purge, a partition teardown and
+    /// a snapshot restore each open a window where a retention pass hands back
+    /// bytes the parents have already given up, and the clamp is the intended
+    /// outcome there -- the `given_a_late_decrement_on_a_rolled_back_partition`
+    /// unit test in `iggy_common::streaming_stats` drives exactly that. What is
+    /// worth paging on is a bounded rate OUTSIDE those windows: that is the
+    /// shape that says the tree is diverging rather than settling.
     ///
     /// A `Counter`, not a `Gauge`: it only ever climbs within a process, so
     /// `rate()` and `increase()` are the queries an operator wants, and both are
     /// counter-only. The scrape handler samples the source and advances this by
     /// the difference, which is why the source is monotonic per process.
+    ///
+    /// Advanced only by the `/metrics` scrape, so it needs `http.enabled` and
+    /// `http.metrics.enabled` -- as does every other series in this registry,
+    /// which is the only Prometheus surface the server has. A TCP-only or
+    /// QUIC-only deployment exports nothing, and the per-scope `warn!` in
+    /// `iggy_common` is the whole signal there.
     stats_rollup_underflows: Counter,
 }
 

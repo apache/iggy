@@ -408,10 +408,13 @@ impl Stream {
 ///   current batch's `absorb_first` (0.11.8 `write.rs`), which is an
 ///   implementation detail, not a contract.
 ///
-/// Independently of both, `fetch_partition_stats` refuses to register a
-/// partition the committed topic does not list, which is what closes the live
-/// route: a get-or-create from the reconciler cannot resurrect an entry the
-/// first apply evicted.
+/// Narrowing both, `fetch_partition_build_inputs` refuses to register a
+/// partition the committed topic does not list. It does not close the window:
+/// the check reads the left-right READ side, and the eviction lands in
+/// `absorb_first` on the write side, so a get-or-create between that apply and
+/// the next `publish()` still sees the partition listed and can mint the entry
+/// back. What it does buy is that the resurrected entry carries an id the
+/// evicting op named, so the deferred `absorb_second` run evicts it again.
 #[derive(Debug, Default)]
 pub struct StatsRegistry {
     streams: std::sync::Mutex<AHashMap<usize, Arc<StreamStats>>>,
@@ -432,6 +435,14 @@ struct PartitionEntry {
     /// purge acked. Counters are shared side state (one `Arc` across buffers),
     /// so an ungated second reset would wipe messages sent since the purge.
     purged_generation: u64,
+    /// The committed [`Partition::created_revision`] these counters belong to.
+    ///
+    /// Slab keys are recycled, so the key alone does not say WHICH partition an
+    /// entry counts. [`StatsRegistry::retain_from_snapshot`] is where that
+    /// matters: a donor that recycled a key would otherwise leave the receiver
+    /// holding the dead occupant's counters, and `rebuild_parent_totals` then
+    /// makes them the topic and stream totals.
+    created_revision: u64,
 }
 
 impl StatsRegistry {
@@ -463,22 +474,30 @@ impl StatsRegistry {
     /// reads the same `Arc`, so partition-plane counters are visible
     /// cross-shard without a gather.
     ///
+    /// Takes the committed record rather than a bare id, because a fresh entry
+    /// has to inherit two things from it. `created_revision` is the identity
+    /// `retain_from_snapshot` compares against. `purge_generation` is
+    /// the reset gate: mint it at 0 and a purge that committed while this
+    /// partition was torn down and rebuilt still counts as pending, so its
+    /// deferred second-buffer apply wipes everything appended since.
+    ///
     /// # Panics
     /// If the registry mutex is poisoned.
     pub fn partition(
         &self,
         stream_id: usize,
         topic_id: usize,
-        partition_id: usize,
+        partition: &Partition,
         parent: Arc<TopicStats>,
     ) -> Arc<PartitionStats> {
         self.partitions
             .lock()
             .expect("stats registry mutex poisoned")
-            .entry((stream_id, topic_id, partition_id))
+            .entry((stream_id, topic_id, partition.id))
             .or_insert_with(|| PartitionEntry {
                 stats: Arc::new(PartitionStats::new(parent)),
-                purged_generation: 0,
+                purged_generation: partition.purge_generation,
+                created_revision: partition.created_revision,
             })
             .stats
             .clone()
@@ -543,6 +562,7 @@ impl StatsRegistry {
                     .or_insert_with(|| PartitionEntry {
                         stats: Arc::new(PartitionStats::new(Arc::clone(parent))),
                         purged_generation: 0,
+                        created_revision: partition.created_revision,
                     });
                 if entry.purged_generation >= partition.purge_generation {
                     continue;
@@ -562,26 +582,44 @@ impl StatsRegistry {
     /// there is no parent total that owes the dropped counters back, and both
     /// readers (`get_stats`, the `/metrics` gauges) reach stream totals by
     /// walking the live streams, which this one has already left.
-    fn remove_stream(&self, id: usize) {
+    ///
+    /// Keyed off the committed tree the caller still holds, not a predicate
+    /// sweep: every entry in the three maps was inserted under ids taken from
+    /// that tree, so walking it names all of them, and a `retain` would instead
+    /// walk every entry on the node per deleted stream.
+    fn remove_stream(&self, id: usize, stream: &Stream) {
         self.streams
             .lock()
             .expect("stats registry mutex poisoned")
             .remove(&id);
-        self.topics
-            .lock()
-            .expect("stats registry mutex poisoned")
-            .retain(|(stream_id, _), _| *stream_id != id);
-        self.partitions
-            .lock()
-            .expect("stats registry mutex poisoned")
-            .retain(|(stream_id, _, _), _| *stream_id != id);
+        {
+            let mut partitions = self
+                .partitions
+                .lock()
+                .expect("stats registry mutex poisoned");
+            for (topic_id, topic) in &stream.topics {
+                for partition in &topic.partitions {
+                    partitions.remove(&(id, topic_id, partition.id));
+                }
+            }
+        }
+        {
+            let mut topics = self.topics.lock().expect("stats registry mutex poisoned");
+            for (topic_id, _) in &stream.topics {
+                topics.remove(&(id, topic_id));
+            }
+        }
     }
 
-    fn remove_topic(&self, stream_id: usize, topic_id: usize) {
+    /// Roll a deleted topic out of its stream and drop every entry under it.
+    ///
+    /// `partition_ids` comes off the committed topic the caller is about to
+    /// drop. Keyed, not swept: see [`Self::remove_partitions`].
+    fn remove_topic(&self, stream_id: usize, topic_id: usize, partition_ids: &[usize]) {
         // Partitions first: each one's rollback cascades through its parent
         // topic into the stream, so zeroing the topic ahead of them would
         // subtract the same bytes from the stream twice.
-        self.remove_partitions_where(|(sid, tid, _)| *sid == stream_id && *tid == topic_id);
+        self.remove_partitions(stream_id, topic_id, partition_ids);
         let topic = self
             .topics
             .lock()
@@ -599,12 +637,22 @@ impl StatsRegistry {
 
     /// Roll the named partitions out of their parents and drop their entries.
     ///
+    /// Both halves are load-bearing. A partition reports by incrementing its
+    /// parents through the `Arc`, so evicting alone strands what it contributed
+    /// in the topic and stream totals. And zeroing alone leaves an entry that
+    /// outlives its ids: a topic's slab key is recycled by the next
+    /// `create_topic`, and `DeletePartitions` truncates the tail so the next
+    /// `CreatePartitions` mints the freed ids again.
+    ///
     /// Ids, never positions. `DeletePartitions` truncates the tail of a `Vec`,
     /// and a count-based predicate (`id >= retained`) only picks the same set
     /// while ids happen to be dense; when they are not it evicts and zeroes a
     /// SURVIVING partition, which strips its bytes from the parents and resets
     /// the offset its clients store against.
-    fn remove_partitions(&self, stream_id: usize, topic_id: usize, removed_ids: &[usize]) {
+    ///
+    /// # Panics
+    /// If the registry mutex is poisoned.
+    pub fn remove_partitions(&self, stream_id: usize, topic_id: usize, removed_ids: &[usize]) {
         // Keyed removes, not a predicate: the ids are known, and a predicate
         // makes the map walk every entry on the node to drop a handful of them.
         // Bulk deletes call this per topic, so that walk squares.
@@ -626,63 +674,6 @@ impl StatsRegistry {
         }
     }
 
-    /// Drop every partition entry `should_drop` selects, rolling each one's
-    /// counters out of its parent topic and stream on the way.
-    ///
-    /// Both halves are load-bearing. A partition reports by incrementing its
-    /// parents through the `Arc`, so evicting alone strands what it contributed
-    /// in the topic and stream totals. And zeroing alone leaves an entry that
-    /// outlives its ids: a topic's slab key is recycled by the next
-    /// `create_topic`, and `DeletePartitions` truncates the tail so the next
-    /// `CreatePartitions` mints the freed ids again. The survivor would hand
-    /// its successor both its counters and its `purged_generation`, and that
-    /// stale generation makes the next purge's gate skip the reset.
-    ///
-    /// # Panics
-    /// If the registry mutex is poisoned.
-    fn remove_partitions_where(&self, should_drop: impl Fn(&(usize, usize, usize)) -> bool) {
-        let dropped: Vec<Arc<PartitionStats>> = {
-            let mut entries = self
-                .partitions
-                .lock()
-                .expect("stats registry mutex poisoned");
-            let mut dropped = Vec::new();
-            entries.retain(|key, entry| {
-                if should_drop(key) {
-                    dropped.push(Arc::clone(&entry.stats));
-                    return false;
-                }
-                true
-            });
-            dropped
-        };
-        // Guard released first: the rollback cascades into parent totals, which
-        // the partition map has no part in.
-        for stats in dropped {
-            stats.zero_out_all();
-        }
-    }
-
-    /// Roll one partition out of its parents and drop its entry.
-    ///
-    /// For the reconciler's owned-partition teardown. It tombstones the
-    /// namespace first, which stops any NEW frame from resolving the partition;
-    /// a frame already past that gate can still finish and touch the counters
-    /// afterwards, so this settles the bulk rather than closing the window. The
-    /// clamped rollback keeps that remainder from being taken out of a
-    /// sibling's data.
-    ///
-    /// The metadata apply has usually evicted the entry already, in which case
-    /// this is a no-op and the caller's own handle carries whatever landed
-    /// after; a stale incarnation being torn down after a slab-key reuse still
-    /// has its entry, and it must not survive into the rebuild.
-    ///
-    /// # Panics
-    /// If the registry mutex is poisoned.
-    pub fn remove_partition(&self, stream_id: usize, topic_id: usize, partition_id: usize) {
-        self.remove_partitions(stream_id, topic_id, &[partition_id]);
-    }
-
     /// Drop every entry the snapshot does not describe, keeping the rest.
     ///
     /// Used by the in-place restore (state transfer), which replaces the whole
@@ -691,18 +682,29 @@ impl StatsRegistry {
     /// or every already-materialized partition reads (0,0,0,0) forever. Slab
     /// keys are recycled, so anything the snapshot dropped has to go with it.
     ///
+    /// A partition key is kept only when the snapshot's `created_revision`
+    /// matches the entry's. The key alone says nothing about identity: behind a
+    /// donor that deleted and re-created a partition into the same slot, a
+    /// key-only retain hands the new occupant the dead one's counters, and
+    /// [`Self::rebuild_parent_totals`] then makes them the topic and stream
+    /// totals. Dropping the mismatch instead costs one re-registration by the
+    /// reconciler, which folds the on-disk delta back in.
+    ///
     /// # Panics
     /// If the registry mutex is poisoned.
     fn retain_from_snapshot(&self, snapshot: &StreamsSnapshot) {
         let mut live_streams: AHashSet<usize> = AHashSet::new();
         let mut live_topics: AHashSet<(usize, usize)> = AHashSet::new();
-        let mut live_partitions: AHashSet<(usize, usize, usize)> = AHashSet::new();
+        let mut live_partitions: AHashMap<(usize, usize, usize), u64> = AHashMap::new();
         for (stream_key, stream) in &snapshot.items {
             live_streams.insert(*stream_key);
             for (topic_key, topic) in &stream.topics {
                 live_topics.insert((*stream_key, *topic_key));
                 for partition in &topic.partitions {
-                    live_partitions.insert((*stream_key, *topic_key, partition.id));
+                    live_partitions.insert(
+                        (*stream_key, *topic_key, partition.id),
+                        partition.created_revision,
+                    );
                 }
             }
         }
@@ -717,7 +719,11 @@ impl StatsRegistry {
         self.partitions
             .lock()
             .expect("stats registry mutex poisoned")
-            .retain(|key, _| live_partitions.contains(key));
+            .retain(|key, entry| {
+                live_partitions
+                    .get(key)
+                    .is_some_and(|created_revision| *created_revision == entry.created_revision)
+            });
     }
 
     /// Recompute every topic and stream total as the sum of the partition
@@ -1914,10 +1920,11 @@ impl StateHandler for DeleteStreamRequest {
             return ApplyReply::err(DeleteStreamResult::StreamNotFound);
         };
         let name = stream.name.clone();
+        // Evict registry entries so a reused slab id starts with fresh stats.
+        // Before the removal: the committed tree is what names the entries.
+        state.stats_registry.remove_stream(stream_id, stream);
         state.items.remove(stream_id);
         state.index.remove(&name);
-        // Evict registry entries so a reused slab id starts with fresh stats.
-        state.stats_registry.remove_stream(stream_id);
         state.revision = state.revision.wrapping_add(1);
         // The dropped stream may have held groups with pending revocations.
         state.recompute_pending_revocations_count();
@@ -2231,11 +2238,20 @@ impl StateHandler for DeleteTopicRequest {
             return ApplyReply::err(DeleteTopicResult::TopicNotFound);
         };
         let name = topic.name.clone();
+        // Read the ids off the committed topic before it goes: they are what
+        // names its registry entries.
+        let partition_ids: Vec<usize> = topic
+            .partitions
+            .iter()
+            .map(|partition| partition.id)
+            .collect();
         stream.topics.remove(topic_id);
         stream.topic_index.remove(&name);
         // Roll the topic and its partitions out of the stream total and evict
         // their entries, so a reused slab id starts from zero.
-        state.stats_registry.remove_topic(stream_id, topic_id);
+        state
+            .stats_registry
+            .remove_topic(stream_id, topic_id, &partition_ids);
         state.revision = state.revision.wrapping_add(1);
         // The dropped topic may have held groups with pending revocations.
         state.recompute_pending_revocations_count();
@@ -2531,7 +2547,22 @@ impl Snapshotable for Streams {
         // Boot: no live registry exists yet, so mint one. Safe because
         // `new_from_empty` clones this single inner onto the other left-right
         // buffer rather than building a second one.
-        Ok(StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default())).into())
+        let inner = StreamsInner::inner_from_snapshot(snapshot, Arc::new(StatsRegistry::default()));
+        // Drop the checkpoint's aggregates here, BEFORE journal replay runs over
+        // this state machine. Boot rebuilds every counter from disk (each shard
+        // folds its `load_partition` deltas in), so the stored totals are never
+        // authoritative -- and a checkpoint reads a stream's total and its
+        // topics' as separate loads while the partition plane keeps counting, so
+        // they can disagree in either direction. Left in place, a replayed
+        // `DeleteTopic` over that torn shape rolls the topic back against a
+        // stream that never held it, clamps, and raises the rollup-underflow
+        // alarm on every boot with no real divergence behind it.
+        //
+        // The registry is empty here, so this stores zero at both levels; it is
+        // the same walk state transfer uses, which is why there is no second
+        // spelling of it.
+        inner.stats_registry.rebuild_parent_totals(&inner.items);
+        Ok(inner.into())
     }
 }
 
@@ -3612,8 +3643,18 @@ mod tests {
         };
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
         let topic_stats = inner.items[0].topics[0].stats.clone();
-        let survivor = inner.stats_registry.partition(0, 0, 3, topic_stats.clone());
-        let removed = inner.stats_registry.partition(0, 0, 4, topic_stats);
+        let survivor = inner.stats_registry.partition(
+            0,
+            0,
+            &committed_partition(&inner, 0, 0, 3),
+            topic_stats.clone(),
+        );
+        let removed = inner.stats_registry.partition(
+            0,
+            0,
+            &committed_partition(&inner, 0, 0, 4),
+            topic_stats,
+        );
         survivor.increment_size_bytes(512);
         survivor.set_current_offset(42);
         removed.increment_size_bytes(64);
@@ -3688,7 +3729,12 @@ mod tests {
         );
 
         let topic_stats = inner.items[0].topics[0].stats.clone();
-        let stats = inner.stats_registry.partition(0, 0, 0, topic_stats);
+        let stats = inner.stats_registry.partition(
+            0,
+            0,
+            &committed_partition(&inner, 0, 0, 0),
+            topic_stats,
+        );
         stats.increment_size_bytes(512);
 
         let _ = StateHandler::apply(&purge, &mut inner, IggyTimestamp::now());
@@ -3720,9 +3766,12 @@ mod tests {
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
         let topic_stats = inner.items[0].topics[0].stats.clone();
         for partition_id in 0..4 {
-            let stats = inner
-                .stats_registry
-                .partition(0, 0, partition_id, topic_stats.clone());
+            let stats = inner.stats_registry.partition(
+                0,
+                0,
+                &committed_partition(&inner, 0, 0, partition_id),
+                topic_stats.clone(),
+            );
             stats.increment_size_bytes(512);
             stats.increment_messages_count(7);
             stats.increment_segments_count(1);
@@ -3805,7 +3854,12 @@ mod tests {
         };
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
         let second_topic_stats = inner.items[0].topics[1].stats.clone();
-        inner.stats_registry.partition(0, 1, 0, second_topic_stats);
+        inner.stats_registry.partition(
+            0,
+            1,
+            &committed_partition(&inner, 0, 1, 0),
+            second_topic_stats,
+        );
 
         let counters: Vec<Arc<PartitionStats>> = (0..2)
             .map(|topic_id| {
@@ -3914,7 +3968,12 @@ mod tests {
         // The data plane materializes the partition afterwards and counts what
         // it plants; the purge must not have invented a segment for it.
         let topic_stats = inner.items[0].topics[0].stats.clone();
-        let stats = inner.stats_registry.partition(0, 0, 0, topic_stats);
+        let stats = inner.stats_registry.partition(
+            0,
+            0,
+            &committed_partition(&inner, 0, 0, 0),
+            topic_stats,
+        );
         assert_eq!(stats.segments_count_inconsistent(), 0);
         stats.increment_segments_count(1);
         stats.increment_messages_count(5);
@@ -4019,8 +4078,69 @@ mod tests {
         };
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
         let topic_stats = inner.items[0].topics[0].stats.clone();
-        inner.stats_registry.partition(0, 0, 0, topic_stats);
         inner
+            .stats_registry
+            .partition(0, 0, &committed_partition(&inner, 0, 0, 0), topic_stats);
+        inner
+    }
+
+    /// The committed record for one partition, which is what the registry keys
+    /// its entry's identity and purge gate off.
+    fn committed_partition(
+        inner: &StreamsInner,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> Partition {
+        inner.items[stream_id].topics[topic_id]
+            .partitions
+            .iter()
+            .find(|partition| partition.id == partition_id)
+            .expect("committed partition")
+            .clone()
+    }
+
+    /// A checkpoint reads a stream's total and each of its topics' as separate
+    /// loads while the partition plane keeps counting, so the two can disagree
+    /// in either direction. The boot restore drops both levels, and drops them
+    /// before journal replay runs: a replayed `DeleteTopic` over the surviving
+    /// residue rolls a topic back against a stream that never held it, clamps,
+    /// and raises the underflow alarm on every boot after.
+    #[test]
+    fn given_a_torn_checkpoint_when_restoring_at_boot_should_drop_both_levels() {
+        let mut snapshot = Streams::from(inner_with_registered_partition()).to_snapshot();
+        // Topics summing above their stream is the torn shape: the stream was
+        // read first, and the topic kept counting before its own read.
+        snapshot.items[0].1.stats = StatsSnapshot {
+            size_bytes: 100,
+            messages_count: 1,
+            segments_count: 1,
+        };
+        snapshot.items[0].1.topics[0].1.stats = StatsSnapshot {
+            size_bytes: 200,
+            messages_count: 2,
+            segments_count: 2,
+        };
+
+        let restored = Streams::from_snapshot(snapshot).expect("snapshot restore");
+
+        let (stream_size, stream_messages, stream_segments, topic_size) = restored.read(|inner| {
+            let stream = inner.items.get(0).expect("restored stream");
+            let topic = stream.topics.get(0).expect("restored topic");
+            (
+                stream.stats.size_bytes_inconsistent(),
+                stream.stats.messages_count_inconsistent(),
+                stream.stats.segments_count_inconsistent(),
+                topic.stats.size_bytes_inconsistent(),
+            )
+        });
+        assert_eq!(topic_size, 0);
+        assert_eq!(
+            stream_size, 0,
+            "the stream total is snapshotted independently of its topics, so it has to go too"
+        );
+        assert_eq!(stream_messages, 0);
+        assert_eq!(stream_segments, 0);
     }
 
     // The restore command is absorbed on BOTH left-right buffers. Minting a
