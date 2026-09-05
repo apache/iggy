@@ -33,7 +33,7 @@ use deps::SimClock;
 use deps::SimSuperblock;
 use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
-use iggy_binary_protocol::{Command, GenericHeader, ReplyHeader};
+use iggy_binary_protocol::{Command, GenericHeader, PrepareHeader, ReplyHeader};
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use metadata::impls::metadata::StreamsFrontend;
@@ -930,6 +930,19 @@ impl Simulator {
             }
             for shard in &replica.shards {
                 let pending = shard.inbox_len();
+                // A fenced pump has exited, so its frames pile up exactly as a
+                // missed wake does. Reported apart: the fix is a failed commit,
+                // not a channel bug.
+                assert!(
+                    pending == 0 || shard.fenced_partition_fault().is_none(),
+                    "fenced pump: replica {replica_id} shard {} holds {pending} frame(s) at \
+                     quiescence because its pump exited on a fatal commit ({:?}). Not a lost \
+                     wakeup; fix the commit failure (seed {:#x}, schedule hash {:#x})",
+                    shard.id,
+                    shard.fenced_partition_fault(),
+                    self.seed,
+                    self.executor.schedule_hash(),
+                );
                 assert_eq!(
                     pending,
                     0,
@@ -1317,6 +1330,24 @@ impl Simulator {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
         let partition = shard.plane.partitions().get_by_ns(&namespace)?;
         Some(partition.offsets())
+    }
+
+    /// A replica's journaled partition-plane prepare header at `op`, or `None` when
+    /// it does not host the namespace or no longer holds the entry.
+    ///
+    /// Absence is ordinary, unlike on the metadata plane: the partition journal
+    /// evicts its committed prefix as it flushes to segments. The quiesce oracle
+    /// compares only the ops two replicas both still hold.
+    #[must_use]
+    pub(crate) fn partition_journaled_header(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+        op: u64,
+    ) -> Option<PrepareHeader> {
+        let shard = self.replicas[replica_idx].partition_shard(namespace);
+        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        partition.log.journal().inner.header_by_op(op)
     }
 
     /// Consensus view for a replica's partition-plane group, or `None` if that

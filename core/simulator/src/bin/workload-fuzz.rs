@@ -562,9 +562,11 @@ fn run_quiesce_phase(
     };
     println!(
         "quiesced and converged (leader-relative; entity oracle: {entity_oracle}; \
-         evictions={}; ops_compared={} replicas_compared={} namespaces_checked={})",
+         evictions={}; ops_compared={} partition_ops_compared={} replicas_compared={} \
+         namespaces_checked={})",
         workload.evictions(),
         convergence.ops_compared,
+        convergence.partition_ops_compared,
         convergence.replicas_compared,
         convergence.namespaces_checked,
     );
@@ -574,13 +576,17 @@ fn run_quiesce_phase(
          proved nothing about entity state (seed={seed:#x})"
     );
     let live = usize::from(replicas) - sim.crashed.len();
+    // Either plane satisfies it: a partition-plane run commits almost no metadata,
+    // so the metadata count alone called every such run vacuous.
+    let compared = convergence.ops_compared + convergence.partition_ops_compared;
     assert!(
-        args.min_ops_compared == 0 || live < 2 || convergence.ops_compared >= args.min_ops_compared,
-        "--min-ops-compared {}: {live} replicas live but only {} op(s) witnessed \
-         by more than one, so cross-replica agreement went untested \
-         (seed={seed:#x})",
+        args.min_ops_compared == 0 || live < 2 || compared >= args.min_ops_compared,
+        "--min-ops-compared {}: {live} replicas live but only {compared} op(s) witnessed \
+         by more than one ({} metadata, {} partition), so cross-replica agreement went \
+         untested (seed={seed:#x})",
         args.min_ops_compared,
         convergence.ops_compared,
+        convergence.partition_ops_compared,
     );
     // Again after the drain: the drain both answers outstanding requests and
     // issues its own resends, so the pre-drain numbers are not the final ones.

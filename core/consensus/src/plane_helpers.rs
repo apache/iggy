@@ -435,8 +435,14 @@ where
 
 /// Drain and return committable prepares from the pipeline head.
 ///
-/// Entries are drained only from the head and only while their op is covered
-/// by the current commit frontier.
+/// Entries are drained from the head, while covered by the commit frontier, and
+/// only as a contiguous run starting at the next op owed to the state machine.
+///
+/// Callers `advance_commit_min` per entry, so a run starting above
+/// `commit_min + 1` or breaking partway hits that counter's sequential-advance
+/// assert. Pipeline-side twin of `commit_journal`'s gap-stop, and a backstop
+/// only: reaching it means committing over a hole coverage should have caught.
+/// Loud in debug and the simulator, hold-and-repair in release.
 ///
 /// # Panics
 /// If `head()` returns `Some` but `pop()` returns `None` (unreachable).
@@ -446,11 +452,31 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
+    let commit_min = consensus.commit_min();
+    let replica = consensus.replica();
     let mut drained = Vec::new();
 
     consensus.with_pipeline_mut(|pipeline| {
+        let mut next = commit_min + 1;
         while let Some(head_op) = pipeline.head().map(|entry| entry.header.op) {
             if head_op > commit {
+                break;
+            }
+            if head_op != next {
+                debug_assert_eq!(
+                    head_op, next,
+                    "pipeline head must be the next op owed to the state machine"
+                );
+                tracing::error!(
+                    replica,
+                    head_op,
+                    expected_op = next,
+                    commit_min,
+                    commit_max = commit,
+                    drained = drained.len(),
+                    "committable head sits above a hole in the committed prefix; holding the \
+                     commit walk until repair refills it"
+                );
                 break;
             }
 
@@ -458,6 +484,7 @@ where
                 .pop()
                 .expect("drain_committable_prefix: head exists");
             drained.push(entry);
+            next += 1;
         }
     });
 
@@ -473,7 +500,8 @@ where
     drained
 }
 
-/// Header of the pipeline head, iff its op is covered by the commit frontier.
+/// Header of the pipeline head, iff its op is the next one this replica owes its
+/// state machine and is covered by the commit frontier.
 ///
 /// Peek-only counterpart of [`drain_committable_prefix`] for commit paths that
 /// must survive their driving future being canceled between "committable" and
@@ -482,15 +510,37 @@ where
 /// revalidates that the head is still this exact entry before popping and
 /// applying it. A driver dropped at an await strands nothing; a sibling driver
 /// that committed the op first fails the caller's revalidation and re-peeks.
+///
+/// Bounded below for the reason [`drain_committable_prefix`] is, and stalls rather
+/// than panicking for the same one: a shard pump's panic is swallowed by
+/// `compio::runtime::spawn`, while `tick_metadata` re-arms repair on the level.
 pub fn peek_committable_head<B, P>(consensus: &VsrConsensus<B, P>) -> Option<PrepareHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
 {
     let commit = consensus.commit_max();
-    consensus
+    let next = consensus.commit_min() + 1;
+    let head = consensus
         .pipeline_head_header()
-        .filter(|header| header.op <= commit)
+        .filter(|header| header.op <= commit)?;
+    if head.op != next {
+        // Unreachable in debug and the simulator; release reports and waits.
+        debug_assert_eq!(
+            head.op, next,
+            "pipeline head must be the next op owed to the state machine"
+        );
+        tracing::error!(
+            replica = consensus.replica(),
+            head_op = head.op,
+            commit_min = consensus.commit_min(),
+            commit_max = commit,
+            "committable head sits above a hole in the committed prefix; holding the \
+             commit walk until repair refills it"
+        );
+        return None;
+    }
+    Some(head)
 }
 
 /// Build reply for a committed prepare.
@@ -1995,6 +2045,8 @@ mod tests {
     fn drains_only_up_to_commit_frontier_even_without_quorum_flags() {
         let consensus = VsrConsensus::new(1, 0, 3, 0, NoopBus, LocalPipeline::new());
         consensus.init();
+        // Pipeline opens at op 5, so the state machine must already be through 4.
+        consensus.restore_commit_state(4, 4);
 
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(5, 0, 50));
         consensus.pipeline_message(PlaneKind::Metadata, &prepare_message(6, 50, 60));

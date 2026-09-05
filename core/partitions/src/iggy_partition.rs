@@ -2008,7 +2008,7 @@ where
         // durably stored; the in-memory update is idempotent on replay
         // because we look up by (kind, id).
         self.persist_consumer_offset_commit(pending).await?;
-        self.apply_consumer_offset_commit(pending)?;
+        self.apply_consumer_offset_commit(pending);
         self.pending_consumer_offset_commits.remove(&op);
         Ok(())
     }
@@ -2081,10 +2081,27 @@ where
             .is_some_and(|&high_water| offset <= high_water)
     }
 
-    fn apply_consumer_offset_commit(
-        &self,
-        pending: PendingConsumerOffsetCommit,
-    ) -> Result<(), IggyError> {
+    /// Note a committed delete that found no offset to remove.
+    ///
+    /// Expected wherever the paired `AckLevel::NoAck` store never replicated, so a
+    /// diagnostic and not a fault. Still logged: on a replica that did serve the
+    /// store it is the first symptom of a lost apply.
+    fn log_absent_offset_delete(&self, kind: &str, id: u64) {
+        debug!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            replica_id = self.consensus.replica(),
+            namespace_raw = self.namespace().inner(),
+            kind,
+            id,
+            follower = self.consensus.is_follower(),
+            "committed consumer offset delete found no offset to remove"
+        );
+    }
+
+    /// Infallible: idempotent map mutations. A committed op must apply on every
+    /// replica, so there is no way to refuse one.
+    fn apply_consumer_offset_commit(&self, pending: PendingConsumerOffsetCommit) {
         match pending.mutation {
             PendingConsumerOffsetMutation::Upsert(offset)
                 if pending.kind == ConsumerKind::Consumer =>
@@ -2104,7 +2121,6 @@ where
                     pending.auto_commit,
                     create,
                 );
-                Ok(())
             }
             PendingConsumerOffsetMutation::Upsert(offset)
                 if pending.kind == ConsumerKind::ConsumerGroup =>
@@ -2133,28 +2149,20 @@ where
                     pending.auto_commit,
                     create,
                 );
-                Ok(())
             }
-            // Commit-time apply keeps its invariant check on the PRIMARY:
-            // admission verified the offset exists there, so a miss on the
-            // primary is real divergence (log corruption / out-of-order apply)
-            // and must surface rather than silently mask a split state. A
-            // FOLLOWER may legitimately miss the offset: `AckLevel::NoAck`
-            // stores apply on the primary only and are never replicated,
-            // so a later quorum delete finds nothing on the backups -- erroring
-            // there would fail the committed apply, panic the replica as
-            // divergent, and crash-loop on every journal replay. The
-            // prepare-time race is handled by not re-checking existence at
-            // staging (see `stage_consumer_offset_delete`).
+            // Deleting an absent offset is a no-op on every role: `AckLevel::NoAck`
+            // stores never replicate, so which replicas hold an offset is not
+            // agreed and presence cannot be an invariant of a committed delete.
+            // Erroring would fence, then crash-loop on replay, over a state the
+            // design permits. The prepare-time race is handled by not re-checking
+            // existence at staging (see `stage_consumer_offset_delete`).
             PendingConsumerOffsetMutation::Delete if pending.kind == ConsumerKind::Consumer => {
                 let id = pending.consumer_id;
                 let guard = self.consumer_offsets.pin();
                 let key = usize::try_from(id).expect("u32 consumer id must fit usize");
-                let removed = guard.remove(&key).is_some();
-                if !removed && !self.consensus.is_follower() {
-                    return Err(IggyError::ConsumerOffsetNotFound(key));
+                if guard.remove(&key).is_none() {
+                    self.log_absent_offset_delete("consumer", u64::from(id));
                 }
-                Ok(())
             }
             PendingConsumerOffsetMutation::Delete
                 if pending.kind == ConsumerKind::ConsumerGroup =>
@@ -2164,13 +2172,11 @@ where
                 let key = ConsumerGroupId(
                     usize::try_from(group_id).expect("u32 group id must fit usize"),
                 );
-                let removed = guard.remove(&key).is_some();
-                if !removed && !self.consensus.is_follower() {
-                    return Err(IggyError::ConsumerOffsetNotFound(key.0));
+                if guard.remove(&key).is_none() {
+                    self.log_absent_offset_delete("consumer_group", u64::from(group_id));
                 }
-                Ok(())
             }
-            _ => Ok(()),
+            _ => {}
         }
     }
 
@@ -2269,15 +2275,7 @@ where
             );
             return;
         }
-        if let Err(error) = self.apply_consumer_offset_commit(pending) {
-            emit_partition_diag(
-                tracing::Level::WARN,
-                &PartitionDiagEvent::new(self.diag_ctx(), "no_ack offset apply failed")
-                    .with_operation(request_header.operation)
-                    .with_error(error.to_string()),
-            );
-            return;
-        }
+        self.apply_consumer_offset_commit(pending);
 
         let reply = build_reply_from_request(
             &self.consensus,
@@ -2587,7 +2585,7 @@ where
         offset: u64,
     ) -> Result<(), IggyError> {
         let pending = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, offset)?;
-        self.apply_consumer_offset_commit(pending)?;
+        self.apply_consumer_offset_commit(pending);
         Ok(())
     }
 
