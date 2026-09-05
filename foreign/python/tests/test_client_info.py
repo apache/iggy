@@ -30,51 +30,6 @@ from apache_iggy import (
 from .utils import login_fresh_client, unique_credentials
 
 
-def unused_client_id(clients: list[ClientInfo]) -> int:
-    """Return a client id that no currently connected client holds."""
-    return max((client.client_id for client in clients), default=0) + 1_000_000
-
-
-async def group_with_distinct_ids(client: IggyClient, unique_name):
-    """Create a stream, topic and consumer group with pairwise distinct ids.
-
-    Topic and consumer group ids restart per parent, so a fresh stream hands
-    its first topic and first group the same id and a swapped field mapping
-    would still satisfy the assertions. Creating three candidates of each and
-    picking one that collides with nothing leaves the three ids distinct.
-    """
-    stream_name = unique_name()
-    await client.create_stream(stream_name)
-    stream = await client.get_stream(stream_name)
-    assert stream is not None
-
-    topics = []
-    for _ in range(3):
-        name = unique_name()
-        await client.create_topic(
-            stream=stream_name,
-            name=name,
-            partitions_count=1,
-        )
-        details = await client.get_topic(stream_name, name)
-        assert details is not None
-        topics.append((name, details))
-    topic_name, topic = next((n, t) for n, t in topics if t.id != stream.id)
-
-    groups = []
-    for _ in range(3):
-        name = unique_name()
-        await client.create_consumer_group(stream_name, topic_name, name)
-        details = await client.get_consumer_group(stream_name, topic_name, name)
-        assert details is not None
-        groups.append((name, details))
-    group_name, group = next(
-        (n, g) for n, g in groups if g.id not in (stream.id, topic.id)
-    )
-
-    return (stream_name, topic_name, group_name), (stream, topic, group)
-
-
 class TestGetMe:
     """Test the currently connected client via get_me."""
 
@@ -102,10 +57,42 @@ class TestGetMe:
         self, iggy_client: IggyClient, unique_name
     ):
         """Test a joined group appears with the stream, topic and group ids."""
-        names, (stream, topic, group) = await group_with_distinct_ids(
-            iggy_client, unique_name
+        # Topic and consumer group ids restart per parent, so a fresh stream
+        # hands its first topic and first group the same id and a swapped
+        # field mapping would still satisfy the assertions below. Creating
+        # three candidates of each and picking one that collides with
+        # nothing keeps the three ids distinct.
+        stream_name = unique_name()
+        await iggy_client.create_stream(stream_name)
+        stream = await iggy_client.get_stream(stream_name)
+        assert stream is not None
+
+        topics = []
+        for _ in range(3):
+            name = unique_name()
+            await iggy_client.create_topic(
+                stream=stream_name,
+                name=name,
+                partitions_count=1,
+            )
+            details = await iggy_client.get_topic(stream_name, name)
+            assert details is not None
+            topics.append((name, details))
+        topic_name, topic = next((n, t) for n, t in topics if t.id != stream.id)
+
+        groups = []
+        for _ in range(3):
+            name = unique_name()
+            await iggy_client.create_consumer_group(stream_name, topic_name, name)
+            details = await iggy_client.get_consumer_group(
+                stream_name, topic_name, name
+            )
+            assert details is not None
+            groups.append((name, details))
+        group_name, group = next(
+            (n, g) for n, g in groups if g.id not in (stream.id, topic.id)
         )
-        stream_name, topic_name, group_name = names
+
         # Guard the assertions below: equal ids would survive a swapped mapping.
         assert len({stream.id, topic.id, group.id}) == 3
 
@@ -168,8 +155,9 @@ class TestGetClient:
     async def test_get_client_unknown_id_returns_none(self, iggy_client: IggyClient):
         """Test an unknown client id resolves to None rather than raising."""
         clients = await iggy_client.get_clients()
+        unused_id = max((c.client_id for c in clients), default=0) + 1_000_000
 
-        assert await iggy_client.get_client(unused_client_id(clients)) is None
+        assert await iggy_client.get_client(unused_id) is None
 
     @pytest.mark.parametrize("out_of_range", [-1, 2**32], ids=["negative", "above-u32"])
     @pytest.mark.asyncio
