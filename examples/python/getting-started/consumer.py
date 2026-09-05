@@ -114,6 +114,13 @@ def build_config(args: ArgNamespace) -> TcpConfig:
         tls_enabled=args.tls,
         tls_ca_file=args.tls_ca_file or None,
     )
+    # IggyClient(...) also accepts an HttpConfig for the HTTP transport. HTTP
+    # has no AutoLogin or reconnection policy, so main() below would also need
+    # an explicit `await client.login_user(args.username, args.password)`
+    # after connecting:
+    # from apache_iggy import HttpConfig
+    #
+    # return HttpConfig(api_url="http://127.0.0.1:3000")
 
 
 async def main():

@@ -409,7 +409,7 @@ impl TcpConfig {
     }
 }
 
-/// Configuration for the HTTP transport, accepted by `IggyClient.http(...)`.
+/// Configuration for the HTTP transport, accepted by `IggyClient(...)`.
 ///
 /// Every field is keyword-only and optional.
 #[gen_stub_pyclass]
@@ -521,12 +521,15 @@ fn python_bool(value: bool) -> &'static str {
     if value { "True" } else { "False" }
 }
 
-/// What `IggyClient(...)` accepts: a bare `host:port` or a full `TcpConfig`.
+/// What `IggyClient(...)` accepts: a bare `host:port`, a full `TcpConfig`, or an
+/// `HttpConfig` for the HTTP transport.
 #[derive(FromPyObject)]
 pub enum PyClientConfig {
     #[pyo3(transparent)]
-    Config(TcpConfig),
+    Tcp(TcpConfig),
+    #[pyo3(transparent)]
+    Http(HttpConfig),
     #[pyo3(transparent, annotation = "str")]
     ServerAddress(String),
 }
-impl_stub_type!(PyClientConfig = TcpConfig | String);
+impl_stub_type!(PyClientConfig = TcpConfig | HttpConfig | String);

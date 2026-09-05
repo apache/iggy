@@ -841,7 +841,7 @@ class HeaderValue:
 @typing.final
 class HttpConfig:
     r"""
-    Configuration for the HTTP transport, accepted by `IggyClient.http(...)`.
+    Configuration for the HTTP transport, accepted by `IggyClient(...)`.
 
     Every field is keyword-only and optional.
     """
@@ -886,44 +886,34 @@ class IggyClient:
     A Python class representing the Iggy client.
     It provides asynchronous functionality through the contained runtime.
     """
-    def __new__(cls, conn: TcpConfig | builtins.str | None = None) -> IggyClient:
+    def __new__(
+        cls, conn: TcpConfig | HttpConfig | builtins.str | None = None
+    ) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
-        This initializes a new runtime for asynchronous operations.
+        Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or an
+        `HttpConfig`. This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
 
         Args:
-            conn: Either a `host:port` address, or a `TcpConfig` carrying the full
-                transport configuration. Defaults to `127.0.0.1:8090` with auto-login
-                disabled. A malformed address is reported differently by the two
-                forms: the string form raises `RuntimeError` here, while `TcpConfig`
-                raises `ValueError` when it is constructed, before it ever reaches
-                this call. Neither exception is a subclass of the other.
+            conn: A `host:port` address, a `TcpConfig`, or an `HttpConfig`. Defaults
+                to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
+                address is reported differently depending on the form: the string
+                form raises `RuntimeError` here, while `TcpConfig`/`HttpConfig`
+                raise `ValueError` when they are constructed, before either ever
+                reaches this call. Neither exception is a subclass of the other.
 
         Raises:
             RuntimeError: If the address passed as a string is not a valid
-                `host:port` pair.
+                `host:port` pair, or if an `HttpConfig` client cannot be
+                constructed. `api_url` is already validated when `HttpConfig` is
+                built, so the latter does not currently fail; the exception is
+                documented for interface consistency with the other transports.
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
         r"""
         Constructs a new IggyClient from a connection string.
         Returns an error if the connection string provided is invalid.
-        """
-    @classmethod
-    def http(cls, config: HttpConfig | None = None) -> IggyClient:
-        r"""
-        Constructs a new IggyClient configured for the HTTP transport.
-
-        `api_url` is already validated when `config` is built, so this does not
-        currently fail; the exception is documented for interface consistency
-        with the other transport constructors.
-
-        Args:
-            config: HTTP transport configuration. Defaults to `HttpConfig()`.
-
-        Raises:
-            RuntimeError: If the client cannot be constructed.
         """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
