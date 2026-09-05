@@ -698,7 +698,7 @@ impl HttpSource {
         let count = batch.messages.len();
         drop(staged);
         warn!(
-            "Runtime NACKed {count} messages ({nacks} so far) for {CONNECTOR_NAME} connector ID: {}, replaying them on the next poll",
+            "Runtime NACKed {count} messages ({nacks} so far) for {CONNECTOR_NAME} connector ID: {}",
             self.id
         );
         Ok(())
@@ -782,8 +782,14 @@ impl Source for HttpSource {
     /// Applies the runtime's verdict on the batch `poll()` last produced.
     ///
     /// An Ack means the batch reached the topic and its state was persisted, so
-    /// the staged copy is free. A Nack means neither happened, so the copy has
-    /// to outlive it for the next `poll()` to replay.
+    /// the staged copy is free.
+    ///
+    /// A Nack does not mean neither happened. The runtime NACKs a batch it sent
+    /// successfully but whose state it could not persist, and the SDK NACKs on
+    /// its own result timeout while that send may still have landed. Holding
+    /// the copy and replaying it is therefore at-least-once by construction:
+    /// the alternative, dropping it, would turn every one of those into
+    /// silent loss.
     async fn on_batch_result(&self, result: source::SourceBatchResult) -> Result<(), Error> {
         match result {
             source::SourceBatchResult::Ack => {

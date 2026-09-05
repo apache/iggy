@@ -21,6 +21,7 @@ What mitigates this in practice is the caller: webhook senders such as GitHub, S
 
 1. A caller times out after the connector enqueued the message but before the 200 reached it, retries, and the payload lands twice.
 2. A load balancer or proxy retries a POST after a hiccup downstream of a successful enqueue.
+3. A NACK does not mean the batch never landed. The runtime NACKs a batch it sent but whose state it could not persist, and the SDK NACKs on its own result timeout while the send may still have succeeded, so the replay on the next `poll()` re-sends messages that are already on the topic. This is the window the connector itself creates, and it is the price of not dropping post-200 data.
 
 So the guarantee is best-effort in both directions: no silent-loss guarantee and no dedup guarantee. Consumers that need effectively-once processing should dedupe on the provider's delivery id (`X-GitHub-Delivery`, `svix-id`, Stripe's `event.id` in the body), which is why forwarding those headers is the default recommendation.
 
@@ -49,8 +50,10 @@ linger_time = "5ms"
 
 [plugin_config]
 # Loopback so a copied snippet cannot expose a port. Production wants 0.0.0.0
-# behind a load balancer, with TLS terminated in front of it, and real secrets
-# supplied through the runtime's env overrides rather than written here.
+# behind a load balancer, with TLS terminated in front of it. The runtime's env
+# overrides can supply `auth_bearer_token` and `management_token`, but they
+# reach top-level fields only: an endpoint's `auth_secret` stays in this file
+# or is registered through the management API. See Options below.
 listen_addr = "127.0.0.1:9090"
 admin_listen_addr = "127.0.0.1:9091"
 instance_name = "http_github"
@@ -130,6 +133,10 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `hmac_prefix` | string | `sha256=` | Prefix stripped before hex-decoding. Use `""` for a bare hex signature. |
 | `expires_at` | u64 | none | Unix seconds. Requests arriving at or after this answer 404. |
 
+Env overrides reach top-level fields only, and only under the local config provider. `IGGY_CONNECTORS_SOURCE_<KEY>_PLUGIN_CONFIG_<FIELD>` sets one field of this table; the suffix is taken whole, so a nested attempt such as `..._ENDPOINTS_0_AUTH_SECRET` becomes the flat key `endpoints_0_auth_secret` and is ignored. Endpoint secrets therefore stay in TOML or go through the management API.
+
+Values are coerced before they are deserialized: `true`/`false` become booleans and anything that parses as a number becomes one. So `..._INSTANCE_NAME=42` or a numeric `..._TOPIC_PATH` hands a JSON number to a string field and fails the whole configuration parse, with an error that does not name the field. Quote such values into non-numeric form, or set them in TOML.
+
 `HttpSourceConfig` deliberately does not implement `Serialize`, so this connector cannot write a credential out by accident. That does **not** protect the values in your TOML: the runtime keeps plugin configuration as raw JSON and serves it verbatim from `GET /sources/{key}/configs/plugin` (and inside `/configs` and `/configs/active`), so anyone who can reach the runtime's control API can read every secret configured here. Treat that API as privileged. (`/stats` carries no plugin configuration.)
 
 ## Routing
@@ -182,7 +189,7 @@ With `include_http_metadata = true` each message carries:
 | Header | Value |
 | ------ | ----- |
 | `iggy_source_instance` | `instance_name`, or the connector id if unset |
-| `iggy_http_remote_addr` | Peer IP address |
+| `iggy_http_remote_addr` | TCP peer address. Behind the load balancer this README recommends, that is the proxy, not the sender; forward `X-Forwarded-For` to see the original client |
 | `iggy_http_received_at` | Accept time, microseconds since the Unix epoch |
 
 Anything listed in `forward_headers` is copied alongside, under its own name. Iggy rejects header values over 255 bytes, and real values such as `User-Agent` routinely exceed that, so forwarded values are truncated to fit rather than failing the message. Truncations and drops are counted in `http_source_headers_clamped_total` and `http_source_headers_dropped_total`.
@@ -255,7 +262,7 @@ What closed the gap instead was #3855. The SDK now keeps one batch in flight and
 That coupling holds only while the runtime answers inside the SDK's batch-result timeout, 30s. Past it the SDK stops waiting, NACKs, and polls again, so the bridge drains and the pressure moves into the runtime's unbounded forwarding channel instead of reaching the sender. Tracked in #3981.
 
 ```text
-Iggy slow -> forwarding loop blocks -> bounded channel fills -> poll() stalls
+Iggy slow -> forwarding loop blocks -> batch stays unacknowledged -> poll() stalls
           -> instance bridge fills -> HTTP 429 + Retry-After: 1
 ```
 
@@ -267,7 +274,7 @@ The handler never blocks on a full bridge. Waiting would hold connections open a
 | 100 to 1000 req/s | 10000 (default) | Absorbs roughly ten seconds of burst |
 | Over 1000 req/s | 50000 to 100000 | Sustained bursts; tune against the buffer metrics |
 
-The bridge is bounded by message count, not bytes, so worst-case memory is `buffer_capacity * max_body_size_bytes`. At the defaults that is about 10 GB. Size the two together.
+The bridge is bounded by message count, not bytes, so its worst case is `buffer_capacity * max_body_size_bytes`. At the defaults that is about 10 GB. Add the in-flight batch on top: at the moment of a send a batch exists as the staged copy this connector holds for replay, the SDK's serialized copy, and the runtime's decoded copy, so budget up to three times `max_batch_size * max_body_size_bytes` above the bridge. Size all of them together.
 
 ## Observability
 
@@ -299,6 +306,10 @@ A metric with no series yet is absent from the scrape rather than reported as ze
 **Revocation tombstones accumulate.** They are retained deliberately, so a revocation survives a restart and stays auditable, and nothing evicts them.
 
 Each is roughly a hundred bytes and the whole registry is rewritten on every mutation, so a deployment that churns endpoints continuously will see the state file grow over time. An instance whose endpoints are all static writes no state file until something mutates its registry. Revoking a static endpoint through the management API does exactly that, and the tombstone it writes is what stops the TOML entry coming back.
+
+The registry is capped at `MAX_ENDPOINTS` (10000) per instance. At the cap the oldest revoked dynamic entries are reclaimed to make room; revoked static ones never are, because their tombstone is what outranks TOML. A registration that finds nothing reclaimable is refused with 507.
+
+Recovering a revoked static endpoint means giving it a **new** `endpoint_id`. Editing `auth_secret` in TOML does nothing, because the tombstone outranks the file by design, and deleting the state file to clear one tombstone also drops every dynamic endpoint and every other revocation with it.
 
 **`dropped_on_close` disappears with its listener.** The counter lives on the shared listener's registry, so it survives one instance of several leaving — but when the *last* instance closes, the listener and its metrics go with it. In a single-instance deployment the `warn!` log line is the only surviving record of messages lost at shutdown.
 
