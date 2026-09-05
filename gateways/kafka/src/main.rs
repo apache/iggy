@@ -196,7 +196,22 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_positive, reject_unknown_kafka_env_vars};
+    use iggy_gateway_kafka::bridge::IggyBridgeConfig;
+
+    use super::{KNOWN_KAFKA_ENV_VARS, parse_positive, reject_unknown_kafka_env_vars};
+
+    /// `KNOWN_KAFKA_ENV_VARS` hand-copies `IggyBridgeConfig::KNOWN_ENV_VARS` (see this module's
+    /// doc comment on why) - nothing else ties the two lists together, so a rename on either side
+    /// would otherwise silently desync until a user hit a spurious "unknown env var" rejection.
+    #[test]
+    fn known_kafka_env_vars_includes_every_bridge_env_var() {
+        for var in IggyBridgeConfig::KNOWN_ENV_VARS {
+            assert!(
+                KNOWN_KAFKA_ENV_VARS.contains(var),
+                "{var} is in IggyBridgeConfig::KNOWN_ENV_VARS but missing from KNOWN_KAFKA_ENV_VARS"
+            );
+        }
+    }
 
     /// Sequential (not two separate `#[test]` fns) so the two env-var mutations can't race
     /// against each other under the test harness's default parallel execution - env vars are

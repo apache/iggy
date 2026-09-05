@@ -21,7 +21,7 @@
 //! module invoked from a real (non-unit) test rather than only compiled.
 
 use std::collections::HashMap;
-use std::net::TcpListener;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::OnceLock;
@@ -36,12 +36,48 @@ use serial_test::serial;
 
 use iggy_gateway_kafka::bridge::{BridgeError, IggyBridge, IggyBridgeConfig, TopicMapping};
 
-/// Picks a free TCP port by binding to `127.0.0.1:0` and immediately releasing it. Small TOCTOU
-/// window between release and `iggy-server` binding the same port - acceptable for a test helper,
-/// same tradeoff `core/integration`'s own `port_reserver.rs` makes.
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
+/// First port of the local reservation band. Clear of both the default Linux/macOS ephemeral
+/// range (roughly 32768-60999 and 49152-65535 respectively) and `core/integration`'s own
+/// `port_reserver.rs` band (20000 up to that ephemeral floor), so a `bind(0)` call in an unrelated
+/// process - including that harness's own test servers - is never handed a port this band has
+/// claimed.
+const PORT_LOCK_BAND_START: u16 = 61000;
+const PORT_LOCK_BAND_SLOTS: u16 = 200;
+
+/// Exclusive claim on one port, released (and the port freed for reuse) when dropped - including
+/// on an unclean process exit, since the OS drops the `flock` with the file descriptor. Unlike
+/// bind-then-drop, nothing ever binds the port on this side, so there is no TOCTOU window between
+/// picking it and `iggy-server` binding it: the lock, not a socket, is the allocator.
+struct PortGuard {
+    port: u16,
+    _lock: File,
+}
+
+impl PortGuard {
+    fn acquire() -> Self {
+        let lock_dir = std::env::temp_dir().join("iggy-kafka-gateway-test-port-locks");
+        std::fs::create_dir_all(&lock_dir).expect("create port lock dir");
+        for offset in 0..PORT_LOCK_BAND_SLOTS {
+            let port = PORT_LOCK_BAND_START + offset;
+            let path = lock_dir.join(format!("{port}.lock"));
+            let Ok(file) = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+            else {
+                continue;
+            };
+            if file.try_lock().is_ok() {
+                return Self { port, _lock: file };
+            }
+        }
+        panic!(
+            "no free port slot in [{PORT_LOCK_BAND_START}, {}]",
+            PORT_LOCK_BAND_START + PORT_LOCK_BAND_SLOTS - 1
+        );
+    }
 }
 
 /// Builds `iggy-server` (idempotent - a no-op rebuild once already current) and returns its path.
@@ -78,14 +114,15 @@ fn iggy_server_binary() -> &'static PathBuf {
 struct TestServer {
     child: Child,
     address: String,
+    _port_guard: PortGuard,
 }
 
 impl TestServer {
-    /// Spawns `iggy-server` with an isolated temp data dir and an ephemeral TCP port, then blocks
+    /// Spawns `iggy-server` with an isolated temp data dir and a locked TCP port, then blocks
     /// until a bridge connection succeeds or the startup budget is exhausted.
     async fn spawn(data_dir: &std::path::Path) -> Self {
-        let port = free_port();
-        let address = format!("127.0.0.1:{port}");
+        let port_guard = PortGuard::acquire();
+        let address = format!("127.0.0.1:{}", port_guard.port);
 
         let mut command = Command::new(iggy_server_binary());
         command
@@ -100,7 +137,11 @@ impl TestServer {
             .env("IGGY_ROOT_PASSWORD", "iggy");
         let child = command.spawn().expect("spawn iggy-server");
 
-        let server = Self { child, address };
+        let server = Self {
+            child,
+            address,
+            _port_guard: port_guard,
+        };
         server.wait_ready().await;
         server
     }
@@ -299,8 +340,8 @@ async fn ensure_stream_and_topic_is_idempotent_for_a_numeric_topic_name() {
 #[serial]
 async fn connect_succeeds_with_password_containing_special_characters() {
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let port = free_port();
-    let address = format!("127.0.0.1:{port}");
+    let port_guard = PortGuard::acquire();
+    let address = format!("127.0.0.1:{}", port_guard.port);
     let password = "p@ss:word";
 
     let mut command = Command::new(iggy_server_binary());
@@ -347,9 +388,9 @@ async fn connect_succeeds_with_password_containing_special_characters() {
 /// assertion is exactly the failure mode being guarded against.
 #[tokio::test]
 async fn connect_to_unreachable_iggy_returns_err_not_panic() {
-    let port = free_port(); // reserved, then immediately released, nothing binds it
+    let port_guard = PortGuard::acquire(); // locked but never bound - nothing listens on it
     let config = IggyBridgeConfig {
-        address: format!("127.0.0.1:{port}"),
+        address: format!("127.0.0.1:{}", port_guard.port),
         username: "iggy".to_string(),
         password: SecretString::from("iggy"),
         topic_mapping: TopicMapping {

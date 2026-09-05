@@ -18,7 +18,9 @@
 use iggy::prelude::IggyError;
 use thiserror::Error;
 
-use crate::protocol::api::{ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
+use crate::protocol::api::{
+    ERROR_INVALID_PARTITIONS, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+};
 
 /// Kafka's generic `UNKNOWN_SERVER_ERROR` (`-1`). Not in `protocol::api`'s `ERROR_*` set - that
 /// table only lists codes the foundation's stub responses actually send; this is the bridge's own
@@ -49,6 +51,19 @@ pub enum BridgeError {
         partition: u32,
         partitions_count: u32,
     },
+    /// `ensure_topic` was asked to ensure a topic that already exists with a different partition
+    /// count. `ensure_topic`'s whole contract is "the topic has `partition_count` partitions
+    /// afterward" - silently keeping the old count and returning `Ok(())` would let two
+    /// concurrent callers requesting different counts for the same topic both believe they
+    /// succeeded.
+    #[error(
+        "topic '{topic}' already exists with {existing} partitions, but {requested} were requested"
+    )]
+    PartitionCountMismatch {
+        topic: String,
+        existing: u32,
+        requested: u32,
+    },
 }
 
 impl BridgeError {
@@ -64,6 +79,7 @@ impl BridgeError {
         match self {
             Self::Iggy(err) => iggy_error_to_kafka_code(err),
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+            Self::PartitionCountMismatch { .. } => ERROR_INVALID_PARTITIONS,
             // Not a wire-response case in practice: an invalid bridge config is caught at
             // `IggyBridge::connect` before any handler exists to answer a Kafka request, so this
             // is reachable only if a future caller starts constructing configs at request time.
@@ -163,5 +179,15 @@ mod tests {
             partitions_count: 2,
         };
         assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    #[test]
+    fn partition_count_mismatch_maps_to_invalid_partitions() {
+        let err = BridgeError::PartitionCountMismatch {
+            topic: "t".to_string(),
+            existing: 3,
+            requested: 5,
+        };
+        assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_PARTITIONS);
     }
 }

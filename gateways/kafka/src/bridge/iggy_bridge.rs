@@ -19,7 +19,7 @@ use iggy::prelude::{
     AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyError,
     StreamClient, TopicClient, TopicCreateOptions,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
@@ -95,16 +95,19 @@ impl IggyBridge {
     /// Ensures the Iggy stream and topic backing `kafka_topic` exist, creating either or both if
     /// missing. Resolves `kafka_topic` through the configured [`TopicMapping`](crate::bridge::topic_map::TopicMapping).
     ///
-    /// Idempotent: a `get` before each `create` means calling this twice for the same topic is a
-    /// no-op the second time. A `NameAlreadyExists` race from a concurrent caller creating the
-    /// same stream/topic between this call's `get` and `create` is treated as success, not an
-    /// error - the desired end state (it exists) is what idempotency actually promises, not that
-    /// this call was the one that created it.
+    /// Idempotent when repeated with the *same* `partition_count`: a `get` before each `create`
+    /// means calling this twice for the same topic is a no-op the second time, and a
+    /// `NameAlreadyExists` race from a concurrent caller creating the same stream/topic between
+    /// this call's `get` and `create` is treated as success, not an error - the desired end state
+    /// (it exists) is what idempotency actually promises, not that this call was the one that
+    /// created it. A *different* `partition_count` against an already-existing topic is not
+    /// idempotent - see [`BridgeError::PartitionCountMismatch`].
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::Iggy`] for any Iggy failure other than the
-    /// already-exists race described above (auth, connectivity, invalid name).
+    /// Returns [`BridgeError::Iggy`] for connectivity/auth/invalid-name failures. Returns
+    /// [`BridgeError::PartitionCountMismatch`] if the topic already exists with a different
+    /// partition count than `partition_count`.
     pub async fn ensure_stream_and_topic(
         &self,
         kafka_topic: &str,
@@ -175,17 +178,18 @@ impl IggyBridge {
             .map_err(BridgeError::Iggy)?
         {
             debug!("Iggy topic '{topic_name}' already exists");
-            // A topic re-ensured with a different partition count would otherwise report success
-            // with no signal, and a later produce/fetch against the "new" partitions would fail
-            // with a hard-to-trace PartitionOutOfRange. Growing partitions on the caller's behalf
-            // is a bigger decision (CreatePartitions has its own semantics) than ensure_topic
-            // should make silently - surface the mismatch instead.
+            // ensure_topic's contract is "the topic has partition_count partitions afterward" -
+            // a mismatch here means that's false. Returning Ok(()) anyway (even with a warn!)
+            // would let two concurrent callers requesting different counts for the same topic
+            // both believe they succeeded; growing partitions on the caller's behalf is also a
+            // bigger decision (CreatePartitions has its own semantics) than this method should
+            // make silently. Erring is the only response that keeps the postcondition honest.
             if existing.partitions_count != partition_count {
-                warn!(
-                    "Iggy topic '{topic_name}' has {} partitions, but {partition_count} were \
-                     requested - keeping the existing partition count",
-                    existing.partitions_count
-                );
+                return Err(BridgeError::PartitionCountMismatch {
+                    topic: topic_name.to_string(),
+                    existing: existing.partitions_count,
+                    requested: partition_count,
+                });
             }
             return Ok(());
         }
@@ -205,14 +209,26 @@ impl IggyBridge {
             }
             Err(IggyError::TopicNameAlreadyExists(_, _)) => {
                 // Lost a create race - re-verify by name rather than trusting the race outcome
-                // alone, the same way ensure_stream's arm does.
-                self.client
+                // alone, the same way ensure_stream's arm does. The winner of the race may have
+                // created it with a different partition count than this call requested, so this
+                // needs the same mismatch check the existing-topic branch above makes - skipping
+                // it here would let two concurrent ensure_topic(N) / ensure_topic(M) calls for
+                // the same topic both return Ok(()).
+                let existing = self
+                    .client
                     .get_topic(stream_id, &identifier)
                     .await
                     .map_err(BridgeError::Iggy)?
                     .ok_or_else(|| {
                         IggyError::TopicNameNotFound(topic_name.to_string(), stream_id.to_string())
                     })?;
+                if existing.partitions_count != partition_count {
+                    return Err(BridgeError::PartitionCountMismatch {
+                        topic: topic_name.to_string(),
+                        existing: existing.partitions_count,
+                        requested: partition_count,
+                    });
+                }
                 Ok(())
             }
             Err(err) => Err(BridgeError::Iggy(err)),
@@ -230,10 +246,18 @@ impl IggyBridge {
     ///
     /// `Partition::current_offset` is the offset of the *last written* message, not "next offset
     /// to produce" - confirmed against a live server (3 produced messages read back
-    /// `current_offset == 2`). An empty partition has no last-written offset at all, so
-    /// `messages_count == 0` is the dedicated empty case rather than inferring it from
-    /// `current_offset == 0` (which is also a fresh partition's default value and would
-    /// otherwise be indistinguishable from "one message at offset 0").
+    /// `current_offset == 2`). An empty partition has no last-written offset at all, so this
+    /// needs a dedicated empty case rather than inferring it from `current_offset == 0` (also a
+    /// fresh partition's default value, indistinguishable from "one message at offset 0").
+    ///
+    /// That empty case is `messages_count == 0 && current_offset == 0`, not `messages_count == 0`
+    /// alone: retention cleanup decrements `messages_count` as segments are dropped
+    /// (`core/partitions/src/iggy_partition.rs::decrement_messages_count`) but never rewinds
+    /// `current_offset` - a fully-retention-purged partition that has produced messages reports
+    /// `messages_count == 0` with `current_offset` still at its high value. Treating that as
+    /// "empty" would report high watermark `0` for a partition that has, in fact, produced past
+    /// offset `0`; a future `ListOffsets` (`#3537`) LATEST built on this would rewind instead of
+    /// pointing at the true next-write position.
     ///
     /// # Errors
     ///
@@ -269,10 +293,12 @@ impl IggyBridge {
                 partitions_count: details.partitions_count,
             })?;
 
-        Ok(if partition_details.messages_count == 0 {
-            0
-        } else {
-            partition_details.current_offset + 1
-        })
+        Ok(
+            if partition_details.messages_count == 0 && partition_details.current_offset == 0 {
+                0
+            } else {
+                partition_details.current_offset + 1
+            },
+        )
     }
 }

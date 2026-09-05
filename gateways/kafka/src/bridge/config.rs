@@ -76,6 +76,19 @@ impl IggyBridgeConfig {
         let password = std::env::var("IGGY_KAFKA_IGGY_PASSWORD")
             .unwrap_or_else(|_| DEFAULT_IGGY_PASSWORD.to_string());
         let stream_env = std::env::var("IGGY_KAFKA_IGGY_STREAM").ok();
+        // Caught here, not left to TopicMapping::from_toml_str's own empty check: that
+        // validation only runs when IGGY_KAFKA_TOPIC_MAP_PATH is set, since the no-file branch
+        // below builds a TopicMapping directly rather than through the validating constructor.
+        // An explicitly-empty (not merely absent) IGGY_KAFKA_IGGY_STREAM would otherwise pass
+        // from_env cleanly and only fail much later, deep in the first ensure_stream_and_topic
+        // call, as an opaque Identifier::named("") error.
+        if let Some(ref stream) = stream_env
+            && stream.trim().is_empty()
+        {
+            return Err(BridgeError::InvalidConfig(
+                "IGGY_KAFKA_IGGY_STREAM must not be empty".to_string(),
+            ));
+        }
         let topic_map_path = std::env::var("IGGY_KAFKA_TOPIC_MAP_PATH").ok();
 
         let topic_mapping = match topic_map_path {
@@ -105,6 +118,8 @@ impl IggyBridgeConfig {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     fn test_config() -> IggyBridgeConfig {
@@ -153,6 +168,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_env_rejects_missing_topic_map_file() {
         // Safety: single-threaded within this function; no other test in this crate touches
         // IGGY_KAFKA_TOPIC_MAP_PATH.
@@ -167,6 +183,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn from_env_prefers_topic_map_files_default_stream_over_env_var() {
         let file = tempfile::NamedTempFile::new().expect("create temp file");
         std::fs::write(file.path(), "default_stream = \"from-toml\"\n").expect("write temp file");
@@ -187,5 +204,20 @@ mod tests {
             result.expect("valid config").topic_mapping.default_stream,
             "from-toml"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_rejects_empty_stream_env_var() {
+        // Safety: single-threaded within this function; no other test in this crate touches
+        // IGGY_KAFKA_IGGY_STREAM.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_STREAM", "");
+        }
+        let result = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
+        }
+        assert!(matches!(result, Err(BridgeError::InvalidConfig(_))));
     }
 }

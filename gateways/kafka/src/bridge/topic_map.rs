@@ -57,9 +57,11 @@ impl TopicMapping {
     ///
     /// # Errors
     ///
-    /// Returns [`BridgeError::InvalidConfig`] if `raw` is not valid TOML for this shape, or if
-    /// `default_stream` is empty (every unmapped Kafka topic would otherwise resolve to an empty
-    /// stream name, which the Iggy SDK rejects only once a request is actually made).
+    /// Returns [`BridgeError::InvalidConfig`] if `raw` is not valid TOML for this shape, if
+    /// `default_stream` is empty, or if any `[topics.*]` override has an empty `stream`/`topic` -
+    /// in every case, an empty Iggy stream/topic name would otherwise pass config loading
+    /// cleanly and only fail much later, deep in `IggyBridge::ensure_stream`/`ensure_topic`, as
+    /// an opaque `Identifier::named("")` error with no link back to the config entry at fault.
     pub fn from_toml_str(raw: &str) -> Result<Self, BridgeError> {
         let mapping: Self = toml::from_str(raw)
             .map_err(|e| BridgeError::InvalidConfig(format!("invalid topic mapping TOML: {e}")))?;
@@ -67,6 +69,15 @@ impl TopicMapping {
             return Err(BridgeError::InvalidConfig(
                 "topic mapping's default_stream must not be empty".to_string(),
             ));
+        }
+        for (kafka_topic, over) in &mapping.topics {
+            if over.stream.trim().is_empty() || over.topic.trim().is_empty() {
+                return Err(BridgeError::InvalidConfig(format!(
+                    "topic mapping override for '{kafka_topic}' must not have an empty stream \
+                     or topic (stream: {:?}, topic: {:?})",
+                    over.stream, over.topic
+                )));
+            }
         }
         Ok(mapping)
     }
@@ -148,6 +159,32 @@ mod tests {
     #[test]
     fn from_toml_str_rejects_empty_default_stream() {
         let toml = r#"default_stream = """#;
+        let err = TopicMapping::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn from_toml_str_rejects_empty_override_stream() {
+        let toml = r#"
+            default_stream = "kafka"
+
+            [topics.orders]
+            stream = ""
+            topic = "orders_v2"
+        "#;
+        let err = TopicMapping::from_toml_str(toml).unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn from_toml_str_rejects_empty_override_topic() {
+        let toml = r#"
+            default_stream = "kafka"
+
+            [topics.orders]
+            stream = "billing"
+            topic = ""
+        "#;
         let err = TopicMapping::from_toml_str(toml).unwrap_err();
         assert!(matches!(err, BridgeError::InvalidConfig(_)));
     }

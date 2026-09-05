@@ -77,10 +77,10 @@ real `iggy-server`).
 | `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
 | `IGGY_KAFKA_TOPIC_MAP_PATH` | unset | Path to a topic-mapping TOML file (see below); omit to use only the default rule |
 
-The connection retries a fixed, bounded number of times (not the Iggy SDK client's own default of
-unlimited retries, one dial per second, forever) so a bridge call fails within a few seconds
-against an unreachable Iggy instead of blocking the calling task indefinitely - see
-`IggyBridgeConfig::connection_string`'s doc comment.
+The connection retries a fixed, bounded number of times (`RECONNECTION_RETRIES`, not the Iggy SDK
+client's own default of unlimited retries, one dial per second, forever), so a bridge call fails
+within a few seconds against an unreachable Iggy instead of blocking the calling task indefinitely.
+See `IggyBridge::connect`'s doc comment.
 
 ### Topic mapping
 
@@ -94,6 +94,13 @@ default_stream = "kafka"
 [topics.orders]
 stream = "billing"
 topic = "orders_v2"
+
+# A Kafka topic name containing dots needs the key quoted, or TOML parses it as nested
+# tables ([topics.org] containing [apache] containing [kafka]) instead of one topic named
+# "org.apache.kafka.events".
+[topics."org.apache.kafka.events"]
+stream = "billing"
+topic = "kafka_events"
 ```
 
 Point `IGGY_KAFKA_TOPIC_MAP_PATH` at the file to load it; topics not listed under `[topics.*]`
@@ -102,17 +109,20 @@ still fall back to the default rule.
 ### Provisioning and idempotency
 
 `ensure_stream_and_topic(kafka_topic, partition_count)` creates the mapped Iggy stream and topic
-if either is missing, and is a no-op if both already exist - safe to call on every Produce/Fetch
-for a topic once the handler wiring lands. A `NameAlreadyExists` race against a concurrent caller
-is treated as success, not an error: the goal is "it exists," not "this call created it."
+if either is missing. Idempotent when repeated with the *same* `partition_count`: a no-op if both
+already exist with that count, and a `NameAlreadyExists` race against a concurrent caller creating
+the same stream/topic is treated as success, not an error - the goal is "it exists," not "this
+call created it." A *different* `partition_count` against an already-existing topic returns
+`BridgeError::PartitionCountMismatch` rather than silently keeping the old count or growing it -
+two concurrent callers requesting different counts for the same topic must not both see success.
 
 ### Error mapping
 
 `BridgeError::to_kafka_error_code()` maps Iggy failures to Kafka wire error codes - stream/topic
 not found → `UNKNOWN_TOPIC_OR_PARTITION` (3), auth/credential failures →
 `TOPIC_AUTHORIZATION_FAILED` (29), connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6, the
-same retriable code the foundation's own stubs send, so a client backs off and retries), anything
-else → `UNKNOWN_SERVER_ERROR` (-1).
+same retriable code the foundation's own stubs send, so a client backs off and retries),
+`PartitionCountMismatch` → `INVALID_PARTITIONS` (37), anything else → `UNKNOWN_SERVER_ERROR` (-1).
 
 ## Wire fixture tool
 
