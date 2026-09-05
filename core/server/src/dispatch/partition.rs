@@ -30,9 +30,9 @@ use crate::dispatch::failure::{
     send_non_replicated_deny, send_result_rejection,
 };
 use crate::dispatch::submit::submit_client_request_on_owner;
-use crate::responses::{
+use crate::namespace::{resolve_partition_namespace, resolve_partition_request_namespace};
+use crate::reply_frame::{
     build_consumer_offset_body, build_polled_messages_reply, current_metadata_commit,
-    resolve_partition_namespace, resolve_partition_request_namespace,
 };
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::request_body;

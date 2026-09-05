@@ -31,9 +31,10 @@ use crate::dispatch::failure::{
     FrameChannel, send_host_frame, send_non_replicated_bytes, send_non_replicated_deny,
 };
 use crate::dispatch::partition::{handle_get_consumer_offset, handle_poll_messages};
+use crate::reply_frame::{build_empty_reply, current_metadata_commit};
 use crate::responses::{
-    build_empty_reply, build_get_me_response, build_get_personal_access_tokens_response,
-    build_non_replicated_response, connected_client_to_response, current_metadata_commit,
+    build_get_me_response, build_get_personal_access_tokens_response,
+    build_non_replicated_response, connected_client_to_response,
 };
 use crate::session_manager::SessionManager;
 use crate::shell::{ShellBus, ShellShard};
