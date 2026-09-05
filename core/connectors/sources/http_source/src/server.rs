@@ -779,10 +779,6 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
     .into_response()
 }
 
-/// Hands an accepted request to its instance's bridge, or rejects it.
-///
-/// Never blocks on a full bridge: waiting would turn a slow Iggy into a pile
-/// of held-open connections and, once the sender times out, a retry storm.
 /// The 429 a full bridge answers with.
 ///
 /// Shared so the early check and the `try_send` gate cannot drift apart in
@@ -798,6 +794,10 @@ fn bridge_full_response() -> Response {
         .into_response()
 }
 
+/// Hands an accepted request to its instance's bridge, or rejects it.
+///
+/// Never blocks on a full bridge: waiting would turn a slow Iggy into a pile
+/// of held-open connections and, once the sender times out, a retry storm.
 fn enqueue(
     instance: &Arc<SharedState>,
     request_headers: &HeaderMap,
@@ -1122,7 +1122,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_oversized_body_to_unknown_endpoint_should_answer_not_found_not_payload_too_large()
-    {
+     {
         // Guards the ordering against a return to buffering before routing.
         // With the body as an extractor, axum size-checked it before the
         // handler ran, so an unknown id answered 413 having already paid for

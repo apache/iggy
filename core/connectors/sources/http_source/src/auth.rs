@@ -89,9 +89,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     hmac::verify(&COMPARE_KEY, right, left_tag.as_ref()).is_ok()
 }
 
-/// Validates an HMAC signature over the raw request body bytes, never a
-/// re-serialized form (whitespace or key-order changes would break the hash).
-/// `ring::hmac::verify` compares in constant time.
 /// Longest tag any supported algorithm produces: SHA-256 at 32 bytes.
 const MAX_TAG_LEN: usize = 32;
 
@@ -107,6 +104,9 @@ pub fn hmac_key(algorithm: HmacAlgorithm, secret: &SecretString) -> hmac::Key {
     )
 }
 
+/// Validates an HMAC signature over the raw request body bytes, never a
+/// re-serialized form (whitespace or key-order changes would break the hash).
+/// `ring::hmac::verify` compares in constant time.
 pub fn validate_hmac(
     body: &[u8],
     signature_header: Option<&str>,
