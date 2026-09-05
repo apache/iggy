@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::config::PyClientConfig;
+use crate::config::{PyClientConfig, WebSocketConfig};
 use crate::consumer::{
     AutoCommit, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
     ConsumerGroupDetails as PyConsumerGroupDetails, IggyConsumer,
@@ -141,6 +141,32 @@ impl IggyClient {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(Self {
             inner: Arc::new(client),
+        })
+    }
+
+    /// Constructs a new IggyClient configured for the WebSocket transport.
+    ///
+    /// `server_address` is already validated when `config` is built, so this
+    /// does not currently fail; the exception is documented for interface
+    /// consistency with the other transport constructors.
+    ///
+    /// Args:
+    ///     config: WebSocket transport configuration. Defaults to `WebSocketConfig()`.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the client cannot be constructed.
+    #[classmethod]
+    #[pyo3(signature = (config=None))]
+    fn websocket(_cls: &Bound<'_, PyType>, config: Option<WebSocketConfig>) -> PyResult<Self> {
+        let config = config
+            .map(|config| config.client_config())
+            .unwrap_or_else(|| Arc::new(WebSocketClientConfig::default()));
+        let websocket_client = WebSocketClient::create(config)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(RustIggyClient::new(ClientWrapper::WebSocket(
+                websocket_client,
+            ))),
         })
     }
 

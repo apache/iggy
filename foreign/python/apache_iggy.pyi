@@ -60,6 +60,9 @@ __all__ = [
     "UserInfo",
     "UserInfoDetails",
     "UserStatus",
+    "WebSocketConfig",
+    "WebSocketFramingConfig",
+    "WebSocketReconnectionConfig",
 ]
 
 class AutoCommit:
@@ -866,6 +869,21 @@ class IggyClient:
         r"""
         Constructs a new IggyClient from a connection string.
         Returns an error if the connection string provided is invalid.
+        """
+    @classmethod
+    def websocket(cls, config: WebSocketConfig | None = None) -> IggyClient:
+        r"""
+        Constructs a new IggyClient configured for the WebSocket transport.
+
+        `server_address` is already validated when `config` is built, so this
+        does not currently fail; the exception is documented for interface
+        consistency with the other transport constructors.
+
+        Args:
+            config: WebSocket transport configuration. Defaults to `WebSocketConfig()`.
+
+        Raises:
+            RuntimeError: If the client cannot be constructed.
         """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
@@ -2333,3 +2351,165 @@ class UserStatus(enum.Enum):
     r"""
     The user account is inactive and cannot be used.
     """
+
+@typing.final
+class WebSocketConfig:
+    r"""
+    Configuration for the WebSocket transport, accepted by `IggyClient.websocket(...)`.
+
+    Every field is keyword-only and optional.
+    """
+    @property
+    def server_address(self) -> builtins.str: ...
+    @property
+    def auto_login(self) -> AutoLogin: ...
+    @property
+    def reconnection(self) -> WebSocketReconnectionConfig: ...
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    @property
+    def framing(self) -> WebSocketFramingConfig: ...
+    @property
+    def tls_enabled(self) -> builtins.bool: ...
+    @property
+    def tls_domain(self) -> builtins.str: ...
+    @property
+    def tls_ca_file(self) -> builtins.str | None: ...
+    @property
+    def tls_validate_certificate(self) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        server_address: builtins.str | None = None,
+        auto_login: AutoLogin | None = None,
+        reconnection: WebSocketReconnectionConfig | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+        framing: WebSocketFramingConfig | None = None,
+        tls_enabled: builtins.bool | None = None,
+        tls_domain: builtins.str | None = None,
+        tls_ca_file: builtins.str | None = None,
+        tls_validate_certificate: builtins.bool | None = None,
+    ) -> WebSocketConfig:
+        r"""
+        Constructs a WebSocket configuration.
+
+        Args:
+            server_address: `host:port` of the Iggy server. Defaults to `127.0.0.1:8092`.
+            auto_login: Credentials replayed on every connect. Defaults to `AutoLogin.disabled()`.
+            reconnection: Reconnection policy. Defaults to `WebSocketReconnectionConfig()`.
+            heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+            framing: Frame- and buffer-level options. Defaults to `WebSocketFramingConfig()`.
+            tls_enabled: Whether to connect over TLS. Defaults to disabled.
+            tls_domain: Domain to validate the certificate against. Defaults to `localhost`.
+            tls_ca_file: Path to the CA file for TLS. Read only when `tls_enabled`
+                and `tls_validate_certificate` are both on; with either one off it
+                is kept but never consulted, so pairing it with
+                `tls_validate_certificate=False` pins nothing.
+            tls_validate_certificate: Whether to validate the server certificate.
+                Defaults to `False`, unlike the TCP and QUIC transports. Disabling
+                this accepts any certificate the server presents, including
+                self-signed and mismatched ones, and takes precedence over
+                `tls_ca_file`.
+
+        Raises:
+            ValueError: If `server_address` is not a valid `host:port` pair, if a
+                duration is negative, or if `heartbeat_interval` is zero.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class WebSocketFramingConfig:
+    r"""
+    Frame- and buffer-level options passed through to the underlying WebSocket
+    implementation, accepted by `WebSocketConfig`'s `framing` argument.
+
+    Every field is keyword-only and optional; unset fields fall back to the
+    underlying WebSocket library's own defaults.
+    """
+    @property
+    def read_buffer_size(self) -> builtins.int | None: ...
+    @property
+    def write_buffer_size(self) -> builtins.int | None: ...
+    @property
+    def max_write_buffer_size(self) -> builtins.int | None: ...
+    @property
+    def max_message_size(self) -> builtins.int | None: ...
+    @property
+    def max_frame_size(self) -> builtins.int | None: ...
+    @property
+    def accept_unmasked_frames(self) -> builtins.bool: ...
+    def __new__(
+        cls,
+        *,
+        read_buffer_size: builtins.int | None = None,
+        write_buffer_size: builtins.int | None = None,
+        max_write_buffer_size: builtins.int | None = None,
+        max_message_size: builtins.int | None = None,
+        max_frame_size: builtins.int | None = None,
+        accept_unmasked_frames: builtins.bool | None = None,
+    ) -> WebSocketFramingConfig:
+        r"""
+        Constructs a WebSocket framing configuration.
+
+        Args:
+            read_buffer_size: Read buffer size in bytes.
+            write_buffer_size: Write buffer size in bytes.
+            max_write_buffer_size: Maximum write buffer size in bytes.
+            max_message_size: Maximum message size in bytes, or `None` for no limit.
+            max_frame_size: Maximum frame size in bytes, or `None` for no limit.
+            accept_unmasked_frames: Whether to accept unmasked frames. Defaults to
+                `False`; clients should typically keep this off for RFC compliance.
+
+        Raises:
+            ValueError: If a numeric field is outside the range of a pointer-sized
+                unsigned integer.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class WebSocketReconnectionConfig:
+    r"""
+    How the WebSocket client reconnects after the connection to the server is lost.
+    """
+    @property
+    def enabled(self) -> builtins.bool: ...
+    @property
+    def max_retries(self) -> builtins.int | None: ...
+    @property
+    def interval(self) -> datetime.timedelta: ...
+    @property
+    def reestablish_after(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        enabled: builtins.bool | None = None,
+        max_retries: builtins.int | None = None,
+        interval: datetime.timedelta | None = None,
+        reestablish_after: datetime.timedelta | None = None,
+    ) -> WebSocketReconnectionConfig:
+        r"""
+        Constructs a reconnection policy.
+
+        Args:
+            enabled: Whether to reconnect at all. Defaults to enabled.
+            max_retries: Passes over the known endpoints after the first, or
+                `None` for unlimited; `0` still makes that first pass. One pass
+                tries the endpoint the client is on, the address it was
+                configured with, and every node the roster named, so this counts
+                passes rather than dials. Defaults
+                to unlimited, which means a call awaited while the server is
+                down never returns: `connect()`, `send_messages()` and
+                `poll_messages()` all wait inside the retry loop. Set a finite
+                number for request/reply style usage, so a call fails instead.
+            interval: Delay between passes. Defaults to 1 second. The first pass
+                runs at once when more than one endpoint is known.
+            reestablish_after: Cooldown before redialing the endpoint of the last
+                successful connection, measured from when it was established, so
+                a session that outlived the interval is redialed at once. Owed to
+                that endpoint alone. Defaults to 5 seconds.
+
+        Raises:
+            ValueError: If a duration is negative, if `max_retries` is outside the
+                range of an unsigned 32-bit integer, or if `interval` is zero.
+        """
+    def __repr__(self) -> builtins.str: ...
