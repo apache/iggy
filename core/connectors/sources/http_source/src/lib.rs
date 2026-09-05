@@ -58,7 +58,8 @@ pub const DEFAULT_MAX_BATCH_SIZE: usize = 500;
 ///
 /// `buffer_capacity` is the dangerous one: crossfire asserts `bound <=
 /// u32::MAX` while building the ring and allocates every slot eagerly, each
-/// holding an inline `MaybeUninit<T>`, so a typo either panics or OOMs. That panic unwinds out of `iggy_source_open`, which is
+/// holding an inline `MaybeUninit<T>`, so a typo either panics or OOMs. That
+/// panic unwinds out of `iggy_source_open`, which is
 /// `extern "C"` with no `catch_unwind` around it, and takes down the whole
 /// connectors process along with every other plugin loaded into it. The ring
 /// is built in `new`, before the SDK ever calls `open`, so `validate` cannot
@@ -378,8 +379,9 @@ impl SharedState {
     /// Only ever called for an empty batch. The runtime saves state solely on
     /// the success branch of the Iggy send, so attaching state to a batch of
     /// messages would let a failed send skip the save while this side had
-    /// already cleared the flag, losing a revocation tombstone with no trace. An empty batch cannot fail *for
-    /// want of a successful publish*, which is what makes it the safe carrier.
+    /// already cleared the flag, losing a revocation tombstone with no trace.
+    /// An empty batch cannot fail *for want of a successful publish*, which is
+    /// what makes it the safe carrier.
     /// It can still be NACKed: the runtime short-circuits the send stage when
     /// its own state storage is latched or a pending checkpoint will not
     /// resolve, which is why `on_nack` re-arms rather than assuming success.
@@ -427,7 +429,7 @@ impl SharedState {
 }
 
 /// Deliberately not `Serialize`. The runtime keeps plugin configuration as raw
-/// JSON and never serializes this struct, so nothing needs it — and without it
+/// JSON and never serializes this struct, so nothing needs it, and without it
 /// the compiler guarantees a credential cannot be written out by some future
 /// caller. `SecretString` has no `Serialize` impl for exactly that reason.
 #[derive(Debug, Clone, Deserialize)]
