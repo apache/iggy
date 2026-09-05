@@ -540,6 +540,12 @@ fn admin_router(state: Arc<ServerState>, max_body_size_bytes: usize) -> Router {
         .with_state(state)
 }
 
+/// A request that resolved to no instance is still metered, under [`UNROUTED`],
+/// which is where a scan for live endpoint ids shows up.
+fn instance_label(instance: Option<&Arc<SharedState>>) -> &str {
+    instance.map_or(UNROUTED, |instance| instance.instance_name.as_str())
+}
+
 fn same_token(left: &Option<SecretString>, right: &Option<SecretString>) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -562,10 +568,9 @@ async fn handle_named_path(
     request: Request,
 ) -> Response {
     let started = Instant::now();
-    let (instance_name, response) =
-        named_path_outcome(&state, &topic_path, remote_addr, request).await;
+    let (instance, response) = named_path_outcome(&state, &topic_path, remote_addr, request).await;
     state.metrics.record_request(
-        &instance_name,
+        instance_label(instance.as_ref()),
         PathKind::Named,
         response.status().as_u16(),
         started.elapsed(),
@@ -580,10 +585,10 @@ async fn handle_secret_path(
     request: Request,
 ) -> Response {
     let started = Instant::now();
-    let (instance_name, response) =
+    let (instance, response) =
         secret_path_outcome(&state, &endpoint_id, remote_addr, request).await;
     state.metrics.record_request(
-        &instance_name,
+        instance_label(instance.as_ref()),
         PathKind::Secret,
         response.status().as_u16(),
         started.elapsed(),
@@ -591,15 +596,16 @@ async fn handle_secret_path(
     response
 }
 
-/// Returns the instance the request resolved to alongside the response, so
-/// the caller can label the metrics. Requests that never resolved are still
-/// counted, under [`UNROUTED`].
+/// The instance the request resolved to, for the caller to label metrics with.
+/// Returning the `Arc` the lookup already produced rather than a copy of its
+/// name keeps the label allocation-free on the request path; `None` is a
+/// request that resolved to no instance, counted under [`UNROUTED`].
 async fn named_path_outcome(
     state: &ServerState,
     topic_path: &str,
     remote_addr: SocketAddr,
     request: Request,
-) -> (String, Response) {
+) -> (Option<Arc<SharedState>>, Response) {
     // `into_parts` hands them over owned, so nothing is cloned to survive the
     // body being taken.
     let (parts, body) = request.into_parts();
@@ -607,21 +613,17 @@ async fn named_path_outcome(
     let instance = {
         let routes = &state.published().routes;
         let Some(instance) = routes.lookup_named_path(topic_path) else {
-            return (
-                UNROUTED.to_owned(),
-                error_response(StatusCode::NOT_FOUND, "not found"),
-            );
+            return (None, error_response(StatusCode::NOT_FOUND, "not found"));
         };
         Arc::clone(instance)
     };
-    let name = instance.instance_name.clone();
 
     // Before the body: the whole point of taking the request whole.
     if let Some(expected) = &instance.config.auth_bearer_token
         && !validate_bearer(bearer_header(&request_headers), expected)
     {
         return (
-            name,
+            Some(instance),
             error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
         );
     }
@@ -630,7 +632,7 @@ async fn named_path_outcome(
     // the cap is applied here instead.
     let body = match axum::body::to_bytes(body, state.max_body_size_bytes).await {
         Ok(body) => body,
-        Err(error) => return (name, oversized_body_response(&error)),
+        Err(error) => return (Some(instance), oversized_body_response(&error)),
     };
     let response = enqueue(
         &instance,
@@ -639,7 +641,7 @@ async fn named_path_outcome(
         body,
         &state.metrics,
     );
-    (name, response)
+    (Some(instance), response)
 }
 
 async fn secret_path_outcome(
@@ -647,7 +649,7 @@ async fn secret_path_outcome(
     endpoint_id: &str,
     remote_addr: SocketAddr,
     request: Request,
-) -> (String, Response) {
+) -> (Option<Arc<SharedState>>, Response) {
     // `into_parts` hands the headers over owned; taking them as an extractor
     // cloned the whole map on every request.
     let (parts, body) = request.into_parts();
@@ -662,25 +664,22 @@ async fn secret_path_outcome(
         // unknown path is `unrouted`.
         RouteLookup::Revoked(entry) | RouteLookup::Expired(entry) => {
             return (
-                entry.instance.instance_name.clone(),
+                Some(Arc::clone(&entry.instance)),
                 error_response(StatusCode::NOT_FOUND, "not found"),
             );
         }
         RouteLookup::Unknown => {
-            return (
-                UNROUTED.to_owned(),
-                error_response(StatusCode::NOT_FOUND, "not found"),
-            );
+            return (None, error_response(StatusCode::NOT_FOUND, "not found"));
         }
     };
-    let name = entry.instance.instance_name.clone();
+    let instance = Arc::clone(&entry.instance);
     // Only now, once the id resolved to something that is actually serving.
     // An unknown or revoked id used to cost a full body read before its 404,
     // which is free amplification on the public listener. HMAC still needs the
     // body, so the read cannot move any earlier than this.
     let body = match axum::body::to_bytes(body, state.max_body_size_bytes).await {
         Ok(body) => body,
-        Err(error) => return (name, oversized_body_response(&error)),
+        Err(error) => return (Some(instance), oversized_body_response(&error)),
     };
     if !authorize(
         &entry.endpoint,
@@ -689,7 +688,7 @@ async fn secret_path_outcome(
         &body,
     ) {
         return (
-            name,
+            Some(instance),
             error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
         );
     }
@@ -700,7 +699,7 @@ async fn secret_path_outcome(
         body,
         &state.metrics,
     );
-    (name, response)
+    (Some(instance), response)
 }
 
 /// OpenMetrics text format. Unguarded like `/admin/health`: the admin
@@ -1800,6 +1799,51 @@ mod tests {
             scraped.contains(
                 "http_source_endpoints_active{instance=\"http_github\",kind=\"static\"} 1"
             )
+        );
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_revoked_endpoint_when_posted_should_meter_it_against_its_owner() {
+        // `build` keeps revoked entries in the table so a leaked id 404s under
+        // the instance that owns it. Without that the id would fall through to
+        // `unrouted`, which is the endpoint-id-scan signal, and revoking a busy
+        // endpoint would look exactly like an attack in progress.
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.instance_name = Some("http_github".to_string());
+        let admin = format!("http://{}", config.admin_listen_addr);
+        let mut source = open(1, config).await;
+        let base = base_url(&source);
+        let shared = Arc::clone(&source.shared);
+        let _polling = shared.enter_poll();
+
+        assert!(shared.mutate_registry(|registry| registry.revoke(
+            ENDPOINT_ONE,
+            "compromised".to_string(),
+            1
+        )));
+        rebuild_routes(&source).await;
+
+        post_signed(&base, ENDPOINT_ONE, "{}").await;
+
+        let scraped = client()
+            .get(format!("{admin}/admin/metrics"))
+            .send()
+            .await
+            .expect("the request must reach the admin listener")
+            .text()
+            .await
+            .expect("the scrape must have a body");
+
+        assert!(
+            scraped.contains(
+                "http_source_requests_total{instance=\"http_github\",kind=\"secret\",status=\"4xx\"} 1"
+            ),
+            "a revoked endpoint is still the owning instance's traffic, got: {scraped}"
+        );
+        assert!(
+            !scraped.contains("instance=\"unrouted\""),
+            "attributing it to unrouted would forge the scan signal, got: {scraped}"
         );
         close(&mut source).await;
     }
