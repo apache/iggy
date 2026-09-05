@@ -49,6 +49,7 @@ __all__ = [
     "SendMessage",
     "SendMessagesConfirmation",
     "SendMessagesResponse",
+    "Stream",
     "StreamDetails",
     "StreamPermissions",
     "TcpConfig",
@@ -1055,6 +1056,93 @@ class IggyClient:
         Returns the stream details, or `None` if the stream does not exist.
         Raises `RuntimeError` on failure.
         """
+    def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
+        r"""
+        Return all streams.
+
+        Returns:
+            A list of `Stream` summaries.
+
+        Raises:
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `read_streams` or `manage_streams` permission, or the request fails.
+        """
+    def update_stream(
+        self,
+        stream_id: builtins.str | builtins.int,
+        name: builtins.str,
+        options: builtins.dict[builtins.str, builtins.str] | None = None,
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Rename a stream selected by name or numeric ID.
+
+        `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
+        decimal-only string is interpreted as a numeric ID. `name` must be unique
+        and contain between 1 and 255 UTF-8 bytes. Renaming a stream to its current
+        name succeeds without changing it.
+
+        Args:
+            stream_id: Stream identifier as `str | int`.
+            name: New stream name as `str`.
+            options: Additional option keys as `dict[str, str] | None`, forwarded
+                to the server. Current server versions reject all stream update
+                option keys.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`, or `name` is not `str`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, the new name is invalid or already used, or
+                the request fails.
+        """
+    def delete_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete a stream selected by name or numeric ID.
+
+        Deletion removes the stream and all of its topics, partitions, and messages.
+        `stream_id` accepts a stream name as `str` or numeric ID as `int`. A
+        decimal-only string is interpreted as a numeric ID.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, or the request fails.
+        """
+    def purge_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Delete all messages from every topic in a stream.
+
+        The stream, topics, and partitions remain available. Repeated purges of an
+        existing empty stream succeed. `stream_id` accepts a stream name as `str`
+        or numeric ID as `int`. A decimal-only string is interpreted as a numeric
+        ID.
+
+        Returns:
+            None.
+
+        Raises:
+            TypeError: If `stream_id` is not `str` or an integer in
+                `0..=2**32 - 1`.
+            ValueError: If a string identifier is empty or exceeds 255 UTF-8 bytes.
+            RuntimeError: If the client is not authenticated, the user lacks global
+                `manage_streams` or per-stream `manage_stream` permission, the
+                stream does not exist, or the request fails.
+        """
     def create_topic(
         self,
         stream: builtins.str | builtins.int,
@@ -1837,15 +1925,69 @@ class SendMessagesResponse:
         """
 
 @typing.final
+class Stream:
+    r"""
+    Summary information returned by `IggyClient.get_streams()`.
+
+    `created_at` is Unix time in microseconds. `size` is the stream's current
+    stored size in bytes.
+    """
+    @property
+    def id(self) -> builtins.int:
+        r"""
+        Numeric stream identifier.
+        """
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        Stream creation time as Unix time in microseconds.
+        """
+    @property
+    def name(self) -> builtins.str:
+        r"""
+        Unique stream name.
+        """
+    @property
+    def size(self) -> builtins.int:
+        r"""
+        Current stored stream size in bytes.
+        """
+    @property
+    def messages_count(self) -> builtins.int:
+        r"""
+        Total messages across all topics in the stream.
+        """
+    @property
+    def topics_count(self) -> builtins.int:
+        r"""
+        Number of topics in the stream.
+        """
+
+@typing.final
 class StreamDetails:
+    @property
+    def created_at(self) -> builtins.int:
+        r"""
+        Stream creation time as Unix time in microseconds.
+        """
     @property
     def id(self) -> builtins.int: ...
     @property
     def name(self) -> builtins.str: ...
     @property
+    def size(self) -> builtins.int:
+        r"""
+        Current stored stream size in bytes.
+        """
+    @property
     def messages_count(self) -> builtins.int: ...
     @property
     def topics_count(self) -> builtins.int: ...
+    @property
+    def topics(self) -> builtins.list[Topic]:
+        r"""
+        Returns the topics in the stream.
+        """
 
 @typing.final
 class StreamPermissions:
