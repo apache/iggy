@@ -86,45 +86,79 @@ fn resolve_topic_params(
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
-    /// Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
-    /// This initializes a new runtime for asynchronous operations.
+    /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or a
+    /// `QuicConfig`. This initializes a new runtime for asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
     ///
     /// Args:
-    ///     conn: Either a `host:port` address, or a `TcpConfig` carrying the full
-    ///         transport configuration. Defaults to `127.0.0.1:8090` with auto-login
-    ///         disabled. A malformed address is reported differently by the two
-    ///         forms: the string form raises `RuntimeError` here, while `TcpConfig`
-    ///         raises `ValueError` when it is constructed, before it ever reaches
-    ///         this call. Neither exception is a subclass of the other.
+    ///     conn: A `host:port` address, a `TcpConfig`, or a `QuicConfig`. Defaults
+    ///         to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
+    ///         address is reported differently depending on the form: the string
+    ///         form raises `RuntimeError` here, while `TcpConfig`/`QuicConfig`
+    ///         raise `ValueError` when they are constructed, before either ever
+    ///         reaches this call. Neither exception is a subclass of the other.
     ///
     /// Raises:
     ///     RuntimeError: If the address passed as a string is not a valid
-    ///         `host:port` pair.
+    ///         `host:port` pair, or if a `QuicConfig` client cannot be
+    ///         constructed, e.g. `client_address` is not a valid `host:port`
+    ///         pair or the local UDP socket cannot be bound (for example the
+    ///         port is already in use).
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
-        #[gen_stub(override_type(type_repr = "TcpConfig | builtins.str | None"))] conn: Option<
-            PyClientConfig,
-        >,
+        #[gen_stub(override_type(type_repr = "TcpConfig | QuicConfig | builtins.str | None"))]
+        conn: Option<PyClientConfig>,
     ) -> PyResult<Self> {
-        let config = match conn {
-            Some(PyClientConfig::Config(config)) => config.client_config(),
-            Some(PyClientConfig::ServerAddress(server_address)) => Arc::new(
-                TcpClientConfigBuilder::new()
-                    .with_server_address(server_address)
-                    .build()
-                    .map_err(|e| {
+        match conn {
+            Some(PyClientConfig::Tcp(config)) => {
+                let tcp_client = TcpClient::create(config.client_config()).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                Ok(Self {
+                    inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
+                })
+            }
+            Some(PyClientConfig::ServerAddress(server_address)) => {
+                let config = Arc::new(
+                    TcpClientConfigBuilder::new()
+                        .with_server_address(server_address)
+                        .build()
+                        .map_err(|e| {
+                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                        })?,
+                );
+                let tcp_client = TcpClient::create(config).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                Ok(Self {
+                    inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
+                })
+            }
+            Some(PyClientConfig::Quic(config)) => {
+                // `quinn::Endpoint::client` (invoked eagerly by `QuicClient::create`) looks
+                // up the current Tokio runtime via `Handle::try_current()` and fails with
+                // `CannotCreateEndpoint` if none is active. This method runs synchronously
+                // from Python without one, so enter the runtime pyo3-async-runtimes uses
+                // for our own async methods before building the endpoint.
+                let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
+                let quic_client = QuicClient::create(config.client_config()).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                Ok(Self {
+                    inner: Arc::new(RustIggyClient::new(ClientWrapper::Quic(quic_client))),
+                })
+            }
+            None => {
+                let tcp_client =
+                    TcpClient::create(Arc::new(TcpClientConfig::default())).map_err(|e| {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
-                    })?,
-            ),
-            None => Arc::new(TcpClientConfig::default()),
-        };
-        let tcp_client = TcpClient::create(config)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(IggyClient {
-            inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
-        })
+                    })?;
+                Ok(Self {
+                    inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
+                })
+            }
+        }
     }
 
     /// Constructs a new IggyClient from a connection string.
@@ -137,6 +171,11 @@ impl IggyClient {
         _cls: &Bound<'_, PyType>,
         connection_string: String,
     ) -> PyResult<Self> {
+        // The QUIC transport builds its endpoint eagerly and needs a Tokio runtime context
+        // to do so (see the `QuicConfig` arm of `new()` above for details); entering it here
+        // is a no-op for the other transports since the protocol isn't known until the
+        // connection string is parsed.
+        let _guard = pyo3_async_runtimes::tokio::get_runtime().enter();
         let client = RustIggyClient::from_connection_string(&connection_string)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(Self {

@@ -168,6 +168,9 @@ async def main():
 asyncio.run(main())
 ```
 
+`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport; see
+`examples/python/getting-started/producer.py` for a config swap example.
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.

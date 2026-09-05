@@ -40,6 +40,27 @@ pub fn iggy_duration_to_py_delta(
     duration.get_duration().into_pyobject(py)
 }
 
+/// Converts a Python timedelta to milliseconds, for fields the Rust SDK
+/// stores as a raw millisecond count rather than an `IggyDuration` (e.g.
+/// QUIC's `keep_alive_interval`/`max_idle_timeout`). Zero is a magic value for
+/// both of those fields (disables the keep-alive, or falls back to quinn's own
+/// default), so a non-zero duration that rounds down to 0ms would silently
+/// mean something other than what was asked for.
+pub fn py_delta_to_millis(delta: &Py<PyDelta>, parameter: &str) -> PyResult<u64> {
+    let duration = py_delta_to_iggy_duration(delta)?.get_duration();
+    if !duration.is_zero() && duration.as_millis() == 0 {
+        return Err(PyValueError::new_err(format!(
+            "'{parameter}' is non-zero but rounds down to 0ms; use a duration of at least 1ms, or exactly zero"
+        )));
+    }
+    Ok(duration.as_millis() as u64)
+}
+
+/// The inverse of `py_delta_to_millis`.
+pub fn millis_to_py_delta(py: Python<'_>, millis: u64) -> PyResult<Bound<'_, PyDelta>> {
+    Duration::from_millis(millis).into_pyobject(py)
+}
+
 /// Renders a duration the way it would be written in Python, so that a `__repr__`
 /// built from it can be pasted back into a constructor.
 pub fn duration_repr(duration: IggyDuration) -> String {
@@ -51,6 +72,11 @@ pub fn duration_repr(duration: IggyDuration) -> String {
     } else {
         format!("datetime.timedelta(microseconds={micros})")
     }
+}
+
+/// The `duration_repr` equivalent for a raw millisecond count.
+pub fn millis_repr(millis: u64) -> String {
+    duration_repr(IggyDuration::new(Duration::from_millis(millis)))
 }
 
 /// Converts a duration for parameters that pace a loop, where zero means an
