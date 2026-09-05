@@ -211,8 +211,16 @@ export class CommandResponseStream extends EventEmitter {
    */
   _init() {
     this.heartbeat(this.options.heartbeatInterval);
+    this.connection.on('connecting', () => {
+      this.emit('connecting');
+    });
+    this.connection.on('connect', () => {
+      this.emit('connected');
+    });
     this.connection.on('error', (error: Error) => {
       this._failQueue(error);
+      if (this.listenerCount('error') > 0)
+        this.emit('error', error);
     });
     this.connection.on('eviction', (error: VsrEvictionError) => {
       this._resetSession();
