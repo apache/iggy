@@ -42,6 +42,7 @@ members = [
     "core/connectors/sinks/influxdb_sink",
     "core/connectors/sinks/meilisearch_sink",
     "core/connectors/sinks/mongodb_sink",
+    "core/connectors/sinks/opensearch_sink",
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/redshift_sink",
@@ -233,6 +234,7 @@ nix = { version = "0.31.3", features = ["feature", "fs", "resource", "sched"] }
 nonzero_lit = "0.1.2"
 notify = "8.2.0"
 octocrab = "0.54.1"
+opensearch = { version = "2.4.0", default-features = false, features = ["rustls-tls"] }
 opentelemetry = { version = "0.32.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["log"] }
 opentelemetry-otlp = { version = "0.32.0", features = [

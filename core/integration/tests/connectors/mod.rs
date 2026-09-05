@@ -27,6 +27,7 @@ mod iceberg;
 mod influxdb;
 mod meilisearch;
 mod mongodb;
+mod opensearch;
 mod postgres;
 mod quickwit;
 mod random;
