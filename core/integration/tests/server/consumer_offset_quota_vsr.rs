@@ -252,10 +252,6 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
             .as_code()
     );
 
-    let offsets_dir = harness.server().data_path().join(format!(
-        "streams/{}/topics/{}/partitions/{PARTITION_ID}/offsets/consumers",
-        stream_details.id, topic_details.id
-    ));
     let file_count = integration::harness::disk::consumer_offset_file_ids(
         &harness.server().data_path(),
         stream_details.id,
@@ -266,13 +262,14 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
     .expect("consumer offsets directory")
     .len();
     assert_eq!(file_count, LIMIT as usize);
-    let groups_dir = offsets_dir
-        .parent()
-        .expect("consumer offset directory has offsets parent")
-        .join("groups");
-    let group_file_count = fs::read_dir(groups_dir)
-        .map(|entries| entries.filter_map(Result::ok).count())
-        .unwrap_or_default();
+    let group_file_count = integration::harness::disk::consumer_offset_file_ids(
+        &harness.server().data_path(),
+        stream_details.id,
+        topic_details.id,
+        PARTITION_ID,
+        ConsumerKind::ConsumerGroup,
+    )
+    .map_or(0, |ids| ids.len());
     assert_eq!(group_file_count, 0);
 
     let named_group = StoreConsumerOffsetRequest {

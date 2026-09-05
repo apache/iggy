@@ -90,6 +90,7 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::BusMessage;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::Streams;
 use partitions::{Fragment, PollFragments};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages;
@@ -293,19 +294,30 @@ where
         )
         .map(|_| ())
         .ok_or_else(|| {
+            resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)
+                .err()
+                .unwrap_or(IggyError::ConsumerGroupPartitionNotOwned(
+                    client_id as u32,
+                    partition_id,
+                ))
+        })
+}
+
+pub fn resolve_offset_group_id(
+    streams: &Streams,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    group: &WireIdentifier,
+) -> Result<u64, IggyError> {
+    streams
+        .resolve_consumer_group_id(stream_id, topic_id, group)
+        .ok_or_else(|| {
             if streams
-                .resolve_consumer_group_id(stream_id, topic_id, &consumer.id)
-                .is_some()
-            {
-                IggyError::ConsumerGroupPartitionNotOwned(client_id as u32, partition_id)
-            } else if streams
                 .topic_partitions_count(stream_id, topic_id)
                 .is_some()
             {
-                missing_consumer_group_error(&consumer.id, topic_id)
+                missing_consumer_group_error(group, topic_id)
             } else {
-                // An unknown stream or topic is not a missing group: report
-                // the same not-found every other partition op gives.
                 IggyError::ResourceNotFound(String::new())
             }
         })

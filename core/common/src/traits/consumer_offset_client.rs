@@ -24,6 +24,7 @@ pub trait ConsumerOffsetClient {
     /// Store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to poll the messages.
+    /// A new key at the per-partition limit returns [`IggyError::TooManyConsumerOffsets`] (3024).
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,

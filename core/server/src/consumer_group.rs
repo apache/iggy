@@ -25,13 +25,12 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
-use crate::responses::{missing_consumer_group_error, resolve_partition_namespace};
+use crate::responses::{resolve_offset_group_id, resolve_partition_namespace};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::requests::consumer_groups::{
     JoinConsumerGroupRequest as WireJoinConsumerGroupRequest,
     LeaveConsumerGroupRequest as WireLeaveConsumerGroupRequest,
@@ -235,20 +234,12 @@ where
             if wire.consumer.kind != KIND_CONSUMER_GROUP {
                 return Ok(request);
             }
-            let Some(group_id) =
-                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
-            else {
-                // An unknown stream or topic is not a missing group: let the
-                // namespace resolution below answer it with the same
-                // not-found every other partition op reports.
-                if !topic_exists(shard, &wire.stream_id, &wire.topic_id) {
-                    return Ok(request);
-                }
-                return Err(missing_consumer_group_error(
-                    &wire.consumer.id,
-                    &wire.topic_id,
-                ));
-            };
+            let group_id = resolve_offset_group_id(
+                shard.plane.metadata().mux_stm.streams(),
+                &wire.stream_id,
+                &wire.topic_id,
+                &wire.consumer.id,
+            )?;
             // The partition-plane group-offset key is u32 (see the documented
             // ceiling on `Topic::next_consumer_group_id`). Clamp on the
             // ~4-billion-creates overflow rather than panic this live
@@ -266,46 +257,4 @@ where
     };
 
     rewrite_request_body(&request, &rewritten)
-}
-
-fn topic_exists<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    stream_id: &WireIdentifier,
-    topic_id: &WireIdentifier,
-) -> bool
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .topic_partitions_count(stream_id, topic_id)
-        .is_some()
-}
-
-/// Resolve the monotonic group id for a group consumer-offset op.
-fn resolve_group_offset_id<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    consumer: &WireConsumer,
-    namespace: (&WireIdentifier, &WireIdentifier),
-) -> Option<u64>
-where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .resolve_consumer_group_id(namespace.0, namespace.1, &consumer.id)
 }

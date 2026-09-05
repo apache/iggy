@@ -48,6 +48,7 @@ use server_common::send_messages::decode_batch_slice;
 use server_common::{SegmentStorage, yield_to_reactor};
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -626,6 +627,31 @@ const fn validate_consumer_offset_transfer_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[compio::test]
+    async fn given_transient_offset_io_failure_when_retried_should_succeed_without_exhausting_budget()
+     {
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_offset_io(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(if attempts.get() == 1 { Err(()) } else { Ok(7) })
+        })
+        .await;
+        assert_eq!(result, Ok(7));
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[compio::test]
+    async fn given_persistent_offset_io_failure_when_retried_should_stop_at_attempt_limit() {
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_offset_io(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(Err::<(), _>(7))
+        })
+        .await;
+        assert_eq!(result, Err(7));
+        assert_eq!(attempts.get(), OFFSET_IO_ATTEMPTS);
+    }
 
     fn table() -> ConsumerOffsetsWire {
         ConsumerOffsetsWire {
@@ -1321,12 +1347,9 @@ pub struct PartitionInstallOutcome {
     /// `installed_frontier`), and op-vs-offset confusion is what produced this
     /// PR's durability defects.
     pub applied_commit_op: u64,
-    /// Every transferred offset file was WRITTEN (and the offset
-    /// directories fsynced, so the old files' unlinks stick). Not a
-    /// durability claim for the file contents: `persist_offset` fsyncs only
-    /// under `consumer_offset_enforce_fsync`, matching the normal
-    /// offset-commit path -- shipped default off.
-    pub offsets_written: bool,
+    /// The offered purge generation was already recorded or persisted during
+    /// this install. False means a restart may repeat the purge and transfer.
+    pub purge_generation_recorded: bool,
 }
 
 /// Failure installing a transferred partition state. Every `check`-phase
@@ -1599,6 +1622,21 @@ fn final_paths(partition_dir: &str, start_offset: u64) -> (String, String) {
 /// depth against how long one partition monopolises it; matches the tick's
 /// superblock pre-pass.
 const OFFSET_PERSIST_CONCURRENCY: usize = 16;
+const OFFSET_IO_ATTEMPTS: usize = 3;
+
+async fn retry_offset_io<T, E, F: Future<Output = Result<T, E>>>(
+    mut operation: impl FnMut() -> F,
+) -> Result<T, E> {
+    for _ in 1..OFFSET_IO_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(_) => {
+                yield_to_reactor().await;
+            }
+        }
+    }
+    operation().await
+}
 
 /// One consumer-offset file the install is about to write. Collected before any
 /// write is issued so the offset maps and the persisted-offset tracker are never
@@ -1996,46 +2034,14 @@ where
     /// store commits them, so neither can be promoted by state transfer.
     fn offsets_wire_snapshot(&self) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
         self.validate_consumer_offset_transfer_counts()?;
-        let mut consumers = self
-            .durable_consumer_offsets
-            .committed_entries(ConsumerKind::Consumer);
         let consumer_map = self.consumer_offsets.pin();
-        for (consumer_id, _) in &consumers {
-            if !consumer_map.contains_key(&(*consumer_id as usize))
-                || self
-                    .durable_consumer_offsets
-                    .get(ConsumerKind::Consumer, *consumer_id)
-                    .is_some_and(|state| state.persisted_high_water.is_none())
-            {
-                return Err(
-                    PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
-                        kind: ConsumerKind::Consumer,
-                        consumer_id: *consumer_id,
-                    },
-                );
-            }
-        }
-        consumers.sort_unstable_by_key(|(id, _)| *id);
-        let mut groups = self
-            .durable_consumer_offsets
-            .committed_entries(ConsumerKind::ConsumerGroup);
+        let consumers = self.snapshot_offset_kind(ConsumerKind::Consumer, |id| {
+            consumer_map.contains_key(&(id as usize))
+        })?;
         let group_map = self.consumer_group_offsets.pin();
-        for (consumer_id, _) in &groups {
-            if !group_map.contains_key(&ConsumerGroupId(*consumer_id as usize))
-                || self
-                    .durable_consumer_offsets
-                    .get(ConsumerKind::ConsumerGroup, *consumer_id)
-                    .is_some_and(|state| state.persisted_high_water.is_none())
-            {
-                return Err(
-                    PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
-                        kind: ConsumerKind::ConsumerGroup,
-                        consumer_id: *consumer_id,
-                    },
-                );
-            }
-        }
-        groups.sort_unstable_by_key(|(id, _)| *id);
+        let groups = self.snapshot_offset_kind(ConsumerKind::ConsumerGroup, |id| {
+            group_map.contains_key(&ConsumerGroupId(id as usize))
+        })?;
         // The append counter, not the segment end: retention can GC every
         // sealed segment while the counter stands at N, and the receiver
         // must resume minting at N either way.
@@ -2048,6 +2054,28 @@ where
             groups,
             dedup,
         })
+    }
+
+    fn snapshot_offset_kind(
+        &self,
+        kind: ConsumerKind,
+        map_contains: impl Fn(u32) -> bool,
+    ) -> Result<Vec<(u32, u64)>, PartitionTransferUnavailable> {
+        let entries = self.durable_consumer_offsets.snapshot_entries(kind);
+        let mut snapshot = Vec::with_capacity(entries.len());
+        for (&consumer_id, state) in entries.iter() {
+            if state.persisted_high_water.is_none() || !map_contains(consumer_id) {
+                return Err(
+                    PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
+                        kind,
+                        consumer_id,
+                    },
+                );
+            }
+            snapshot.push((consumer_id, state.committed_offset));
+        }
+        snapshot.sort_unstable_by_key(|(id, _)| *id);
+        Ok(snapshot)
     }
 
     #[cfg(test)]
@@ -2911,9 +2939,10 @@ where
         let enforce_fsync = self.consumer_offset_enforce_fsync;
         for batch in planned.chunks(OFFSET_PERSIST_CONCURRENCY) {
             let writes = batch.iter().map(|write| async move {
-                let written = persist_offset(&write.path, write.value, enforce_fsync)
-                    .await
-                    .is_ok();
+                let written =
+                    retry_offset_io(|| persist_offset(&write.path, write.value, enforce_fsync))
+                        .await
+                        .is_ok();
                 (written, write.kind, write.id, write.value)
             });
             for (written, kind, id, value) in futures::future::join_all(writes).await {
@@ -2940,7 +2969,7 @@ where
             .into_iter()
             .chain(self.consumer_group_offsets_path.clone())
         {
-            if fsync_dir(&dir).await.is_err() {
+            if retry_offset_io(|| fsync_dir(&dir)).await.is_err() {
                 offsets_written = false;
             }
         }
@@ -3003,8 +3032,8 @@ where
         // would make a restart re-purge the just-installed data and pull it
         // all over again. A write failure only re-opens that restart window
         // (the wipe-then-retransfer is self-healing, peers keep the data),
-        // so it degrades like the offset writes above instead of failing the
-        // install.
+        // so it is reported separately from the mandatory offset writes.
+        let mut purge_generation_recorded = true;
         if offsets_wire.purge_generation > self.applied_purge_generation
             && let Some(dir) = self.partition_dir.clone()
         {
@@ -3026,7 +3055,7 @@ where
                      generation; a restart before the next purge records it will \
                      re-purge and re-transfer this partition"
                 );
-                offsets_written = false;
+                purge_generation_recorded = false;
             }
         }
         self.applied_purge_generation = self
@@ -3067,7 +3096,7 @@ where
 
         Ok(PartitionInstallOutcome {
             applied_commit_op: commit_op,
-            offsets_written,
+            purge_generation_recorded,
         })
     }
 
@@ -3116,10 +3145,10 @@ where
             .chain(self.consumer_group_offsets_path.iter())
         {
             for path in strayed_offset_files(Some(dir), &[]) {
-                delete_persisted_offset(&path).await?;
+                retry_offset_io(|| delete_persisted_offset(&path)).await?;
             }
             if std::path::Path::new(dir).exists() {
-                fsync_dir(dir)
+                retry_offset_io(|| fsync_dir(dir))
                     .await
                     .map_err(|_| iggy_common::IggyError::CannotSyncFile)?;
             }

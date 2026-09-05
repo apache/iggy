@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy_common::ConsumerKind;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -116,12 +116,20 @@ impl DurableConsumerOffsets {
             .set(self.membership_epoch.get().wrapping_add(1));
     }
 
+    #[cfg(any(test, feature = "simulator"))]
     pub(crate) fn committed_entries(&self, kind: ConsumerKind) -> Vec<(u32, u64)> {
         self.entries(kind)
             .borrow()
             .iter()
             .map(|(id, state)| (*id, state.committed_offset))
             .collect()
+    }
+
+    pub(crate) fn snapshot_entries(
+        &self,
+        kind: ConsumerKind,
+    ) -> Ref<'_, HashMap<u32, DurableOffsetState>> {
+        self.entries(kind).borrow()
     }
 
     const fn entries(&self, kind: ConsumerKind) -> &RefCell<HashMap<u32, DurableOffsetState>> {

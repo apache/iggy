@@ -67,7 +67,10 @@ use metadata::impls::metadata::{
     StreamsFrontend, build_truncate_partition_client_message,
     build_truncate_partition_client_message_with_identifiers,
 };
-use partitions::{AutoCommitApplied, PollPlan, PollingArgs, PollingConsumer};
+use partitions::{
+    AutoCommitApplied, ConsumerOffsetCapacityError, PollFragments, PollPlan, PollingArgs,
+    PollingConsumer,
+};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
@@ -111,26 +114,7 @@ where
                         spawn_poll_io(Rc::clone(&shard), namespace, plan, reply);
                     }
                     Some(plan) => {
-                        let result = match plan.execute_resident() {
-                            Ok((fragments, current_offset, auto_commit)) => {
-                                if let Some(applied) = auto_commit
-                                    && let Err(error) =
-                                        submit_auto_commit(&shard, namespace, &applied)
-                                {
-                                    PartitionReadReply::Rejected(error)
-                                } else {
-                                    PartitionReadReply::Poll {
-                                        fragments,
-                                        current_offset,
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                shard.metrics().record_consumer_offset_denied(error.kind);
-                                warn_auto_commit_capacity(namespace, error);
-                                PartitionReadReply::Rejected(error.into())
-                            }
-                        };
+                        let result = poll_reply(&shard, namespace, plan.execute_resident());
                         let _ = reply.try_send(result);
                     }
                 }
@@ -212,27 +196,42 @@ fn spawn_poll_io<B, MJ, S, SB>(
                 "slow partition poll; gather side may have timed out"
             );
         }
-        let result = match result {
-            Ok((fragments, current_offset, auto_commit)) => {
-                if let Some(applied) = auto_commit
-                    && let Err(error) = submit_auto_commit(&shard, namespace, &applied)
-                {
-                    PartitionReadReply::Rejected(error)
-                } else {
-                    PartitionReadReply::Poll {
-                        fragments,
-                        current_offset,
-                    }
-                }
-            }
-            Err(error) => {
-                shard.metrics().record_consumer_offset_denied(error.kind);
-                warn_auto_commit_capacity(namespace, error);
-                PartitionReadReply::Rejected(error.into())
-            }
-        };
+        let result = poll_reply(&shard, namespace, result);
         let _ = reply.try_send(result);
     });
+}
+
+fn poll_reply<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    namespace: IggyNamespace,
+    result: Result<(PollFragments, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError>,
+) -> PartitionReadReply
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    match result {
+        Ok((fragments, current_offset, auto_commit)) => {
+            if let Some(applied) = auto_commit
+                && let Err(error) = submit_auto_commit(shard, namespace, &applied)
+            {
+                PartitionReadReply::Rejected(error)
+            } else {
+                PartitionReadReply::Poll {
+                    fragments,
+                    current_offset,
+                }
+            }
+        }
+        Err(error) => {
+            shard.metrics().record_consumer_offset_denied(error.kind);
+            warn_auto_commit_capacity(namespace, error);
+            PartitionReadReply::Rejected(error.into())
+        }
+    }
 }
 
 /// Replicate a poll's auto-committed offset through the partition consensus so
@@ -525,11 +524,8 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     // metadata access to resolve it.
     let request = match maybe_rewrite_consumer_offset_request(shard, request) {
         Ok(rewritten) => rewritten,
-        // Not reachable through the wire path: the same body already decoded in
-        // `resolve_partition_request_namespace` above, and re-encoding it can
-        // only fail past `u32::MAX` bytes against a 64 MiB request cap. Denying
-        // typed keeps a future re-encode failure from acking work the partition
-        // plane never saw.
+        // Metadata can change during the routing wait, so a previously valid
+        // group may be missing now. Preserve the typed failure before submit.
         Err(error) => {
             warn!(
                 transport_client_id,

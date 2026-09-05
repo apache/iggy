@@ -2444,8 +2444,7 @@ where
                             .record_stranded(consumer_id);
                     }
                 }
-            }
-            if offset.is_none() {
+            } else {
                 self.consumer_offset_capacity_for(kind)
                     .record_stranded(consumer_id);
             }
@@ -2641,8 +2640,21 @@ where
             .then_some(IggyError::InvalidOffset(offset))
     }
 
-    #[allow(clippy::too_many_lines)]
     fn resynchronize_consumer_offset_reservations(&mut self) {
+        self.resynchronize_consumer_offset_reservations_inner(false);
+    }
+
+    /// Retry incomplete accounting at most once per shard tick, after progress.
+    pub fn retry_consumer_offset_reservations(&mut self) {
+        if self.consumer_offset_capacity.is_uncertain()
+            || self.consumer_group_offset_capacity.is_uncertain()
+        {
+            self.resynchronize_consumer_offset_reservations_inner(true);
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn resynchronize_consumer_offset_reservations_inner(&mut self, from_tick: bool) {
         let current_view = self.consensus.view();
         let scan_state = (
             self.consensus.commit_min(),
@@ -2650,14 +2662,17 @@ where
             self.consensus.sequencer().current_sequence(),
             self.log.journal().inner.last_op(),
         );
-        let retry_uncertain = (self.consumer_offset_capacity.is_uncertain()
-            || self.consumer_group_offset_capacity.is_uncertain())
-            && self.offset_reservations_scan_state != Some(scan_state);
-        if current_view == self.observed_view
-            && !self.offset_reservations_need_resync.get()
-            && !retry_uncertain
-        {
-            return;
+        let uncertain = self.consumer_offset_capacity.is_uncertain()
+            || self.consumer_group_offset_capacity.is_uncertain();
+        if current_view == self.observed_view {
+            if uncertain && !from_tick {
+                return;
+            }
+            let retry_requested = self.offset_reservations_need_resync.get()
+                || (uncertain && self.offset_reservations_scan_state != Some(scan_state));
+            if !retry_requested {
+                return;
+            }
         }
 
         if current_view != self.observed_view {
@@ -2745,31 +2760,47 @@ where
         self.observed_view = current_view;
         self.consumer_group_offsets_need_reconcile.set(true);
         self.offset_reservations_scan_state = Some(scan_state);
-        // Retry uncertainty on journal or frontier progress, not every tick.
+        // The shard tick retries uncertainty after journal or frontier progress.
         self.offset_reservations_need_resync.set(false);
-        if !decode_failed {
-            self.reclaim_phantom_offsets(ConsumerKind::Consumer);
-            self.reclaim_phantom_offsets(ConsumerKind::ConsumerGroup);
-        }
     }
 
-    fn reclaim_phantom_offsets(&self, kind: ConsumerKind) {
+    fn reclaim_phantom_offsets(&self, kind: ConsumerKind, map_count: usize) {
         let capacity = self.consumer_offset_capacity_for(kind);
         if self.durable_consumer_offsets.count(kind) >= capacity.limit()
             || !capacity.should_reclaim(&self.durable_consumer_offsets)
         {
             return;
         }
-        let keep = |id| capacity.protects(id, &self.durable_consumer_offsets);
+        let mut remaining = map_count.saturating_sub(capacity.limit()).saturating_add(1);
         match kind {
-            ConsumerKind::Consumer => self
-                .consumer_offsets
-                .pin()
-                .retain(|id, _| u32::try_from(*id).ok().is_none_or(keep)),
-            ConsumerKind::ConsumerGroup => self
-                .consumer_group_offsets
-                .pin()
-                .retain(|id, _| u32::try_from(id.0).ok().is_none_or(keep)),
+            ConsumerKind::Consumer => {
+                let map = self.consumer_offsets.pin();
+                for (key, _) in &map {
+                    if let Ok(id) = u32::try_from(*key)
+                        && !capacity.protects(id, &self.durable_consumer_offsets)
+                    {
+                        map.remove(key);
+                        remaining -= 1;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            ConsumerKind::ConsumerGroup => {
+                let map = self.consumer_group_offsets.pin();
+                for (key, _) in &map {
+                    if let Ok(id) = u32::try_from(key.0)
+                        && !capacity.protects(id, &self.durable_consumer_offsets)
+                    {
+                        map.remove(key);
+                        remaining -= 1;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
         }
         capacity.rearm_map_if_below_limit(self.consumer_offset_map_count(kind));
     }
@@ -2834,9 +2865,7 @@ where
             && let Ok(pending) = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, 0)
         {
             let capacity = self.consumer_offset_capacity_for(pending.kind);
-            if !capacity.is_uncertain()
-                && self.consumer_offset_map_count(pending.kind) >= capacity.limit()
-            {
+            if !capacity.is_uncertain() {
                 let exists = match pending.kind {
                     ConsumerKind::Consumer => self
                         .consumer_offsets
@@ -2848,7 +2877,10 @@ where
                         .contains_key(&ConsumerGroupId(pending.consumer_id as usize)),
                 };
                 if !exists {
-                    self.reclaim_phantom_offsets(pending.kind);
+                    let map_count = self.consumer_offset_map_count(pending.kind);
+                    if map_count >= capacity.limit() {
+                        self.reclaim_phantom_offsets(pending.kind, map_count);
+                    }
                 }
             }
         }
@@ -5309,8 +5341,8 @@ where
             .repair_entry(op)
             .ok_or(IggyError::InvalidCommand)?;
         // Deep copy: the journal buffer is shared and `Message::try_from`
-        // wants an `Owned`; this path only runs on the post-view-change
-        // fallback, never per-commit.
+        // wants an `Owned`. Used by view adoption, tick-bounded accounting
+        // recovery, and commit fallback when staging is absent.
         let owned = Owned::<MESSAGE_ALIGN>::copy_from_slice(entry.as_slice());
         let message = Message::<GenericHeader>::try_from(owned)
             .map_err(|_| IggyError::InvalidCommand)?
@@ -8474,7 +8506,7 @@ mod tests {
             .install_state_transfer(&repair_config(), 12, Vec::new(), &wire.encode(), 0)
             .await
             .expect("retry must install accepted state above the local cap");
-        assert!(outcome.offsets_written);
+        assert!(outcome.purge_generation_recorded);
         assert_eq!(partition.consensus.commit_min(), 12);
         assert_eq!(
             partition.durable_consumer_offset_count(ConsumerKind::Consumer),
@@ -8799,7 +8831,8 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_primary_view_change_when_phantoms_exist_should_keep_only_protected_keys() {
+    async fn given_primary_view_change_when_map_pressure_arrives_should_reclaim_only_unprotected_key()
+     {
         let (mut partition, _) = recording_partition_at(0, 3);
         partition.set_consumer_offsets_max(4);
         partition.stats.increment_messages_count(1);
@@ -8822,6 +8855,8 @@ mod tests {
         }
         partition.consensus.set_view(3);
         partition.resynchronize_consumer_offset_reservations();
+        assert_eq!(partition.consumer_offsets.len(), 4);
+        partition.reclaim_phantom_offsets(ConsumerKind::Consumer, 4);
         assert_eq!(partition.consumer_offsets.len(), 3);
         assert!(!partition.consumer_offsets.pin().contains_key(&10));
         for id in 7..=9 {
@@ -8860,6 +8895,17 @@ mod tests {
         partition.resynchronize_consumer_offset_reservations();
         assert!(partition.consumer_offset_capacity.is_uncertain());
         assert!(!partition.offset_reservations_need_resync.get());
+        let failed_scan = partition.offset_reservations_scan_state;
+        for op in 3..=20 {
+            journal_prepare(&partition, op, Operation::SendMessages).await;
+            partition.consensus.sequencer().set_sequence(op);
+            partition.offset_reservations_need_resync.set(true);
+            partition.resynchronize_consumer_offset_reservations();
+            assert_eq!(partition.offset_reservations_scan_state, failed_scan);
+        }
+        partition.retry_consumer_offset_reservations();
+        assert_ne!(partition.offset_reservations_scan_state, failed_scan);
+        assert!(partition.consumer_offset_capacity.is_uncertain());
         partition.seed_recovered_consumer_offset(ConsumerKind::Consumer, 7, 0, 0);
         let existing = partition
             .auto_commit_ctx(PollingConsumer::Consumer(7, 0), true)
@@ -8879,6 +8925,8 @@ mod tests {
         }
         partition.consensus.sequencer().set_sequence(3);
         partition.resynchronize_consumer_offset_reservations();
+        assert!(partition.consumer_offset_capacity.is_uncertain());
+        partition.retry_consumer_offset_reservations();
         assert!(!partition.consumer_offset_capacity.is_uncertain());
     }
 
@@ -8932,7 +8980,9 @@ mod tests {
         }
         let args = PollingArgs::new(iggy_common::PollingStrategy::first(), 1, true);
         let _ = partition.build_poll_plan(PollingConsumer::Consumer(3, 0), &args, false);
-        assert!(partition.consumer_offsets.is_empty());
+        assert_eq!(partition.consumer_offsets.len(), 1);
+        let retained_id = *partition.consumer_offsets.pin().keys().next().unwrap();
+        assert!(retained_id == 1 || retained_id == 2);
         assert!(
             partition
                 .auto_commit_ctx(PollingConsumer::Consumer(3, 0), true)
@@ -8940,6 +8990,8 @@ mod tests {
                 .apply(0)
                 .is_ok()
         );
+        assert!(partition.consumer_offsets.pin().contains_key(&retained_id));
+        assert_eq!(partition.consumer_offsets.len(), 2);
         assert!(!partition.consensus.is_primary());
     }
 
