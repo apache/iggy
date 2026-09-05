@@ -23,8 +23,20 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 
 public record Partitioning(PartitioningKind kind, byte[] value) {
+
+    /** Server-side cap on a messages key, in encoded bytes, matching its u8 length prefix. */
+    public static final int MAX_MESSAGES_KEY_LENGTH = 255;
+
+    public Partitioning {
+        if (value.length > MAX_MESSAGES_KEY_LENGTH) {
+            throw new IggyInvalidArgumentException(
+                    "Partitioning value must be at most " + MAX_MESSAGES_KEY_LENGTH + " bytes, got " + value.length);
+        }
+    }
+
     public static Partitioning balanced() {
         return new Partitioning(PartitioningKind.Balanced, new byte[] {});
     }
@@ -38,10 +50,15 @@ public record Partitioning(PartitioningKind kind, byte[] value) {
     }
 
     public static Partitioning messagesKey(String key) {
-        if (key == null || key.isBlank() || key.length() > 255) {
-            throw new IggyInvalidArgumentException("Key must be non-empty and less than 255 characters long");
+        if (key == null || key.isBlank()) {
+            throw new IggyInvalidArgumentException("Key must be non-empty");
         }
-        return new Partitioning(PartitioningKind.MessagesKey, key.getBytes());
+        byte[] encoded = key.getBytes(StandardCharsets.UTF_8);
+        if (encoded.length > MAX_MESSAGES_KEY_LENGTH) {
+            throw new IggyInvalidArgumentException(
+                    "Key must be at most " + MAX_MESSAGES_KEY_LENGTH + " bytes, got " + encoded.length);
+        }
+        return new Partitioning(PartitioningKind.MessagesKey, encoded);
     }
 
     public int getSize() {

@@ -19,6 +19,7 @@
 
 package org.apache.iggy.client.async.tcp;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.async.UsersClient;
@@ -35,6 +36,7 @@ import org.apache.iggy.user.UserStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -155,20 +157,23 @@ public class UsersTcpClient implements UsersClient {
         return routingHook.loginOnLeader(() -> loginWithoutRedirect(username, password));
     }
 
+    static ByteBuf loginPayload(String username, String password, String version, String context) {
+        byte[] versionBytes = version.getBytes(StandardCharsets.UTF_8);
+        byte[] contextBytes = context.getBytes(StandardCharsets.UTF_8);
+        var payload = Unpooled.buffer();
+        payload.writeBytes(toBytes(username));
+        payload.writeBytes(toBytes(password));
+        payload.writeIntLE(versionBytes.length);
+        payload.writeBytes(versionBytes);
+        payload.writeIntLE(contextBytes.length);
+        payload.writeBytes(contextBytes);
+        return payload;
+    }
+
     private CompletableFuture<IdentityInfo> loginWithoutRedirect(String username, String password) {
         String version = IggyVersion.getInstance().getUserAgent();
         String context = IggyVersion.getInstance().toString();
-
-        var payload = Unpooled.buffer();
-        var usernameBytes = toBytes(username);
-        var passwordBytes = toBytes(password);
-
-        payload.writeBytes(usernameBytes);
-        payload.writeBytes(passwordBytes);
-        payload.writeIntLE(version.length());
-        payload.writeBytes(version.getBytes());
-        payload.writeIntLE(context.length());
-        payload.writeBytes(context.getBytes());
+        var payload = loginPayload(username, password, version, context);
 
         log.debug("Logging in user: {}", username);
 
