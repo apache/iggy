@@ -9919,14 +9919,29 @@ where
     }
 }
 
-/// Whether the parked `StartView` log names every op in the uncommitted
-/// suffix `(commit_max, head]`, in descending order. Only this canonical list
-/// makes fetching bodies above the commit point safe.
+/// Whether the parked `StartView` log names every op in the adopted suffix
+/// `(commit_max, pending.op_head]`, in descending order. Only this canonical
+/// list makes fetching bodies above the commit point safe.
+///
+/// `head` may sit ABOVE the adopted suffix, and pinning the two together
+/// wedged the group. A backup that adopts a suffix while it is also behind its
+/// own commit frontier closes the lag first and reaches the suffix on the arm
+/// after ([`partition_is_gap_stopped`]); the live primary's next prepare lands
+/// meanwhile, passes the sequential gap check, and carries `head` one past the
+/// adopted head. With the two pinned, this detector went quiet exactly then --
+/// the adopted body never arrived, the primary's retransmits kept hitting the
+/// gap check, and nothing armed again.
+///
+/// Widening the window to `head` stays safe: an op above `pending.op_head` is
+/// resident by construction, because the only way past the gap check is
+/// journaling each op in turn. So `(commit_max, head]` is incomplete precisely
+/// where the adopted suffix is, and `apply_repaired_prepare` still refuses any
+/// body above the commit point that this list does not name.
 fn pending_covers_suffix(pending: &MergedLog, commit_max: u64, head: u64) -> bool {
-    if head <= commit_max || pending.commit_max != commit_max || pending.op_head != head {
+    if head <= commit_max || pending.commit_max != commit_max || pending.op_head > head {
         return false;
     }
-    let mut expected = head;
+    let mut expected = pending.op_head;
     for header in pending
         .headers
         .iter()
@@ -10795,6 +10810,20 @@ mod repair_scope_tests {
         let mut wrong_frontier = pending;
         wrong_frontier.commit_max = 97;
         assert!(!pending_covers_suffix(&wrong_frontier, 98, 100));
+    }
+
+    #[test]
+    fn given_a_parked_view_when_the_head_ran_past_the_adopted_suffix_should_still_cover_it() {
+        // The wedge this guards: a backup that adopts a suffix while it is also
+        // behind its own commit frontier repairs the lag first, and the live
+        // primary's next prepares carry the head past the adopted head before
+        // the suffix arm comes round. Read as "no suffix", nothing ever fetches
+        // the adopted body and the primary's retransmits gap-check forever.
+        assert!(pending_covers_suffix(&parked(), 98, 102));
+
+        // A parked head ABOVE the local head is a different shape -- ops this
+        // replica has not sequenced at all -- and stays out of scope.
+        assert!(!pending_covers_suffix(&parked(), 98, 99));
     }
 }
 
