@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import { randomFillSync } from 'node:crypto';
 import { uint32ToBuf, u128ToBuf, uint8ToBuf } from '../number.utils.js';
 import { serializeHeaders, type Headers } from './header.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
@@ -31,8 +32,8 @@ import {
 /** Size of the message ID in bytes (u128) */
 const MESSAGE_ID_SIZE = 16;
 
-/** Exclusive upper bound for a numeric message ID: a u128 must be < 2^128. */
-const MESSAGE_ID_UPPER_BOUND = 1n << 128n;
+/** Exclusive upper bound for a numeric message ID: it must be < 2^(size*8). */
+const MESSAGE_ID_UPPER_BOUND = 1n << BigInt((MESSAGE_ID_SIZE * 8));
 
 /** Largest representable frame timestamp delta (u32, microseconds) */
 const MAX_TIMESTAMP_DELTA = 0xFFFF_FFFFn;
@@ -102,7 +103,7 @@ export const serializeMessageId = (id?: unknown) => {
 
     const idValue = 'number' === typeof id ? BigInt(id) : id;
     if (idValue >= MESSAGE_ID_UPPER_BOUND)
-      throw new Error(`invalid message id: '${id}' (numeric id must be < 2^128)`)
+      throw new Error(`invalid message id: '${id}' (numeric id must be < 2^${MESSAGE_ID_SIZE * 8})`)
     return u128ToBuf(idValue);
   }
 
@@ -118,26 +119,38 @@ export const serializeMessageId = (id?: unknown) => {
 
 }
 
+/** Number of ids drawn per CSPRNG refill. One randomFillSync fills the whole
+ *  pool; ids are handed out from it until drained, amortizing the per-call
+ *  crypto overhead (~2us) across this many mints. */
+const ID_POOL_COUNT = 4096;
+
+/** Pooled random bytes and a cursor into them. Filled lazily on first mint. */
+const idPool = Buffer.allocUnsafe(ID_POOL_COUNT * MESSAGE_ID_SIZE);
+let idPoolCursor = idPool.length; // past the end -> refill on first use
+
 /**
- * Mints a random 16-byte message ID.
+ * Mints a random 16-byte message ID from a pooled CSPRNG buffer.
  *
- * Fills the buffer with four little-endian 32-bit draws from `Math.random`
- * (V8 xorshift128+) — no UUID string, no hex round-trip, no BigInt (issue
- * #4066). The id is opaque, not keyed on, and need not be secret, so a
- * non-cryptographic PRNG is appropriate; 128 bits keeps collisions far below
- * the birthday bound at any realistic message rate. The all-zero result has
- * probability 2^-128, so the "non-zero" intent holds without a per-message
- * retry.
+ * One randomFillSync fills the whole pool; each mint copies the next 16 bytes
+ * into a freshly owned buffer and advances the cursor, refilling when drained.
+ * Amortizing the per-call crypto cost across ID_POOL_COUNT ids makes this both
+ * faster than a per-id draw and stronger than a non-cryptographic PRNG. The id
+ * is opaque and not keyed on, so its only requirements are uniqueness and a
+ * non-zero value; 128 bits keeps collisions far below the birthday bound, and
+ * the all-zero result has probability 2^-128, so "non-zero" holds without a
+ * retry. The bytes are copied out, so the id stays valid across a later refill.
  *
- * @returns 16-byte buffer of random bytes
+ * @returns 16-byte buffer of random bytes owned by the caller
  */
 const mintMessageId = (): Buffer => {
-  const b = Buffer.allocUnsafe(MESSAGE_ID_SIZE);
-  b.writeUInt32LE((Math.random() * 0x1_0000_0000) >>> 0, 0);
-  b.writeUInt32LE((Math.random() * 0x1_0000_0000) >>> 0, 4);
-  b.writeUInt32LE((Math.random() * 0x1_0000_0000) >>> 0, 8);
-  b.writeUInt32LE((Math.random() * 0x1_0000_0000) >>> 0, 12);
-  return b;
+  if (idPoolCursor + MESSAGE_ID_SIZE > idPool.length) {
+    randomFillSync(idPool);
+    idPoolCursor = 0;
+  }
+  const id = Buffer.allocUnsafe(MESSAGE_ID_SIZE);
+  idPool.copy(id, 0, idPoolCursor, idPoolCursor + MESSAGE_ID_SIZE);
+  idPoolCursor += MESSAGE_ID_SIZE;
+  return id;
 };
 
 /**
