@@ -184,8 +184,17 @@ jobs:
           retention-days: 7
 
   windows:
-    if: false # TODO(hubcio): temporarily disabled
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      # Windows exposes no `python3.X` on PATH and maturin's py-launcher
+      # fallback does not see setup-python tool-cache installs, so one
+      # job cannot target several interpreters. One job per version
+      # instead, each falling through to maturin's default of the
+      # interpreter on PATH. 3.10 is Windows-only excluded, see
+      # WHEEL_MATRIX_SKIP in scripts/ci/sync-python-interpreter-version.sh.
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
@@ -209,22 +218,51 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.10"
+          python-version: ${{ matrix.python-version }}
           architecture: x64
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          shared-key: python-wheels-windows
+
+      # aws-lc-sys, reached through quinn's default rustls provider,
+      # assembles its x86_64 crypto with NASM. The runner image ships
+      # CMake but not NASM, and Chocolatey leaves it off PATH.
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          $nasmDir = "C:\Program Files\NASM"
+          choco install nasm --no-progress -y
+          Add-Content -Path $env:GITHUB_PATH -Value $nasmDir
+          # GITHUB_PATH only reaches later steps, so prove the install
+          # landed where expected here rather than in a linker error.
+          $env:PATH = "$nasmDir;$env:PATH"
+          nasm -v
+
+      - name: Generate third-party license manifest
+        shell: bash
+        run: |
+          TARGET="x86_64-pc-windows-msvc"
+          # HOME is Windows-style here, which MSYS tar mishandles as -C.
+          CARGO_BIN="$(cygpath -u "$HOME")/.cargo/bin"
+          curl -sSfL "https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.0/cargo-about-0.9.0-${TARGET}.tar.gz" \
+            | tar -xz -C "$CARGO_BIN" --strip-components=1 "cargo-about-0.9.0-${TARGET}/cargo-about.exe"
+          ./scripts/ci/third-party-licenses.sh --generate --manifest foreign/python/Cargo.toml --output foreign/python/LICENSE-binary
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: x86_64
           working-directory: foreign/python
-          args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
+          args: --release --out dist
           sccache: "true"
 
       - name: Upload wheels
         if: inputs.upload_artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: wheels-windows-x64
+          name: wheels-windows-x64-py${{ matrix.python-version }}
           path: foreign/python/dist
           retention-days: 7
 
@@ -265,7 +303,7 @@ jobs:
 
   collect:
     name: Collect all wheels
-    needs: [linux, macos, sdist] # TODO(hubcio): add windows back when re-enabled
+    needs: [linux, macos, windows, sdist]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     outputs:
@@ -312,3 +350,33 @@ jobs:
 
       - id: output
         run: echo "artifact_name=python-wheels-all" >> $GITHUB_OUTPUT
+
+      # Runs last so the artifact and the summary survive for inspection
+      # when a leg is missing. A failed build job uploads nothing, so a
+      # short count means one did not contribute. These counts are not
+      # derived from the matrices above - update them together.
+      - name: Verify wheel coverage
+        run: |
+          EXPECTED_LINUX=16   # 4 build variants x 4 interpreters
+          EXPECTED_MACOS=8    # 2 targets x 4 interpreters
+          EXPECTED_WINDOWS=3  # 1 interpreter per job, 3.10 excluded
+          EXPECTED_SDIST=1
+
+          missing=0
+          check() {
+            local label="$1" pattern="$2" expected="$3" actual
+            actual=$(find dist -maxdepth 1 -name "$pattern" | wc -l)
+            if [ "$actual" -ne "$expected" ]; then
+              echo "::error::${label}: expected ${expected}, found ${actual}"
+              missing=1
+            else
+              echo "${label}: ${actual}"
+            fi
+          }
+
+          check Linux '*linux*.whl' "$EXPECTED_LINUX"
+          check macOS '*macosx*.whl' "$EXPECTED_MACOS"
+          check Windows '*win*.whl' "$EXPECTED_WINDOWS"
+          check sdist '*.tar.gz' "$EXPECTED_SDIST"
+
+          exit "$missing"
