@@ -114,6 +114,11 @@ impl EndpointRegistry {
         let mut dropped_static = 0;
         for (endpoint_id, mut endpoint) in persisted.endpoints {
             endpoint.submitted = true;
+            // The id is both the map key and a field, and both are written out.
+            // A hand-edited state file could disagree between them, which would
+            // split `owner_of`, keyed off the map, from `lookup_secret_path`,
+            // built from the field. The key wins.
+            endpoint.endpoint_id = endpoint_id.clone();
             let revoked = !endpoint.is_active();
             // Registration rejects a malformed `hmac_header`, but state written
             // by an older build, or edited by hand, can still carry one. Such an

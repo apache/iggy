@@ -26,6 +26,7 @@
 //! a response here means "accepted", not "written"; `GET /admin/endpoints`
 //! reports `submitted` per endpoint for callers that need the difference.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
@@ -304,8 +305,18 @@ async fn rotate_secret(
 async fn revoke_endpoint(
     State(state): State<Arc<ServerState>>,
     Path(endpoint_id): Path<String>,
-    body: Option<Json<RevokeRequest>>,
+    body: Result<Option<Json<RevokeRequest>>, JsonRejection>,
 ) -> Response {
+    // `Option<Json<_>>` alone yields `None` only when there is no content
+    // type; malformed JSON or the wrong one came back as axum's plain-text
+    // rejection, which is neither this API's `{"error":..}` shape nor
+    // documented anywhere.
+    let body = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            return error_response(rejection.status(), "invalid request body");
+        }
+    };
     let reason = body
         .and_then(|Json(request)| request.reason)
         .unwrap_or_else(|| "unspecified".to_string());
@@ -467,8 +478,9 @@ fn generate_endpoint_id() -> EndpointId {
         .expect("hex of 16 bytes is 32 lowercase hex characters")
 }
 
-// Unlike the plugin config, these never carry the runtime's flat env
-// overrides, so a rejected unknown field is a caller typo and nothing else.
+// The three request bodies below reject unknown fields. Unlike the plugin
+// config, they never carry the runtime's flat env overrides, so a rejected
+// unknown field is a caller typo and nothing else.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegisterRequest {
@@ -485,16 +497,12 @@ struct RegisterRequest {
     expires_at: Option<u64>,
 }
 
-// Unlike the plugin config, these never carry the runtime's flat env
-// overrides, so a rejected unknown field is a caller typo and nothing else.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RotateRequest {
     auth_secret: SecretString,
 }
 
-// Unlike the plugin config, these never carry the runtime's flat env
-// overrides, so a rejected unknown field is a caller typo and nothing else.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RevokeRequest {
@@ -517,6 +525,10 @@ struct EndpointSummary {
     state: &'static str,
     origin: &'static str,
     auth_type: EndpointAuthType,
+    /// Neither is secret, and without them an operator debugging a 401 cannot
+    /// see which header the endpoint reads or what prefix it strips.
+    hmac_header: String,
+    hmac_prefix: String,
     expires_at: Option<u64>,
     /// False until the batch carrying this endpoint has been handed to the
     /// runtime. Not `persisted`: the plugin gets no acknowledgement that the
@@ -540,6 +552,8 @@ impl EndpointSummary {
             state: endpoint.state.as_str(),
             origin: endpoint.origin.as_str(),
             auth_type: endpoint.auth_type,
+            hmac_header: endpoint.hmac_header.clone(),
+            hmac_prefix: endpoint.hmac_prefix.clone(),
             expires_at: endpoint.expires_at,
             // Derived, not read straight off the endpoint: `take_dirty_state`
             // marks the whole registry submitted before the state leaves, and a
@@ -1138,6 +1152,40 @@ mod tests {
             rotated.status(),
             StatusCode::CONFLICT,
             "an endpoint with no auth has no secret to rotate"
+        );
+        fixture.close().await;
+    }
+
+    #[tokio::test]
+    async fn given_malformed_json_when_revoked_should_answer_in_the_api_error_shape() {
+        // Bad JSON used to come back as axum's plain-text rejection, which is
+        // neither this API's shape nor listed in the README.
+        let fixture = Fixture::start(Some(TOKEN)).await;
+        let registered = fixture
+            .register(json!({"instance": "http_github", "auth_type": "none"}))
+            .await;
+        let endpoint_id = registered
+            .json::<Value>()
+            .await
+            .expect("the response must be json")["endpoint_id"]
+            .as_str()
+            .expect("the response must carry the endpoint id")
+            .to_string();
+
+        let response = client()
+            .delete(format!("{}/admin/endpoints/{endpoint_id}", fixture.admin))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .expect("the request must reach the admin listener");
+
+        assert!(response.status().is_client_error());
+        let body: Value = response.json().await.expect("the error must be json");
+        assert!(
+            body.get("error").is_some(),
+            "every management error answers with an `error` field, got: {body}"
         );
         fixture.close().await;
     }
