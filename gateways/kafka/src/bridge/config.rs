@@ -91,7 +91,7 @@ impl IggyBridgeConfig {
     /// expects, embedding credentials. Never pass the result to a `tracing`/`format!` call that
     /// might reach a log line - it exposes `password` in full, unlike this struct's own `Debug`.
     ///
-    /// Pins `reconnection_retries` to [`RECONNECTION_RETRIES`] rather than the SDK's own default
+    /// Pins `reconnection_retries` to `RECONNECTION_RETRIES` rather than the SDK's own default
     /// (`TcpClientReconnectionConfig::default()` is `max_retries: None` - unlimited, one dial per
     /// second, forever). A Kafka client already retries at the wire-protocol level once a handler
     /// maps a bridge failure to a retriable error code; the bridge blocking a request task inside
