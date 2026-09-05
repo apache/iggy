@@ -170,6 +170,14 @@ fn default_repair_retry_interval() -> IggyDuration {
     SERVER_CONFIG.cluster.repair_retry_interval.parse().unwrap()
 }
 
+fn default_repair_gap_debounce_interval() -> IggyDuration {
+    SERVER_CONFIG
+        .cluster
+        .repair_gap_debounce_interval
+        .parse()
+        .unwrap()
+}
+
 /// serde fallback for configs written before the field existed; the value
 /// itself lives in `core/server/config.toml` like every other default.
 fn default_repair_chunk_max() -> usize {
@@ -264,10 +272,28 @@ pub struct ClusterConfig {
     /// partition repair loops. Sizes the retry threshold in consensus ticks.
     /// Zero (and the `0` / `disabled` / `unlimited` sentinels, which all parse
     /// to zero) is rejected at boot.
+    ///
+    /// Paces streams that are already open only. How long a hole waits before a
+    /// stream is opened for it is `repair_gap_debounce_interval`.
     #[serde(default = "default_repair_retry_interval")]
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub repair_retry_interval: IggyDuration,
+    /// How long a partition backup must hold committed ops it cannot walk to
+    /// before the shard sweep OPENS a repair session for it.
+    ///
+    /// Separate from `repair_retry_interval`, which paces an already-open
+    /// stream: this one decides how long a replication hole stays open, so
+    /// raising the retry interval to quiet repair chatter must not widen it.
+    /// Floored at `PARTITION_GAP_DEBOUNCE_TICKS_MIN` consensus ticks, since one
+    /// tick of lag is ordinary pipelining and repair against it would fire on
+    /// healthy traffic; the shard crate owns the floor and `config.toml` states
+    /// its value. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
+    /// all parse to zero) is rejected at boot.
+    #[serde(default = "default_repair_gap_debounce_interval")]
+    #[serde_as(as = "DisplayFromStr")]
+    #[config_env(leaf)]
+    pub repair_gap_debounce_interval: IggyDuration,
     /// Prepares a peer serves per repair round before the requester walks to
     /// the next chunk. Each frame rides the per-peer message-bus queue, so this
     /// must stay below `message_bus.peer_queue_capacity` or a full round
@@ -276,10 +302,11 @@ pub struct ClusterConfig {
     /// be > 0 and <= `MAX_REPAIR_CHUNK_MAX`.
     #[serde(default = "default_repair_chunk_max")]
     pub repair_chunk_max: usize,
-    /// How long the metadata superblock may stay unwritable before the replica
-    /// fail-stops. While wedged the replica is already fenced quorum-invisible
-    /// and peers elect around it; this converts the log-only limp into a
-    /// distinct exit status a supervisor can act on. Zero (and the `0` /
+    /// How long a superblock may stay unwritable before the replica fail-stops.
+    /// Applies per plane: the metadata superblock, and each PARTITION's own. While
+    /// wedged the group is already fenced quorum-invisible and peers elect around
+    /// it; this converts the log-only limp into a distinct exit status a
+    /// supervisor can act on. Zero (and the `0` /
     /// `disabled` / `unlimited` sentinels, which all parse to zero) disables
     /// the fail-stop; nonzero values below
     /// `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are rejected at boot.
@@ -1001,6 +1028,13 @@ impl Validatable<ConfigurationError> for ClusterConfig {
         // The repair retry interval sizes a tick threshold that has to advance;
         // `0` / `disabled` / `unlimited` all collapse to zero and would wedge
         // every stalled repair stream - reject them.
+        if self.repair_gap_debounce_interval.get_duration().is_zero() {
+            eprintln!(
+                "Invalid cluster configuration: cluster.repair_gap_debounce_interval must be \
+                 nonzero (it debounces the partition sweep's repair arm)"
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         if self.repair_retry_interval.get_duration().is_zero() {
             eprintln!(
                 "Invalid cluster configuration: cluster.repair_retry_interval must be nonzero \
@@ -1470,6 +1504,7 @@ mod tests {
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
             repair_retry_interval: default_repair_retry_interval(),
+            repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
             superblock_wedged_fatal_timeout: default_superblock_wedged_fatal_timeout(),
             nodes: Vec::new(),
@@ -1877,6 +1912,7 @@ mod cluster_validate_tests {
             ),
             view_probe_attempts_max: default_view_probe_attempts_max(),
             repair_retry_interval: default_repair_retry_interval(),
+            repair_gap_debounce_interval: default_repair_gap_debounce_interval(),
             repair_chunk_max: default_repair_chunk_max(),
             superblock_wedged_fatal_timeout: default_superblock_wedged_fatal_timeout(),
             nodes,
@@ -2001,6 +2037,16 @@ mod cluster_validate_tests {
         // stalled repair streams.
         let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
         c.repair_retry_interval = IggyDuration::new(Duration::ZERO);
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_repair_gap_debounce_interval() {
+        // Same sentinel family as the retry interval above: `0`, `disabled` and
+        // `unlimited` all parse to zero, and a zero debounce would arm repair
+        // against a single reordered prepare on every partition.
+        let mut c = cfg(vec![node("n1", 0), node("n2", 1)]);
+        c.repair_gap_debounce_interval = IggyDuration::new(Duration::ZERO);
         assert!(c.validate().is_err());
     }
 
