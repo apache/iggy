@@ -29,6 +29,7 @@ import {
   type TLSSocket
 } from 'node:tls';
 import { describe, it, before, after } from 'node:test';
+import { Client } from './client.js';
 import { ProtocolFrameError } from './client.frame.js';
 import { IggyConnection } from './client.connection.js';
 import type { ClientConfig } from './client.type.js';
@@ -112,6 +113,28 @@ describe('IggyConnection', () => {
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(await connection.connect(), connection);
         assert.equal(connection.connected, true);
+      } finally {
+        await closeConnection(connection, server);
+      }
+    }
+  );
+
+  it('emits connecting when an attempt retries on the same socket',
+    async () => {
+      const server = await startServer();
+      const connection = new IggyConnection(connectionConfig(server));
+      const socket = connection.socket;
+      let connectingEvents = 0;
+      connection.on('connecting', () => { connectingEvents += 1; });
+      connection.on('error', () => undefined);
+      try {
+        const firstAttempt = connection.connect();
+        socket.emit('error', new Error('first attempt failed'));
+        await assert.rejects(firstAttempt, /first attempt failed/);
+        assert.equal(connection.socket, socket);
+
+        await connection.connect();
+        assert.equal(connectingEvents, 2);
       } finally {
         await closeConnection(connection, server);
       }
@@ -953,4 +976,47 @@ describe('IggyConnection', () => {
   });
 
   after(() => clearInterval(keepAlive));
+});
+
+describe('Client connection events', () => {
+  it('exposes connecting and connected events through on and once', async () => {
+    const server = await startServer();
+    const client = new Client(connectionConfig(server));
+    let connectingEvents = 0;
+    let connectedEvents = 0;
+    const connected = new Promise<void>((resolve) => {
+      assert.equal(client.on('connecting', () => {
+        connectingEvents += 1;
+      }), client);
+      assert.equal(client.once('connected', () => {
+        connectedEvents += 1;
+        resolve();
+      }), client);
+    });
+
+    try {
+      await connected;
+      assert.equal(connectingEvents, 1);
+      assert.equal(connectedEvents, 1);
+    } finally {
+      await client.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('exposes connection errors through once', async () => {
+    const unavailable = await startServer();
+    const config = connectionConfig(unavailable);
+    await new Promise<void>((resolve) => unavailable.close(() => resolve()));
+    const client = new Client(config);
+    const connectionError = new Promise<Error>((resolve) => {
+      assert.equal(client.once('error', resolve), client);
+    });
+
+    try {
+      assert.ok(await connectionError instanceof Error);
+    } finally {
+      await client.destroy();
+    }
+  });
 });
