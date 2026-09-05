@@ -307,6 +307,23 @@ async fn should_handle_resource_deletion_and_restart() {
 
             let topic_ident = Identifier::numeric(topic_idx).unwrap();
 
+            // One pass per partition. Without messages every delete below
+            // removes an empty scope, and the stats assertions across the
+            // restart would hold whether or not a delete rolls its bytes out
+            // of the parent totals.
+            for partition_id in 0..3u32 {
+                let mut messages = deletion_test_messages();
+                client
+                    .send_messages(
+                        &stream_ident,
+                        &topic_ident,
+                        &Partitioning::partition_id(partition_id),
+                        &mut messages,
+                    )
+                    .await
+                    .unwrap();
+            }
+
             // Create 3 consumer groups per topic
             for cg_idx in 0..3 {
                 client
@@ -400,12 +417,32 @@ async fn should_handle_resource_deletion_and_restart() {
         stream_ids
     );
 
+    // Deletes roll their bytes out of the parent totals at commit time; a
+    // restart rebuilds those totals from disk instead. The two have to agree,
+    // or one of the paths still counts data the other already removed.
+    let stats_before_restart = client.get_stats().await.unwrap();
+
     drop(client);
 
     // Restart server
     harness.restart_server().await.unwrap();
 
     let client = harness.tcp_root_client().await.unwrap();
+
+    let stats_after_restart = client.get_stats().await.unwrap();
+    assert!(
+        stats_before_restart.messages_count > 0,
+        "the deletes above must leave messages behind, or the comparison is vacuous"
+    );
+    assert_eq!(
+        stats_before_restart.messages_count, stats_after_restart.messages_count,
+        "messages_count must survive the restart unchanged after the deletes"
+    );
+    assert_eq!(
+        stats_before_restart.messages_size_bytes.as_bytes_u64(),
+        stats_after_restart.messages_size_bytes.as_bytes_u64(),
+        "messages_size_bytes must survive the restart unchanged after the deletes"
+    );
 
     // Verify streams after restart - should have 3 streams: 0, 1 (reused), 2
     let streams = client.get_streams().await.unwrap();
@@ -519,4 +556,18 @@ async fn should_handle_resource_deletion_and_restart() {
             cg_ids
         );
     }
+}
+
+/// Payload for `should_handle_resource_deletion_and_restart`: small, fixed and
+/// non-empty, so a scope that gets deleted has bytes worth rolling back.
+fn deletion_test_messages() -> Vec<IggyMessage> {
+    (0..8u128)
+        .map(|offset| {
+            IggyMessage::builder()
+                .id(offset + 1)
+                .payload(bytes::Bytes::from_static(b"deletion-stats-payload"))
+                .build()
+                .expect("Failed to build message")
+        })
+        .collect()
 }

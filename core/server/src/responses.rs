@@ -1382,13 +1382,14 @@ fn partition_response(
     // across all shards and both left-right buffers).
     //
     // Registration is NOT materialization: the owning shard's reconciler mints
-    // the entry (get-or-create in `fetch_partition_stats`) before it builds the
-    // partition, and `ensure_initial_segment` only bumps `segments_count` once
-    // the segment file is open. So a registry MISS and a registered entry still
-    // reading zero segments are the same thing to a caller -- committed, not yet
-    // holding storage -- and both report the deterministic shape every
-    // materialization lands on: one empty segment at offset 0. A bare zero
-    // would read as "no storage" to a client polling right after `create_topic`.
+    // the entry (get-or-create in `fetch_partition_build_inputs`) before it
+    // builds the partition, and `ensure_initial_segment` only bumps
+    // `segments_count` once the segment file is open. So a registry MISS and a
+    // registered entry still reading zero segments are the same thing to a
+    // caller -- committed, not yet holding storage -- and both report the
+    // deterministic shape every materialization lands on: one empty segment at
+    // offset 0. A bare zero would read as "no storage" to a client polling
+    // right after `create_topic`.
     //
     // Cost of the clamp: a partition fenced for rebuild (tombstoned after a
     // refused chain) also reads as one empty segment rather than zero. Telling
@@ -2103,7 +2104,9 @@ mod tests {
         // before `ensure_initial_segment` runs, so this is the SAME state to a
         // caller and must not read as "no storage".
         let topic_stats = Arc::new(TopicStats::new(Arc::new(StreamStats::default())));
-        let stats = streams.stats_registry.partition(0, 0, 0, topic_stats);
+        let stats = streams
+            .stats_registry
+            .partition(0, 0, &partition, topic_stats);
         let mid_build = partition_response(&streams, 0, 0, &partition).expect("response builds");
         assert_eq!(mid_build.segments_count, 1);
 
@@ -2151,7 +2154,12 @@ mod tests {
         // counter reported 1 here, so a caller polling `[stats]` twice saw the
         // total climb to 2 with no write in between (and `get_topic` already
         // reported 2 for the same partitions).
-        let stats = streams.stats_registry.partition(0, 0, 0, topic_stats);
+        let stats = streams.stats_registry.partition(
+            0,
+            0,
+            &Partition::new(0, 1, created_at, 0, 0),
+            topic_stats,
+        );
         stats.increment_segments_count(1);
 
         let (_, _, partitions, segments, _, _) =
@@ -2167,7 +2175,7 @@ mod tests {
         let late = streams.stats_registry.partition(
             0,
             0,
-            1,
+            &Partition::new(1, 1, created_at, 0, 0),
             Arc::new(TopicStats::new(Arc::new(StreamStats::default()))),
         );
         late.increment_segments_count(1);

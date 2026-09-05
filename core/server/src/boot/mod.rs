@@ -541,22 +541,6 @@ async fn shard_main(
             .await
             .map_err(ServerError::MetadataRecovery)?;
             ensure_default_root_user(&recovered.mux_stm);
-            // The factory bundle hands every peer a read handle over the
-            // same `Inner`, so `Arc<TopicStats>` (and the parent
-            // `Arc<StreamStats>`) is shared across all shards. Zero the
-            // snapshot totals here, once, before any peer can observe the
-            // bundle. Per-shard `load_partition` deltas in
-            // `build_shard_for_thread` then race only against other
-            // atomic adds, never against a concurrent `swap(0)` that
-            // would mistake an in-flight delta for the snapshot total
-            // and decrement the parent `StreamStats` by it.
-            let () = recovered.mux_stm.streams().read(|inner| {
-                for (_, stream) in &inner.items {
-                    for (_, topic) in &stream.topics {
-                        topic.stats.zero_out_all();
-                    }
-                }
-            });
             (
                 Rc::new(recovered.mux_stm),
                 Some(bundle_tx),

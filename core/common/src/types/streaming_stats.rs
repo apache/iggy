@@ -19,6 +19,110 @@ use std::sync::{
     Arc,
     atomic::{AtomicU32, AtomicU64, Ordering},
 };
+use tracing::warn;
+
+/// Number of rollup decrements that could not be covered by the counter they
+/// were subtracted from.
+///
+/// A decrement bigger than the total it targets means the tree lost
+/// `parent >= sum(children)` somewhere upstream. The counters are unsigned, so
+/// without a clamp that subtraction wraps to ~1.8e19 and every reader
+/// (`get_stream`, `get_topic`, `/stats`, `/metrics`) serves the wrapped value
+/// until the process restarts.
+///
+/// Clamping trades that for a total that is merely low, and low is where it
+/// stays: increments are `fetch_add`, so every later write stacks on the
+/// clamped base and carries the shortfall with it. Only a rebuild
+/// (`rebuild_parent_totals`) or a restart puts the total back. This counter
+/// plus the `warn!` below is what tells an operator the divergence happened,
+/// and that the aggregate needs a rebuild rather than time.
+static ROLLUP_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+
+/// Monotonic count of clamped rollup decrements. Surfaced on `/metrics` so the
+/// clamp is alertable rather than log-grep-able.
+///
+/// Hidden from the docs: `iggy_common` re-exports this module at its root, and
+/// a server-only diagnostic has no business in the published SDK surface.
+#[doc(hidden)]
+#[must_use]
+pub fn rollup_underflows() -> u64 {
+    ROLLUP_UNDERFLOWS.load(Ordering::Relaxed)
+}
+
+/// One scope/counter pair's clamp state: the labels an operator reads, plus the
+/// count the log throttle keys on.
+struct UnderflowSite {
+    scope: &'static str,
+    counter: &'static str,
+    clamped: AtomicU64,
+}
+
+impl UnderflowSite {
+    const fn new(scope: &'static str, counter: &'static str) -> Self {
+        Self {
+            scope,
+            counter,
+            clamped: AtomicU64::new(0),
+        }
+    }
+
+    /// Count the clamp globally, then log this pair's first and every power of
+    /// two after it.
+    ///
+    /// The throttle is per pair, not global: a skewed tree emits up to three
+    /// lines per counter per rollback and a bulk delete turns that into a
+    /// flood, so a shared count would hold a quiet pair's first-ever
+    /// divergence back for up to 1023 events behind a noisy one.
+    fn report(&self, shortfall: u64) {
+        ROLLUP_UNDERFLOWS.fetch_add(1, Ordering::Relaxed);
+        let clamped = self.clamped.fetch_add(1, Ordering::Relaxed) + 1;
+        if clamped.is_power_of_two() {
+            warn!(
+                scope = self.scope,
+                counter = self.counter,
+                shortfall,
+                clamped,
+                "rollup decrement exceeded the total it was subtracted from; clamped at zero"
+            );
+        }
+    }
+}
+
+static STREAM_SIZE_BYTES: UnderflowSite = UnderflowSite::new("stream", "size_bytes");
+static STREAM_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("stream", "messages_count");
+static STREAM_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("stream", "segments_count");
+static TOPIC_SIZE_BYTES: UnderflowSite = UnderflowSite::new("topic", "size_bytes");
+static TOPIC_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("topic", "messages_count");
+static TOPIC_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("topic", "segments_count");
+static PARTITION_SIZE_BYTES: UnderflowSite = UnderflowSite::new("partition", "size_bytes");
+static PARTITION_MESSAGES_COUNT: UnderflowSite = UnderflowSite::new("partition", "messages_count");
+static PARTITION_SEGMENTS_COUNT: UnderflowSite = UnderflowSite::new("partition", "segments_count");
+
+/// Subtract `amount`, clamping at zero instead of wrapping. Returns what was
+/// actually taken, which is what the caller passes on to its parent.
+///
+/// `fetch_update` rather than a load followed by a subtract: the counters are
+/// written from the metadata shard and from whichever shard owns the partition,
+/// so a separate load leaves a window where the clamp reads one value and
+/// subtracts from another.
+macro_rules! clamped_sub {
+    ($name:ident, $counter:ty, $amount:ty) => {
+        fn $name(counter: &$counter, amount: $amount, site: &'static UnderflowSite) -> $amount {
+            let previous = counter
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(amount))
+                })
+                .unwrap_or_else(|previous| previous);
+            if previous < amount {
+                site.report(u64::from(amount - previous));
+            }
+            previous.min(amount)
+        }
+    };
+}
+
+clamped_sub!(clamped_sub_u64, AtomicU64, u64);
+clamped_sub!(clamped_sub_u32, AtomicU32, u32);
 
 #[derive(Default, Debug)]
 pub struct StreamStats {
@@ -42,18 +146,21 @@ impl StreamStats {
             .fetch_add(segments_count, Ordering::AcqRel);
     }
 
-    pub fn decrement_size_bytes(&self, size_bytes: u64) {
-        self.size_bytes.fetch_sub(size_bytes, Ordering::AcqRel);
+    /// Returns the shortfall -- how much of `size_bytes` this counter did not
+    /// hold -- so a caller that knows the ids can name where the divergence is.
+    /// Zero whenever the decrement was covered.
+    pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
+        size_bytes - clamped_sub_u64(&self.size_bytes, size_bytes, &STREAM_SIZE_BYTES)
     }
 
-    pub fn decrement_messages_count(&self, messages_count: u64) {
-        self.messages_count
-            .fetch_sub(messages_count, Ordering::AcqRel);
+    pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
+        messages_count
+            - clamped_sub_u64(&self.messages_count, messages_count, &STREAM_MESSAGES_COUNT)
     }
 
-    pub fn decrement_segments_count(&self, segments_count: u32) {
-        self.segments_count
-            .fetch_sub(segments_count, Ordering::AcqRel);
+    pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
+        segments_count
+            - clamped_sub_u32(&self.segments_count, segments_count, &STREAM_SEGMENTS_COUNT)
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -164,21 +271,31 @@ impl TopicStats {
         self.parent.decrement_segments_count(segments_count);
     }
 
-    pub fn decrement_size_bytes(&self, size_bytes: u64) {
-        self.size_bytes.fetch_sub(size_bytes, Ordering::AcqRel);
-        self.decrement_parent_size_bytes(size_bytes);
+    // Forward what this level actually gave up, not what was asked for. A
+    // decrement bigger than the counter holds means the bytes were never in
+    // this subtree, so the ancestors do not hold them either -- passing the
+    // full amount up would take them out of a sibling's live data instead.
+    // Under `parent == sum(children)` the two are equal and nothing changes.
+    //
+    // Each returns this level's shortfall -- how much of the amount it did not
+    // hold, zero when the decrement was covered -- so a caller that knows the
+    // ids can name where the divergence is.
+    pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
+        let taken = clamped_sub_u64(&self.size_bytes, size_bytes, &TOPIC_SIZE_BYTES);
+        self.decrement_parent_size_bytes(taken);
+        size_bytes - taken
     }
 
-    pub fn decrement_messages_count(&self, messages_count: u64) {
-        self.messages_count
-            .fetch_sub(messages_count, Ordering::AcqRel);
-        self.decrement_parent_messages_count(messages_count);
+    pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
+        let taken = clamped_sub_u64(&self.messages_count, messages_count, &TOPIC_MESSAGES_COUNT);
+        self.decrement_parent_messages_count(taken);
+        messages_count - taken
     }
 
-    pub fn decrement_segments_count(&self, segments_count: u32) {
-        self.segments_count
-            .fetch_sub(segments_count, Ordering::AcqRel);
-        self.decrement_parent_segments_count(segments_count);
+    pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
+        let taken = clamped_sub_u32(&self.segments_count, segments_count, &TOPIC_SEGMENTS_COUNT);
+        self.decrement_parent_segments_count(taken);
+        segments_count - taken
     }
 
     pub fn size_bytes_inconsistent(&self) -> u64 {
@@ -282,21 +399,39 @@ impl PartitionStats {
         self.parent.increment_segments_count(segments_count);
     }
 
-    pub fn decrement_size_bytes(&self, size_bytes: u64) {
-        self.size_bytes.fetch_sub(size_bytes, Ordering::AcqRel);
-        self.decrement_parent_size_bytes(size_bytes);
+    // Forward what this level actually gave up, not what was asked for. A
+    // decrement bigger than the counter holds means the bytes were never in
+    // this subtree, so the ancestors do not hold them either -- passing the
+    // full amount up would take them out of a sibling's live data instead.
+    // Under `parent == sum(children)` the two are equal and nothing changes.
+    //
+    // Each returns this level's shortfall -- how much of the amount it did not
+    // hold, zero when the decrement was covered -- so a caller that knows the
+    // ids can name where the divergence is.
+    pub fn decrement_size_bytes(&self, size_bytes: u64) -> u64 {
+        let taken = clamped_sub_u64(&self.size_bytes, size_bytes, &PARTITION_SIZE_BYTES);
+        self.decrement_parent_size_bytes(taken);
+        size_bytes - taken
     }
 
-    pub fn decrement_messages_count(&self, messages_count: u64) {
-        self.messages_count
-            .fetch_sub(messages_count, Ordering::AcqRel);
-        self.decrement_parent_messages_count(messages_count);
+    pub fn decrement_messages_count(&self, messages_count: u64) -> u64 {
+        let taken = clamped_sub_u64(
+            &self.messages_count,
+            messages_count,
+            &PARTITION_MESSAGES_COUNT,
+        );
+        self.decrement_parent_messages_count(taken);
+        messages_count - taken
     }
 
-    pub fn decrement_segments_count(&self, segments_count: u32) {
-        self.segments_count
-            .fetch_sub(segments_count, Ordering::AcqRel);
-        self.decrement_parent_segments_count(segments_count);
+    pub fn decrement_segments_count(&self, segments_count: u32) -> u32 {
+        let taken = clamped_sub_u32(
+            &self.segments_count,
+            segments_count,
+            &PARTITION_SEGMENTS_COUNT,
+        );
+        self.decrement_parent_segments_count(taken);
+        segments_count - taken
     }
 
     pub fn decrement_parent_size_bytes(&self, size_bytes: u64) {
@@ -355,5 +490,117 @@ impl PartitionStats {
         self.zero_out_messages_count();
         self.zero_out_segments_count();
         self.zero_out_current_offset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree() -> (Arc<StreamStats>, Arc<TopicStats>, Arc<PartitionStats>) {
+        let stream = Arc::new(StreamStats::default());
+        let topic = Arc::new(TopicStats::new(stream.clone()));
+        let partition = Arc::new(PartitionStats::new(topic.clone()));
+        (stream, topic, partition)
+    }
+
+    #[test]
+    fn given_a_parent_short_of_its_child_when_rolling_back_should_clamp_instead_of_wrapping() {
+        let (stream, topic, partition) = tree();
+        partition.increment_size_bytes(512);
+        // A snapshot restore stores absolute parent totals, so a parent can end
+        // up holding less than its children do.
+        topic.store_from_snapshot(0, 0, 0);
+        stream.store_from_snapshot(0, 0, 0);
+
+        partition.zero_out_all();
+
+        assert_eq!(topic.size_bytes_inconsistent(), 0);
+        assert_eq!(stream.size_bytes_inconsistent(), 0);
+    }
+
+    /// A deleted partition keeps its handle until the reconciler tears it down,
+    /// so a retention sweep can decrement counters the delete already rolled
+    /// back. Those bytes are not in the parents any more, and taking them again
+    /// would take a live sibling's instead.
+    #[test]
+    fn given_a_late_decrement_on_a_rolled_back_partition_should_leave_siblings_alone() {
+        let stream = Arc::new(StreamStats::default());
+        let topic = Arc::new(TopicStats::new(stream.clone()));
+        let survivor = Arc::new(PartitionStats::new(topic.clone()));
+        let deleted = Arc::new(PartitionStats::new(topic.clone()));
+        survivor.increment_size_bytes(488);
+        deleted.increment_size_bytes(512);
+
+        deleted.zero_out_all();
+        assert_eq!(topic.size_bytes_inconsistent(), 488);
+
+        // Retention retiring a segment of the partition that is on its way out.
+        deleted.decrement_size_bytes(100);
+
+        assert_eq!(
+            topic.size_bytes_inconsistent(),
+            488,
+            "the survivor's bytes are the only ones left; they are not the deleted partition's"
+        );
+        assert_eq!(stream.size_bytes_inconsistent(), 488);
+        assert_eq!(survivor.size_bytes_inconsistent(), 488);
+    }
+
+    /// `delete_topic` settles the topic's residue on the stream, and the
+    /// reconciler later settles the same partition's own handle. The second
+    /// pass must find nothing left to take, or it takes it from another topic.
+    #[test]
+    fn given_a_topic_already_settled_when_its_partition_settles_should_leave_other_topics_alone() {
+        let stream = Arc::new(StreamStats::default());
+        let doomed_topic = Arc::new(TopicStats::new(stream.clone()));
+        let live_topic = Arc::new(TopicStats::new(stream.clone()));
+        let doomed_partition = Arc::new(PartitionStats::new(doomed_topic.clone()));
+        let live_partition = Arc::new(PartitionStats::new(live_topic.clone()));
+        live_partition.increment_size_bytes(900);
+        // Landed through the cached handle after the delete evicted its entry.
+        doomed_partition.increment_size_bytes(100);
+        assert_eq!(stream.size_bytes_inconsistent(), 1000);
+
+        doomed_topic.zero_out_all();
+        assert_eq!(stream.size_bytes_inconsistent(), 900);
+
+        doomed_partition.zero_out_all();
+
+        assert_eq!(
+            stream.size_bytes_inconsistent(),
+            900,
+            "the surviving topic's bytes must not pay for the deleted one's residue"
+        );
+        assert_eq!(live_topic.size_bytes_inconsistent(), 900);
+    }
+
+    #[test]
+    fn given_a_short_u32_segments_count_when_rolling_back_should_clamp_that_counter_too() {
+        let (stream, topic, partition) = tree();
+        partition.increment_segments_count(3);
+        topic.store_from_snapshot(0, 0, 0);
+        stream.store_from_snapshot(0, 0, 0);
+
+        partition.zero_out_all();
+
+        // u32 wraps at a different modulus than the two u64 counters, so it
+        // needs its own coverage.
+        assert_eq!(topic.segments_count_inconsistent(), 0);
+        assert_eq!(stream.segments_count_inconsistent(), 0);
+    }
+
+    #[test]
+    fn given_a_covered_decrement_when_rolling_back_should_subtract_exactly() {
+        let (stream, topic, partition) = tree();
+        partition.increment_size_bytes(512);
+        partition.increment_messages_count(7);
+
+        partition.decrement_size_bytes(112);
+
+        assert_eq!(partition.size_bytes_inconsistent(), 400);
+        assert_eq!(topic.size_bytes_inconsistent(), 400);
+        assert_eq!(stream.size_bytes_inconsistent(), 400);
+        assert_eq!(stream.messages_count_inconsistent(), 7);
     }
 }

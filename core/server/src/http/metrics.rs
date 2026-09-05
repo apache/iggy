@@ -45,6 +45,30 @@ pub(in crate::http) struct HttpMetrics {
     pub(in crate::http) messages: Gauge,
     pub(in crate::http) users: Gauge,
     pub(in crate::http) clients: Gauge,
+    /// Not a legacy-parity metric: the running count of rollup decrements that
+    /// had to be clamped at zero. Non-zero means a topic or stream total was
+    /// asked to give back more than it held, so the aggregate it now reports is
+    /// low, and stays low until a rebuild or a restart.
+    ///
+    /// Not "alert on any increase". A delete, a purge, a partition teardown and
+    /// a snapshot restore each open a window where a retention pass hands back
+    /// bytes the parents have already given up, and the clamp is the intended
+    /// outcome there -- the `given_a_late_decrement_on_a_rolled_back_partition`
+    /// unit test in `iggy_common::streaming_stats` drives exactly that. What is
+    /// worth paging on is a bounded rate OUTSIDE those windows: that is the
+    /// shape that says the tree is diverging rather than settling.
+    ///
+    /// A `Counter`, not a `Gauge`: it only ever climbs within a process, so
+    /// `rate()` and `increase()` are the queries an operator wants, and both are
+    /// counter-only. The scrape handler samples the source and advances this by
+    /// the difference, which is why the source is monotonic per process.
+    ///
+    /// Advanced only by the `/metrics` scrape, so it needs `http.enabled` and
+    /// `http.metrics.enabled` -- as does every other series in this registry,
+    /// which is the only Prometheus surface the server has. A TCP-only or
+    /// QUIC-only deployment exports nothing, and the per-scope `warn!` in
+    /// `iggy_common` is the whole signal there.
+    stats_rollup_underflows: Counter,
 }
 
 impl HttpMetrics {
@@ -58,6 +82,7 @@ impl HttpMetrics {
         let messages = Gauge::default();
         let users = Gauge::default();
         let clients = Gauge::default();
+        let stats_rollup_underflows = Counter::default();
         registry.register(
             "http_requests",
             "total count of http_requests",
@@ -74,6 +99,11 @@ impl HttpMetrics {
         registry.register("messages", "total count of messages", messages.clone());
         registry.register("users", "total count of users", users.clone());
         registry.register("clients", "total count of clients", clients.clone());
+        registry.register(
+            "stats_rollup_underflows",
+            "total count of aggregate stats decrements clamped at zero",
+            stats_rollup_underflows.clone(),
+        );
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
         // without a `shard_id` label in the counter label sets (see
@@ -97,6 +127,7 @@ impl HttpMetrics {
             messages,
             users,
             clients,
+            stats_rollup_underflows,
         }
     }
 
@@ -104,6 +135,17 @@ impl HttpMetrics {
     /// `Arc`-backed, so bumping the clone bumps the registered metric.
     pub(in crate::http) fn request_counter(&self) -> Counter {
         self.http_requests.clone()
+    }
+
+    /// Advance the rollup-underflow counter to `total`, the process-wide count
+    /// sampled at scrape time. A counter cannot be set, so this adds the
+    /// difference; `total` only climbs within a process, and a restart resets
+    /// both sides together, which is the counter reset Prometheus expects.
+    pub(in crate::http) fn observe_rollup_underflows(&self, total: u64) {
+        let recorded = self.stats_rollup_underflows.get();
+        if let Some(delta) = total.checked_sub(recorded) {
+            self.stats_rollup_underflows.inc_by(delta);
+        }
     }
 
     pub(in crate::http) fn formatted_output(&self) -> String {
@@ -200,6 +242,20 @@ mod tests {
         assert!(
             output.ends_with("# EOF\n"),
             "missing exposition trailer:\n{output}"
+        );
+    }
+
+    #[test]
+    fn rollup_underflow_total_tracks_the_sampled_count() {
+        let metrics = HttpMetrics::init(&[]);
+        metrics.observe_rollup_underflows(3);
+        metrics.observe_rollup_underflows(5);
+        // A restart resets the source; the counter must not run backwards.
+        metrics.observe_rollup_underflows(0);
+        let output = metrics.formatted_output();
+        assert!(
+            output.contains("\nstats_rollup_underflows_total 5\n"),
+            "expected the sampled total in the exposition:\n{output}"
         );
     }
 

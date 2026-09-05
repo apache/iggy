@@ -173,7 +173,7 @@ use futures::FutureExt;
 use iggy_common::{ConsumerGroupId, IggyTimestamp};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::Partition;
+use metadata::stm::stream::{Partition, StatsRegistry};
 use partitions::delete_persisted_offset;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
@@ -221,6 +221,12 @@ pub struct ReconcilerCtx {
     pub cluster_id: u128,
     pub self_replica_id: u8,
     pub replica_count: u8,
+    /// The shared per-entity stats registry, cloned once at construction. It is
+    /// minted during metadata bootstrap and never re-minted, and a topic delete
+    /// settles one namespace per partition, so reading it out of the STM per
+    /// teardown would open a reader epoch per partition for a clone that cannot
+    /// change.
+    stats_registry: Arc<StatsRegistry>,
     failure_state: RefCell<AHashMap<(IggyNamespace, FailureCause), FailureRecord>>,
     /// `Streams::revision` observed at the end of the last pass that fully
     /// converged. Paired with `last_pass_noop` for the fast-skip in
@@ -241,6 +247,12 @@ impl ReconcilerCtx {
         self_replica_id: u8,
         replica_count: u8,
     ) -> Self {
+        let stats_registry = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| Arc::clone(&inner.stats_registry));
         Self {
             shard,
             total_shards,
@@ -248,6 +260,7 @@ impl ReconcilerCtx {
             cluster_id,
             self_replica_id,
             replica_count,
+            stats_registry,
             failure_state: RefCell::new(AHashMap::new()),
             last_revision: Cell::new(None),
             last_pass_noop: Cell::new(false),
@@ -660,11 +673,12 @@ async fn reconcile_additions(
             continue;
         }
 
-        // Resolve the shared stats `Arc` only for namespaces actually
-        // built, not once per committed partition every pass. A topic that
-        // vanished between the target snapshot and this read defers to the
-        // next pass.
-        let Some((partition_stats, topic_runtime)) = fetch_partition_stats(ctx, ns) else {
+        // Resolved only for namespaces actually built, not once per committed
+        // partition every pass. A stream, topic or partition that vanished
+        // between the target snapshot and this read defers to the next pass.
+        let Some((partition_stats, topic_runtime, partition_metadata)) =
+            fetch_partition_build_inputs(ctx, ns)
+        else {
             continue;
         };
 
@@ -680,9 +694,6 @@ async fn reconcile_additions(
                 .system
                 .get_partition_path(ns.stream_id(), ns.topic_id(), ns.partition_id());
         let built = if std::fs::metadata(&partition_dir).is_ok() {
-            let Some(partition_metadata) = fetch_partition_metadata(ctx, ns) else {
-                continue;
-            };
             load_partition_or_fence(
                 ctx.config.as_ref(),
                 ns,
@@ -932,6 +943,12 @@ async fn tear_down_owned_partition(
         partitions.tombstone(ns);
     }
     shards_table.remove(&ns);
+    // Registry entry only. The mounted partition's OWN counters are settled by
+    // the `ConfirmRemove` arm, which is the point where the partition value is
+    // dropped: a handler suspended mid-append resumes and increments through
+    // its cached handle, and anything settled before that drop leaves the
+    // increment in the parent totals with nothing left to roll it back.
+    settle_partition_stats(ctx, ns);
 
     if let Err(err) = delete_partitions_from_disk(
         ns.stream_id(),
@@ -1095,8 +1112,8 @@ struct TargetPartition {
     ns: IggyNamespace,
     /// The committed `created_revision`. Lets the pass detect a stale local
     /// incarnation after slab-key reuse without an `Arc<TopicStats>` clone per
-    /// partition; stats are fetched lazily in [`fetch_partition_stats`] only
-    /// for namespaces actually built.
+    /// partition: [`fetch_partition_build_inputs`] re-reads committed metadata
+    /// for the namespaces actually built, and takes the stats there.
     epoch: u64,
     /// The view a fresh materialisation seeds its consensus group with; see
     /// `build_partition_fresh`.
@@ -1137,44 +1154,66 @@ fn current_revision(ctx: &ReconcilerCtx) -> u64 {
         .read(|inner| inner.revision)
 }
 
-/// Clone the parent topic's `Arc<TopicStats>` for a single namespace.
-/// `None` if the topic vanished between the target snapshot and this read.
-fn fetch_partition_stats(
+/// Roll a torn-down partition out of its parent topic and stream by dropping
+/// its registry entry.
+///
+/// Usually a no-op: the metadata apply evicts the entry on the commit that
+/// acked the delete. What is left for this call is a stale incarnation being
+/// torn down after a slab-key reuse, whose entry the apply never named. It must
+/// not survive into the rebuild -- `StatsRegistry::partition` is a
+/// get-or-create, so the rebuild would inherit the dead incarnation's counters.
+/// (Its `purged_generation` no longer rides along either way: a fresh entry
+/// seeds that gate from the committed partition.)
+///
+/// The mounted partition's own handle is settled later, on `ConfirmRemove`.
+fn settle_partition_stats(ctx: &ReconcilerCtx, ns: IggyNamespace) {
+    ctx.stats_registry
+        .remove_partitions(ns.stream_id(), ns.topic_id(), &[ns.partition_id()]);
+}
+
+/// Everything one namespace's build needs out of committed metadata: the shared
+/// `Arc<PartitionStats>`, the topic's runtime options, and the committed
+/// [`Partition`] record the disk loader reads `created_at` / `created_revision`
+/// / `created_view` from.
+///
+/// One read for all three. The `Partition` lookup doubles as the membership
+/// check: the committed topic has to still list this partition, because a pass
+/// captures its targets once and then awaits disk work per namespace, so
+/// without it a target captured before a `DeletePartitions` re-creates the
+/// entry that delete just evicted -- and the apply on the second left-right
+/// buffer, deferred to a later publish, then zeroes a live partition's counters
+/// and drops its entry again.
+///
+/// `None` if the stream, the topic, or the partition vanished between the
+/// target snapshot and this read.
+fn fetch_partition_build_inputs(
     ctx: &ReconcilerCtx,
     ns: IggyNamespace,
 ) -> Option<(
     Arc<iggy_common::PartitionStats>,
     iggy_common::TopicRuntimeOptions,
+    Partition,
 )> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
         let stream = inner.items.get(ns.stream_id())?;
         let topic = stream.topics.get(ns.topic_id())?;
+        let partition = topic
+            .partitions
+            .iter()
+            .find(|partition| partition.id == ns.partition_id())?
+            .clone();
         // Get-or-create in the shared registry so the owning shard's counters
         // are the same `Arc` every shard's `get_topic` reply reads.
         Some((
             inner.stats_registry.partition(
                 ns.stream_id(),
                 ns.topic_id(),
-                ns.partition_id(),
+                &partition,
                 topic.stats.clone(),
             ),
             iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options),
+            partition,
         ))
-    })
-}
-
-/// The committed [`Partition`] record for `ns`, which the disk loader needs
-/// (`created_at`, `created_revision`, `created_view`). `None` if the topic or
-/// partition vanished between the target snapshot and this read.
-fn fetch_partition_metadata(ctx: &ReconcilerCtx, ns: IggyNamespace) -> Option<Partition> {
-    ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
-        let stream = inner.items.get(ns.stream_id())?;
-        let topic = stream.topics.get(ns.topic_id())?;
-        topic
-            .partitions
-            .iter()
-            .find(|partition| partition.id == ns.partition_id())
-            .cloned()
     })
 }
 
@@ -1274,7 +1313,7 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 mod tests {
     use super::{
         FailureCause, FailureRecord, ReconcilerCtx, build_partition_fresh,
-        delete_partitions_from_disk, fetch_partition_stats, reconcile_once,
+        delete_partitions_from_disk, fetch_partition_build_inputs, reconcile_once,
     };
     use configs::server::{ServerConfig, ServerSystemConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
@@ -1817,6 +1856,148 @@ mod tests {
         );
     }
 
+    /// A pass captures its targets once and then awaits disk work per
+    /// namespace, so a delete committed mid-pass leaves a stale target behind.
+    /// Resolving stats for it would get-or-CREATE the registry entry the delete
+    /// just evicted, and the apply on the second left-right buffer would then
+    /// zero and drop a live partition's counters.
+    #[compio::test]
+    async fn stats_are_refused_for_a_partition_the_committed_topic_no_longer_lists() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+
+        let listed = IggyNamespace::new(0, 0, 0);
+        assert!(
+            fetch_partition_build_inputs(&ctx, listed).is_some(),
+            "a partition the topic lists must still resolve"
+        );
+
+        let unlisted = IggyNamespace::new(0, 0, 7);
+        assert!(
+            fetch_partition_build_inputs(&ctx, unlisted).is_none(),
+            "a partition the committed topic does not list must not resolve"
+        );
+        assert!(
+            registry(&ctx).partition_get(0, 0, 7).is_none(),
+            "and the refusal must not have created its entry on the way"
+        );
+    }
+
+    /// The metadata apply rolls a deleted partition out of its parents at
+    /// commit, but the partition stays mounted until the reconciler tears it
+    /// down, and appends in that window land in parents with no entry left to
+    /// account for them. Teardown is where that residue gets settled.
+    #[compio::test]
+    async fn teardown_settles_the_residue_the_metadata_delete_could_not_reach() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        reconcile_once(&ctx).await;
+        ctx.shard.apply_reconcile_ops();
+        let (stats, ..) =
+            fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        stats.increment_size_bytes(512);
+
+        seed_delete_topic(&ctx.shard.plane.metadata().mux_stm, 3, 0, 0);
+        // The apply evicted the entry and rolled back what it could see. This
+        // is the append that beat the teardown, through the handle the mounted
+        // partition still holds.
+        stats.increment_size_bytes(100);
+        assert_eq!(stream_size(&ctx), 100);
+
+        reconcile_once(&ctx).await;
+        ctx.shard.apply_reconcile_ops();
+
+        assert_eq!(
+            stream_size(&ctx),
+            0,
+            "teardown must settle what landed after the commit that acked the delete"
+        );
+    }
+
+    /// The eviction half of the teardown settle, which the test above cannot
+    /// reach: there the metadata apply had already dropped the entry, so the
+    /// rollback came from the mounted partition's own handle. A stale
+    /// incarnation left by a slab-key reuse still holds an entry the apply
+    /// never named, and it has to go, or the rebuild's get-or-create inherits
+    /// the dead incarnation's counters.
+    #[compio::test]
+    async fn teardown_evicts_a_registry_entry_the_metadata_delete_never_named() {
+        let tmp = TempDir::new().expect("tempdir for system path");
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream-a");
+        seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
+
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ns = IggyNamespace::new(0, 0, 0);
+
+        reconcile_once(&ctx).await;
+        ctx.shard.apply_reconcile_ops();
+        let (stats, _, partition) =
+            fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
+        let topic_stats = stats.parent();
+
+        seed_delete_topic(&ctx.shard.plane.metadata().mux_stm, 3, 0, 0);
+        assert!(
+            registry(&ctx).partition_get(0, 0, 0).is_none(),
+            "the apply evicts the entry it named, which is what leaves this test something else \
+             to prove"
+        );
+        // The entry a stale incarnation carries into the teardown, counting
+        // into parents that outlive it. Minted here rather than left behind by
+        // a slab-key reuse, which no in-crate fixture can stage.
+        registry(&ctx)
+            .partition(0, 0, &partition, topic_stats)
+            .increment_size_bytes(100);
+        assert_eq!(stream_size(&ctx), 100);
+
+        reconcile_once(&ctx).await;
+        ctx.shard.apply_reconcile_ops();
+
+        assert!(
+            registry(&ctx).partition_get(0, 0, 0).is_none(),
+            "an entry surviving teardown hands the rebuild the dead incarnation's counters"
+        );
+        assert_eq!(
+            stream_size(&ctx),
+            0,
+            "and evicting without the rollback strands its bytes in the stream total"
+        );
+    }
+
+    fn registry(ctx: &ReconcilerCtx) -> Arc<metadata::stm::stream::StatsRegistry> {
+        ctx.shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| Arc::clone(&inner.stats_registry))
+    }
+
+    fn stream_size(ctx: &ReconcilerCtx) -> u64 {
+        ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(0)
+                .map_or(0, |stream| stream.stats.size_bytes_inconsistent())
+        })
+    }
+
     /// The cross-pass guard: a pass must not rebuild a namespace an earlier pass
     /// already built and left queued. Rebuilding is not merely wasted work --
     /// the second build shares the namespace's `PartitionStats` with the queued
@@ -1856,7 +2037,8 @@ mod tests {
         // `ensure_initial_segment` plants exactly one segment per build and
         // folds it into the namespace's shared stats, so this counter is the
         // observable that separates them.
-        let (stats, _) = fetch_partition_stats(&ctx, ns).expect("materialised namespace has stats");
+        let (stats, ..) =
+            fetch_partition_build_inputs(&ctx, ns).expect("materialised namespace has stats");
         assert_eq!(
             stats.segments_count_inconsistent(),
             1,
@@ -1893,7 +2075,8 @@ mod tests {
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config.clone()));
         let ns = IggyNamespace::new(0, 0, 0);
 
-        let (stats, _) = fetch_partition_stats(&ctx, ns).expect("committed namespace has stats");
+        let (stats, ..) =
+            fetch_partition_build_inputs(&ctx, ns).expect("committed namespace has stats");
         let live = build_partition_fresh(
             &config,
             ns,

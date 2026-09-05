@@ -3978,6 +3978,25 @@ where
         self.commit_messages_inner(config, true).await
     }
 
+    /// Highest offset this replica's segments hold on disk, or `None` when it
+    /// holds none.
+    ///
+    /// Empty segments are skipped rather than reporting `end_offset` 0: a fresh
+    /// or just-rotated segment names an offset it has no bytes for, and reading
+    /// it as durable would suppress the first real batch. Same filter boot
+    /// recovery derives `recovered_durable_offset` through, and that line is
+    /// folded in so a state-transfer install (which sets it without segment
+    /// bytes of its own) still counts.
+    fn durable_segment_end(&self) -> Option<u64> {
+        self.log
+            .segments()
+            .iter()
+            .filter(|segment| segment.size.as_bytes_u64() > 0)
+            .map(|segment| segment.end_offset)
+            .chain(self.recovered_durable_offset)
+            .max()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn commit_messages_inner(
         &mut self,
@@ -4073,6 +4092,11 @@ where
             }
 
             let (frozen_batches, index_bytes, flush_index, batch_count, committed_info, chunk_len) = {
+                // Highest offset this replica's segments already hold, boot-time
+                // line included. Recomputed per chunk because a chunk that
+                // persists stamps a new `end_offset`, and a rotation moves the
+                // answer to the segment it just sealed.
+                let durable_floor = self.durable_segment_end();
                 let segment = self.log.active_segment();
                 let mut file_position = segment.size.as_bytes_u64();
                 let mut flush_index = None;
@@ -4123,13 +4147,23 @@ where
                     if message_count == 0 {
                         continue;
                     }
-                    // A repaired batch at or below the boot-time recovered
-                    // durable offset is already IN the segments this replica
-                    // recovered; persisting it again would append duplicate
-                    // bytes past the segment end. Evict it without writing.
-                    // Live traffic always sits above the (immutable) line.
+                    // A batch at or below the durable line is already IN this
+                    // replica's segments; persisting it again would append
+                    // duplicate bytes past the segment end. Evict it without
+                    // writing. Live traffic always sits above the line.
+                    //
+                    // The line has to include what THIS process has persisted,
+                    // not just what boot recovered. `apply_repaired_prepare`
+                    // rests its idempotence on `holds_op`, and eviction clears
+                    // that: an op this flush already wrote and evicted reads as
+                    // absent, so a repair ingest still streaming the window
+                    // re-journals it and the next chunk writes a second copy.
+                    // Only offsets above the boot line show the damage -- below
+                    // it the frozen line already covered them -- which is why a
+                    // rejoining backup diverged from the group by exactly the
+                    // ops it repaired.
                     let batch_end = batch.header.base_offset + u64::from(message_count) - 1;
-                    if let Some(durable) = self.recovered_durable_offset
+                    if let Some(durable) = durable_floor
                         && batch_end <= durable
                     {
                         continue;
@@ -5169,16 +5203,13 @@ where
                 }
             }
 
-            let segment_size = segment.size.as_bytes_u64();
             // The removal loop above only reaches sealed segments, which always
             // hold at least one message, so the count is inclusive end..=start.
             // A one-message sealed segment has `start_offset == end_offset`, so
             // the `+ 1` is required (a `start == end -> 0` special case would
             // undercount it).
             let messages_in_segment = segment.end_offset - segment.start_offset + 1;
-            self.stats.decrement_size_bytes(segment_size);
-            self.stats.decrement_segments_count(1);
-            self.stats.decrement_messages_count(messages_in_segment);
+            settle_cleaned_segment(&self.stats, namespace, &segment, messages_in_segment);
 
             removal.segments += 1;
             removal.messages += messages_in_segment;
@@ -6412,6 +6443,39 @@ pub struct SegmentRemoval {
     pub segments: u64,
     pub messages: u64,
     pub budget_spent: bool,
+}
+
+/// Roll one cleaned-up segment out of the partition counters, naming the
+/// partition when the rollback could not be covered.
+///
+/// Retention is the likeliest source of a clamped rollback: a partition on its
+/// way out keeps serving cleanup passes after the delete already settled its
+/// counters into the parents. The `stats_rollup_underflows` metric says a
+/// divergence happened and carries no ids; this says which partition and which
+/// segment, which is what an operator needs to act on it.
+fn settle_cleaned_segment(
+    stats: &PartitionStats,
+    namespace: IggyNamespace,
+    segment: &Segment,
+    messages_count: u64,
+) {
+    let size_shortfall = stats.decrement_size_bytes(segment.size.as_bytes_u64());
+    let segments_shortfall = stats.decrement_segments_count(1);
+    let messages_shortfall = stats.decrement_messages_count(messages_count);
+    if size_shortfall == 0 && segments_shortfall == 0 && messages_shortfall == 0 {
+        return;
+    }
+    warn!(
+        target: "iggy.partitions.diag",
+        plane = "partitions",
+        namespace_raw = namespace.inner(),
+        start_offset = segment.start_offset,
+        size_shortfall,
+        segments_shortfall,
+        messages_shortfall,
+        "segment cleanup gave back more than the partition counters held; the parent totals \
+         are now low by the shortfall until a rebuild or a restart"
+    );
 }
 
 /// Highest `end_offset` among the leading run of expired sealed segments, or
@@ -8861,7 +8925,11 @@ mod tests {
         }
     }
 
-    fn armed_session(to_op: u64, floor: u64, first_batch_offset: Option<u64>) -> RepairSession {
+    pub(super) fn armed_session(
+        to_op: u64,
+        floor: u64,
+        first_batch_offset: Option<u64>,
+    ) -> RepairSession {
         armed_fetch_session(to_op, to_op, floor, first_batch_offset)
     }
 
@@ -8908,7 +8976,11 @@ mod tests {
 
     /// A repaired `SendMessages` prepare with an explicit chain identity, as a
     /// serving peer ships it.
-    fn repaired_send_prepare(op: u64, parent: u128, checksum: u128) -> Message<PrepareHeader> {
+    pub(super) fn repaired_send_prepare(
+        op: u64,
+        parent: u128,
+        checksum: u128,
+    ) -> Message<PrepareHeader> {
         let namespace = IggyNamespace::new(1, 1, 0);
         let record = build_segment_record(namespace, op);
         let header_size = std::mem::size_of::<PrepareHeader>();
@@ -10244,7 +10316,10 @@ mod retention_tests {
 
 #[cfg(test)]
 mod purge_floor_tests {
-    use super::tests::{build_segment_record, journal_send_batch, repair_config, test_partition};
+    use super::tests::{
+        armed_session, build_segment_record, journal_send_batch, repair_config,
+        repaired_send_prepare, test_partition,
+    };
     use super::*;
     use iggy_binary_protocol::{Command, WireConsumer, WireEncode};
 
@@ -10695,6 +10770,62 @@ mod purge_floor_tests {
             partition.log.active_segment().size.as_bytes_u64(),
             build_segment_record(IggyNamespace::new(1, 1, 0), 0).len() as u64,
             "after the purge the same offset-0 batch reaches the segment"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Eviction is what makes a second copy reachable at all:
+    /// `apply_repaired_prepare` refuses an op the journal still holds, so a
+    /// re-delivered repair frame is only re-journaled once the flush that
+    /// persisted it has evicted it. `commit_min` is what lets the frame past
+    /// the other guard: the flush persists the whole committed prefix while
+    /// the walk advances `commit_min` by at most [`COMMIT_WALK_OPS_MAX`], so
+    /// every op above the walk's reach is persisted, evicted, and still
+    /// re-deliverable. The flush is the last gate, and a durable line frozen at
+    /// boot cannot see its own writes -- a rejoining backup then diverged from
+    /// the group by exactly the ops it repaired.
+    ///
+    /// Journaled through the repair path, the one that keeps a batch's original
+    /// offsets; `apply_replicated_operation` re-stamps from the local counter
+    /// and so cannot collide with itself.
+    #[compio::test]
+    async fn given_offsets_already_persisted_when_flushed_again_should_not_append_a_second_copy() {
+        const CHECKSUM: u128 = 0x5a;
+        // One op past the walk budget, so the last one stays above `commit_min`
+        // after the flush that persists it.
+        const OPS: u64 = COMMIT_WALK_OPS_MAX as u64 + 1;
+        let (mut partition, dir) = purge_test_partition("persisted-twice");
+        let record_len = build_segment_record(IggyNamespace::new(1, 1, 0), 1).len() as u64;
+        partition.repair = Some(armed_session(OPS, 0, None));
+
+        for op in 1..=OPS {
+            partition
+                .apply_repaired_prepare(repaired_send_prepare(op, 0, CHECKSUM))
+                .await;
+        }
+        partition.consensus().advance_commit_max(OPS);
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(
+            partition.log.active_segment().size.as_bytes_u64(),
+            record_len * OPS,
+            "the first flush persists the whole committed prefix"
+        );
+        assert!(
+            partition.consensus().commit_min() < OPS,
+            "the premise: the walk leaves the last op above `commit_min`, which \
+             is what lets the repair ingest re-deliver it"
+        );
+
+        partition.repair = Some(armed_session(OPS, 0, None));
+        partition
+            .apply_repaired_prepare(repaired_send_prepare(OPS, 0, CHECKSUM))
+            .await;
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(
+            partition.log.active_segment().size.as_bytes_u64(),
+            record_len * OPS,
+            "offsets the segment already holds must not be appended twice"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
