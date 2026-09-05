@@ -17,9 +17,14 @@
 
 //! Iggy metadata module
 
+pub mod applied_frontier;
 pub mod impls;
 pub mod permissioner;
 pub mod stm;
+
+// The node-wide read frontier the read gates park on; minted by the bootstrap
+// before any shard exists, so it is named outside `impls::`.
+pub use applied_frontier::{AppliedFrontier, Reached};
 
 // Re-export IggyMetadata for use in other modules
 pub use impls::metadata::{

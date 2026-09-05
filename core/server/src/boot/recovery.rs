@@ -23,7 +23,8 @@ use crate::partition_helpers::load_partition_or_fence;
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
 use crate::shell::{
-    ServerMetadata, ServerShard, ShellHandlers, consensus_timers, repair_retry_ticks,
+    ServerMetadata, ServerShard, ShellHandlers, ShellShardHandle, consensus_timers,
+    repair_gap_debounce_ticks, repair_retry_ticks,
 };
 use configs::server::ServerConfig;
 use consensus::{
@@ -35,6 +36,7 @@ use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
 use journal::superblock::PingPongSuperblock;
 use message_bus::IggyMessageBus;
+use message_bus::client_listener::RequestHandler;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use partitions::{IggyPartitions, PartitionsConfig};
@@ -50,7 +52,19 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// A shard built for its thread, with what `shard_main` wires after the
+/// build: the session manager its request plane shares, the shard's one
+/// client-request handler (shard 0 hands the same instance to its local
+/// transports), and the weak self-reference the deferred handlers
+/// upgrade per frame, already backfilled.
+pub(in crate::boot) struct ShardBuild {
+    pub shard: Rc<ServerShard>,
+    pub sessions: Rc<RefCell<SessionManager>>,
+    pub on_client_request: RequestHandler,
+    pub shard_handle: ShellShardHandle<Rc<IggyMessageBus>, PrepareJournal, IggySnapshot>,
+}
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(in crate::boot) async fn build_shard_for_thread(
@@ -65,7 +79,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     reply_inbox: ShardReceiver<ShardFrame>,
     metrics: ShardMetrics,
     roster_cells: &RosterCells,
-) -> Result<(Rc<ServerShard>, Rc<RefCell<SessionManager>>), ServerError> {
+) -> Result<ShardBuild, ServerError> {
     let shard_local_id = ShardId::new(shard_id);
     let total_partitions = metadata.mux_stm.streams().read(|inner| {
         inner
@@ -172,7 +186,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     for (stream_id, topic_id, partition_stats, partition_metadata, topic_runtime) in owned {
         let namespace = IggyNamespace::new(stream_id, topic_id, partition_metadata.id);
-        let Some(partition) = load_partition_or_fence(
+        let loaded = load_partition_or_fence(
             config,
             namespace,
             partition_stats,
@@ -184,9 +198,26 @@ pub(in crate::boot) async fn build_shard_for_thread(
             Rc::clone(&bus),
             &partitions,
         )
-        .await?
-        else {
-            continue;
+        .await;
+        let partition = match loaded {
+            Ok(Some(partition)) => partition,
+            Ok(None) => continue,
+            // A refused claim is a failed superblock write, not damage: the
+            // namespace stays materialisable, so skipping it here costs one
+            // partition its start instead of the whole shard, and the
+            // reconciler's addition pass retries it within a tick.
+            Err(error @ ServerError::PartitionOffsetReservationClaim { .. }) => {
+                error!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    %error,
+                    "skipping this partition at boot; the reconciler retries its first \
+                     offset reservation claim"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         partitions.insert(namespace, partition);
         shards_table.insert(
@@ -226,7 +257,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         ShardIdentity::new(shard_id, shard_name),
         Rc::clone(&bus),
         on_replica_message,
-        on_client_request,
+        Rc::clone(&on_client_request),
         on_metadata_submit,
         on_list_clients,
         on_partition_read,
@@ -254,6 +285,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
+    shard.set_partition_gap_debounce_ticks(repair_gap_debounce_ticks(config));
     shard.set_superblock_wedged_fatal_failures(superblock_wedged_fatal_failures(config));
     shard.set_served_segment_cache_bytes_max(
         config
@@ -272,7 +304,12 @@ pub(in crate::boot) async fn build_shard_for_thread(
         usize::try_from(config.message_bus.max_message_size.as_bytes_u64()).unwrap_or(usize::MAX),
     );
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
-    Ok((shard, sessions))
+    Ok(ShardBuild {
+        shard,
+        sessions,
+        on_client_request,
+        shard_handle,
+    })
 }
 
 // Pin the configs-crate default literals (duplicated there to avoid a
@@ -333,11 +370,9 @@ const _: () =
     assert!(consensus::DVC_HEADERS_MAX == iggy_binary_protocol::consensus::DVC_HEADERS_MAX);
 const _: () = assert!(consensus::DVC_HEADERS_MAX == u128::BITS as usize);
 
-/// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count.
-/// Retries pin at the backoff cap after warmup, so the window divided by
-/// [`journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS`] bounds how
-/// long a wedged replica may limp before it fail-stops. Zero stays zero
-/// (fail-stop disabled).
+/// `[cluster] superblock_wedged_fatal_timeout` as a consecutive-failure count,
+/// which is the only shape the shard's `superblock_wedged` can compare. Zero
+/// stays zero (fail-stop disabled).
 fn superblock_wedged_fatal_failures(config: &ServerConfig) -> u64 {
     superblock_window_to_failures(
         config
@@ -347,12 +382,44 @@ fn superblock_wedged_fatal_failures(config: &ServerConfig) -> u64 {
     )
 }
 
+/// The failure count whose arrival time is the first at or past `window`.
+///
+/// Walks the real retry schedule rather than dividing by the backoff cap. Only
+/// the retries past warmup pin at the cap: the first six wait 20, 40, 80, 160,
+/// 320 and 640 ms, so they spend 1.26 s of the window where a flat division
+/// charges them six. The default 2 m window came out as 120 failures, which
+/// arrive after about 114.26 s -- the fail-stop firing almost six seconds before
+/// the window the operator configured.
 fn superblock_window_to_failures(window: Duration) -> u64 {
     if window.is_zero() {
         return 0;
     }
-    let cap_micros = u128::from(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS);
-    u64::try_from((window.as_micros() / cap_micros).max(1)).unwrap_or(u64::MAX)
+    // `write_superblock_inner` records failure N and only then arms the wait
+    // that follows it, so failure N ARRIVES at the sum of the N-1 waits before
+    // it -- the first arrives at zero. The loop sums forward until the window is
+    // covered, and the count that satisfies it is one past the last wait summed.
+    let window_micros = window.as_micros();
+    let mut elapsed = 0u128;
+    let mut waits = 0u64;
+    while elapsed < window_micros {
+        waits += 1;
+        elapsed += u128::from(superblock_retry_backoff_micros(waits));
+    }
+    // A window shorter than the very first retry lands here with one wait
+    // summed, giving two: a threshold of one would fail-stop on the first
+    // failure, before any of the window had elapsed at all.
+    waits.saturating_add(1)
+}
+
+/// The wait `IggyPartition`'s superblock writer arms after its `failures`-th
+/// consecutive failure.
+///
+/// Mirrors that arithmetic exactly. A divergence here does not fail a test, it
+/// moves the fail-stop to a time no operator asked for.
+fn superblock_retry_backoff_micros(failures: u64) -> u64 {
+    journal::superblock::SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS
+        .saturating_mul(1 << failures.min(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT))
+        .min(journal::superblock::SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS)
 }
 
 /// Floor for the post-restart read-recovery deadline (see
@@ -592,14 +659,51 @@ mod tests {
         );
         assert_eq!(
             superblock_window_to_failures(Duration::from_mins(2)),
-            120,
-            "past warmup one retry rides each 1s backoff cap"
+            126,
+            "the six warmup retries spend 1.26s, not 6s: 120 would fire at ~114.26s"
+        );
+        assert_eq!(
+            superblock_window_to_failures(Duration::from_secs(30)),
+            36,
+            "the configured floor for a nonzero window"
         );
         assert_eq!(
             superblock_window_to_failures(Duration::from_micros(500)),
-            1,
-            "a sub-cap window still needs one failure to fire"
+            2,
+            "a window shorter than the first retry must not fail-stop on the \
+             very first failure, before any of it elapsed"
         );
+    }
+
+    /// The threshold is a floor on elapsed time, never a ceiling: the failure it
+    /// names must arrive at or after the configured window, and its predecessor
+    /// must arrive before it. Walked against the writer's own schedule.
+    #[test]
+    fn given_a_fatal_window_when_converted_should_never_fire_before_it_elapses() {
+        for window in [
+            Duration::from_secs(30),
+            Duration::from_secs(45),
+            Duration::from_mins(2),
+            Duration::from_mins(10),
+        ] {
+            let threshold = superblock_window_to_failures(window);
+            // Failure N arrives at the sum of the N-1 waits before it.
+            let arrival = |count: u64| -> u128 {
+                (1..count)
+                    .map(|wait| u128::from(superblock_retry_backoff_micros(wait)))
+                    .sum()
+            };
+            assert!(
+                arrival(threshold) >= window.as_micros(),
+                "{window:?}: failure {threshold} arrives at {}us, inside the window",
+                arrival(threshold)
+            );
+            assert!(
+                arrival(threshold - 1) < window.as_micros(),
+                "{window:?}: failure {} already covers the window, so {threshold} is late",
+                threshold - 1
+            );
+        }
     }
 
     #[test]
@@ -836,6 +940,45 @@ mod tests {
         );
     }
 
+    /// The floor is prose in `config.toml` ("50 consensus ticks (500ms at the
+    /// 10ms tick)"), which is the number an operator sizes
+    /// `repair_gap_debounce_interval` against. Nothing else would notice it
+    /// drifting.
+    #[test]
+    fn documented_gap_debounce_floor_matches_the_shard_constant() {
+        assert_eq!(
+            shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN,
+            50,
+            "the gap debounce floor moved; core/server/config.toml states it in \
+             ticks and milliseconds under [cluster] repair_gap_debounce_interval"
+        );
+        assert_eq!(
+            u128::from(shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN)
+                * shard::CONSENSUS_TICK_INTERVAL.as_millis(),
+            500,
+            "the floor is no longer 500ms; core/server/config.toml states that \
+             figure under [cluster] repair_gap_debounce_interval"
+        );
+    }
+
+    #[test]
+    fn default_repair_gap_debounce_interval_matches_partitions_constant() {
+        // Same lockstep the retry interval keeps: the shipped config.toml value
+        // is what an un-configured replica and the simulator run on, and the
+        // shard's own default is the compile-time constant.
+        let config_default = configs::cluster::ClusterConfig::default()
+            .repair_gap_debounce_interval
+            .get_duration()
+            .as_millis();
+        let built_in =
+            u128::from(partitions::REPAIR_RETRY_TICKS) * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+        assert_eq!(
+            config_default, built_in,
+            "[cluster] repair_gap_debounce_interval default drifted from the shard's \
+             compile-time debounce"
+        );
+    }
+
     #[test]
     fn default_repair_chunk_max_matches_shard_constant() {
         // Belt and suspenders with the static assert above: that pins the
@@ -846,6 +989,21 @@ mod tests {
             config_default as u64,
             shard::REPAIR_CHUNK_MAX,
             "[cluster] repair_chunk_max default drifted from shard::REPAIR_CHUNK_MAX"
+        );
+    }
+
+    #[test]
+    fn default_offset_reservation_lease_matches_partitions_constant() {
+        // `IggyPartition::new` falls back to the partitions constant (simulator,
+        // unit tests) while boot installs this one, so drift would have the
+        // fence write at a different rate in the simulator than in production.
+        let config_default =
+            configs::partition::PartitionConfig::default().offset_reservation_lease;
+        assert_eq!(
+            config_default.get(),
+            partitions::DEFAULT_OFFSET_RESERVATION_LEASE,
+            "[partition] offset_reservation_lease default drifted from \
+             partitions::DEFAULT_OFFSET_RESERVATION_LEASE"
         );
     }
 

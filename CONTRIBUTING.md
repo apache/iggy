@@ -146,6 +146,8 @@ line in a regular PR comment (not an inline review reply):
 | `/ready`                            | author or maintainer                | mark `S-waiting-on-review`                                   |
 | `/author`                           | maintainer or returning contributor | mark `S-waiting-on-author`                                   |
 | `/request-review @user-or-team ...` | author or maintainer                | request review from the listed `@user` / `@org/team` handles |
+| `/pin`                              | author or maintainer                | add `pinned`, exempting the PR from the stale bot            |
+| `/unpin`                            | author or maintainer                | remove `pinned`                                              |
 
 Some labels move on their own: opening or marking a non-draft PR ready sets
 `S-waiting-on-review`; a "Request changes" review sets `S-waiting-on-author`;
@@ -164,7 +166,19 @@ PRs may be closed if:
 - Code not ran and tested locally
 - Mixed purposes or purposes not clear
 - Can't answer questions about the change
-- Inactivity for longer than 7 days
+- Inactivity, see [Stale PRs](#stale-prs) below
+
+Whoever closes leaves a comment saying why. If the thread holds a finding
+that outlives the change, open an issue for it and link it from that
+comment. The closed thread is the first place someone looks to find out
+whether anything fell through.
+
+### Stale PRs
+
+A bot labels a PR `S-stale` after 7 days without activity and closes it 7
+days after that. A push, comment, review, reopen, or ready-for-review
+clears the label. Drafts and PRs labeled `pinned` are exempt. Issues are
+never labeled or closed by it. A closed PR can be reopened.
 
 ## Questions?
 

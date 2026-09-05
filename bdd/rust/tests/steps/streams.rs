@@ -18,11 +18,6 @@
 use crate::common::global_context::GlobalContext;
 use cucumber::{given, then, when};
 use iggy::prelude::{Identifier, StreamClient, StreamUpdateOptions};
-use std::time::Duration;
-use tokio::time::{Instant, sleep};
-
-const METADATA_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(2);
-const METADATA_CONVERGENCE_POLL: Duration = Duration::from_millis(10);
 
 #[given("I have no streams in the system")]
 pub async fn given_no_streams(world: &mut GlobalContext) {
@@ -128,18 +123,20 @@ pub async fn when_delete_stream_by_numeric_id(world: &mut GlobalContext) {
 
 #[then("getting the stream by its numeric ID should return no stream")]
 pub async fn then_get_stream_returns_no_stream(world: &mut GlobalContext) {
-    let deadline = Instant::now() + METADATA_CONVERGENCE_TIMEOUT;
-    loop {
-        get_stream_by_numeric_id(world).await;
-        if world.last_stream_name.is_none() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Deleted stream should not be returned after {METADATA_CONVERGENCE_TIMEOUT:?}"
-        );
-        sleep(METADATA_CONVERGENCE_POLL).await;
-    }
+    // Read before the get overwrites it. The assertion is "not the stream we
+    // deleted", not "nothing at this id": `IdSlab::insert` hands out the lowest
+    // free key and these scenarios share one server, so a concurrent create can
+    // legitimately occupy the deleted stream's id.
+    let deleted = world
+        .last_stream_name
+        .clone()
+        .expect("Stream should have been created");
+    get_stream_by_numeric_id(world).await;
+    assert_ne!(
+        world.last_stream_name.as_ref(),
+        Some(&deleted),
+        "Deleted stream should not be returned"
+    );
 }
 
 async fn create_stream(world: &mut GlobalContext, stream_name: &str) {

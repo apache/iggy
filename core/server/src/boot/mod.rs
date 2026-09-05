@@ -47,20 +47,21 @@ use crate::boot::listeners::{
     make_replica_delegation_fns, make_shard_zero_client_accept_fns, start_tcp_runtime,
 };
 use crate::boot::recovery::{
-    RecoveredOwnerState, build_shard_for_thread, restore_metadata_consensus,
+    RecoveredOwnerState, ShardBuild, build_shard_for_thread, restore_metadata_consensus,
 };
 use crate::boot::threads::{
-    StopSignals, await_pump_drain, install_panic_hook, join_partial_shard_survivors,
-    resolve_shard_assignments, run_shard_thread, spawn_shutdown_watchdog,
-    validate_sharding_runtime_knobs,
+    PeerExitCountdown, PeerExitWait, ShutdownDeadline, StopSignals, await_pump_drain,
+    install_panic_hook, join_partial_shard_survivors, resolve_shard_assignments, run_shard_thread,
+    spawn_shutdown_watchdog, validate_sharding_runtime_knobs,
 };
 use crate::boot::topology::{RosterCells, resolve_tcp_topology};
 use crate::dispatch::partition::make_partition_read_handler;
+use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::dispatch::submit::make_metadata_submit_handler;
 use crate::dispatch::{
-    make_client_request_handler, make_deferred_client_request_handler,
-    make_deferred_replica_message_handler, make_list_clients_handler,
+    make_deferred_client_request_handler, make_deferred_replica_message_handler,
+    make_list_clients_handler,
 };
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
@@ -76,9 +77,9 @@ use journal::{Journal, JournalHandle};
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
-use metadata::ReplicaIdentity;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
+use metadata::{AppliedFrontier, ReplicaIdentity};
 use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
@@ -277,6 +278,23 @@ pub fn bootstrap(
     // thread body or in a task compio's `spawn` would swallow, escapes it.
     let first_panic = install_panic_hook(Arc::clone(&shutdown_flag));
     let config = Arc::new(config);
+    // One post-shutdown budget for the whole process: the main thread's
+    // shard joins and shard 0's peer wait both count down this instant
+    // instead of each arming a full `shutdown_join_timeout`. The floor keeps a
+    // spent join budget from releasing the metadata writer while a peer still
+    // reads through it, so it covers a peer's whole exit: one poll interval to
+    // observe the shutdown flag, then one drain budget to drain. Flooring at
+    // the drain alone is short by a poll interval, and
+    // `shutdown_join_timeout == shutdown_drain_timeout` is a legal config.
+    let shutdown_deadline = Arc::new(ShutdownDeadline::new(
+        config.system.sharding.shutdown_join_timeout.get_duration(),
+        config
+            .system
+            .sharding
+            .shutdown_drain_timeout
+            .get_duration()
+            .saturating_add(config.system.sharding.shutdown_poll_interval.get_duration()),
+    ));
     // One owner table per server process, Arc-cloned into every shard's bus so
     // any shard's bus reads the same atomic slots that the owning
     // shard's installer / disconnect path writes.
@@ -301,9 +319,21 @@ pub fn bootstrap(
     // count so a sender never blocks (each peer sends exactly once).
     let (ready_tx, ready_rx) = crossfire::mpmc::bounded_async::<u16>(metadata_peers);
 
+    // Shard 0 blocks on this at exit until every peer thread is done (see
+    // `PeerExitCountdown`). Sized to the real peer count, not the clamped
+    // channel capacity above: a single-shard server must not wait at all.
+    let peer_exit = Arc::new(PeerExitCountdown::new(shards_count.saturating_sub(1)));
+
     let mut shard_threads: Vec<(u16, thread::JoinHandle<Result<(), ServerError>>)> =
         Vec::with_capacity(shards_count);
     let roster_cells = RosterCells::default();
+    // Shared applied-metadata frontier: shard 0's commit path advances it and
+    // wakes the reads parked on it, every shard's read gate reads it. Minted
+    // here, before any shard exists, because a shard holding a private cell
+    // would gate reads on a number nothing moves - and it carries the held
+    // reads' budget, which is sized from the configured commit-broadcast
+    // cadence and which a peer shard has no other way to learn.
+    let metadata_applied_frontier = Arc::new(AppliedFrontier::new(read_frontier_budget(&config)));
     // Every shard's metric handles, minted before the threads spawn: each
     // shard bumps its own entry, and shard 0's HTTP scrape endpoint registers
     // the whole set (counters are Arc-backed, so cross-thread reads see the
@@ -344,7 +374,10 @@ pub fn bootstrap(
         };
 
         let roster_cells_for_shard = roster_cells.clone();
+        let applied_frontier_for_shard = Arc::clone(&metadata_applied_frontier);
         let shard_metrics_for_shard = shard_metrics_all.clone();
+        let peer_exit_for_shard = Arc::clone(&peer_exit);
+        let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
             .spawn(move || -> Result<(), ServerError> {
@@ -362,7 +395,10 @@ pub fn bootstrap(
                     barrier_for_shard,
                     owner_table_for_shard,
                     roster_cells_for_shard,
+                    applied_frontier_for_shard,
                     shard_metrics_for_shard,
+                    peer_exit_for_shard,
+                    shutdown_deadline_for_shard,
                 )
             }) {
             Ok(handle) => handle,
@@ -379,10 +415,14 @@ pub fn bootstrap(
                 drop(metadata_bundle_rx);
                 drop(ready_tx);
                 drop(ready_rx);
-                join_partial_shard_survivors(
-                    shard_threads,
-                    config.system.sharding.shutdown_join_timeout.get_duration(),
+                // Shard 0 spawns first, so the vec holds it plus every peer
+                // that made it; the rest are peers shard 0's exit wait would
+                // otherwise sit out its whole budget for.
+                let spawned_peers = shard_threads.len().saturating_sub(1);
+                peer_exit.peers_never_spawned(
+                    shards_count.saturating_sub(1).saturating_sub(spawned_peers),
                 );
+                join_partial_shard_survivors(shard_threads, &shutdown_deadline);
                 return Err(ServerError::ShardSpawnFailed { shard_id, source });
             }
         };
@@ -406,7 +446,7 @@ pub fn bootstrap(
     Ok(ShardHandles {
         shutdown_flag,
         shard_threads,
-        join_timeout: config.system.sharding.shutdown_join_timeout.get_duration(),
+        deadline: shutdown_deadline,
         first_panic,
     })
 }
@@ -429,7 +469,10 @@ async fn shard_main(
     barrier: BootstrapBarrier,
     owner_table: Arc<ReplicaOwnerTable>,
     roster_cells: RosterCells,
+    metadata_applied_frontier: Arc<AppliedFrontier>,
     shard_metrics_all: Vec<ShardMetrics>,
+    peer_exit: Arc<PeerExitCountdown>,
+    shutdown_deadline: Arc<ShutdownDeadline>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
     let bus = Rc::new(IggyMessageBus::with_config_and_owner_table(
@@ -467,7 +510,12 @@ async fn shard_main(
     // metadata VSR; per-commit `publish()` (in `WriteCell::apply`)
     // bounds reader staleness to one op.
     let data_dir = Path::new(&config.system.path);
-    let (mux_stm, owner_state) = match metadata_handoff {
+    // The bundle broadcast is deliberately NOT inside the owner arm: it is
+    // the first moment a peer can hold a read handle over shard 0's writer,
+    // so the writer must first be parked in a binding that outlives the peer
+    // wait armed below. A `recover()` failure inside the arm is safe for the
+    // same reason -- no peer holds a handle yet.
+    let (mux_stm, pending_bundle_tx, owner_state) = match metadata_handoff {
         MetadataHandoff::Owner { bundle_tx } => {
             // Root is created locally at boot (never journaled), so replay
             // must start from the same baseline or every WAL-created user
@@ -509,17 +557,9 @@ async fn shard_main(
                     }
                 }
             });
-            broadcast_metadata_bundle(
-                shard_id,
-                &bundle_tx,
-                recovered.mux_stm.factory_bundle(),
-                total_shards.saturating_sub(1),
-                &shutdown_flag_for_handoff,
-                poll_interval,
-            )
-            .await?;
             (
-                recovered.mux_stm,
+                Rc::new(recovered.mux_stm),
+                Some(bundle_tx),
                 Some(RecoveredOwnerState {
                     journal: recovered.journal,
                     snapshot: recovered.snapshot,
@@ -540,9 +580,39 @@ async fn shard_main(
                 poll_interval,
             )
             .await?;
-            (ServerMuxStateMachine::from_factory_bundle(bundle), None)
+            (
+                Rc::new(ServerMuxStateMachine::from_factory_bundle(bundle)),
+                None,
+                None,
+            )
         }
     };
+
+    // Shard 0 owns the metadata state machine's only write handle, and the
+    // peers read through it until their runtimes are gone. Declared after
+    // `mux_stm` so it drops first: every exit from here on, clean or `?`,
+    // waits for the peers before the write side goes. The `Rc` above is what
+    // makes that hold -- the handle no longer travels by value into the
+    // fallible shard build, which would drop it inside the callee.
+    let _peer_exit_wait = (shard_id == 0).then(|| {
+        PeerExitWait::new(
+            peer_exit,
+            Arc::clone(&shutdown_flag_for_handoff),
+            shutdown_deadline,
+        )
+    });
+
+    if let Some(bundle_tx) = pending_bundle_tx {
+        broadcast_metadata_bundle(
+            shard_id,
+            &bundle_tx,
+            mux_stm.factory_bundle(),
+            total_shards.saturating_sub(1),
+            &shutdown_flag_for_handoff,
+            poll_interval,
+        )
+        .await?;
+    }
 
     // Metadata consensus + journal + snapshot live only on shard 0.
     // `IggyShard::tick_metadata` short-circuits when `consensus.is_none()`,
@@ -578,9 +648,11 @@ async fn shard_main(
         journal_for_metadata,
         snapshot_for_metadata,
         superblock_for_metadata,
-        mux_stm,
+        Rc::clone(&mux_stm),
         Some(PathBuf::from(&config.system.path)),
-    );
+    )
+    .with_applied_frontier(metadata_applied_frontier);
+    metadata.seed_applied_frontier_from_consensus();
     // Size the VSR client table before listeners bind and any client registers.
     // Must precede the recovered-table install below: the setter rebuilds the
     // table from scratch, so running it afterwards would drop every resumed
@@ -612,7 +684,12 @@ async fn shard_main(
     // Heap-pin like `run_shard_thread` pins `shard_main`: the builder future
     // carries the whole shard construction state machine and outgrew clippy's
     // `large_futures` cap; one allocation per shard startup.
-    let (shard, sessions) = Box::pin(build_shard_for_thread(
+    let ShardBuild {
+        shard,
+        sessions,
+        on_client_request,
+        shard_handle,
+    } = Box::pin(build_shard_for_thread(
         shard_id,
         total_shards,
         config,
@@ -879,11 +956,15 @@ async fn shard_main(
             boot_view,
             shard.plane.metadata().client_table.borrow().client_ids(),
         );
-        let on_client_request = make_client_request_handler(
-            &shard,
-            &sessions,
-            Arc::clone(&config.system),
-            config.personal_access_token.max_tokens_per_user,
+        // The request handler strands every frame until the weak
+        // self-reference is backfilled, so the build must have done that
+        // before the first listener binds.
+        debug_assert!(
+            shard_handle
+                .borrow()
+                .as_ref()
+                .is_some_and(|weak| weak.upgrade().is_some()),
+            "shard self-reference must be backfilled before listeners bind"
         );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
