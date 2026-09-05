@@ -78,6 +78,7 @@ rcgen = { workspace = true }
 reqwest = { workspace = true, features = ["http2", "json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
+ring = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "reqwest",

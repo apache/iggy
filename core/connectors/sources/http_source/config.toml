@@ -1,0 +1,68 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+type = "source"
+key = "http_github"
+enabled = true
+version = 0
+name = "HTTP source (GitHub)"
+path = "../../target/release/libiggy_connector_http_source"
+verbose = false
+
+[[streams]]
+stream = "webhooks"
+topic = "github_events"
+schema = "raw"
+batch_length = 100
+linger_time = "5ms"
+
+[plugin_config]
+# Public listener. Instances that name the same address share one listener.
+# Naming a different address binds a second listener instead, which then fails
+# on the shared admin port - so keep this identical across instances that are
+# meant to share.
+#
+# Loopback here so a copied default cannot expose a port. Production wants
+# 0.0.0.0 behind a load balancer, with TLS terminated in front of it.
+listen_addr = "127.0.0.1:9090"
+# Management API, admin health, and metrics. Never route this through the
+# public load balancer.
+admin_listen_addr = "127.0.0.1:9091"
+instance_name = "http_github"
+# Exposes POST /topics/github_events. Omit for secret-path endpoints only.
+topic_path = "github_events"
+# Guards the named path. Omit when an authenticating gateway fronts it.
+auth_bearer_token = "replace_with_secret_token"
+# Enables POST/GET/PATCH/DELETE /admin/endpoints. Omit to leave the
+# management API unmounted.
+management_token = "replace_with_admin_token"
+max_body_size_bytes = 1048576
+buffer_capacity = 10000
+max_batch_size = 500
+include_http_metadata = true
+# The provider's delivery id is the dedup key a consumer needs, because
+# delivery is best-effort in both directions. See the README.
+forward_headers = ["X-GitHub-Delivery", "X-Request-ID"]
+
+# Static secret-path endpoint: POST /e/{endpoint_id}. The URL is itself the
+# credential, so generate it with `openssl rand -hex 16`.
+[[plugin_config.endpoints]]
+endpoint_id = "a3f8c2e1b9d04f7a8e6c1d2b3a4f5e6d"
+auth_type = "hmac-sha256"
+auth_secret = "whsec_github_example"
+hmac_header = "X-Hub-Signature-256"
+hmac_prefix = "sha256="

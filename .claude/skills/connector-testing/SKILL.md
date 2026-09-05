@@ -54,6 +54,33 @@ fn given_payload_json_should_serialize_correctly() { ... }
 
 You may **omit one part** when the test is small (`given_X_should_Y` instead of full `given_X_when_Y_should_Z`), but **stay consistent within a file**. Imperative `test_foo` / `does_bar` names are not the convention here.
 
+### Prove a test can fail, before trusting it
+
+A passing test says nothing until you have watched it fail. Break the behaviour it names, run the
+suite, and put the code back:
+
+```bash
+# commit first: this reverts with `git checkout --`, which discards
+# every uncommitted change in the file, not only the mutation
+git status --porcelain -- <file>            # must be empty
+<edit the guard out>
+cargo nextest run -p <crate>                # expect a failure naming that test
+git checkout -- <file>
+```
+
+Two failures this catches, both seen in review of `http_source`:
+
+- **A fixture that makes the interesting case unreachable.** A guard test for endpoint resurrection
+  passed `&[]` as the static config, so there was nothing to resurrect and the assertion held
+  whatever `restore` did.
+- **An assertion aimed at something self-healing.** A test for a teardown guard asserted on gauges,
+  which `Metrics::encode` rebuilds from the live instances on every scrape, so it passed with the
+  guard deleted. Delete such a test rather than keep it; a test that cannot fail is worse than none,
+  because it reads as coverage.
+
+Watch for an arm hidden behind a catch-all: `StatusClass::from` ends in `_ => ServerError`, so the
+redirect arm could be removed with every existing assertion still green.
+
 ### `test_config()` helper
 
 Every plugin's tests start with a small helper returning a tuned-down version of the production config. New tests extend it. don't construct from scratch each time.

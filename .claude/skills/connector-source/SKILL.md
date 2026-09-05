@@ -27,8 +27,8 @@ successful send.
 
 ## STOP and ask the user before
 
-- Changing the SDK trait surface (`Source::open` / `poll` / `close`) - that's an SDK change.
-- Adding a long-running side task in the plugin - the runtime owns lifecycle. orphans survive `close()`.
+- Changing the SDK trait surface (`Source::open` / `poll` / `on_batch_result` / `close`) - that's an SDK change.
+- Adding a long-running side task in the plugin - the runtime owns lifecycle, and orphans survive `close()`. Sanctioned only where the source is itself a server the runtime cannot drive, as in `http_source`'s listener, and then only with an explicit shutdown in the last `close()` that awaits its tasks before returning.
 - Persisting unbounded state - `State` is rewritten every batch.
 - Adding a source that requires authoritative offsets external to Apache Iggy without coordinating retention.
 
@@ -57,11 +57,32 @@ let persisted = {                                           // brief write
 };
 ```
 
+### Delivery acknowledgment
+
+`on_batch_result` (added by #3855) is how a source learns what happened to the batch it just
+returned. The SDK keeps exactly one batch in flight: it will not call `poll()` again until this
+returns, and it stops the source after `MAX_CONSECUTIVE_NACKS` (5) consecutive NACKs, roughly 1.5s
+of backoff, without calling `close()`.
+
+- `Ack` means the runtime sent the batch **and** persisted its state. `Nack` means it could not
+  confirm both, which is **not** the same as neither happening: a batch that reached the topic but
+  whose state save failed is NACKed, and the SDK NACKs on its own result timeout while the send may
+  still have landed. A source that replays on `Nack` is at-least-once, not exactly-once.
+- The trait has a **default no-op**, which suits only a source with no staged cursor and no
+  destructive work. If `poll()` advances a cursor, deletes rows, or drains an in-memory buffer,
+  omitting this loses data silently and nothing will tell you. `random_source` and `http_source`
+  implement it; the other shipped sources take the default and skip rows on a NACK.
+- Stage in `poll()`, apply on `Ack`, discard or replay on `Nack`. A source whose input is pushed to
+  it, rather than re-readable upstream, has to hold the batch itself: see `http_source`'s staging.
+- Returning `Err` from it stops the source immediately, so it is not a retry signal.
+
 ### State persistence
 
 - `ConnectorState` is `Vec<u8>` via MessagePack (`rmp_serde`). Use `ConnectorState::serialize(&state, NAME, id)` + `ConnectorState::deserialize::<State>(NAME, id)`. Both return `Option<T>` and log on failure (non-fatal).
 - Runtime saves to `{state_path}/source_{key}.state` only after a successful Iggy send. Between `poll()` returning and the runtime persisting the save, a crash leaves the same cursor for the next poll - downstream must tolerate at-least-once.
-- **Always return state in every `ProducedMessages`**, including empty polls. Empty results still need to advance watermarks (timestamp sources) or affirm "nothing new."
+- **Return state on a batch whose send cannot fail.** The runtime saves state only on the success branch of the Iggy send, so state riding a batch of messages is skipped whenever that send fails, while the source has already cleared whatever dirty flag it tracks.
+- Timestamp sources that stage their cursor and apply it in `on_batch_result` can attach state to any batch. A source whose state is a control-plane record rather than a cursor, such as `http_source`'s endpoint registry, should ride it on an empty batch instead, which cannot fail for want of a publish.
+- The runtime can still NACK an empty batch: it short-circuits the send stage when its own state storage is latched or a pending checkpoint will not resolve. Never treat a hand-off as durable; `on_batch_result` is how you learn.
 - Keep `State` small - rewritten every batch. No unbounded vecs.
 
 ### Sleep first
@@ -86,7 +107,7 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 ### Concurrency
 
 - Runtime spawns ONE `poll()` task per source. No concurrent `poll()`.
-- Don't spawn your own long-running Tokio tasks - runtime owns lifecycle.
+- Don't spawn your own long-running Tokio tasks: the runtime owns lifecycle. The exception is a source that listens rather than polls, which has to own its listener; `http_source` is the worked example, and it shuts its tasks down in the last `close()` rather than leaving them to outlive the connector.
 
 ### Errors
 
