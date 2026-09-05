@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.Tests.UtilityTests;
@@ -30,6 +31,27 @@ public sealed class IdentifiersByteSerializationTests
         Assert.Throws<ArgumentException>(() => Identifier.String(val));
     }
 
+    [Theory]
+    [InlineData("café", 5)]
+    [InlineData("naïve-café", 12)]
+    [InlineData("日本語", 9)]
+    public void StringIdentifier_WithNonAscii_ShouldUseUtf8ByteLength(string value, int expectedLength)
+    {
+        var identifier = Identifier.String(value);
+
+        Assert.Equal(expectedLength, identifier.Length);
+        Assert.Equal(expectedLength, identifier.Value.Length);
+        Assert.Equal(value, identifier.GetString());
+    }
+
+    [Fact]
+    public void StringIdentifier_WithNonAsciiExceeding255Bytes_ShouldThrowArgumentException()
+    {
+        var val = new string('あ', 200);
+
+        Assert.Throws<ArgumentException>(() => Identifier.String(val));
+    }
+
     [Fact]
     public void KeyEntityId_WithInvalidLength_ShouldThrowArgumentException()
     {
@@ -37,6 +59,35 @@ public sealed class IdentifiersByteSerializationTests
         var val = string.Concat(Enumerable.Range(0, 500).Select(_ => character));
 
         Assert.Throws<ArgumentException>(() => Partitioning.EntityIdString(val));
+    }
+
+    [Theory]
+    [InlineData("café", 5)]
+    [InlineData("日本語", 9)]
+    public void KeyEntityId_WithNonAscii_ShouldUseUtf8ByteLength(string value, int expectedLength)
+    {
+        var partitioning = Partitioning.EntityIdString(value);
+
+        Assert.Equal(expectedLength, partitioning.Length);
+        Assert.Equal(expectedLength, partitioning.Value.Length);
+    }
+
+    [Fact]
+    public void KeyEntityId_WithNonAsciiExceeding255Bytes_ShouldThrowArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => Partitioning.EntityIdString(new string('あ', 200)));
+    }
+
+    [Fact]
+    public void HeaderKey_WithNonAsciiExceeding255Bytes_ShouldThrowArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => HeaderKey.FromString(new string('あ', 200)));
+    }
+
+    [Fact]
+    public void HeaderValue_WithNonAsciiExceeding255Bytes_ShouldThrowArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => HeaderValue.FromString(new string('あ', 200)));
     }
 
     [Fact]
@@ -62,6 +113,16 @@ public sealed class IdentifiersByteSerializationTests
     public void PartitionId_WithNegativeValue_ShouldThrow()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => Partitioning.PartitionId(-1));
+    }
+
+    [Fact]
+    public void Identifier_WithSameKindAndValue_ShouldBeEqual()
+    {
+        Assert.Equal(Identifier.Numeric(1), Identifier.Numeric(1));
+        Assert.Equal(Identifier.String("name"), Identifier.String("name"));
+        Assert.Equal(Identifier.Numeric(1).GetHashCode(), Identifier.Numeric(1).GetHashCode());
+        Assert.NotEqual(Identifier.Numeric(1), Identifier.Numeric(2));
+        Assert.NotEqual(Identifier.Numeric(1), Identifier.String("1"));
     }
 
     [Fact]

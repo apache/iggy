@@ -17,6 +17,7 @@
 
 using System.Buffers.Binary;
 using System.Text;
+using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.Kinds;
 
@@ -33,12 +34,24 @@ public readonly struct Partitioning
     /// <summary>
     ///     Length of the partitioning value.
     /// </summary>
-    public required int Length { get; init; }
+    public int Length => Value.Length;
 
     /// <summary>
-    ///     Partitioning value as bytes.
+    ///     Partitioning value as bytes, at most 255 of them.
     /// </summary>
-    public required byte[] Value { get; init; }
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when the value is longer than 255 bytes.</exception>
+    public required byte[] Value
+    {
+        get => _value;
+        init
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(value.Length, WireName.MAX_LENGTH, nameof(Value));
+            _value = value;
+        }
+    }
+
+    private readonly byte[] _value;
 
     /// <summary>
     ///     Creates a partitioning strategy that use default partitioning (balanced).
@@ -49,7 +62,6 @@ public readonly struct Partitioning
         return new Partitioning
         {
             Kind = Enums.Partitioning.Balanced,
-            Length = 0,
             Value = []
         };
     }
@@ -78,7 +90,6 @@ public readonly struct Partitioning
         return new Partitioning
         {
             Kind = Enums.Partitioning.PartitionId,
-            Length = 4,
             Value = bytes
         };
     }
@@ -91,16 +102,13 @@ public readonly struct Partitioning
     /// <exception cref="ArgumentException">Thrown when the value size is incorrect</exception>
     public static Partitioning EntityIdString(string value)
     {
-        if (value.Length is 0 or > 255)
-        {
-            throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(value));
-        }
+        var bytes = Encoding.UTF8.GetBytes(value);
+        WireName.Validate(bytes.Length, nameof(value));
 
         return new Partitioning
         {
             Kind = Enums.Partitioning.MessageKey,
-            Length = value.Length,
-            Value = Encoding.UTF8.GetBytes(value)
+            Value = bytes
         };
     }
 
@@ -120,7 +128,6 @@ public readonly struct Partitioning
         return new Partitioning
         {
             Kind = Enums.Partitioning.MessageKey,
-            Length = value.Length,
             Value = value
         };
     }
@@ -137,7 +144,6 @@ public readonly struct Partitioning
         return new Partitioning
         {
             Kind = Enums.Partitioning.MessageKey,
-            Length = 4,
             Value = bytes.ToArray()
         };
     }
@@ -154,7 +160,6 @@ public readonly struct Partitioning
         return new Partitioning
         {
             Kind = Enums.Partitioning.MessageKey,
-            Length = 8,
             Value = bytes.ToArray()
         };
     }
@@ -170,7 +175,6 @@ public readonly struct Partitioning
         return new Partitioning
         {
             Kind = Enums.Partitioning.MessageKey,
-            Length = 16,
             Value = bytes
         };
     }

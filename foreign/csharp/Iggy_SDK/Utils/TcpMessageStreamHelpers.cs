@@ -61,10 +61,7 @@ internal static class TcpMessageStreamHelpers
             _ => throw new ArgumentOutOfRangeException()
         };
         bytes[1] = (byte)identifier.Length;
-        for (var i = 0; i < identifier.Length; i++)
-        {
-            bytes[i + 2] = identifier.Value[i];
-        }
+        identifier.Value.CopyTo(bytes[2..]);
 
         return bytes.ToArray();
     }
