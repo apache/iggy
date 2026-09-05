@@ -218,6 +218,20 @@ impl IggySnapshot {
 /// accepted (unverified, loudly) while a PRESENT but mismatching one refuses boot. A
 /// bare checksum could not tell those apart, and guessing wrong in either direction is
 /// unacceptable: silently accepting corruption, or bricking a healthy node.
+/// Committed ops one [`IggyMetadata::commit_journal`] call applies before
+/// returning to the pump.
+///
+/// The twin of `partitions::COMMIT_WALK_OPS_MAX`, and needed for the same
+/// reason: the walk reads a WAL body and applies it per op with no await the
+/// pump can interleave, and the resident `(commit_min, commit_max]` run is the
+/// whole backlog after a repair or a rejoin, not the pipeline depth.
+///
+/// Every caller is re-driven, so a truncated walk resumes rather than losing
+/// anything: `tick_metadata`'s walk backstop covers a follower and
+/// `resume_stranded_commits` covers the primary, both level-triggered on
+/// `commit_min < commit_max` every tick.
+const COMMIT_WALK_OPS_MAX: usize = 64;
+
 const SNAPSHOT_TRAILER_MAGIC: u32 = 0x4953_4E50;
 
 /// `magic` + the payload's [`checkpoint_checksum`].
@@ -776,6 +790,16 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// whole snapshot on shard 0's pump, and hands each requester its own
     /// multi-MB copy.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
+    /// Prepares the backup gap check destroyed since `tick_metadata` last
+    /// drained the count into `metadata_prepare_gap_drops_total`. What it does
+    /// and does not prove is `IggyPartition::prepare_gap_drops`, verbatim; what
+    /// differs is the frontier the check runs against, the journal head rather
+    /// than the sequencer, so this also counts the ops that fall outside what
+    /// metadata repair can refill (an interior hole below the head, a forward
+    /// gap above `commit_max`).
+    ///
+    /// `Cell` because every method on this type takes `&self`.
+    prepare_gap_drops: Cell<u64>,
     /// Highest metadata op whose apply has been PUBLISHED on this node, plus
     /// the reads parked on it. Shared by every shard; see
     /// [`AppliedFrontier`] for the ordering and the wake contract.
@@ -838,12 +862,19 @@ where
             commit_notifier: RefCell::new(None),
             client_table_frontier: Cell::new(0),
             transfer_offer_cache: RefCell::new(None),
+            prepare_gap_drops: Cell::new(0),
             applied_frontier: Arc::default(),
         }
     }
 }
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
+    /// Take and clear the gap-drop count (`prepare_gap_drops`).
+    #[must_use = "dropping the count loses the only record those prepares existed"]
+    pub const fn take_prepare_gap_drops(&self) -> u64 {
+        self.prepare_gap_drops.replace(0)
+    }
+
     /// Share one process-wide applied frontier with every other shard.
     ///
     /// Consumed at construction rather than swapped in later: a shard that
@@ -1280,6 +1311,8 @@ where
                     sequencer_op = current_op,
                     "on_replicate: dropping out-of-order prepare (gap)"
                 );
+                self.prepare_gap_drops
+                    .set(self.prepare_gap_drops.get().saturating_add(1));
                 return;
             }
         } else {
@@ -3608,15 +3641,26 @@ where
         let consensus = self.consensus.as_ref().unwrap();
         let journal = self.journal.as_ref().unwrap();
 
+        let mut applied = 0usize;
         while consensus.commit_min() < consensus.commit_max() {
+            if applied == COMMIT_WALK_OPS_MAX {
+                debug!(
+                    "commit_journal: stopping at op={} after {applied} ops; resuming next tick",
+                    consensus.commit_min()
+                );
+                break;
+            }
+            applied += 1;
             let op = consensus.commit_min() + 1;
 
             let Some(header) = journal.handle().header(op as usize) else {
                 // Gap-stop: the walk halts at the first missing prepare and
-                // resumes once it is refilled. Live drops refill via the
-                // primary's prepare retransmit; a replica behind at recovery
-                // or after StartView adoption arms a `MetadataRepairSession`
-                // (shard) that re-requests the missing window.
+                // resumes once it is refilled -- by the primary's retransmit
+                // while the op still lacks quorum, otherwise by a
+                // `MetadataRepairSession` (shard), armed at recovery, at
+                // StartView adoption, or by `tick_metadata`'s gap detector,
+                // which is the only one of those a live drop under sustained
+                // traffic reaches.
                 break;
             };
             let header = *header;
@@ -4251,6 +4295,20 @@ mod tests {
     /// touches their methods.
     fn peer_metadata() -> IggyMetadata<(), (), (), TestMux> {
         IggyMetadata::new(None, None, None, None, TestMux::default(), None)
+    }
+
+    #[test]
+    fn take_prepare_gap_drops_drains_the_count() {
+        let md = peer_metadata();
+        assert_eq!(md.take_prepare_gap_drops(), 0);
+
+        md.prepare_gap_drops.set(2);
+        assert_eq!(md.take_prepare_gap_drops(), 2);
+        assert_eq!(
+            md.take_prepare_gap_drops(),
+            0,
+            "a second drain must not re-report drops the metrics already counted"
+        );
     }
 
     #[test]

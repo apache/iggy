@@ -5209,9 +5209,14 @@ mod partition_repair_driver_tests {
         };
     }
 
-    /// The partition-plane prepare a packet carries, if it carries one for
-    /// `group`.
-    fn prepare_for(packet: &Packet, group: u64) -> Option<PrepareHeader> {
+    /// The prepare a packet carries, if it carries one for `group`. Keyed on
+    /// the group, so `metadata_repair_driver_tests` reads the metadata plane's
+    /// prepares with the same helper.
+    ///
+    /// `pub`, not `pub(super)`, in this and the helpers below: the module is
+    /// private and `#[cfg(test)]`, so both spell the same reach, and
+    /// `clippy::redundant_pub_crate` refuses the narrower one.
+    pub fn prepare_for(packet: &Packet, group: u64) -> Option<PrepareHeader> {
         if packet.message.header().command != Command::Prepare {
             return None;
         }
@@ -5221,7 +5226,7 @@ mod partition_repair_driver_tests {
     }
 
     /// Whether a packet is a commit heartbeat for `group`.
-    fn is_commit_for(packet: &Packet, group: u64) -> bool {
+    pub fn is_commit_for(packet: &Packet, group: u64) -> bool {
         if packet.message.header().command != Command::Commit {
             return false;
         }
@@ -5231,7 +5236,7 @@ mod partition_repair_driver_tests {
     }
 
     /// Whether a packet is a repair request for `group`.
-    fn is_request_prepares_for(packet: &Packet, group: u64) -> bool {
+    pub fn is_request_prepares_for(packet: &Packet, group: u64) -> bool {
         if packet.message.header().command != Command::RequestPrepares {
             return false;
         }
@@ -5242,7 +5247,7 @@ mod partition_repair_driver_tests {
     }
 
     /// Whether a packet is a repair stream terminator for `group`.
-    fn is_repair_done_for(packet: &Packet, group: u64) -> bool {
+    pub fn is_repair_done_for(packet: &Packet, group: u64) -> bool {
         if packet.message.header().command != Command::RepairDone {
             return false;
         }
@@ -5252,7 +5257,7 @@ mod partition_repair_driver_tests {
         header.group == group
     }
 
-    fn cluster(seed: u64) -> (Simulator, SimClient) {
+    pub fn cluster(seed: u64) -> (Simulator, SimClient) {
         server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
             enabled: false,
             size: iggy_common::IggyByteSize::from(0u64),
@@ -5960,6 +5965,512 @@ mod partition_repair_driver_tests {
             counted + buffered,
             "the {buffered} prepare(s) buffered on the partition went to the floor \
              with it; the drops are the only record those frames existed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_repair_driver_tests {
+    //! A backup that missed a committed metadata prepare recovers in Normal
+    //! status, without waiting for a view change.
+    //!
+    //! The metadata twin of `partition_repair_driver_tests`, driven by the
+    //! detector in `tick_metadata`: the same preflight `commit_max` advance
+    //! starves the `Advanced`-gated arm in `on_commit`, and
+    //! `retry_stalled_metadata_repair` re-drives only a session that already
+    //! exists. Every fault here is keyed on `METADATA_GROUP`, since both
+    //! planes share `Prepare` and `Commit` on the same links.
+
+    use super::partition_repair_driver_tests::{
+        cluster, is_commit_for, is_repair_done_for, is_request_prepares_for, prepare_for,
+    };
+    use super::*;
+    use consensus::Status;
+    use journal::Journal;
+    use packet::Packet;
+    use server_common::sharding::METADATA_GROUP;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Chain replication runs 0 -> 1 -> 2 and stops before the primary, so
+    /// replica 2 is the only one whose losses cannot starve the group of
+    /// quorum (see `partition_repair_driver_tests::LAGGING`).
+    const LAGGING: u8 = 2;
+
+    const CLIENT_ID: u128 = 1;
+
+    /// Ops committed cleanly before the fault, so the gap opens above a
+    /// committed prefix rather than at the group's first op.
+    const WARMUP_SENDS: usize = 3;
+
+    /// Ticks stepped after each stream creation, one round trip's worth.
+    const STEPS_PER_SEND: usize = 12;
+
+    /// Creations issued with the fault standing in the gap test. Long enough
+    /// that prepares keep consuming the `commit_max` advance the heartbeat
+    /// backstop needs; the debounce may elapse mid-produce, which the verdict
+    /// tolerates (the withheld heartbeats mean only the tick driver can arm).
+    const GAP_SENDS: usize = 12;
+
+    /// Creations issued with the fault standing in the eviction and
+    /// walk-starvation tests: few enough (under the debounce) that it fires
+    /// only after the traffic stops, so the floor stamp or the starved walk
+    /// edge is in place before the arm runs.
+    const SHORT_GAP_SENDS: usize = 3;
+
+    /// Quiet ticks for the repair stream to land, kept under
+    /// `NORMAL_HEARTBEAT_TICKS` (500) so no election can be the healer.
+    const QUIET_STEPS: usize = 160;
+
+    /// Budget for the group to settle once the fault is lifted; the drain
+    /// loop breaks on convergence.
+    const DRAIN_STEPS: usize = 600;
+
+    /// Quiet budget for the walk-starvation test: debounce, repair stream,
+    /// then the drain, still under `NORMAL_HEARTBEAT_TICKS`.
+    const STRAND_QUIET_STEPS: usize = 300;
+
+    /// Ticks of healthy load in the no-false-positive test, several debounce
+    /// intervals' worth so the driver gets many chances to arm.
+    const LOAD_TICKS: usize = 4 * partitions::REPAIR_RETRY_TICKS as usize;
+
+    /// Paced at a fraction of a round trip; faster submission only collects
+    /// transient rejections once the prepare pipeline fills.
+    const TICKS_PER_SEND: usize = 4;
+
+    /// Ops the healthy run must have committed for its verdict to mean
+    /// anything: enough to prove the group was live across several debounce
+    /// intervals, not that it was saturated.
+    const COMMITTED_MIN: u64 = 20;
+
+    /// Defines this test's `withhold_one_prepare` chain hook over the static it
+    /// names: swallow the FIRST metadata prepare, once, and record its op in
+    /// `$withheld_op`.
+    ///
+    /// A macro for the same reason as the partition twin: link hooks are bare
+    /// `fn` pointers, so the body cannot capture, and the statics must stay
+    /// per-test or the siblings in this binary would share one fault.
+    macro_rules! withhold_one_metadata_prepare {
+        ($withheld_op:ident) => {
+            fn withhold_one_prepare(packet: &Packet) -> bool {
+                let Some(header) = prepare_for(packet, METADATA_GROUP) else {
+                    return false;
+                };
+                $withheld_op
+                    .compare_exchange(0, header.op, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            }
+        };
+    }
+
+    /// Defines this test's primary -> backup hook: withhold this group's commit
+    /// heartbeats, so the `Advanced` backstop can never run, and withhold
+    /// retransmits of the op `$withheld_op` names.
+    ///
+    /// The retransmit half stands in for production behaviour rather than
+    /// adding a fault: `consensus::retransmit_targets` skips an op that already
+    /// reached quorum, and this op reaches quorum on 0 and 1 alone.
+    macro_rules! starve_commit_edge {
+        ($withheld_op:ident) => {
+            fn starve_commit_edge(packet: &Packet) -> bool {
+                if let Some(header) = prepare_for(packet, METADATA_GROUP) {
+                    return header.op == $withheld_op.load(Ordering::Relaxed);
+                }
+                is_commit_for(packet, METADATA_GROUP)
+            }
+        };
+    }
+
+    /// `(status, view, commit_min, commit_max)` of one replica's metadata group.
+    fn metadata_state(sim: &Simulator, replica: u8) -> (Status, u32, u64, u64) {
+        let metadata = sim.replicas[replica as usize].shards[0].plane.metadata();
+        let consensus = metadata
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus");
+        (
+            consensus.status(),
+            consensus.view(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        )
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn journal_holds(sim: &Simulator, replica: u8, op: u64) -> bool {
+        sim.replicas[replica as usize]
+            .metadata_journal
+            .header(op as usize)
+            .is_some()
+    }
+
+    fn gap_drops(sim: &Simulator, replica: u8) -> u64 {
+        sim.replicas[replica as usize].shards[0]
+            .metrics()
+            .metadata_prepare_gap_drops_value()
+    }
+
+    fn transfer_armed(sim: &Simulator, replica: u8) -> bool {
+        let metadata = sim.replicas[replica as usize].shards[0].plane.metadata();
+        metadata.consensus.as_ref().is_some_and(|consensus| {
+            consensus.state_transfer_stage() != consensus::StateTransferStage::Idle
+        })
+    }
+
+    /// Submit `sends` stream creations to the primary, stepping between each.
+    fn create_streams(sim: &mut Simulator, client: &SimClient, sends: usize, tag: &str) {
+        for index in 0..sends {
+            let msg = client.create_stream(&format!("{tag}-{index}"));
+            sim.submit_request(client.client_id(), 0, msg.into_generic());
+            for _ in 0..STEPS_PER_SEND {
+                sim.step();
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_backup_that_dropped_a_committed_metadata_prepare_when_heartbeat_advances_are_starved_should_repair_in_normal_status()
+     {
+        // Statics, not captures: the link hooks are bare `fn` pointers,
+        // declared inside the test so parallel siblings cannot share them.
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+        starve_commit_edge!(WITHHELD_OP);
+
+        let (mut sim, client) = cluster(0x5EED_0240);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+        let (_, _, warm_commit_min, _) = metadata_state(&sim, LAGGING);
+        assert!(
+            warm_commit_min > 0,
+            "the lagging replica committed nothing before the fault, so the gap \
+             below would open at the group's first op"
+        );
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+
+        create_streams(&mut sim, &client, GAP_SENDS, "md-gap");
+
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+        assert!(
+            gap_drops(&sim, LAGGING) > 0,
+            "the lagging replica never reached its backup gap check, so the \
+             prepares after the withheld op were not dropped as a gap"
+        );
+
+        for _ in 0..QUIET_STEPS {
+            sim.step();
+        }
+
+        // Judged with the blockade still standing: no commit heartbeat for
+        // this group has reached the replica since the gap opened, so only
+        // the tick driver can have armed the repair.
+        let (status, view, commit_min, _) = metadata_state(&sim, LAGGING);
+        assert_eq!(
+            view, 0,
+            "a view change healed the gap instead of the repair driver; the test \
+             proves nothing about normal status"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        assert!(
+            journal_holds(&sim, LAGGING, withheld),
+            "op {withheld} was never repaired back into the lagging replica's WAL"
+        );
+        assert!(
+            commit_min >= withheld,
+            "the commit walk never crossed the repaired hole: stopped at \
+             {commit_min}, the withheld op is {withheld}"
+        );
+
+        // Lift the blockade and let the group settle; the tail above the
+        // repaired window waits on the heartbeats the fault withheld.
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) = None;
+        for _ in 0..DRAIN_STEPS {
+            sim.step();
+            let (_, _, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+            if commit_min == commit_max {
+                break;
+            }
+        }
+        let (status, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+        assert_eq!((status, view), (Status::Normal, 0));
+        assert_eq!(
+            commit_min, commit_max,
+            "the lagging replica is still gap-stopped: committed through \
+             {commit_max} but walkable only to {commit_min}"
+        );
+    }
+
+    #[test]
+    fn given_a_metadata_repair_armed_by_the_tick_driver_when_the_floor_is_evicted_should_convert_to_state_transfer()
+     {
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+        starve_commit_edge!(WITHHELD_OP);
+
+        let (mut sim, client) = cluster(0x5EED_0241);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_commit_edge);
+
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
+        assert_ne!(
+            WITHHELD_OP.load(Ordering::Relaxed),
+            0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+
+        // Move the primary's retention floor past the whole gap window before
+        // the debounce can arm (`SHORT_GAP_SENDS`): the serve path reads only
+        // the snapshot watermark, so the request is answered `RangeEvicted`
+        // (see `stamp_metadata_snapshot`).
+        let primary_commit_min = metadata_state(&sim, 0).2;
+        sim.stamp_metadata_snapshot(0, primary_commit_min);
+
+        for _ in 0..QUIET_STEPS {
+            sim.step();
+            if transfer_armed(&sim, LAGGING) {
+                break;
+            }
+        }
+
+        let (status, view, ..) = metadata_state(&sim, LAGGING);
+        assert_eq!(
+            view, 0,
+            "a view change armed the recovery instead of the tick-armed repair session"
+        );
+        assert!(
+            transfer_armed(&sim, LAGGING),
+            "the tick-armed repair session hit an evicted floor but never converted \
+             to a state transfer (status {status:?})"
+        );
+    }
+
+    #[test]
+    fn given_a_backup_holding_resident_committed_metadata_ops_when_every_walk_edge_is_starved_should_drain_in_normal_status()
+     {
+        static WITHHELD_OP: AtomicU64 = AtomicU64::new(0);
+        static WITHHELD_DONES: AtomicU64 = AtomicU64::new(0);
+        withhold_one_metadata_prepare!(WITHHELD_OP);
+
+        /// Primary -> 2: withhold every direct prepare (live ones ride the
+        /// chain, so this starves only retransmit heals), the group's commit
+        /// heartbeats, and its repair terminators. The repaired ops themselves
+        /// pass, so the window lands resident while the `RepairDone` that would
+        /// run the walk never fires.
+        fn starve_walk_edges(packet: &Packet) -> bool {
+            if prepare_for(packet, METADATA_GROUP).is_some() {
+                return true;
+            }
+            if is_repair_done_for(packet, METADATA_GROUP) {
+                WITHHELD_DONES.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            is_commit_for(packet, METADATA_GROUP)
+        }
+
+        let (mut sim, client) = cluster(0x5EED_0242);
+        sim.register_client_with_primary(&client);
+        WITHHELD_OP.store(0, Ordering::Relaxed);
+        WITHHELD_DONES.store(0, Ordering::Relaxed);
+
+        create_streams(&mut sim, &client, WARMUP_SENDS, "md-warm");
+        let (_, _, warm_commit_min, _) = metadata_state(&sim, LAGGING);
+        assert!(
+            warm_commit_min > 0,
+            "the lagging replica committed nothing before the fault, so the gap \
+             below would open at the group's first op"
+        );
+
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(1), ProcessId::Replica(LAGGING)) =
+            Some(withhold_one_prepare);
+        *sim.network
+            .link_drop_packet_fn(ProcessId::Replica(0), ProcessId::Replica(LAGGING)) =
+            Some(starve_walk_edges);
+
+        create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-strand");
+
+        let withheld = WITHHELD_OP.load(Ordering::Relaxed);
+        assert_ne!(
+            withheld, 0,
+            "no metadata prepare crossed the chain link, so the fault never armed"
+        );
+
+        for _ in 0..STRAND_QUIET_STEPS {
+            sim.step();
+            let (_, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+            if view != 0 || (commit_min >= withheld && commit_min == commit_max) {
+                break;
+            }
+        }
+
+        assert!(
+            WITHHELD_DONES.load(Ordering::Relaxed) > 0,
+            "no repair terminator was withheld, so the walk was never starved and \
+             a green run would not prove the tick backstop"
+        );
+        assert!(
+            journal_holds(&sim, LAGGING, withheld),
+            "op {withheld} was never repaired back into the lagging replica's WAL"
+        );
+        let (status, view, commit_min, commit_max) = metadata_state(&sim, LAGGING);
+        assert_eq!(
+            view, 0,
+            "a view change drained the walk instead of the tick backstop; the test \
+             proves nothing about normal status"
+        );
+        assert_eq!(status, Status::Normal, "the replica left Normal status");
+        for op in commit_min + 1..=commit_max {
+            assert!(
+                journal_holds(&sim, LAGGING, op),
+                "op {op} is not resident, so this run stranded on a repair gap, \
+                 not a parked walk"
+            );
+        }
+        assert_eq!(
+            commit_min, commit_max,
+            "the walk never resumed over resident committed ops: walkable to \
+             {commit_min}, committed through {commit_max}, every op between resident"
+        );
+    }
+
+    /// Regression canary, expected green even without the tick driver: a
+    /// healthy metadata backup walks at every accepted prepare's tail
+    /// (`on_replicate`), so per-tick lag never survives to quiescence and the
+    /// journal-hole half of the predicate is pinned by `gap_detector_tests`
+    /// instead. What this run pins is that the driver stays silent under
+    /// sustained pipelined load.
+    #[test]
+    fn given_healthy_metadata_traffic_when_no_gap_exists_should_not_arm_repair() {
+        static REPAIR_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+        /// Observer, not a fault: counts this group's repair requests and
+        /// passes every packet through.
+        fn count_repair_requests(packet: &Packet) -> bool {
+            if is_request_prepares_for(packet, METADATA_GROUP) {
+                REPAIR_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+
+        // TWO replicas, as in the partition twin: quorum spans both, so no op
+        // can commit while the backup misses it, and every reordering-induced
+        // gap blocks quorum until retransmit refills it.
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolSettings {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+        let replica_count: u8 = 2;
+        let mut sim = Simulator::new(
+            replica_count as usize,
+            std::iter::once(CLIENT_ID),
+            packet::PacketSimulatorOptions {
+                node_count: replica_count,
+                client_count: 1,
+                seed: 0x5EED_0243,
+                ..packet::PacketSimulatorOptions::default()
+            },
+        );
+        let client = SimClient::new(CLIENT_ID);
+        sim.register_client_with_primary(&client);
+        REPAIR_REQUESTS.store(0, Ordering::Relaxed);
+
+        for (from, to) in [(0u8, 1u8), (1, 0)] {
+            *sim.network
+                .link_drop_packet_fn(ProcessId::Replica(from), ProcessId::Replica(to)) =
+                Some(count_repair_requests);
+        }
+
+        // Sustained, not bursty, and the run asserts the load went somewhere,
+        // so a green result cannot come from a workload that never loaded the
+        // group.
+        let mut lag_run = 0u32;
+        let mut longest_lag_run = 0u32;
+        let sample = |sim: &Simulator, lag_run: &mut u32, longest: &mut u32| {
+            let (_, _, commit_min, commit_max) = metadata_state(sim, 1);
+            if commit_min < commit_max {
+                *lag_run += 1;
+                *longest = (*longest).max(*lag_run);
+            } else {
+                *lag_run = 0;
+            }
+        };
+        for tick in 0..LOAD_TICKS {
+            if tick % TICKS_PER_SEND == 0 {
+                let msg = client.create_stream(&format!("healthy-{tick}"));
+                sim.submit_request(client.client_id(), 0, msg.into_generic());
+            }
+            sim.step();
+            sample(&sim, &mut lag_run, &mut longest_lag_run);
+        }
+        for _ in 0..QUIET_STEPS {
+            sim.step();
+            sample(&sim, &mut lag_run, &mut longest_lag_run);
+        }
+
+        let committed = metadata_state(&sim, 1).2;
+        let sends = LOAD_TICKS / TICKS_PER_SEND;
+        assert!(
+            committed >= COMMITTED_MIN,
+            "the backup committed only {committed} ops across {sends} sends, so the \
+             driver was never ticked over a loaded group"
+        );
+        // Asserted, not merely recorded: on this plane the tail walk in
+        // `on_replicate` leaves a healthy backup caught up at every quiescence
+        // point, so any lag at all is a change in that behaviour rather than
+        // ordinary pipelining. The predicate itself is pinned by
+        // `gap_detector_tests`; what this holds is the premise the repair check
+        // below rests on.
+        assert_eq!(
+            longest_lag_run, 0,
+            "healthy two-replica metadata traffic left the backup lagging for \
+             {longest_lag_run} consecutive ticks; the run below then proves nothing \
+             about false positives, and this test should sample residency the way \
+             the partition twin's walk-starvation run does"
+        );
+        for replica in 0..replica_count {
+            let (status, view, commit_min, commit_max) = metadata_state(&sim, replica);
+            assert_eq!(
+                (status, view),
+                (Status::Normal, 0),
+                "replica {replica} left view 0 / Normal, so a view change could \
+                 account for repair traffic"
+            );
+            if commit_min < commit_max {
+                assert!(
+                    journal_holds(&sim, replica, commit_min + 1),
+                    "replica {replica} lags at {commit_min} of {commit_max} with op \
+                     {} missing, so a no-loss run produced a real hole",
+                    commit_min + 1
+                );
+            }
+        }
+        assert_eq!(
+            REPAIR_REQUESTS.load(Ordering::Relaxed),
+            0,
+            "the tick driver requested repair on a healthy group; its gap predicate \
+             is reading ordinary commit lag as a journal hole"
         );
     }
 }

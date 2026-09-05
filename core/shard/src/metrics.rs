@@ -212,6 +212,7 @@ pub struct ShardMetrics {
     partition_requests_denied_transient_total: Counter,
     partition_repair_serves_deferred_purge_total: Counter,
     partition_prepare_gap_drops_total: Counter,
+    metadata_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
 }
@@ -239,6 +240,7 @@ impl ShardMetrics {
             partition_requests_denied_transient_total: Counter::default(),
             partition_repair_serves_deferred_purge_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
+            metadata_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
         }
@@ -473,10 +475,9 @@ impl ShardMetrics {
     /// other partition counter in this file is shard-scoped for the same
     /// reason. The per-group detail is in the arm's log line.
     ///
-    /// The metadata plane's own gap drop is NOT counted here, and has no
-    /// counter of its own: its repair is armed by the same edge-triggered sites
-    /// this plane's sweep exists to backstop, so that plane is starvable in the
-    /// same way and is simply not instrumented for it yet.
+    /// The metadata plane's own gap drop is NOT counted here: it has its own
+    /// counter, and its own level-triggered driver in `tick_metadata`. See
+    /// [`Self::record_metadata_prepare_gap_drops`].
     pub fn record_partition_prepare_gap_drops(&self, drops: u64) {
         self.partition_prepare_gap_drops_total.inc_by(drops);
     }
@@ -486,6 +487,31 @@ impl ShardMetrics {
     #[must_use]
     pub fn partition_prepare_gap_drops_value(&self) -> u64 {
         self.partition_prepare_gap_drops_total.get()
+    }
+
+    /// Add the prepares the metadata backup gap check destroyed since the last
+    /// tick, drained from `IggyMetadata::take_prepare_gap_drops`.
+    ///
+    /// The sibling of [`Self::record_partition_prepare_gap_drops`], and it
+    /// carries every caveat that one does: it counts the prepares that ARRIVED
+    /// after a hole rather than the holes, so a nonzero value proves the
+    /// metadata repair driver has work and a zero one proves nothing. There is
+    /// one metadata group per node, so unlike the partition counter it needs no
+    /// argument about namespace cardinality.
+    ///
+    /// Deliberately NOT a `frame_drops_total` reason, for the same reason: that
+    /// family means the bus or the router shed a frame and the simulator
+    /// asserts it stays at zero on runs with no injected loss, while a gap drop
+    /// is a protocol-ordering drop the tick repairs.
+    pub fn record_metadata_prepare_gap_drops(&self, drops: u64) {
+        self.metadata_prepare_gap_drops_total.inc_by(drops);
+    }
+
+    /// Snapshot of `metadata_prepare_gap_drops_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn metadata_prepare_gap_drops_value(&self) -> u64 {
+        self.metadata_prepare_gap_drops_total.get()
     }
 
     /// Snapshot of `partition_frames_rejected_stale_total`. Test/simulator
@@ -583,6 +609,11 @@ impl ShardMetrics {
             "partition_prepare_gap_drops",
             "replicated prepares dropped out of order by a backup's gap check",
             self.partition_prepare_gap_drops_total.clone(),
+        );
+        registry.register(
+            "metadata_prepare_gap_drops",
+            "replicated metadata prepares dropped out of order by a backup's gap check",
+            self.metadata_prepare_gap_drops_total.clone(),
         );
         registry.register(
             "metadata_read_frontier_refusals",

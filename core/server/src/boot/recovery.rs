@@ -285,7 +285,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // Repair pacing is shared by both planes' repair loops, so it is a
     // per-shard tunable set once here rather than per consensus group.
     shard.set_repair_retry_ticks(repair_retry_ticks(config));
-    shard.set_partition_gap_debounce_ticks(repair_gap_debounce_ticks(config));
+    shard.set_repair_gap_debounce_ticks(repair_gap_debounce_ticks(config));
     shard.set_superblock_wedged_fatal_failures(superblock_wedged_fatal_failures(config));
     shard.set_served_segment_cache_bytes_max(
         config
@@ -947,13 +947,13 @@ mod tests {
     #[test]
     fn documented_gap_debounce_floor_matches_the_shard_constant() {
         assert_eq!(
-            shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN,
+            shard::REPAIR_GAP_DEBOUNCE_TICKS_MIN,
             50,
             "the gap debounce floor moved; core/server/config.toml states it in \
              ticks and milliseconds under [cluster] repair_gap_debounce_interval"
         );
         assert_eq!(
-            u128::from(shard::PARTITION_GAP_DEBOUNCE_TICKS_MIN)
+            u128::from(shard::REPAIR_GAP_DEBOUNCE_TICKS_MIN)
                 * shard::CONSENSUS_TICK_INTERVAL.as_millis(),
             500,
             "the floor is no longer 500ms; core/server/config.toml states that \

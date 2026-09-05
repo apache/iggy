@@ -279,13 +279,15 @@ pub struct ClusterConfig {
     #[serde_as(as = "DisplayFromStr")]
     #[config_env(leaf)]
     pub repair_retry_interval: IggyDuration,
-    /// How long a partition backup must hold committed ops it cannot walk to
-    /// before the shard sweep OPENS a repair session for it.
+    /// How long a backup must hold committed ops it cannot walk to before the
+    /// shard tick OPENS a repair session for it. Paces both planes' detectors:
+    /// the partition sweep in `tick_partitions` and the metadata one in
+    /// `tick_metadata`.
     ///
     /// Separate from `repair_retry_interval`, which paces an already-open
     /// stream: this one decides how long a replication hole stays open, so
     /// raising the retry interval to quiet repair chatter must not widen it.
-    /// Floored at `PARTITION_GAP_DEBOUNCE_TICKS_MIN` consensus ticks, since one
+    /// Floored at `REPAIR_GAP_DEBOUNCE_TICKS_MIN` consensus ticks, since one
     /// tick of lag is ordinary pipelining and repair against it would fire on
     /// healthy traffic; the shard crate owns the floor and `config.toml` states
     /// its value. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
