@@ -59,6 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// away the central provider's typo-detection for this whole namespace - a misspelled key here
 /// would otherwise silently no-op instead of surfacing anywhere. `reject_unknown_kafka_env_vars`
 /// is this crate's own replacement for that lost check.
+///
+/// Includes `bridge::config::IggyBridgeConfig::KNOWN_ENV_VARS` even though nothing in `main`
+/// reads them yet (`IggyBridge` isn't wired into the live dispatch path until `#3535`/`#3536`) -
+/// a user who exports them ahead of that wiring landing must not see a spurious "unknown env var"
+/// rejection for a name this crate already recognizes.
 const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_BIND_ADDR",
     "IGGY_KAFKA_ADVERTISED_HOST",
@@ -69,6 +74,11 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_READ_TIMEOUT_SECS",
     "IGGY_KAFKA_WRITE_TIMEOUT_SECS",
     "IGGY_KAFKA_SHUTDOWN_DRAIN_TIMEOUT_SECS",
+    "IGGY_KAFKA_IGGY_ADDR",
+    "IGGY_KAFKA_IGGY_USERNAME",
+    "IGGY_KAFKA_IGGY_PASSWORD",
+    "IGGY_KAFKA_IGGY_STREAM",
+    "IGGY_KAFKA_TOPIC_MAP_PATH",
 ];
 
 /// Rejects any `IGGY_KAFKA_*` env var not in [`KNOWN_KAFKA_ENV_VARS`] - a typo (e.g.

@@ -58,6 +58,62 @@ Before check-in, run the procedure in [docs/MANUAL_TESTING.md](docs/MANUAL_TESTI
 
 See [docs/SCOPE.md](docs/SCOPE.md) for [#3421](https://github.com/apache/iggy/issues/3421) deliverables, supported API key/version table, and post-foundation TODO backlog.
 
+## Iggy bridge ([#3533](https://github.com/apache/iggy/issues/3533))
+
+`src/bridge/` is the SDK integration layer: connects to Iggy, maps Kafka topics to Iggy
+streams/topics, provisions them on demand, and looks up the high watermark for `ListOffsets`.
+**Not wired into the live Produce/Fetch dispatch path yet** - that lands with
+[#3535](https://github.com/apache/iggy/issues/3535)/[#3536](https://github.com/apache/iggy/issues/3536).
+Exercised today by `bridge`'s own unit tests and `tests/bridge_iggy_integration_tests.rs` (spawns a
+real `iggy-server`).
+
+### Connection config
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Address of the Iggy server to bridge to |
+| `IGGY_KAFKA_IGGY_USERNAME` | `iggy` | Iggy username |
+| `IGGY_KAFKA_IGGY_PASSWORD` | `iggy` | Iggy password |
+| `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default Iggy stream for a Kafka topic with no explicit mapping override |
+| `IGGY_KAFKA_TOPIC_MAP_PATH` | unset | Path to a topic-mapping TOML file (see below); omit to use only the default rule |
+
+The connection retries a fixed, bounded number of times (not the Iggy SDK client's own default of
+unlimited retries, one dial per second, forever) so a bridge call fails within a few seconds
+against an unreachable Iggy instead of blocking the calling task indefinitely - see
+`IggyBridgeConfig::connection_string`'s doc comment.
+
+### Topic mapping
+
+Default rule, no config file needed: a Kafka topic `orders` maps to Iggy stream
+`IGGY_KAFKA_IGGY_STREAM` (default `kafka`), topic `orders` - the Kafka topic name carries over
+unchanged. Override specific topics with a TOML file:
+
+```toml
+default_stream = "kafka"
+
+[topics.orders]
+stream = "billing"
+topic = "orders_v2"
+```
+
+Point `IGGY_KAFKA_TOPIC_MAP_PATH` at the file to load it; topics not listed under `[topics.*]`
+still fall back to the default rule.
+
+### Provisioning and idempotency
+
+`ensure_stream_and_topic(kafka_topic, partition_count)` creates the mapped Iggy stream and topic
+if either is missing, and is a no-op if both already exist - safe to call on every Produce/Fetch
+for a topic once the handler wiring lands. A `NameAlreadyExists` race against a concurrent caller
+is treated as success, not an error: the goal is "it exists," not "this call created it."
+
+### Error mapping
+
+`BridgeError::to_kafka_error_code()` maps Iggy failures to Kafka wire error codes - stream/topic
+not found → `UNKNOWN_TOPIC_OR_PARTITION` (3), auth/credential failures →
+`TOPIC_AUTHORIZATION_FAILED` (29), connection-shaped failures → `NOT_LEADER_OR_FOLLOWER` (6, the
+same retriable code the foundation's own stubs send, so a client backs off and retries), anything
+else → `UNKNOWN_SERVER_ERROR` (-1).
+
 ## Wire fixture tool
 
 See [tools/kafka-tool/README.md](tools/kafka-tool/README.md).
