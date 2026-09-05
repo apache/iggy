@@ -18,18 +18,16 @@
 use crate::{RUNTIME, ffi};
 use bytes::Bytes;
 use iggy::prelude::{
-    AutoLogin as RustAutoLogin, Client as IggyConnectionClient, ClusterClient,
-    CompressionAlgorithm as RustCompressionAlgorithm, Consumer, ConsumerGroupClient,
-    ConsumerOffsetClient, Identifier as RustIdentifier, IggyClient as RustIggyClient,
-    IggyClientBuilder as RustIggyClientBuilder, IggyDuration as RustIggyDuration,
-    IggyExpiry as RustIggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize as RustMaxTopicSize,
-    MessageClient, NonZeroIggyDuration as RustNonZeroIggyDuration,
-    OptionsScope as RustOptionsScope, PartitionClient, Partitioning,
-    Permissions as RustPermissions, PollingStrategy, SegmentClient,
+    AutoLogin as RustAutoLogin, Client as IggyConnectionClient, ClusterClient, Consumer,
+    ConsumerGroupClient, ConsumerOffsetClient, Identifier as RustIdentifier,
+    IggyClient as RustIggyClient, IggyClientBuilder as RustIggyClientBuilder,
+    IggyDuration as RustIggyDuration, IggyMessage, IggyTimestamp, MessageClient,
+    NonZeroIggyDuration as RustNonZeroIggyDuration, OptionsScope as RustOptionsScope,
+    PartitionClient, Partitioning, Permissions as RustPermissions, PollingStrategy, SegmentClient,
     SnapshotCompression as RustSnapshotCompression, StreamClient, StreamUpdateOptions,
     SystemClient as RustSystemClient, SystemSnapshotType as RustSystemSnapshotType, TopicClient,
-    TopicCreateOptions, TopicUpdateOptions, UserClient, UserStatus as RustUserStatus,
-    UserUpdateOptions,
+    TopicCreateOptions as RustTopicCreateOptions, TopicUpdateOptions as RustTopicUpdateOptions,
+    UserClient, UserStatus as RustUserStatus, UserUpdateOptions,
 };
 use iggy_common::Credentials as RustCredentials;
 use std::collections::HashSet;
@@ -104,9 +102,8 @@ pub fn new_connection(config: ffi::IggyClientConfig) -> Result<*mut Client, Stri
     );
     if config.has_reconnection_interval {
         let reconnection_interval =
-            RustNonZeroIggyDuration::try_from(config.reconnection_interval_micros).map_err(
-                |error| format!("Invalid reconnection interval: {error}"),
-            )?;
+            RustNonZeroIggyDuration::try_from(config.reconnection_interval_micros)
+                .map_err(|error| format!("Invalid reconnection interval: {error}"))?;
         builder = builder.with_reconnection_interval(reconnection_interval);
     }
     if config.has_reestablish_after {
@@ -229,13 +226,16 @@ impl Client {
         &self,
         stream_id: ffi::Identifier,
         stream_name: String,
+        options: Vec<ffi::HeaderEntry>,
     ) -> Result<(), String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not update stream '{stream_name}': {error}"))?;
+        // Stream options are currently null-op (UPDATABLE_STREAM_OPTION_KEYS is empty),
+        // so no conversion is needed. Keep param for surface parity and pass default.
+        let _ = options;
 
         RUNTIME.block_on(async {
             self.inner
-                // Streams have no option keys yet.
                 .update_stream(
                     &rust_stream_id,
                     &stream_name,
@@ -438,66 +438,16 @@ impl Client {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
         stream_id: ffi::Identifier,
         topic_name: String,
-        partitions_count: u32,
-        compression_algorithm: String,
-        message_expiry_kind: String,
-        message_expiry_value: u64,
-        max_topic_size: String,
-        options: Vec<ffi::HeaderEntry>,
+        options: ffi::TopicCreateOptions,
     ) -> Result<ffi::TopicDetails, String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
-        let rust_compression_algorithm = match compression_algorithm.to_lowercase().as_str() {
-            "" | "none" => RustCompressionAlgorithm::None,
-            _ => RustCompressionAlgorithm::from_str(&compression_algorithm).map_err(|error| {
-                format!(
-                    "Could not create topic '{topic_name}': invalid compression algorithm '{compression_algorithm}': {error}"
-                )
-            })?,
-        };
-        let rust_message_expiry = match message_expiry_kind.as_str() {
-            "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
-            "never_expire" => RustIggyExpiry::NeverExpire,
-            "duration" => RustIggyExpiry::ExpireDuration(iggy::prelude::IggyDuration::from(
-                message_expiry_value,
-            )),
-            _ => {
-                return Err(format!(
-                    "Could not create topic '{topic_name}': invalid message expiry kind '{message_expiry_kind}'"
-                ));
-            }
-        };
-        let rust_max_topic_size = match max_topic_size.as_str() {
-            "" | "server_default" | "0" => RustMaxTopicSize::ServerDefault,
-            _ => RustMaxTopicSize::from_str(&max_topic_size).map_err(|error| {
-                format!(
-                    "Could not create topic '{topic_name}': invalid max topic size '{max_topic_size}': {error}"
-                )
-            })?,
-        };
-
-        let raw = crate::type_conversion::ffi_options_to_raw(options)
+        let options = RustTopicCreateOptions::try_from(options)
             .map_err(|error| format!("Could not create topic '{topic_name}': {error}"))?;
-
-        // `None` is what tells admission to resolve the server default, so the
-        // sentinels the string parsers produce must collapse back to it.
-        let options = TopicCreateOptions {
-            partitions_count: Some(partitions_count),
-            compression_algorithm: (rust_compression_algorithm
-                != RustCompressionAlgorithm::default())
-            .then_some(rust_compression_algorithm),
-            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
-                .then_some(rust_message_expiry),
-            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
-                .then_some(rust_max_topic_size),
-            raw,
-            ..TopicCreateOptions::default()
-        };
 
         RUNTIME.block_on(async {
             let topic_details = self
@@ -558,66 +508,19 @@ impl Client {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn update_topic(
         &self,
         stream_id: ffi::Identifier,
         topic_id: ffi::Identifier,
         topic_name: String,
-        compression_algorithm: String,
-        message_expiry_kind: String,
-        message_expiry_value: u64,
-        max_topic_size: String,
-        options: Vec<ffi::HeaderEntry>,
+        options: ffi::TopicUpdateOptions,
     ) -> Result<(), String> {
         let rust_stream_id = RustIdentifier::try_from(stream_id)
             .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
         let rust_topic_id = RustIdentifier::try_from(topic_id)
             .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
-        let rust_compression_algorithm = match compression_algorithm.to_lowercase().as_str() {
-            "" | "none" => RustCompressionAlgorithm::None,
-            _ => RustCompressionAlgorithm::from_str(&compression_algorithm).map_err(|error| {
-                format!(
-                    "Could not update topic '{topic_name}': invalid compression algorithm '{compression_algorithm}': {error}"
-                )
-            })?,
-        };
-        let rust_message_expiry = match message_expiry_kind.as_str() {
-            "" | "server_default" | "default" => RustIggyExpiry::ServerDefault,
-            "never_expire" => RustIggyExpiry::NeverExpire,
-            "duration" => RustIggyExpiry::ExpireDuration(iggy::prelude::IggyDuration::from(
-                message_expiry_value,
-            )),
-            _ => {
-                return Err(format!(
-                    "Could not update topic '{topic_name}': invalid message expiry kind '{message_expiry_kind}'"
-                ));
-            }
-        };
-        let rust_max_topic_size = match max_topic_size.as_str() {
-            "" | "server_default" | "0" => RustMaxTopicSize::ServerDefault,
-            _ => RustMaxTopicSize::from_str(&max_topic_size).map_err(|error| {
-                format!(
-                    "Could not update topic '{topic_name}': invalid max topic size '{max_topic_size}': {error}"
-                )
-            })?,
-        };
-
-        let raw = crate::type_conversion::ffi_options_to_raw(options)
+        let update_options = RustTopicUpdateOptions::try_from(options)
             .map_err(|error| format!("Could not update topic '{topic_name}': {error}"))?;
-
-        // Settings ride the options block; a server-default sentinel means the
-        // caller did not set the key, so the topic keeps its current value.
-        let update_options = TopicUpdateOptions {
-            compression_algorithm: (rust_compression_algorithm
-                != RustCompressionAlgorithm::default())
-            .then_some(rust_compression_algorithm),
-            message_expiry: (rust_message_expiry != RustIggyExpiry::ServerDefault)
-                .then_some(rust_message_expiry),
-            max_topic_size: (rust_max_topic_size != RustMaxTopicSize::ServerDefault)
-                .then_some(rust_max_topic_size),
-            raw,
-        };
 
         RUNTIME.block_on(async {
             self.inner

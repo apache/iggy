@@ -428,6 +428,40 @@ mod ffi {
         no_delay: bool,
     }
 
+    struct TopicCreateOptions {
+        has_partitions_count: bool,
+        partitions_count: u32,
+        has_compression_algorithm: bool,
+        compression_algorithm: String,
+        has_message_expiry: bool,
+        message_expiry_kind: String,
+        message_expiry_value: u64,
+        has_max_topic_size: bool,
+        max_topic_size: String,
+        has_segment_size: bool,
+        segment_size: u64,
+        has_enforce_fsync: bool,
+        enforce_fsync: bool,
+        has_messages_required_to_save: bool,
+        messages_required_to_save: u32,
+        has_size_of_messages_required_to_save: bool,
+        size_of_messages_required_to_save: u64,
+        has_preallocate_segments: bool,
+        preallocate_segments: bool,
+        raw_options: Vec<HeaderEntry>,
+    }
+
+    struct TopicUpdateOptions {
+        has_compression_algorithm: bool,
+        compression_algorithm: String,
+        has_message_expiry: bool,
+        message_expiry_kind: String,
+        message_expiry_value: u64,
+        has_max_topic_size: bool,
+        max_topic_size: String,
+        raw_options: Vec<HeaderEntry>,
+    }
+
     extern "Rust" {
         type Client;
         type Consumer;
@@ -440,22 +474,21 @@ mod ffi {
         fn logout_user(self: &Client) -> Result<()>;
         fn connect(self: &Client) -> Result<()>;
         fn create_stream(self: &Client, stream_name: String) -> Result<StreamDetails>;
-        fn update_stream(self: &Client, stream_id: Identifier, stream_name: String) -> Result<()>;
+        fn update_stream(
+            self: &Client,
+            stream_id: Identifier,
+            stream_name: String,
+            options: Vec<HeaderEntry>,
+        ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(self: &Client, stream_id: Identifier) -> Result<()>;
         fn purge_stream(self: &Client, stream_id: Identifier) -> Result<()>;
-        #[allow(clippy::too_many_arguments)]
         fn create_topic(
             self: &Client,
             stream_id: Identifier,
             topic_name: String,
-            partitions_count: u32,
-            compression_algorithm: String,
-            message_expiry_kind: String,
-            message_expiry_value: u64,
-            max_topic_size: String,
-            options: Vec<HeaderEntry>,
+            options: TopicCreateOptions,
         ) -> Result<TopicDetails>;
         fn get_topic(
             self: &Client,
@@ -463,17 +496,12 @@ mod ffi {
             topic_id: Identifier,
         ) -> Result<TopicDetails>;
         fn get_topics(self: &Client, stream_id: Identifier) -> Result<Vec<Topic>>;
-        #[allow(clippy::too_many_arguments)]
         fn update_topic(
             self: &Client,
             stream_id: Identifier,
             topic_id: Identifier,
             topic_name: String,
-            compression_algorithm: String,
-            message_expiry_kind: String,
-            message_expiry_value: u64,
-            max_topic_size: String,
-            options: Vec<HeaderEntry>,
+            options: TopicUpdateOptions,
         ) -> Result<()>;
         fn delete_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
         fn purge_topic(self: &Client, stream_id: Identifier, topic_id: Identifier) -> Result<()>;
