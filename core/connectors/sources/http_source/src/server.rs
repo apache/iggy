@@ -1201,8 +1201,17 @@ mod tests {
         // what regresses if the read moves back ahead of the lookup and its
         // failure is surfaced there. It does not, and over HTTP cannot, prove
         // that no bytes were read.
-        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
-        let oversized = "x".repeat(crate::DEFAULT_MAX_BODY_SIZE_BYTES + 1024);
+        // A small cap, and a body oversized only relative to it. At the
+        // default 1 MiB the request outgrew the socket buffer, so the server's
+        // early 404 reached the client mid-write and reqwest surfaced a
+        // BrokenPipe instead of the response: the refusal this test wants is
+        // exactly what made it flaky. A few KiB completes the write before the
+        // server can answer, and the cap is what "oversized" is measured
+        // against, so shrinking both pins the same ordering deterministically.
+        let mut config = config(free_port(), free_port(), &[ENDPOINT_ONE]);
+        config.max_body_size_bytes = 1024;
+        let oversized = "x".repeat(config.max_body_size_bytes + 1024);
+        let mut source = open(1, config).await;
 
         let response = client()
             .post(format!("{}/e/{ENDPOINT_TWO}", base_url(&source)))
