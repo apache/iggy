@@ -32,7 +32,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::config::{HttpConfig, PyClientConfig};
+use crate::config::PyClientConfig;
 use crate::consumer::{
     AutoCommit, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
     ConsumerGroupDetails as PyConsumerGroupDetails, IggyConsumer,
@@ -92,26 +92,34 @@ fn resolve_topic_params(
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
-    /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or a
-    /// `QuicConfig`. This initializes a new runtime for asynchronous operations.
+    /// Constructs a new IggyClient from a TCP server address, a `TcpConfig`, a
+    /// `QuicConfig`, or an `HttpConfig`. This initializes a new runtime for
+    /// asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
     ///
     /// Args:
-    ///     conn: A `host:port` address, a `TcpConfig`, or a `QuicConfig`. Defaults
-    ///         to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
-    ///         address is reported differently depending on the form: the string
-    ///         form raises `RuntimeError` here, while `TcpConfig`/`QuicConfig`
-    ///         raise `ValueError` when they are constructed, before either ever
-    ///         reaches this call. Neither exception is a subclass of the other.
+    ///     conn: A `host:port` address, a `TcpConfig`, a `QuicConfig`, or an
+    ///         `HttpConfig`. Defaults to `127.0.0.1:8090` over TCP with auto-login
+    ///         disabled. A malformed address is reported differently depending on
+    ///         the form: the string form raises `RuntimeError` here, while
+    ///         `TcpConfig`/`QuicConfig`/`HttpConfig` raise `ValueError` when they
+    ///         are constructed, before any of them ever reaches this call. Neither
+    ///         exception is a subclass of the other.
     ///
     /// Raises:
     ///     RuntimeError: If the address passed as a string is not a valid
-    ///         `host:port` pair, or if a `QuicConfig` client cannot bind its
-    ///         local UDP socket (for example the port is already in use).
+    ///         `host:port` pair, if a `QuicConfig` client cannot bind its local
+    ///         UDP socket (for example the port is already in use), or if an
+    ///         `HttpConfig` client cannot be constructed. `api_url` is already
+    ///         validated when `HttpConfig` is built, so the last case does not
+    ///         currently fail; the exception is documented for interface
+    ///         consistency with the other transports.
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
-        #[gen_stub(override_type(type_repr = "TcpConfig | QuicConfig | builtins.str | None"))]
+        #[gen_stub(override_type(
+            type_repr = "TcpConfig | QuicConfig | HttpConfig | builtins.str | None"
+        ))]
         conn: Option<PyClientConfig>,
     ) -> PyResult<Self> {
         let wrapper = match conn {
@@ -138,6 +146,9 @@ impl IggyClient {
                     QuicClient::create(config.client_config()).map_err(to_runtime_error)?,
                 )
             }
+            Some(PyClientConfig::Http(config)) => ClientWrapper::Http(
+                HttpClient::create(config.client_config()).map_err(to_runtime_error)?,
+            ),
             None => ClientWrapper::Tcp(
                 TcpClient::create(Arc::new(TcpClientConfig::default()))
                     .map_err(to_runtime_error)?,
@@ -167,30 +178,6 @@ impl IggyClient {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(Self {
             inner: Arc::new(client),
-        })
-    }
-
-    /// Constructs a new IggyClient configured for the HTTP transport.
-    ///
-    /// `api_url` is already validated when `config` is built, so this does not
-    /// currently fail; the exception is documented for interface consistency
-    /// with the other transport constructors.
-    ///
-    /// Args:
-    ///     config: HTTP transport configuration. Defaults to `HttpConfig()`.
-    ///
-    /// Raises:
-    ///     RuntimeError: If the client cannot be constructed.
-    #[classmethod]
-    #[pyo3(signature = (config=None))]
-    fn http(_cls: &Bound<'_, PyType>, config: Option<HttpConfig>) -> PyResult<Self> {
-        let config = config
-            .map(|config| config.client_config())
-            .unwrap_or_else(|| Arc::new(HttpClientConfig::default()));
-        let http_client = HttpClient::create(config)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(Self {
-            inner: Arc::new(RustIggyClient::new(ClientWrapper::Http(http_client))),
         })
     }
 

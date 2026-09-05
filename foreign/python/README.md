@@ -171,31 +171,10 @@ asyncio.run(main())
 `IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport; see
 `examples/python/getting-started/producer.py` for a config swap example.
 
-`IggyClient.http(...)` takes an `HttpConfig` the same way, built from `IggyClient.http()`'s own
-config type rather than passed to `IggyClient(...)`. HTTP is a stateless per-request transport,
-so there is no reconnection policy to configure. There is also no `AutoLogin`: call
-`login_user(...)` explicitly after connecting.
-
-```python
-import asyncio
-
-from apache_iggy import HttpConfig, IggyClient
-
-
-async def main():
-    client = IggyClient.http(
-        HttpConfig(
-            api_url="http://127.0.0.1:3000",
-            retries=3,
-            # jwt="...",
-        )
-    )
-    await client.connect()
-    await client.login_user("iggy", "iggy")
-
-
-asyncio.run(main())
-```
+`IggyClient(...)` also accepts an `HttpConfig` for the HTTP transport. HTTP is a
+stateless per-request transport, so there is no reconnection policy to configure.
+There is also no `AutoLogin`: call `login_user(...)` explicitly after connecting.
+See `examples/python/getting-started/producer.py` for a config swap example.
 
 ## Examples
 

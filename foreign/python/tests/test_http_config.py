@@ -124,15 +124,15 @@ class TestHttpConfig:
 
 @pytest.mark.unit
 class TestHttpClientConstruction:
-    """Test what `IggyClient.http(...)` accepts."""
+    """Test that `IggyClient(...)` accepts an `HttpConfig`."""
 
     def test_accepts_a_config(self):
         """Test that a client can be built from a config object."""
-        assert IggyClient.http(HttpConfig(api_url="http://127.0.0.1:3000")) is not None
+        assert IggyClient(HttpConfig(api_url="http://127.0.0.1:3000")) is not None
 
-    def test_accepts_nothing(self):
-        """Test that the default configuration is used when no argument is given."""
-        assert IggyClient.http() is not None
+    def test_accepts_the_default_config(self):
+        """Test that an explicit default `HttpConfig` is accepted."""
+        assert IggyClient(HttpConfig()) is not None
 
 
 @pytest.mark.integration
@@ -144,7 +144,7 @@ class TestHttpConfigAgainstServer:
         """Test that a client built with a custom config reaches the server."""
         host, port = get_http_server_config()
 
-        client = IggyClient.http(HttpConfig(api_url=f"http://{host}:{port}"))
+        client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
         await client.connect()
         await wait_for_ping(client)
 
@@ -161,7 +161,7 @@ class TestHttpConfigAgainstServer:
         topic_name = unique_name()
         payload = f"payload-{unique_name()}"
 
-        client = IggyClient.http(HttpConfig(api_url=f"http://{host}:{port}"))
+        client = IggyClient(HttpConfig(api_url=f"http://{host}:{port}"))
         await client.connect()
         await wait_for_ping(client)
         await client.login_user("iggy", "iggy")
