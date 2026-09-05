@@ -185,6 +185,7 @@ async fn register_endpoint(
             );
         }
     }
+    warn_if_poll_stopped(&instance, "Registered", endpoint_id.as_str());
     if let Some(failure) = republish(&state).await {
         // Undo the insert. Left in place it would be persisted on the next
         // flush and come back live after a restart, despite the caller having
@@ -297,6 +298,7 @@ async fn rotate_secret(
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "instance is closing");
     }
 
+    warn_if_poll_stopped(&instance, "Rotated", &endpoint_id);
     info!(
         "Rotated the secret for endpoint {} on {CONNECTOR_NAME} connector ID: {}",
         EndpointId::log_prefix_of(&endpoint_id),
@@ -336,12 +338,18 @@ async fn revoke_endpoint(
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "instance is closing");
     }
 
+    warn_if_poll_stopped(&instance, "Revoked", &endpoint_id);
     info!(
         "Revoked endpoint {} on {CONNECTOR_NAME} connector ID: {}",
         EndpointId::log_prefix_of(&endpoint_id),
         instance.id
     );
-    StatusCode::NO_CONTENT.into_response()
+    // 202, not 204. The tombstone is live in the route table before this
+    // returns, so the endpoint stops serving immediately, but it reaches the
+    // runtime only on a later `poll()` and `submitted` flips before the state
+    // leaves the plugin, so waiting on that flag would not prove durability
+    // either. `GET /admin/endpoints/{id}` is where an operator watches for it.
+    StatusCode::ACCEPTED.into_response()
 }
 
 async fn list_endpoints(State(state): State<Arc<ServerState>>) -> Response {
@@ -407,6 +415,24 @@ fn owner_of(state: &ServerState, endpoint_id: &str) -> Option<Arc<SharedState>> 
 /// under that name. A handler awaits between resolving and mutating, and an
 /// instance can close in between - the mutation would then land on a registry
 /// nobody polls and the caller would be told it succeeded.
+/// Warns when a mutation landed on an instance whose poll task looks stopped.
+///
+/// `still_joined` proves only that the instance is registered. The SDK stops
+/// the poll task after five consecutive NACKs without calling `close()`, so an
+/// instance can stay registered and keep answering 201 and 202 for changes
+/// nothing will ever carry to the runtime. `/admin/health` reports the same
+/// signal as `poll_is_live`. See #3941.
+fn warn_if_poll_stopped(instance: &Arc<SharedState>, action: &str, endpoint_id: &str) {
+    if instance.poll_is_live(unix_now_seconds()) {
+        return;
+    }
+    warn!(
+        "{action} endpoint {} on {CONNECTOR_NAME} connector ID: {} while its poll task looks stopped; the change is in memory but nothing is carrying it to the runtime",
+        EndpointId::log_prefix_of(endpoint_id),
+        instance.id
+    );
+}
+
 fn still_joined(state: &ServerState, instance: &Arc<SharedState>) -> bool {
     state
         .instance(&instance.instance_name)
@@ -746,7 +772,7 @@ mod tests {
 
         assert_eq!(
             revoke().await.expect("first revoke").status(),
-            StatusCode::NO_CONTENT
+            StatusCode::ACCEPTED
         );
         fixture
             .source
@@ -929,7 +955,7 @@ mod tests {
             .expect("the request must reach the listener");
 
         assert_eq!(accepted.status(), StatusCode::OK);
-        assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+        assert_eq!(revoked.status(), StatusCode::ACCEPTED);
         assert_eq!(
             after.status(),
             StatusCode::NOT_FOUND,

@@ -217,7 +217,7 @@ POST   /admin/endpoints          register, id generated server-side  -> 201
 GET    /admin/endpoints          list every endpoint, secrets omitted -> 200
 GET    /admin/endpoints/{id}     one endpoint                         -> 200
 PATCH  /admin/endpoints/{id}     rotate auth_secret in place          -> 200
-DELETE /admin/endpoints/{id}     revoke                               -> 204
+DELETE /admin/endpoints/{id}     revoke                               -> 202
 ```
 
 ```bash
@@ -241,7 +241,7 @@ Rotation deliberately keeps the path: a webhook sender configures the URL once, 
 
 Revocation writes a tombstone rather than deleting the entry. The tombstone persists, so a restart against a stale TOML file cannot resurrect an endpoint someone revoked. That rests on `open()` failing when the state file cannot be decoded, rather than falling back to the TOML: the connector reports the decode failure as `last_error` and serves nothing, instead of quietly putting revoked endpoints back on the wire.
 
-The 204 means the endpoint stopped serving *now*, in memory. Durability follows the same path as registration below, with one asymmetry worth knowing: losing an unsaved registration fails closed, but losing an unsaved revocation fails **open**, so the endpoint would come back after a restart.
+The 202 means the endpoint stopped serving *now*, in memory, and that the tombstone has been accepted but not yet persisted. It is deliberately not a 204: the change reaches the runtime only on a later `poll()`, and `submitted` flips before the state leaves the plugin, so no field on this response could honestly claim durability. Watch `GET /admin/endpoints/{id}` for it. Durability follows the same path as registration below, with one asymmetry worth knowing: losing an unsaved registration fails closed, but losing an unsaved revocation fails **open**, so the endpoint would come back after a restart.
 
 `submitted` on `GET /admin/endpoints/{id}` is not the durability check. It flips when the mutation is handed to the runtime, which happens before the runtime persists it. A save that failed shows up as `last_error` on the connector and re-arms the flush for the next poll, so treat a revocation as final only once the connector is error-free. If it cannot reach Iggy, remove the endpoint from the TOML too.
 

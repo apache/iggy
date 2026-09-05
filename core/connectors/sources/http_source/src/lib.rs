@@ -37,7 +37,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -178,7 +178,13 @@ pub struct SharedState {
     registry_writer: Mutex<()>,
     /// Wakes `poll()` when a management mutation needs a state flush and no
     /// webhook traffic would otherwise arrive to carry it.
-    pub state_flush: Notify,
+    ///
+    /// Shared so a refused flush can re-post the permit from a timer rather
+    /// than immediately; see [`SharedState::rearm_state_flush`].
+    pub state_flush: Arc<Notify>,
+    /// Consecutive state flushes the runtime has refused, which is what the
+    /// re-post backs off on.
+    state_flush_nacks: AtomicU32,
 }
 
 impl SharedState {
@@ -282,7 +288,30 @@ impl SharedState {
     /// never retried and nothing on the control API says so.
     pub fn rearm_state_flush(&self) {
         self.registry_dirty.store(true, Ordering::Release);
-        self.state_flush.notify_one();
+        let attempt = self.state_flush_nacks.fetch_add(1, Ordering::AcqRel);
+        let delay = state_flush_retry_delay(attempt);
+        if delay.is_zero() {
+            self.state_flush.notify_one();
+            return;
+        }
+        // Re-posting immediately turns a latched state store into a tight
+        // loop: `poll()` produces another state-only batch, the runtime
+        // refuses it for the same reason, and the SDK stops the source after
+        // five of those without calling `close()`. Backing off keeps the
+        // mutation deliverable without spending that budget on a store that
+        // is not going to answer yet. Dropping the permit instead would leave
+        // an idle gateway, one with no traffic and no further mutations, with
+        // no wakeup at all.
+        let state_flush = Arc::clone(&self.state_flush);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            state_flush.notify_one();
+        });
+    }
+
+    /// Clears the refused-flush backoff once the runtime accepts a batch.
+    pub fn clear_state_flush_backoff(&self) {
+        self.state_flush_nacks.store(0, Ordering::Release);
     }
 
     /// Hands the registry to the runtime for persistence, once per mutation.
@@ -613,7 +642,8 @@ impl HttpSource {
             poll_active: AtomicBool::new(false),
             last_poll_at: AtomicU64::new(0),
             registry_writer: Mutex::new(()),
-            state_flush: Notify::new(),
+            state_flush: Arc::new(Notify::new()),
+            state_flush_nacks: AtomicU32::new(0),
         };
         HttpSource {
             id,
@@ -794,6 +824,7 @@ impl Source for HttpSource {
         match result {
             source::SourceBatchResult::Ack => {
                 self.lock_staged().take();
+                self.shared.clear_state_flush_backoff();
                 Ok(())
             }
             source::SourceBatchResult::Nack => self.on_nack(),
@@ -815,12 +846,39 @@ impl Source for HttpSource {
             }
             None => 0,
         };
+        // A mutation made after the last poll never reached the runtime, and
+        // there is no poll left to carry it. The endpoint is live again after
+        // the restart while the admin API reported the change applied, so this
+        // is the only record that it did not stick. `close()` has no way to
+        // flush it: state reaches the runtime only as the return value of
+        // `poll()`.
+        if self.shared.has_pending_state() {
+            warn!(
+                "Closing {CONNECTOR_NAME} connector ID: {} with an unflushed registry: {} endpoint(s) not submitted, so a change made since the last poll will not survive the restart",
+                self.id,
+                self.shared.registry().unsubmitted_count()
+            );
+        }
         // The SDK stops the poll task before calling this, so anything still
         // in the bridge is already unreachable. Deregistering first is what
         // stops new requests from being accepted into a queue nobody drains.
         server::leave(&self.shared, staged_dropped).await;
         info!("Closed {CONNECTOR_NAME} connector ID: {}", self.id);
         Ok(())
+    }
+}
+
+/// Backoff before re-posting a state flush the runtime refused.
+///
+/// The first retry is immediate, so an isolated refusal costs nothing. Past
+/// that it doubles to an eight second ceiling, which is inside the SDK's
+/// result timeout, so a store that recovers is picked up promptly. A store
+/// that stays latched still ends in the SDK stopping the source; that is
+/// #3941's subject, not something this connector can fix from the inside.
+fn state_flush_retry_delay(attempt: u32) -> Duration {
+    match attempt {
+        0 => Duration::ZERO,
+        n => Duration::from_millis(250u64 << (n - 1).min(5)),
     }
 }
 
@@ -1226,6 +1284,36 @@ mod tests {
                 "{header} would be copied onto every message and persisted in the log"
             );
         }
+    }
+
+    #[test]
+    fn given_first_refused_flush_when_retried_should_not_delay() {
+        // An isolated refusal must cost nothing: the store may already be
+        // healthy again by the next poll, and delaying every one of them would
+        // hold a revocation back for no reason.
+        assert_eq!(state_flush_retry_delay(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn given_repeated_refusals_when_retried_should_back_off_to_a_ceiling() {
+        // Growth is what stops a latched store burning the SDK's five-NACK
+        // budget in a tight loop; the ceiling is what stops a recovered store
+        // waiting minutes to be noticed.
+        let delays: Vec<Duration> = (1..=10).map(state_flush_retry_delay).collect();
+        for pair in delays.windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "backoff must never shrink, got {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        assert_eq!(delays[0], Duration::from_millis(250));
+        assert_eq!(
+            *delays.last().expect("range is not empty"),
+            Duration::from_secs(8),
+            "the delay must stop growing well inside the SDK's result timeout"
+        );
     }
 
     #[test]
