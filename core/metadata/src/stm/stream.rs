@@ -561,12 +561,25 @@ impl StatsRegistry {
     }
 
     fn remove_partitions_from(&self, stream_id: usize, topic_id: usize, first_removed: usize) {
-        self.partitions
+        let mut partitions = self
+            .partitions
             .lock()
-            .expect("stats registry mutex poisoned")
-            .retain(|(sid, tid, pid), _| {
-                !(*sid == stream_id && *tid == topic_id && *pid >= first_removed)
-            });
+            .expect("stats registry mutex poisoned");
+        let mut removed = Vec::new();
+        partitions.retain(|(sid, tid, pid), entry| {
+            let keep = !(*sid == stream_id && *tid == topic_id && *pid >= first_removed);
+            if !keep {
+                removed.push(entry.stats.clone());
+            }
+            keep
+        });
+        drop(partitions);
+
+        // Roll counters out of the parents after releasing the registry lock.
+        // A second left-right apply finds no entries and is a no-op.
+        for stats in removed {
+            stats.zero_out_all();
+        }
     }
 
     /// Drop every entry the snapshot does not describe, keeping the rest.
@@ -3067,6 +3080,62 @@ mod tests {
                 "deleting {count_to_delete} of {partitions_count} partitions"
             );
         }
+    }
+
+    #[test]
+    fn given_counted_partitions_when_deleted_should_roll_back_parent_stats() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let create_topic = CreateTopicWithAssignmentsRequest {
+            created_view: 0,
+            request: make_topic_request(0, 3, "topic"),
+            derived_options: WireOptions::empty(),
+            partitions: (0..3)
+                .map(|partition_id| CreatedPartitionAssignment {
+                    partition_id,
+                    consensus_group_id: 1,
+                })
+                .collect(),
+        };
+        let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
+
+        let topic_stats = inner.items[0].topics[0].stats.clone();
+        let partition_stats: Vec<_> = (0..3)
+            .map(|partition_id| {
+                inner
+                    .stats_registry
+                    .partition(0, 0, partition_id, topic_stats.clone())
+            })
+            .collect();
+        for (index, stats) in partition_stats.iter().enumerate() {
+            stats.increment_messages_count((index + 1) as u64);
+            stats.increment_size_bytes(((index + 1) * 100) as u64);
+            stats.increment_segments_count(1);
+        }
+
+        let delete = DeletePartitionsRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partitions_count: 2,
+        };
+        let apply = StateHandler::apply(&delete, &mut inner, IggyTimestamp::now());
+        assert_eq!(apply.code, 0);
+
+        assert_eq!(partition_stats[0].messages_count_inconsistent(), 1);
+        assert_eq!(partition_stats[0].size_bytes_inconsistent(), 100);
+        assert_eq!(partition_stats[0].segments_count_inconsistent(), 1);
+        for stats in &partition_stats[1..] {
+            assert_eq!(stats.messages_count_inconsistent(), 0);
+            assert_eq!(stats.size_bytes_inconsistent(), 0);
+            assert_eq!(stats.segments_count_inconsistent(), 0);
+        }
+        assert_eq!(topic_stats.messages_count_inconsistent(), 1);
+        assert_eq!(topic_stats.size_bytes_inconsistent(), 100);
+        assert_eq!(inner.items[0].stats.messages_count_inconsistent(), 1);
+        assert_eq!(inner.items[0].stats.size_bytes_inconsistent(), 100);
+        assert!(inner.stats_registry.partition_get(0, 0, 0).is_some());
+        assert!(inner.stats_registry.partition_get(0, 0, 1).is_none());
+        assert!(inner.stats_registry.partition_get(0, 0, 2).is_none());
     }
 
     #[test]

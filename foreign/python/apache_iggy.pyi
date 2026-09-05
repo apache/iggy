@@ -1201,18 +1201,22 @@ class IggyClient:
         partitions_count: builtins.int,
     ) -> collections.abc.Awaitable[None]:
         r"""
-        Create partitions for a topic.
+        Create partitions for a topic. New partitions use consecutive, zero-based IDs
+        after the current maximum; IDs removed by deletion can be reused. Existing
+        consumer groups leave them unassigned until their next rebalance.
 
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
-            partitions_count: Number of partitions to create.
+            partitions_count: Number of partitions to create as `int`; must be
+                1..=1000.
 
         Returns:
             An awaitable that resolves to `None` when the partitions are created.
 
         Raises:
             ValueError: If an identifier is invalid.
+            OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
             RuntimeError: If the request fails.
         """
     def delete_partitions(
@@ -1223,17 +1227,21 @@ class IggyClient:
     ) -> collections.abc.Awaitable[None]:
         r"""
         Delete the last partitions from a topic, including all messages stored in them.
+        Consumer groups are rebalanced away from the removed partitions.
 
         Args:
             stream_id: Stream identifier as `str | int`.
             topic_id: Topic identifier as `str | int`.
-            partitions_count: Number of partitions to delete from the end of the topic.
+            partitions_count: Number of partitions to delete as `int` from the end of
+                the topic; must be 1..=1000 and no greater than its current count.
 
         Returns:
-            An awaitable that resolves to `None` when the partitions are deleted.
+            An awaitable that resolves to `None` when deletion is accepted; storage
+            teardown completes asynchronously.
 
         Raises:
             ValueError: If an identifier is invalid.
+            OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
             RuntimeError: If the request fails.
         """
     def create_consumer_group(

@@ -57,6 +57,10 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
+fn to_runtime_error(error: impl ToString) -> PyErr {
+    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
+}
+
 /// Resolves the shared `create_topic`/`update_topic` parameters, applying
 /// server defaults where the caller left them unset.
 fn resolve_topic_params(
@@ -777,18 +781,22 @@ impl IggyClient {
         })
     }
 
-    /// Create partitions for a topic.
+    /// Create partitions for a topic. New partitions use consecutive, zero-based IDs
+    /// after the current maximum; IDs removed by deletion can be reused. Existing
+    /// consumer groups leave them unassigned until their next rebalance.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
     ///     topic_id: Topic identifier as `str | int`.
-    ///     partitions_count: Number of partitions to create.
+    ///     partitions_count: Number of partitions to create as `int`; must be
+    ///         1..=1000.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the partitions are created.
     ///
     /// Raises:
     ///     ValueError: If an identifier is invalid.
+    ///     OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
     ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_partitions<'a>(
@@ -806,23 +814,27 @@ impl IggyClient {
             inner
                 .create_partitions(&stream_id, &topic_id, partitions_count)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
 
     /// Delete the last partitions from a topic, including all messages stored in them.
+    /// Consumer groups are rebalanced away from the removed partitions.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
     ///     topic_id: Topic identifier as `str | int`.
-    ///     partitions_count: Number of partitions to delete from the end of the topic.
+    ///     partitions_count: Number of partitions to delete as `int` from the end of
+    ///         the topic; must be 1..=1000 and no greater than its current count.
     ///
     /// Returns:
-    ///     An awaitable that resolves to `None` when the partitions are deleted.
+    ///     An awaitable that resolves to `None` when deletion is accepted; storage
+    ///     teardown completes asynchronously.
     ///
     /// Raises:
     ///     ValueError: If an identifier is invalid.
+    ///     OverflowError: If `partitions_count` is outside the unsigned 32-bit range.
     ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_partitions<'a>(
@@ -840,7 +852,7 @@ impl IggyClient {
             inner
                 .delete_partitions(&stream_id, &topic_id, partitions_count)
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+                .map_err(to_runtime_error)?;
             Ok(())
         })
     }
