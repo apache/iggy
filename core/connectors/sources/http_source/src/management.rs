@@ -49,6 +49,7 @@ use crate::{CONNECTOR_NAME, EndpointAuthType, SharedState};
 /// Bytes of entropy behind a generated endpoint id. The URL is the bearer
 /// token for a secret-path endpoint, so it carries the whole secret.
 const ENDPOINT_ID_BYTES: usize = 16;
+
 /// A revoke reason rides the tombstone, and tombstones are never evicted,
 /// so an uncapped one is an authenticated caller writing to the state file
 /// without limit.
@@ -411,13 +412,9 @@ fn owner_of(state: &ServerState, endpoint_id: &str) -> Option<Arc<SharedState>> 
         .find(|instance| instance.registry().endpoint(endpoint_id).is_some())
 }
 
-/// Whether the instance a handler resolved earlier is still the one joined
-/// under that name. A handler awaits between resolving and mutating, and an
-/// instance can close in between - the mutation would then land on a registry
-/// nobody polls and the caller would be told it succeeded.
 /// Warns when a mutation landed on an instance whose poll task looks stopped.
 ///
-/// `still_joined` proves only that the instance is registered. The SDK stops
+/// [`still_joined`] proves only that the instance is registered. The SDK stops
 /// the poll task after five consecutive NACKs without calling `close()`, so an
 /// instance can stay registered and keep answering 201 and 202 for changes
 /// nothing will ever carry to the runtime. `/admin/health` reports the same
@@ -433,6 +430,10 @@ fn warn_if_poll_stopped(instance: &Arc<SharedState>, action: &str, endpoint_id: 
     );
 }
 
+/// Whether the instance a handler resolved earlier is still the one joined
+/// under that name. A handler awaits between resolving and mutating, and an
+/// instance can close in between - the mutation would then land on a registry
+/// nobody polls and the caller would be told it succeeded.
 fn still_joined(state: &ServerState, instance: &Arc<SharedState>) -> bool {
     state
         .instance(&instance.instance_name)
