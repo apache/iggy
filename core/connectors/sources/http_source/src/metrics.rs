@@ -36,7 +36,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::error;
 
@@ -119,6 +119,12 @@ pub struct Metrics {
     buffer_used: Family<InstanceLabel, Gauge>,
     buffer_capacity: Family<InstanceLabel, Gauge>,
     endpoints_active: Family<EndpointLabels, Gauge>,
+    /// Serialises the gauge refresh in [`Metrics::encode`].
+    ///
+    /// The refresh clears three families and refills them. Two scrapes racing
+    /// meant one could encode between the other's clear and its refill, and
+    /// render those families empty or half filled. Never held across an await.
+    scrape: Mutex<()>,
 }
 
 impl Metrics {
@@ -189,6 +195,7 @@ impl Metrics {
 
         Metrics {
             registry,
+            scrape: Mutex::new(()),
             requests,
             request_duration_seconds,
             rejected_full,
@@ -282,27 +289,52 @@ impl Metrics {
         // depth is not merely stale but meaningless, and reconciling here is
         // what keeps that impossible. Counters are untouched: they are
         // cumulative and their last value stays true after an instance goes.
+        // Read every value before touching a family, so the window in which
+        // the gauges are cleared but not yet refilled holds no registry walks.
+        let now = unix_now_seconds();
+        let readings: Vec<_> = instances
+            .iter()
+            .map(|instance| {
+                let registry = instance.registry();
+                (
+                    instance.instance_name.clone(),
+                    instance.sender.len() as i64,
+                    instance.config.buffer_capacity as i64,
+                    [
+                        registry.serving_count_by_origin(EndpointOrigin::Static, now) as i64,
+                        registry.serving_count_by_origin(EndpointOrigin::Dynamic, now) as i64,
+                    ],
+                )
+            })
+            .collect();
+
+        // Held across the clear, the refill and the encode below, or a second
+        // scrape could render these families mid-rebuild.
+        let _scrape = self.scrape.lock().unwrap_or_else(|poisoned| {
+            // A panicking scrape leaves nothing to repair: the next one clears
+            // and refills these families outright.
+            self.scrape.clear_poison();
+            poisoned.into_inner()
+        });
         self.buffer_used.clear();
         self.buffer_capacity.clear();
         self.endpoints_active.clear();
-        for instance in instances {
-            let label = label(&instance.instance_name);
-            self.buffer_used
-                .get_or_create(&label)
-                .set(instance.sender.len() as i64);
+        for (instance_name, used, capacity, [static_count, dynamic_count]) in readings {
+            let instance_label = label(&instance_name);
+            self.buffer_used.get_or_create(&instance_label).set(used);
             self.buffer_capacity
-                .get_or_create(&label)
-                .set(instance.config.buffer_capacity as i64);
-
-            let registry = instance.registry();
-            let now = unix_now_seconds();
-            for origin in [EndpointOrigin::Static, EndpointOrigin::Dynamic] {
+                .get_or_create(&instance_label)
+                .set(capacity);
+            for (origin, count) in [
+                (EndpointOrigin::Static, static_count),
+                (EndpointOrigin::Dynamic, dynamic_count),
+            ] {
                 self.endpoints_active
                     .get_or_create(&EndpointLabels {
-                        instance: instance.instance_name.clone(),
+                        instance: instance_name.clone(),
                         kind: origin,
                     })
-                    .set(registry.serving_count_by_origin(origin, now) as i64);
+                    .set(count);
             }
         }
 
