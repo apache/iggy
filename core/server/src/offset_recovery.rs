@@ -33,13 +33,16 @@ use tracing::{error, trace, warn};
 
 const COMPONENT: &str = "STREAMING_PARTITIONS";
 
-pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyError> {
+pub type RecoveredOffsets<T> = (Vec<T>, Vec<u32>);
+
+pub fn load_consumer_offsets(path: &str) -> Result<RecoveredOffsets<ConsumerOffset>, IggyError> {
     trace!("Loading consumer offsets from path: {path}...");
     let Ok(dir_entries) = std::fs::read_dir(path) else {
         return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
     };
 
     let mut consumer_offsets = Vec::new();
+    let mut stranded = Vec::new();
     for dir_entry in dir_entries {
         let dir_entry = match dir_entry {
             Ok(entry) => entry,
@@ -52,7 +55,7 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
             }
         };
 
-        let metadata = match dir_entry.metadata() {
+        let metadata = match dir_entry.file_type() {
             Ok(m) => m,
             Err(e) => {
                 warn!(
@@ -63,7 +66,7 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
             }
         };
 
-        if metadata.is_dir() {
+        if !metadata.is_file() {
             continue;
         }
 
@@ -83,6 +86,9 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
         };
 
         let Some(offset) = read_offset_file(&path, "consumer offset") else {
+            if std::path::Path::new(&path).is_file() {
+                stranded.push(consumer_id);
+            }
             continue;
         };
 
@@ -95,18 +101,19 @@ pub fn load_consumer_offsets(path: &str) -> Result<Vec<ConsumerOffset>, IggyErro
     }
 
     consumer_offsets.sort_by_key(|consumer_offset| consumer_offset.consumer_id);
-    Ok(consumer_offsets)
+    Ok((consumer_offsets, stranded))
 }
 
 pub fn load_consumer_group_offsets(
     path: &str,
-) -> Result<Vec<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
+) -> Result<RecoveredOffsets<(ConsumerGroupId, ConsumerOffset)>, IggyError> {
     trace!("Loading consumer group offsets from path: {path}...");
     let Ok(dir_entries) = std::fs::read_dir(path) else {
         return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
     };
 
     let mut consumer_group_offsets = Vec::new();
+    let mut stranded = Vec::new();
     for dir_entry in dir_entries {
         let dir_entry = match dir_entry {
             Ok(entry) => entry,
@@ -119,7 +126,7 @@ pub fn load_consumer_group_offsets(
             }
         };
 
-        let metadata = match dir_entry.metadata() {
+        let metadata = match dir_entry.file_type() {
             Ok(m) => m,
             Err(e) => {
                 warn!(
@@ -130,7 +137,7 @@ pub fn load_consumer_group_offsets(
             }
         };
 
-        if metadata.is_dir() {
+        if !metadata.is_file() {
             continue;
         }
 
@@ -154,6 +161,9 @@ pub fn load_consumer_group_offsets(
         };
 
         let Some(offset) = read_offset_file(&path, "consumer group offset") else {
+            if std::path::Path::new(&path).is_file() {
+                stranded.push(raw_consumer_group_id);
+            }
             continue;
         };
 
@@ -167,7 +177,7 @@ pub fn load_consumer_group_offsets(
         consumer_group_offsets.push((consumer_group_id, consumer_offset));
     }
 
-    Ok(consumer_group_offsets)
+    Ok((consumer_group_offsets, stranded))
 }
 
 fn read_offset_file(path: &str, offset_kind: &'static str) -> Option<AtomicU64> {
@@ -214,5 +224,27 @@ fn read_offset_file(path: &str, offset_kind: &'static str) -> Option<AtomicU64> 
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_numeric_directory_and_torn_file_when_loading_should_reserve_only_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("7")).unwrap();
+        std::fs::write(dir.path().join("8"), [1, 2]).unwrap();
+        std::fs::write(dir.path().join("9"), 12_u64.to_le_bytes()).unwrap();
+        let path = dir.path().to_str().unwrap();
+        let (consumers, stranded) = load_consumer_offsets(path).unwrap();
+        assert_eq!(consumers.len(), 1);
+        assert_eq!(consumers[0].consumer_id, 9);
+        assert_eq!(stranded, vec![8]);
+        let (groups, stranded) = load_consumer_group_offsets(path).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, ConsumerGroupId(9));
+        assert_eq!(stranded, vec![8]);
     }
 }

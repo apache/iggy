@@ -19,6 +19,7 @@ use iggy_common::ConsumerKind;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,7 @@ pub struct DurableOffsetState {
 pub struct DurableConsumerOffsets {
     consumers: RefCell<HashMap<u32, DurableOffsetState>>,
     groups: RefCell<HashMap<u32, DurableOffsetState>>,
+    membership_epoch: Cell<u64>,
 }
 
 impl DurableConsumerOffsets {
@@ -99,12 +101,19 @@ impl DurableConsumerOffsets {
     }
 
     pub(crate) fn remove(&self, kind: ConsumerKind, id: u32) -> bool {
-        self.entries(kind).borrow_mut().remove(&id).is_some()
+        let removed = self.entries(kind).borrow_mut().remove(&id).is_some();
+        if removed {
+            self.membership_epoch
+                .set(self.membership_epoch.get().wrapping_add(1));
+        }
+        removed
     }
 
     pub(crate) fn clear(&self) {
         self.consumers.borrow_mut().clear();
         self.groups.borrow_mut().clear();
+        self.membership_epoch
+            .set(self.membership_epoch.get().wrapping_add(1));
     }
 
     pub(crate) fn committed_entries(&self, kind: ConsumerKind) -> Vec<(u32, u64)> {
@@ -147,11 +156,13 @@ pub struct ConsumerOffsetCapacity {
     kind: ConsumerKind,
     limit: Cell<usize>,
     pending: RefCell<HashMap<u32, usize>>,
-    provisional: RefCell<HashMap<u32, Weak<()>>>,
+    provisional: RefCell<HashMap<u32, Weak<ProvisionalToken>>>,
     stranded: RefCell<HashSet<u32>>,
     uncertain: Cell<bool>,
     durable_warned: Cell<bool>,
     map_warned: Cell<bool>,
+    reclaim_epoch: Arc<AtomicU64>,
+    last_reclaim: Cell<Option<(u64, u64)>>,
 }
 
 impl ConsumerOffsetCapacity {
@@ -165,6 +176,8 @@ impl ConsumerOffsetCapacity {
             uncertain: Cell::new(false),
             durable_warned: Cell::new(false),
             map_warned: Cell::new(false),
+            reclaim_epoch: Arc::new(AtomicU64::new(0)),
+            last_reclaim: Cell::new(None),
         }
     }
 
@@ -191,7 +204,6 @@ impl ConsumerOffsetCapacity {
         id: u32,
         durable: &DurableConsumerOffsets,
     ) -> Result<(), ConsumerOffsetCapacityError> {
-        self.rearm_if_below_limit(durable);
         if durable.contains(self.kind, id)
             || self.pending.borrow().contains_key(&id)
             || self
@@ -203,11 +215,17 @@ impl ConsumerOffsetCapacity {
         {
             return Ok(());
         }
-        self.provisional
-            .borrow_mut()
-            .retain(|_, token| token.strong_count() > 0);
-        let occupied = self.occupied(durable);
         let limit = self.limit.get();
+        let durable_count = durable.count(self.kind);
+        // A full durable table cannot gain room by pruning provisional keys.
+        let occupied = if durable_count >= limit {
+            durable_count
+        } else {
+            self.provisional
+                .borrow_mut()
+                .retain(|_, token| token.strong_count() > 0);
+            self.occupied(durable)
+        };
         if self.uncertain.get() || occupied >= limit {
             return Err(ConsumerOffsetCapacityError {
                 kind: self.kind,
@@ -217,6 +235,7 @@ impl ConsumerOffsetCapacity {
                 uncertain: self.uncertain.get(),
             });
         }
+        self.durable_warned.set(false);
         Ok(())
     }
 
@@ -231,7 +250,9 @@ impl ConsumerOffsetCapacity {
             .get(&id)
             .and_then(Weak::upgrade)
             .unwrap_or_else(|| {
-                let token = Arc::new(());
+                let token = Arc::new(ProvisionalToken {
+                    reclaim_epoch: Arc::clone(&self.reclaim_epoch),
+                });
                 provisional.insert(id, Arc::downgrade(&token));
                 token
             });
@@ -263,7 +284,9 @@ impl ConsumerOffsetCapacity {
 
     pub(crate) fn set_pending_count(&self, id: u32, count: usize) {
         if count == 0 {
-            self.pending.borrow_mut().remove(&id);
+            if self.pending.borrow_mut().remove(&id).is_some() {
+                self.note_local_key_change();
+            }
         } else {
             self.pending.borrow_mut().insert(id, count);
         }
@@ -276,6 +299,7 @@ impl ConsumerOffsetCapacity {
         };
         if *count == 1 {
             pending.remove(&id);
+            self.note_local_key_change();
         } else {
             *count -= 1;
         }
@@ -296,6 +320,7 @@ impl ConsumerOffsetCapacity {
             *pending.entry(id).or_default() += 1;
         }
         drop(pending);
+        self.note_local_key_change();
         self.uncertain.set(false);
         self.rearm_if_below_limit(durable);
     }
@@ -303,6 +328,7 @@ impl ConsumerOffsetCapacity {
     pub(crate) fn mark_uncertain(&self) {
         self.pending.borrow_mut().clear();
         self.uncertain.set(true);
+        self.note_local_key_change();
     }
 
     pub(crate) fn record_stranded(&self, id: u32) {
@@ -322,7 +348,10 @@ impl ConsumerOffsetCapacity {
     }
 
     pub(crate) fn rearm_if_below_limit(&self, durable: &DurableConsumerOffsets) {
-        if !self.durable_warned.get() || self.uncertain.get() {
+        if !self.durable_warned.get()
+            || self.uncertain.get()
+            || durable.count(self.kind) >= self.limit.get()
+        {
             return;
         }
         if self.occupied(durable) < self.limit.get() {
@@ -333,6 +362,7 @@ impl ConsumerOffsetCapacity {
     pub(crate) const fn admit_local_map_key(
         &self,
         map_len: usize,
+        durable_full: bool,
     ) -> Result<(), ConsumerOffsetCapacityError> {
         let limit = self.limit.get();
         if map_len < limit {
@@ -343,7 +373,7 @@ impl ConsumerOffsetCapacity {
             occupied: map_len,
             limit,
             first_in_episode: !self.map_warned.replace(true),
-            uncertain: false,
+            uncertain: !durable_full,
         })
     }
 
@@ -351,6 +381,21 @@ impl ConsumerOffsetCapacity {
         if map_len < self.limit.get() {
             self.map_warned.set(false);
         }
+    }
+
+    pub(crate) fn note_local_key_change(&self) {
+        self.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn should_reclaim(&self, durable: &DurableConsumerOffsets) -> bool {
+        if self.uncertain.get() {
+            return false;
+        }
+        let epoch = (
+            self.reclaim_epoch.load(Ordering::Relaxed),
+            durable.membership_epoch.get(),
+        );
+        self.last_reclaim.replace(Some(epoch)) != Some(epoch)
     }
 
     pub(crate) fn occupied(&self, durable: &DurableConsumerOffsets) -> usize {
@@ -380,14 +425,54 @@ impl ConsumerOffsetCapacity {
 /// Keeps a provisional key occupied until the pump admits or drops its request.
 #[derive(Debug)]
 pub struct AutoCommitReservation {
-    token: Arc<()>,
+    token: Arc<ProvisionalToken>,
     pub(crate) kind: ConsumerKind,
     pub(crate) consumer_id: u32,
+}
+
+#[derive(Debug)]
+struct ProvisionalToken {
+    reclaim_epoch: Arc<AtomicU64>,
+}
+
+impl Drop for ProvisionalToken {
+    fn drop(&mut self) {
+        self.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_unchanged_protection_when_reclaim_repeats_should_skip_until_guard_drops() {
+        let durable = Rc::new(DurableConsumerOffsets::default());
+        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        let held = capacity.reserve_provisional(7, &durable).unwrap();
+        assert!(capacity.should_reclaim(&durable));
+        for _ in 0..100 {
+            assert!(!capacity.should_reclaim(&durable));
+        }
+        drop(held);
+        assert!(capacity.should_reclaim(&durable));
+        assert!(!capacity.should_reclaim(&durable));
+        capacity.note_local_key_change();
+        assert!(capacity.should_reclaim(&durable));
+    }
+
+    #[test]
+    fn given_local_map_pressure_when_durable_has_room_should_return_transient_error() {
+        let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 1);
+        assert!(matches!(
+            iggy_common::IggyError::from(capacity.admit_local_map_key(1, false).unwrap_err()),
+            iggy_common::IggyError::TransientNotAccepted
+        ));
+        assert!(matches!(
+            iggy_common::IggyError::from(capacity.admit_local_map_key(1, true).unwrap_err()),
+            iggy_common::IggyError::TooManyConsumerOffsets
+        ));
+    }
 
     #[test]
     fn given_provisional_and_journal_reservations_when_rebuilt_and_canceled_should_preserve_journal_slot()

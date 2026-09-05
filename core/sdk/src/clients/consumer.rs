@@ -1366,9 +1366,9 @@ impl IggyConsumer {
                 if is_consumer_group {
                     joined_consumer_group.store(false, ORDERING);
                 }
-                trace!("Retrying to poll messages in {retry_interval}...");
-                sleep(retry_interval.get_duration()).await;
             }
+            trace!("Retrying to poll messages in {retry_interval}...");
+            sleep(retry_interval.get_duration()).await;
             Err(error)
         }
     }

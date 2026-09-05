@@ -1030,6 +1030,13 @@ dedup_clients_max = 4096
 # A non-empty auto_commit poll that needs a new offset key is also rejected
 # with TooManyConsumerOffsets and returns no messages. Polls with auto_commit
 # disabled do not allocate offset keys and remain available.
+# UPGRADE: existing files are loaded even above this limit, but new keys then
+# remain blocked until offsets are explicitly deleted or this limit is raised.
+# Standalone offsets have no automatic expiry. Reuse stable consumer ids and
+# count existing numeric offset files per partition and kind before upgrading.
+# The environment override is IGGY_PARTITION_CONSUMER_OFFSETS_MAX.
+# On replicated partitions, offset stores and deletes carrying NoAck now wait
+# for VSR commit. First-party SDK offset methods already request Quorum.
 # Must be > 0 and <= 262144.
 consumer_offsets_max = 4096
 

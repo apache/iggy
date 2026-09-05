@@ -29,7 +29,9 @@
 //! `CreateTopic` / `CreatePartitions` event has no matching local
 //! partition yet.
 
-use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets};
+use crate::offset_recovery::{
+    RecoveredOffsets, load_consumer_group_offsets, load_consumer_offsets,
+};
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{PartitionRecoveryRefusal, ServerError};
 use crate::shell::consensus_timers;
@@ -185,7 +187,7 @@ pub fn configure_consumer_offsets(
     // path, where the max leaves `current_offset` in charge as before.
     let offset_space_ceiling = current_offset.max(partition.mint_frontier().saturating_sub(1));
 
-    let loaded_consumer_offsets = load_partition_consumer_offsets(
+    let (loaded_consumer_offsets, stranded_consumers) = load_partition_consumer_offsets(
         &consumer_offsets_path,
         "consumer",
         stream_id,
@@ -226,7 +228,7 @@ pub fn configure_consumer_offsets(
         }
     }
 
-    let loaded_group_offsets = load_partition_consumer_group_offsets(
+    let (loaded_group_offsets, stranded_groups) = load_partition_consumer_group_offsets(
         &consumer_group_offsets_path,
         stream_id,
         topic_id,
@@ -275,13 +277,13 @@ pub fn configure_consumer_offsets(
         consumer_group_offsets,
         enforce_fsync,
     );
-    for consumer_id in numeric_offset_file_ids(&consumer_offsets_path) {
+    for consumer_id in stranded_consumers {
         if partition.seed_stranded_consumer_offset(ConsumerKind::Consumer, consumer_id) {
             warn!(stream_id, topic_id, partition_id, consumer_id, path = %consumer_offsets_path,
                 "unloaded consumer offset file retains its capacity slot until updated or deleted");
         }
     }
-    for group_id in numeric_offset_file_ids(&consumer_group_offsets_path) {
+    for group_id in stranded_groups {
         if partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, group_id) {
             warn!(stream_id, topic_id, partition_id, group_id, path = %consumer_group_offsets_path,
                 "unloaded group offset file retains its capacity slot until repaired or reclaimed");
@@ -304,31 +306,21 @@ pub fn configure_consumer_offsets(
     Ok(())
 }
 
-fn numeric_offset_file_ids(path: &str) -> Vec<u32> {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
-        .collect()
-}
-
 fn load_partition_consumer_offsets(
     path: &str,
     consumer_kind: &'static str,
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-) -> Result<Vec<iggy_common::ConsumerOffset>, ServerError> {
+) -> Result<RecoveredOffsets<iggy_common::ConsumerOffset>, ServerError> {
     if !Path::new(path).exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     load_consumer_offsets(path).or_else(|source| {
         if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
         {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         Err(ServerError::ConsumerOffsetsLoad {
@@ -347,15 +339,18 @@ fn load_partition_consumer_group_offsets(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-) -> Result<Vec<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>, ServerError> {
+) -> Result<
+    RecoveredOffsets<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>,
+    ServerError,
+> {
     if !Path::new(path).exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     load_consumer_group_offsets(path).or_else(|source| {
         if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
         {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         Err(ServerError::ConsumerOffsetsLoad {

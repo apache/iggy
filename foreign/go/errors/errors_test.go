@@ -100,7 +100,7 @@ func TestIggyError_TooManyConsumerOffsets(t *testing.T) {
 	if err.Code() != TooManyConsumerOffsetsCode {
 		t.Errorf("Code() = %v, want %v", err.Code(), TooManyConsumerOffsetsCode)
 	}
-	if err.Error() != "too many consumer offsets for partition" {
+	if err.Error() != "per-partition consumer offset limit reached (see [partition] consumer_offsets_max)" {
 		t.Errorf("Error() = %q", err.Error())
 	}
 	if !errors.Is(err, ErrTooManyConsumerOffsets) {

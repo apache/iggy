@@ -1008,11 +1008,17 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
         {
             continue;
         }
-        let live = live_groups.get(&(namespace.stream_id(), namespace.topic_id()));
+        let Some((next_group_id, live)) =
+            live_groups.get(&(namespace.stream_id(), namespace.topic_id()))
+        else {
+            continue;
+        };
         let dead = partitions
             .with_partition(&namespace, |partition| {
                 partition.dead_consumer_group_offset_ids(|group_id| {
-                    live.is_some_and(|set| set.contains(&group_id))
+                    // A lagging metadata replica cannot prove a group deleted
+                    // until it has applied the allocation of that group's id.
+                    group_id >= *next_group_id || live.contains(&group_id)
                 })
             })
             .unwrap_or_default();
@@ -1163,21 +1169,23 @@ fn reconcile_pending_revocations(ctx: &ReconcilerCtx) {
 /// id (the store path is rewritten to it; the read path resolves it), so the
 /// live-set carries those ids too -- otherwise the reconciler would treat every
 /// live offset as orphaned and purge it.
-fn snapshot_topic_live_groups(ctx: &ReconcilerCtx) -> AHashMap<(usize, usize), AHashSet<u64>> {
+fn snapshot_topic_live_groups(
+    ctx: &ReconcilerCtx,
+) -> AHashMap<(usize, usize), (u64, AHashSet<u64>)> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
-        let mut map: AHashMap<(usize, usize), AHashSet<u64>> = AHashMap::new();
+        let mut map = AHashMap::new();
         for (_, stream) in &inner.items {
             for (topic_id, topic) in &stream.topics {
-                if topic.consumer_groups.is_empty() {
-                    continue;
-                }
                 map.insert(
                     (stream.id, topic_id),
-                    topic
-                        .consumer_groups
-                        .values()
-                        .map(|group| group.id)
-                        .collect(),
+                    (
+                        topic.next_consumer_group_id,
+                        topic
+                            .consumer_groups
+                            .values()
+                            .map(|group| group.id)
+                            .collect(),
+                    ),
                 );
             }
         }
@@ -3287,6 +3295,8 @@ mod tests {
         let mux = TestMux::default();
         seed_stream(&mux, 1, "cleanup-stream");
         seed_topic(&mux, 2, 0, "cleanup-topic", vec![assignment(0, 1)]);
+        seed_create_consumer_group(&mux, 3, 0, 0, "deleted");
+        seed_delete_consumer_group(&mux, 4, 0, 0, 0);
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
         reconcile_pass(&ctx).await;
@@ -3296,10 +3306,10 @@ mod tests {
             .partitions()
             .with_partition(&namespace, |partition| {
                 partition.consumer_group_offsets.pin().insert(
-                    iggy_common::ConsumerGroupId(7),
+                    iggy_common::ConsumerGroupId(0),
                     iggy_common::ConsumerOffset::new(
                         iggy_common::ConsumerKind::ConsumerGroup,
-                        7,
+                        0,
                         0,
                         String::new(),
                     ),
@@ -3313,7 +3323,7 @@ mod tests {
         );
         seed_topic(
             &shard.plane.metadata().mux_stm,
-            3,
+            5,
             0,
             "unrelated-topic",
             vec![assignment(0, 1)],
@@ -3331,6 +3341,74 @@ mod tests {
                 .borrow()
                 .contains(&namespace)
         );
+    }
+
+    #[compio::test]
+    async fn given_lagging_group_metadata_when_reconciling_should_wait_for_proven_deletion() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream");
+        seed_topic(&mux, 2, 0, "topic", vec![assignment(0, 1)]);
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.consumer_group_offsets.pin().insert(
+                    iggy_common::ConsumerGroupId(0),
+                    iggy_common::ConsumerOffset::new(
+                        iggy_common::ConsumerKind::ConsumerGroup,
+                        0,
+                        0,
+                        String::new(),
+                    ),
+                );
+            });
+        let mut counters = PassCounters::default();
+        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        assert_eq!(counters.cg_offsets_submitted, 0);
+        let stm = &shard.plane.metadata().mux_stm;
+        seed_create_consumer_group(stm, 3, 0, 0, "not-replayed-yet");
+        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        assert_eq!(counters.cg_offsets_submitted, 0);
+        seed_delete_consumer_group(stm, 4, 0, 0, 0);
+        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        assert_eq!(counters.cg_offsets_submitted, 1);
+    }
+
+    #[compio::test]
+    async fn given_missing_topic_snapshot_when_group_offset_exists_should_not_submit_delete() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream");
+        seed_topic(&mux, 2, 0, "topic", vec![assignment(0, 1)]);
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        shard
+            .plane
+            .partitions()
+            .with_partition(&IggyNamespace::new(0, 0, 0), |partition| {
+                partition.consumer_group_offsets.pin().insert(
+                    iggy_common::ConsumerGroupId(0),
+                    iggy_common::ConsumerOffset::new(
+                        iggy_common::ConsumerKind::ConsumerGroup,
+                        0,
+                        0,
+                        String::new(),
+                    ),
+                );
+            });
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        let mut counters = PassCounters::default();
+        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        assert_eq!(counters.cg_offsets_submitted, 0);
+        assert!(ctx.group_offset_cleanup_inflight.borrow().is_empty());
     }
 
     #[compio::test]

@@ -219,7 +219,11 @@ where
     pub(crate) consumer_group_offset_capacity: Rc<ConsumerOffsetCapacity>,
     pub(crate) observed_view: u32,
     offset_reservations_need_resync: Cell<bool>,
+    offset_reservations_scan_state: Option<(u64, u64, u64, Option<u64>)>,
     consumer_group_offsets_need_reconcile: Cell<bool>,
+    consumer_offset_dirs_dirty: [Cell<bool>; 2],
+    #[cfg(test)]
+    offset_dir_sync_count: Cell<usize>,
     /// Highest `PurgeTopic` generation this replica has locally applied (reset
     /// the partition to empty). The reconciler compares the committed metadata
     /// generation against this and resets only when it advances, so a redundant
@@ -569,7 +573,11 @@ where
             )),
             observed_view,
             offset_reservations_need_resync: Cell::new(false),
+            offset_reservations_scan_state: None,
             consumer_group_offsets_need_reconcile: Cell::new(true),
+            consumer_offset_dirs_dirty: [Cell::new(false), Cell::new(false)],
+            #[cfg(test)]
+            offset_dir_sync_count: Cell::new(0),
             applied_purge_generation: 0,
             created_revision: 0,
             purge_floor_op: 0,
@@ -2194,6 +2202,11 @@ where
             PendingConsumerOffsetMutation::Delete => {
                 if let Some(path) = path.as_deref() {
                     delete_persisted_offset(path).await?;
+                    self.consumer_offset_dirs_dirty[match pending.kind {
+                        ConsumerKind::Consumer => 0,
+                        ConsumerKind::ConsumerGroup => 1,
+                    }]
+                    .set(true);
                 }
                 self.durable_consumer_offsets
                     .remove(pending.kind, pending.consumer_id);
@@ -2412,7 +2425,12 @@ where
             |value| PendingConsumerOffsetCommit::upsert(kind, consumer_id, value),
         );
 
-        if let Err(error) = self.persist_consumer_offset_commit(pending).await {
+        let persisted = async {
+            self.persist_consumer_offset_commit(pending).await?;
+            self.flush_consumer_offset_directories().await
+        }
+        .await;
+        if let Err(error) = persisted {
             if offset.is_some() {
                 self.release_consumer_offset_reservation(kind, consumer_id);
                 if !self.durable_consumer_offsets.contains(kind, consumer_id)
@@ -2426,6 +2444,10 @@ where
                             .record_stranded(consumer_id);
                     }
                 }
+            }
+            if offset.is_none() {
+                self.consumer_offset_capacity_for(kind)
+                    .record_stranded(consumer_id);
             }
             emit_partition_diag(
                 tracing::Level::WARN,
@@ -2619,9 +2641,22 @@ where
             .then_some(IggyError::InvalidOffset(offset))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resynchronize_consumer_offset_reservations(&mut self) {
         let current_view = self.consensus.view();
-        if current_view == self.observed_view && !self.offset_reservations_need_resync.get() {
+        let scan_state = (
+            self.consensus.commit_min(),
+            self.consensus.commit_max(),
+            self.consensus.sequencer().current_sequence(),
+            self.log.journal().inner.last_op(),
+        );
+        let retry_uncertain = (self.consumer_offset_capacity.is_uncertain()
+            || self.consumer_group_offset_capacity.is_uncertain())
+            && self.offset_reservations_scan_state != Some(scan_state);
+        if current_view == self.observed_view
+            && !self.offset_reservations_need_resync.get()
+            && !retry_uncertain
+        {
             return;
         }
 
@@ -2634,13 +2669,27 @@ where
             .commit_min()
             .max(self.purge_floor_op)
             .saturating_add(1);
-        let to_op = self.consensus.sequencer().current_sequence();
-        let mut rebuilt = HashMap::new();
+        let commit_max = self.consensus.commit_max();
+        let to_op = self
+            .consensus
+            .sequencer()
+            .current_sequence()
+            .min(self.log.journal().inner.last_op().unwrap_or(commit_max));
+        // Committed offset prepares still need local apply, even if a message
+        // flush already evicted their journal bytes. Never drop their staging.
+        let mut rebuilt: HashMap<_, _> = self
+            .pending_consumer_offset_commits
+            .iter()
+            .filter(|(op, _)| **op >= from_op && **op <= commit_max)
+            .map(|(op, pending)| (*op, *pending))
+            .collect();
         let headers = self.log.journal().inner.repair_headers_in(from_op..=to_op);
+        let uncommitted_from = from_op.max(commit_max.saturating_add(1));
         let expected = to_op
-            .checked_sub(from_op)
+            .checked_sub(uncommitted_from)
             .map_or(0, |span| span.saturating_add(1));
-        let mut decode_failed = headers.len() as u64 != expected;
+        let mut decode_failed =
+            headers.keys().filter(|op| **op >= uncommitted_from).count() as u64 != expected;
         for (op, header) in headers {
             if !matches!(
                 header.operation,
@@ -2695,10 +2744,10 @@ where
         }
         self.observed_view = current_view;
         self.consumer_group_offsets_need_reconcile.set(true);
-        // Repair and truncation rearm this flag when journal contents change.
-        // A failed decode alone must not cause a full scan on every tick.
+        self.offset_reservations_scan_state = Some(scan_state);
+        // Retry uncertainty on journal or frontier progress, not every tick.
         self.offset_reservations_need_resync.set(false);
-        if !decode_failed && self.consensus.is_primary() {
+        if !decode_failed {
             self.reclaim_phantom_offsets(ConsumerKind::Consumer);
             self.reclaim_phantom_offsets(ConsumerKind::ConsumerGroup);
         }
@@ -2706,6 +2755,11 @@ where
 
     fn reclaim_phantom_offsets(&self, kind: ConsumerKind) {
         let capacity = self.consumer_offset_capacity_for(kind);
+        if self.durable_consumer_offsets.count(kind) >= capacity.limit()
+            || !capacity.should_reclaim(&self.durable_consumer_offsets)
+        {
+            return;
+        }
         let keep = |id| capacity.protects(id, &self.durable_consumer_offsets);
         match kind {
             ConsumerKind::Consumer => self
@@ -2777,7 +2831,6 @@ where
         };
 
         if args.auto_commit
-            && self.consensus.is_primary()
             && let Ok(pending) = PendingConsumerOffsetCommit::try_from_polling_consumer(consumer, 0)
         {
             let capacity = self.consumer_offset_capacity_for(pending.kind);
@@ -4806,13 +4859,13 @@ where
         let committed_batch_stats = self.resolve_committed_visible_offsets(&drained);
         let mut messages_committed = false;
 
-        for (mut entry, batch_stats) in drained.into_iter().zip(committed_batch_stats) {
+        for (entry, batch_stats) in drained.iter().zip(&committed_batch_stats) {
             let prepare_header = entry.header;
             if !self
                 .commit_partition_entry(
                     prepare_header,
                     &mut messages_committed,
-                    batch_stats,
+                    *batch_stats,
                     &mut failed_commit,
                     config,
                 )
@@ -4853,7 +4906,24 @@ where
                 });
                 return;
             }
+        }
 
+        // Commit replies and the applied frontier must follow directory
+        // durability. One sync per touched kind covers the whole walk.
+        if let Err(error) = self.flush_consumer_offset_directories().await {
+            if let Some(entry) = drained.last() {
+                error!(namespace_raw, %error, "consumer offset directory sync failed after committed operations");
+                self.fatal = Some(FatalCommit {
+                    namespace_raw,
+                    op: entry.header.op,
+                    operation: entry.header.operation,
+                });
+            }
+            return;
+        }
+
+        for (mut entry, batch_stats) in drained.into_iter().zip(committed_batch_stats) {
+            let prepare_header = entry.header;
             self.consensus.advance_commit_min(prepare_header.op);
 
             // Fold the committed request into this group's dedup slice. Runs on
@@ -4961,6 +5031,30 @@ where
         // Each commit frees one prepare slot, promote up to drained_count
         // buffered requests so the pipeline stays busy.
         self.drain_request_queue_into_prepares(drained_count).await;
+    }
+
+    async fn flush_consumer_offset_directories(&self) -> Result<(), IggyError> {
+        for (index, dir) in [
+            self.consumer_offsets_path.as_deref(),
+            self.consumer_group_offsets_path.as_deref(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !self.consumer_offset_dirs_dirty[index].get() {
+                continue;
+            }
+            if let Some(dir) = dir {
+                crate::state_transfer::fsync_dir(dir)
+                    .await
+                    .map_err(|_| IggyError::CannotSyncFile)?;
+                #[cfg(test)]
+                self.offset_dir_sync_count
+                    .set(self.offset_dir_sync_count.get() + 1);
+            }
+            self.consumer_offset_dirs_dirty[index].set(false);
+        }
+        Ok(())
     }
 
     /// Batch stats for each drained entry, positionally parallel to `drained`.
@@ -8345,7 +8439,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_transfer_above_cap_when_file_write_fails_should_preserve_membership() {
+    async fn given_transfer_above_cap_when_file_write_fails_should_refuse_until_retry_succeeds() {
         let dir = tempfile::tempdir().expect("transfer directory");
         let consumers = dir.path().join("consumers");
         let groups = dir.path().join("groups");
@@ -8362,14 +8456,26 @@ mod tests {
             groups: vec![(9, 3)],
             dedup: Vec::new(),
         };
+        partition
+            .install_state_transfer(&repair_config(), 12, Vec::new(), &wire.encode(), 0)
+            .await
+            .expect_err("incomplete offset state must not advance the commit floor");
+        assert_eq!(partition.consensus.commit_min(), 0);
+        assert_eq!(
+            partition.durable_consumer_offset_count(ConsumerKind::Consumer),
+            0
+        );
+        assert_eq!(
+            partition.durable_consumer_offset_count(ConsumerKind::ConsumerGroup),
+            0
+        );
+        std::fs::remove_file(&groups).expect("remove file-write fault");
         let outcome = partition
             .install_state_transfer(&repair_config(), 12, Vec::new(), &wire.encode(), 0)
             .await
-            .expect("accepted state must install above the local admission cap");
-        assert!(
-            !outcome.offsets_written,
-            "group file write must fail in this fixture"
-        );
+            .expect("retry must install accepted state above the local cap");
+        assert!(outcome.offsets_written);
+        assert_eq!(partition.consensus.commit_min(), 12);
         assert_eq!(
             partition.durable_consumer_offset_count(ConsumerKind::Consumer),
             2
@@ -8383,23 +8489,73 @@ mod tests {
                 .reserve_consumer_offset(ConsumerKind::Consumer, 10)
                 .is_err()
         );
-        assert!(!partition.is_auto_commit_offset_covered(ConsumerKind::ConsumerGroup, 9, 3));
+        assert!(partition.is_auto_commit_offset_covered(ConsumerKind::ConsumerGroup, 9, 3));
         assert_eq!(
             partition
                 .offsets_wire_snapshot_for_test()
                 .expect("durable snapshot"),
             vec![(7, 1), (8, 2)]
         );
-        std::fs::remove_file(&groups).expect("remove file-write fault");
+    }
+
+    #[compio::test]
+    async fn given_committed_deletes_when_drained_together_should_sync_directory_once_before_replies()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut partition, sent) = recording_partition_at(0, 3);
+        partition.consumer_offsets_path = Some(dir.path().to_string_lossy().into_owned());
+        let mut drained = Vec::new();
+        for id in 1..=2 {
+            partition
+                .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert(
+                    ConsumerKind::Consumer,
+                    id,
+                    0,
+                ))
+                .await
+                .unwrap();
+            partition.stage_consumer_offset_delete(u64::from(id), ConsumerKind::Consumer, id);
+            let header = PrepareHeader {
+                op: u64::from(id),
+                operation: Operation::DeleteConsumerOffset,
+                client: 42,
+                request: u64::from(id),
+                ..Default::default()
+            };
+            drained.push(PipelineEntry::new(header));
+        }
+        partition.consensus.restore_commit_state(0, 2);
         partition
-            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert_auto_commit(
-                ConsumerKind::ConsumerGroup,
-                9,
-                1,
-            ))
-            .await
-            .expect("repair to committed value after fault clears");
-        assert!(partition.is_auto_commit_offset_covered(ConsumerKind::ConsumerGroup, 9, 3));
+            .handle_committed_entries(drained, &repair_config(), true)
+            .await;
+        assert_eq!(partition.offset_dir_sync_count.get(), 1);
+        assert_eq!(partition.consensus.commit_min(), 2);
+        assert_eq!(sent.borrow().len(), 2);
+        assert!(!dir.path().join("1").exists());
+        assert!(!dir.path().join("2").exists());
+    }
+
+    #[compio::test]
+    async fn given_directory_sync_failure_when_delete_commits_should_fence_without_success_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut partition, sent) = recording_partition_at(0, 3);
+        partition.consumer_offsets_path =
+            Some(dir.path().join("missing").to_string_lossy().into_owned());
+        partition.stage_consumer_offset_delete(1, ConsumerKind::Consumer, 7);
+        partition.consensus.restore_commit_state(0, 1);
+        let header = PrepareHeader {
+            op: 1,
+            operation: Operation::DeleteConsumerOffset,
+            client: 42,
+            request: 1,
+            ..Default::default()
+        };
+        partition
+            .handle_committed_entries(vec![PipelineEntry::new(header)], &repair_config(), true)
+            .await;
+        assert!(partition.fatal.is_some());
+        assert_eq!(partition.consensus.commit_min(), 0);
+        assert!(sent.borrow().is_empty());
     }
 
     #[compio::test]
@@ -8694,10 +8850,12 @@ mod tests {
         assert!(partition.consumer_offsets.pin().contains_key(&7));
     }
 
-    #[test]
-    fn given_missing_retained_header_when_resync_fails_should_wait_for_new_journal_state() {
-        let (mut partition, _) = recording_partition();
-        partition.consensus.sequencer().set_sequence(1);
+    #[compio::test]
+    async fn given_missing_retained_header_when_journal_progresses_should_retry_without_view_change()
+     {
+        let mut partition = test_partition();
+        journal_prepare(&partition, 2, Operation::SendMessages).await;
+        partition.consensus.sequencer().set_sequence(2);
         partition.consensus.set_view(1);
         partition.resynchronize_consumer_offset_reservations();
         assert!(partition.consumer_offset_capacity.is_uncertain());
@@ -8715,6 +8873,74 @@ mod tests {
             .apply(0)
             .unwrap();
         assert!(!partition.auto_commit_admission_ready(&new));
+        partition.log.journal().inner.clear_all();
+        for op in 1..=3 {
+            journal_prepare(&partition, op, Operation::SendMessages).await;
+        }
+        partition.consensus.sequencer().set_sequence(3);
+        partition.resynchronize_consumer_offset_reservations();
+        assert!(!partition.consumer_offset_capacity.is_uncertain());
+    }
+
+    #[compio::test]
+    async fn given_evicted_committed_prefix_when_promoted_should_preserve_staging_without_latching()
+    {
+        let mut partition = test_partition();
+        partition.consensus.restore_commit_state(0, 5000);
+        partition.consensus.sequencer().set_sequence(5001);
+        partition.stage_consumer_offset_upsert(4999, ConsumerKind::Consumer, 7, 0, false);
+        journal_prepare(&partition, 5001, Operation::SendMessages).await;
+        partition.consensus.set_view(1);
+        partition.resynchronize_consumer_offset_reservations();
+        assert!(!partition.consumer_offset_capacity.is_uncertain());
+        assert!(
+            partition
+                .pending_consumer_offset_commits
+                .contains_key(&4999)
+        );
+        assert_eq!(
+            partition.occupied_consumer_offset_count(ConsumerKind::Consumer),
+            1
+        );
+    }
+
+    #[test]
+    fn given_truncated_journal_when_sequencer_is_ahead_should_not_latch_capacity() {
+        let (mut partition, _) = recording_partition();
+        partition.consensus.sequencer().set_sequence(100);
+        partition.offset_reservations_need_resync.set(true);
+        partition.resynchronize_consumer_offset_reservations();
+        assert!(!partition.consumer_offset_capacity.is_uncertain());
+        assert!(
+            partition
+                .reserve_consumer_offset(ConsumerKind::Consumer, 7)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn given_full_backup_phantom_map_when_new_consumer_polls_should_reclaim_without_promotion() {
+        let (mut partition, _) = recording_partition_at(1, 3);
+        partition.set_consumer_offsets_max(2);
+        partition.offset_space.committed_seeded = true;
+        for id in 1..=2 {
+            partition
+                .auto_commit_ctx(PollingConsumer::Consumer(id, 0), true)
+                .unwrap()
+                .apply(0)
+                .unwrap();
+        }
+        let args = PollingArgs::new(iggy_common::PollingStrategy::first(), 1, true);
+        let _ = partition.build_poll_plan(PollingConsumer::Consumer(3, 0), &args, false);
+        assert!(partition.consumer_offsets.is_empty());
+        assert!(
+            partition
+                .auto_commit_ctx(PollingConsumer::Consumer(3, 0), true)
+                .unwrap()
+                .apply(0)
+                .is_ok()
+        );
+        assert!(!partition.consensus.is_primary());
     }
 
     #[compio::test]

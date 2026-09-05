@@ -1311,9 +1311,8 @@ impl fmt::Display for PartitionTransferUnavailable {
 
 impl std::error::Error for PartitionTransferUnavailable {}
 
-/// Outcome of a completed install. A degraded install is a SUCCESS: the
-/// segments and floor landed; only some consumer-offset file writes failed,
-/// and the next offset commit blind-writes those files.
+/// Outcome of a completed install. Offset files must land before the installed
+/// commit floor advances. A failed purge-generation record remains retryable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionInstallOutcome {
     /// The consensus op the install applied. Named for what it holds: every
@@ -2002,7 +2001,12 @@ where
             .committed_entries(ConsumerKind::Consumer);
         let consumer_map = self.consumer_offsets.pin();
         for (consumer_id, _) in &consumers {
-            if !consumer_map.contains_key(&(*consumer_id as usize)) {
+            if !consumer_map.contains_key(&(*consumer_id as usize))
+                || self
+                    .durable_consumer_offsets
+                    .get(ConsumerKind::Consumer, *consumer_id)
+                    .is_some_and(|state| state.persisted_high_water.is_none())
+            {
                 return Err(
                     PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
                         kind: ConsumerKind::Consumer,
@@ -2017,7 +2021,12 @@ where
             .committed_entries(ConsumerKind::ConsumerGroup);
         let group_map = self.consumer_group_offsets.pin();
         for (consumer_id, _) in &groups {
-            if !group_map.contains_key(&ConsumerGroupId(*consumer_id as usize)) {
+            if !group_map.contains_key(&ConsumerGroupId(*consumer_id as usize))
+                || self
+                    .durable_consumer_offsets
+                    .get(ConsumerKind::ConsumerGroup, *consumer_id)
+                    .is_some_and(|state| state.persisted_high_water.is_none())
+            {
                 return Err(
                     PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
                         kind: ConsumerKind::ConsumerGroup,
@@ -2936,6 +2945,15 @@ where
             }
         }
 
+        if !offsets_written {
+            return Err(PartitionInstallError::SwapIo {
+                path: partition_dir.to_owned(),
+                source: std::io::Error::other(
+                    "consumer offset files or directories could not be persisted",
+                ),
+            });
+        }
+
         // Counters and stats. The offset counter seeds from the ARTIFACT's
         // frontier, not the installed segments: base offsets are minted
         // locally per replica, so a counter behind the group (all sealed
@@ -3082,6 +3100,30 @@ where
         }
         self.log.journal().inner.clear_all();
         self.log.journal_mut().info = crate::log::JournalInfo::default();
+        self.consumer_offsets.pin().clear();
+        self.consumer_group_offsets.pin().clear();
+        self.last_polled_offsets.pin().clear();
+        self.durable_consumer_offsets.clear();
+        self.pending_consumer_offset_commits.clear();
+        self.queued_auto_commit_reservations.borrow_mut().clear();
+        for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+            self.consumer_offset_capacity_for(kind)
+                .rebuild(&self.durable_consumer_offsets, std::iter::empty());
+        }
+        for dir in self
+            .consumer_offsets_path
+            .iter()
+            .chain(self.consumer_group_offsets_path.iter())
+        {
+            for path in strayed_offset_files(Some(dir), &[]) {
+                delete_persisted_offset(&path).await?;
+            }
+            if std::path::Path::new(dir).exists() {
+                fsync_dir(dir)
+                    .await
+                    .map_err(|_| iggy_common::IggyError::CannotSyncFile)?;
+            }
+        }
         // Every segment and staging file this partition had is about to be
         // unlinked, so neither memo can describe anything real afterwards. The
         // checksum map's own doc promises the clear happens here; without it the

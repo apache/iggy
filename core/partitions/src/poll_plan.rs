@@ -911,6 +911,7 @@ impl AutoCommitCtx {
                 *consumer_id as usize,
                 offset,
                 &self.capacity,
+                self.durable.count(kind) >= self.capacity.limit(),
                 || create(create_path.as_deref()),
             )?,
             AutoCommitTarget::ConsumerGroup {
@@ -922,6 +923,7 @@ impl AutoCommitCtx {
                 ConsumerGroupId(*group_id as usize),
                 offset,
                 &self.capacity,
+                self.durable.count(kind) >= self.capacity.limit(),
                 || create(create_path.as_deref()),
             )?,
         };
@@ -987,6 +989,9 @@ impl AutoCommitApplied {
             ),
         };
         self.capacity.rearm_map_if_below_limit(map_len);
+        if self.previous_offset.is_none() {
+            self.capacity.note_local_key_change();
+        }
     }
 }
 
@@ -1011,14 +1016,16 @@ fn apply_local_offset<K: Hash + Eq + Clone + Send + Sync>(
     key: K,
     offset: u64,
     capacity: &ConsumerOffsetCapacity,
+    durable_full: bool,
     create: impl FnOnce() -> ConsumerOffset,
 ) -> Result<Option<u64>, ConsumerOffsetCapacityError> {
     let guard = map.pin();
     if let Some(existing) = guard.get(&key) {
         return Ok(Some(existing.offset.fetch_max(offset, Ordering::Relaxed)));
     }
-    capacity.admit_local_map_key(guard.len())?;
+    capacity.admit_local_map_key(guard.len(), durable_full)?;
     guard.insert(key, create());
+    capacity.note_local_key_change();
     Ok(None)
 }
 
