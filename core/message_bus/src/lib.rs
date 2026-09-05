@@ -797,7 +797,7 @@ impl IggyMessageBus {
     }
 
     /// Construct a bus with explicit runtime tunables and a pre-allocated
-    /// owner table. Server-ng bootstrap uses this so every shard's bus
+    /// owner table. Server bootstrap uses this so every shard's bus
     /// shares the same atomic slots; tests use [`Self::with_tunables`]
     /// which allocates a fresh table per bus.
     ///

@@ -466,10 +466,11 @@ unsafe impl Sync for IggyConsumer {}
 /// comes back empty is not an error and not the end of the stream, it just means nothing new has
 /// arrived yet.
 ///
-/// A failed request is yielded as `Some(Err(..))` and leaves the consumer usable, while the next call
-/// retries. Connection and authentication failures pause polling until the client has reconnected
-/// and signed in again, which the consumer handles automatically. Hence, deciding when to give up on
-/// repeated errors is up to you.
+/// A failed poll request waits [`polling_retry_interval()`] before yielding `Some(Err(..))` and leaves
+/// the consumer usable for the next call. This delay also applies to terminal server errors and when
+/// the ordinary poll interval is disabled. Connection and authentication failures pause polling until
+/// the client has reconnected and signed in again, which the consumer handles automatically. Hence,
+/// deciding when to give up on repeated errors is up to you.
 ///
 /// For a boilerplate implementation of such a loop Iggy provides [`IggyConsumerMessageExt::consume_messages`].
 ///
@@ -548,7 +549,7 @@ unsafe impl Sync for IggyConsumer {}
 /// | [`allow_replay()`] | off | whether a message can be handed over again |
 /// | [`auto_join_consumer_group()`] | on | joining the group during [`init()`](Self::init) and again whenever the membership is lost. With [`do_not_auto_join_consumer_group()`] joining is up to the caller, and a poll without a membership fails with [`IggyError::ConsumerGroupMemberNotFound`] |
 /// | [`create_consumer_group_if_not_exists()`] | on | creating the group when it is missing |
-/// | [`polling_retry_interval()`] | one second | wait between attempts while polling is blocked or the member holds no partitions |
+/// | [`polling_retry_interval()`] | one second | delay before yielding a poll error, and between attempts while polling is blocked or the member holds no partitions |
 /// | [`init_retries()`] | none, one second apart | retries when the stream or topic is missing at [`init()`](Self::init) |
 /// | [`offset_drain_timeout()`] | five seconds | how long [`shutdown()`](Self::shutdown) waits for pending commits |
 /// | [`encryptor()`] | inherited from the client | decrypting payloads and user headers, see [Encryption](#encryption) |
@@ -618,6 +619,14 @@ unsafe impl Sync for IggyConsumer {}
 /// [`topic()`]: crate::prelude::IggyConsumerBuilder::topic
 /// [`without_encryptor()`]: crate::prelude::IggyConsumerBuilder::without_encryptor
 /// [`without_poll_interval()`]: crate::prelude::IggyConsumerBuilder::without_poll_interval
+///
+/// A server-side auto-commit poll can fail with `TooManyConsumerOffsets` when
+/// its consumer needs a new offset key at the partition's configured limit.
+/// The rejected poll returns no messages. Other auto-commit modes store the
+/// same key through a client request. Background and shutdown stores log a
+/// capacity failure but do not yield it through this stream. Only
+/// [`AutoCommit::Disabled`] avoids automatic key allocation. Existing keys
+/// remain usable.
 pub struct IggyConsumer {
     initialized: bool,
     shutdown: Arc<AtomicBool>,
@@ -1361,9 +1370,9 @@ impl IggyConsumer {
                 if is_consumer_group {
                     joined_consumer_group.store(false, ORDERING);
                 }
-                trace!("Retrying to poll messages in {retry_interval}...");
-                sleep(retry_interval.get_duration()).await;
             }
+            trace!("Retrying to poll messages in {retry_interval}...");
+            sleep(retry_interval.get_duration()).await;
             Err(error)
         }
     }

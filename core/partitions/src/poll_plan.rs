@@ -31,6 +31,10 @@
 //! sound on a detached task concurrently with the pump's own writes.
 
 use crate::PollFragments;
+use crate::consumer_offset_capacity::{
+    AutoCommitReservation, ConsumerOffsetCapacity, ConsumerOffsetCapacityError,
+    DurableConsumerOffsets,
+};
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{
@@ -174,6 +178,8 @@ pub struct DiskSegment {
 /// node-local only and diverge on failover.
 pub struct AutoCommitCtx {
     pub(crate) target: AutoCommitTarget,
+    pub(crate) capacity: Rc<ConsumerOffsetCapacity>,
+    pub(crate) durable: Rc<DurableConsumerOffsets>,
 }
 
 /// The offset an `auto_commit` poll applied in memory, surfaced for replication.
@@ -185,6 +191,11 @@ pub struct AutoCommitApplied {
     pub kind: ConsumerKind,
     pub consumer_id: u32,
     pub offset: u64,
+    previous_offset: Option<u64>,
+    target: AutoCommitTarget,
+    capacity: Rc<ConsumerOffsetCapacity>,
+    durable: Rc<DurableConsumerOffsets>,
+    last_polled: Option<LastPolledCtx>,
 }
 
 /// The lock-free offset map this auto-commit updates, captured as an owned
@@ -296,7 +307,17 @@ impl PollPlan {
     /// docs), so it is safe on a detached task. Returns the served fragments,
     /// the poll's high-water offset, and the auto-committed offset (if any) for
     /// the serving shard to replicate through consensus.
-    pub async fn execute(self) -> (PollFragments<4096>, u64, Option<AutoCommitApplied>) {
+    ///
+    /// # Errors
+    /// Returns a capacity error when auto-commit would create a new live-map
+    /// entry after the configured per-kind bound has been reached.
+    /// The serving shard also rejects completion with `TransientNotAccepted`
+    /// if the partition disappeared or changed incarnation during disk I/O.
+    /// No fragments are returned for that rejected completion.
+    pub async fn execute(
+        self,
+    ) -> Result<(PollFragments<4096>, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError>
+    {
         let commit_offset = self.commit_offset;
         let (fragments, last_matching_offset) = match self.tier {
             PollTier::Empty => (PollFragments::new(), None),
@@ -362,7 +383,7 @@ impl PollPlan {
         };
 
         finish(
-            self.last_polled.as_ref(),
+            self.last_polled,
             self.auto_commit,
             commit_offset,
             fragments,
@@ -374,8 +395,14 @@ impl PollPlan {
     /// ([`Self::needs_off_pump_io`] is `false`): no disk read, so the pump
     /// applies the auto-commit in memory and replies inline without spawning.
     /// The auto-committed offset is returned for the serving shard to replicate.
-    #[must_use]
-    pub fn execute_resident(self) -> (PollFragments<4096>, u64, Option<AutoCommitApplied>) {
+    ///
+    /// # Errors
+    /// Returns a capacity error when auto-commit would create a new live-map
+    /// entry after the configured per-kind bound has been reached.
+    pub fn execute_resident(
+        self,
+    ) -> Result<(PollFragments<4096>, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError>
+    {
         let commit_offset = self.commit_offset;
         let (fragments, last_matching_offset) = match self.tier {
             PollTier::Empty => (PollFragments::new(), None),
@@ -390,7 +417,7 @@ impl PollPlan {
             }
         };
         finish(
-            self.last_polled.as_ref(),
+            self.last_polled,
             self.auto_commit,
             commit_offset,
             fragments,
@@ -403,17 +430,19 @@ impl PollPlan {
 /// factored out so the high-water record, auto-commit, and returned triple
 /// stay identical across both.
 fn finish(
-    last_polled: Option<&LastPolledCtx>,
+    last_polled: Option<LastPolledCtx>,
     auto_commit: Option<AutoCommitCtx>,
     commit_offset: u64,
     fragments: PollFragments<4096>,
     last_matching_offset: Option<u64>,
-) -> (PollFragments<4096>, u64, Option<AutoCommitApplied>) {
-    if let (Some(last_polled), Some(last_offset)) = (last_polled, last_matching_offset) {
+) -> Result<(PollFragments<4096>, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError> {
+    let mut auto_commit_applied = apply_auto_commit(auto_commit, &fragments, last_matching_offset)?;
+    if let Some(applied) = &mut auto_commit_applied {
+        applied.last_polled = last_polled;
+    } else if let (Some(last_polled), Some(last_offset)) = (last_polled, last_matching_offset) {
         last_polled.record(last_offset);
     }
-    let auto_commit_applied = apply_auto_commit(auto_commit, &fragments, last_matching_offset);
-    (fragments, commit_offset, auto_commit_applied)
+    Ok((fragments, commit_offset, auto_commit_applied))
 }
 
 /// Apply an `auto_commit` to the in-memory offset map (monotone) and surface
@@ -429,19 +458,17 @@ fn apply_auto_commit(
     auto_commit: Option<AutoCommitCtx>,
     fragments: &PollFragments<4096>,
     last_matching_offset: Option<u64>,
-) -> Option<AutoCommitApplied> {
-    let auto_commit = auto_commit?;
+) -> Result<Option<AutoCommitApplied>, ConsumerOffsetCapacityError> {
+    let Some(auto_commit) = auto_commit else {
+        return Ok(None);
+    };
     if fragments.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let last_offset = last_matching_offset?;
-    auto_commit.apply(last_offset);
-    let (kind, consumer_id) = auto_commit.kind_and_id();
-    Some(AutoCommitApplied {
-        kind,
-        consumer_id,
-        offset: last_offset,
-    })
+    let Some(last_offset) = last_matching_offset else {
+        return Ok(None);
+    };
+    auto_commit.apply(last_offset).map(Some)
 }
 
 pub enum PollTier {
@@ -861,53 +888,146 @@ impl AutoCommitCtx {
     /// newer explicit store; the maps are lock-free (`papaya`), so this is
     /// sound off the pump task.
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn apply(&self, offset: u64) {
-        match &self.target {
+    pub(crate) fn apply(
+        self,
+        offset: u64,
+    ) -> Result<AutoCommitApplied, ConsumerOffsetCapacityError> {
+        let (kind, consumer_id) = self.kind_and_id();
+        let create = |path: Option<&str>| {
+            ConsumerOffset::new(
+                kind,
+                consumer_id,
+                offset,
+                path.map_or_else(String::new, |path| format!("{path}/{consumer_id}")),
+            )
+        };
+        let previous_offset = match &self.target {
             AutoCommitTarget::Consumer {
                 offsets,
                 consumer_id,
                 create_path,
-            } => {
-                let consumer_id = *consumer_id;
-                let map: &ConsumerOffsets = offsets;
-                upsert_offset_max(map, consumer_id as usize, offset, || {
-                    create_path.as_deref().map_or_else(
-                        || {
-                            ConsumerOffset::new(
-                                ConsumerKind::Consumer,
-                                consumer_id,
-                                0,
-                                String::new(),
-                            )
-                        },
-                        |path| ConsumerOffset::default_for_consumer(consumer_id, path),
-                    )
-                });
-            }
+            } => apply_local_offset(
+                offsets,
+                *consumer_id as usize,
+                offset,
+                &self.capacity,
+                self.durable.count(kind) >= self.capacity.limit(),
+                || create(create_path.as_deref()),
+            )?,
             AutoCommitTarget::ConsumerGroup {
                 offsets,
                 group_id,
                 create_path,
-            } => {
-                let group_id = *group_id;
-                let key = ConsumerGroupId(group_id as usize);
-                let map: &ConsumerGroupOffsets = offsets;
-                upsert_offset_max(map, key, offset, || {
-                    create_path.as_deref().map_or_else(
-                        || {
-                            ConsumerOffset::new(
-                                ConsumerKind::ConsumerGroup,
-                                group_id,
-                                0,
-                                String::new(),
-                            )
-                        },
-                        |path| ConsumerOffset::default_for_consumer_group(key, path),
-                    )
-                });
-            }
+            } => apply_local_offset(
+                offsets,
+                ConsumerGroupId(*group_id as usize),
+                offset,
+                &self.capacity,
+                self.durable.count(kind) >= self.capacity.limit(),
+                || create(create_path.as_deref()),
+            )?,
+        };
+        Ok(AutoCommitApplied {
+            kind,
+            consumer_id,
+            offset,
+            previous_offset,
+            target: self.target,
+            capacity: self.capacity,
+            durable: self.durable,
+            last_polled: None,
+        })
+    }
+}
+
+impl AutoCommitApplied {
+    /// Record the group handoff frontier only after poll admission succeeds.
+    pub fn mark_served(&self) {
+        if let Some(last_polled) = &self.last_polled {
+            last_polled.record(self.offset);
         }
     }
+    /// Reserve a durable key before the synthetic store is submitted.
+    /// Returns `None` when committed state already covers this offset.
+    ///
+    /// # Errors
+    /// Returns a capacity error when this is a new durable key and the
+    /// partition's per-kind limit has been reached.
+    pub fn reserve_durable(
+        &self,
+    ) -> Result<Option<AutoCommitReservation>, ConsumerOffsetCapacityError> {
+        if self
+            .durable
+            .covers(self.kind, self.consumer_id, self.offset)
+        {
+            return Ok(None);
+        }
+        self.capacity
+            .reserve_provisional(self.consumer_id, &self.durable)
+            .map(Some)
+    }
+
+    pub(crate) fn belongs_to(&self, durable: &Rc<DurableConsumerOffsets>) -> bool {
+        Rc::ptr_eq(&self.durable, durable)
+    }
+
+    /// Undo this poll's eager update after synchronous admission fails. The
+    /// caller must not yield between execution and this rollback.
+    pub fn rollback_created(&self) {
+        let map_len = match &self.target {
+            AutoCommitTarget::Consumer {
+                offsets,
+                consumer_id,
+                ..
+            } => rollback_local_offset(offsets, *consumer_id as usize, self.previous_offset),
+            AutoCommitTarget::ConsumerGroup {
+                offsets, group_id, ..
+            } => rollback_local_offset(
+                offsets,
+                ConsumerGroupId(*group_id as usize),
+                self.previous_offset,
+            ),
+        };
+        self.capacity.rearm_map_if_below_limit(map_len);
+        if self.previous_offset.is_none() {
+            self.capacity.note_local_key_change();
+            self.capacity.forget_inactive_provisional(self.consumer_id);
+        }
+    }
+}
+
+fn rollback_local_offset<K: Hash + Eq + Send + Sync + Copy>(
+    map: &papaya::HashMap<K, ConsumerOffset>,
+    key: K,
+    previous: Option<u64>,
+) -> usize {
+    let guard = map.pin();
+    if let Some(previous) = previous {
+        if let Some(entry) = guard.get(&key) {
+            entry.offset.store(previous, Ordering::Relaxed);
+        }
+    } else {
+        guard.remove(&key);
+    }
+    guard.len()
+}
+
+fn apply_local_offset<K: Hash + Eq + Clone + Send + Sync>(
+    map: &papaya::HashMap<K, ConsumerOffset>,
+    key: K,
+    offset: u64,
+    capacity: &ConsumerOffsetCapacity,
+    durable_full: bool,
+    create: impl FnOnce() -> ConsumerOffset,
+) -> Result<Option<u64>, ConsumerOffsetCapacityError> {
+    let guard = map.pin();
+    if let Some(existing) = guard.get(&key) {
+        return Ok(Some(existing.offset.fetch_max(offset, Ordering::Relaxed)));
+    }
+    capacity.admit_local_map_key(guard.len(), durable_full)?;
+    guard.insert(key, create());
+    capacity.note_local_key_change();
+    Ok(None)
 }
 
 /// Upsert a committed offset into a lock-free `papaya` offset map: bump an
@@ -1141,13 +1261,93 @@ mod tests {
     }
 
     fn consumer_auto_commit(offsets: Arc<ConsumerOffsets>, consumer_id: u32) -> AutoCommitCtx {
+        consumer_auto_commit_with_limit(offsets, consumer_id, crate::DEFAULT_CONSUMER_OFFSETS_MAX)
+    }
+
+    fn consumer_auto_commit_with_limit(
+        offsets: Arc<ConsumerOffsets>,
+        consumer_id: u32,
+        limit: usize,
+    ) -> AutoCommitCtx {
         AutoCommitCtx {
             target: AutoCommitTarget::Consumer {
                 offsets,
                 consumer_id,
                 create_path: None,
             },
+            capacity: Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, limit)),
+            durable: Rc::new(DurableConsumerOffsets::default()),
         }
+    }
+
+    #[test]
+    fn given_existing_phantom_when_primary_reservation_is_denied_should_restore_previous_offset() {
+        let offsets = Arc::new(ConsumerOffsets::with_capacity(2));
+        offsets.pin().insert(
+            7,
+            ConsumerOffset::new(ConsumerKind::Consumer, 7, 4, String::new()),
+        );
+        let context = consumer_auto_commit_with_limit(Arc::clone(&offsets), 7, 1);
+        context
+            .durable
+            .record_explicit(ConsumerKind::Consumer, 8, 0, 0);
+        let applied = context
+            .apply(9)
+            .expect("existing phantom is locally writable");
+        assert!(applied.reserve_durable().is_err());
+        applied.rollback_created();
+        assert_eq!(
+            offsets
+                .pin()
+                .get(&7)
+                .expect("phantom retained")
+                .offset
+                .load(Ordering::Relaxed),
+            4
+        );
+    }
+
+    #[test]
+    fn given_new_auto_commit_when_provisional_guard_is_dropped_should_reopen_capacity() {
+        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
+        let context = consumer_auto_commit_with_limit(Arc::clone(&offsets), 7, 1);
+        let capacity = Rc::clone(&context.capacity);
+        let durable = Rc::clone(&context.durable);
+        let applied = context.apply(9).expect("new poll fits");
+        let reservation = applied
+            .reserve_durable()
+            .expect("primary admits")
+            .expect("new slot");
+        assert!(capacity.check(8, &durable).is_err());
+        drop(reservation);
+        applied.rollback_created();
+        assert!(capacity.check(8, &durable).is_ok());
+        assert!(offsets.pin().is_empty());
+    }
+
+    #[test]
+    fn given_full_auto_commit_map_when_creating_key_should_reject_without_insertion() {
+        let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
+        offsets.pin().insert(
+            1,
+            ConsumerOffset::new(ConsumerKind::Consumer, 1, 0, String::new()),
+        );
+        let plan = PollPlan {
+            commit_offset: 42,
+            auto_commit: Some(consumer_auto_commit_with_limit(offsets.clone(), 2, 1)),
+            last_polled: None,
+            tier: PollTier::Resident {
+                fragments: non_empty_fragments(),
+                last_matching_offset: Some(5),
+            },
+        };
+
+        let Err(error) = plan.execute_resident() else {
+            panic!("a missing key at the map limit must be rejected");
+        };
+        assert_eq!(error.kind, ConsumerKind::Consumer);
+        assert_eq!(error.occupied, 1);
+        assert!(offsets.pin().get(&2).is_none());
     }
 
     #[test]
@@ -1172,7 +1372,8 @@ mod tests {
             "a resident auto_commit no longer persists on the poll path; the pump must not spawn",
         );
 
-        let (fragments, commit_offset, applied) = plan.execute_resident();
+        let (fragments, commit_offset, applied) =
+            plan.execute_resident().expect("auto-commit is admitted");
         assert!(!fragments.is_empty(), "resident fragments must be returned");
         assert_eq!(commit_offset, 42, "commit offset is forwarded verbatim");
 
@@ -1203,7 +1404,8 @@ mod tests {
             last_polled: None,
             tier: PollTier::Empty,
         };
-        let (fragments, _commit_offset, applied) = plan.execute_resident();
+        let (fragments, _commit_offset, applied) =
+            plan.execute_resident().expect("empty poll needs no slot");
         assert!(fragments.is_empty());
         assert!(
             applied.is_none(),
@@ -1220,9 +1422,9 @@ mod tests {
         // Auto-commit must never rewind a newer offset (anti-rewind via
         // fetch_max); an explicit StoreConsumerOffset may legitimately rewind.
         let offsets = Arc::new(ConsumerOffsets::with_capacity(1));
-        let auto_commit = consumer_auto_commit(offsets.clone(), 7);
-
-        auto_commit.apply(10);
+        consumer_auto_commit(offsets.clone(), 7)
+            .apply(10)
+            .expect("first auto-commit is admitted");
         let after_high = offsets
             .pin()
             .get(&7usize)
@@ -1230,7 +1432,9 @@ mod tests {
         assert_eq!(after_high, Some(10));
 
         // A stale auto-commit with a smaller offset must not rewind.
-        auto_commit.apply(4);
+        consumer_auto_commit(offsets.clone(), 7)
+            .apply(4)
+            .expect("existing key remains admitted");
         let after_stale = offsets
             .pin()
             .get(&7usize)

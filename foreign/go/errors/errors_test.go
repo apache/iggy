@@ -95,6 +95,25 @@ func TestIggyError_ConsensusErrors(t *testing.T) {
 	}
 }
 
+func TestIggyError_TooManyConsumerOffsets(t *testing.T) {
+	err := TooManyConsumerOffsets{}
+	if err.Code() != TooManyConsumerOffsetsCode {
+		t.Errorf("Code() = %v, want %v", err.Code(), TooManyConsumerOffsetsCode)
+	}
+	if err.Error() != "consumer offset limit reached for partition" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	if !errors.Is(err, ErrTooManyConsumerOffsets) {
+		t.Errorf("errors.Is(%v, ErrTooManyConsumerOffsets) = false", err)
+	}
+	if errors.Is(err, ErrConsumerOffsetNotFound) {
+		t.Errorf("errors.Is(%v, ErrConsumerOffsetNotFound) = true", err)
+	}
+	if resolved := FromCode(TooManyConsumerOffsetsCode); !errors.Is(resolved, ErrTooManyConsumerOffsets) {
+		t.Errorf("FromCode(%d) = %v", TooManyConsumerOffsetsCode, resolved)
+	}
+}
+
 func TestFromCode_FallsBackToTheGenericError(t *testing.T) {
 	if resolved := FromCode(Code(0xFFFFFF)); !errors.Is(resolved, ErrError) {
 		t.Errorf("FromCode(unknown) = %v, want ErrError", resolved)

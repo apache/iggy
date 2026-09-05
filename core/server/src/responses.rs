@@ -90,6 +90,7 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::BusMessage;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::Streams;
 use partitions::{Fragment, PollFragments};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages;
@@ -278,12 +279,9 @@ where
         return Ok(());
     }
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
+    let streams = shard.plane.metadata().mux_stm.streams();
     #[allow(clippy::cast_possible_truncation)]
-    shard
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
+    streams
         // Commit fence: allow a pending-revoked partition (the source commits it
         // to drain the cooperative handoff), so `require_pollable = false`.
         .consumer_group_fence(
@@ -295,10 +293,46 @@ where
             false,
         )
         .map(|_| ())
-        .ok_or(IggyError::ConsumerGroupPartitionNotOwned(
-            client_id as u32,
-            partition_id,
-        ))
+        .ok_or_else(|| {
+            resolve_offset_group_id(streams, stream_id, topic_id, &consumer.id)
+                .err()
+                .unwrap_or(IggyError::ConsumerGroupPartitionNotOwned(
+                    client_id as u32,
+                    partition_id,
+                ))
+        })
+}
+
+pub fn resolve_offset_group_id(
+    streams: &Streams,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+    group: &WireIdentifier,
+) -> Result<u64, IggyError> {
+    streams
+        .resolve_consumer_group_id(stream_id, topic_id, group)
+        .ok_or_else(|| {
+            if streams
+                .topic_partitions_count(stream_id, topic_id)
+                .is_some()
+            {
+                missing_consumer_group_error(group, topic_id)
+            } else {
+                IggyError::ResourceNotFound(String::new())
+            }
+        })
+}
+
+pub fn missing_consumer_group_error(group: &WireIdentifier, topic: &WireIdentifier) -> IggyError {
+    let topic = wire_identifier_for_display(topic);
+    match group {
+        WireIdentifier::Numeric(_) => {
+            IggyError::ConsumerGroupIdNotFound(wire_identifier_for_display(group), topic)
+        }
+        WireIdentifier::String(name) => {
+            IggyError::ConsumerGroupNameNotFound(name.as_str().to_owned(), topic)
+        }
+    }
 }
 
 /// Fence a consumer-group offset op then resolve its target partition

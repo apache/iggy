@@ -34,10 +34,10 @@ use message_bus::MessageBus;
 use server_common::Message;
 use server_common::send_messages::{ChecksumMode, convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
-#[cfg(debug_assertions)]
 use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use tracing::warn;
 
 /// RAII counter for live [`IggyPartitions::with_partition`] borrows. The
@@ -108,6 +108,7 @@ where
     /// per-shard runtime is single-threaded, so runtime borrow checks
     /// suffice; callers must not hold a borrow across `.await`.
     tombstoned: RefCell<AHashSet<IggyNamespace>>,
+    consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
     /// `insert` / `remove` can assert the partitions vec is never mutated
     /// while a sanctioned non-pump read borrow is outstanding. Cannot fire for
@@ -131,6 +132,7 @@ where
             partitions: UnsafeCell::new(Vec::new()),
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashSet::new()),
+            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
@@ -145,6 +147,7 @@ where
             // BTreeMap has no capacity hint; the Vec above absorbs the sizing.
             namespace_to_local: UnsafeCell::new(BTreeMap::new()),
             tombstoned: RefCell::new(AHashSet::new()),
+            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
@@ -224,7 +227,11 @@ where
     /// [`Self::with_partition`]; the `&mut` path above is uncounted (it is
     /// pump-only, so it cannot alias this same-task mutation).
     #[doc(hidden)]
-    pub fn insert(&self, namespace: IggyNamespace, partition: IggyPartition<B, SB>) -> LocalIdx {
+    pub fn insert(
+        &self,
+        namespace: IggyNamespace,
+        mut partition: IggyPartition<B, SB>,
+    ) -> LocalIdx {
         #[cfg(debug_assertions)]
         debug_assert_eq!(
             self.borrow_active.get(),
@@ -232,12 +239,27 @@ where
             "IggyPartitions::insert while a with_partition borrow is live"
         );
         partition.publish_current_offset();
+        partition.set_consumer_group_offsets_reconcile_epoch(Rc::clone(
+            &self.consumer_group_offsets_reconcile_epoch,
+        ));
         // Safety: pump-only invariant, caller responsibility.
         let partitions = unsafe { &mut *self.partitions.get() };
         let local_idx = LocalIdx::new(partitions.len());
         partitions.push(partition);
         self.namespace_map_mut().insert(namespace, local_idx);
         local_idx
+    }
+
+    pub fn consumer_group_offsets_reconcile_epoch(&self) -> u64 {
+        self.consumer_group_offsets_reconcile_epoch.get()
+    }
+
+    pub fn note_consumer_group_offsets_reconcile_needed(&self) {
+        self.consumer_group_offsets_reconcile_epoch.set(
+            self.consumer_group_offsets_reconcile_epoch
+                .get()
+                .wrapping_add(1),
+        );
     }
 
     /// Check if a namespace exists.
@@ -626,6 +648,31 @@ where
     ) {
         if let Some(waiter) = waiter {
             let _ = waiter.send(build_deny_reply_from_request_header(header, status));
+        }
+    }
+
+    pub async fn on_auto_commit_request(
+        &self,
+        request: Message<RoutedRequestHeader>,
+        reservation: crate::AutoCommitReservation,
+    ) {
+        let namespace = IggyNamespace::from_raw(request.header().group);
+        if self.is_tombstoned(&namespace) {
+            tracing::debug!(
+                namespace_raw = namespace.inner(),
+                "dropping auto-commit for tombstoned partition"
+            );
+            return;
+        }
+        if let Some(partition) = self.get_mut_by_ns(&namespace) {
+            partition
+                .on_request_with_reservation(request, None, Some(reservation))
+                .await;
+        } else {
+            tracing::debug!(
+                namespace_raw = namespace.inner(),
+                "dropping auto-commit for missing partition"
+            );
         }
     }
 }

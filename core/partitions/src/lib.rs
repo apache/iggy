@@ -17,6 +17,7 @@
 
 #![allow(clippy::future_not_send)]
 
+mod consumer_offset_capacity;
 mod iggy_index;
 mod iggy_index_reader;
 mod iggy_index_writer;
@@ -32,6 +33,7 @@ pub mod segment_anchor;
 pub mod state_transfer;
 mod types;
 
+pub use consumer_offset_capacity::{AutoCommitReservation, ConsumerOffsetCapacityError};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
@@ -54,12 +56,16 @@ pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 /// Both consumers -- the fallback in [`IggyPartition`] and the `[partition]`
 /// config default boot installs -- already depend on this crate.
 pub const DEFAULT_OFFSET_RESERVATION_LEASE: u32 = 64 * 1024;
+
+/// Shipped per-kind durable consumer-offset limit for one partition.
+pub const DEFAULT_CONSUMER_OFFSETS_MAX: usize = 4096;
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use poll_plan::{AutoCommitApplied, PollPlan};
 pub use segment::Segment;
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
+pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
 pub use types::{
     AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
     PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
@@ -89,6 +95,8 @@ pub struct RetainedPartitionState {
     /// Whether that incarnation ever stamped an offset, i.e. whether the two
     /// numbers above describe an offset space at all.
     pub offset_space_used: bool,
+    pub consumer_offsets: Vec<(u32, u64)>,
+    pub consumer_group_offsets: Vec<(u32, u64)>,
 }
 
 /// Partition-level data plane operations.

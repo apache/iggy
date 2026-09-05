@@ -333,6 +333,8 @@ pub enum IggyError {
     NotResolvedConsumer(Identifier) = 3022,
     #[error("Cannot open consumer offsets file for path: {0}")]
     CannotOpenConsumerOffsetsFile(String) = 3023,
+    #[error("Consumer offset limit reached for partition")]
+    TooManyConsumerOffsets = 3024,
     #[error("Segment not found")]
     SegmentNotFound = 4000,
     #[error("Segment with start offset: {0} and partition with ID: {1} is closed")]
@@ -626,5 +628,13 @@ mod tests {
             IggyError::InvalidConsumerGroupName.as_string(),
             IggyError::from_code_as_string(GROUP_NAME_ERROR_CODE)
         )
+    }
+
+    #[test]
+    fn too_many_consumer_offsets_round_trips_by_code() {
+        let error = IggyError::TooManyConsumerOffsets;
+        assert_eq!(error.as_code(), 3024);
+        assert_eq!(IggyError::from_code(3024), error);
+        assert_eq!(IggyError::from_code_as_string(3024), error.as_string());
     }
 }

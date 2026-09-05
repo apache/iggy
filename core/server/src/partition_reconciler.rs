@@ -170,11 +170,17 @@ use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use futures::FutureExt;
+use iggy_binary_protocol::requests::consumer_offsets::DeleteConsumerOffsetRequest;
+use iggy_binary_protocol::{
+    AckLevel, Command, Operation, ReplyHeader, RoutedRequestHeader, WireConsumer, WireEncode,
+    WireIdentifier,
+};
 use iggy_common::{ConsumerGroupId, IggyTimestamp};
+use message_bus::AUTO_COMMIT_CLIENT_ID;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::Partition;
-use partitions::delete_persisted_offset;
+use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
 use shard::ReconcileOp;
@@ -184,10 +190,11 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
+const GROUP_OFFSET_DELETES_PER_PASS: usize = 32;
 
 /// Consecutive same-cause failures before [`ReconcilerCtx::record_failure`]
 /// escalates to an operator-visible error (the backoff is capped, so
@@ -229,6 +236,9 @@ pub struct ReconcilerCtx {
     /// `true` when the previous pass made no changes. Only then is a
     /// same-`revision` pass safe to skip.
     last_pass_noop: Cell<bool>,
+    group_offset_cleanup_inflight: Rc<RefCell<AHashSet<IggyNamespace>>>,
+    group_offset_cleanup_completed: Rc<Cell<usize>>,
+    last_group_offset_reconcile_epoch: Cell<u64>,
 }
 
 impl ReconcilerCtx {
@@ -251,6 +261,9 @@ impl ReconcilerCtx {
             failure_state: RefCell::new(AHashMap::new()),
             last_revision: Cell::new(None),
             last_pass_noop: Cell::new(false),
+            group_offset_cleanup_inflight: Rc::new(RefCell::new(AHashSet::new())),
+            group_offset_cleanup_completed: Rc::new(Cell::new(0)),
+            last_group_offset_reconcile_epoch: Cell::new(0),
         }
     }
 
@@ -383,9 +396,12 @@ struct PassCounters {
     backoff_skipped: usize,
     /// Stale incarnations (slab-key reuse) torn down for rebuild.
     stale: usize,
-    /// Consumer-group offsets reclaimed for groups deleted while their topic
-    /// survived (a bare `DeleteConsumerGroup`, not a topic/stream delete).
-    cg_offsets_purged: usize,
+    /// Group-offset deletes successfully handed to the pump this pass.
+    cg_offsets_submitted: usize,
+    /// Successful replicated deletes reported by detached completion tasks.
+    cg_offsets_completed: usize,
+    /// Group-offset deletes refused by the inbox and needing another pass.
+    cg_offsets_pending: usize,
     /// Committed delete watermarks not yet fully enforced on local segments.
     /// Counted so the pass does not arm the fast-skip: the pump can be
     /// blocked by a consumer barrier or by a rejoin whose offsets land via
@@ -423,7 +439,9 @@ impl PassCounters {
             + self.removed_routed
             + self.backoff_skipped
             + self.stale
-            + self.cg_offsets_purged
+            + self.cg_offsets_submitted
+            + self.cg_offsets_completed
+            + self.cg_offsets_pending
             + self.trims_pending
             + self.purges_staged
             + self.deferred
@@ -439,6 +457,14 @@ impl PassCounters {
 async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     let shard_id = ctx.shard.id;
     let revision = current_revision(ctx);
+    // Snapshotted with `revision` before the pass, so a partition that arms
+    // itself during one of the awaits below bumps past this value and forces
+    // the next pass instead of being absorbed by an end-of-pass read.
+    let group_offset_epoch = ctx
+        .shard
+        .plane
+        .partitions()
+        .consumer_group_offsets_reconcile_epoch();
 
     // Cooperative-revocation completion runs every tick, before the fast-skip:
     // a timeout fires on wall-clock and a drain on partition-offset state, and
@@ -464,7 +490,9 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     if ctx.last_revision.get() == Some(revision)
         && ctx.last_pass_noop.get()
         && ctx.failure_state.borrow().is_empty()
+        && ctx.group_offset_cleanup_completed.get() == 0
         && !ctx.shard.has_parked_partition_frames()
+        && ctx.last_group_offset_reconcile_epoch.get() == group_offset_epoch
     {
         trace!(
             shard = shard_id,
@@ -475,12 +503,15 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
 
     let target = snapshot_target_namespaces(ctx);
     let target_set: AHashSet<IggyNamespace> = target.iter().map(|partition| partition.ns).collect();
-    let mut counters = PassCounters::default();
+    let mut counters = PassCounters {
+        cg_offsets_completed: ctx.group_offset_cleanup_completed.replace(0),
+        ..PassCounters::default()
+    };
 
     reconcile_additions(ctx, target, &mut counters).await;
     reconcile_removals(ctx, &target_set, &mut counters).await;
     reconcile_parked_frames(ctx, &mut counters);
-    reconcile_consumer_group_offsets(ctx, &mut counters).await;
+    reconcile_consumer_group_offsets(ctx, &mut counters);
     reconcile_segment_truncations(ctx, &mut counters);
     reconcile_partition_purges(ctx, &mut counters);
 
@@ -494,6 +525,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     // still runs even though `revision` did not change.
     let did_work = counters.total() > 0;
     ctx.last_revision.set(Some(revision));
+    ctx.last_group_offset_reconcile_epoch
+        .set(group_offset_epoch);
     ctx.last_pass_noop.set(!did_work);
 
     if did_work {
@@ -511,6 +544,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
             parked_reclaimed = counters.parked_reclaimed,
             purges_staged = counters.purges_staged,
             trims_pending = counters.trims_pending,
+            cg_offsets_pending = counters.cg_offsets_pending,
             "partition reconciler pass complete"
         );
     } else {
@@ -960,45 +994,116 @@ async fn tear_down_owned_partition(
     counters.removed_local += 1;
 }
 
-/// Reclaim consumer-group offsets left behind by a `DeleteConsumerGroup` whose
-/// topic still exists (a topic/stream delete already drops the whole partition
-/// directory, offsets included). For each owned partition, any stored
-/// consumer-group offset whose group id is no longer present in the topic's
-/// committed metadata is removed (in-memory entry + persisted file). Monotonic,
-/// never-reused group ids make this purely reclamation -- a recreated group
-/// gets a fresh id and never reads a dead group's offset -- so it is safe to do
-/// lazily on the reconcile pass rather than synchronously on delete.
-async fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
+/// Reclaim deleted groups through ordered offset deletes. Replicas must see
+/// each delete before a replacement store can reuse its durable slot.
+fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCounters) {
     let live_groups = snapshot_topic_live_groups(ctx);
     let partitions = ctx.shard.plane.partitions();
     let owned: Vec<IggyNamespace> = partitions.namespaces().copied().collect();
-    for ns in owned {
-        let live = live_groups.get(&(ns.stream_id(), ns.topic_id()));
-        // Take the in-memory removes + owned unlink paths under a closure-scoped
-        // borrow that cannot escape into the await below. Holding a raw
-        // `&IggyPartition` across `delete_persisted_offset().await` would let the
-        // pump task realloc the partitions vec underneath us (a UAF).
-        let paths = partitions.with_partition(&ns, |partition| {
-            partition.reclaim_dead_group_offsets(|group_id| {
-                live.is_some_and(|set| set.contains(&group_id))
-            })
-        });
-        let Some(paths) = paths else {
+    for namespace in owned {
+        if ctx
+            .group_offset_cleanup_inflight
+            .borrow()
+            .contains(&namespace)
+        {
+            continue;
+        }
+        let Some((next_group_id, live)) =
+            live_groups.get(&(namespace.stream_id(), namespace.topic_id()))
+        else {
             continue;
         };
-        for path in paths {
-            if let Err(err) = delete_persisted_offset(&path).await {
-                warn!(
-                    shard = ctx.shard.id,
-                    ns_raw = ns.inner(),
-                    error = %err,
-                    "reconciler failed to reclaim deleted consumer-group offset"
-                );
-                continue;
+        let dead = partitions
+            .with_partition(&namespace, |partition| {
+                partition.dead_consumer_group_offset_ids(|group_id| {
+                    // A lagging metadata replica cannot prove a group deleted
+                    // until it has applied the allocation of that group's id.
+                    group_id >= *next_group_id || live.contains(&group_id)
+                })
+            })
+            .unwrap_or_default();
+        // Bound work per pass so a historical directory cannot monopolize the
+        // reconciler. Unprocessed keys keep the partition's dirty flag armed.
+        let mut tickets = Vec::with_capacity(dead.len().min(GROUP_OFFSET_DELETES_PER_PASS));
+        for consumer_id in dead.into_iter().take(GROUP_OFFSET_DELETES_PER_PASS) {
+            let request = group_offset_delete_request(namespace, consumer_id);
+            if let Ok(ticket) = ctx.shard.partition_submit(namespace, request) {
+                counters.cg_offsets_submitted += 1;
+                tickets.push(ticket);
+            } else {
+                counters.cg_offsets_pending += 1;
             }
-            counters.cg_offsets_purged += 1;
         }
+        if tickets.is_empty() {
+            continue;
+        }
+        ctx.group_offset_cleanup_inflight
+            .borrow_mut()
+            .insert(namespace);
+        let inflight = Rc::clone(&ctx.group_offset_cleanup_inflight);
+        let completed = Rc::clone(&ctx.group_offset_cleanup_completed);
+        let shard = Rc::clone(&ctx.shard);
+        shard.bus.clone().spawn(async move {
+            let replies = futures::future::join_all(
+                tickets
+                    .into_iter()
+                    .map(|ticket| shard.await_partition_submit(ticket)),
+            )
+            .await;
+            let count = replies
+                .into_iter()
+                .flatten()
+                .filter(|reply| {
+                    reply
+                        .as_slice()
+                        .get(..size_of::<ReplyHeader>())
+                        .and_then(|bytes| {
+                            bytemuck::checked::try_from_bytes::<ReplyHeader>(bytes).ok()
+                        })
+                        .is_some_and(|header| header.status == 0)
+                })
+                .count();
+            completed.set(completed.get() + count);
+            inflight.borrow_mut().remove(&namespace);
+            shard
+                .plane
+                .partitions()
+                .note_consumer_group_offsets_reconcile_needed();
+        });
     }
+}
+
+fn group_offset_delete_request(
+    namespace: IggyNamespace,
+    consumer_id: u32,
+) -> Message<RoutedRequestHeader> {
+    let body = DeleteConsumerOffsetRequest {
+        consumer: WireConsumer::consumer_group(WireIdentifier::Numeric(consumer_id)),
+        stream_id: WireIdentifier::Numeric(
+            u32::try_from(namespace.stream_id()).expect("stream id fits u32"),
+        ),
+        topic_id: WireIdentifier::Numeric(
+            u32::try_from(namespace.topic_id()).expect("topic id fits u32"),
+        ),
+        partition_id: Some(u32::try_from(namespace.partition_id()).expect("partition id fits u32")),
+        ack: AckLevel::Quorum,
+    }
+    .to_bytes();
+    let size = size_of::<RoutedRequestHeader>() + body.len();
+    let mut request = Message::<RoutedRequestHeader>::new(size);
+    request.as_mut_slice()[size_of::<RoutedRequestHeader>()..].copy_from_slice(&body);
+    request.transmute_header(|_, header: &mut RoutedRequestHeader| {
+        *header = RoutedRequestHeader {
+            command: Command::Request,
+            operation: Operation::DeleteConsumerOffset,
+            size: u32::try_from(size).expect("offset request fits u32"),
+            client: AUTO_COMMIT_CLIENT_ID,
+            session: 1,
+            request: 1,
+            group: namespace.inner(),
+            ..Default::default()
+        };
+    })
 }
 
 /// Complete cooperative consumer-group revocations whose source member has
@@ -1068,21 +1173,23 @@ fn reconcile_pending_revocations(ctx: &ReconcilerCtx) {
 /// id (the store path is rewritten to it; the read path resolves it), so the
 /// live-set carries those ids too -- otherwise the reconciler would treat every
 /// live offset as orphaned and purge it.
-fn snapshot_topic_live_groups(ctx: &ReconcilerCtx) -> AHashMap<(usize, usize), AHashSet<u64>> {
+fn snapshot_topic_live_groups(
+    ctx: &ReconcilerCtx,
+) -> AHashMap<(usize, usize), (u64, AHashSet<u64>)> {
     ctx.shard.plane.metadata().mux_stm.streams().read(|inner| {
-        let mut map: AHashMap<(usize, usize), AHashSet<u64>> = AHashMap::new();
+        let mut map = AHashMap::new();
         for (_, stream) in &inner.items {
             for (topic_id, topic) in &stream.topics {
-                if topic.consumer_groups.is_empty() {
-                    continue;
-                }
                 map.insert(
                     (stream.id, topic_id),
-                    topic
-                        .consumer_groups
-                        .values()
-                        .map(|group| group.id)
-                        .collect(),
+                    (
+                        topic.next_consumer_group_id,
+                        topic
+                            .consumer_groups
+                            .values()
+                            .map(|group| group.id)
+                            .collect(),
+                    ),
                 );
             }
         }
@@ -1273,8 +1380,9 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureCause, FailureRecord, ReconcilerCtx, build_partition_fresh,
-        delete_partitions_from_disk, fetch_partition_stats, reconcile_once,
+        FailureCause, FailureRecord, PassCounters, ReconcilerCtx, build_partition_fresh,
+        current_revision, delete_partitions_from_disk, fetch_partition_stats,
+        reconcile_consumer_group_offsets, reconcile_once,
     };
     use configs::server::{ServerConfig, ServerSystemConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
@@ -2410,6 +2518,21 @@ mod tests {
             "unchanged revision after convergence must fast-skip the diff"
         );
 
+        let revision = current_revision(&ctx);
+        shard
+            .plane
+            .partitions()
+            .note_consumer_group_offsets_reconcile_needed();
+        assert_eq!(
+            current_revision(&ctx),
+            revision,
+            "partition-local offset work does not change metadata revision"
+        );
+        assert!(
+            reconcile_once(&ctx).await,
+            "the shard offset epoch must defeat the O(1) fast-skip"
+        );
+
         // A new partition-shaping commit bumps the revision → next pass runs.
         seed_topic(
             &shard.plane.metadata().mux_stm,
@@ -3181,11 +3304,134 @@ mod tests {
         );
     }
 
-    /// A bare `DeleteConsumerGroup` (topic survives) leaves the group's offsets
-    /// on the partition. The reconciler must reclaim a deleted group's offset
-    /// while leaving a still-live group's offset untouched.
+    /// Failed delivery must leave the offset and its quota slot intact for a
+    /// later replicated delete. This fixture deliberately has no running pump.
     #[compio::test]
-    async fn reconcile_reclaims_offsets_of_deleted_consumer_group() {
+    async fn given_pending_group_cleanup_when_another_topic_arrives_should_reconcile_without_waiting()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "cleanup-stream");
+        seed_topic(&mux, 2, 0, "cleanup-topic", vec![assignment(0, 1)]);
+        seed_create_consumer_group(&mux, 3, 0, 0, "deleted");
+        seed_delete_consumer_group(&mux, 4, 0, 0, 0);
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.consumer_group_offsets.pin().insert(
+                    iggy_common::ConsumerGroupId(0),
+                    iggy_common::ConsumerOffset::new(
+                        iggy_common::ConsumerKind::ConsumerGroup,
+                        0,
+                        0,
+                        String::new(),
+                    ),
+                );
+            });
+        reconcile_consumer_group_offsets(&ctx, &mut PassCounters::default());
+        assert!(
+            ctx.group_offset_cleanup_inflight
+                .borrow()
+                .contains(&namespace)
+        );
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            5,
+            0,
+            "unrelated-topic",
+            vec![assignment(0, 1)],
+        );
+        reconcile_pass(&ctx).await;
+        assert!(
+            shard
+                .plane
+                .partitions()
+                .contains(&IggyNamespace::new(0, 1, 0)),
+            "an unanswered cleanup must not block partition creation"
+        );
+        assert!(
+            ctx.group_offset_cleanup_inflight
+                .borrow()
+                .contains(&namespace)
+        );
+    }
+
+    #[compio::test]
+    async fn given_lagging_group_metadata_when_reconciling_should_wait_for_proven_deletion() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream");
+        seed_topic(&mux, 2, 0, "topic", vec![assignment(0, 1)]);
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        shard
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.consumer_group_offsets.pin().insert(
+                    iggy_common::ConsumerGroupId(0),
+                    iggy_common::ConsumerOffset::new(
+                        iggy_common::ConsumerKind::ConsumerGroup,
+                        0,
+                        0,
+                        String::new(),
+                    ),
+                );
+            });
+        let mut counters = PassCounters::default();
+        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        assert_eq!(counters.cg_offsets_submitted, 0);
+        let stm = &shard.plane.metadata().mux_stm;
+        seed_create_consumer_group(stm, 3, 0, 0, "not-replayed-yet");
+        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        assert_eq!(counters.cg_offsets_submitted, 0);
+        seed_delete_consumer_group(stm, 4, 0, 0, 0);
+        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        assert_eq!(counters.cg_offsets_submitted, 1);
+    }
+
+    #[compio::test]
+    async fn given_missing_topic_snapshot_when_group_offset_exists_should_not_submit_delete() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "stream");
+        seed_topic(&mux, 2, 0, "topic", vec![assignment(0, 1)]);
+        let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        shard
+            .plane
+            .partitions()
+            .with_partition(&IggyNamespace::new(0, 0, 0), |partition| {
+                partition.consumer_group_offsets.pin().insert(
+                    iggy_common::ConsumerGroupId(0),
+                    iggy_common::ConsumerOffset::new(
+                        iggy_common::ConsumerKind::ConsumerGroup,
+                        0,
+                        0,
+                        String::new(),
+                    ),
+                );
+            });
+        seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
+        let mut counters = PassCounters::default();
+        reconcile_consumer_group_offsets(&ctx, &mut counters);
+        assert_eq!(counters.cg_offsets_submitted, 0);
+        assert!(ctx.group_offset_cleanup_inflight.borrow().is_empty());
+    }
+
+    #[compio::test]
+    async fn given_deleted_group_when_cleanup_submit_fails_should_preserve_state_for_retry() {
         use iggy_common::{ConsumerGroupId, ConsumerKind, ConsumerOffset};
 
         let tmp = TempDir::new().expect("tempdir for system path");
@@ -3235,9 +3481,14 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(
             ids,
-            vec![u64::from(live_key)],
-            "deleted group's offset reclaimed; live group's offset retained"
+            vec![u64::from(dead_key), u64::from(live_key)],
+            "failed submission must not unlink or remove either offset"
         );
+        assert_eq!(
+            partition.dead_consumer_group_offset_ids(|id| id == u64::from(live_key)),
+            vec![dead_key]
+        );
+        assert!(!ctx.last_pass_noop.get(), "failed cleanup must be retried");
     }
 
     /// A partition-count change must re-run consumer-group assignment: a new

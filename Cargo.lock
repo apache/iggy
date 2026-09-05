@@ -1862,7 +1862,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "bench-dashboard-frontend"
-version = "0.8.0-edge.3"
+version = "0.8.0-edge.4"
 dependencies = [
  "bench-dashboard-shared",
  "bench-report",
@@ -1892,7 +1892,7 @@ dependencies = [
 
 [[package]]
 name = "bench-report"
-version = "0.4.0-edge.3"
+version = "0.4.0-edge.4"
 dependencies = [
  "charming",
  "colored",
@@ -6594,7 +6594,7 @@ checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
 
 [[package]]
 name = "iggy"
-version = "0.11.0-edge.6"
+version = "0.11.0-edge.7"
 dependencies = [
  "async-broadcast",
  "async-dropper",
@@ -6628,7 +6628,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench"
-version = "0.6.0-edge.6"
+version = "0.6.0-edge.7"
 dependencies = [
  "async-trait",
  "bench-report",
@@ -6657,7 +6657,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-bench-dashboard-server"
-version = "0.8.0-edge.3"
+version = "0.8.0-edge.4"
 dependencies = [
  "actix-cors",
  "actix-files",
@@ -6685,7 +6685,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-cli"
-version = "0.14.0-edge.6"
+version = "0.14.0-edge.7"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -6791,7 +6791,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.5.0-edge.5"
+version = "0.5.0-edge.6"
 dependencies = [
  "axum",
  "axum-server",
@@ -6825,7 +6825,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_binary_protocol"
-version = "0.11.0-edge.6"
+version = "0.11.0-edge.7"
 dependencies = [
  "aligned-vec",
  "bytemuck",
@@ -6838,7 +6838,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_common"
-version = "0.11.0-edge.6"
+version = "0.11.0-edge.7"
 dependencies = [
  "aes-gcm 0.11.1",
  "async-broadcast",
@@ -7203,7 +7203,7 @@ dependencies = [
 
 [[package]]
 name = "iggy_connector_sdk"
-version = "0.4.0-edge.3"
+version = "0.4.0-edge.4"
 dependencies = [
  "anyhow",
  "apache-avro 0.22.0",
@@ -12160,7 +12160,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.9.0-edge.6"
+version = "0.9.0-edge.7"
 dependencies = [
  "ahash 0.8.12",
  "argon2",

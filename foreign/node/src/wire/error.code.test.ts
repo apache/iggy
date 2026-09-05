@@ -19,6 +19,10 @@ import assert from 'node:assert/strict';
 import { it } from 'node:test';
 import { translateErrorCode } from './error.code.js';
 
+it('translates the consumer-offset capacity error', () => {
+  assert.equal(translateErrorCode(3024), 'Consumer offset limit reached for partition');
+});
+
 it('translates the consumer-group error range', () => {
   assert.equal(
     translateErrorCode(5000),

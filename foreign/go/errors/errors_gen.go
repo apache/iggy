@@ -1584,6 +1584,15 @@ func (e CannotOpenConsumerOffsetsFile) Is(target error) bool {
 	return ok
 }
 
+type TooManyConsumerOffsets struct{}
+
+func (e TooManyConsumerOffsets) Error() string { return "consumer offset limit reached for partition" }
+func (e TooManyConsumerOffsets) Code() Code    { return 3024 }
+func (e TooManyConsumerOffsets) Is(target error) bool {
+	_, ok := target.(TooManyConsumerOffsets)
+	return ok
+}
+
 type PartitionIdSpaceExhausted struct{}
 
 func (e PartitionIdSpaceExhausted) Error() string {
@@ -2784,6 +2793,7 @@ var (
 	ErrConsumerOffsetNotFound                     = ConsumerOffsetNotFound{}
 	ErrNotResolvedConsumer                        = NotResolvedConsumer{}
 	ErrCannotOpenConsumerOffsetsFile              = CannotOpenConsumerOffsetsFile{}
+	ErrTooManyConsumerOffsets                     = TooManyConsumerOffsets{}
 	ErrPartitionIdSpaceExhausted                  = PartitionIdSpaceExhausted{}
 	ErrSegmentNotFound                            = SegmentNotFound{}
 	ErrSegmentClosed                              = SegmentClosed{}
@@ -3027,6 +3037,7 @@ const (
 	ConsumerOffsetNotFoundCode                     Code = 3021
 	NotResolvedConsumerCode                        Code = 3022
 	CannotOpenConsumerOffsetsFileCode              Code = 3023
+	TooManyConsumerOffsetsCode                     Code = 3024
 	PartitionIdSpaceExhaustedCode                  Code = 3013
 	SegmentNotFoundCode                            Code = 4000
 	SegmentClosedCode                              Code = 4001
@@ -3409,6 +3420,8 @@ func (c Code) String() string {
 		return "NotResolvedConsumer"
 	case CannotOpenConsumerOffsetsFileCode:
 		return "CannotOpenConsumerOffsetsFile"
+	case TooManyConsumerOffsetsCode:
+		return "TooManyConsumerOffsets"
 	case PartitionIdSpaceExhaustedCode:
 		return "PartitionIdSpaceExhausted"
 	case SegmentNotFoundCode:
@@ -3892,6 +3905,8 @@ func FromCode(code Code) IggyError {
 		return ErrNotResolvedConsumer
 	case CannotOpenConsumerOffsetsFileCode:
 		return ErrCannotOpenConsumerOffsetsFile
+	case TooManyConsumerOffsetsCode:
+		return ErrTooManyConsumerOffsets
 	case PartitionIdSpaceExhaustedCode:
 		return ErrPartitionIdSpaceExhausted
 	case SegmentNotFoundCode:

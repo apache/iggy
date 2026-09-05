@@ -679,7 +679,7 @@ pub fn apply_committed_prepare<M>(
 pub type CommitNotifier = std::rc::Rc<dyn Fn(Operation)>;
 
 pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
-    /// `Some` on shard 0, `None` on other shards. Server-ng bootstrap
+    /// `Some` on shard 0, `None` on other shards. Server bootstrap
     /// holds the invariant: only shard 0 owns the metadata consensus
     /// replica; every other shard reconstructs `mux_stm` from the
     /// `MetadataHandoff::Waiter` factory bundle broadcast by shard 0
@@ -897,7 +897,7 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     }
 
     /// Install (or replace) the post-commit notifier. Passing `None`
-    /// removes any previous one. Server-ng bootstrap calls this on shard 0
+    /// removes any previous one. Server bootstrap calls this on shard 0
     /// only; peer shards never commit metadata locally.
     pub fn set_commit_notifier(&self, notifier: Option<CommitNotifier>) {
         *self.commit_notifier.borrow_mut() = notifier;
@@ -906,7 +906,7 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// Seed the coordinator's last-checkpoint pairing at boot from the recovered
     /// snapshot, so the first post-boot view-change superblock write records the real
     /// `(checkpoint_op, checksum)` instead of `(0, 0)`. No-op without a coordinator
-    /// (peer shards, the simulator). Server-ng bootstrap calls this on shard 0 after
+    /// (peer shards, the simulator). Server bootstrap calls this on shard 0 after
     /// cross-checking the pairing.
     pub fn seed_checkpoint_ref(&self, checkpoint_op: u64, checkpoint_checksum: u128) {
         if let Some(coordinator) = &self.coordinator {

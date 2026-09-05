@@ -29,7 +29,9 @@
 //! `CreateTopic` / `CreatePartitions` event has no matching local
 //! partition yet.
 
-use crate::offset_recovery::{load_consumer_group_offsets, load_consumer_offsets};
+use crate::offset_recovery::{
+    RecoveredOffsets, load_consumer_group_offsets, load_consumer_offsets,
+};
 use crate::segment_recovery::{RecoveredSegment, load_persisted_segments};
 use crate::server_error::{PartitionRecoveryRefusal, ServerError};
 use crate::shell::consensus_timers;
@@ -39,8 +41,8 @@ use consensus::{
     FreshGroupStart, JoinMode, LocalPipeline, VsrConsensus, VsrRestore, VsrState, fresh_group_start,
 };
 use iggy_common::{
-    ConsumerGroupOffsets, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp, PartitionStats,
-    TopicRuntimeOptions,
+    ConsumerGroupOffsets, ConsumerKind, ConsumerOffsets, IggyByteSize, IggyError, IggyTimestamp,
+    PartitionStats, TopicRuntimeOptions,
 };
 use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
@@ -155,6 +157,7 @@ pub async fn create_partition_file_hierarchy(
 /// Returns [`ServerError::ConsumerOffsetsLoad`] when the on-disk files
 /// exist but fail to decode. A stored offset past the offset space is clamped
 /// to `current_offset` (with a warning), not an error.
+#[allow(clippy::too_many_lines)]
 pub fn configure_consumer_offsets(
     partition: &mut IggyPartition<Rc<IggyMessageBus>>,
     config: &ServerConfig,
@@ -184,17 +187,17 @@ pub fn configure_consumer_offsets(
     // path, where the max leaves `current_offset` in charge as before.
     let offset_space_ceiling = current_offset.max(partition.mint_frontier().saturating_sub(1));
 
-    let loaded_consumer_offsets = load_partition_consumer_offsets(
+    let recovered_consumers = load_partition_consumer_offsets(
         &consumer_offsets_path,
         "consumer",
         stream_id,
         topic_id,
         partition_id,
     )?;
-    let consumer_offsets = ConsumerOffsets::with_capacity(loaded_consumer_offsets.len());
+    let consumer_offsets = ConsumerOffsets::with_capacity(recovered_consumers.entries.len());
     {
         let guard = consumer_offsets.pin();
-        for offset in loaded_consumer_offsets {
+        for offset in recovered_consumers.entries {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
             if recovered_offset > offset_space_ceiling {
                 // A crash can persist an offset ahead of the flushed data
@@ -213,20 +216,29 @@ pub fn configure_consumer_offsets(
                 );
                 offset.offset.store(current_offset, Ordering::Relaxed);
             }
-            guard.insert(offset.consumer_id as usize, offset);
+            let consumer_id = offset.consumer_id;
+            let committed_offset = offset.offset.load(Ordering::Relaxed);
+            partition.seed_recovered_consumer_offset(
+                ConsumerKind::Consumer,
+                consumer_id,
+                committed_offset,
+                recovered_offset,
+            );
+            guard.insert(consumer_id as usize, offset);
         }
     }
 
-    let loaded_group_offsets = load_partition_consumer_group_offsets(
+    let recovered_groups = load_partition_consumer_group_offsets(
         &consumer_group_offsets_path,
         stream_id,
         topic_id,
         partition_id,
     )?;
-    let consumer_group_offsets = ConsumerGroupOffsets::with_capacity(loaded_group_offsets.len());
+    let consumer_group_offsets =
+        ConsumerGroupOffsets::with_capacity(recovered_groups.entries.len());
     {
         let guard = consumer_group_offsets.pin();
-        for (group_id, offset) in loaded_group_offsets {
+        for (group_id, offset) in recovered_groups.entries {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
             if recovered_offset > offset_space_ceiling {
                 warn!(
@@ -241,6 +253,13 @@ pub fn configure_consumer_offsets(
                 );
                 offset.offset.store(current_offset, Ordering::Relaxed);
             }
+            let committed_offset = offset.offset.load(Ordering::Relaxed);
+            partition.seed_recovered_consumer_offset(
+                ConsumerKind::ConsumerGroup,
+                u32::try_from(group_id.0).expect("recovered group id originated as u32"),
+                committed_offset,
+                recovered_offset,
+            );
             guard.insert(group_id, offset);
         }
     }
@@ -253,12 +272,38 @@ pub fn configure_consumer_offsets(
         .enforce_fsync
         .unwrap_or(iggy_common::DEFAULT_ENFORCE_FSYNC);
     partition.configure_consumer_offset_storage(
-        consumer_offsets_path,
-        consumer_group_offsets_path,
+        consumer_offsets_path.clone(),
+        consumer_group_offsets_path.clone(),
         consumer_offsets,
         consumer_group_offsets,
         enforce_fsync,
     );
+    for consumer_id in recovered_consumers.stranded_ids {
+        if partition.seed_stranded_consumer_offset(ConsumerKind::Consumer, consumer_id) {
+            warn!(stream_id, topic_id, partition_id, consumer_id, path = %consumer_offsets_path,
+                "unloaded consumer offset file retains its capacity slot until updated or deleted");
+        }
+    }
+    for group_id in recovered_groups.stranded_ids {
+        if partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, group_id) {
+            warn!(stream_id, topic_id, partition_id, group_id, path = %consumer_group_offsets_path,
+                "unloaded group offset file retains its capacity slot until repaired or reclaimed");
+        }
+    }
+    for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
+        let count = partition.occupied_consumer_offset_count(kind);
+        if count > config.partition.consumer_offsets_max {
+            warn!(
+                stream_id,
+                topic_id,
+                partition_id,
+                ?kind,
+                count,
+                limit = config.partition.consumer_offsets_max,
+                "recovered consumer offsets exceed the configured admission limit"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -268,15 +313,21 @@ fn load_partition_consumer_offsets(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-) -> Result<Vec<iggy_common::ConsumerOffset>, ServerError> {
+) -> Result<RecoveredOffsets<iggy_common::ConsumerOffset>, ServerError> {
     if !Path::new(path).exists() {
-        return Ok(Vec::new());
+        return Ok(RecoveredOffsets {
+            entries: Vec::new(),
+            stranded_ids: Vec::new(),
+        });
     }
 
     load_consumer_offsets(path).or_else(|source| {
         if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
         {
-            return Ok(Vec::new());
+            return Ok(RecoveredOffsets {
+                entries: Vec::new(),
+                stranded_ids: Vec::new(),
+            });
         }
 
         Err(ServerError::ConsumerOffsetsLoad {
@@ -295,15 +346,24 @@ fn load_partition_consumer_group_offsets(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-) -> Result<Vec<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>, ServerError> {
+) -> Result<
+    RecoveredOffsets<(iggy_common::ConsumerGroupId, iggy_common::ConsumerOffset)>,
+    ServerError,
+> {
     if !Path::new(path).exists() {
-        return Ok(Vec::new());
+        return Ok(RecoveredOffsets {
+            entries: Vec::new(),
+            stranded_ids: Vec::new(),
+        });
     }
 
     load_consumer_group_offsets(path).or_else(|source| {
         if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
         {
-            return Ok(Vec::new());
+            return Ok(RecoveredOffsets {
+                entries: Vec::new(),
+                stranded_ids: Vec::new(),
+            });
         }
 
         Err(ServerError::ConsumerOffsetsLoad {
@@ -816,6 +876,7 @@ async fn load_partition(
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
     partition.set_dedup_clients_max(config.partition.dedup_clients_max);
+    partition.set_consumer_offsets_max(config.partition.consumer_offsets_max);
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir.clone());
     // Before the hydrate: the durable record is keyed by incarnation, so a
@@ -1264,6 +1325,7 @@ pub async fn build_partition_fresh(
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
     partition.set_dedup_clients_max(config.partition.dedup_clients_max);
+    partition.set_consumer_offsets_max(config.partition.consumer_offsets_max);
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir);
     // Fresh dirs read generation 0; a dir surviving from a crashed process

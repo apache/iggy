@@ -682,8 +682,8 @@ impl SimClient {
         self.non_replicated_request(GET_STREAM_CODE, METADATA_GROUP, &body)
     }
 
-    /// Store offset with explicit `AckLevel`. `NoAck` takes the primary's
-    /// fast path (no replication); `Quorum` goes through VSR.
+    /// Store offset with explicit `AckLevel`. A multi-replica partition routes
+    /// both values through VSR. A single replica retains the `NoAck` fast path.
     ///
     /// # Panics
     /// Panics on payload too large for `Owned::<4096>` or invalid
