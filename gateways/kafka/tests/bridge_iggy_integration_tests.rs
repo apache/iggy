@@ -27,6 +27,10 @@ use std::process::{Child, Command};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use iggy::prelude::{
+    AutoLogin, Client, Credentials, Identifier, IggyClient, IggyClientBuilder, IggyMessage,
+    MessageClient, Partitioning,
+};
 use secrecy::SecretString;
 use serial_test::serial;
 
@@ -138,6 +142,24 @@ impl Drop for TestServer {
     }
 }
 
+/// Builds and connects a raw `IggyClient` against `server` - for producing test data directly,
+/// independent of the `IggyBridge` under test. Mirrors `IggyBridge::connect`'s fluent-builder
+/// approach (not a hand-built connection string) purely so this test helper doesn't reintroduce
+/// the credential-escaping bug finding #4 fixes.
+async fn raw_client(server: &TestServer) -> IggyClient {
+    let client = IggyClientBuilder::new()
+        .with_tcp()
+        .with_server_address(server.address.clone())
+        .with_auto_sign_in(AutoLogin::Enabled(Credentials::UsernamePassword(
+            "iggy".to_string(),
+            SecretString::from("iggy"),
+        )))
+        .build()
+        .expect("build raw test client");
+    client.connect().await.expect("connect raw test client");
+    client
+}
+
 #[tokio::test]
 #[serial]
 async fn ensure_stream_and_topic_is_idempotent_on_repeated_calls() {
@@ -163,7 +185,7 @@ async fn ensure_stream_and_topic_is_idempotent_on_repeated_calls() {
 
 #[tokio::test]
 #[serial]
-async fn high_watermark_reflects_produced_messages() {
+async fn high_watermark_is_zero_for_a_fresh_empty_partition() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let bridge = IggyBridge::connect(server.test_config())
@@ -176,12 +198,55 @@ async fn high_watermark_reflects_produced_messages() {
         .expect("stream and topic must exist before checking the watermark");
 
     let watermark = bridge
-        .high_watermark("kafka", "orders", 0)
+        .high_watermark("orders", 0)
         .await
         .expect("fresh topic must report a watermark, not an error");
     assert_eq!(
         watermark, 0,
         "a freshly created, empty partition's high watermark must be 0"
+    );
+}
+
+/// Pins the exact semantics of `Iggy::Partition::current_offset` (offset of the *last written*
+/// message, not Kafka's "next offset to produce") against a real server - a test that only
+/// checked the empty-topic case would pass under either interpretation and hide an off-by-one.
+#[tokio::test]
+#[serial]
+async fn high_watermark_reflects_produced_messages() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("orders", 1)
+        .await
+        .expect("stream and topic must exist before producing");
+
+    let stream_id = Identifier::named("kafka").expect("valid stream name");
+    let topic_id = Identifier::named("orders").expect("valid topic name");
+    let mut messages: Vec<IggyMessage> = (0..3)
+        .map(|i| IggyMessage::from(format!("message-{i}")))
+        .collect();
+    let client = raw_client(&server).await;
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send 3 messages");
+
+    let watermark = bridge
+        .high_watermark("orders", 0)
+        .await
+        .expect("topic must report a watermark after producing");
+    assert_eq!(
+        watermark, 3,
+        "high watermark after 3 messages (offsets 0, 1, 2) must be 3, not the last offset (2)"
     );
 }
 
@@ -200,10 +265,81 @@ async fn high_watermark_rejects_out_of_range_partition() {
         .expect("stream and topic must exist before checking the watermark");
 
     let err = bridge
-        .high_watermark("kafka", "orders", 5)
+        .high_watermark("orders", 5)
         .await
         .expect_err("partition 5 does not exist on a 1-partition topic");
     assert!(matches!(err, BridgeError::PartitionOutOfRange { .. }));
+}
+
+#[tokio::test]
+#[serial]
+async fn ensure_stream_and_topic_is_idempotent_for_a_numeric_topic_name() {
+    // Regression test: Identifier::try_from/FromStr parses an all-digit string as a numeric ID,
+    // not a name - a second call for the same numeric-named topic would look it up by the wrong
+    // resource kind and fail with StreamIdNotFound/TopicIdNotFound despite the topic existing.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge should connect to a ready server");
+
+    bridge
+        .ensure_stream_and_topic("2024", 1)
+        .await
+        .expect("first call creates the numeric-named stream and topic");
+    bridge
+        .ensure_stream_and_topic("2024", 1)
+        .await
+        .expect("second call must still find the numeric-named topic by name, not by ID");
+}
+
+/// Finding: the SDK's connection-string parser splits on `@` then `:`, so a password containing
+/// either character breaks unless credentials are passed as already-separated fields.
+#[tokio::test]
+#[serial]
+async fn connect_succeeds_with_password_containing_special_characters() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let port = free_port();
+    let address = format!("127.0.0.1:{port}");
+    let password = "p@ss:word";
+
+    let mut command = Command::new(iggy_server_binary());
+    command
+        .env("IGGY_SYSTEM_PATH", data_dir.path().display().to_string())
+        .env("IGGY_TCP_ADDRESS", &address)
+        .env("IGGY_HTTP_ENABLED", "false")
+        .env("IGGY_QUIC_ENABLED", "false")
+        .env("IGGY_ROOT_USERNAME", "iggy")
+        .env("IGGY_ROOT_PASSWORD", password);
+    let mut child = command.spawn().expect("spawn iggy-server");
+
+    let config = IggyBridgeConfig {
+        address,
+        username: "iggy".to_string(),
+        password: SecretString::from(password),
+        topic_mapping: TopicMapping {
+            default_stream: "kafka".to_string(),
+            topics: HashMap::new(),
+        },
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let result = loop {
+        match IggyBridge::connect(config.clone()).await {
+            Ok(bridge) => break Ok(bridge),
+            Err(err) => {
+                if tokio::time::Instant::now() >= deadline {
+                    break Err(err);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    result.expect("bridge must connect with a password containing '@' and ':'");
 }
 
 /// Acceptance criterion: "no panics on Iggy unreachable at handler boundary." Connects to a port

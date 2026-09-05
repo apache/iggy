@@ -17,7 +17,8 @@
 
 use std::path::Path;
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
+use tracing::warn;
 
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::TopicMapping;
@@ -57,6 +58,12 @@ impl IggyBridgeConfig {
     /// Builds config from `IGGY_KAFKA_*` env vars, defaulting to the Iggy server's own
     /// out-of-the-box address and root credentials.
     ///
+    /// `IGGY_KAFKA_IGGY_STREAM` and `IGGY_KAFKA_TOPIC_MAP_PATH` both influence the mapping's
+    /// default stream; when both are set, the TOML file's own `default_stream` wins and
+    /// `IGGY_KAFKA_IGGY_STREAM` is ignored entirely for the topics it covers (a TOML file is a
+    /// complete mapping document, not an overlay) - a `warn!` fires so that isn't silently
+    /// mysterious to whoever set the env var expecting it to matter.
+    ///
     /// # Errors
     ///
     /// Returns [`BridgeError::InvalidConfig`] if `IGGY_KAFKA_TOPIC_MAP_PATH` is set but the file
@@ -68,13 +75,21 @@ impl IggyBridgeConfig {
             .unwrap_or_else(|_| DEFAULT_IGGY_USERNAME.to_string());
         let password = std::env::var("IGGY_KAFKA_IGGY_PASSWORD")
             .unwrap_or_else(|_| DEFAULT_IGGY_PASSWORD.to_string());
-        let default_stream =
-            std::env::var("IGGY_KAFKA_IGGY_STREAM").unwrap_or_else(|_| "kafka".to_string());
+        let stream_env = std::env::var("IGGY_KAFKA_IGGY_STREAM").ok();
+        let topic_map_path = std::env::var("IGGY_KAFKA_TOPIC_MAP_PATH").ok();
 
-        let topic_mapping = match std::env::var("IGGY_KAFKA_TOPIC_MAP_PATH") {
-            Ok(path) => TopicMapping::from_file(Path::new(&path))?,
-            Err(_) => TopicMapping {
-                default_stream,
+        let topic_mapping = match topic_map_path {
+            Some(path) => {
+                if stream_env.is_some() {
+                    warn!(
+                        "IGGY_KAFKA_IGGY_STREAM is set but ignored: IGGY_KAFKA_TOPIC_MAP_PATH's \
+                         own default_stream takes precedence"
+                    );
+                }
+                TopicMapping::from_file(Path::new(&path))?
+            }
+            None => TopicMapping {
+                default_stream: stream_env.unwrap_or_else(|| "kafka".to_string()),
                 topics: std::collections::HashMap::new(),
             },
         };
@@ -86,33 +101,7 @@ impl IggyBridgeConfig {
             topic_mapping,
         })
     }
-
-    /// Builds the `iggy://` connection string the SDK's `IggyClientBuilder::from_connection_string`
-    /// expects, embedding credentials. Never pass the result to a `tracing`/`format!` call that
-    /// might reach a log line - it exposes `password` in full, unlike this struct's own `Debug`.
-    ///
-    /// Pins `reconnection_retries` to `RECONNECTION_RETRIES` rather than the SDK's own default
-    /// (`TcpClientReconnectionConfig::default()` is `max_retries: None` - unlimited, one dial per
-    /// second, forever). A Kafka client already retries at the wire-protocol level once a handler
-    /// maps a bridge failure to a retriable error code; the bridge blocking a request task inside
-    /// an unbounded internal reconnect loop would just add a second, invisible retry layer
-    /// underneath that one instead of surfacing the failure so the mapped code can be sent.
-    #[must_use]
-    pub fn connection_string(&self) -> String {
-        format!(
-            "iggy://{}:{}@{}?reconnection_retries={RECONNECTION_RETRIES}",
-            self.username,
-            self.password.expose_secret(),
-            self.address
-        )
-    }
 }
-
-/// Passes attempted, after the first, before `IggyBridge::connect` gives up and returns
-/// `Err` - see [`IggyBridgeConfig::connection_string`]'s doc comment for why this is bounded
-/// at all. At the default `reconnection_interval` (1s), a fully unreachable address fails in a
-/// few seconds rather than hanging.
-const RECONNECTION_RETRIES: u32 = 3;
 
 #[cfg(test)]
 mod tests {
@@ -131,20 +120,15 @@ mod tests {
     }
 
     #[test]
-    fn connection_string_embeds_credentials_and_address() {
-        let config = test_config();
-        assert_eq!(
-            config.connection_string(),
-            "iggy://iggy:iggy@127.0.0.1:8090?reconnection_retries=3"
-        );
-    }
-
-    #[test]
     fn debug_output_does_not_expose_password() {
-        let config = test_config();
+        // A distinctive value, not the shared fixture's "iggy" - that string also appears as the
+        // username and inside the struct's own name, which would make a substring check here
+        // pass trivially regardless of whether the password field itself is actually redacted.
+        let mut config = test_config();
+        config.password = SecretString::from("correct-horse-battery-staple");
         let debug_output = format!("{config:?}");
         assert!(
-            !debug_output.contains("iggy://iggy:iggy"),
+            !debug_output.contains("correct-horse-battery-staple"),
             "Debug output must not expose the plaintext password: {debug_output}"
         );
     }
@@ -180,5 +164,28 @@ mod tests {
             std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
         }
         assert!(matches!(result, Err(BridgeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn from_env_prefers_topic_map_files_default_stream_over_env_var() {
+        let file = tempfile::NamedTempFile::new().expect("create temp file");
+        std::fs::write(file.path(), "default_stream = \"from-toml\"\n").expect("write temp file");
+
+        // Safety: single-threaded within this function; no other test in this crate touches
+        // IGGY_KAFKA_IGGY_STREAM or IGGY_KAFKA_TOPIC_MAP_PATH.
+        unsafe {
+            std::env::set_var("IGGY_KAFKA_IGGY_STREAM", "from-env");
+            std::env::set_var("IGGY_KAFKA_TOPIC_MAP_PATH", file.path());
+        }
+        let result = IggyBridgeConfig::from_env();
+        unsafe {
+            std::env::remove_var("IGGY_KAFKA_IGGY_STREAM");
+            std::env::remove_var("IGGY_KAFKA_TOPIC_MAP_PATH");
+        }
+
+        assert_eq!(
+            result.expect("valid config").topic_mapping.default_stream,
+            "from-toml"
+        );
     }
 }

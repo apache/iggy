@@ -18,9 +18,7 @@
 use iggy::prelude::IggyError;
 use thiserror::Error;
 
-use crate::protocol::api::{
-    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_VERSION,
-};
+use crate::protocol::api::{ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_TOPIC_OR_PARTITION};
 
 /// Kafka's generic `UNKNOWN_SERVER_ERROR` (`-1`). Not in `protocol::api`'s `ERROR_*` set - that
 /// table only lists codes the foundation's stub responses actually send; this is the bridge's own
@@ -66,20 +64,25 @@ impl BridgeError {
         match self {
             Self::Iggy(err) => iggy_error_to_kafka_code(err),
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
-            Self::InvalidConfig(_) => ERROR_UNSUPPORTED_VERSION,
+            // Not a wire-response case in practice: an invalid bridge config is caught at
+            // `IggyBridge::connect` before any handler exists to answer a Kafka request, so this
+            // is reachable only if a future caller starts constructing configs at request time.
+            // `UNKNOWN_SERVER_ERROR` at least doesn't claim a specific, wrong cause the way
+            // `UNSUPPORTED_VERSION` (misleadingly implies a Kafka API version mismatch) would.
+            Self::InvalidConfig(_) => ERROR_UNKNOWN_SERVER_ERROR,
         }
     }
 }
 
-/// `InvalidConfig` maps to `ERROR_UNSUPPORTED_VERSION` only because no closer code exists in the
-/// foundation's table for "this gateway is misconfigured" - it is never actually sent for a
-/// version mismatch. Kept private so that association can change without touching call sites.
+/// Kept private so this association can change without touching call sites.
 const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
     match err {
-        IggyError::StreamIdNotFound(_) | IggyError::TopicIdNotFound(_, _) => {
-            ERROR_UNKNOWN_TOPIC_OR_PARTITION
-        }
+        IggyError::StreamIdNotFound(_)
+        | IggyError::StreamNameNotFound(_)
+        | IggyError::TopicIdNotFound(_, _)
+        | IggyError::TopicNameNotFound(_, _) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
         IggyError::Unauthenticated
+        | IggyError::Unauthorized
         | IggyError::InvalidCredentials
         | IggyError::InvalidUsername
         | IggyError::InvalidPassword => ERROR_TOPIC_AUTHORIZATION_FAILED,
@@ -96,8 +99,23 @@ mod tests {
     use iggy::prelude::Identifier;
 
     #[test]
-    fn stream_not_found_maps_to_unknown_topic_or_partition() {
+    fn stream_id_not_found_maps_to_unknown_topic_or_partition() {
         let err = BridgeError::Iggy(IggyError::StreamIdNotFound(Identifier::numeric(1).unwrap()));
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    #[test]
+    fn stream_name_not_found_maps_to_unknown_topic_or_partition() {
+        let err = BridgeError::Iggy(IggyError::StreamNameNotFound("orders".to_string()));
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    #[test]
+    fn topic_name_not_found_maps_to_unknown_topic_or_partition() {
+        let err = BridgeError::Iggy(IggyError::TopicNameNotFound(
+            "orders".to_string(),
+            "kafka".to_string(),
+        ));
         assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 
@@ -105,6 +123,18 @@ mod tests {
     fn unauthenticated_maps_to_topic_authorization_failed() {
         let err = BridgeError::Iggy(IggyError::Unauthenticated);
         assert_eq!(err.to_kafka_error_code(), ERROR_TOPIC_AUTHORIZATION_FAILED);
+    }
+
+    #[test]
+    fn unauthorized_maps_to_topic_authorization_failed() {
+        let err = BridgeError::Iggy(IggyError::Unauthorized);
+        assert_eq!(err.to_kafka_error_code(), ERROR_TOPIC_AUTHORIZATION_FAILED);
+    }
+
+    #[test]
+    fn invalid_config_maps_to_unknown_server_error_not_unsupported_version() {
+        let err = BridgeError::InvalidConfig("bad config".to_string());
+        assert_eq!(err.to_kafka_error_code(), ERROR_UNKNOWN_SERVER_ERROR);
     }
 
     #[test]
