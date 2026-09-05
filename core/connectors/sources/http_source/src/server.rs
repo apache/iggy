@@ -27,7 +27,6 @@
 use arc_swap::{ArcSwap, Guard};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::rejection::BytesRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -35,6 +34,7 @@ use axum::routing::{get, post};
 use axum::{Json, serve};
 use iggy_common::{HeaderKey, HeaderValue};
 use iggy_connector_sdk::Error;
+use ring::hmac;
 use secrecy::SecretString;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
@@ -374,7 +374,7 @@ impl SharedServer {
         let tasks = vec![
             tokio::spawn(run(
                 public,
-                public_router(Arc::clone(&state), config.max_body_size_bytes),
+                public_router(Arc::clone(&state)),
                 shutdown.subscribe(),
                 "public",
             )),
@@ -507,12 +507,14 @@ async fn run(
     }
 }
 
-fn public_router(state: Arc<ServerState>, max_body_size_bytes: usize) -> Router {
+/// No `DefaultBodyLimit`: both POST handlers take the request whole and pass
+/// the operator's cap to `to_bytes` themselves, which is what lets them refuse
+/// a request before reading it.
+fn public_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/topics/{topic_path}", post(handle_named_path))
         .route("/e/{endpoint_id}", post(handle_secret_path))
         .route("/health", get(handle_health))
-        .layer(DefaultBodyLimit::max(max_body_size_bytes))
         .with_state(state)
 }
 
@@ -565,12 +567,11 @@ async fn handle_secret_path(
     State(state): State<Arc<ServerState>>,
     Path(endpoint_id): Path<String>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
-    request_headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    request: Request,
 ) -> Response {
     let started = Instant::now();
     let (instance_name, response) =
-        secret_path_outcome(&state, &endpoint_id, remote_addr, &request_headers, body);
+        secret_path_outcome(&state, &endpoint_id, remote_addr, request).await;
     state.metrics.record_request(
         &instance_name,
         PathKind::Secret,
@@ -589,8 +590,10 @@ async fn named_path_outcome(
     remote_addr: SocketAddr,
     request: Request,
 ) -> (String, Response) {
-    // Cloned before the body is taken, since reading it consumes the request.
-    let request_headers = request.headers().clone();
+    // `into_parts` hands them over owned, so nothing is cloned to survive the
+    // body being taken.
+    let (parts, body) = request.into_parts();
+    let request_headers = parts.headers;
     let instance = {
         let routes = &state.published().routes;
         let Some(instance) = routes.lookup_named_path(topic_path) else {
@@ -615,7 +618,7 @@ async fn named_path_outcome(
 
     // `DefaultBodyLimit` guards the extractor, which is no longer in play, so
     // the cap is applied here instead.
-    let body = match axum::body::to_bytes(request.into_body(), state.max_body_size_bytes).await {
+    let body = match axum::body::to_bytes(body, state.max_body_size_bytes).await {
         Ok(body) => body,
         Err(error) => return (name, oversized_body_response(&error)),
     };
@@ -629,13 +632,16 @@ async fn named_path_outcome(
     (name, response)
 }
 
-fn secret_path_outcome(
+async fn secret_path_outcome(
     state: &ServerState,
     endpoint_id: &str,
     remote_addr: SocketAddr,
-    request_headers: &HeaderMap,
-    body: Result<Bytes, BytesRejection>,
+    request: Request,
 ) -> (String, Response) {
+    // `into_parts` hands the headers over owned; taking them as an extractor
+    // cloned the whole map on every request.
+    let (parts, body) = request.into_parts();
+    let request_headers = parts.headers;
     let routes = &state.published().routes;
     let entry = match routes.lookup_secret_path(endpoint_id, unix_now_seconds()) {
         RouteLookup::Active(entry) => entry,
@@ -665,11 +671,20 @@ fn secret_path_outcome(
         }
     };
     let name = entry.instance.instance_name.clone();
-    let body = match body {
+    // Only now, once the id resolved to something that is actually serving.
+    // An unknown or revoked id used to cost a full body read before its 404,
+    // which is free amplification on the public listener. HMAC still needs the
+    // body, so the read cannot move any earlier than this.
+    let body = match axum::body::to_bytes(body, state.max_body_size_bytes).await {
         Ok(body) => body,
-        Err(rejection) => return (name, rejected_body_response(rejection)),
+        Err(error) => return (name, oversized_body_response(&error)),
     };
-    if !authorize(&entry.endpoint, request_headers, &body) {
+    if !authorize(
+        &entry.endpoint,
+        entry.hmac_key.as_ref(),
+        &request_headers,
+        &body,
+    ) {
         return (
             name,
             error_response(StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -677,7 +692,7 @@ fn secret_path_outcome(
     }
     let response = enqueue(
         &entry.instance,
-        request_headers,
+        &request_headers,
         remote_addr,
         body,
         &state.metrics,
@@ -768,6 +783,21 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
 ///
 /// Never blocks on a full bridge: waiting would turn a slow Iggy into a pile
 /// of held-open connections and, once the sender times out, a retry storm.
+/// The 429 a full bridge answers with.
+///
+/// Shared so the early check and the `try_send` gate cannot drift apart in
+/// status, `Retry-After`, or body.
+fn bridge_full_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, "1")],
+        Json(ErrorResponse {
+            error: "service temporarily unavailable",
+        }),
+    )
+        .into_response()
+}
+
 fn enqueue(
     instance: &Arc<SharedState>,
     request_headers: &HeaderMap,
@@ -775,6 +805,18 @@ fn enqueue(
     body: Bytes,
     metrics: &Metrics,
 ) -> Response {
+    // Checked before the header map is built and the body copied, since a full
+    // bridge throws both away. `is_full` is racy, which is why `try_send`
+    // below stays the real gate; this only skips the work when the answer is
+    // already known.
+    if instance.sender.is_full() {
+        metrics.record_rejected_full(&instance.instance_name);
+        debug!(
+            "Rejected a request for {CONNECTOR_NAME} connector ID: {}, bridge is full at {} messages",
+            instance.id, instance.config.buffer_capacity
+        );
+        return bridge_full_response();
+    }
     let (headers, clamped, dropped) = message_headers(instance, request_headers, remote_addr);
     let message = QueuedMessage {
         // `to_vec`, deliberately, not `Vec::from(body)`. The latter hands back
@@ -809,14 +851,7 @@ fn enqueue(
             "Rejected a request for {CONNECTOR_NAME} connector ID: {}, bridge is full at {} messages",
             instance.id, instance.config.buffer_capacity
         );
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, "1")],
-            Json(ErrorResponse {
-                error: "service temporarily unavailable",
-            }),
-        )
-            .into_response();
+        return bridge_full_response();
     }
     // Only now: a rejected request produced no message, so its header losses
     // would otherwise be counted against messages that never existed.
@@ -824,7 +859,12 @@ fn enqueue(
     Json(StatusResponse { status: "queued" }).into_response()
 }
 
-fn authorize(endpoint: &Endpoint, request_headers: &HeaderMap, body: &[u8]) -> bool {
+fn authorize(
+    endpoint: &Endpoint,
+    hmac_key: Option<&hmac::Key>,
+    request_headers: &HeaderMap,
+    body: &[u8],
+) -> bool {
     match endpoint.auth_type {
         EndpointAuthType::None => true,
         EndpointAuthType::Bearer => endpoint
@@ -832,18 +872,16 @@ fn authorize(endpoint: &Endpoint, request_headers: &HeaderMap, body: &[u8]) -> b
             .as_ref()
             .is_some_and(|secret| validate_bearer(bearer_header(request_headers), secret)),
         EndpointAuthType::HmacSha256 | EndpointAuthType::HmacSha1 => {
-            let (Some(secret), Some(algorithm)) = (
-                endpoint.auth_secret.as_ref(),
-                endpoint.auth_type.hmac_algorithm(),
-            ) else {
+            // Absent only if the endpoint claims HMAC with no secret, which
+            // `validate()` and the management API both refuse. Fail closed.
+            let Some(key) = hmac_key else {
                 return false;
             };
             validate_hmac(
                 body,
                 header_str(request_headers, &endpoint.hmac_header),
                 &endpoint.hmac_prefix,
-                secret,
-                algorithm,
+                key,
             )
         }
     }
@@ -967,16 +1005,6 @@ fn oversized_body_response(error: &axum::Error) -> Response {
     }
 }
 
-fn rejected_body_response(rejection: BytesRejection) -> Response {
-    let status = rejection.status();
-    let message = if status == StatusCode::PAYLOAD_TOO_LARGE {
-        "payload too large"
-    } else {
-        "bad request"
-    };
-    error_response(status, message)
-}
-
 pub(crate) fn error_response(status: StatusCode, error: &'static str) -> Response {
     (status, Json(ErrorResponse { error })).into_response()
 }
@@ -1089,6 +1117,34 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(source.shared.sender.len(), 0);
+        close(&mut source).await;
+    }
+
+    #[tokio::test]
+    async fn given_oversized_body_to_unknown_endpoint_should_answer_not_found_not_payload_too_large()
+    {
+        // Guards the ordering against a return to buffering before routing.
+        // With the body as an extractor, axum size-checked it before the
+        // handler ran, so an unknown id answered 413 having already paid for
+        // the read. What this pins is the status an unknown id gets, which is
+        // what regresses if the read moves back ahead of the lookup and its
+        // failure is surfaced there. It does not, and over HTTP cannot, prove
+        // that no bytes were read.
+        let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
+        let oversized = "x".repeat(crate::DEFAULT_MAX_BODY_SIZE_BYTES + 1024);
+
+        let response = client()
+            .post(format!("{}/e/{ENDPOINT_TWO}", base_url(&source)))
+            .body(oversized)
+            .send()
+            .await
+            .expect("the request must reach the listener");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an unknown id must be refused before its body is read"
+        );
         close(&mut source).await;
     }
 

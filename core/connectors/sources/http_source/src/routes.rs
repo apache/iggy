@@ -22,6 +22,7 @@
 //! join, leave, and management mutations, so a request resolves its auth
 //! requirements and its destination bridge from one wait-free snapshot.
 
+use ring::hmac;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -171,10 +172,26 @@ pub struct RouteTable {
 
 /// A resolved secret path: the endpoint's own auth rules plus the instance
 /// whose bridge receives the body.
-#[derive(Debug)]
 pub struct RouteEntry {
     pub instance: Arc<SharedState>,
     pub endpoint: Endpoint,
+    /// Derived once here rather than per request. The table is rebuilt on
+    /// every registry mutation, so a rotated secret cannot be verified against
+    /// a stale key.
+    pub hmac_key: Option<hmac::Key>,
+}
+
+// Hand-written because `hmac::Key` is not `Debug`, and a key has no business
+// in a log line even if it were.
+impl fmt::Debug for RouteEntry {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RouteEntry")
+            .field("instance", &self.instance)
+            .field("endpoint", &self.endpoint)
+            .field("hmac_key", &self.hmac_key.is_some())
+            .finish()
+    }
 }
 
 /// Outcome of resolving a secret path. `Revoked` and `Unknown` both answer 404
@@ -249,9 +266,15 @@ impl RouteTable {
                         });
                     }
                     Entry::Vacant(vacant) => {
+                        let hmac_key = endpoint
+                            .auth_type
+                            .hmac_algorithm()
+                            .zip(endpoint.auth_secret.as_ref())
+                            .map(|(algorithm, secret)| crate::auth::hmac_key(algorithm, secret));
                         vacant.insert(RouteEntry {
                             instance: Arc::clone(instance),
                             endpoint: endpoint.clone(),
+                            hmac_key,
                         });
                     }
                 }

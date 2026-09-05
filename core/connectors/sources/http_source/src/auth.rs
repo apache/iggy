@@ -92,12 +92,26 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 /// Validates an HMAC signature over the raw request body bytes, never a
 /// re-serialized form (whitespace or key-order changes would break the hash).
 /// `ring::hmac::verify` compares in constant time.
+/// Longest tag any supported algorithm produces: SHA-256 at 32 bytes.
+const MAX_TAG_LEN: usize = 32;
+
+/// Derives the verification key for an endpoint, once.
+///
+/// Called from `RouteTable::build`, so the key is rebuilt whenever the table
+/// is, which is on every registry mutation. That is what keeps a rotated
+/// secret from being verified against the old key.
+pub fn hmac_key(algorithm: HmacAlgorithm, secret: &SecretString) -> hmac::Key {
+    hmac::Key::new(
+        algorithm.ring_algorithm(),
+        secret.expose_secret().as_bytes(),
+    )
+}
+
 pub fn validate_hmac(
     body: &[u8],
     signature_header: Option<&str>,
     signature_prefix: &str,
-    secret: &SecretString,
-    algorithm: HmacAlgorithm,
+    key: &hmac::Key,
 ) -> bool {
     let Some(header_value) = signature_header else {
         return false;
@@ -105,14 +119,18 @@ pub fn validate_hmac(
     let Some(signature_hex) = header_value.strip_prefix(signature_prefix) else {
         return false;
     };
-    let Ok(expected_signature) = hex::decode(signature_hex) else {
+    // Decoded into a stack buffer: this runs per request, and the tag is at
+    // most 32 bytes. An odd or oversized hex string is rejected here rather
+    // than allocated for.
+    if signature_hex.len() % 2 != 0 || signature_hex.len() / 2 > MAX_TAG_LEN {
         return false;
-    };
-    let key = hmac::Key::new(
-        algorithm.ring_algorithm(),
-        secret.expose_secret().as_bytes(),
-    );
-    hmac::verify(&key, body, &expected_signature).is_ok()
+    }
+    let tag_len = signature_hex.len() / 2;
+    let mut tag = [0u8; MAX_TAG_LEN];
+    if hex::decode_to_slice(signature_hex, &mut tag[..tag_len]).is_err() {
+        return false;
+    }
+    hmac::verify(key, body, &tag[..tag_len]).is_ok()
 }
 
 #[cfg(test)]
@@ -181,8 +199,7 @@ mod tests {
             BODY,
             Some(&signature),
             "sha256=",
-            &secret(),
-            HmacAlgorithm::HmacSha256,
+            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
         ));
     }
 
@@ -196,8 +213,7 @@ mod tests {
             BODY,
             Some(&signature),
             "sha1=",
-            &secret(),
-            HmacAlgorithm::HmacSha1,
+            &hmac_key(HmacAlgorithm::HmacSha1, &secret()),
         ));
     }
 
@@ -211,8 +227,7 @@ mod tests {
             br#"{"event": "push", "repository": "attacker/repo"}"#,
             Some(&signature),
             "sha256=",
-            &secret(),
-            HmacAlgorithm::HmacSha256,
+            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
         ));
     }
 
@@ -222,8 +237,7 @@ mod tests {
             BODY,
             None,
             "sha256=",
-            &secret(),
-            HmacAlgorithm::HmacSha256,
+            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
         ));
     }
 
@@ -237,8 +251,31 @@ mod tests {
             BODY,
             Some(&signature),
             "sha256=",
-            &secret(),
-            HmacAlgorithm::HmacSha256,
+            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+        ));
+    }
+
+    #[test]
+    fn given_oversized_signature_when_hmac_validated_should_reject() {
+        // The tag is decoded into a 32 byte stack buffer, so anything longer
+        // has to be refused before the decode rather than overrun it.
+        let header = format!("sha256={}", "a".repeat((MAX_TAG_LEN + 1) * 2));
+        assert!(!validate_hmac(
+            BODY,
+            Some(&header),
+            "sha256=",
+            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
+        ));
+    }
+
+    #[test]
+    fn given_odd_length_signature_when_hmac_validated_should_reject() {
+        let header = "sha256=abc".to_string();
+        assert!(!validate_hmac(
+            BODY,
+            Some(&header),
+            "sha256=",
+            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
         ));
     }
 
@@ -248,8 +285,7 @@ mod tests {
             BODY,
             Some("sha256=not-hex-at-all"),
             "sha256=",
-            &secret(),
-            HmacAlgorithm::HmacSha256,
+            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
         ));
     }
 
@@ -260,8 +296,7 @@ mod tests {
             BODY,
             Some(&signature),
             "",
-            &secret(),
-            HmacAlgorithm::HmacSha256,
+            &hmac_key(HmacAlgorithm::HmacSha256, &secret()),
         ));
     }
 }
