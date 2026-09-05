@@ -24,7 +24,11 @@ import io.netty.buffer.ByteBufAllocator;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
 
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 /**
  * Rewrites serialized login payloads into the
@@ -45,6 +49,11 @@ final class VsrLoginCodec {
     static final int PROTOCOL_VERSION = (11 << 10); // 0.11.0
 
     static final String SDK_NAME = "java-sdk";
+
+    /** Bound on a u8-length-prefixed field, in encoded bytes. */
+    static final int MAX_SHORT_FIELD_LENGTH = 255;
+
+    private static final String UNKNOWN_SDK_VERSION = "unknown";
 
     private VsrLoginCodec() {}
 
@@ -94,15 +103,22 @@ final class VsrLoginCodec {
     private static void writeVersionInfo(ByteBuf body) {
         body.writeIntLE(PROTOCOL_VERSION);
         writeShortField(body, SDK_NAME.getBytes(StandardCharsets.UTF_8));
-        writeShortField(body, sdkVersion().getBytes(StandardCharsets.UTF_8));
+        writeShortField(body, sdkVersionField(IggyVersion.getInstance().getVersion()));
     }
 
-    private static String sdkVersion() {
-        String version = IggyVersion.getInstance().getVersion();
-        if (version == null || version.isEmpty()) {
-            return "unknown";
-        }
-        return version.length() > 255 ? version.substring(0, 255) : version;
+    /**
+     * An over-long version is cut on the encoded bytes at a code point boundary, so the field
+     * always fits its u8 prefix and still decodes as UTF-8 on the server.
+     */
+    static byte[] sdkVersionField(String version) {
+        String value = version == null || version.isEmpty() ? UNKNOWN_SDK_VERSION : version;
+        ByteBuffer encoded = ByteBuffer.allocate(MAX_SHORT_FIELD_LENGTH);
+        StandardCharsets.UTF_8
+                .newEncoder()
+                .onMalformedInput(CodingErrorAction.REPLACE)
+                .onUnmappableCharacter(CodingErrorAction.REPLACE)
+                .encode(CharBuffer.wrap(value), encoded, true);
+        return Arrays.copyOf(encoded.array(), encoded.position());
     }
 
     private static byte[] readShortField(ByteBuf in, String field) {
@@ -119,8 +135,9 @@ final class VsrLoginCodec {
     }
 
     private static void writeShortField(ByteBuf out, byte[] value) {
-        if (value.length == 0 || value.length > 255) {
-            throw new IggyInvalidArgumentException("Wire name fields must be 1..255 bytes, got " + value.length);
+        if (value.length == 0 || value.length > MAX_SHORT_FIELD_LENGTH) {
+            throw new IggyInvalidArgumentException(
+                    "Wire name fields must be 1.." + MAX_SHORT_FIELD_LENGTH + " bytes, got " + value.length);
         }
         out.writeByte(value.length);
         out.writeBytes(value);

@@ -63,6 +63,9 @@ public final class BytesSerializer {
      */
     private static final int MAX_HEADER_FIELD_LENGTH = 255;
 
+    /** Bound on a u8-length-prefixed wire string, in encoded bytes. */
+    private static final int MAX_U8_STRING_LENGTH = 255;
+
     /** The timestamp delta is a u32 microsecond offset from the batch origin timestamp. */
     private static final BigInteger MAX_TIMESTAMP_DELTA_MICROS = BigInteger.valueOf(0xFFFF_FFFFL);
 
@@ -86,10 +89,11 @@ public final class BytesSerializer {
             buffer.writeIntLE(identifier.getId().intValue());
             return buffer;
         } else if (identifier.getKind() == 2) {
-            ByteBuf buffer = Unpooled.buffer(2 + identifier.getName().length());
+            byte[] name = identifier.getEncodedName();
+            ByteBuf buffer = Unpooled.buffer(2 + name.length);
             buffer.writeByte(2);
-            buffer.writeByte(identifier.getName().length());
-            buffer.writeBytes(identifier.getName().getBytes());
+            buffer.writeByte(name.length);
+            buffer.writeBytes(name);
             return buffer;
         } else {
             throw new IggyInvalidArgumentException("Unknown identifier kind: " + identifier.getKind());
@@ -210,9 +214,12 @@ public final class BytesSerializer {
     }
 
     public static ByteBuf toBytes(String value) {
-        int bufferLength = 1 + value.length();
-        ByteBuf buffer = Unpooled.buffer(bufferLength);
         byte[] stringBytes = value.getBytes(StandardCharsets.UTF_8);
+        if (stringBytes.length > MAX_U8_STRING_LENGTH) {
+            throw new IggyInvalidArgumentException("String must be at most " + MAX_U8_STRING_LENGTH
+                    + " bytes when UTF-8 encoded, got " + stringBytes.length);
+        }
+        ByteBuf buffer = Unpooled.buffer(1 + stringBytes.length);
         buffer.writeByte(stringBytes.length);
         buffer.writeBytes(stringBytes);
         return buffer;

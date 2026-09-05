@@ -106,11 +106,13 @@ public class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
             StreamId streamId, TopicId topicId, String name) {
         var streamIdBytes = BytesSerializer.toBytes(streamId);
         var topicIdBytes = BytesSerializer.toBytes(topicId);
-        var payload = Unpooled.buffer(1 + streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + name.length());
+        var nameBytes = BytesSerializer.toBytes(name);
+        var payload = Unpooled.buffer(
+                streamIdBytes.readableBytes() + topicIdBytes.readableBytes() + nameBytes.readableBytes());
 
         payload.writeBytes(streamIdBytes);
         payload.writeBytes(topicIdBytes);
-        payload.writeBytes(BytesSerializer.toBytes(name));
+        payload.writeBytes(nameBytes);
 
         log.debug("Creating consumer group - Stream: {}, Topic: {}, Name: {}", streamId, topicId, name);
 
