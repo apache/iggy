@@ -115,7 +115,7 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | ------ | ---- | ------- | ----------- |
 | `listen_addr` | string | required | Public listener. Every instance sharing it must configure the identical value. |
 | `admin_listen_addr` | string | `127.0.0.1:9091` | Management API, admin health, and metrics. Never route this through a public load balancer. |
-| `instance_name` | string | runtime id | Identifies the instance in message headers and on the admin listener. The default is the plugin's numeric runtime id, assigned in load order and **not stable across restarts** — set it explicitly in production. |
+| `instance_name` | string | runtime id | Identifies the instance in message headers and on the admin listener. The default is the plugin's numeric runtime id, assigned in load order and **not stable across restarts**, so set it explicitly in production. |
 | `topic_path` | string | none | Exposes `POST /topics/{topic_path}`. Unset leaves only secret-path endpoints. |
 | `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
@@ -123,7 +123,7 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. |
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
-| `forward_headers` | array | `[]` | Request headers copied onto the message. Invalid names fail `open()`, as do `Authorization`, `Proxy-Authorization`, and `Cookie` — forwarding a reusable credential would copy it onto every message and persist it in the log. |
+| `forward_headers` | array | `[]` | Request headers copied onto the message. Invalid names fail `open()`, as do `Authorization`, `Proxy-Authorization`, and `Cookie`, because forwarding a reusable credential would copy it onto every message and persist it in the log. |
 | `endpoints` | array | `[]` | Static secret-path endpoints. |
 
 ### Endpoint options
@@ -234,7 +234,7 @@ curl -sS -X POST http://127.0.0.1:9091/admin/endpoints \
 # {"endpoint_id":"9f2c...","path":"/e/9f2c..."}
 ```
 
-Rotation deliberately keeps the path: a webhook sender configures the URL once, so changing the shared secret must not force it to be reconfigured. It applies to dynamic endpoints only — a static endpoint's secret lives in TOML, so rotating one answers 409 and points you at the file, because restoring prefers TOML and would silently revert the change on the next restart.
+Rotation deliberately keeps the path: a webhook sender configures the URL once, so changing the shared secret must not force it to be reconfigured. It applies to dynamic endpoints only: a static endpoint's secret lives in TOML, so rotating one answers 409 and points you at the file, because restoring prefers TOML and would silently revert the change on the next restart.
 
 | Status | Condition |
 | ------ | --------- |
@@ -323,7 +323,7 @@ The registry is capped at `MAX_ENDPOINTS` (10000) per instance. At the cap the o
 
 Recovering a revoked static endpoint means giving it a **new** `endpoint_id`. Editing `auth_secret` in TOML does nothing, because the tombstone outranks the file by design, and deleting the state file to clear one tombstone also drops every dynamic endpoint and every other revocation with it.
 
-**`dropped_on_close` disappears with its listener.** The counter lives on the shared listener's registry, so it survives one instance of several leaving — but when the *last* instance closes, the listener and its metrics go with it. In a single-instance deployment the `warn!` log line is the only surviving record of messages lost at shutdown.
+**`dropped_on_close` disappears with its listener.** The counter lives on the shared listener's registry, so it survives one instance of several leaving, but when the *last* instance closes, the listener and its metrics go with it. In a single-instance deployment the `warn!` log line is the only surviving record of messages lost at shutdown.
 
 **Sampled gauges are dropped when an instance leaves**, so `buffer_used` and `endpoints_active` do not linger at a stale value for an instance that no longer exists. The counters persist, as counters should.
 
