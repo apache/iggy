@@ -295,11 +295,18 @@ where
         .ok_or_else(|| {
             if streams
                 .resolve_consumer_group_id(stream_id, topic_id, &consumer.id)
-                .is_none()
+                .is_some()
+            {
+                IggyError::ConsumerGroupPartitionNotOwned(client_id as u32, partition_id)
+            } else if streams
+                .topic_partitions_count(stream_id, topic_id)
+                .is_some()
             {
                 missing_consumer_group_error(&consumer.id, topic_id)
             } else {
-                IggyError::ConsumerGroupPartitionNotOwned(client_id as u32, partition_id)
+                // An unknown stream or topic is not a missing group: report
+                // the same not-found every other partition op gives.
+                IggyError::ResourceNotFound(String::new())
             }
         })
 }

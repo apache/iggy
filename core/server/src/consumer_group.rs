@@ -235,12 +235,20 @@ where
             if wire.consumer.kind != KIND_CONSUMER_GROUP {
                 return Ok(request);
             }
-            let group_id = resolve_group_offset_id(
-                shard,
-                &wire.consumer,
-                (&wire.stream_id, &wire.topic_id),
-            )
-            .ok_or_else(|| missing_consumer_group_error(&wire.consumer.id, &wire.topic_id))?;
+            let Some(group_id) =
+                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
+            else {
+                // An unknown stream or topic is not a missing group: let the
+                // namespace resolution below answer it with the same
+                // not-found every other partition op reports.
+                if !topic_exists(shard, &wire.stream_id, &wire.topic_id) {
+                    return Ok(request);
+                }
+                return Err(missing_consumer_group_error(
+                    &wire.consumer.id,
+                    &wire.topic_id,
+                ));
+            };
             // The partition-plane group-offset key is u32 (see the documented
             // ceiling on `Topic::next_consumer_group_id`). Clamp on the
             // ~4-billion-creates overflow rather than panic this live
@@ -258,6 +266,27 @@ where
     };
 
     rewrite_request_body(&request, &rewritten)
+}
+
+fn topic_exists<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    stream_id: &WireIdentifier,
+    topic_id: &WireIdentifier,
+) -> bool
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .topic_partitions_count(stream_id, topic_id)
+        .is_some()
 }
 
 /// Resolve the monotonic group id for a group consumer-offset op.

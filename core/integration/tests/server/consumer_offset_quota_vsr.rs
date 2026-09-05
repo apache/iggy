@@ -297,6 +297,29 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         IggyError::ConsumerGroupNameNotFound("unknown-group".to_owned(), topic.clone()).as_code()
     );
 
+    let unknown_stream = StoreConsumerOffsetRequest {
+        consumer: WireConsumer::consumer_group(WireIdentifier::Numeric(999)),
+        stream_id: WireIdentifier::Numeric(999_999),
+        topic_id: WireIdentifier::Numeric(topic_details.id),
+        partition_id: Some(PARTITION_ID),
+        offset: 0,
+        ack: AckLevel::Quorum,
+    }
+    .to_bytes();
+    let header = raw_tcp::request_header(
+        Operation::StoreConsumerOffset,
+        raw_client_id,
+        session,
+        3,
+        unknown_stream.len(),
+    );
+    let (reply, _) = raw_tcp::exchange(&mut raw, &header, &unknown_stream).await;
+    assert_eq!(
+        raw_tcp::reply_status(&reply),
+        IggyError::ResourceNotFound(String::new()).as_code(),
+        "a missing stream is not reported as a missing group"
+    );
+
     let http = HttpClient::login_root(harness).await;
     let response = http
         .client
