@@ -236,6 +236,12 @@ impl SourceManager {
             state,
         )?;
         info!("Source connector with ID: {plugin_id} for plugin: {key} initialized successfully.");
+        // Armed from here until the id is recorded below. Until then nothing
+        // outside the plugin knows this instance exists, so any early return
+        // would strand it: `stop_connector` closes `details.info.id`, which
+        // still names the previous one.
+        let instance =
+            source::SourceInstanceGuard::new(container.iggy_source_close, plugin_id, key);
 
         let (producer, encoder, transforms) =
             source::setup_source_producer(key, config, iggy_client).await?;
@@ -265,6 +271,8 @@ impl SourceManager {
             details.handler_tasks = handler_tasks;
             metrics.increment_sources_running();
         }
+        // `details.info.id` now names this instance, so a later stop reaches it.
+        instance.disarm();
 
         Ok(())
     }

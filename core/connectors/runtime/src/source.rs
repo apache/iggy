@@ -248,12 +248,7 @@ pub async fn init(
                 let connector = source_connectors
                     .get_mut(&path)
                     .expect("source connector was inserted above");
-                let close_result = (connector.container.iggy_source_close)(plugin_id);
-                if close_result != 0 {
-                    warn!(
-                        "iggy_source_close returned {close_result} while cleaning up failed source connector with ID: {plugin_id} ({key})"
-                    );
-                }
+                close_failed_source(connector.container.iggy_source_close, plugin_id, &key);
                 if let Some(plugin) = connector
                     .plugins
                     .iter_mut()
@@ -302,6 +297,63 @@ pub(crate) fn init_source(
         Err(RuntimeError::InvalidConfiguration(error))
     } else {
         Ok(())
+    }
+}
+
+/// Closes a source instance that `iggy_source_open` created and nothing else
+/// will ever reach.
+///
+/// Between `init_source` succeeding and the plugin id being recorded on
+/// `SourceDetails`, the instance exists inside the plugin and nothing outside
+/// it knows the id: `stop_connector` closes whatever `details.info.id` holds,
+/// which is still the previous instance. An early return in that window
+/// stranded the new one for the life of the process.
+///
+/// A guard rather than a cleanup branch at the one call site that can fail
+/// today, because the window is defined by the two statements that open and
+/// record the instance, not by which call between them happens to be fallible.
+/// Adding a `?` inside it stays correct.
+pub(crate) struct SourceInstanceGuard<'a> {
+    close: extern "C" fn(u32) -> i32,
+    plugin_id: u32,
+    key: &'a str,
+    armed: bool,
+}
+
+impl<'a> SourceInstanceGuard<'a> {
+    pub(crate) fn new(close: extern "C" fn(u32) -> i32, plugin_id: u32, key: &'a str) -> Self {
+        Self {
+            close,
+            plugin_id,
+            key,
+            armed: true,
+        }
+    }
+
+    /// Hands ownership of the instance to the caller, once something else can
+    /// close it. Call only after the plugin id is durably recorded.
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SourceInstanceGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            close_failed_source(self.close, self.plugin_id, self.key);
+        }
+    }
+}
+
+/// Closes an instance whose setup did not finish, reporting a refusal rather
+/// than returning it: both callers are already on a failure path and have an
+/// error of their own to surface.
+pub(crate) fn close_failed_source(close: extern "C" fn(u32) -> i32, plugin_id: u32, key: &str) {
+    let close_result = close(plugin_id);
+    if close_result != 0 {
+        warn!(
+            "iggy_source_close returned {close_result} while cleaning up failed source connector with ID: {plugin_id} ({key})"
+        );
     }
 }
 
@@ -959,6 +1011,88 @@ mod tests {
             stream_name: "test-stream".to_string(),
             topic_name: "test-topic".to_string(),
         }
+    }
+
+    /// Records what `SourceInstanceGuard` passed to the FFI. A stub has to be a
+    /// plain `extern "C" fn`, so recording goes through statics rather than a
+    /// captured closure. Each test therefore gets its **own** stub and statics:
+    /// sharing one pair would make two tests that both reset and read it race,
+    /// since the suite runs them in the same process at the same time.
+    static ARMED_CLOSED_ID: AtomicU32 = AtomicU32::new(0);
+    static ARMED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    extern "C" fn armed_close(id: u32) -> i32 {
+        ARMED_CLOSED_ID.store(id, Ordering::SeqCst);
+        ARMED_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    static DISARMED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    extern "C" fn disarmed_close(_id: u32) -> i32 {
+        DISARMED_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    static REFUSED_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    extern "C" fn refusing_close(_id: u32) -> i32 {
+        REFUSED_CALLS.fetch_add(1, Ordering::SeqCst);
+        -1
+    }
+
+    #[test]
+    fn given_an_armed_guard_when_dropped_should_close_the_instance() {
+        // The leak this exists for: `init_source` has created the instance and
+        // nothing outside the plugin knows its id yet, so an early return here
+        // would strand it for the life of the process.
+        let plugin_id = next_plugin_id();
+
+        drop(SourceInstanceGuard::new(armed_close, plugin_id, "random"));
+
+        assert_eq!(
+            ARMED_CALLS.load(Ordering::SeqCst),
+            1,
+            "a guard still armed owns the instance and must close it"
+        );
+        assert_eq!(
+            ARMED_CLOSED_ID.load(Ordering::SeqCst),
+            plugin_id,
+            "closing any other id would leave this instance open and kill a live one"
+        );
+    }
+
+    #[test]
+    fn given_a_disarmed_guard_when_dropped_should_leave_the_instance_open() {
+        // Disarmed means `details.info.id` names the instance, so `stop_connector`
+        // will close it. Closing here too would tear down a source that just
+        // started successfully.
+        let plugin_id = next_plugin_id();
+
+        SourceInstanceGuard::new(disarmed_close, plugin_id, "random").disarm();
+
+        assert_eq!(
+            DISARMED_CALLS.load(Ordering::SeqCst),
+            0,
+            "the instance is the manager's once its id is recorded"
+        );
+    }
+
+    #[test]
+    fn given_a_refused_close_when_guard_drops_should_not_panic() {
+        // The plugin answers -1 for an id it does not know. Both callers are
+        // already returning an error of their own, so the refusal is reported
+        // and not propagated; unwinding out of `drop` would be worse than the
+        // leak it is cleaning up after.
+        let plugin_id = next_plugin_id();
+
+        drop(SourceInstanceGuard::new(
+            refusing_close,
+            plugin_id,
+            "random",
+        ));
+
+        assert_eq!(REFUSED_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
