@@ -845,42 +845,34 @@ class IggyClient:
     A Python class representing the Iggy client.
     It provides asynchronous functionality through the contained runtime.
     """
-    def __new__(cls, conn: TcpConfig | builtins.str | None = None) -> IggyClient:
+    def __new__(
+        cls, conn: TcpConfig | QuicConfig | builtins.str | None = None
+    ) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
-        This initializes a new runtime for asynchronous operations.
+        Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or a
+        `QuicConfig`. This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
 
         Args:
-            conn: Either a `host:port` address, or a `TcpConfig` carrying the full
-                transport configuration. Defaults to `127.0.0.1:8090` with auto-login
-                disabled. A malformed address is reported differently by the two
-                forms: the string form raises `RuntimeError` here, while `TcpConfig`
-                raises `ValueError` when it is constructed, before it ever reaches
-                this call. Neither exception is a subclass of the other.
+            conn: A `host:port` address, a `TcpConfig`, or a `QuicConfig`. Defaults
+                to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
+                address is reported differently depending on the form: the string
+                form raises `RuntimeError` here, while `TcpConfig`/`QuicConfig`
+                raise `ValueError` when they are constructed, before either ever
+                reaches this call. Neither exception is a subclass of the other.
 
         Raises:
             RuntimeError: If the address passed as a string is not a valid
-                `host:port` pair.
+                `host:port` pair, or if a `QuicConfig` client cannot be
+                constructed, e.g. `client_address` is not a valid `host:port`
+                pair or the local UDP socket cannot be bound (for example the
+                port is already in use).
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
         r"""
         Constructs a new IggyClient from a connection string.
         Returns an error if the connection string provided is invalid.
-        """
-    @classmethod
-    def quic(cls, config: QuicConfig | None = None) -> IggyClient:
-        r"""
-        Constructs a new IggyClient configured for the QUIC transport.
-
-        Args:
-            config: QUIC transport configuration. Defaults to `QuicConfig()`.
-
-        Raises:
-            RuntimeError: If the client cannot be constructed, e.g. `client_address`
-                is not a valid `host:port` pair or the local UDP socket cannot be
-                bound (for example the port is already in use).
         """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
@@ -1724,7 +1716,7 @@ class PollingStrategy:
 @typing.final
 class QuicConfig:
     r"""
-    Configuration for the QUIC transport, accepted by `IggyClient.quic(...)`.
+    Configuration for the QUIC transport, accepted by `IggyClient(...)`.
 
     Every field is keyword-only and optional.
     """
@@ -1800,14 +1792,18 @@ class QuicConfig:
             keep_alive_interval: Interval between QUIC keep-alive pings, or a zero
                 duration to disable them. Defaults to 5 seconds.
             max_idle_timeout: How long the connection tolerates silence before it is
-                considered dead, or a zero duration for no limit. Defaults to 10 seconds.
+                considered dead, or a zero duration to use quinn's own default (30
+                seconds) instead, since `configure()` skips the setter entirely when
+                zero. Defaults to 10 seconds.
             validate_certificate: Whether to validate the server certificate. Defaults
                 to disabled, unlike the TCP and WebSocket transports.
 
         Raises:
             ValueError: If `server_address` is not a valid `host:port` pair, if a
-                duration is negative, if `heartbeat_interval` is zero, or if a
-                numeric field is outside the range of its underlying wire type.
+                duration is negative, if `heartbeat_interval` is zero, if
+                `keep_alive_interval` or `max_idle_timeout` is non-zero but rounds
+                down to 0ms, if `initial_mtu` is below quinn's minimum of 1200, or if
+                a numeric field is outside the range of its underlying wire type.
         """
     def __repr__(self) -> builtins.str: ...
 

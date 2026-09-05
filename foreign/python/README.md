@@ -168,37 +168,8 @@ async def main():
 asyncio.run(main())
 ```
 
-`IggyClient.quic(...)` takes a `QuicConfig` the same way, built from `IggyClient.quic()`'s own
-config type rather than passed to `IggyClient(...)`:
-
-```python
-import asyncio
-from datetime import timedelta
-
-from apache_iggy import AutoLogin, IggyClient, QuicConfig, QuicReconnectionConfig
-
-
-async def main():
-    client = IggyClient.quic(
-        QuicConfig(
-            server_address="127.0.0.1:8080",
-            server_name="localhost",
-            auto_login=AutoLogin.username_password("iggy", "iggy"),
-            reconnection=QuicReconnectionConfig(
-                enabled=True,
-                max_retries=10,
-                interval=timedelta(seconds=2),
-                reestablish_after=timedelta(seconds=30),
-            ),
-            heartbeat_interval=timedelta(seconds=5),
-            # validate_certificate=True,
-        )
-    )
-    await client.connect()
-
-
-asyncio.run(main())
-```
+`IggyClient(...)` also accepts a `QuicConfig` for the QUIC transport; see
+`examples/python/getting-started/producer.py` for a config swap example.
 
 ## Examples
 

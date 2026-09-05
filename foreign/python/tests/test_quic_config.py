@@ -315,16 +315,16 @@ class TestQuicConfig:
 
 
 @pytest.mark.unit
-class TestClientConstruction:
-    """Test what `IggyClient.quic(...)` accepts."""
+class TestQuicClientConstruction:
+    """Test that `IggyClient(...)` accepts a `QuicConfig`."""
 
     def test_accepts_a_config(self):
         """Test that a client can be built from a config object."""
-        assert IggyClient.quic(QuicConfig(server_address="127.0.0.1:8080")) is not None
+        assert IggyClient(QuicConfig(server_address="127.0.0.1:8080")) is not None
 
-    def test_accepts_nothing(self):
-        """Test that the default configuration is used when no argument is given."""
-        assert IggyClient.quic() is not None
+    def test_accepts_the_default_config(self):
+        """Test that an explicit default `QuicConfig` is accepted."""
+        assert IggyClient(QuicConfig()) is not None
 
 
 @pytest.mark.integration
@@ -336,7 +336,7 @@ class TestAutoLoginAgainstServer:
         """Test that a privileged call succeeds without a manual login_user()."""
         host, port = get_quic_server_config()
 
-        client = IggyClient.quic(
+        client = IggyClient(
             QuicConfig(
                 server_address=f"{host}:{port}",
                 auto_login=AutoLogin.username_password("iggy", "iggy"),
@@ -360,7 +360,7 @@ class TestAutoLoginAgainstServer:
         """Test that the same call fails when no credentials are configured."""
         host, port = get_quic_server_config()
 
-        client = IggyClient.quic(
+        client = IggyClient(
             QuicConfig(
                 server_address=f"{host}:{port}",
                 # The default reconnection policy retries forever: a missing
@@ -380,7 +380,7 @@ class TestAutoLoginAgainstServer:
         """Test that bad configured credentials surface as a connect failure."""
         host, port = get_quic_server_config()
 
-        client = IggyClient.quic(
+        client = IggyClient(
             QuicConfig(
                 server_address=f"{host}:{port}",
                 auto_login=AutoLogin.username_password("iggy", "invalid-password"),

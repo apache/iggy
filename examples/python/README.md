@@ -95,19 +95,6 @@ python message-headers/typed-headers/producer.py
 python message-headers/typed-headers/consumer.py
 ```
 
-## Transport Protocol Examples
-
-### QUIC
-
-Uses the explicit `IggyClient.quic()` constructor. Assumes a server started with defaults,
-which enables all four transports (`cargo run --bin iggy-server`, or the `docker run` command
-above).
-
-```bash
-uv run quic/producer.py
-uv run quic/consumer.py
-```
-
 ## TLS Examples
 
 To test with a TLS-enabled server, start the server with TLS configured (see main README), then run:

@@ -525,7 +525,7 @@ impl QuicReconnectionConfig {
     }
 }
 
-/// Configuration for the QUIC transport, accepted by `IggyClient.quic(...)`.
+/// Configuration for the QUIC transport, accepted by `IggyClient(...)`.
 ///
 /// Every field is keyword-only and optional.
 #[gen_stub_pyclass]
@@ -852,12 +852,15 @@ fn varint_param(value: i64, parameter: &str) -> PyResult<u64> {
     Ok(value)
 }
 
-/// What `IggyClient(...)` accepts: a bare `host:port` or a full `TcpConfig`.
+/// What `IggyClient(...)` accepts: a bare `host:port`, a full `TcpConfig`, or a
+/// `QuicConfig` for the QUIC transport.
 #[derive(FromPyObject)]
 pub enum PyClientConfig {
     #[pyo3(transparent)]
-    Config(TcpConfig),
+    Tcp(TcpConfig),
+    #[pyo3(transparent)]
+    Quic(QuicConfig),
     #[pyo3(transparent, annotation = "str")]
     ServerAddress(String),
 }
-impl_stub_type!(PyClientConfig = TcpConfig | String);
+impl_stub_type!(PyClientConfig = TcpConfig | QuicConfig | String);
