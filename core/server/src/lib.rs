@@ -43,7 +43,9 @@ pub(crate) mod shard_allocator;
 // spine: the request path - shell vocabulary, dispatch funnel, per-domain ops.
 pub(crate) mod consumer_group;
 pub(crate) mod dispatch;
+pub(crate) mod namespace;
 pub(crate) mod pat;
+pub(crate) mod reply_frame;
 pub(crate) mod responses;
 pub(crate) mod rewrite;
 pub mod session_manager;
@@ -68,3 +70,4 @@ pub(crate) mod offset_recovery;
 pub(crate) mod partition_helpers;
 pub(crate) mod segment_recovery;
 pub mod server_error;
+pub(crate) mod sysinfo_probe;

@@ -25,7 +25,7 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
-use crate::responses::resolve_partition_namespace;
+use crate::namespace::resolve_partition_namespace;
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
 use consensus::MetadataHandle;

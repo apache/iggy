@@ -39,9 +39,7 @@ use std::rc::Rc;
 use crate::http::error::{Consistency, ReadError};
 use crate::http::extractor::Identity;
 use crate::http::state::HttpInner;
-use crate::responses::{
-    NonReplicatedResponse, build_non_replicated_response, resolve_stream_id, resolve_topic_id,
-};
+use crate::responses::{NonReplicatedResponse, build_non_replicated_response};
 
 /// The per-op RBAC + consistency check itself, without the waits: run the
 /// route's `rule` against the caller's committed permissions via the live
@@ -316,7 +314,7 @@ pub(in crate::http) fn resolve_gate_stream(
         .metadata()
         .mux_stm
         .streams()
-        .read(|inner| resolve_stream_id(inner, stream_id))
+        .read(|inner| inner.resolve_stream_id(stream_id))
 }
 
 /// Resolve a wire user identifier to its committed slab id, or `None` on a
@@ -348,8 +346,8 @@ pub(in crate::http) fn resolve_gate_topic(
         .mux_stm
         .streams()
         .read(|inner| {
-            let stream_id = resolve_stream_id(inner, stream_id)?;
-            let topic_id = resolve_topic_id(inner, stream_id, topic_id)?;
+            let stream_id = inner.resolve_stream_id(stream_id)?;
+            let topic_id = inner.resolve_topic_id(stream_id, topic_id)?;
             Some((stream_id, topic_id))
         })
 }

@@ -19,6 +19,7 @@ use crate::{
     Consensus, IgnoreReason, Pipeline, PipelineEntry, PlaneKind, PrepareOkOutcome, Sequencer,
     Status, VsrConsensus,
 };
+use iggy_binary_protocol::consensus::{REJECTION_SECTION_LEN, write_rejection_section};
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command, ConsensusHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
     ReplyHeader, RoutedRequestHeader, frame_body,
@@ -536,30 +537,7 @@ where
     let total_size = header_size + body_len;
     let mut buffer = Owned::<4096>::zeroed(total_size);
 
-    let header = ReplyHeader {
-        checksum: 0,
-        checksum_body: 0,
-        cluster: prepare_header.cluster,
-        size: total_size as u32,
-        // Commit-time view
-        view: prepare_header.view,
-        release: prepare_header.release,
-        command: Command::Reply,
-        // Original primary's id
-        replica: prepare_header.replica,
-        reserved_frame: [0; 66],
-        request_checksum: prepare_header.request_checksum,
-        context: 0,
-        client: prepare_header.client,
-        op: prepare_header.op,
-        // Prepare's op (not commit_max): drives ClientTable eviction order;
-        // must be deterministic across replicas.
-        commit: prepare_header.op,
-        timestamp: prepare_header.timestamp,
-        request: prepare_header.request,
-        operation: prepare_header.operation,
-        ..Default::default()
-    };
+    let header = ReplyHeader::from_prepare(prepare_header, total_size as u32);
     let bytes = buffer.as_mut_slice();
     bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 
@@ -593,39 +571,22 @@ pub fn build_result_rejection_reply(
     commit: u64,
     code: u32,
 ) -> Message<ReplyHeader> {
-    // `[count: u32][index: u32][result: u32]`, the single-entry rejection shape
-    // of `ApplyReply::write_reply_body` (mirrored here to avoid a metadata dep).
-    const RESULT_BODY_LEN: usize = 12;
     let header_size = std::mem::size_of::<ReplyHeader>();
-    let total_size = header_size + RESULT_BODY_LEN;
+    let total_size = header_size + REJECTION_SECTION_LEN;
     let mut buffer = Owned::<4096>::zeroed(total_size);
 
     let header = ReplyHeader {
-        cluster: request_header.cluster,
-        size: total_size as u32,
-        view: request_header.view,
-        release: request_header.release,
-        command: Command::Reply,
-        replica: request_header.replica,
-        request_checksum: request_header.request_checksum,
         client: request_header.client,
         // Position-typed like the sibling builders (`build_reply_from_request`
         // stamps `op: commit` too); inert on this path -- rejections are never
         // cached -- but keeps the wire field convention for frame inspection.
         op: commit,
         commit,
-        timestamp: request_header.timestamp,
-        request: request_header.request,
-        operation: request_header.operation,
-        ..Default::default()
+        ..ReplyHeader::echoing(request_header, total_size as u32)
     };
     let bytes = buffer.as_mut_slice();
     bytes[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
-
-    let body = &mut bytes[header_size..];
-    body[0..4].copy_from_slice(&1u32.to_le_bytes());
-    body[4..8].copy_from_slice(&0u32.to_le_bytes());
-    body[8..12].copy_from_slice(&code.to_le_bytes());
+    write_rejection_section(&mut bytes[header_size..], code);
 
     Message::try_from(buffer).expect("transient reply buffer must contain a valid reply message")
 }
@@ -734,19 +695,9 @@ pub fn build_deny_reply_from_request_header(
     let mut buffer = Owned::<4096>::zeroed(header_size);
 
     let header = ReplyHeader {
-        cluster: request_header.cluster,
-        size: header_size as u32,
-        view: request_header.view,
-        release: request_header.release,
-        command: Command::Reply,
-        replica: request_header.replica,
-        request_checksum: request_header.request_checksum,
         client: request_header.client,
         status,
-        timestamp: request_header.timestamp,
-        request: request_header.request,
-        operation: request_header.operation,
-        ..Default::default()
+        ..ReplyHeader::echoing(request_header, header_size as u32)
     };
     buffer.as_mut_slice()[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 

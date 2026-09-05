@@ -29,7 +29,7 @@ use crate::dispatch::session_ops::{
     submit_register_local_or_forward,
 };
 use crate::dispatch::upgrade_shard_handle;
-use crate::responses::committed_reply_header;
+use crate::reply_frame::committed_reply_header;
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
 use consensus::MetadataHandle;
 use iggy_binary_protocol::{GenericHeader, PrepareHeader, RoutedRequestHeader};
@@ -229,7 +229,7 @@ pub fn committed_reply_commit(reply: &Message<GenericHeader>) -> Option<u64> {
 mod tests {
     use super::committed_reply_commit;
     use crate::dispatch::test_support::request_message;
-    use crate::responses::{build_deny_reply, build_reply_from_bytes};
+    use crate::reply_frame::{build_deny_reply, build_reply_from_bytes};
     use bytes::Bytes;
     use iggy_binary_protocol::Operation;
     use iggy_common::IggyError;

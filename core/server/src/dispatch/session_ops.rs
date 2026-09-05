@@ -36,7 +36,7 @@ use crate::dispatch::failure::{
     FrameChannel, send_eviction, send_host_frame, send_result_rejection,
 };
 use crate::dispatch::login_error::LoginRegisterError;
-use crate::responses::{
+use crate::reply_frame::{
     build_deny_reply, build_empty_reply, build_login_register_reply, current_metadata_commit,
 };
 use crate::session_manager::{ClientSdkInfo, SessionManager};

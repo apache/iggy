@@ -52,7 +52,7 @@ use crate::dispatch::session_ops::{
     handle_login_register_request, handle_logout_request, submit_disconnect_logout,
 };
 use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
-use crate::responses::build_raw_pat_reply;
+use crate::reply_frame::build_raw_pat_reply;
 use crate::rewrite::{RewriteDeny, RewriteStage, tcp_chain};
 use crate::session_manager::{ConnectionContext, SessionManager};
 use crate::shell::{ShellBus, ShellShard, ShellShardHandle};
