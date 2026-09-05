@@ -4659,6 +4659,12 @@ where
             let (frozen_batches, index_bytes, flush_index, batch_count, committed_info, chunk_len) = {
                 let segment = self.log.active_segment();
                 let mut file_position = segment.size.as_bytes_u64();
+                let persisted_end = if file_position == 0 {
+                    segment.start_offset.checked_sub(1)
+                } else {
+                    Some(segment.end_offset)
+                }
+                .max(self.recovered_durable_offset);
                 let mut flush_index = None;
                 let mut frozen = Vec::with_capacity(entries.len());
                 let mut batch_count = 0u32;
@@ -4707,13 +4713,13 @@ where
                     if message_count == 0 {
                         continue;
                     }
-                    // A repaired batch at or below the boot-time recovered
-                    // durable offset is already IN the segments this replica
-                    // recovered; persisting it again would append duplicate
-                    // bytes past the segment end. Evict it without writing.
-                    // Live traffic always sits above the (immutable) line.
+                    // Flush can run ahead of the bounded commit walk. Repair
+                    // may re-journal an evicted batch above commit_min even
+                    // after this process persisted it. Include the current
+                    // segment frontier, not just the boot recovery frontier,
+                    // so that replay cannot append a second copy.
                     let batch_end = batch.header.base_offset + u64::from(message_count) - 1;
-                    if let Some(durable) = self.recovered_durable_offset
+                    if let Some(durable) = persisted_end
                         && batch_end <= durable
                     {
                         continue;
@@ -11421,6 +11427,72 @@ mod tests {
             IggyIndex::new(7, 8, FIRST_PAYLOAD.len() as u64),
             "the second entry must address the first chunk's end"
         );
+    }
+
+    #[compio::test]
+    async fn given_flushed_repair_ahead_of_commit_min_when_replayed_should_persist_only_new_batches()
+     {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log_path = dir.path().join("segment.log");
+        let index_path = dir.path().join("segment.index");
+        let mut fixture = PersistFixture::new(
+            log_path.to_str().expect("utf-8 path"),
+            index_path.to_str().expect("utf-8 path"),
+        )
+        .await;
+        let partition = &mut fixture.partition;
+        partition.log.journal().inner.set_repair_retention(true);
+        partition.repair = Some(armed_session(4, 0, None));
+        let prepares: Vec<_> = (1..=4)
+            .map(|op| repaired_send_prepare(op, 0, u128::from(op)).into_frozen())
+            .collect();
+        let replay = |op: usize| {
+            let bytes = prepares[op - 1].as_slice();
+            let mut message = Message::<PrepareHeader>::new(bytes.len());
+            message.as_mut_slice().copy_from_slice(bytes);
+            message
+        };
+        for op in 1..=3 {
+            partition.apply_repaired_prepare(replay(op)).await;
+        }
+        partition.consensus().advance_commit_max(3);
+        partition
+            .flush_committed_messages(&repair_config())
+            .await
+            .expect("flush before the commit walk catches up");
+        assert_eq!(partition.consensus().commit_min(), 0);
+        assert_eq!(partition.recovered_durable_offset, None);
+        let original = std::fs::read(&log_path).expect("read initial segment");
+        let original_index = std::fs::read(&index_path).expect("read initial index");
+
+        for op in 2..=3 {
+            partition.apply_repaired_prepare(replay(op)).await;
+        }
+        partition
+            .flush_committed_messages(&repair_config())
+            .await
+            .expect("flush replayed batches");
+        assert_eq!(std::fs::read(&log_path).unwrap(), original);
+        assert_eq!(std::fs::read(&index_path).unwrap(), original_index);
+
+        let next = replay(4);
+        let mut expected = original;
+        expected.extend_from_slice(&next.as_slice()[size_of::<PrepareHeader>()..]);
+        partition.apply_repaired_prepare(next).await;
+        partition.consensus().advance_commit_max(4);
+        partition
+            .flush_committed_messages(&repair_config())
+            .await
+            .expect("flush the new batch");
+        assert_eq!(std::fs::read(&log_path).unwrap(), expected);
+        // The commit walk needs resident headers after the earlier flush.
+        for op in 1..=4 {
+            partition.apply_repaired_prepare(replay(op)).await;
+        }
+        partition.commit_journal(&repair_config()).await;
+        assert_eq!(partition.consensus().commit_min(), 4);
+        assert!(partition.fatal.is_none());
+        assert_eq!(std::fs::read(&log_path).unwrap(), expected);
     }
 
     #[cfg(target_os = "linux")]

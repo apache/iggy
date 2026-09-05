@@ -1324,7 +1324,13 @@ impl TcpClient {
                         // never reach the rest of the roster.
                         (next, true)
                     } else {
-                        return Err(IggyError::TransientNotAccepted);
+                        // A one-node roster has nowhere else to walk while a
+                        // freshly committed partition is still materialising.
+                        // The server explicitly did not admit this request, so
+                        // keep retrying the current endpoint within the existing
+                        // overall deadline rather than surfacing a transient
+                        // solely because the roster contains no alternative.
+                        (current, false)
                     };
 
                     loop {

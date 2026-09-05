@@ -457,7 +457,15 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
                 operation = ?header.operation,
                 "partition request with unresolved namespace; replying denied"
             );
-            send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
+            let status = if matches!(
+                header.operation,
+                Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+            ) {
+                error.as_code()
+            } else {
+                IggyError::ResourceNotFound(String::new()).as_code()
+            };
+            send_deny_reply(shard, transport_client_id, &header, status).await;
             return;
         }
     };

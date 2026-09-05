@@ -218,7 +218,10 @@ impl BinaryTransport for QuicClient {
                 } else if let Some(next) = roster_walk.as_mut().and_then(RosterWalk::next) {
                     (next, true)
                 } else {
-                    break;
+                    // A single-node roster can still be converging a newly
+                    // committed partition. Retry this explicitly unadmitted
+                    // request on the current endpoint within the same budget.
+                    (current, false)
                 };
 
                 loop {
