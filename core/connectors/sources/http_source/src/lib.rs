@@ -112,11 +112,43 @@ pub struct HttpSource {
     /// landing inside `stage()` could drop the batch there with nothing
     /// counting it.
     staged: StdMutex<Option<StagedBatch>>,
+    /// Whether the last `poll()` returned a state-only batch, which decides
+    /// which arm of the next poll's `select!` gets first refusal.
+    ///
+    /// Not on [`SharedState`]: it is bookkeeping for the single poll task, and
+    /// nothing a request handler can reach has any business reading it.
+    last_poll_was_state_only: AtomicBool,
     /// Why the persisted registry could not be restored, if it could not be.
     ///
     /// Held rather than acted on in `new` so `open` can fail with it, which is
     /// what puts it on the control API as `last_error`.
     restore_error: Option<String>,
+}
+
+/// Takes the message the `select!` arm received and tops the batch up with
+/// whatever else is already queued, without waiting for more.
+///
+/// The SDK races `poll()` against its own shutdown watch, so blocking on
+/// `recv()` until traffic arrives is what keeps an idle gateway off the CPU;
+/// crossfire documents it as cancellation-safe. `recv` errs only once every
+/// sender is dropped and one lives in `SharedState`, which outlives the poll,
+/// so an error leaves the batch empty rather than needing an arm of its own.
+fn drain_bridge(
+    receiver: &MessageReceiver,
+    received: Result<QueuedMessage, crossfire::RecvError>,
+    max_batch_size: usize,
+    queued: &mut Vec<QueuedMessage>,
+) {
+    let Ok(message) = received else {
+        return;
+    };
+    queued.push(message);
+    while queued.len() < max_batch_size {
+        let Ok(message) = receiver.try_recv() else {
+            break;
+        };
+        queued.push(message);
+    }
 }
 
 /// Clears the in-flight marker however `poll()` ends, including cancellation.
@@ -655,6 +687,7 @@ impl HttpSource {
             shared: Arc::new(shared),
             receiver: Mutex::new(receiver),
             staged: StdMutex::new(None),
+            last_poll_was_state_only: AtomicBool::new(false),
             restore_error,
         }
     }
@@ -774,30 +807,41 @@ impl Source for HttpSource {
         // nothing.
         let mut queued: Vec<QueuedMessage> = Vec::new();
         let receiver = self.receiver.lock().await;
-        tokio::select! {
-            // The SDK races poll() against its own shutdown watch, so blocking
-            // here until traffic arrives is what keeps an idle gateway off the
-            // CPU. crossfire documents recv() as cancellation-safe.
-            // `recv` errs only once every sender is dropped, and one lives in
-            // `self.shared`, which outlives this call, so the error leaves the
-            // batch empty rather than needing an arm of its own.
-            received = receiver.recv() => if let Ok(message) = received {
-                queued.push(message);
-                while queued.len() < max_batch_size {
-                    let Ok(message) = receiver.try_recv() else {
-                        break;
-                    };
-                    queued.push(message);
-                }
-            },
-            _ = self.shared.state_flush.notified() => {}
+        // Ordered, not raced. Left unbiased, an armed flush and waiting traffic
+        // were a coin flip, so a mutation took two polls to leave on average and
+        // on a quiet gateway a poll is however long the next request takes.
+        //
+        // The order flips after a state-only batch, which is the guard that
+        // makes biasing safe: pinned with the flush first, a caller looping on
+        // the management API re-arms the notify faster than the bridge drains
+        // and `recv()` never runs. Both arms stay live in either order, so a
+        // flush on an idle bridge still has its wakeup; only first refusal
+        // moves. Reading it clears it, so the flip lasts exactly one poll.
+        let traffic_first = self.last_poll_was_state_only.swap(false, Ordering::AcqRel);
+        if traffic_first {
+            tokio::select! {
+                biased;
+                received = receiver.recv() => drain_bridge(&receiver, received, max_batch_size, &mut queued),
+                _ = self.shared.state_flush.notified() => {}
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = self.shared.state_flush.notified() => {}
+                received = receiver.recv() => drain_bridge(&receiver, received, max_batch_size, &mut queued),
+            }
         }
 
         // State rides an empty batch and nothing else, so no failed publish
         // can skip its save. Under traffic that means deferring to a later
         // poll; re-arming the notify stops it waiting on traffic to arrive.
         let state = if queued.is_empty() {
-            self.shared.take_dirty_state()
+            let state = self.shared.take_dirty_state();
+            // Only a batch that carried state counts: an empty poll that found
+            // nothing to flush has not taken a turn away from traffic.
+            self.last_poll_was_state_only
+                .store(state.is_some(), Ordering::Release);
+            state
         } else {
             if self.shared.has_pending_state() {
                 self.shared.state_flush.notify_one();
@@ -1530,10 +1574,10 @@ mod tests {
             .try_send(queued("one"))
             .expect("bridge must accept");
 
-        // Consume the permit the mutation armed, so `select!` has exactly one
-        // ready branch and the batch-carrying poll is deterministic. Asserting
-        // across both polls instead would only catch the regression when the
-        // random branch order happened to cooperate.
+        // Consume the permit the mutation armed. The arms are ordered now, so
+        // leaving it would deterministically produce a state-only batch and
+        // this test would never reach the case it exists for: what a batch
+        // that does carry messages is allowed to carry alongside them.
         source.shared.state_flush.notified().await;
 
         let carried = source.poll().await.expect("poll must succeed");
@@ -1557,6 +1601,67 @@ mod tests {
         assert!(
             flushed.state.is_some(),
             "the re-arm must carry it without waiting for further traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_pending_flush_and_traffic_when_polled_should_take_the_flush_first() {
+        // Both arms ready. Unbiased, which one ran was a coin flip, so a
+        // revocation left on the second poll on average and this assertion
+        // could only ever hold half the time.
+        let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
+        source
+            .shared
+            .sender
+            .try_send(queued("one"))
+            .expect("bridge must accept");
+
+        let produced = source.poll().await.expect("poll must succeed");
+        assert!(
+            produced.messages.is_empty(),
+            "the armed flush must win first refusal over waiting traffic"
+        );
+        assert!(
+            produced.state.is_some(),
+            "so the mutation rides the very next poll rather than waiting one out"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_second_mutation_when_polled_should_not_starve_the_bridge() {
+        // What makes biasing safe. A caller looping on the management API arms
+        // the flush faster than the bridge drains, so with the flush arm pinned
+        // first the queued request below would never be read.
+        let source = HttpSource::new(
+            1,
+            test_support::config(None, &[ENDPOINT_ONE, ENDPOINT_TWO]),
+            None,
+        );
+        source
+            .shared
+            .sender
+            .try_send(queued("one"))
+            .expect("bridge must accept");
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
+
+        let first = source.poll().await.expect("poll must succeed");
+        assert!(first.state.is_some(), "the first poll takes the flush");
+        assert!(first.messages.is_empty());
+
+        source
+            .shared
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_TWO, "rotated".to_string(), 43));
+
+        let second = source.poll().await.expect("poll must succeed");
+        assert_eq!(
+            second.messages.first().map(|message| &message.payload),
+            Some(&b"one".to_vec()),
+            "a state-only batch must hand first refusal back to traffic for one poll"
         );
     }
 
@@ -1732,8 +1837,10 @@ mod tests {
             "a NACKed state flush is a revocation the runtime never persisted, and `take_dirty_state` already marked it submitted, so without the re-arm it is lost for good"
         );
 
-        // Consume the permit the re-arm posted, so `select!` has exactly one
-        // ready branch and the traffic poll below is deterministic.
+        // Consume the permit the re-arm posted, so the poll below is reached
+        // through the bridge rather than through the flush. The state-only
+        // batch above would hand traffic first refusal anyway; taking the
+        // permit keeps this test independent of that.
         source.shared.state_flush.notified().await;
         source
             .shared
