@@ -21,7 +21,10 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use std::cell::{Cell, UnsafeCell};
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle;
 use std::path::{Path, PathBuf};
 
 /// File-backed storage implementing the `Storage` trait.
@@ -79,7 +82,10 @@ impl FileStorage {
     pub(crate) fn truncate(&self, len: u64) -> io::Result<()> {
         // SAFETY: single-threaded compio runtime, no concurrent access to the file.
         let file = unsafe { &*self.file.get() };
+        #[cfg(unix)]
         let file = fs::File::from(file.as_fd().try_clone_to_owned()?);
+        #[cfg(windows)]
+        let file = fs::File::from(file.as_handle().try_clone_to_owned()?);
         file.set_len(len)?;
         self.write_offset.set(len);
         file.sync_all()
@@ -200,6 +206,9 @@ mod tests {
     /// Pins the synchronous truncate signature and verifies it works inside a
     /// shard executor with no blocking pool. A modern test kernel supports
     /// `IORING_OP_FTRUNCATE`, so this does not reproduce compio's fallback.
+    /// Unix-only: `create_shard_executor` keeps the zero blocking-pool limit
+    /// on io_uring targets only, so the premise does not hold elsewhere.
+    #[cfg(unix)]
     #[test]
     fn given_a_shard_executor_with_no_blocking_pool_when_truncating_should_repair_the_file() {
         let runtime = create_shard_executor().unwrap();

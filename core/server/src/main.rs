@@ -28,6 +28,7 @@ use server_common::log::Logging;
 use system_stats::capture_allowed_cpus;
 use tracing::{error, info};
 
+#[cfg_attr(windows, allow(clippy::result_large_err))]
 fn main() -> Result<(), ServerError> {
     // This prelude must stay ahead of the first thread the process ever
     // spawns: `--with-default-root-credentials` writes to the environment,

@@ -39,8 +39,7 @@ use server_common::MESSAGE_ALIGN;
 use server_common::iobuf::{Frozen, IOV_MAX};
 use std::io;
 use std::mem;
-use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
+use std::net::{Shutdown, SocketAddr};
 use tracing::{debug, error, trace};
 
 /// Inbound TCP listener wrapper.
@@ -148,18 +147,15 @@ impl TransportConn for TcpTransportConn {
     }
 }
 
-/// Spawn a detached watchdog that calls `libc::shutdown(fd, SHUT_RD)`
-/// when the shutdown token fires. The reader's pending `io_uring`
-/// read SQE then completes with `Ok(0)`, the reader observes EOF, and the
-/// reader loop exits without ever sitting inside a `select!` over a
-/// TCP read.
+/// Spawn a detached watchdog that wakes the reader's parked read when the
+/// shutdown token fires, so the reader loop exits without ever sitting
+/// inside a `select!` over a TCP read.
 ///
 /// On a natural-EOF run (peer closed first) the watchdog stays parked
-/// until the bus-wide shutdown token ultimately fires; the resulting
-/// `libc::shutdown` on a fd whose socket is already closed is benign
-/// (returns ENOTCONN). All TCP-family transports converge on this
-/// shutdown model: the reader never sits inside a `select!` against the
-/// shutdown token; the watchdog wakes the parked `io_uring` read instead.
+/// until the bus-wide shutdown token ultimately fires. All TCP-family
+/// transports converge on this shutdown model: the reader never sits inside
+/// a `select!` against the shutdown token; the watchdog wakes the parked
+/// read instead.
 #[allow(clippy::future_not_send)]
 fn spawn_shutdown_watchdog(
     poll_fd: PollFd<socket2::Socket>,
@@ -169,22 +165,55 @@ fn spawn_shutdown_watchdog(
 ) {
     compio::runtime::spawn(async move {
         shutdown.wait().await;
-        // SAFETY: `poll_fd` is a refcounted handle obtained from the
-        // still-live `TcpStream` before `into_split`; the matching
-        // clones in both owned halves keep the kernel fd open. The
-        // watchdog's handle independently keeps it open across this
-        // syscall.
-        let raw_fd = poll_fd.as_raw_fd();
-        let rc = unsafe { libc::shutdown(raw_fd, libc::SHUT_RD) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            // ENOTCONN is expected when the peer closed first.
-            if err.raw_os_error() != Some(libc::ENOTCONN) {
-                debug!(%label, %peer, error = ?err, "tcp watchdog: SHUT_RD returned");
-            }
-        }
+        wake_parked_reader(&poll_fd, label, &peer);
     })
     .detach();
+}
+
+/// Unix: `shutdown(SHUT_RD)` completes the reader's parked `io_uring` read
+/// SQE with `Ok(0)`, which the reader surfaces as EOF.
+#[cfg(unix)]
+fn wake_parked_reader(poll_fd: &PollFd<socket2::Socket>, label: &'static str, peer: &str) {
+    if let Err(err) = poll_fd.shutdown(Shutdown::Read) {
+        debug!(%label, %peer, error = ?err, "tcp watchdog: read shutdown returned");
+    }
+}
+
+/// Windows: `shutdown()` does NOT complete a pending overlapped `WSARecv`,
+/// so the Unix wake does not port directly. Both calls are needed, and in
+/// this order:
+///
+/// * `shutdown(SD_RECEIVE)` is sticky, so a read the reader issues AFTER
+///   the watchdog fires returns 0 (EOF) instead of parking forever.
+/// * `CancelIoEx` with a null `OVERLAPPED` cancels operations already
+///   pending on the handle regardless of issuing thread; that read then
+///   completes with `ERROR_OPERATION_ABORTED`, which the reader treats as
+///   a read error and exits on, same as EOF.
+///
+/// Doing only the first hangs on an already-parked read; only the second
+/// races a reader that has not issued its read yet.
+///
+/// `ERROR_NOT_FOUND` is the benign case where nothing was pending.
+#[cfg(windows)]
+fn wake_parked_reader(poll_fd: &PollFd<socket2::Socket>, label: &'static str, peer: &str) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, HANDLE};
+    use windows_sys::Win32::System::IO::CancelIoEx;
+
+    if let Err(err) = poll_fd.shutdown(Shutdown::Read) {
+        debug!(%label, %peer, error = ?err, "tcp watchdog: read shutdown returned");
+    }
+
+    // SAFETY: `poll_fd` keeps the socket alive for this call, and a null
+    // `OVERLAPPED` is the documented "cancel all pending IO on this handle"
+    // argument.
+    let cancelled = unsafe { CancelIoEx(poll_fd.as_raw_socket() as HANDLE, std::ptr::null()) };
+    if cancelled == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(ERROR_NOT_FOUND.cast_signed()) {
+            debug!(%label, %peer, error = ?err, "tcp watchdog: CancelIoEx returned");
+        }
+    }
 }
 
 /// Read framed consensus messages off the wire and forward each to
@@ -192,7 +221,7 @@ fn spawn_shutdown_watchdog(
 /// closure.
 ///
 /// No `select!` over the TCP read. Cooperative shutdown is delivered
-/// via [`spawn_shutdown_watchdog`], which calls `libc::shutdown(SHUT_RD)`
+/// via [`spawn_shutdown_watchdog`], which shuts down the socket's read half
 /// when the bus token fires; the in-flight read returns `Ok(0)` and
 /// `framing::read_message` surfaces it as an EOF error on the next
 /// iteration.

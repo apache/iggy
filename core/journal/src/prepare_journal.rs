@@ -19,6 +19,7 @@ use crate::file_storage::FileStorage;
 use crate::{Journal, JournalHandle};
 use compio::io::AsyncWriteAtExt;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Command, PrepareHeader};
+use server_common::fs_utils::fsync_parent_dir_async;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Owned};
 use std::cell::{Cell, OnceCell, Ref, RefCell};
 use std::fmt;
@@ -838,16 +839,8 @@ impl Journal for PrepareJournal {
         compio::fs::rename(&tmp_path, wal_path).await?;
         tmp_guard.defuse();
 
-        if let Some(parent) = wal_path.parent() {
-            let dir = match compio::fs::File::open(parent).await {
-                Ok(dir) => dir,
-                Err(error) => {
-                    return Err(self.poison("truncate_from: open parent dir for fsync", error));
-                }
-            };
-            if let Err(error) = dir.sync_all().await {
-                return Err(self.poison("truncate_from: parent dir fsync", error));
-            }
+        if let Err(error) = fsync_parent_dir_async(wal_path).await {
+            return Err(self.poison("truncate_from: parent dir fsync", error));
         }
         if let Err(error) = self.storage.reopen().await {
             return Err(self.poison("truncate_from: storage reopen after rename", error));
@@ -1012,16 +1005,8 @@ impl Journal for PrepareJournal {
         // pre-drain WAL re-presents on recovery; with the journal
         // poisoned the caller learns the drain is not durable instead
         // of silently proceeding.
-        if let Some(parent) = wal_path.parent() {
-            let dir = match compio::fs::File::open(parent).await {
-                Ok(d) => d,
-                Err(e) => {
-                    return Err(self.poison("drain: open parent dir for fsync", e));
-                }
-            };
-            if let Err(e) = dir.sync_all().await {
-                return Err(self.poison("drain: parent dir fsync", e));
-            }
+        if let Err(error) = fsync_parent_dir_async(wal_path).await {
+            return Err(self.poison("drain: parent dir fsync", error));
         }
 
         // Reopen the file descriptor at the same path. A failure here

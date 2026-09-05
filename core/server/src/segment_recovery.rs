@@ -38,7 +38,6 @@ use server_common::sharding::IggyNamespace;
 use server_common::{SegmentStorage, yield_to_reactor};
 use std::fs;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
 
@@ -57,6 +56,57 @@ const SPARSE_INDEX_ENTRY_SIZE: usize = std::mem::size_of::<u64>() * 3;
 /// partition load, refilled forward on demand; batches larger than this fall
 /// back to a single direct read.
 const SCAN_WINDOW_CAPACITY: usize = 4 * 1024 * 1024;
+
+trait PositionedFileExt {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
+    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
+}
+
+impl PositionedFileExt for fs::File {
+    fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            let read = read_at(self, buf, offset)?;
+            if read == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            offset += read as u64;
+            buf = &mut buf[read..];
+        }
+        Ok(())
+    }
+
+    fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            let written = write_at(self, buf, offset)?;
+            if written == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            offset += written as u64;
+            buf = &buf[written..];
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn read_at(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+#[cfg(unix)]
+fn write_at(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    std::os::unix::fs::FileExt::write_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn write_at(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+}
 
 /// Byte stride between rebuilt sparse index entries, mirroring the
 /// state-transfer receiver's rebuild policy: lower-bound consumers are
@@ -902,18 +952,18 @@ fn install_rebuilt_index(
 }
 
 /// Makes renames and new files in `dir` durable. Synchronous like every
-/// other mutation in this module (see [`FileScanner`]).
+/// other mutation in this module (see [`FileScanner`]). No-op on Windows,
+/// which cannot fsync a directory handle (see
+/// [`server_common::fs_utils::fsync_dir`]).
 fn fsync_dir(dir: &str) -> Result<(), ServerError> {
-    fs::File::open(dir)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|source| {
-            error!(
-                dir,
-                error = %source,
-                "failed to fsync a directory during recovery"
-            );
-            ServerError::from(IggyError::CannotSyncFile)
-        })
+    server_common::fs_utils::fsync_dir(dir).map_err(|source| {
+        error!(
+            dir,
+            error = %source,
+            "failed to fsync a directory during recovery"
+        );
+        ServerError::from(IggyError::CannotSyncFile)
+    })
 }
 
 /// Moves a segment pair that recovery proved unreadable into a fresh
@@ -2487,6 +2537,7 @@ mod tests {
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned, calculate_batch_checksum,
     };
     use server_common::sharding::IggyNamespace;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
@@ -2823,6 +2874,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[compio::test]
     async fn given_unopenable_index_when_recovering_should_fail_stop_without_truncating() {
         let tmp = tempdir().expect("tempdir");
@@ -2864,6 +2916,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[compio::test]
     async fn given_unopenable_log_when_recovering_index_less_should_fail_stop_without_truncating() {
         let tmp = tempdir().expect("tempdir");

@@ -510,8 +510,14 @@ runs:
         exit 1
       shell: bash
 
-    # Windows builds (SDK and CLI only - iggy-server does not support Windows)
+    # Windows SDK and CLI build
     - name: Build Windows SDK and CLI
       if: inputs.task == 'build-windows-sdk'
       run: cargo build --locked -p iggy -p iggy-cli
+      shell: bash
+
+    # The reusable test workflow installs hwloc and pkgconf before this step.
+    - name: Build Windows server
+      if: inputs.task == 'build-windows-server'
+      run: cargo build --locked -p server --bin iggy-server
       shell: bash

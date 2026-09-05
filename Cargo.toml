@@ -362,6 +362,7 @@ web-sys = { version = "0.3", features = [
 ] }
 webpki-roots = "1.0.9"
 windows-native-keyring-store = "1.1.0"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_IO"] }
 wiremock = "0.6"
 yew = { version = "0.23", features = ["csr"] }
 yew-router = "0.20"
