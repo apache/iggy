@@ -17,15 +17,16 @@
 
 use iggy_common::ConsumerKind;
 use std::cell::{Cell, Ref, RefCell};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableOffsetState {
     pub(crate) committed_offset: u64,
-    pub(crate) persisted_high_water: Option<u64>,
+    pub(crate) persisted_high_water: u64,
 }
 
 #[derive(Debug, Default)]
@@ -50,10 +51,7 @@ impl DurableConsumerOffsets {
 
     pub(crate) fn covers(&self, kind: ConsumerKind, id: u32, offset: u64) -> bool {
         self.get(kind, id).is_some_and(|state| {
-            state.committed_offset >= offset
-                && state
-                    .persisted_high_water
-                    .is_some_and(|persisted| persisted >= offset)
+            state.committed_offset >= offset && state.persisted_high_water >= offset
         })
     }
 
@@ -62,15 +60,23 @@ impl DurableConsumerOffsets {
         kind: ConsumerKind,
         id: u32,
         committed_offset: u64,
-        persisted_high_water: Option<u64>,
-    ) {
-        self.entries(kind).borrow_mut().insert(
-            id,
-            DurableOffsetState {
-                committed_offset,
-                persisted_high_water,
-            },
-        );
+        persisted_high_water: u64,
+    ) -> bool {
+        let created = self
+            .entries(kind)
+            .borrow_mut()
+            .insert(
+                id,
+                DurableOffsetState {
+                    committed_offset,
+                    persisted_high_water,
+                },
+            )
+            .is_none();
+        if created {
+            self.bump_membership_epoch();
+        }
+        created
     }
 
     pub(crate) fn record_auto_commit(
@@ -81,30 +87,27 @@ impl DurableConsumerOffsets {
         persisted_high_water: u64,
     ) {
         let mut entries = self.entries(kind).borrow_mut();
-        let state = entries.entry(id).or_insert(DurableOffsetState {
-            committed_offset,
-            persisted_high_water: None,
-        });
-        state.committed_offset = state.committed_offset.max(committed_offset);
-        state.persisted_high_water = Some(
-            state
-                .persisted_high_water
-                .unwrap_or(0)
-                .max(persisted_high_water),
-        );
-    }
-
-    pub(crate) fn mark_persisted(&self, kind: ConsumerKind, id: u32, high_water: u64) {
-        if let Some(state) = self.entries(kind).borrow_mut().get_mut(&id) {
-            state.persisted_high_water = Some(high_water);
+        match entries.entry(id) {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                state.committed_offset = state.committed_offset.max(committed_offset);
+                state.persisted_high_water = state.persisted_high_water.max(persisted_high_water);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(DurableOffsetState {
+                    committed_offset,
+                    persisted_high_water,
+                });
+                drop(entries);
+                self.bump_membership_epoch();
+            }
         }
     }
 
     pub(crate) fn remove(&self, kind: ConsumerKind, id: u32) -> bool {
         let removed = self.entries(kind).borrow_mut().remove(&id).is_some();
         if removed {
-            self.membership_epoch
-                .set(self.membership_epoch.get().wrapping_add(1));
+            self.bump_membership_epoch();
         }
         removed
     }
@@ -112,8 +115,7 @@ impl DurableConsumerOffsets {
     pub(crate) fn clear(&self) {
         self.consumers.borrow_mut().clear();
         self.groups.borrow_mut().clear();
-        self.membership_epoch
-            .set(self.membership_epoch.get().wrapping_add(1));
+        self.bump_membership_epoch();
     }
 
     #[cfg(any(test, feature = "simulator"))]
@@ -137,6 +139,11 @@ impl DurableConsumerOffsets {
             ConsumerKind::Consumer => &self.consumers,
             ConsumerKind::ConsumerGroup => &self.groups,
         }
+    }
+
+    fn bump_membership_epoch(&self) {
+        self.membership_epoch
+            .set(self.membership_epoch.get().wrapping_add(1));
     }
 }
 
@@ -164,7 +171,7 @@ pub struct ConsumerOffsetCapacity {
     kind: ConsumerKind,
     limit: Cell<usize>,
     pending: RefCell<HashMap<u32, usize>>,
-    provisional: RefCell<HashMap<u32, Weak<ProvisionalToken>>>,
+    provisional: RefCell<HashMap<u32, Arc<ProvisionalToken>>>,
     stranded: RefCell<HashSet<u32>>,
     uncertain: Cell<bool>,
     durable_warned: Cell<bool>,
@@ -212,15 +219,7 @@ impl ConsumerOffsetCapacity {
         id: u32,
         durable: &DurableConsumerOffsets,
     ) -> Result<(), ConsumerOffsetCapacityError> {
-        if durable.contains(self.kind, id)
-            || self.pending.borrow().contains_key(&id)
-            || self
-                .provisional
-                .borrow()
-                .get(&id)
-                .is_some_and(|token| token.strong_count() > 0)
-            || self.stranded.borrow().contains(&id)
-        {
+        if self.holds(id, durable) || self.stranded.borrow().contains(&id) {
             return Ok(());
         }
         let limit = self.limit.get();
@@ -229,9 +228,12 @@ impl ConsumerOffsetCapacity {
         let occupied = if durable_count >= limit {
             durable_count
         } else {
-            self.provisional
-                .borrow_mut()
-                .retain(|_, token| token.strong_count() > 0);
+            let mut provisional = self.provisional.borrow_mut();
+            if provisional.len() >= limit {
+                provisional
+                    .retain(|key, token| *key == id || token.active.load(Ordering::Relaxed) > 0);
+            }
+            drop(provisional);
             self.occupied(durable)
         };
         if self.uncertain.get() || occupied >= limit {
@@ -254,16 +256,13 @@ impl ConsumerOffsetCapacity {
     ) -> Result<AutoCommitReservation, ConsumerOffsetCapacityError> {
         self.check(id, durable)?;
         let mut provisional = self.provisional.borrow_mut();
-        let token = provisional
-            .get(&id)
-            .and_then(Weak::upgrade)
-            .unwrap_or_else(|| {
-                let token = Arc::new(ProvisionalToken {
-                    reclaim_epoch: Arc::clone(&self.reclaim_epoch),
-                });
-                provisional.insert(id, Arc::downgrade(&token));
-                token
-            });
+        let token = Arc::clone(provisional.entry(id).or_insert_with(|| {
+            Arc::new(ProvisionalToken {
+                reclaim_epoch: Arc::clone(&self.reclaim_epoch),
+                active: AtomicUsize::new(0),
+            })
+        }));
+        token.active.fetch_add(1, Ordering::Relaxed);
         Ok(AutoCommitReservation {
             token,
             kind: self.kind,
@@ -277,17 +276,17 @@ impl ConsumerOffsetCapacity {
                 .provisional
                 .borrow()
                 .get(&reservation.consumer_id)
-                .is_some_and(|token| std::ptr::eq(token.as_ptr(), Arc::as_ptr(&reservation.token)))
+                .is_some_and(|token| Arc::ptr_eq(token, &reservation.token))
     }
 
-    pub(crate) fn protects(&self, id: u32, durable: &DurableConsumerOffsets) -> bool {
+    pub(crate) fn holds(&self, id: u32, durable: &DurableConsumerOffsets) -> bool {
         durable.contains(self.kind, id)
             || self.pending.borrow().contains_key(&id)
             || self
                 .provisional
                 .borrow()
                 .get(&id)
-                .is_some_and(|token| token.strong_count() > 0)
+                .is_some_and(|token| token.active.load(Ordering::Relaxed) > 0)
     }
 
     pub(crate) fn set_pending_count(&self, id: u32, count: usize) {
@@ -347,10 +346,6 @@ impl ConsumerOffsetCapacity {
         self.stranded.borrow_mut().remove(&id);
     }
 
-    pub(crate) fn stranded_ids(&self) -> Vec<u32> {
-        self.stranded.borrow().iter().copied().collect()
-    }
-
     pub(crate) fn is_stranded(&self, id: u32) -> bool {
         self.stranded.borrow().contains(&id)
     }
@@ -395,6 +390,16 @@ impl ConsumerOffsetCapacity {
         self.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn forget_inactive_provisional(&self, id: u32) {
+        let mut provisional = self.provisional.borrow_mut();
+        if provisional
+            .get(&id)
+            .is_some_and(|token| token.active.load(Ordering::Relaxed) == 0)
+        {
+            provisional.remove(&id);
+        }
+    }
+
     pub(crate) fn should_reclaim(&self, durable: &DurableConsumerOffsets) -> bool {
         if self.uncertain.get() {
             return false;
@@ -416,14 +421,16 @@ impl ConsumerOffsetCapacity {
                 .chain(
                     provisional
                         .iter()
-                        .filter(|(id, token)| !pending.contains_key(id) && token.strong_count() > 0)
+                        .filter(|(id, token)| {
+                            !pending.contains_key(id) && token.active.load(Ordering::Relaxed) > 0
+                        })
                         .map(|(id, _)| id),
                 )
                 .chain(stranded.iter().filter(|id| {
                     !pending.contains_key(id)
                         && provisional
                             .get(id)
-                            .is_none_or(|token| token.strong_count() == 0)
+                            .is_none_or(|token| token.active.load(Ordering::Relaxed) == 0)
                 }))
                 .filter(|id| !durable.contains(self.kind, **id))
                 .count()
@@ -441,11 +448,14 @@ pub struct AutoCommitReservation {
 #[derive(Debug)]
 struct ProvisionalToken {
     reclaim_epoch: Arc<AtomicU64>,
+    active: AtomicUsize,
 }
 
-impl Drop for ProvisionalToken {
+impl Drop for AutoCommitReservation {
     fn drop(&mut self) {
-        self.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
+        if self.token.active.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.token.reclaim_epoch.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -467,6 +477,31 @@ mod tests {
         assert!(!capacity.should_reclaim(&durable));
         capacity.note_local_key_change();
         assert!(capacity.should_reclaim(&durable));
+    }
+
+    #[test]
+    fn given_repeated_reservation_for_same_key_should_reuse_token_allocation() {
+        let durable = Rc::new(DurableConsumerOffsets::default());
+        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        let first = capacity.reserve_provisional(7, &durable).unwrap();
+        let token = Arc::clone(&first.token);
+        drop(first);
+        drop(capacity.reserve_provisional(8, &durable).unwrap());
+        assert_eq!(capacity.provisional.borrow().len(), 2);
+        let second = capacity.reserve_provisional(7, &durable).unwrap();
+        assert!(Arc::ptr_eq(&token, &second.token));
+    }
+
+    #[test]
+    fn given_inactive_token_cache_at_limit_when_new_key_arrives_should_prune_it() {
+        let durable = Rc::new(DurableConsumerOffsets::default());
+        let capacity = Rc::new(ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 2));
+        drop(capacity.reserve_provisional(7, &durable).unwrap());
+        drop(capacity.reserve_provisional(8, &durable).unwrap());
+        assert_eq!(capacity.provisional.borrow().len(), 2);
+        let _third = capacity.reserve_provisional(9, &durable).unwrap();
+        assert_eq!(capacity.provisional.borrow().len(), 1);
+        assert!(capacity.provisional.borrow().contains_key(&9));
     }
 
     #[test]
@@ -518,7 +553,7 @@ mod tests {
     #[test]
     fn given_full_durable_set_when_reserving_new_key_should_reject() {
         let durable = DurableConsumerOffsets::default();
-        durable.record_explicit(ConsumerKind::Consumer, 1, 0, Some(0));
+        durable.record_explicit(ConsumerKind::Consumer, 1, 0, 0);
         let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 1);
         let error = capacity
             .try_reserve(2, &durable)
@@ -581,7 +616,7 @@ mod tests {
     #[test]
     fn given_capacity_episode_when_occupancy_drops_should_rearm_first_warning() {
         let durable = DurableConsumerOffsets::default();
-        durable.record_explicit(ConsumerKind::Consumer, 1, 0, Some(0));
+        durable.record_explicit(ConsumerKind::Consumer, 1, 0, 0);
         let capacity = ConsumerOffsetCapacity::new(ConsumerKind::Consumer, 1);
         assert!(
             capacity
@@ -597,7 +632,7 @@ mod tests {
         );
         durable.remove(ConsumerKind::Consumer, 1);
         capacity.rearm_if_below_limit(&durable);
-        durable.record_explicit(ConsumerKind::Consumer, 3, 0, Some(0));
+        durable.record_explicit(ConsumerKind::Consumer, 3, 0, 0);
         assert!(
             capacity
                 .try_reserve(4, &durable)
@@ -607,16 +642,16 @@ mod tests {
     }
 
     #[test]
-    fn given_missing_file_state_when_checking_coverage_should_preserve_membership() {
+    fn given_persisted_state_when_checking_coverage_should_preserve_membership() {
         let durable = DurableConsumerOffsets::default();
-        durable.record_explicit(ConsumerKind::Consumer, 3, 11, None);
+        durable.record_explicit(ConsumerKind::Consumer, 3, 11, 11);
         assert!(durable.contains(ConsumerKind::Consumer, 3));
         assert_eq!(durable.count(ConsumerKind::Consumer), 1);
         assert_eq!(
             durable.get(ConsumerKind::Consumer, 3),
             Some(DurableOffsetState {
                 committed_offset: 11,
-                persisted_high_water: None,
+                persisted_high_water: 11,
             })
         );
     }

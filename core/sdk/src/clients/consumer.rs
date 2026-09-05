@@ -622,8 +622,11 @@ unsafe impl Sync for IggyConsumer {}
 ///
 /// A server-side auto-commit poll can fail with `TooManyConsumerOffsets` when
 /// its consumer needs a new offset key at the partition's configured limit.
-/// The rejected poll returns no messages. Existing offset keys remain usable,
-/// and polling with server-side auto-commit disabled allocates no offset key.
+/// The rejected poll returns no messages. Other auto-commit modes store the
+/// same key through a client request. Background and shutdown stores log a
+/// capacity failure but do not yield it through this stream. Only
+/// [`AutoCommit::Disabled`] avoids automatic key allocation. Existing keys
+/// remain usable.
 pub struct IggyConsumer {
     initialized: bool,
     shutdown: Arc<AtomicBool>,

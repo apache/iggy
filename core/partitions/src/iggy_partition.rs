@@ -221,6 +221,7 @@ where
     offset_reservations_need_resync: Cell<bool>,
     offset_reservations_scan_state: Option<(u64, u64, u64, Option<u64>)>,
     consumer_group_offsets_need_reconcile: Cell<bool>,
+    consumer_group_offsets_reconcile_epoch: Rc<Cell<u64>>,
     consumer_offset_dirs_dirty: [Cell<bool>; 2],
     #[cfg(test)]
     offset_dir_sync_count: Cell<usize>,
@@ -575,6 +576,7 @@ where
             offset_reservations_need_resync: Cell::new(false),
             offset_reservations_scan_state: None,
             consumer_group_offsets_need_reconcile: Cell::new(true),
+            consumer_group_offsets_reconcile_epoch: Rc::new(Cell::new(0)),
             consumer_offset_dirs_dirty: [Cell::new(false), Cell::new(false)],
             #[cfg(test)]
             offset_dir_sync_count: Cell::new(0),
@@ -1129,7 +1131,7 @@ where
                 ConsumerKind::Consumer,
                 consumer_id,
                 offset,
-                Some(offset),
+                offset,
             );
         }
         for (group_id, offset) in consumer_group_offsets {
@@ -1141,7 +1143,7 @@ where
                 ConsumerKind::ConsumerGroup,
                 group_id,
                 offset,
-                Some(offset),
+                offset,
             );
         }
         // Empty carry-over: the previous incarnation never took a write, so there
@@ -2015,7 +2017,7 @@ where
             kind,
             consumer_id,
             committed_offset,
-            Some(persisted_high_water),
+            persisted_high_water,
         );
     }
 
@@ -2130,10 +2132,6 @@ where
     ) -> Result<(), IggyError> {
         let path = self.persisted_offset_path(pending.kind, pending.consumer_id);
         let capacity = self.consumer_offset_capacity_for(pending.kind);
-        let creates_group = pending.kind == ConsumerKind::ConsumerGroup
-            && !self
-                .durable_consumer_offsets
-                .contains(pending.kind, pending.consumer_id);
         match pending.mutation {
             // A server auto-commit persists monotonically: its op offset can
             // trail the durably-recorded value (disk-tier polls replicate in
@@ -2151,12 +2149,8 @@ where
                     .get(pending.kind, pending.consumer_id);
                 let persisted_high_water = match (path.as_deref(), tracked) {
                     (None, _) => offset,
-                    (Some(_), Some(state))
-                        if state
-                            .persisted_high_water
-                            .is_some_and(|high_water| offset <= high_water) =>
-                    {
-                        state.persisted_high_water.expect("covered persisted value")
+                    (Some(_), Some(state)) if offset <= state.persisted_high_water => {
+                        state.persisted_high_water
                     }
                     (Some(path), Some(state)) => {
                         let value = state.committed_offset.max(offset);
@@ -2177,9 +2171,12 @@ where
                     },
                     persisted_high_water,
                 );
+                if path.is_some() && self.consumer_offset_enforce_fsync {
+                    self.mark_consumer_offset_dir_dirty(pending.kind);
+                }
                 capacity.clear_stranded(pending.consumer_id);
-                if creates_group {
-                    self.consumer_group_offsets_need_reconcile.set(true);
+                if pending.kind == ConsumerKind::ConsumerGroup && tracked.is_none() {
+                    self.mark_consumer_group_offsets_need_reconcile();
                 }
                 Ok(())
             }
@@ -2187,52 +2184,35 @@ where
                 if let Some(path) = path.as_deref() {
                     persist_offset(path, offset, self.consumer_offset_enforce_fsync).await?;
                 }
-                self.durable_consumer_offsets.record_explicit(
+                let created = self.durable_consumer_offsets.record_explicit(
                     pending.kind,
                     pending.consumer_id,
                     offset,
-                    Some(offset),
+                    offset,
                 );
+                if path.is_some() && self.consumer_offset_enforce_fsync {
+                    self.mark_consumer_offset_dir_dirty(pending.kind);
+                }
                 capacity.clear_stranded(pending.consumer_id);
-                if creates_group {
-                    self.consumer_group_offsets_need_reconcile.set(true);
+                if pending.kind == ConsumerKind::ConsumerGroup && created {
+                    self.mark_consumer_group_offsets_need_reconcile();
                 }
                 Ok(())
             }
             PendingConsumerOffsetMutation::Delete => {
                 if let Some(path) = path.as_deref() {
-                    delete_persisted_offset(path).await?;
-                    self.consumer_offset_dirs_dirty[match pending.kind {
-                        ConsumerKind::Consumer => 0,
-                        ConsumerKind::ConsumerGroup => 1,
-                    }]
-                    .set(true);
+                    if delete_persisted_offset(path).await? {
+                        self.mark_consumer_offset_dir_dirty(pending.kind);
+                    }
+                    capacity.clear_stranded(pending.consumer_id);
                 }
                 self.durable_consumer_offsets
                     .remove(pending.kind, pending.consumer_id);
-                capacity.clear_stranded(pending.consumer_id);
+                capacity.forget_inactive_provisional(pending.consumer_id);
                 capacity.rearm_if_below_limit(&self.durable_consumer_offsets);
                 Ok(())
             }
         }
-    }
-
-    /// Whether the committed high-water for this consumer already covers
-    /// `offset`, so a poll's auto-commit submit cannot advance it and may be
-    /// skipped instead of burning a consensus op. Reads committed state only
-    /// (the tracker is fed at commit-apply, never by the eager poll-path
-    /// apply): an offset covered in memory but not yet committed keeps
-    /// resubmitting until the covering op actually lands, so a dropped
-    /// in-flight op self-heals on the next poll.
-    #[must_use]
-    pub fn is_auto_commit_offset_covered(
-        &self,
-        kind: ConsumerKind,
-        consumer_id: u32,
-        offset: u64,
-    ) -> bool {
-        self.durable_consumer_offsets
-            .covers(kind, consumer_id, offset)
     }
 
     /// Reject completion from a removed partition or a view whose retained
@@ -2252,13 +2232,9 @@ where
 
     fn apply_consumer_offset_commit(&self, pending: PendingConsumerOffsetCommit) {
         if pending.kind == ConsumerKind::ConsumerGroup
-            && (matches!(pending.mutation, PendingConsumerOffsetMutation::Delete)
-                || !self
-                    .consumer_group_offsets
-                    .pin()
-                    .contains_key(&ConsumerGroupId(pending.consumer_id as usize)))
+            && matches!(pending.mutation, PendingConsumerOffsetMutation::Delete)
         {
-            self.consumer_group_offsets_need_reconcile.set(true);
+            self.mark_consumer_group_offsets_need_reconcile();
         }
         match pending.mutation {
             PendingConsumerOffsetMutation::Upsert(offset)
@@ -2365,12 +2341,12 @@ where
                 dead.push(id);
             }
         }
-        dead.extend(
-            self.consumer_group_offset_capacity
-                .stranded_ids()
-                .into_iter()
-                .filter(|id| !is_live(u64::from(*id))),
-        );
+        // A stranded file already failed normal loading or unlink. Reissuing
+        // replicated deletes every reconciliation pass cannot make its
+        // filesystem writable and would create a permanent commit loop.
+        // A single-replica explicit deletion can retry after repair. On a
+        // replicated partition the file must be repaired or removed locally,
+        // because older peers do not recognize a delete for a map-missing key.
         dead.sort_unstable();
         dead.dedup();
         self.consumer_group_offsets_need_reconcile
@@ -2383,6 +2359,22 @@ where
         self.consumer_group_offsets_need_reconcile.get()
             && self.consensus.is_primary()
             && self.consensus.is_normal()
+    }
+
+    pub(crate) fn set_consumer_group_offsets_reconcile_epoch(&mut self, epoch: Rc<Cell<u64>>) {
+        self.consumer_group_offsets_reconcile_epoch = epoch;
+        if self.consumer_group_offsets_need_reconcile.get() {
+            self.mark_consumer_group_offsets_need_reconcile();
+        }
+    }
+
+    fn mark_consumer_group_offsets_need_reconcile(&self) {
+        self.consumer_group_offsets_need_reconcile.set(true);
+        self.consumer_group_offsets_reconcile_epoch.set(
+            self.consumer_group_offsets_reconcile_epoch
+                .get()
+                .wrapping_add(1),
+        );
     }
 
     /// Cooperative-rebalance classification: a group's `(last_polled, committed)`
@@ -2425,28 +2417,9 @@ where
             |value| PendingConsumerOffsetCommit::upsert(kind, consumer_id, value),
         );
 
-        let persisted = async {
-            self.persist_consumer_offset_commit(pending).await?;
-            self.flush_consumer_offset_directories().await
-        }
-        .await;
-        if let Err(error) = persisted {
+        if let Err(error) = self.persist_consumer_offset_commit(pending).await {
             if offset.is_some() {
                 self.release_consumer_offset_reservation(kind, consumer_id);
-                if !self.durable_consumer_offsets.contains(kind, consumer_id)
-                    && let Some(path) = self.persisted_offset_path(kind, consumer_id)
-                {
-                    if delete_persisted_offset(&path).await.is_ok() {
-                        self.consumer_offset_capacity_for(kind)
-                            .clear_stranded(consumer_id);
-                    } else {
-                        self.consumer_offset_capacity_for(kind)
-                            .record_stranded(consumer_id);
-                    }
-                }
-            } else {
-                self.consumer_offset_capacity_for(kind)
-                    .record_stranded(consumer_id);
             }
             emit_partition_diag(
                 tracing::Level::WARN,
@@ -2465,6 +2438,26 @@ where
             return;
         }
         self.apply_consumer_offset_commit(pending);
+        if let Err(error) = self.flush_consumer_offset_directories().await {
+            if offset.is_some() {
+                self.release_consumer_offset_reservation(kind, consumer_id);
+            }
+            emit_partition_diag(
+                tracing::Level::WARN,
+                &PartitionDiagEvent::new(self.diag_ctx(), "no_ack offset directory sync failed")
+                    .with_operation(request_header.operation)
+                    .with_error(error.to_string()),
+            );
+            Self::send_partition_deny_or_log(
+                &self.consensus,
+                &request_header,
+                error.as_code(),
+                "no_ack offset directory sync failure reply send failed",
+                waiter,
+            )
+            .await;
+            return;
+        }
 
         let reply = build_reply_from_request(
             &self.consensus,
@@ -2584,6 +2577,7 @@ where
                 ?kind,
                 occupied = capacity_error.occupied,
                 limit = capacity_error.limit,
+                config = "[partition] consumer_offsets_max",
                 "consumer offset admission limit reached"
             );
         }
@@ -2616,11 +2610,21 @@ where
             }
         };
 
-        if found
-            || self
-                .consumer_offset_capacity_for(kind)
-                .is_stranded(consumer_id)
-        {
+        if self.consensus.replica_count() > 1 {
+            return self
+                .durable_consumer_offsets
+                .contains(kind, consumer_id)
+                .then_some(())
+                .ok_or_else(|| {
+                    IggyError::ConsumerOffsetNotFound(
+                        usize::try_from(consumer_id).expect("u32 consumer id must fit usize"),
+                    )
+                });
+        }
+        let local_stranded = self
+            .consumer_offset_capacity_for(kind)
+            .is_stranded(consumer_id);
+        if found || local_stranded {
             Ok(())
         } else {
             Err(IggyError::ConsumerOffsetNotFound(
@@ -2758,7 +2762,7 @@ where
                 .rebuild(&self.durable_consumer_offsets, group_ids);
         }
         self.observed_view = current_view;
-        self.consumer_group_offsets_need_reconcile.set(true);
+        self.mark_consumer_group_offsets_need_reconcile();
         self.offset_reservations_scan_state = Some(scan_state);
         // The shard tick retries uncertainty after journal or frontier progress.
         self.offset_reservations_need_resync.set(false);
@@ -2777,9 +2781,10 @@ where
                 let map = self.consumer_offsets.pin();
                 for (key, _) in &map {
                     if let Ok(id) = u32::try_from(*key)
-                        && !capacity.protects(id, &self.durable_consumer_offsets)
+                        && !capacity.holds(id, &self.durable_consumer_offsets)
                     {
                         map.remove(key);
+                        capacity.forget_inactive_provisional(id);
                         remaining -= 1;
                         if remaining == 0 {
                             break;
@@ -2791,9 +2796,10 @@ where
                 let map = self.consumer_group_offsets.pin();
                 for (key, _) in &map {
                     if let Ok(id) = u32::try_from(key.0)
-                        && !capacity.protects(id, &self.durable_consumer_offsets)
+                        && !capacity.holds(id, &self.durable_consumer_offsets)
                     {
                         map.remove(key);
+                        capacity.forget_inactive_provisional(id);
                         remaining -= 1;
                         if remaining == 0 {
                             break;
@@ -3285,6 +3291,12 @@ where
                 .consumer_offset_capacity_for(reservation.kind)
                 .owns(reservation)
         }) {
+            debug!(
+                namespace_raw = self.namespace().inner(),
+                kind = ?reservation.as_ref().map(|reservation| reservation.kind),
+                consumer_id = ?reservation.as_ref().map(|reservation| reservation.consumer_id),
+                "dropping auto-commit reservation owned by another partition incarnation"
+            );
             return;
         }
         // Taken by whichever arm answers: the deny paths, the NoAck fast path,
@@ -3651,23 +3663,28 @@ where
         while promoted < slots_freed {
             let req = self.consensus().pop_queued_request();
             let Some(mut req) = req else { break };
-            let _reservation =
-                Self::parse_consumer_offset_request(req.message.header().operation, &req.message)
-                    .ok()
-                    .and_then(|(kind, id, _, _)| {
-                        if req.message.header().operation != Operation::StoreConsumerOffset
-                            || !is_auto_commit_client(req.message.header().client)
-                        {
-                            return None;
-                        }
-                        let mut queued = self.queued_auto_commit_reservations.borrow_mut();
-                        let reservations = queued.get_mut(&(kind, id))?;
-                        let reservation = reservations.pop();
-                        if reservations.is_empty() {
-                            queued.remove(&(kind, id));
-                        }
-                        reservation
-                    });
+            let parsed_store = (req.message.header().operation == Operation::StoreConsumerOffset)
+                .then(|| {
+                    Self::parse_consumer_offset_request(
+                        Operation::StoreConsumerOffset,
+                        &req.message,
+                    )
+                });
+            let _reservation = parsed_store
+                .as_ref()
+                .and_then(|parsed| parsed.as_ref().ok())
+                .and_then(|(kind, id, _, _)| {
+                    if !is_auto_commit_client(req.message.header().client) {
+                        return None;
+                    }
+                    let mut queued = self.queued_auto_commit_reservations.borrow_mut();
+                    let reservations = queued.get_mut(&(*kind, *id))?;
+                    let reservation = reservations.pop();
+                    if reservations.is_empty() {
+                        queued.remove(&(*kind, *id));
+                    }
+                    reservation
+                });
 
             // Taken before the preflight so a refusal answers the parked waiter
             // instead of waking it with `Canceled`.
@@ -3679,11 +3696,7 @@ where
                 break;
             }
 
-            if req.message.header().operation == Operation::StoreConsumerOffset {
-                let parsed = Self::parse_consumer_offset_request(
-                    Operation::StoreConsumerOffset,
-                    &req.message,
-                );
+            if let Some(parsed) = parsed_store {
                 let Ok((kind, consumer_id, Some(offset), _)) = parsed else {
                     Self::send_partition_deny_or_log(
                         self.consensus(),
@@ -4891,6 +4904,12 @@ where
         let committed_batch_stats = self.resolve_committed_visible_offsets(&drained);
         let mut messages_committed = false;
 
+        // Apply the drained batch before advancing any op because directory
+        // durability is shared by every delete in the batch. Until the sync
+        // below succeeds, earlier applied entries intentionally remain above
+        // commit_min and their replies and dedup folds stay owned by `drained`.
+        // A failure at entry K fences the replica. Recovery replays the whole
+        // unadvanced prefix idempotently, including entries applied before K.
         for (entry, batch_stats) in drained.iter().zip(&committed_batch_stats) {
             let prepare_header = entry.header;
             if !self
@@ -4941,7 +4960,9 @@ where
         }
 
         // Commit replies and the applied frontier must follow directory
-        // durability. One sync per touched kind covers the whole walk.
+        // durability. One sync per touched kind covers the whole walk. A sync
+        // failure is attributed to the batch boundary because one directory
+        // sync covers every delete in that kind, not one uniquely failing op.
         if let Err(error) = self.flush_consumer_offset_directories().await {
             if let Some(entry) = drained.last() {
                 error!(namespace_raw, %error, "consumer offset directory sync failed after committed operations");
@@ -5077,9 +5098,27 @@ where
                 continue;
             }
             if let Some(dir) = dir {
-                crate::state_transfer::fsync_dir(dir)
-                    .await
-                    .map_err(|_| IggyError::CannotSyncFile)?;
+                match crate::state_transfer::fsync_dir(dir).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // The directory disappeared after the final unlink.
+                        // There is no remaining dirent whose durability needs
+                        // proving.
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "iggy.partitions.diag",
+                            plane = "partitions",
+                            replica_id = self.consensus.replica(),
+                            namespace_raw = self.namespace().inner(),
+                            path = dir,
+                            error_kind = ?error.kind(),
+                            %error,
+                            "consumer offset directory sync failed"
+                        );
+                        return Err(IggyError::CannotSyncFile);
+                    }
+                }
                 #[cfg(test)]
                 self.offset_dir_sync_count
                     .set(self.offset_dir_sync_count.get() + 1);
@@ -5087,6 +5126,14 @@ where
             self.consumer_offset_dirs_dirty[index].set(false);
         }
         Ok(())
+    }
+
+    fn mark_consumer_offset_dir_dirty(&self, kind: ConsumerKind) {
+        let index = match kind {
+            ConsumerKind::Consumer => 0,
+            ConsumerKind::ConsumerGroup => 1,
+        };
+        self.consumer_offset_dirs_dirty[index].set(true);
     }
 
     /// Batch stats for each drained entry, positionally parallel to `drained`.
@@ -8449,28 +8496,6 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_missing_installed_offset_file_when_older_auto_commit_lands_should_repair_committed_value()
-     {
-        let dir = tempfile::tempdir().expect("offset directory");
-        let (mut partition, _) = recording_partition();
-        partition.consumer_offsets_path = Some(dir.path().to_string_lossy().into_owned());
-        partition
-            .durable_consumer_offsets
-            .record_explicit(ConsumerKind::Consumer, 7, 20, None);
-        partition
-            .persist_consumer_offset_commit(PendingConsumerOffsetCommit::upsert_auto_commit(
-                ConsumerKind::Consumer,
-                7,
-                5,
-            ))
-            .await
-            .expect("repair missing offset file");
-        let bytes = std::fs::read(dir.path().join("7")).expect("repaired file");
-        assert_eq!(u64::from_le_bytes(*bytes.first_chunk::<8>().unwrap()), 20);
-        assert!(partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, 7, 20));
-    }
-
-    #[compio::test]
     async fn given_transfer_above_cap_when_file_write_fails_should_refuse_until_retry_succeeds() {
         let dir = tempfile::tempdir().expect("transfer directory");
         let consumers = dir.path().join("consumers");
@@ -8493,6 +8518,11 @@ mod tests {
             .await
             .expect_err("incomplete offset state must not advance the commit floor");
         assert_eq!(partition.consensus.commit_min(), 0);
+        assert_eq!(
+            partition.log.segments().len(),
+            1,
+            "offset staging failure must preserve the existing segment chain"
+        );
         assert_eq!(
             partition.durable_consumer_offset_count(ConsumerKind::Consumer),
             0
@@ -8521,7 +8551,11 @@ mod tests {
                 .reserve_consumer_offset(ConsumerKind::Consumer, 10)
                 .is_err()
         );
-        assert!(partition.is_auto_commit_offset_covered(ConsumerKind::ConsumerGroup, 9, 3));
+        assert!(
+            partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::ConsumerGroup, 9, 3)
+        );
         assert_eq!(
             partition
                 .offsets_wire_snapshot_for_test()
@@ -8568,7 +8602,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_directory_sync_failure_when_delete_commits_should_fence_without_success_reply() {
+    async fn given_absent_offset_file_when_delete_commits_should_skip_directory_sync() {
         let dir = tempfile::tempdir().unwrap();
         let (mut partition, sent) = recording_partition_at(0, 3);
         partition.consumer_offsets_path =
@@ -8585,9 +8619,10 @@ mod tests {
         partition
             .handle_committed_entries(vec![PipelineEntry::new(header)], &repair_config(), true)
             .await;
-        assert!(partition.fatal.is_some());
-        assert_eq!(partition.consensus.commit_min(), 0);
-        assert!(sent.borrow().is_empty());
+        assert!(partition.fatal.is_none());
+        assert_eq!(partition.consensus.commit_min(), 1);
+        assert_eq!(partition.offset_dir_sync_count.get(), 0);
+        assert_eq!(sent.borrow().len(), 1);
     }
 
     #[compio::test]
@@ -9291,11 +9326,15 @@ mod tests {
         );
 
         assert!(
-            partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 114),
+            partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::Consumer, consumer_id, 114),
             "committed high-water covers the persisted offset"
         );
         assert!(
-            !partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 115),
+            !partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::Consumer, consumer_id, 115),
             "an advancing offset is not covered and must submit"
         );
 
@@ -9310,7 +9349,9 @@ mod tests {
             .expect("explicit store persist 109");
         assert_eq!(read_disk(&path), 109, "explicit store may rewind the file");
         assert!(
-            !partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 114),
+            !partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::Consumer, consumer_id, 114),
             "explicit rewind lowers the high-water so a later auto-commit may re-advance"
         );
 
@@ -9358,7 +9399,9 @@ mod tests {
             .await
             .expect("seed offset file");
         assert!(
-            !partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 1),
+            !partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::Consumer, consumer_id, 1),
             "a cold key is never covered; the first submit must go through"
         );
 
@@ -9376,7 +9419,9 @@ mod tests {
             "cold-key fold must not rewind the pre-existing on-disk value"
         );
         assert!(
-            partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 114),
+            partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::Consumer, consumer_id, 114),
             "tracker warms with the on-disk value, not the trailing op offset"
         );
 
@@ -9389,7 +9434,9 @@ mod tests {
             .expect("delete persisted offset");
         assert!(!std::path::Path::new(&path).exists(), "file unlinked");
         assert!(
-            !partition.is_auto_commit_offset_covered(ConsumerKind::Consumer, consumer_id, 1),
+            !partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::Consumer, consumer_id, 1),
             "delete drops the tracker entry with the file"
         );
 
@@ -9430,6 +9477,163 @@ mod tests {
             0
         );
         assert!(partition.consumer_group_offset_ids().is_empty());
+    }
+
+    #[compio::test]
+    async fn given_known_stranded_group_file_when_reconciling_should_not_submit_delete_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let group_dir = dir.path().join("groups");
+        std::fs::create_dir_all(group_dir.join("7")).unwrap();
+        let (mut partition, _) = recording_partition();
+        partition.consumer_group_offsets_path = Some(group_dir.to_string_lossy().into_owned());
+        partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, 7);
+        assert!(partition.consumer_group_offset_capacity.is_stranded(7));
+        assert!(
+            partition
+                .dead_consumer_group_offset_ids(|_| false)
+                .is_empty(),
+            "automatic cleanup must not resubmit a known failed unlink"
+        );
+        assert!(
+            partition
+                .offsets_wire_snapshot_for_test()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn given_stranded_only_key_when_replicated_should_not_enter_the_delete_log() {
+        let (partition, _) = recording_partition_at(0, 3);
+        partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, 7);
+        assert!(
+            partition
+                .ensure_consumer_offset_exists(ConsumerKind::ConsumerGroup, 7)
+                .is_err()
+        );
+        partition.consumer_group_offsets.pin().insert(
+            ConsumerGroupId(8),
+            ConsumerOffset::new(ConsumerKind::ConsumerGroup, 8, 0, String::new()),
+        );
+        assert!(
+            partition
+                .ensure_consumer_offset_exists(ConsumerKind::ConsumerGroup, 8)
+                .is_err(),
+            "a follower-local phantom must not become a replicated delete"
+        );
+
+        let (single, _) = recording_partition();
+        single.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, 7);
+        assert!(
+            single
+                .ensure_consumer_offset_exists(ConsumerKind::ConsumerGroup, 7)
+                .is_ok()
+        );
+    }
+
+    #[compio::test]
+    async fn given_committed_delete_when_unlink_fails_should_not_advance_logical_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let group_dir = dir.path().join("groups");
+        std::fs::create_dir_all(group_dir.join("7")).unwrap();
+        let (mut partition, _) = recording_partition();
+        partition.consumer_group_offsets_path = Some(group_dir.to_string_lossy().into_owned());
+        partition.consumer_group_offsets.pin().insert(
+            ConsumerGroupId(7),
+            ConsumerOffset::new(ConsumerKind::ConsumerGroup, 7, 11, String::new()),
+        );
+        partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, 7, 11, 11);
+        partition.stage_consumer_offset_delete(1, ConsumerKind::ConsumerGroup, 7);
+
+        assert!(
+            partition
+                .apply_staged_consumer_offset_commit(1)
+                .await
+                .is_err()
+        );
+        assert_eq!(partition.consumer_group_offset_ids(), vec![7]);
+        assert_eq!(
+            partition.durable_consumer_offset_count(ConsumerKind::ConsumerGroup),
+            1
+        );
+        assert!(partition.pending_consumer_offset_commits.contains_key(&1));
+    }
+
+    #[compio::test]
+    async fn given_no_ack_store_when_unrelated_dirty_directory_is_gone_should_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut partition, sent) = recording_partition();
+        partition.consumer_offsets_path =
+            Some(dir.path().join("consumers").to_string_lossy().into_owned());
+        partition.consumer_group_offsets_path = Some(
+            dir.path()
+                .join("missing-groups")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        partition.consumer_offset_dirs_dirty[1].set(true);
+        partition.stats.increment_messages_count(1);
+
+        partition
+            .on_request(
+                store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::NoAck),
+                None,
+            )
+            .await;
+
+        assert!(partition.consumer_offsets.pin().contains_key(&7));
+        assert!(
+            partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::Consumer, 7, 0)
+        );
+        let reply = sent.borrow();
+        let header = reply
+            .first()
+            .and_then(|(_, message)| {
+                bytemuck::checked::try_from_bytes::<ReplyHeader>(
+                    &message.as_slice()[..size_of::<ReplyHeader>()],
+                )
+                .ok()
+            })
+            .expect("success reply");
+        assert_eq!(header.status, 0);
+    }
+
+    #[compio::test]
+    async fn given_no_ack_store_when_genuine_directory_sync_fails_should_keep_maps_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut partition, sent) = recording_partition();
+        partition.consumer_offsets_path =
+            Some(dir.path().join("consumers").to_string_lossy().into_owned());
+        partition.consumer_group_offsets_path = Some("/proc".to_owned());
+        partition.consumer_offset_dirs_dirty[1].set(true);
+        partition.stats.increment_messages_count(1);
+
+        partition
+            .on_request(
+                store_offset_request(42, 1, ConsumerKind::Consumer, 7, 0, AckLevel::NoAck),
+                None,
+            )
+            .await;
+
+        assert!(partition.consumer_offsets.pin().contains_key(&7));
+        assert!(
+            partition
+                .durable_consumer_offsets
+                .covers(ConsumerKind::Consumer, 7, 0)
+        );
+        let reply = sent.borrow();
+        let header = reply
+            .first()
+            .and_then(|(_, message)| {
+                bytemuck::checked::try_from_bytes::<ReplyHeader>(
+                    &message.as_slice()[..size_of::<ReplyHeader>()],
+                )
+                .ok()
+            })
+            .expect("sync failure reply");
+        assert_eq!(header.status, IggyError::CannotSyncFile.as_code());
     }
 
     #[test]

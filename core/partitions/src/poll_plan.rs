@@ -991,6 +991,7 @@ impl AutoCommitApplied {
         self.capacity.rearm_map_if_below_limit(map_len);
         if self.previous_offset.is_none() {
             self.capacity.note_local_key_change();
+            self.capacity.forget_inactive_provisional(self.consumer_id);
         }
     }
 }
@@ -1289,7 +1290,7 @@ mod tests {
         let context = consumer_auto_commit_with_limit(Arc::clone(&offsets), 7, 1);
         context
             .durable
-            .record_explicit(ConsumerKind::Consumer, 8, 0, Some(0));
+            .record_explicit(ConsumerKind::Consumer, 8, 0, 0);
         let applied = context
             .apply(9)
             .expect("existing phantom is locally writable");

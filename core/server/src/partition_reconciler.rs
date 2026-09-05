@@ -238,6 +238,7 @@ pub struct ReconcilerCtx {
     last_pass_noop: Cell<bool>,
     group_offset_cleanup_inflight: Rc<RefCell<AHashSet<IggyNamespace>>>,
     group_offset_cleanup_completed: Rc<Cell<usize>>,
+    last_group_offset_reconcile_epoch: Cell<u64>,
 }
 
 impl ReconcilerCtx {
@@ -262,6 +263,7 @@ impl ReconcilerCtx {
             last_pass_noop: Cell::new(false),
             group_offset_cleanup_inflight: Rc::new(RefCell::new(AHashSet::new())),
             group_offset_cleanup_completed: Rc::new(Cell::new(0)),
+            last_group_offset_reconcile_epoch: Cell::new(0),
         }
     }
 
@@ -455,6 +457,14 @@ impl PassCounters {
 async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     let shard_id = ctx.shard.id;
     let revision = current_revision(ctx);
+    // Snapshotted with `revision` before the pass, so a partition that arms
+    // itself during one of the awaits below bumps past this value and forces
+    // the next pass instead of being absorbed by an end-of-pass read.
+    let group_offset_epoch = ctx
+        .shard
+        .plane
+        .partitions()
+        .consumer_group_offsets_reconcile_epoch();
 
     // Cooperative-revocation completion runs every tick, before the fast-skip:
     // a timeout fires on wall-clock and a drain on partition-offset state, and
@@ -482,19 +492,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         && ctx.failure_state.borrow().is_empty()
         && ctx.group_offset_cleanup_completed.get() == 0
         && !ctx.shard.has_parked_partition_frames()
-        && !ctx.shard.plane.partitions().namespaces().any(|namespace| {
-            ctx.shard
-                .plane
-                .partitions()
-                .with_partition(namespace, |partition| {
-                    partition.consumer_group_offsets_reconcile_needed()
-                        && !ctx
-                            .group_offset_cleanup_inflight
-                            .borrow()
-                            .contains(namespace)
-                })
-                .unwrap_or(false)
-        })
+        && ctx.last_group_offset_reconcile_epoch.get() == group_offset_epoch
     {
         trace!(
             shard = shard_id,
@@ -527,6 +525,8 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     // still runs even though `revision` did not change.
     let did_work = counters.total() > 0;
     ctx.last_revision.set(Some(revision));
+    ctx.last_group_offset_reconcile_epoch
+        .set(group_offset_epoch);
     ctx.last_pass_noop.set(!did_work);
 
     if did_work {
@@ -1065,6 +1065,10 @@ fn reconcile_consumer_group_offsets(ctx: &ReconcilerCtx, counters: &mut PassCoun
                 .count();
             completed.set(completed.get() + count);
             inflight.borrow_mut().remove(&namespace);
+            shard
+                .plane
+                .partitions()
+                .note_consumer_group_offsets_reconcile_needed();
         });
     }
 }
@@ -1377,8 +1381,8 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 mod tests {
     use super::{
         FailureCause, FailureRecord, PassCounters, ReconcilerCtx, build_partition_fresh,
-        delete_partitions_from_disk, fetch_partition_stats, reconcile_consumer_group_offsets,
-        reconcile_once,
+        current_revision, delete_partitions_from_disk, fetch_partition_stats,
+        reconcile_consumer_group_offsets, reconcile_once,
     };
     use configs::server::{ServerConfig, ServerSystemConfig};
     use consensus::{MetadataHandle, PartitionsHandle};
@@ -2512,6 +2516,21 @@ mod tests {
         assert!(
             !reconcile_once(&ctx).await,
             "unchanged revision after convergence must fast-skip the diff"
+        );
+
+        let revision = current_revision(&ctx);
+        shard
+            .plane
+            .partitions()
+            .note_consumer_group_offsets_reconcile_needed();
+        assert_eq!(
+            current_revision(&ctx),
+            revision,
+            "partition-local offset work does not change metadata revision"
+        );
+        assert!(
+            reconcile_once(&ctx).await,
+            "the shard offset epoch must defeat the O(1) fast-skip"
         );
 
         // A new partition-shaping commit bumps the revision → next pass runs.

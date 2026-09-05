@@ -1586,10 +1586,8 @@ func (e CannotOpenConsumerOffsetsFile) Is(target error) bool {
 
 type TooManyConsumerOffsets struct{}
 
-func (e TooManyConsumerOffsets) Error() string {
-	return "per-partition consumer offset limit reached (see [partition] consumer_offsets_max)"
-}
-func (e TooManyConsumerOffsets) Code() Code { return 3024 }
+func (e TooManyConsumerOffsets) Error() string { return "consumer offset limit reached for partition" }
+func (e TooManyConsumerOffsets) Code() Code    { return 3024 }
 func (e TooManyConsumerOffsets) Is(target error) bool {
 	_, ok := target.(TooManyConsumerOffsets)
 	return ok

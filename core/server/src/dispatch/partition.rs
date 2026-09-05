@@ -227,7 +227,9 @@ where
             }
         }
         Err(error) => {
-            shard.metrics().record_consumer_offset_denied(error.kind);
+            if !error.uncertain {
+                shard.metrics().record_consumer_offset_denied(error.kind);
+            }
             warn_auto_commit_capacity(namespace, error);
             PartitionReadReply::Rejected(error.into())
         }
@@ -292,7 +294,9 @@ where
             return Ok(());
         }
         Err(error) => {
-            shard.metrics().record_consumer_offset_denied(applied.kind);
+            if !error.uncertain {
+                shard.metrics().record_consumer_offset_denied(applied.kind);
+            }
             warn_auto_commit_capacity(namespace, error);
             applied.rollback_created();
             return Err(error.into());
@@ -327,12 +331,19 @@ fn warn_auto_commit_capacity(
     namespace: IggyNamespace,
     error: partitions::ConsumerOffsetCapacityError,
 ) {
-    if error.first_in_episode {
+    if error.first_in_episode && error.uncertain {
+        warn!(
+            namespace_raw = namespace.inner(),
+            kind = ?error.kind,
+            "consumer offset accounting unavailable during auto-commit"
+        );
+    } else if error.first_in_episode {
         warn!(
             namespace_raw = namespace.inner(),
             kind = ?error.kind,
             occupied = error.occupied,
             limit = error.limit,
+            config = "[partition] consumer_offsets_max",
             "consumer offset map limit reached during auto-commit"
         );
     }
@@ -446,15 +457,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
                 operation = ?header.operation,
                 "partition request with unresolved namespace; replying denied"
             );
-            let status = if matches!(
-                error,
-                IggyError::ConsumerGroupIdNotFound(..) | IggyError::ConsumerGroupNameNotFound(..)
-            ) {
-                error.as_code()
-            } else {
-                IggyError::ResourceNotFound(String::new()).as_code()
-            };
-            send_deny_reply(shard, transport_client_id, &header, status).await;
+            send_deny_reply(shard, transport_client_id, &header, error.as_code()).await;
             return;
         }
     };
@@ -620,14 +623,15 @@ async fn relay_partition_reply<B, MJ, S, SB>(
             // commits moments later. The client's read-timeout is the recovery.
             return;
         };
-        if reply
-            .as_slice()
-            .get(..size_of::<iggy_binary_protocol::ReplyHeader>())
-            .and_then(|bytes| {
-                bytemuck::checked::try_from_bytes::<iggy_binary_protocol::ReplyHeader>(bytes).ok()
-            })
-            .is_some_and(|header| header.status == IggyError::TooManyConsumerOffsets.as_code())
-            && let Some(kind) = consumer_kind
+        if let Some(kind) = consumer_kind
+            && reply
+                .as_slice()
+                .get(..size_of::<iggy_binary_protocol::ReplyHeader>())
+                .and_then(|bytes| {
+                    bytemuck::checked::try_from_bytes::<iggy_binary_protocol::ReplyHeader>(bytes)
+                        .ok()
+                })
+                .is_some_and(|header| header.status == IggyError::TooManyConsumerOffsets.as_code())
         {
             shard.metrics().record_consumer_offset_denied(kind);
         }

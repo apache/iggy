@@ -16,7 +16,7 @@
 // under the License.
 
 use compio::{
-    fs::{OpenOptions, create_dir_all, remove_file},
+    fs::{OpenOptions, create_dir_all, remove_file, rename},
     io::{AsyncReadAt, AsyncReadAtExt, AsyncWriteAtExt},
 };
 use iggy_common::{IggyError, calculate_checksum};
@@ -39,6 +39,9 @@ pub const OFFSET_RECORD_SIZE: usize = OFFSET_SIZE + CHECKSUM_SIZE;
 /// partition incarnation it was applied for.
 pub const PURGE_GENERATION_FILE: &str = "purge.gen";
 
+/// Sibling name an atomic offset replacement writes before its rename lands.
+pub const OFFSET_REPLACEMENT_SUFFIX: &str = ".tmp";
+
 /// `[generation][created_revision]`, both LE u64.
 const PURGE_GENERATION_RECORD_SIZE: usize = 2 * OFFSET_SIZE;
 
@@ -48,7 +51,7 @@ pub enum OffsetRecord {
     /// A usable offset. `checksummed` is false for a bare offset predating the
     /// checksum, read as-is and upgraded by the next write.
     Value { offset: u64, checksummed: bool },
-    /// Shorter than the value: a crash between `persist_offset`'s truncate and write.
+    /// Shorter than the value, such as a legacy interrupted in-place write.
     Torn,
     /// The checksum does not describe the value stored beside it.
     Corrupt {
@@ -109,6 +112,54 @@ pub fn decode_offset_record(bytes: &[u8]) -> OffsetRecord {
 /// # Errors
 /// [`IggyError`] when the directory, file, or write cannot be created or completed.
 pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Result<(), IggyError> {
+    replace_file(path, encode_offset_record(offset), enforce_fsync, false).await
+}
+
+pub(crate) async fn stage_offset_replacement(path: &str, offset: u64) -> Result<(), IggyError> {
+    write_replacement(path, encode_offset_record(offset), true)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn commit_offset_replacement(path: &str) -> Result<(), IggyError> {
+    rename(replacement_path(path), path)
+        .await
+        .map_err(|_| IggyError::CannotWriteToFile)
+}
+
+pub(crate) async fn discard_offset_replacement(path: &str) {
+    let _ = remove_file(replacement_path(path)).await;
+}
+
+async fn replace_file<const N: usize>(
+    path: &str,
+    record: [u8; N],
+    enforce_fsync: bool,
+    sync_parent: bool,
+) -> Result<(), IggyError> {
+    let temporary = write_replacement(path, record, enforce_fsync).await?;
+    if rename(&temporary, path).await.is_err() {
+        let _ = remove_file(&temporary).await;
+        return Err(IggyError::CannotWriteToFile);
+    }
+    if sync_parent && let Some(parent) = Path::new(path).parent() {
+        let parent = compio::fs::File::open(parent)
+            .await
+            .map_err(|_| IggyError::CannotSyncFile)?;
+        parent
+            .sync_all()
+            .await
+            .map_err(|_| IggyError::CannotSyncFile)?;
+    }
+
+    Ok(())
+}
+
+async fn write_replacement<const N: usize>(
+    path: &str,
+    record: [u8; N],
+    enforce_fsync: bool,
+) -> Result<String, IggyError> {
     // No `exists()` probe first: that is a BLOCKING `std::path` stat on the pump
     // in front of every write, which serialises a batched fan-out on stats
     // before it can submit any I/O. `create_dir_all` is already a no-op on an
@@ -119,25 +170,33 @@ pub async fn persist_offset(path: &str, offset: u64, enforce_fsync: bool) -> Res
         })?;
     }
 
+    // Keep the previous cursor intact until the complete replacement exists.
+    // A failed truncate-and-write otherwise turns a valid cursor into a torn
+    // file that boot discards. The fixed sibling is safe because writes to one
+    // consumer key are serialized by the partition pump.
+    let temporary = replacement_path(path);
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(path)
+        .open(&temporary)
         .await
         .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
-    file.write_all_at(encode_offset_record(offset), 0)
-        .await
-        .0
-        .map_err(|_| IggyError::CannotWriteToFile)?;
-
-    if enforce_fsync {
-        file.sync_data()
-            .await
-            .map_err(|_| IggyError::CannotWriteToFile)?;
+    if file.write_all_at(record, 0).await.0.is_err() {
+        let _ = remove_file(&temporary).await;
+        return Err(IggyError::CannotWriteToFile);
     }
 
-    Ok(())
+    if enforce_fsync && file.sync_data().await.is_err() {
+        let _ = remove_file(&temporary).await;
+        return Err(IggyError::CannotWriteToFile);
+    }
+    drop(file);
+    Ok(temporary)
+}
+
+fn replacement_path(path: &str) -> String {
+    format!("{path}{OFFSET_REPLACEMENT_SUFFIX}")
 }
 
 /// Monotone counterpart of [`persist_offset`] for a server auto-commit op.
@@ -196,7 +255,7 @@ pub async fn persist_offset_max(
 /// Durably record the purge generation a partition has locally applied, keyed
 /// to the incarnation (`created_revision`) it was applied for.
 ///
-/// Truncate+write like [`persist_offset`] but ALWAYS data-synced, regardless of
+/// Atomic replacement like [`persist_offset`] but ALWAYS data-synced, regardless of
 /// the consumer-offset fsync knob: purges are rare, the record is 16 bytes, and
 /// a generation lost from the page cache in a crash makes the reconciler
 /// re-purge on restart, wiping messages appended after the purge. A failure
@@ -210,30 +269,10 @@ pub async fn persist_purge_generation(
     generation: u64,
     created_revision: u64,
 ) -> Result<(), IggyError> {
-    if let Some(parent) = Path::new(path).parent() {
-        create_dir_all(parent).await.map_err(|_| {
-            IggyError::CannotCreateConsumerOffsetsDirectory(parent.display().to_string())
-        })?;
-    }
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .await
-        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
     let mut record = [0u8; PURGE_GENERATION_RECORD_SIZE];
     record[..OFFSET_SIZE].copy_from_slice(&generation.to_le_bytes());
     record[OFFSET_SIZE..].copy_from_slice(&created_revision.to_le_bytes());
-    file.write_all_at(record, 0)
-        .await
-        .0
-        .map_err(|_| IggyError::CannotWriteToFile)?;
-    file.sync_data()
-        .await
-        .map_err(|_| IggyError::CannotWriteToFile)?;
-    Ok(())
+    replace_file(path, record, true, true).await
 }
 
 /// Read the purge generation this replica applied for the `created_revision`
@@ -325,14 +364,15 @@ async fn read_offset_record(path: &str) -> Result<Option<OffsetRecord>, IggyErro
 /// Unlink a persisted consumer-offset file. A no-op if the file is absent.
 ///
 /// # Errors
+/// Returns whether a file was removed. An absent file is `Ok(false)`.
 /// Returns [`IggyError::CannotDeleteConsumerOffsetFile`] if the unlink fails.
-pub async fn delete_persisted_offset(path: &str) -> Result<(), IggyError> {
+pub async fn delete_persisted_offset(path: &str) -> Result<bool, IggyError> {
     // NotFound is tolerated on the result instead of probed for: the probe was
     // a blocking stat on the pump before every unlink, and "already gone" is
     // exactly the outcome this wants anyway.
     match remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(IggyError::CannotDeleteConsumerOffsetFile(path.to_owned())),
     }
 }
@@ -474,6 +514,29 @@ mod tests {
                 offset: 114,
                 checksummed: true
             })
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn failed_replacement_keeps_the_previous_offset_file_intact() {
+        let dir = unique_temp_dir();
+        let path = dir.join("42").to_string_lossy().into_owned();
+        persist_offset(&path, 114, true)
+            .await
+            .expect("initial persist");
+        std::fs::create_dir(format!("{path}{OFFSET_REPLACEMENT_SUFFIX}"))
+            .expect("block temporary file creation");
+
+        assert!(persist_offset(&path, 115, true).await.is_err());
+        let bytes = std::fs::read(&path).expect("previous offset survives");
+        assert_eq!(
+            decode_offset_record(&bytes),
+            OffsetRecord::Value {
+                offset: 114,
+                checksummed: true,
+            }
         );
 
         let _ = std::fs::remove_dir_all(&dir);

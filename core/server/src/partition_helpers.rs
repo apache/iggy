@@ -187,17 +187,17 @@ pub fn configure_consumer_offsets(
     // path, where the max leaves `current_offset` in charge as before.
     let offset_space_ceiling = current_offset.max(partition.mint_frontier().saturating_sub(1));
 
-    let (loaded_consumer_offsets, stranded_consumers) = load_partition_consumer_offsets(
+    let recovered_consumers = load_partition_consumer_offsets(
         &consumer_offsets_path,
         "consumer",
         stream_id,
         topic_id,
         partition_id,
     )?;
-    let consumer_offsets = ConsumerOffsets::with_capacity(loaded_consumer_offsets.len());
+    let consumer_offsets = ConsumerOffsets::with_capacity(recovered_consumers.entries.len());
     {
         let guard = consumer_offsets.pin();
-        for offset in loaded_consumer_offsets {
+        for offset in recovered_consumers.entries {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
             if recovered_offset > offset_space_ceiling {
                 // A crash can persist an offset ahead of the flushed data
@@ -228,16 +228,17 @@ pub fn configure_consumer_offsets(
         }
     }
 
-    let (loaded_group_offsets, stranded_groups) = load_partition_consumer_group_offsets(
+    let recovered_groups = load_partition_consumer_group_offsets(
         &consumer_group_offsets_path,
         stream_id,
         topic_id,
         partition_id,
     )?;
-    let consumer_group_offsets = ConsumerGroupOffsets::with_capacity(loaded_group_offsets.len());
+    let consumer_group_offsets =
+        ConsumerGroupOffsets::with_capacity(recovered_groups.entries.len());
     {
         let guard = consumer_group_offsets.pin();
-        for (group_id, offset) in loaded_group_offsets {
+        for (group_id, offset) in recovered_groups.entries {
             let recovered_offset = offset.offset.load(Ordering::Relaxed);
             if recovered_offset > offset_space_ceiling {
                 warn!(
@@ -277,13 +278,13 @@ pub fn configure_consumer_offsets(
         consumer_group_offsets,
         enforce_fsync,
     );
-    for consumer_id in stranded_consumers {
+    for consumer_id in recovered_consumers.stranded_ids {
         if partition.seed_stranded_consumer_offset(ConsumerKind::Consumer, consumer_id) {
             warn!(stream_id, topic_id, partition_id, consumer_id, path = %consumer_offsets_path,
                 "unloaded consumer offset file retains its capacity slot until updated or deleted");
         }
     }
-    for group_id in stranded_groups {
+    for group_id in recovered_groups.stranded_ids {
         if partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, group_id) {
             warn!(stream_id, topic_id, partition_id, group_id, path = %consumer_group_offsets_path,
                 "unloaded group offset file retains its capacity slot until repaired or reclaimed");
@@ -314,13 +315,19 @@ fn load_partition_consumer_offsets(
     partition_id: usize,
 ) -> Result<RecoveredOffsets<iggy_common::ConsumerOffset>, ServerError> {
     if !Path::new(path).exists() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(RecoveredOffsets {
+            entries: Vec::new(),
+            stranded_ids: Vec::new(),
+        });
     }
 
     load_consumer_offsets(path).or_else(|source| {
         if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
         {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(RecoveredOffsets {
+                entries: Vec::new(),
+                stranded_ids: Vec::new(),
+            });
         }
 
         Err(ServerError::ConsumerOffsetsLoad {
@@ -344,13 +351,19 @@ fn load_partition_consumer_group_offsets(
     ServerError,
 > {
     if !Path::new(path).exists() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(RecoveredOffsets {
+            entries: Vec::new(),
+            stranded_ids: Vec::new(),
+        });
     }
 
     load_consumer_group_offsets(path).or_else(|source| {
         if matches!(&source, IggyError::CannotReadConsumerOffsets(missing_path) if !Path::new(missing_path).exists())
         {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(RecoveredOffsets {
+                entries: Vec::new(),
+                stranded_ids: Vec::new(),
+            });
         }
 
         Err(ServerError::ConsumerOffsetsLoad {
