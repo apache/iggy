@@ -23,12 +23,46 @@ import org.apache.iggy.exception.IggyInvalidArgumentException;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public class IdentifierTest {
     @Test
     void constructorThrowsIggyInvalidArgumentExceptionWhenBothNameAndIdAreProvided() {
         assertThatThrownBy(() -> new FakeIdentifier("foo", 123L)).isInstanceOf(IggyInvalidArgumentException.class);
+    }
+
+    @Test
+    void getSizeCountsEncodedBytesOfName() {
+        assertThat(new FakeIdentifier("世界", null).getSize()).isEqualTo(2 + 6);
+    }
+
+    @Test
+    void getEncodedNameReturnsUtf8BytesOfName() {
+        assertThat(new FakeIdentifier("世界", null).getEncodedName()).isEqualTo("世界".getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void getEncodedNameIsNullForNumericIdentifier() {
+        assertThat(new FakeIdentifier(null, 7L).getEncodedName()).isNull();
+    }
+
+    @Test
+    void constructorAcceptsNameOfExactly255EncodedBytes() {
+        String name = "世".repeat(85);
+        assertThat(name.getBytes(StandardCharsets.UTF_8)).hasSize(255);
+        assertThat(new FakeIdentifier(name, null).getName()).isEqualTo(name);
+    }
+
+    @Test
+    void constructorThrowsWhenNameExceeds255EncodedBytesEvenIfUnder255Chars() {
+        String name = "あ".repeat(200);
+        assertThat(name.length()).isLessThan(255);
+        assertThatThrownBy(() -> new FakeIdentifier(name, null))
+                .isInstanceOf(IggyInvalidArgumentException.class)
+                .hasMessageContaining("600");
     }
 
     static class FakeIdentifier extends Identifier {

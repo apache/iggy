@@ -20,6 +20,7 @@
 package org.apache.iggy.client.blocking.tcp;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.exception.IggyInvalidArgumentException;
@@ -36,6 +37,8 @@ import org.apache.iggy.user.StreamPermissions;
 import org.apache.iggy.user.TopicPermissions;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -205,6 +208,31 @@ class BytesSerializerTest {
             result.readBytes(stringBytes);
             assertThat(stringBytes).isEqualTo(expectedBytes);
         }
+
+        @Test
+        void shouldSerializeStringOfExactly255EncodedBytes() {
+            // given
+            String input = "世".repeat(85);
+
+            // when
+            ByteBuf result = BytesSerializer.toBytes(input);
+
+            // then
+            assertThat(result.readUnsignedByte()).isEqualTo((short) 255);
+            assertThat(result.readableBytes()).isEqualTo(255);
+        }
+
+        @Test
+        void shouldRejectStringLongerThan255EncodedBytesEvenIfUnder255Chars() {
+            // given
+            String input = "あ".repeat(86);
+            assertThat(input.length()).isLessThan(255);
+
+            // when / then
+            assertThatThrownBy(() -> BytesSerializer.toBytes(input))
+                    .isInstanceOf(IggyInvalidArgumentException.class)
+                    .hasMessageContaining("258");
+        }
     }
 
     @Nested
@@ -238,6 +266,44 @@ class BytesSerializerTest {
             byte[] nameBytes = new byte[11];
             result.readBytes(nameBytes);
             assertThat(new String(nameBytes)).isEqualTo("test-stream");
+        }
+
+        @Test
+        void shouldSerializeUtf8StringIdentifierWithByteLength() {
+            // given
+            String name = "strumień-世界";
+            byte[] expectedBytes = name.getBytes(StandardCharsets.UTF_8);
+            var identifier = StreamId.of(name);
+
+            // when
+            ByteBuf result = BytesSerializer.toBytes(identifier);
+
+            // then
+            assertThat(expectedBytes.length).isGreaterThan(name.length());
+            assertThat(result.readableBytes()).isEqualTo(identifier.getSize());
+            assertThat(result.readByte()).isEqualTo((byte) 2); // kind = 2 (string)
+            assertThat(result.readByte()).isEqualTo((byte) expectedBytes.length);
+            byte[] nameBytes = new byte[expectedBytes.length];
+            result.readBytes(nameBytes);
+            assertThat(nameBytes).isEqualTo(expectedBytes);
+            assertThat(result.readableBytes()).isEqualTo(0);
+        }
+
+        @ParameterizedTest
+        @CsvSource({
+            "café,       02 05 63 61 66 C3 A9",
+            "naïve-café, 02 0C 6E 61 C3 AF 76 65 2D 63 61 66 C3 A9",
+            "日本語,     02 09 E6 97 A5 E6 9C AC E8 AA 9E",
+        })
+        void shouldMatchServerWireFormatForNonAsciiNames(String name, String expectedHex) {
+            // given
+            var identifier = StreamId.of(name);
+
+            // when
+            ByteBuf result = BytesSerializer.toBytes(identifier);
+
+            // then
+            assertThat(ByteBufUtil.hexDump(result).toUpperCase()).isEqualTo(expectedHex.replace(" ", ""));
         }
     }
 
