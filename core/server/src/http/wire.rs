@@ -241,7 +241,7 @@ mod tests {
     };
 
     use crate::http::error::{Consistency, ConsistencyQuery};
-    use crate::responses::build_polled_messages_body;
+    use crate::reply_frame::build_polled_messages_body;
 
     fn produce_command(partitioning: Partitioning) -> SendMessages {
         let first = iggy_common::IggyMessage::builder()
