@@ -65,6 +65,22 @@ export type SendCommandOptions = {
   deadline?: number
 };
 
+export type ClientEventMap = {
+  /** Emitted when a transport connection attempt starts */
+  connecting: [],
+  /** Emitted when the TCP connection or TLS handshake is ready */
+  connected: [],
+  /** Emitted when the transport reports an error */
+  error: [error: Error]
+};
+
+export type RawClientEventMap = ClientEventMap & {
+  eviction: [error: Error],
+  finishQueue: [],
+  heartbeat: [],
+  sessionReset: []
+};
+
 /**
  * Low-level client interface for communicating with the Iggy server.
  * Provides direct access to command sending and event handling.
@@ -85,9 +101,15 @@ export type RawClient = {
   /** Holds a pooled client across multiple command submissions */
   hold?: () => () => void,
   /** Registers an event listener */
-  on: (ev: string, cb: (e?: unknown) => void) => void
+  on: <Event extends keyof RawClientEventMap>(
+    event: Event,
+    listener: (...args: RawClientEventMap[Event]) => void
+  ) => void
   /** Registers a one-time event listener */
-  once: (ev: string, cb: (e?: unknown) => void) => void
+  once: <Event extends keyof RawClientEventMap>(
+    event: Event,
+    listener: (...args: RawClientEventMap[Event]) => void
+  ) => void
   /** Returns the underlying readable stream */
   getReadStream: () => Readable
 }

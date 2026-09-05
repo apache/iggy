@@ -164,6 +164,9 @@ export class IggyConnection extends EventEmitter {
   private connectPromise?: Promise<this>;
   /** Shared promise for callers waiting on automatic reconnection */
   private reconnectPromise?: Promise<this>;
+  /** Avoids duplicating the constructor's deferred attempt notification */
+  private announcedAttemptSocket?: Socket;
+  private initialAttemptNotificationPending: boolean;
   /** Endpoint the client was configured with, kept across leader redirects */
   private readonly seedOptions: ClientConfig['options'];
   /**
@@ -195,10 +198,19 @@ export class IggyConnection extends EventEmitter {
     this.reconnectCount = 0;
     this.connectPromise = undefined;
     this.reconnectPromise = undefined;
+    this.announcedAttemptSocket = undefined;
+    this.initialAttemptNotificationPending = true;
     this.responseDecoder = new ResponseFrameDecoder(
       config.maxResponseFrameSize ?? DEFAULT_MAX_RESPONSE_FRAME_SIZE
     );
     this.socket = this._installSocket(getTransport(config));
+    const initialSocket = this.socket;
+    queueMicrotask(() => {
+      if (!this.initialAttemptNotificationPending)
+        return;
+      this.initialAttemptNotificationPending = false;
+      this._announceConnectionAttempt(initialSocket);
+    });
   }
 
   /**
@@ -224,6 +236,8 @@ export class IggyConnection extends EventEmitter {
     socket.on('error', (err: SocketError) => {
       if (this.socket !== socket)
         return;
+      if (this.announcedAttemptSocket === socket)
+        this.announcedAttemptSocket = undefined;
       debug('socket/error event', err, err.code, this.ending);
       if (this.ending && (err?.code === 'ECONNRESET' || err?.code === 'EPIPE'))
         return
@@ -249,6 +263,7 @@ export class IggyConnection extends EventEmitter {
       debug('socket/close event', hadError);
       this.connected = false;
       this.connecting = false;
+      this.announcedAttemptSocket = undefined;
       this.connectPromise = undefined;
       this._endResponseWait();
       this.emit('disconnected', hadError);
@@ -304,6 +319,8 @@ export class IggyConnection extends EventEmitter {
    * either. It matches the Rust, Go and C# SDKs'.
    */
   private async _dialWithin(socket: Socket, bounded: boolean): Promise<this> {
+    this.initialAttemptNotificationPending = false;
+    this._announceConnectionAttempt(socket);
     if (!bounded)
       return this._waitForConnection(socket);
 
@@ -325,6 +342,16 @@ export class IggyConnection extends EventEmitter {
     } finally {
       clearTimeout(expire);
     }
+  }
+
+  private _announceConnectionAttempt(socket: Socket): void {
+    if (this.announcedAttemptSocket === socket ||
+        this.socket !== socket ||
+        this.connected ||
+        this.ending)
+      return;
+    this.announcedAttemptSocket = socket;
+    this.emit('connecting');
   }
 
   /**
