@@ -26,8 +26,17 @@
 use crate::Simulator;
 use crate::workload::state_checker::StateChecker;
 use crate::workload::{CLIENT_REQUEST_QUEUE_MAX, Workload};
+use consensus::{Consensus, MetadataHandle};
 use server_common::sharding::IggyNamespace;
 use std::collections::HashMap;
+
+/// Ticks a `Normal` metadata primary may sit behind its own recovery barrier
+/// before the run is called wedged.
+///
+/// A primary below the barrier admits nothing. Transient while a resumed primary
+/// re-pipelines its suffix, a handful of round trips, so two orders of magnitude
+/// of slack: only a barrier nothing will ever lower trips it.
+const RECOVERY_BARRIER_WEDGE_TICKS: u32 = 2_000;
 
 /// Per-(replica, namespace) high-water marks carried across ticks so each new
 /// reading can be compared against the last.
@@ -35,6 +44,9 @@ use std::collections::HashMap;
 pub struct Invariants {
     commit_offset: HashMap<(u8, IggyNamespace), u64>,
     view: HashMap<(u8, IggyNamespace), u64>,
+    /// Consecutive ticks a replica has been a `Normal` metadata primary still
+    /// gated by its recovery barrier. Reset as soon as any of that stops holding.
+    barrier_gated_ticks: HashMap<u8, u32>,
     /// Cross-replica committed-log agreement. Runs every tick like the rest, so a
     /// divergence is reported where it appears rather than at the next quiesce.
     state_checker: StateChecker,
@@ -71,8 +83,10 @@ impl Invariants {
 
         for replica_idx in 0..sim.replica_count {
             if sim.is_crashed(replica_idx) {
+                self.barrier_gated_ticks.remove(&replica_idx);
                 continue;
             }
+            self.check_recovery_barrier(sim, seed, replica_idx);
             for &ns in &workload.options.namespaces {
                 if let Some(offsets) = sim.offsets(usize::from(replica_idx), ns) {
                     let cur = offsets.commit_offset;
@@ -100,6 +114,49 @@ impl Invariants {
         );
 
         self.state_checker.check(sim, seed);
+    }
+
+    /// Catch a metadata primary permanently shut behind its own recovery barrier.
+    ///
+    /// The shape `VsrConsensus::redecide_recovery_barrier` fixes, caught from the
+    /// outside: a primary that can never clear its barrier drops every request as
+    /// `NotReady`, which otherwise surfaces only as an unexplained stall.
+    ///
+    /// # Panics
+    /// When a `Normal` metadata primary sits below its barrier for
+    /// [`RECOVERY_BARRIER_WEDGE_TICKS`] consecutive ticks.
+    fn check_recovery_barrier(&mut self, sim: &Simulator, seed: u64, replica_idx: u8) {
+        let Some(consensus) = sim.replicas[usize::from(replica_idx)].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+        else {
+            return;
+        };
+        let gated = consensus.is_primary()
+            && !consensus.has_ceded_primaryship()
+            && consensus.is_normal()
+            && consensus.commit_max() < consensus.recovery_barrier();
+        if !gated {
+            self.barrier_gated_ticks.remove(&replica_idx);
+            return;
+        }
+        let ticks = self
+            .barrier_gated_ticks
+            .entry(replica_idx)
+            .and_modify(|ticks| *ticks += 1)
+            .or_insert(1);
+        assert!(
+            *ticks < RECOVERY_BARRIER_WEDGE_TICKS,
+            "replica {replica_idx} has been a Normal metadata primary gated by its recovery \
+             barrier for {ticks} ticks: barrier={} commit={}..{} view={}. Nothing lowers the \
+             barrier, so this primary drops every client request from here on (seed={seed:#x})",
+            consensus.recovery_barrier(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+            consensus.view(),
+        );
     }
 
     /// The canonical committed chain built so far. Tests read it to prove the

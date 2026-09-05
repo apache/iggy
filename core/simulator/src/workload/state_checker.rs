@@ -35,6 +35,7 @@ use crate::Simulator;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::PrepareHeader;
 use journal::Journal;
+use server_common::sharding::IggyNamespace;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One op of the canonical committed chain.
@@ -289,6 +290,67 @@ pub fn assert_committed_prefixes_agree(sim: &Simulator, seed: u64) -> usize {
         }
     }
     witnesses.values().filter(|&&count| count > 1).count()
+}
+
+/// Assert every live replica's committed partition prefix agrees, op for op.
+///
+/// Partition-plane counterpart of [`assert_committed_prefixes_agree`], and the only
+/// check comparing what replicas committed on this plane rather than how much. The
+/// quiesce oracle otherwise bounds only that no backup committed past its leader.
+///
+/// Two differences from the metadata twin, both from the partition journal evicting
+/// its committed prefix as it flushes to segments:
+///
+/// * A missing header is ordinary, not a hole, so this compares only the ops two
+///   replicas both still hold: the recently committed tail, where a bad repair or a
+///   mis-decided view change lands.
+/// * Identity, not the sealed checksum. `restamp_prepare_view` rewrites the view on
+///   retransmit, so `identity_checksum` compares the entry, not the delivery.
+///
+/// Returns ops witnessed by more than one replica, summed over every namespace.
+///
+/// # Panics
+/// If two live replicas hold different entries at the same committed partition op.
+#[must_use]
+pub fn assert_partition_prefixes_agree(
+    sim: &Simulator,
+    namespaces: &[IggyNamespace],
+    seed: u64,
+) -> usize {
+    let mut compared = 0;
+    for &namespace in namespaces {
+        let mut canonical: BTreeMap<u64, (u128, u8)> = BTreeMap::new();
+        let mut witnesses: BTreeMap<u64, usize> = BTreeMap::new();
+        for replica_idx in 0..sim.replica_count {
+            if sim.is_crashed(replica_idx) {
+                continue;
+            }
+            let idx = usize::from(replica_idx);
+            let Some(state) = sim.partition_consensus_state(idx, namespace) else {
+                continue;
+            };
+            for op in 1..=state.commit_min {
+                let Some(header) = sim.partition_journaled_header(idx, namespace, op) else {
+                    continue;
+                };
+                let identity = header.identity_checksum();
+                if let Some(&(expected, owner)) = canonical.get(&op) {
+                    assert_eq!(
+                        identity, expected,
+                        "at quiesce replica {replica_idx} and replica {owner} disagree on \
+                         committed partition op {op} of ns {namespace:?}: {identity:#x} vs \
+                         {expected:#x} (seed={seed:#x})",
+                    );
+                    *witnesses.entry(op).or_insert(1) += 1;
+                } else {
+                    canonical.insert(op, (identity, replica_idx));
+                    witnesses.insert(op, 1);
+                }
+            }
+        }
+        compared += witnesses.values().filter(|&&count| count > 1).count();
+    }
+    compared
 }
 
 /// Whether a committed op having no journal header is legitimate rather than a

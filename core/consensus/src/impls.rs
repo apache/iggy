@@ -1729,6 +1729,33 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.recovery_barrier.set(required_commit);
     }
 
+    /// Re-decide the barrier against a log head the cluster just settled.
+    ///
+    /// Boot arms it at the recovered journal head: those ops were acked before the
+    /// restart, so admitting writes before they re-commit rolls back committed
+    /// history. It otherwise clears only by `commit_max` passing it, which never
+    /// happens when a view change discards the suffix instead of re-committing it.
+    /// The boot re-pipeline already ran, so nothing re-prepares those ops,
+    /// `is_caught_up_primary` stays shut, and the primary drops the very requests
+    /// that would raise `commit_max`.
+    ///
+    /// Call this wherever the head is authoritatively re-decided: a merged log at
+    /// view start, an adopted `StartView`. `head` lowers the barrier when the view
+    /// truncated the suffix, keeps it when the suffix survived.
+    pub fn redecide_recovery_barrier(&self, head: u64) {
+        let barrier = self.recovery_barrier.get();
+        if barrier == 0 {
+            return;
+        }
+        let barrier = barrier.min(head);
+        self.recovery_barrier
+            .set(if barrier <= self.commit_max.get() {
+                0
+            } else {
+                barrier
+            });
+    }
+
     /// Deadline paired with [`Self::recovery_barrier`]; only meaningful while the
     /// barrier is armed (non-zero).
     #[must_use]
@@ -3363,6 +3390,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // frame, and either value leaves this replica chasing an unservable head.
         let announced = self.adopt_start_view_suffix(header, suffix_body);
         self.sequencer.set_sequence(announced);
+        // Settle a gated suffix's fate as a backup too, so a later election inherits
+        // a decided barrier rather than a latched one.
+        self.redecide_recovery_barrier(announced);
 
         // Update timeouts for normal backup operation
         {
@@ -3703,6 +3733,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.status.set(Status::Normal);
         self.ceded_primaryship.set(false);
         self.sequencer.set_sequence(new_op);
+        // Only place a promotion learns what the merge did to a gated suffix.
+        self.redecide_recovery_barrier(new_op);
         if let Some(head) = merged.headers.first() {
             // Keep the hash chain continuous: the next prepare must chain onto the
             // head this view adopted, not onto whatever was appended last.
@@ -4544,6 +4576,32 @@ mod timestamp_clamp_tests {
         msg
     }
 
+    /// [`make_start_view`] with commit decoupled from head, for a view that keeps
+    /// an uncommitted suffix.
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_start_view_with_commit(
+        view: u32,
+        op: u64,
+        commit: u64,
+        replica: u8,
+    ) -> Message<StartViewHeader> {
+        let size = std::mem::size_of::<StartViewHeader>();
+        let mut msg = Message::<StartViewHeader>::new(size);
+        let header = bytemuck::checked::try_from_bytes_mut::<StartViewHeader>(
+            &mut msg.as_mut_slice()[..size],
+        )
+        .expect("zeroed bytes are a valid StartViewHeader");
+        header.command = Command::StartView;
+        header.cluster = 1;
+        header.view = view;
+        header.op = op;
+        header.commit = commit;
+        header.replica = replica;
+        header.group = METADATA_GROUP;
+        header.size = size as u32;
+        msg
+    }
+
     #[test]
     fn given_recovering_replica_when_start_view_incarnation_foreign_should_ignore() {
         // A StartView addressed to a PREVIOUS incarnation, still in flight when the
@@ -4720,6 +4778,92 @@ mod timestamp_clamp_tests {
              cannot outrank it with a discarded suffix"
         );
         assert_eq!(consensus.status(), Status::Normal);
+    }
+
+    /// The wedge `redecide_recovery_barrier` exists for: a view
+    /// change discards the recovered suffix, the replica later wins an election,
+    /// and a barrier pinned to a head that no longer exists shuts admission.
+    #[test]
+    fn given_a_discarded_suffix_when_adopting_a_view_should_lower_the_barrier() {
+        // Recovered at head 120, proven committed only through 100.
+        let mut consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        consensus.set_view(7);
+        consensus.set_log_view(7);
+        consensus.sequencer().set_sequence(120);
+        consensus.restore_commit_state(100, 100);
+        consensus.set_recovery_barrier(120);
+
+        // The view's head is 105: 106..=120 committed nowhere, so the view drops
+        // them and nothing re-prepares them.
+        assert!(
+            !consensus
+                .handle_start_view(
+                    PlaneKind::Metadata,
+                    make_start_view(7, 105, 1, 0).header(),
+                    &[]
+                )
+                .is_empty(),
+            "the StartView at the commit floor must be adopted"
+        );
+        assert_eq!(
+            consensus.recovery_barrier(),
+            0,
+            "the adopted head settled the suffix's fate and commit_max covers it, \
+             so the barrier must clear rather than latch"
+        );
+        assert!(
+            is_caught_up_primary_barrier_open(&consensus),
+            "a cleared barrier must stop gating admission"
+        );
+    }
+
+    /// The other half: lowering the barrier to the adopted head must not read as
+    /// clearing it while the suffix survives.
+    #[test]
+    fn given_a_surviving_suffix_when_adopting_a_view_should_keep_the_barrier() {
+        let mut consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        consensus.set_view(7);
+        consensus.set_log_view(7);
+        consensus.sequencer().set_sequence(120);
+        consensus.restore_commit_state(100, 100);
+        consensus.set_recovery_barrier(120);
+
+        // Head 120, commit still 100: 101..=120 re-replicate under the new view.
+        let start_view = make_start_view_with_commit(7, 120, 100, 1);
+        assert!(
+            !consensus
+                .handle_start_view(PlaneKind::Metadata, start_view.header(), &[])
+                .is_empty(),
+            "the StartView carrying the surviving suffix must be adopted"
+        );
+        assert_eq!(
+            consensus.recovery_barrier(),
+            120,
+            "a suffix the view kept is still unproven, so its gate must stand"
+        );
+        assert!(
+            !is_caught_up_primary_barrier_open(&consensus),
+            "an unproven suffix must keep admission shut"
+        );
+    }
+
+    #[test]
+    fn given_no_recovered_suffix_when_redeciding_should_stay_disarmed() {
+        // Nothing gated, so no view change may invent a gate.
+        let consensus = VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        consensus.redecide_recovery_barrier(9);
+        assert_eq!(consensus.recovery_barrier(), 0);
+    }
+
+    /// The `commit_max >= recovery_barrier` clause of `is_caught_up_primary`, read
+    /// directly so these tests need not satisfy the primary/status clauses.
+    fn is_caught_up_primary_barrier_open<B: MessageBus, P>(consensus: &VsrConsensus<B, P>) -> bool
+    where
+        P: Pipeline<Entry = PipelineEntry>,
+    {
+        consensus.commit_max() >= consensus.recovery_barrier()
     }
 
     /// The split-brain gate's predicate: `view` and `log_view` each independently
@@ -5075,6 +5219,8 @@ mod vsr_consensus_tests {
         // now measuring op 2 rather than carrying op 1's elapsed ticks.
         consensus.advance_commit_max(1);
         assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        // As real callers do, per entry: the next drain starts at the op now owed.
+        consensus.advance_commit_min(1);
         assert!(
             prepare_ticking(&consensus),
             "a remaining prepare keeps the timer armed"
@@ -5082,6 +5228,7 @@ mod vsr_consensus_tests {
 
         consensus.advance_commit_max(2);
         assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        consensus.advance_commit_min(2);
         assert!(
             !prepare_ticking(&consensus),
             "draining the last prepare disarms the timer without waiting for it to fire"

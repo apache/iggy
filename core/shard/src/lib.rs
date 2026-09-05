@@ -5550,9 +5550,12 @@ where
             // from the evicted ring or the flushed segments.
             let missing = {
                 let journal = partition.log.journal();
-                first_op_not_covered(&pending, consensus.commit_min(), |op| {
-                    journal.inner.header_by_op(op)
-                })
+                first_op_not_covered(
+                    &pending,
+                    consensus.commit_min(),
+                    consensus.commit_min(),
+                    |op| journal.inner.header_by_op(op),
+                )
             };
             if let Some(missing_op) = missing {
                 tracing::debug!(
@@ -5680,15 +5683,22 @@ where
                 // debounce and logs the state each interval.
                 return;
             }
-            // Primary-elect only. Its window starts at the merged log's commit
-            // point, which can sit below local `commit_min` (the headers inherited
-            // from senders behind the canonical log_view live there), so
-            // `commit_min + 1` would skip them. A backup's parked `StartView`
-            // suffix is only a verification reference; resuming from its commit
-            // point would restart at the view's opening head, not at the gap.
+            // Primary-elect only, and floored at `merged_log_scan_floor` so a
+            // retry re-requests the window the initial arm did. The merged log's
+            // commit point can sit below local `commit_min` (the headers
+            // inherited from senders behind the canonical log_view live there),
+            // so `commit_min + 1` would skip them, and above it when the local
+            // prefix has a hole, so the commit point alone would skip that. A
+            // backup's parked `StartView` suffix is only a verification
+            // reference; resuming from its commit point would restart at the
+            // view's opening head, not at the gap.
             let from_op = consensus
                 .is_primary_for_view(consensus.view())
-                .then(|| consensus.with_pending_view_log(|pending| pending.commit_max.max(1)))
+                .then(|| {
+                    consensus.with_pending_view_log(|pending| {
+                        merged_log_scan_floor(pending, consensus.commit_min())
+                    })
+                })
                 .flatten()
                 .unwrap_or_else(|| consensus.commit_min() + 1);
             if from_op <= to_op {
@@ -5915,7 +5925,7 @@ where
         // one back: demanding one parks the view change forever on an op already
         // applied and durable in the snapshot.
         let repair_floor = journal.handle().snapshot_op();
-        let missing = first_op_not_covered(&pending, repair_floor, |op| {
+        let missing = first_op_not_covered(&pending, repair_floor, consensus.commit_min(), |op| {
             usize::try_from(op)
                 .ok()
                 .and_then(|slot| journal.handle().header(slot))
@@ -9993,6 +10003,16 @@ where
     }
 }
 
+/// Lowest op of a primary-elect's merged log this replica can be held to.
+///
+/// The merged commit point is what the cluster committed, `commit_min` what this
+/// replica applied; they diverge exactly when the local prefix has a hole. The
+/// lower of the two keeps coverage, repair scope and the stall retry answering
+/// the same question about that hole.
+fn merged_log_scan_floor(pending: &MergedLog, commit_min: u64) -> u64 {
+    pending.commit_max.min(commit_min + 1).max(1)
+}
+
 /// Whether a repaired prepare at `op` falls inside the range this replica is
 /// currently repairing.
 ///
@@ -10013,7 +10033,7 @@ fn repair_op_in_scope(
     pending
         .filter(|_| is_primary_elect)
         .map_or(op > commit_min, |pending| {
-            (op >= pending.commit_max.max(1) && op <= pending.op_head)
+            (op >= merged_log_scan_floor(pending, commit_min) && op <= pending.op_head)
                 || pending
                     .committed_elsewhere
                     .iter()
@@ -10716,9 +10736,14 @@ const fn header_is_view_entry(local: &PrepareHeader, canonical: &PrepareHeader) 
 /// Neither can diverge from the merged log (a committed or compacted op is the
 /// quorum's op), and no repair puts the journal entry back, so demanding one parks
 /// the view change forever.
+///
+/// Opens at [`merged_log_scan_floor`]: the merged commit point alone would declare
+/// the log serveable over a local gap, promoting a replica whose `CommitJournal`
+/// gap-stops below where `RebuildPipeline` seeds.
 fn first_op_not_covered(
     pending: &MergedLog,
     repair_floor: u64,
+    commit_min: u64,
     header_at: impl Fn(u64) -> Option<PrepareHeader>,
 ) -> Option<u64> {
     let held = |op: u64| {
@@ -10732,7 +10757,7 @@ fn first_op_not_covered(
             .find(|header| header.op == op)
             .is_none_or(|canonical| header_is_view_entry(&local, canonical))
     };
-    (pending.commit_max.max(1).max(repair_floor + 1)..=pending.op_head)
+    (merged_log_scan_floor(pending, commit_min).max(repair_floor + 1)..=pending.op_head)
         .find(|op| !held(*op))
         .or_else(|| {
             pending
@@ -11359,7 +11384,7 @@ mod view_coverage_tests {
             committed_elsewhere: Vec::new(),
         };
         let held = [sealed(100, 1), sealed(99, 7), sealed(98, 1)];
-        let missing = first_op_not_covered(&pending, 0, |op| {
+        let missing = first_op_not_covered(&pending, 0, pending.commit_max, |op| {
             held.iter().find(|header| header.op == op).copied()
         });
         assert_eq!(missing, Some(99));
@@ -11383,14 +11408,77 @@ mod view_coverage_tests {
         };
         let nothing_resident = |_: u64| None;
         assert_eq!(
-            first_op_not_covered(&pending, 0, nothing_resident),
+            first_op_not_covered(&pending, 0, pending.commit_max, nothing_resident),
             Some(256),
             "unfloored, the evicted committed op reads as an unfillable hole"
         );
         assert_eq!(
-            first_op_not_covered(&pending, 256, nothing_resident),
+            first_op_not_covered(&pending, 256, pending.commit_max, nothing_resident),
             None,
             "floored at the local commit point, the view starts"
+        );
+    }
+
+    #[test]
+    fn given_a_hole_below_the_merged_commit_point_when_scanning_should_report_it() {
+        // Missed op 7 and kept taking prepares above it: the cluster committed
+        // through 10 while this state machine stopped at 6. From the merged commit
+        // point the view would start over the gap and the first quorum ack would
+        // apply an op with 7..=10 never executed locally.
+        let pending = MergedLog {
+            op_head: 12,
+            commit_max: 10,
+            headers: (7..=12).rev().map(|op| sealed(op, 1)).collect(),
+            committed_elsewhere: Vec::new(),
+        };
+        let held: Vec<_> = (8..=12).map(|op| sealed(op, 1)).collect();
+        let missing = first_op_not_covered(&pending, 0, 6, |op| {
+            held.iter().find(|header| header.op == op).copied()
+        });
+        assert_eq!(
+            missing,
+            Some(7),
+            "a hole below the merged commit point must park the view change"
+        );
+    }
+
+    #[test]
+    fn given_a_contiguous_prefix_when_scanning_should_open_at_the_merged_commit_point() {
+        // Nothing missing below, so both bounds coincide. Op 9 is held but is not
+        // the view's op 9, so the commit point itself is still identity-checked.
+        let pending = MergedLog {
+            op_head: 12,
+            commit_max: 9,
+            headers: (9..=12).rev().map(|op| sealed(op, 1)).collect(),
+            committed_elsewhere: Vec::new(),
+        };
+        let held: Vec<_> = (9..=12)
+            .map(|op| sealed(op, if op == 9 { 7 } else { 1 }))
+            .collect();
+        let missing = first_op_not_covered(&pending, 0, pending.commit_max, |op| {
+            held.iter().find(|header| header.op == op).copied()
+        });
+        assert_eq!(
+            missing,
+            Some(9),
+            "the merged commit point stays in scope when the prefix is contiguous"
+        );
+    }
+
+    #[test]
+    fn given_a_hole_when_scoping_repair_should_admit_the_missing_op() {
+        // Coverage and scope must agree: the scan parks on op 7, so op 7's repaired
+        // prepare must be ingested. From the merged commit point it would be
+        // requested and then refused.
+        let pending = MergedLog {
+            op_head: 12,
+            commit_max: 10,
+            headers: (7..=12).rev().map(|op| sealed(op, 1)).collect(),
+            committed_elsewhere: Vec::new(),
+        };
+        assert!(
+            super::repair_op_in_scope(Some(&pending), true, 6, 7),
+            "the op the coverage scan parked on must be in repair scope"
         );
     }
 }
