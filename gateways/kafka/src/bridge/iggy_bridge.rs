@@ -223,8 +223,8 @@ impl IggyBridge {
     /// partition of the Iggy topic `kafka_topic` maps to.
     ///
     /// Takes `kafka_topic`, not raw Iggy stream/topic names, and resolves it through the same
-    /// [`TopicMapping`](crate::bridge::topic_map::TopicMapping) [`ensure_stream_and_topic`]
-    /// uses - a caller (a future `ListOffsets` handler, `#3537`) only ever has the Kafka-side
+    /// [`TopicMapping`](crate::bridge::topic_map::TopicMapping) `ensure_stream_and_topic`
+    /// uses - a caller (a future `ListOffsets` handler ) only ever has the Kafka-side
     /// name, and a topic with a mapping override would silently query the wrong Iggy resource
     /// if this took Iggy-space names directly instead.
     ///
