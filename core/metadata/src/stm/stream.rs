@@ -782,7 +782,10 @@ impl StreamsInner {
         self.pending_revocations_count = count;
     }
 
-    pub(crate) fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+    /// Resolve a wire stream identifier to its committed slab id, `None` when
+    /// the stream does not exist.
+    #[must_use]
+    pub fn resolve_stream_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
                 let id = *id as usize;
@@ -796,11 +799,11 @@ impl StreamsInner {
         }
     }
 
-    pub(crate) fn resolve_topic_id(
-        &self,
-        stream_id: usize,
-        identifier: &WireIdentifier,
-    ) -> Option<usize> {
+    /// Resolve a wire topic identifier within the stream already resolved to
+    /// slab id `stream_id` to its committed slab id, `None` when the stream or
+    /// topic does not exist.
+    #[must_use]
+    pub fn resolve_topic_id(&self, stream_id: usize, identifier: &WireIdentifier) -> Option<usize> {
         let stream = self.items.get(stream_id)?;
         match identifier {
             WireIdentifier::Numeric(id) => {

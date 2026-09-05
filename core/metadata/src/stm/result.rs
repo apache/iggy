@@ -29,7 +29,9 @@
 
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::Operation;
-use iggy_binary_protocol::consensus::{RESULT_COUNT_LEN, RESULT_ENTRY_LEN};
+use iggy_binary_protocol::consensus::{
+    REJECTION_SECTION_LEN, RESULT_COUNT_LEN, write_rejection_section,
+};
 
 /// Decode side of the result section, shared with every client (SDK, simulator)
 /// via `binary_protocol`. Re-exported so server-side callers keep one import.
@@ -71,7 +73,7 @@ impl ApplyReply {
         if self.code == 0 {
             RESULT_COUNT_LEN + self.body.len()
         } else {
-            RESULT_COUNT_LEN + RESULT_ENTRY_LEN
+            REJECTION_SECTION_LEN
         }
     }
 
@@ -91,12 +93,7 @@ impl ApplyReply {
             dst[..RESULT_COUNT_LEN].copy_from_slice(&0u32.to_le_bytes());
             dst[RESULT_COUNT_LEN..].copy_from_slice(&self.body);
         } else {
-            // One `{index: 0, result: code}` entry: the two u32 halves of the
-            // 8-byte entry that follows the count.
-            dst[..RESULT_COUNT_LEN].copy_from_slice(&1u32.to_le_bytes());
-            let entry = &mut dst[RESULT_COUNT_LEN..RESULT_COUNT_LEN + RESULT_ENTRY_LEN];
-            entry[..4].copy_from_slice(&0u32.to_le_bytes());
-            entry[4..].copy_from_slice(&self.code.to_le_bytes());
+            write_rejection_section(dst, self.code);
         }
     }
 

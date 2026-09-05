@@ -56,4 +56,7 @@ pub use header::{
     prepare_identity_checksum_bytes, read_size_field,
 };
 pub use operation::Operation;
-pub use reply_result::{RESULT_COUNT_LEN, RESULT_ENTRY_LEN, result_code, result_section_len};
+pub use reply_result::{
+    REJECTION_SECTION_LEN, RESULT_COUNT_LEN, RESULT_ENTRY_LEN, result_code, result_section_len,
+    write_rejection_section,
+};

@@ -39,7 +39,7 @@ use crate::http::reply::{classify_partition_reply, committed_payload, eviction_e
 use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
 use crate::http::wire::build_request_message;
-use crate::responses::transient_code;
+use crate::reply_frame::transient_code;
 use crate::rewrite::http_chain;
 use crate::shell::ServerShard;
 use crate::wire::request_body;
