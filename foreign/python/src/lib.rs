@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod client;
+mod client_info;
 mod config;
 mod consumer;
 mod duration;
@@ -30,6 +31,7 @@ mod user;
 mod user_headers;
 
 use client::IggyClient;
+use client_info::{ClientInfo, ClientInfoDetails, ConsumerGroupInfo};
 use config::{AutoLogin, TcpConfig, TcpReconnectionConfig};
 use consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, Consumer, ConsumerGroup, ConsumerGroupDetails,
@@ -67,6 +69,9 @@ fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ConsumerGroup>()?;
     m.add_class::<ConsumerGroupDetails>()?;
     m.add_class::<ConsumerGroupMember>()?;
+    m.add_class::<ClientInfo>()?;
+    m.add_class::<ClientInfoDetails>()?;
+    m.add_class::<ConsumerGroupInfo>()?;
     m.add_class::<PollingStrategy>()?;
     m.add_class::<IggyConsumer>()?;
     m.add_class::<AutoCommit>()?;

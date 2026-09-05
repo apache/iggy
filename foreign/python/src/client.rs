@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::client_info::{ClientInfo as PyClientInfo, ClientInfoDetails as PyClientInfoDetails};
 use crate::config::PyClientConfig;
 use crate::consumer::{
     AutoCommit, Consumer as PyConsumer, ConsumerGroup as PyConsumerGroup,
@@ -154,6 +155,85 @@ impl IggyClient {
                 .ping()
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+        })
+    }
+
+    /// Get the info about the currently connected client.
+    ///
+    /// Not to be confused with the user: a client is a single connection,
+    /// while a user is the identity it authenticated as.
+    ///
+    /// Requires authentication only, unlike `get_client` and `get_clients`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the `ClientInfoDetails` of this
+    ///     connection.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ClientInfoDetails]", imports=("collections.abc")))]
+    fn get_me<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let client = inner
+                .get_me()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(PyClientInfoDetails::from(client))
+        })
+    }
+
+    /// Get the info about a specific client by unique ID.
+    ///
+    /// Requires the `read_servers` or `manage_servers` global permission.
+    ///
+    /// Args:
+    ///     client_id: Client identifier as `int`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `ClientInfoDetails` if the client is
+    ///     connected, or `None` otherwise.
+    ///
+    /// Raises:
+    ///     RuntimeError: `Unauthorized` when the user holds neither
+    ///         `read_servers` nor `manage_servers`, or if the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ClientInfoDetails | None]", imports=("collections.abc")))]
+    fn get_client<'a>(&self, py: Python<'a>, client_id: u32) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let client = inner
+                .get_client(client_id)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(client.map(PyClientInfoDetails::from))
+        })
+    }
+
+    /// Get the info about all the currently connected clients.
+    ///
+    /// Requires the `read_servers` or `manage_servers` global permission.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[ClientInfo]`.
+    ///
+    /// Raises:
+    ///     RuntimeError: `Unauthorized` when the user holds neither
+    ///         `read_servers` nor `manage_servers`, or if the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ClientInfo]]", imports=("collections.abc")))]
+    fn get_clients<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let clients = inner
+                .get_clients()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(clients
+                .into_iter()
+                .map(PyClientInfo::from)
+                .collect::<Vec<_>>())
         })
     }
 

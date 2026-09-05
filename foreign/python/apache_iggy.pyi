@@ -30,9 +30,12 @@ __all__ = [
     "AutoCommitAfter",
     "AutoCommitWhen",
     "AutoLogin",
+    "ClientInfo",
+    "ClientInfoDetails",
     "Consumer",
     "ConsumerGroup",
     "ConsumerGroupDetails",
+    "ConsumerGroupInfo",
     "ConsumerGroupMember",
     "GlobalPermissions",
     "HeaderKey",
@@ -290,6 +293,78 @@ class AutoLogin:
         """
     def __repr__(self) -> builtins.str: ...
 
+@typing.final
+class ClientInfo:
+    @property
+    def client_id(self) -> builtins.int:
+        r"""
+        The unique identifier of the client.
+        """
+    @property
+    def user_id(self) -> builtins.int | None:
+        r"""
+        The unique identifier of the user, or `None` while the client is
+        connected but not yet authenticated.
+        """
+    @property
+    def address(self) -> builtins.str:
+        r"""
+        The remote address of the client.
+        """
+    @property
+    def transport(self) -> builtins.str:
+        r"""
+        The transport protocol used by the client, one of `"TCP"`, `"QUIC"`,
+        `"HTTP"`, `"WebSocket"`, or `"Unknown"` for a transport this server
+        does not recognise.
+        """
+    @property
+    def consumer_groups_count(self) -> builtins.int:
+        r"""
+        The number of consumer groups the client is part of.
+        """
+
+@typing.final
+class ClientInfoDetails:
+    @property
+    def client_id(self) -> builtins.int:
+        r"""
+        The unique identifier of the client.
+        """
+    @property
+    def user_id(self) -> builtins.int | None:
+        r"""
+        The unique identifier of the user, or `None` while the client is
+        connected but not yet authenticated.
+        """
+    @property
+    def address(self) -> builtins.str:
+        r"""
+        The remote address of the client.
+        """
+    @property
+    def transport(self) -> builtins.str:
+        r"""
+        The transport protocol used by the client, one of `"TCP"`, `"QUIC"`,
+        `"HTTP"`, `"WebSocket"`, or `"Unknown"` for a transport this server
+        does not recognise.
+        """
+    @property
+    def consumer_groups_count(self) -> builtins.int:
+        r"""
+        The number of consumer groups the client is part of.
+        """
+    @property
+    def consumer_groups(self) -> builtins.list[ConsumerGroupInfo]:
+        r"""
+        The collection of consumer groups the client is part of.
+
+        Each read rebuilds the list and every `ConsumerGroupInfo` in it, so
+        bind it once (`groups = details.consumer_groups`) rather than
+        subscripting the attribute repeatedly: two reads never share object
+        identity, and mutating the returned list does not affect the client.
+        """
+
 class Consumer:
     r"""
     The consumer polling the messages. It selects both the consumer kind and the
@@ -368,6 +443,24 @@ class ConsumerGroupDetails:
     def members(self) -> builtins.list[ConsumerGroupMember]:
         r"""
         Gets the collection of members in the consumer group.
+        """
+
+@typing.final
+class ConsumerGroupInfo:
+    @property
+    def stream_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the stream.
+        """
+    @property
+    def topic_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the topic.
+        """
+    @property
+    def group_id(self) -> builtins.int:
+        r"""
+        The unique identifier (numeric) of the consumer group.
         """
 
 @typing.final
@@ -871,6 +964,54 @@ class IggyClient:
         r"""
         Sends a ping request to the server to check connectivity.
         Raises `RuntimeError` if the connection fails.
+        """
+    def get_me(self) -> collections.abc.Awaitable[ClientInfoDetails]:
+        r"""
+        Get the info about the currently connected client.
+
+        Not to be confused with the user: a client is a single connection,
+        while a user is the identity it authenticated as.
+
+        Requires authentication only, unlike `get_client` and `get_clients`.
+
+        Returns:
+            An awaitable that resolves to the `ClientInfoDetails` of this
+            connection.
+
+        Raises:
+            RuntimeError: If the request fails.
+        """
+    def get_client(
+        self, client_id: builtins.int
+    ) -> collections.abc.Awaitable[ClientInfoDetails | None]:
+        r"""
+        Get the info about a specific client by unique ID.
+
+        Requires the `read_servers` or `manage_servers` global permission.
+
+        Args:
+            client_id: Client identifier as `int`.
+
+        Returns:
+            An awaitable that resolves to `ClientInfoDetails` if the client is
+            connected, or `None` otherwise.
+
+        Raises:
+            RuntimeError: `Unauthorized` when the user holds neither
+                `read_servers` nor `manage_servers`, or if the request fails.
+        """
+    def get_clients(self) -> collections.abc.Awaitable[list[ClientInfo]]:
+        r"""
+        Get the info about all the currently connected clients.
+
+        Requires the `read_servers` or `manage_servers` global permission.
+
+        Returns:
+            An awaitable that resolves to `list[ClientInfo]`.
+
+        Raises:
+            RuntimeError: `Unauthorized` when the user holds neither
+                `read_servers` nor `manage_servers`, or if the request fails.
         """
     def describe_options(
         self, scope: builtins.str
