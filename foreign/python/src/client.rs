@@ -198,6 +198,10 @@ impl IggyClient {
     ///         raises `OverflowError` synchronously rather than surfacing as
     ///         a `RuntimeError` from the request itself.
     ///
+    /// Best-effort, like `get_clients`: gathered across every shard with a
+    /// bounded timeout, so a connected client on a slow or overloaded shard
+    /// can transiently resolve to `None` rather than its details.
+    ///
     /// Returns:
     ///     An awaitable that resolves to `ClientInfoDetails` if the client is
     ///     connected, or `None` otherwise.
@@ -222,6 +226,12 @@ impl IggyClient {
     /// Get the info about all the currently connected clients.
     ///
     /// Requires the `read_servers` or `manage_servers` global permission.
+    ///
+    /// Best-effort: the server gathers this list across every shard with a
+    /// bounded timeout, and a shard that misses it is dropped from the
+    /// result rather than failing the call. A client connected to a slow or
+    /// overloaded shard can therefore be missing from an individual call's
+    /// result.
     ///
     /// Returns:
     ///     An awaitable that resolves to `list[ClientInfo]`.

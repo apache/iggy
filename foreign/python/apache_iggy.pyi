@@ -359,10 +359,11 @@ class ClientInfoDetails:
         r"""
         The collection of consumer groups the client is part of.
 
-        Each read rebuilds the list and every `ConsumerGroupInfo` in it, so
-        bind it once (`groups = details.consumer_groups`) rather than
-        subscripting the attribute repeatedly: two reads never share object
-        identity, and mutating the returned list does not affect the client.
+        Each read rebuilds the list and every `ConsumerGroupInfo` in it.
+        `ConsumerGroupInfo` has no `__eq__`, so two `ConsumerGroupInfo`
+        instances built from separate reads compare unequal even with
+        identical field values; bind the list once
+        (`groups = details.consumer_groups`) and compare fields, not objects.
         """
 
 class Consumer:
@@ -999,6 +1000,10 @@ class IggyClient:
                 raises `OverflowError` synchronously rather than surfacing as
                 a `RuntimeError` from the request itself.
 
+        Best-effort, like `get_clients`: gathered across every shard with a
+        bounded timeout, so a connected client on a slow or overloaded shard
+        can transiently resolve to `None` rather than its details.
+
         Returns:
             An awaitable that resolves to `ClientInfoDetails` if the client is
             connected, or `None` otherwise.
@@ -1013,6 +1018,12 @@ class IggyClient:
         Get the info about all the currently connected clients.
 
         Requires the `read_servers` or `manage_servers` global permission.
+
+        Best-effort: the server gathers this list across every shard with a
+        bounded timeout, and a shard that misses it is dropped from the
+        result rather than failing the call. A client connected to a slow or
+        overloaded shard can therefore be missing from an individual call's
+        result.
 
         Returns:
             An awaitable that resolves to `list[ClientInfo]`.

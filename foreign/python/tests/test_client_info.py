@@ -27,7 +27,20 @@ from apache_iggy import (
     Permissions,
 )
 
-from .utils import login_fresh_client, unique_credentials
+from .utils import (
+    get_server_config,
+    login_fresh_client,
+    unique_credentials,
+    wait_for_ping,
+)
+
+# Comfortably outside any client id the server could have assigned.
+UNUSED_CLIENT_ID_MARGIN = 1_000_000
+
+# Attempts when hunting for a topic/group id that doesn't collide with its
+# parent's: enough that a collision across all of them is vanishingly
+# unlikely, without looping unboundedly if it somehow always did.
+DISTINCT_ID_ATTEMPTS = 3
 
 
 class TestGetMe:
@@ -68,7 +81,7 @@ class TestGetMe:
         assert stream is not None
 
         topics = []
-        for _ in range(3):
+        for _ in range(DISTINCT_ID_ATTEMPTS):
             name = unique_name()
             await iggy_client.create_topic(
                 stream=stream_name,
@@ -78,10 +91,12 @@ class TestGetMe:
             details = await iggy_client.get_topic(stream_name, name)
             assert details is not None
             topics.append((name, details))
-        topic_name, topic = next((n, t) for n, t in topics if t.id != stream.id)
+        distinct_topic = next((t for t in topics if t[1].id != stream.id), None)
+        assert distinct_topic is not None
+        topic_name, topic = distinct_topic
 
         groups = []
-        for _ in range(3):
+        for _ in range(DISTINCT_ID_ATTEMPTS):
             name = unique_name()
             await iggy_client.create_consumer_group(stream_name, topic_name, name)
             details = await iggy_client.get_consumer_group(
@@ -89,28 +104,32 @@ class TestGetMe:
             )
             assert details is not None
             groups.append((name, details))
-        group_name, group = next(
-            (n, g) for n, g in groups if g.id not in (stream.id, topic.id)
+        distinct_group = next(
+            (g for g in groups if g[1].id not in (stream.id, topic.id)), None
         )
+        assert distinct_group is not None
+        group_name, group = distinct_group
 
         # Guard the assertions below: equal ids would survive a swapped mapping.
         assert len({stream.id, topic.id, group.id}) == 3
 
-        # A fresh connection keeps the session-scoped fixture out of the group.
-        member = await login_fresh_client("iggy", "iggy")
-        await member.join_consumer_group(stream_name, topic_name, group_name)
+        try:
+            # A fresh connection keeps the session-scoped fixture out of the group.
+            member = await login_fresh_client("iggy", "iggy")
+            await member.join_consumer_group(stream_name, topic_name, group_name)
 
-        me = await member.get_me()
-        assert me.consumer_groups_count == 1
-        assert len(me.consumer_groups) == 1
+            me = await member.get_me()
+            assert me.consumer_groups_count == 1
+            assert len(me.consumer_groups) == 1
 
-        joined = me.consumer_groups[0]
-        assert joined.stream_id == stream.id
-        assert joined.topic_id == topic.id
-        assert joined.group_id == group.id
+            joined = me.consumer_groups[0]
+            assert joined.stream_id == stream.id
+            assert joined.topic_id == topic.id
+            assert joined.group_id == group.id
 
-        await member.leave_consumer_group(stream_name, topic_name, group_name)
-        await iggy_client.delete_consumer_group(stream_name, topic_name, group_name)
+            await member.leave_consumer_group(stream_name, topic_name, group_name)
+        finally:
+            await iggy_client.delete_consumer_group(stream_name, topic_name, group_name)
 
 
 class TestGetClients:
@@ -133,8 +152,29 @@ class TestGetClients:
         mine = next((c for c in clients if c.client_id == me.client_id), None)
         assert mine is not None
         assert mine.address == me.address
-        assert mine.transport == me.transport
+        # Fixed value, not me.transport: both sides come from the same
+        # transport_kind_to_wire mapping, so comparing them to each other
+        # could not catch a wire-code shift that renamed every transport.
+        assert mine.transport == "TCP"
         assert mine.user_id == me.user_id
+
+    @pytest.mark.asyncio
+    async def test_get_clients_reports_none_user_id_before_login(
+        self, iggy_client: IggyClient
+    ):
+        """Test a connected but unauthenticated client has a None user_id."""
+        host, port = get_server_config()
+        before = {client.client_id for client in await iggy_client.get_clients()}
+
+        unauthenticated = IggyClient(f"{host}:{port}")
+        await unauthenticated.connect()
+        await wait_for_ping(unauthenticated)
+
+        # Same completeness caveat as test_get_clients_contains_this_client.
+        after = await iggy_client.get_clients()
+        new_clients = [c for c in after if c.client_id not in before]
+        assert len(new_clients) == 1
+        assert new_clients[0].user_id is None
 
 
 class TestGetClient:
@@ -149,13 +189,17 @@ class TestGetClient:
         assert client is not None
         assert client.client_id == me.client_id
         assert client.user_id == me.user_id
-        assert client.transport == me.transport
+        # Fixed value, not me.transport: see the same note on
+        # test_get_clients_contains_this_client.
+        assert client.transport == "TCP"
 
     @pytest.mark.asyncio
     async def test_get_client_unknown_id_returns_none(self, iggy_client: IggyClient):
         """Test an unknown client id resolves to None rather than raising."""
         clients = await iggy_client.get_clients()
-        unused_id = max((c.client_id for c in clients), default=0) + 1_000_000
+        unused_id = (
+            max((c.client_id for c in clients), default=0) + UNUSED_CLIENT_ID_MARGIN
+        )
 
         assert await iggy_client.get_client(unused_id) is None
 
@@ -189,18 +233,18 @@ class TestServerInfoPermission:
         created = await iggy_client.create_user(
             username, password, permissions=permissions
         )
+        try:
+            client = await login_fresh_client(username, password)
+            me = await client.get_me()
 
-        client = await login_fresh_client(username, password)
-        me = await client.get_me()
-
-        clients = await client.get_clients()
-        # Best-effort scatter-gather across shards, see the completeness note
-        # on test_get_clients_contains_this_client; holds here for the same
-        # reason.
-        assert any(other.client_id == me.client_id for other in clients)
-        assert (await client.get_client(me.client_id)) is not None
-
-        await iggy_client.delete_user(created.id)
+            clients = await client.get_clients()
+            # Best-effort scatter-gather across shards, see the completeness
+            # note on test_get_clients_contains_this_client; holds here for
+            # the same reason.
+            assert any(other.client_id == me.client_id for other in clients)
+            assert (await client.get_client(me.client_id)) is not None
+        finally:
+            await iggy_client.delete_user(created.id)
 
     @pytest.mark.asyncio
     async def test_user_without_read_servers_cannot_list_clients(
@@ -209,15 +253,19 @@ class TestServerInfoPermission:
         """Test get_client and get_clients are denied without read_servers."""
         username, password = unique_credentials(unique_name)
         created = await iggy_client.create_user(username, password)
+        try:
+            client = await login_fresh_client(username, password)
+            # get_me needs authentication only, so it stays available.
+            me = await client.get_me()
+            assert me.user_id == created.id
 
-        client = await login_fresh_client(username, password)
-        # get_me needs authentication only, so it stays available.
-        me = await client.get_me()
-        assert me.user_id == created.id
-
-        with pytest.raises(RuntimeError):
-            await client.get_clients()
-        with pytest.raises(RuntimeError):
-            await client.get_client(me.client_id)
-
-        await iggy_client.delete_user(created.id)
+            # A bare pytest.raises(RuntimeError) would pass on any failure,
+            # since every error this binding can raise becomes RuntimeError;
+            # match the message the docstring promises and that survives the
+            # wire round trip unchanged.
+            with pytest.raises(RuntimeError, match="Unauthorized"):
+                await client.get_clients()
+            with pytest.raises(RuntimeError, match="Unauthorized"):
+                await client.get_client(me.client_id)
+        finally:
+            await iggy_client.delete_user(created.id)

@@ -123,10 +123,11 @@ impl ClientInfoDetails {
 
     /// The collection of consumer groups the client is part of.
     ///
-    /// Each read rebuilds the list and every `ConsumerGroupInfo` in it, so
-    /// bind it once (`groups = details.consumer_groups`) rather than
-    /// subscripting the attribute repeatedly: two reads never share object
-    /// identity, and mutating the returned list does not affect the client.
+    /// Each read rebuilds the list and every `ConsumerGroupInfo` in it.
+    /// `ConsumerGroupInfo` has no `__eq__`, so two `ConsumerGroupInfo`
+    /// instances built from separate reads compare unequal even with
+    /// identical field values; bind the list once
+    /// (`groups = details.consumer_groups`) and compare fields, not objects.
     #[getter]
     pub fn consumer_groups(&self) -> Vec<ConsumerGroupInfo> {
         self.inner
@@ -145,13 +146,7 @@ pub struct ConsumerGroupInfo {
 
 impl From<&RustConsumerGroupInfo> for ConsumerGroupInfo {
     fn from(group: &RustConsumerGroupInfo) -> Self {
-        Self {
-            inner: RustConsumerGroupInfo {
-                stream_id: group.stream_id,
-                topic_id: group.topic_id,
-                group_id: group.group_id,
-            },
-        }
+        Self { inner: *group }
     }
 }
 

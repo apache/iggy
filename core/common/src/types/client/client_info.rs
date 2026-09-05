@@ -67,7 +67,7 @@ pub struct ClientInfoDetails {
 /// - `stream_id`: the unique identifier (numeric) of the stream.
 /// - `topic_id`: the unique identifier (numeric) of the topic.
 /// - `group_id`: the unique identifier (numeric) of the consumer group.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ConsumerGroupInfo {
     /// The unique identifier (numeric) of the stream.
     pub stream_id: u32,
