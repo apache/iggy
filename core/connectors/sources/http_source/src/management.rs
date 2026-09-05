@@ -27,7 +27,7 @@
 //! reports `submitted` per endpoint for callers that need the difference.
 
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, HeaderName, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -39,9 +39,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::auth::{secrets_match, strip_bearer};
+use crate::auth::{is_usable_secret, validate_bearer};
 use crate::routes::{Endpoint, EndpointOrigin, EndpointState};
-use crate::server::{ServerState, error_response, refresh_routes};
+use crate::server::{ServerState, bearer_header, error_response, refresh_routes};
 use crate::state::{InsertOutcome, MAX_ENDPOINTS};
 use crate::types::{EndpointId, unix_now_seconds};
 use crate::{CONNECTOR_NAME, EndpointAuthType, SharedState};
@@ -111,7 +111,7 @@ async fn register_endpoint(
     let Some(instance) = state.instance(&request.instance) else {
         return error_response(StatusCode::NOT_FOUND, "unknown instance");
     };
-    if request.auth_type != EndpointAuthType::None && !is_usable(&request.auth_secret) {
+    if request.auth_type != EndpointAuthType::None && !is_usable_secret(&request.auth_secret) {
         return error_response(
             StatusCode::BAD_REQUEST,
             "a non-empty auth_secret is required",
@@ -157,12 +157,10 @@ async fn register_endpoint(
     };
 
     let mut outcome = InsertOutcome::Collision;
-    instance
-        .mutate_registry(|registry| {
-            outcome = registry.try_insert(endpoint);
-            outcome == InsertOutcome::Inserted
-        })
-        .await;
+    instance.mutate_registry(|registry| {
+        outcome = registry.try_insert(endpoint);
+        outcome == InsertOutcome::Inserted
+    });
     match outcome {
         InsertOutcome::Inserted => {}
         InsertOutcome::Collision => {
@@ -191,10 +189,7 @@ async fn register_endpoint(
         // Undo the insert. Left in place it would be persisted on the next
         // flush and come back live after a restart, despite the caller having
         // been told the registration failed.
-        if !instance
-            .mutate_registry(|registry| registry.remove(endpoint_id.as_str()))
-            .await
-        {
+        if !instance.mutate_registry(|registry| registry.remove(endpoint_id.as_str())) {
             error!(
                 "Failed to roll back endpoint {} on {CONNECTOR_NAME} connector ID: {}; it may be persisted and served after a restart despite this registration failing",
                 endpoint_id.log_prefix(),
@@ -276,19 +271,17 @@ async fn rotate_secret(
         return error_response(StatusCode::CONFLICT, message);
     }
 
-    let rotated = instance
-        .mutate_registry(|registry| {
-            let Some(endpoint) = registry.endpoint_mut(&endpoint_id) else {
-                return false;
-            };
-            if !endpoint.is_active() {
-                return false;
-            }
-            endpoint.auth_secret = Some(request.auth_secret.clone());
-            endpoint.submitted = false;
-            true
-        })
-        .await;
+    let rotated = instance.mutate_registry(|registry| {
+        let Some(endpoint) = registry.endpoint_mut(&endpoint_id) else {
+            return false;
+        };
+        if !endpoint.is_active() {
+            return false;
+        }
+        endpoint.auth_secret = Some(request.auth_secret.clone());
+        endpoint.submitted = false;
+        true
+    });
     if !rotated {
         return error_response(StatusCode::NOT_FOUND, "not found");
     }
@@ -324,8 +317,7 @@ async fn revoke_endpoint(
     };
 
     let revoked = instance
-        .mutate_registry(|registry| registry.revoke(&endpoint_id, reason, unix_now_seconds()))
-        .await;
+        .mutate_registry(|registry| registry.revoke(&endpoint_id, reason, unix_now_seconds()));
     if !revoked {
         return error_response(StatusCode::NOT_FOUND, "not found");
     }
@@ -388,21 +380,13 @@ fn denied(state: &ServerState, request_headers: &HeaderMap) -> Option<Response> 
     let Some(expected) = &state.management_token else {
         return Some(error_response(StatusCode::NOT_FOUND, "not found"));
     };
-    let presented = request_headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(strip_bearer)
-        .map(SecretString::from);
-    match presented {
-        Some(presented) if secrets_match(&presented, expected) => None,
-        _ => Some(error_response(StatusCode::UNAUTHORIZED, "unauthorized")),
+    // The same comparison the webhook paths use, rather than a second
+    // hand-rolled one: an extra `SecretString` was allocated only to be
+    // compared and dropped.
+    if validate_bearer(bearer_header(request_headers), expected) {
+        return None;
     }
-}
-
-fn is_usable(secret: &Option<SecretString>) -> bool {
-    secret
-        .as_ref()
-        .is_some_and(|secret| !secret.expose_secret().is_empty())
+    Some(error_response(StatusCode::UNAUTHORIZED, "unauthorized"))
 }
 
 fn owner_of(state: &ServerState, endpoint_id: &str) -> Option<Arc<SharedState>> {
@@ -574,6 +558,7 @@ mod tests {
     use super::*;
     use crate::HttpSource;
     use crate::test_support::{ENDPOINT_ONE, client, free_port};
+    use axum::http::header;
     use iggy_connector_sdk::Source;
     use serde_json::{Value, json};
 
@@ -814,7 +799,6 @@ mod tests {
                     "compromised".to_string(),
                     1
                 ))
-                .await
         );
         fixture
             .source

@@ -231,8 +231,6 @@ static SERVERS: LazyLock<Mutex<HashMap<String, SharedServer>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct SharedServer {
-    admin_listen_addr: String,
-    max_body_size_bytes: usize,
     state: Arc<ServerState>,
     shutdown: watch::Sender<()>,
     tasks: Vec<JoinHandle<()>>,
@@ -259,6 +257,9 @@ pub(crate) struct ServerState {
     pub(crate) listen_addr: String,
     /// Taken from the first instance to bind, like `management_token`.
     /// `ensure_compatible` refuses a join that disagrees, so it is unambiguous.
+    pub(crate) admin_listen_addr: String,
+    /// Taken from the first instance to bind, like `management_token`.
+    /// `ensure_compatible` refuses a join that disagrees, so it is unambiguous.
     /// Held here so a handler can read the body itself, after authorizing,
     /// rather than letting an extractor buffer it first.
     pub(crate) max_body_size_bytes: usize,
@@ -280,6 +281,7 @@ impl ServerState {
     pub(crate) fn new(config: &HttpSourceConfig) -> Self {
         ServerState {
             listen_addr: config.listen_addr.clone(),
+            admin_listen_addr: config.admin_listen_addr.clone(),
             max_body_size_bytes: config.max_body_size_bytes,
             management_token: config.management_token.clone(),
             metrics: Metrics::new(),
@@ -387,8 +389,6 @@ impl SharedServer {
         ];
 
         Ok(SharedServer {
-            admin_listen_addr: config.admin_listen_addr.clone(),
-            max_body_size_bytes: config.max_body_size_bytes,
             state,
             shutdown,
             tasks,
@@ -402,16 +402,16 @@ impl SharedServer {
     /// Fails closed on purpose: first-instance-wins would leave an operator
     /// with a body limit or admin address their TOML says they do not have.
     fn ensure_compatible(&self, config: &HttpSourceConfig) -> Result<(), Error> {
-        if self.admin_listen_addr != config.admin_listen_addr {
+        if self.state.admin_listen_addr != config.admin_listen_addr {
             return Err(Error::InvalidConfigValue(format!(
                 "admin_listen_addr '{}' does not match '{}' on the listener already bound to {}",
-                config.admin_listen_addr, self.admin_listen_addr, config.listen_addr
+                config.admin_listen_addr, self.state.admin_listen_addr, config.listen_addr
             )));
         }
-        if self.max_body_size_bytes != config.max_body_size_bytes {
+        if self.state.max_body_size_bytes != config.max_body_size_bytes {
             return Err(Error::InvalidConfigValue(format!(
                 "max_body_size_bytes {} does not match {} on the listener already bound to {}",
-                config.max_body_size_bytes, self.max_body_size_bytes, config.listen_addr
+                config.max_body_size_bytes, self.state.max_body_size_bytes, config.listen_addr
             )));
         }
         // The management API guards one shared listener, so instances cannot
@@ -645,19 +645,12 @@ async fn secret_path_outcome(
     let routes = &state.published().routes;
     let entry = match routes.lookup_secret_path(endpoint_id, unix_now_seconds()) {
         RouteLookup::Active(entry) => entry,
-        // Revoked endpoints answer as if they never existed, so a leaked URL
-        // cannot be used to confirm it was once live. The metric still names
-        // the owning instance: only a genuinely unknown path is `unrouted`.
-        RouteLookup::Revoked(entry) => {
-            return (
-                entry.instance.instance_name.clone(),
-                error_response(StatusCode::NOT_FOUND, "not found"),
-            );
-        }
-        // Expired answers 404 for the same reason revoked does. A 410 would
-        // be returned before any credential is checked, so it would tell anyone
-        // holding a leaked or guessed id that the endpoint had once been real.
-        RouteLookup::Expired(entry) => {
+        // Both answer as if the endpoint never existed, so a leaked URL cannot
+        // be used to confirm it was once live: a 410 for the expired case would
+        // be returned before any credential is checked and would say exactly
+        // that. The metric still names the owning instance, so only a genuinely
+        // unknown path is `unrouted`.
+        RouteLookup::Revoked(entry) | RouteLookup::Expired(entry) => {
             return (
                 entry.instance.instance_name.clone(),
                 error_response(StatusCode::NOT_FOUND, "not found"),
@@ -978,7 +971,7 @@ fn received_at_micros() -> Option<String> {
         .map(|elapsed| elapsed.as_micros().to_string())
 }
 
-fn bearer_header(request_headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_header(request_headers: &HeaderMap) -> Option<&str> {
     request_headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -1161,10 +1154,9 @@ mod tests {
     #[tokio::test]
     async fn given_revoked_endpoint_when_posted_should_answer_not_found() {
         let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
-        source
-            .shared
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 1))
-            .await;
+        source.shared.mutate_registry(|registry| {
+            registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 1)
+        });
         rebuild_routes(&source).await;
 
         let response = post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
@@ -1180,16 +1172,13 @@ mod tests {
     #[tokio::test]
     async fn given_expired_endpoint_when_posted_should_answer_not_found() {
         let mut source = open(1, config(free_port(), free_port(), &[ENDPOINT_ONE])).await;
-        source
-            .shared
-            .mutate_registry(|registry| {
-                registry
-                    .endpoint_mut(ENDPOINT_ONE)
-                    .expect("the static endpoint is registered")
-                    .expires_at = Some(1);
-                true
-            })
-            .await;
+        source.shared.mutate_registry(|registry| {
+            registry
+                .endpoint_mut(ENDPOINT_ONE)
+                .expect("the static endpoint is registered")
+                .expires_at = Some(1);
+            true
+        });
         rebuild_routes(&source).await;
 
         let response = post_signed(&base_url(&source), ENDPOINT_ONE, "{}").await;
@@ -1429,10 +1418,9 @@ mod tests {
         config.instance_name = Some("http_github".to_string());
         let admin = format!("http://{}", config.admin_listen_addr);
         let mut source = open(1, config).await;
-        source
-            .shared
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 1))
-            .await;
+        source.shared.mutate_registry(|registry| {
+            registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 1)
+        });
 
         let body: serde_json::Value = client()
             .get(format!("{admin}/admin/health"))
@@ -1459,16 +1447,13 @@ mod tests {
         config.instance_name = Some("http_github".to_string());
         let admin = format!("http://{}", config.admin_listen_addr);
         let mut source = open(1, config).await;
-        source
-            .shared
-            .mutate_registry(|registry| {
-                registry
-                    .endpoint_mut(ENDPOINT_ONE)
-                    .expect("the static endpoint is registered")
-                    .expires_at = Some(1);
-                true
-            })
-            .await;
+        source.shared.mutate_registry(|registry| {
+            registry
+                .endpoint_mut(ENDPOINT_ONE)
+                .expect("the static endpoint is registered")
+                .expires_at = Some(1);
+            true
+        });
 
         let body: serde_json::Value = client()
             .get(format!("{admin}/admin/health"))
@@ -1836,15 +1821,11 @@ mod tests {
         let shared = Arc::clone(&source.shared);
         let _polling = shared.enter_poll();
 
-        assert!(
-            shared
-                .mutate_registry(|registry| registry.revoke(
-                    ENDPOINT_ONE,
-                    "compromised".to_string(),
-                    1
-                ))
-                .await
-        );
+        assert!(shared.mutate_registry(|registry| registry.revoke(
+            ENDPOINT_ONE,
+            "compromised".to_string(),
+            1
+        )));
         rebuild_routes(&source).await;
 
         let response = client()

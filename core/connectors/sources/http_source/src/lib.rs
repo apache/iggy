@@ -31,6 +31,7 @@ use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source,
     source_connector,
 };
+use ring::hmac;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -43,7 +44,6 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
-use crate::auth::HmacAlgorithm;
 use crate::server::{INSTANCE_HEADER, RECEIVED_AT_HEADER, REMOTE_ADDR_HEADER};
 use crate::state::EndpointRegistry;
 use crate::types::{EndpointId, QueuedMessage, unix_now_seconds};
@@ -72,8 +72,6 @@ pub const MAX_MAX_BODY_SIZE_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_HMAC_HEADER: &str = "X-Hub-Signature-256";
 pub const DEFAULT_HMAC_PREFIX: &str = "sha256=";
 
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 /// How long after a poll returns the source still counts as live. Generous
 /// against the SDK's 30s batch-result timeout, which is the longest a healthy
 /// source sits between polls.
@@ -94,7 +92,6 @@ source_connector!(HttpSource);
 /// instance's configured stream/topic.
 #[derive(Debug)]
 pub struct HttpSource {
-    pub id: u32,
     shared: Arc<SharedState>,
     /// Deliberately not on [`SharedState`]: handlers hold that behind an `Arc`
     /// for as long as the listener serves them, and a receiver reachable from
@@ -175,7 +172,7 @@ pub struct SharedState {
     last_poll_at: AtomicU64,
     /// Serializes registry writers, which are all control-plane. The request
     /// path only ever loads the `ArcSwap` and never touches this.
-    registry_writer: Mutex<()>,
+    registry_writer: StdMutex<()>,
     /// Wakes `poll()` when a management mutation needs a state flush and no
     /// webhook traffic would otherwise arrive to carry it.
     ///
@@ -205,12 +202,16 @@ impl SharedState {
     /// caller turn a stream of no-ops, repeatedly revoking an already-revoked
     /// endpoint, into one registry serialization and one state-store write per
     /// 404, which is a remote write on the HTTP state backend.
-    pub async fn mutate_registry(
-        &self,
-        mutation: impl FnOnce(&mut EndpointRegistry) -> bool,
-    ) -> bool {
+    pub fn mutate_registry(&self, mutation: impl FnOnce(&mut EndpointRegistry) -> bool) -> bool {
         {
-            let _writer = self.registry_writer.lock().await;
+            // `std::sync::Mutex`, because the guard never spans an await: the
+            // mutation is a sync closure and the swap is a store. Holding a
+            // `tokio::sync::Mutex` here only bought the ability to yield to a
+            // contender, and contention is control-plane traffic alone.
+            let _writer = self
+                .registry_writer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut next = EndpointRegistry::clone(&self.registry.load());
             if !mutation(&mut next) {
                 return false;
@@ -441,10 +442,14 @@ pub enum EndpointAuthType {
 }
 
 impl EndpointAuthType {
-    pub fn hmac_algorithm(self) -> Option<HmacAlgorithm> {
+    /// The ring algorithm this auth type verifies with, if it verifies at all.
+    ///
+    /// Returning ring's type directly, rather than mirroring these two variants
+    /// into a second enum, is what keeps the two from drifting.
+    pub fn hmac_algorithm(self) -> Option<hmac::Algorithm> {
         match self {
-            Self::HmacSha256 => Some(HmacAlgorithm::HmacSha256),
-            Self::HmacSha1 => Some(HmacAlgorithm::HmacSha1),
+            Self::HmacSha256 => Some(hmac::HMAC_SHA256),
+            Self::HmacSha1 => Some(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY),
             Self::None | Self::Bearer => None,
         }
     }
@@ -641,12 +646,11 @@ impl HttpSource {
             registry_dirty: AtomicBool::new(false),
             poll_active: AtomicBool::new(false),
             last_poll_at: AtomicU64::new(0),
-            registry_writer: Mutex::new(()),
+            registry_writer: StdMutex::new(()),
             state_flush: Arc::new(Notify::new()),
             state_flush_nacks: AtomicU32::new(0),
         };
         HttpSource {
-            id,
             shared: Arc::new(shared),
             receiver: Mutex::new(receiver),
             staged: StdMutex::new(None),
@@ -668,7 +672,7 @@ impl HttpSource {
             "Replaying {} unacknowledged messages after {} NACK(s) for {CONNECTOR_NAME} connector ID: {}",
             staged.messages.len(),
             staged.nacks,
-            self.id
+            self.shared.id
         );
         Some(ProducedMessages {
             schema: Schema::Raw,
@@ -719,7 +723,7 @@ impl HttpSource {
             self.shared.rearm_state_flush();
             warn!(
                 "Runtime NACKed the state flush for {CONNECTOR_NAME} connector ID: {}, re-arming it",
-                self.id
+                self.shared.id
             );
             return Ok(());
         };
@@ -729,7 +733,7 @@ impl HttpSource {
         drop(staged);
         warn!(
             "Runtime NACKed {count} messages ({nacks} so far) for {CONNECTOR_NAME} connector ID: {}",
-            self.id
+            self.shared.id
         );
         Ok(())
     }
@@ -746,7 +750,7 @@ impl Source for HttpSource {
         self.shared.log_auth_posture();
         info!(
             "Opened {CONNECTOR_NAME} connector ID: {}, listen address: {}, endpoints: {}, named path: {:?}",
-            self.id,
+            self.shared.id,
             self.shared.config.listen_addr,
             self.shared.registry().serving_count(unix_now_seconds()),
             self.shared.config.topic_path,
@@ -773,19 +777,17 @@ impl Source for HttpSource {
             // The SDK races poll() against its own shutdown watch, so blocking
             // here until traffic arrives is what keeps an idle gateway off the
             // CPU. crossfire documents recv() as cancellation-safe.
-            received = receiver.recv() => match received {
-                Ok(message) => {
+            // `recv` errs only once every sender is dropped, and one lives in
+            // `self.shared`, which outlives this call, so the error leaves the
+            // batch empty rather than needing an arm of its own.
+            received = receiver.recv() => if let Ok(message) = received {
+                queued.push(message);
+                while queued.len() < max_batch_size {
+                    let Ok(message) = receiver.try_recv() else {
+                        break;
+                    };
                     queued.push(message);
-                    while queued.len() < max_batch_size {
-                        let Ok(message) = receiver.try_recv() else {
-                            break;
-                        };
-                        queued.push(message);
-                    }
                 }
-                // Reachable only once every sender is gone. Idle rather than
-                // spin the SDK's poll loop.
-                Err(_) => tokio::time::sleep(IDLE_POLL_INTERVAL).await,
             },
             _ = self.shared.state_flush.notified() => {}
         }
@@ -840,7 +842,7 @@ impl Source for HttpSource {
                 warn!(
                     "Dropping {} unacknowledged messages for {CONNECTOR_NAME} connector ID: {}",
                     staged.messages.len(),
-                    self.id
+                    self.shared.id
                 );
                 staged.messages.len() as u64
             }
@@ -855,7 +857,7 @@ impl Source for HttpSource {
         if self.shared.has_pending_state() {
             warn!(
                 "Closing {CONNECTOR_NAME} connector ID: {} with an unflushed registry: {} endpoint(s) not submitted, so a change made since the last poll will not survive the restart",
-                self.id,
+                self.shared.id,
                 self.shared.registry().unsubmitted_count()
             );
         }
@@ -863,7 +865,7 @@ impl Source for HttpSource {
         // in the bridge is already unreachable. Deregistering first is what
         // stops new requests from being accepted into a queue nobody drains.
         server::leave(&self.shared, staged_dropped).await;
-        info!("Closed {CONNECTOR_NAME} connector ID: {}", self.id);
+        info!("Closed {CONNECTOR_NAME} connector ID: {}", self.shared.id);
         Ok(())
     }
 }
@@ -1172,10 +1174,7 @@ mod tests {
         let endpoint = &config.endpoints[0];
         assert_eq!(endpoint.hmac_header, DEFAULT_HMAC_HEADER);
         assert_eq!(endpoint.hmac_prefix, DEFAULT_HMAC_PREFIX);
-        assert_eq!(
-            endpoint.auth_type.hmac_algorithm(),
-            Some(HmacAlgorithm::HmacSha256)
-        );
+        assert_eq!(endpoint.auth_type.hmac_algorithm(), Some(hmac::HMAC_SHA256));
         assert!(config.validate().is_ok());
     }
 
@@ -1362,11 +1361,11 @@ mod tests {
         // reject every request the sender signs correctly.
         assert_eq!(
             EndpointAuthType::HmacSha256.hmac_algorithm(),
-            Some(HmacAlgorithm::HmacSha256)
+            Some(hmac::HMAC_SHA256)
         );
         assert_eq!(
             EndpointAuthType::HmacSha1.hmac_algorithm(),
-            Some(HmacAlgorithm::HmacSha1)
+            Some(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY)
         );
         assert_eq!(EndpointAuthType::Bearer.hmac_algorithm(), None);
         assert_eq!(EndpointAuthType::None.hmac_algorithm(), None);
@@ -1464,8 +1463,7 @@ mod tests {
         let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
         source
             .shared
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42))
-            .await;
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
 
         assert!(source.shared.take_dirty_state().is_some());
         assert!(
@@ -1479,8 +1477,7 @@ mod tests {
         let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
         source
             .shared
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42))
-            .await;
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
 
         assert!(
             !source
@@ -1506,8 +1503,7 @@ mod tests {
         let source = HttpSource::new(1, test_support::config(None, &[ENDPOINT_ONE]), None);
         source
             .shared
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42))
-            .await;
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
 
         let produced = source.poll().await.expect("poll must succeed");
 
@@ -1525,8 +1521,7 @@ mod tests {
         let source = HttpSource::new(1, config, None);
         source
             .shared
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42))
-            .await;
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
         source
             .shared
             .sender
@@ -1689,7 +1684,11 @@ mod tests {
         // nothing to carry, and waking anyway spins the poll task through an
         // FFI round trip per iteration.
         let source = HttpSource::new(1, test_support::config(None, &[]), None);
-        let held = source.shared.registry_writer.lock().await;
+        let held = source
+            .shared
+            .registry_writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
 
         assert!(source.shared.take_dirty_state().is_none());
         drop(held);
@@ -1711,8 +1710,7 @@ mod tests {
         let source = HttpSource::new(1, config, None);
         source
             .shared
-            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42))
-            .await;
+            .mutate_registry(|registry| registry.revoke(ENDPOINT_ONE, "rotated".to_string(), 42));
 
         let flushed = source.poll().await.expect("poll must succeed");
         assert!(flushed.messages.is_empty());
