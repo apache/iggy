@@ -168,6 +168,11 @@ async def main():
 asyncio.run(main())
 ```
 
+`IggyClient(...)` also accepts an `HttpConfig` for the HTTP transport. HTTP is a
+stateless per-request transport, so there is no reconnection policy to configure.
+There is also no `AutoLogin`: call `login_user(...)` explicitly after connecting.
+See `examples/python/getting-started/producer.py` for a config swap example.
+
 ## Examples
 
 Refer to the [examples/python/](https://github.com/apache/iggy/tree/master/examples/python) directory for usage examples.

@@ -37,6 +37,7 @@ __all__ = [
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
+    "HttpConfig",
     "IggyClient",
     "IggyConsumer",
     "IggyExpiry",
@@ -838,28 +839,75 @@ class HeaderValue:
         def __new__(cls, value: builtins.float) -> HeaderValue.Float64: ...
 
 @typing.final
+class HttpConfig:
+    r"""
+    Configuration for the HTTP transport, accepted by `IggyClient(...)`.
+
+    Every field is keyword-only and optional.
+    """
+    @property
+    def api_url(self) -> builtins.str: ...
+    @property
+    def retries(self) -> builtins.int: ...
+    @property
+    def has_jwt(self) -> builtins.bool:
+        r"""
+        Whether a JWT is configured, without exposing the token itself.
+        """
+    @property
+    def heartbeat_interval(self) -> datetime.timedelta: ...
+    def __new__(
+        cls,
+        *,
+        api_url: builtins.str | None = None,
+        retries: builtins.int | None = None,
+        jwt: builtins.str | None = None,
+        heartbeat_interval: datetime.timedelta | None = None,
+    ) -> HttpConfig:
+        r"""
+        Constructs an HTTP configuration.
+
+        Args:
+            api_url: Base URL of the Iggy HTTP API. Defaults to `http://127.0.0.1:3000`.
+            retries: Number of retries to perform on transient errors. Defaults to 3.
+            jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to `None`.
+            heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+
+        Raises:
+            ValueError: If `api_url` is not a valid URL, if `retries` is outside the
+                range of an unsigned 32-bit integer, if a duration is negative, or
+                if `heartbeat_interval` is zero.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class IggyClient:
     r"""
     A Python class representing the Iggy client.
     It provides asynchronous functionality through the contained runtime.
     """
-    def __new__(cls, conn: TcpConfig | builtins.str | None = None) -> IggyClient:
+    def __new__(
+        cls, conn: TcpConfig | HttpConfig | builtins.str | None = None
+    ) -> IggyClient:
         r"""
-        Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
-        This initializes a new runtime for asynchronous operations.
+        Constructs a new IggyClient from a TCP server address, a `TcpConfig`, or an
+        `HttpConfig`. This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
 
         Args:
-            conn: Either a `host:port` address, or a `TcpConfig` carrying the full
-                transport configuration. Defaults to `127.0.0.1:8090` with auto-login
-                disabled. A malformed address is reported differently by the two
-                forms: the string form raises `RuntimeError` here, while `TcpConfig`
-                raises `ValueError` when it is constructed, before it ever reaches
-                this call. Neither exception is a subclass of the other.
+            conn: A `host:port` address, a `TcpConfig`, or an `HttpConfig`. Defaults
+                to `127.0.0.1:8090` over TCP with auto-login disabled. A malformed
+                address is reported differently depending on the form: the string
+                form raises `RuntimeError` here, while `TcpConfig`/`HttpConfig`
+                raise `ValueError` when they are constructed, before either ever
+                reaches this call. Neither exception is a subclass of the other.
 
         Raises:
             RuntimeError: If the address passed as a string is not a valid
-                `host:port` pair.
+                `host:port` pair, or if an `HttpConfig` client cannot be
+                constructed. `api_url` is already validated when `HttpConfig` is
+                built, so the latter does not currently fail; the exception is
+                documented for interface consistency with the other transports.
         """
     @classmethod
     def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:

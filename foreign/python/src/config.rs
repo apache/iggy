@@ -17,6 +17,7 @@
 
 use iggy::prelude::{
     AutoLogin as RustAutoLogin, Credentials as RustCredentials,
+    HttpClientConfig as RustHttpClientConfig, HttpClientConfigBuilder,
     TcpClientConfig as RustTcpClientConfig, TcpClientConfigBuilder,
     TcpClientReconnectionConfig as RustTcpClientReconnectionConfig,
 };
@@ -408,16 +409,127 @@ impl TcpConfig {
     }
 }
 
+/// Configuration for the HTTP transport, accepted by `IggyClient(...)`.
+///
+/// Every field is keyword-only and optional.
+#[gen_stub_pyclass]
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct HttpConfig {
+    inner: Arc<RustHttpClientConfig>,
+}
+
+impl HttpConfig {
+    /// The configuration in the shape `HttpClient::create` expects.
+    pub(crate) fn client_config(&self) -> Arc<RustHttpClientConfig> {
+        self.inner.clone()
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl HttpConfig {
+    /// Constructs an HTTP configuration.
+    ///
+    /// Args:
+    ///     api_url: Base URL of the Iggy HTTP API. Defaults to `http://127.0.0.1:3000`.
+    ///     retries: Number of retries to perform on transient errors. Defaults to 3.
+    ///     jwt: JWT token for A2A (Agent-to-Agent) authentication. Defaults to `None`.
+    ///     heartbeat_interval: Interval of heartbeats sent by the client. Defaults to 5 seconds.
+    ///
+    /// Raises:
+    ///     ValueError: If `api_url` is not a valid URL, if `retries` is outside the
+    ///         range of an unsigned 32-bit integer, if a duration is negative, or
+    ///         if `heartbeat_interval` is zero.
+    #[new]
+    #[pyo3(signature = (*, api_url=None, retries=None, jwt=None, heartbeat_interval=None))]
+    fn new(
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] api_url: Option<String>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] retries: Option<i64>,
+        #[gen_stub(override_type(type_repr = "builtins.str | None"))] jwt: Option<String>,
+        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+        heartbeat_interval: Option<Py<PyDelta>>,
+    ) -> PyResult<Self> {
+        // The builder starts from `HttpClientConfig::default()`, and its `build()`
+        // trims and validates the API URL whether or not one was set here.
+        let mut builder = HttpClientConfigBuilder::new();
+        if let Some(api_url) = api_url {
+            builder = builder.with_api_url(api_url);
+        }
+        if let Some(retries) = retries {
+            let retries = u32::try_from(retries).map_err(|_| {
+                PyValueError::new_err(format!("'retries' must be between 0 and {}", u32::MAX))
+            })?;
+            builder = builder.with_retries(retries);
+        }
+        if let Some(jwt) = jwt {
+            builder = builder.with_jwt(jwt);
+        }
+        let mut inner = builder
+            .build()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if let Some(heartbeat_interval) = heartbeat_interval {
+            inner.heartbeat_interval = reject_zero(
+                py_delta_to_iggy_duration(&heartbeat_interval)?,
+                "heartbeat_interval",
+            )?;
+        }
+
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    #[getter]
+    fn api_url(&self) -> String {
+        self.inner.api_url.clone()
+    }
+
+    #[getter]
+    fn retries(&self) -> u32 {
+        self.inner.retries
+    }
+
+    /// Whether a JWT is configured, without exposing the token itself.
+    #[getter]
+    fn has_jwt(&self) -> bool {
+        self.inner.jwt.is_some()
+    }
+
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta", imports=("datetime")))]
+    #[getter]
+    fn heartbeat_interval<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDelta>> {
+        iggy_duration_to_py_delta(py, self.inner.heartbeat_interval.get())
+    }
+
+    fn __repr__(&self) -> String {
+        let jwt = if self.inner.jwt.is_some() {
+            "..."
+        } else {
+            "None"
+        };
+        format!(
+            "HttpConfig(api_url={:?}, retries={}, jwt={jwt}, heartbeat_interval={})",
+            self.inner.api_url,
+            self.inner.retries,
+            duration_repr(self.inner.heartbeat_interval.get()),
+        )
+    }
+}
+
 fn python_bool(value: bool) -> &'static str {
     if value { "True" } else { "False" }
 }
 
-/// What `IggyClient(...)` accepts: a bare `host:port` or a full `TcpConfig`.
+/// What `IggyClient(...)` accepts: a bare `host:port`, a full `TcpConfig`, or an
+/// `HttpConfig` for the HTTP transport.
 #[derive(FromPyObject)]
 pub enum PyClientConfig {
     #[pyo3(transparent)]
-    Config(TcpConfig),
+    Tcp(TcpConfig),
+    #[pyo3(transparent)]
+    Http(HttpConfig),
     #[pyo3(transparent, annotation = "str")]
     ServerAddress(String),
 }
-impl_stub_type!(PyClientConfig = TcpConfig | String);
+impl_stub_type!(PyClientConfig = TcpConfig | HttpConfig | String);
