@@ -326,6 +326,14 @@ impl EndpointRegistry {
         self.endpoints.values().all(|endpoint| endpoint.submitted)
     }
 
+    /// Endpoints whose latest change has not been handed to the runtime.
+    pub fn unsubmitted_count(&self) -> usize {
+        self.endpoints
+            .values()
+            .filter(|endpoint| !endpoint.submitted)
+            .count()
+    }
+
     pub fn to_connector_state(&self, connector_id: u32) -> Option<ConnectorState> {
         ConnectorState::serialize(self, CONNECTOR_NAME, connector_id)
     }
@@ -772,6 +780,26 @@ mod tests {
             registry.endpoints.len(),
             MAX_ENDPOINTS,
             "a refusal must not leave the registry partially reclaimed, or it would arm a flush for a change the caller was told did not happen"
+        );
+    }
+
+    #[test]
+    fn given_mixed_registry_when_counting_unsubmitted_should_exclude_handed_over_entries() {
+        // close() reports this number, and it is the only record that a
+        // revocation made after the last poll did not survive the restart.
+        let mut registry = EndpointRegistry::default();
+        assert!(registry.insert(dynamic_endpoint(ENDPOINT_ONE)));
+        assert!(registry.insert(dynamic_endpoint(ENDPOINT_TWO)));
+        assert_eq!(registry.unsubmitted_count(), 2);
+
+        registry.mark_submitted();
+        assert_eq!(registry.unsubmitted_count(), 0);
+
+        assert!(registry.revoke(ENDPOINT_ONE, "compromised".to_string(), 42));
+        assert_eq!(
+            registry.unsubmitted_count(),
+            1,
+            "revoking marks the entry unsubmitted again, which is what close() must report"
         );
     }
 

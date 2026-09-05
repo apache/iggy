@@ -214,7 +214,7 @@ async fn management_registered_endpoint_accepts_until_revoked(
         .send()
         .await
         .expect("Failed to revoke the endpoint");
-    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    assert_eq!(revoked.status(), StatusCode::ACCEPTED);
 
     let after = http
         .post(fixture.webhook_url(&endpoint_id))
@@ -332,7 +332,7 @@ async fn revoked_static_endpoint_stays_revoked_across_restart(
         .send()
         .await
         .expect("Failed to revoke the static endpoint");
-    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+    assert_eq!(revoked.status(), StatusCode::ACCEPTED);
     wait_for_submitted(&http, &fixture, GITHUB_ENDPOINT_ID).await;
 
     let restarted = http

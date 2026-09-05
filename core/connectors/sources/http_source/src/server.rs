@@ -43,7 +43,7 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -64,6 +64,11 @@ pub const RECEIVED_AT_HEADER: &str = "iggy_http_received_at";
 /// the listener tasks. Bounded so a wedged connection cannot stall shutdown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a `join()` waits for a draining listener to release its address.
+/// Longer than [`SHUTDOWN_TIMEOUT`], since the drain it is waiting on is
+/// itself bounded by that.
+const DRAIN_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// Registers an instance with the listener for its configured address,
 /// binding that listener if this is the first instance to ask for it.
 pub async fn join(instance: Arc<SharedState>) -> Result<(), Error> {
@@ -72,9 +77,25 @@ pub async fn join(instance: Arc<SharedState>) -> Result<(), Error> {
 
     if let Some(server) = servers.get_mut(&listen_addr) {
         if server.draining {
-            return Err(Error::InitError(format!(
-                "The {CONNECTOR_NAME} listener on {listen_addr} is shutting down; retry the open once its port is released"
-            )));
+            // A sibling is mid-shutdown. Failing here turns two concurrent
+            // restarts on one listener into one instance left stopped, so wait
+            // for the entry to go and try again. The waiter is enrolled before
+            // the guard is released, or the notify could fire into the gap and
+            // be missed.
+            let drained = Arc::clone(&server.drained);
+            let mut waiter = Box::pin(drained.notified());
+            waiter.as_mut().enable();
+            drop(servers);
+            if tokio::time::timeout(DRAIN_WAIT_TIMEOUT, waiter)
+                .await
+                .is_err()
+            {
+                return Err(Error::InitError(format!(
+                    "The {CONNECTOR_NAME} listener on {listen_addr} was still shutting down after {}s; retry the open once its port is released",
+                    DRAIN_WAIT_TIMEOUT.as_secs()
+                )));
+            }
+            return Box::pin(join(instance)).await;
         }
         server.ensure_compatible(&instance.config)?;
         let mut instances = server.state.instances();
@@ -152,11 +173,13 @@ pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
         );
         server.state.serve_nothing();
     }
-    // Read back rather than trusting the vec we hoped to publish. `publish` is
-    // all-or-nothing, so on its failure branch the departed instance is still
-    // in `instances`, and counting the local vec would leave a listener bound
-    // for the life of the process: the next `leave` would see two instances,
-    // compute one remaining, and never reach the shutdown branch.
+    // Read back rather than trusting the vec we hoped to publish, so the count
+    // describes what is actually being served. It is not what keeps the
+    // listener from leaking: `publish` is all-or-nothing, so on its failure
+    // branch the departed instance is still in `instances` either way. What
+    // makes that branch unreachable is that `remaining` is a subset of a table
+    // that already built, and dropping entries cannot introduce a path
+    // collision.
     let remaining_count = server.state.instances().len();
     info!(
         "Deregistered {CONNECTOR_NAME} routes for connector ID: {}, instances left on {listen_addr}: {remaining_count}",
@@ -191,7 +214,12 @@ pub async fn leave(instance: &Arc<SharedState>, staged_dropped: u64) {
         drop(servers);
 
         SharedServer::stop(signal, tasks, listen_addr).await;
-        SERVERS.lock().await.remove(listen_addr);
+        let removed = SERVERS.lock().await.remove(listen_addr);
+        // After the removal, so a woken `join()` re-reads a map that no longer
+        // holds the drained entry and binds fresh.
+        if let Some(removed) = removed {
+            removed.drained.notify_waiters();
+        }
     }
 }
 
@@ -212,6 +240,9 @@ struct SharedServer {
     /// a concurrent `join()` cannot bind a port that is still held, but it can
     /// no longer be joined.
     draining: bool,
+    /// Fired once the drained entry has been removed from the registry, so a
+    /// `join()` that arrived mid-drain can retry instead of failing.
+    drained: Arc<Notify>,
 }
 
 /// The instance set and the routes derived from it, published as one value so
@@ -279,7 +310,18 @@ impl ServerState {
     /// removes access but the table cannot be rebuilt: stale routes would keep
     /// honouring a credential the operator believes is gone.
     pub(crate) fn serve_nothing(&self) {
-        let dropped = self.published.load();
+        // `rcu`, not load-then-store. A `publish()` from join or leave landing
+        // between the two would be discarded, and because this keeps the
+        // instance set it would leave the listener bound and serving nothing
+        // with no record of the publish that went missing.
+        let dropped = self.published.rcu(|current| {
+            // Instances are kept: they are still joined and still own bridges,
+            // and it is only the routing that is being withdrawn.
+            Arc::new(Published {
+                instances: current.instances.clone(),
+                routes: RouteTable::default(),
+            })
+        });
         error!(
             "Serving no {CONNECTOR_NAME} routes on {}: dropped {} secret paths and {} named paths across {} instances until the next successful publish",
             self.listen_addr,
@@ -287,12 +329,6 @@ impl ServerState {
             dropped.routes.named_path_count(),
             dropped.instances.len()
         );
-        // Instances are kept: they are still joined and still own bridges, and
-        // it is only the routing that is being withdrawn.
-        self.published.store(Arc::new(Published {
-            instances: dropped.instances.clone(),
-            routes: RouteTable::default(),
-        }));
     }
 
     /// Swaps in a new instance set and the routes it projects to, or leaves
@@ -357,6 +393,7 @@ impl SharedServer {
             shutdown,
             tasks,
             draining: false,
+            drained: Arc::new(Notify::new()),
         })
     }
 
@@ -708,6 +745,7 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
                 endpoints_expired: registry.expired_count(now),
                 endpoints_revoked: registry.revoked_count(),
                 named_path: instance.config.topic_path.is_some(),
+                poll_is_live: instance.poll_is_live(now),
                 // Same derivation as the per-endpoint flag: submitted is set
                 // before the state leaves, so it only means durable if no
                 // flush is still owed.
@@ -971,6 +1009,14 @@ struct InstanceHealth {
     endpoints_expired: usize,
     endpoints_revoked: usize,
     named_path: bool,
+    /// Whether a poll has run recently enough to believe one still will.
+    ///
+    /// `state_submitted` says a change was handed over; this says whether
+    /// anything is still there to hand the next one to. The SDK stops the poll
+    /// task after five consecutive NACKs without calling `close()`, so the
+    /// instance stays registered and keeps accepting mutations that will never
+    /// be persisted. See #3941.
+    poll_is_live: bool,
     state_submitted: bool,
     dropped_headers: u64,
     clamped_headers: u64,
