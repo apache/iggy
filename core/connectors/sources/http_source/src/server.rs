@@ -779,8 +779,8 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
                 // before the state leaves, so it only means durable if no
                 // flush is still owed.
                 state_submitted: registry.all_submitted() && !instance.has_pending_state(),
-                dropped_headers: state.metrics.headers_dropped(&instance.instance_name),
-                clamped_headers: state.metrics.headers_clamped(&instance.instance_name),
+                headers_dropped: state.metrics.headers_dropped(&instance.instance_name),
+                headers_clamped: state.metrics.headers_clamped(&instance.instance_name),
             }
         })
         .collect();
@@ -1076,8 +1076,11 @@ struct InstanceHealth {
     /// be persisted. See #3941.
     poll_is_live: bool,
     state_submitted: bool,
-    dropped_headers: u64,
-    clamped_headers: u64,
+    /// Named to mirror the metric families exactly, so an operator reading
+    /// `/admin/health` and a Prometheus scrape is not looking at two spellings
+    /// of one thing.
+    headers_dropped: u64,
+    headers_clamped: u64,
 }
 
 #[cfg(test)]
