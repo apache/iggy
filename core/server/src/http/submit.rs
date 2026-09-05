@@ -23,29 +23,25 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use consensus::MetadataHandle;
 use futures::channel::oneshot;
 use iggy_binary_protocol::consensus::Command;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::IggyError;
-use metadata::impls::metadata::StreamsFrontend;
 use server_common::{MESSAGE_ALIGN, Message, iobuf::Frozen};
 use tracing::warn;
 
 use crate::dispatch::partition::{dispatch_partition_request, resolve_delete_segments_truncate};
 use crate::dispatch::session_ops::submit_logout_on_owner;
-use crate::dispatch::submit::submit_client_request_on_owner;
+use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
-use crate::http::reply::{
-    classify_partition_reply, committed_payload, eviction_error, transient_code,
-};
+use crate::http::reply::{classify_partition_reply, committed_payload, eviction_error};
 use crate::http::session::HttpSession;
 use crate::http::state::HttpInner;
 use crate::http::wire::build_request_message;
-use crate::pat::rewrite_pat_request_for_user;
+use crate::responses::transient_code;
+use crate::rewrite::http_chain;
 use crate::shell::ServerShard;
-use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::request_body;
 
 /// Bound on a partition write's (produce / consumer-offset write) wait for its
@@ -106,6 +102,7 @@ pub(in crate::http) async fn submit_committed(
     let (result_slot, committed) = oneshot::channel();
     let shard = Rc::clone(&state.shard);
     let task_session = Rc::clone(session);
+    let watermarks = Rc::clone(&state.metadata_watermarks);
     let body = body.to_vec();
     let max_tokens_per_user = state.max_tokens_per_user;
     // Detached so a client disconnect cannot abandon the gate mid-submit;
@@ -113,6 +110,25 @@ pub(in crate::http) async fn submit_committed(
     compio::runtime::spawn(async move {
         let result =
             submit_gated(&shard, &task_session, operation, max_tokens_per_user, &body).await;
+        // Recorded here rather than after the await below, for the same reason
+        // the submit is detached: a caller that disconnected mid-write still
+        // committed the op, and its next request as this user must not be
+        // served state older than what committed. Ordered before the wake, so a
+        // read issued the instant the response lands already sees the mark.
+        //
+        // A follower with HTTP forwarding ON never runs this task: the
+        // middleware relays the write and records the floor from the serving
+        // primary's applied op instead (`http::forward::record_relayed_floor`).
+        // One gap survives that split - a relayed 503 carrying
+        // `TransientNotCommitted` is passed through untouched rather than
+        // retried, because its op may still commit, and only a 2xx records a
+        // floor. A write that did commit behind that code therefore leaves
+        // none, until this caller's next committed write raises it.
+        if let Ok((_, reply, _)) = &result
+            && let Some(commit) = committed_reply_commit(reply)
+        {
+            watermarks.record(task_session.user_id, commit);
+        }
         // A failed send means the handler died mid-await; the submit itself
         // already completed, which is the invariant that matters.
         let _ = result_slot.send(result);
@@ -198,22 +214,8 @@ async fn submit_gated(
         request_id,
         body,
     );
-    let (message, raw_token) = rewrite_pat_request_for_user(
-        session.user_id,
-        max_tokens_per_user,
-        |user_id| {
-            shard
-                .plane
-                .metadata()
-                .mux_stm
-                .users()
-                .read(|users| users.pat_count_of(user_id))
-        },
-        message,
-    )
-    .map_err(WriteError::Rejected)?;
-    let message =
-        maybe_rewrite_user_password_request(shard, message).map_err(WriteError::Rejected)?;
+    let (message, raw_token) = http_chain(shard, session.user_id, max_tokens_per_user, message)
+        .map_err(WriteError::Rejected)?;
     // `DeleteSegments` is not itself a consensus op: resolve it to the metadata
     // `TruncatePartition` that commits the trim before it reaches consensus,
     // mirroring the TCP dispatch. The truncate rides this session's burned
@@ -377,7 +379,13 @@ pub(in crate::http) async fn partition_write_replicated(
     // timeout. Held across every exit below; released by `Drop`.
     let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
     ensure_in_process_reply_target(state, session);
-    let request_id = session.next_data_request_id();
+    // Held from the mint until `dispatch_partition_request` returns, which is
+    // past the owning shard's inbox: the ids of this session's writes must
+    // reach the partition in mint order or the watermark absorbs the overtaken
+    // one. Released before the commit wait so writes still overlap there.
+    let mut next_data_request_id = session.data_gate.lock().await;
+    let request_id = *next_data_request_id;
+    *next_data_request_id += 1;
     let message = build_request_message(
         operation,
         session.client_id,
@@ -407,6 +415,7 @@ pub(in crate::http) async fn partition_write_replicated(
         Some(session.user_id),
     )
     .await;
+    drop(next_data_request_id);
     let outcome = compio::time::timeout(PARTITION_WRITE_REPLY_TIMEOUT, receiver).await;
     // Removes the slot unless the reply already fired, so a late commit
     // reply after a timeout sheds at the bus instead of leaking a waiter.
@@ -442,7 +451,10 @@ pub(in crate::http) async fn produce_unacked(
     body: &[u8],
 ) -> Result<(), PartitionWriteError> {
     let _in_flight = admit_partition_write(&session.in_flight_writes, &state.in_flight_writes)?;
-    let request_id = session.next_data_request_id();
+    // Same gate as the acked path, for the same ordering reason.
+    let mut next_data_request_id = session.data_gate.lock().await;
+    let request_id = *next_data_request_id;
+    *next_data_request_id += 1;
     let message = build_request_message(
         Operation::SendMessages,
         session.client_id,
@@ -459,6 +471,7 @@ pub(in crate::http) async fn produce_unacked(
         Some(session.user_id),
     )
     .await;
+    drop(next_data_request_id);
     Ok(())
 }
 

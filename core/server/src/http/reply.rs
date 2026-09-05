@@ -38,6 +38,7 @@ use tracing::warn;
 
 use crate::dispatch::login_error::LoginRegisterError;
 use crate::http::error::{PartitionWriteError, WriteError};
+use crate::responses::reply_body;
 
 /// Discriminate a partition write reply. Partition replies carry no result
 /// section - a denial is empty-bodied and a committed body, where there is one,
@@ -146,33 +147,6 @@ pub(in crate::http) fn committed_payload(
     }
 }
 
-/// The transient variant of a reply-shaped pre-consensus rejection frame
-/// (`[count=1][index=0][code]`, see `build_result_rejection_reply`), or `None`
-/// for a committed outcome. Either transient means the op did not commit, so
-/// the write path must replay the same request id rather than grade it as a
-/// committed result or advance the session gate. The two codes are kept
-/// distinct because they exhaust differently: `TransientNotAccepted` never
-/// entered the pipeline and is safe to re-issue anywhere, while
-/// `TransientNotCommitted` may still commit and only a same-session same-id
-/// replay is safe.
-pub(in crate::http) fn transient_code(reply: &Message<GenericHeader>) -> Option<IggyError> {
-    match result_code(reply_body(reply)) {
-        Some(code) if code == IggyError::TransientNotCommitted.as_code() => {
-            Some(IggyError::TransientNotCommitted)
-        }
-        Some(code) if code == IggyError::TransientNotAccepted.as_code() => {
-            Some(IggyError::TransientNotAccepted)
-        }
-        _ => None,
-    }
-}
-
-/// The reply body past the generic header, bounded by the header's `size`.
-fn reply_body(reply: &Message<GenericHeader>) -> &[u8] {
-    let size = reply.header().size as usize;
-    reply.as_slice().get(HEADER_SIZE..size).unwrap_or_default()
-}
-
 /// Decode the `GetStreamResponse` payload of a committed create-stream reply into
 /// `StreamDetails`. `payload` is the slice past the result section that
 /// [`submit_write`] already validated as a success.
@@ -271,7 +245,7 @@ mod tests {
 
     use crate::responses::{
         NonReplicatedResponse, build_deny_reply, build_empty_reply, build_reply_from_bytes,
-        build_reply_with_body,
+        build_reply_with_body, transient_code,
     };
 
     use crate::http::wire::build_request_message;

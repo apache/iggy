@@ -29,9 +29,10 @@ use std::rc::Rc;
 
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codes::{
-    DESCRIBE_OPTIONS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_GROUP_CODE,
-    GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE, GET_STATS_CODE, GET_STREAM_CODE,
-    GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, GET_USER_CODE, GET_USERS_CODE,
+    DESCRIBE_OPTIONS_CODE, FLUSH_UNSAVED_BUFFER_CODE, GET_CLUSTER_METADATA_CODE,
+    GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUPS_CODE, GET_PERSONAL_ACCESS_TOKENS_CODE,
+    GET_STATS_CODE, GET_STREAM_CODE, GET_STREAMS_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
+    GET_USER_CODE, GET_USERS_CODE,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     GetConsumerGroupRequest, GetConsumerGroupsRequest,
@@ -39,20 +40,15 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::requests::streams::GetStreamRequest;
 use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
 use iggy_binary_protocol::requests::users::GetUserRequest;
-use iggy_binary_protocol::{
-    Operation, PrepareHeader, RoutedRequestHeader, WireDecode, WireIdentifier,
-};
+use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, lookup_command};
 use iggy_common::IggyError;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
 use server_common::Message;
-use tracing::warn;
 
-use crate::responses::{
-    build_deny_reply, current_metadata_commit, resolve_stream_id, resolve_topic_id,
-};
+use crate::responses::{resolve_stream_id, resolve_topic_id};
 use crate::shell::{ShellBus, ShellShard};
 
 /// Authorize a partition-plane op on its resolved (stream, topic) for the
@@ -132,74 +128,6 @@ where
     decision.err().map(|error| error.as_code())
 }
 
-/// Reply to a request rejected before it reached its plane with the request's
-/// own frame: empty body + nonzero `status`. The nonzero status is the whole
-/// point: the SDK peeks it and surfaces the typed error, whereas a status-0
-/// frame reads as a committed ack for work that never happened. Silence is no
-/// better, the connection decodes replies in lockstep and would wedge on every
-/// later request.
-#[allow(clippy::future_not_send)]
-pub(in crate::dispatch) async fn send_deny_reply<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
-    request_header: &RoutedRequestHeader,
-    status: u32,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let commit = current_metadata_commit(shard);
-    let reply = build_deny_reply(request_header, transport_client_id, 0, commit, status);
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            status,
-            error = %error,
-            operation = ?request_header.operation,
-            "failed to surface request denial"
-        );
-    }
-}
-
-/// Deny a request from an unbound transport without disclosing the metadata
-/// commit frontier. The status is the only field a pre-authenticated caller
-/// needs, while the live commit would expose cluster write activity.
-#[allow(clippy::future_not_send)]
-pub(in crate::dispatch) async fn send_unbound_deny_reply<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    transport_client_id: u128,
-    request_header: &RoutedRequestHeader,
-    status: u32,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let reply = build_deny_reply(request_header, transport_client_id, 0, 0, status);
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            status,
-            error = %error,
-            operation = ?request_header.operation,
-            "failed to surface unbound request denial"
-        );
-    }
-}
-
 /// Run an unscoped non-replicated-read rule for the acting user. A `None` user
 /// id (only the pre-auth path, which serves ungated codes) fails closed.
 pub(in crate::dispatch) fn authorize_uid<B, MJ, S, SB>(
@@ -263,6 +191,11 @@ where
 /// topic]) against committed state first. The PAT list is self-scoped, so
 /// authentication is its whole rule, and `GET_CLUSTER_METADATA` -- which
 /// describes the private replica network -- is gated the same way.
+///
+/// The gate is total over the protocol command table: every code the builder
+/// serves has a named arm, and the tail refuses everything else (a replicated
+/// code inside a `NonReplicated` header, a table-listed code with no arm, an
+/// unknown code) instead of deferring it to the builder's catch-all.
 pub(in crate::dispatch) fn authorize_default_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     code: u32,
@@ -276,8 +209,8 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    // A `u32` match cannot be exhaustive: every gated code is named explicitly,
-    // and the final arm is the ungated set the builder serves without a rule.
+    // A `u32` match cannot be exhaustive, so totality is by construction:
+    // every code with a decision is named, and the tail refuses the rest.
     match code {
         GET_STATS_CODE => authorize_uid(shard, user_id, Permissioner::get_stats),
         GET_USERS_CODE => authorize_uid(shard, user_id, Permissioner::get_users),
@@ -328,46 +261,17 @@ where
             |request| (&request.stream_id, &request.topic_id),
             Permissioner::get_consumer_groups,
         ),
-        _ => Ok(()),
-    }
-}
-
-/// Reply to a denied non-replicated read with the request's reply frame: empty
-/// body + nonzero `status`. The SDK peeks the status before body decode and
-/// surfaces the typed error, so a poll denial never reaches the empty-poll
-/// "0 messages" body path.
-#[allow(clippy::future_not_send)]
-pub(in crate::dispatch) async fn send_non_replicated_deny<B, MJ, S, SB>(
-    shard: &Rc<ShellShard<B, MJ, S, SB>>,
-    request: &Message<RoutedRequestHeader>,
-    transport_client_id: u128,
-    status: u32,
-) where
-    B: ShellBus,
-    MJ: JournalHandle + 'static,
-    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-    S: 'static,
-    SB: SuperblockStore + 'static,
-{
-    let commit = current_metadata_commit(shard);
-    let reply = build_deny_reply(
-        request.header(),
-        request.header().client,
-        request.header().session,
-        commit,
-        status,
-    );
-    if let Err(error) = shard
-        .bus
-        .send_to_client(transport_client_id, reply.into_generic().into_frozen())
-        .await
-    {
-        warn!(
-            transport_client_id,
-            status,
-            error = %error,
-            "failed to surface non-replicated authz denial"
-        );
+        // No on-demand flush primitive exists, and flush has no HTTP route, so
+        // this arm is the only thing answering `FeatureUnavailable` for it.
+        FLUSH_UNSAVED_BUFFER_CODE => Err(IggyError::FeatureUnavailable),
+        // A replicated code smuggled inside a `NonReplicated` header keeps the
+        // builder's `FeatureUnavailable`; a table-listed code with no arm above
+        // and an unknown code are both refused as `InvalidCommand`. The builder
+        // refuses the same set, so a new caller cannot land on a fail-open.
+        _ => match lookup_command(code) {
+            Some(meta) if meta.is_replicated() => Err(IggyError::FeatureUnavailable),
+            _ => Err(IggyError::InvalidCommand),
+        },
     }
 }
 
@@ -507,4 +411,169 @@ where
         let topic_id = resolve_topic_id(inner, stream_id, topic_id)?;
         Some((stream_id, topic_id))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, TestShard, test_shard};
+    use iggy_binary_protocol::COMMAND_TABLE;
+    use iggy_binary_protocol::codes::{
+        CREATE_STREAM_CODE, GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CONSUMER_OFFSET_CODE,
+        GET_ME_CODE, GET_SNAPSHOT_FILE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+        LOGIN_USER_CODE, LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE, LOGOUT_USER_CODE, PING_CODE,
+        POLL_MESSAGES_CODE, SYNC_CONSUMER_GROUP_CODE,
+    };
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+
+    /// A code no `COMMAND_TABLE` entry claims.
+    const UNKNOWN_CODE: u32 = 9999;
+
+    /// The gate's answer as the wire sees it: status 0 allows, anything else
+    /// is the deny code stamped into `ReplyHeader.status`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        Allow,
+        Deny(u32),
+    }
+
+    /// Shard with root seeded, so the root column below exercises the
+    /// permissioner rules rather than a missing-user deny.
+    fn gate_shard() -> Rc<TestShard> {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .ensure_root_user("iggy", "hash");
+        shard
+    }
+
+    /// Gate a header-only frame (`body = &[]`) for `user_id`.
+    fn gate(shard: &Rc<TestShard>, code: u32, user_id: Option<u32>) -> Verdict {
+        match authorize_default_read(shard, code, &[], user_id) {
+            Ok(()) => Verdict::Allow,
+            Err(error) => Verdict::Deny(error.as_code()),
+        }
+    }
+
+    /// Expected verdicts per non-replicated code for a header-only frame, as
+    /// `(code, unbound caller, root)`. Header-only means the identifier-scoped
+    /// arms never decode a body and defer to the builder's own error for both
+    /// callers. Codes the reads router serves on its own arms (`PING`, `GET_ME`,
+    /// `GET_CLIENTS`, ...) and the codes the classifier settles (the legacy
+    /// logins) never reach the gate, which refuses them like any other armless
+    /// code.
+    fn expected_header_only_verdicts() -> Vec<(u32, Verdict, Verdict)> {
+        let allow = Verdict::Allow;
+        let unauthenticated = Verdict::Deny(IggyError::Unauthenticated.as_code());
+        let invalid_command = Verdict::Deny(IggyError::InvalidCommand.as_code());
+        let feature_unavailable = Verdict::Deny(IggyError::FeatureUnavailable.as_code());
+        vec![
+            (PING_CODE, invalid_command, invalid_command),
+            (GET_STATS_CODE, unauthenticated, allow),
+            (GET_SNAPSHOT_FILE_CODE, invalid_command, invalid_command),
+            (GET_CLUSTER_METADATA_CODE, unauthenticated, allow),
+            (GET_ME_CODE, invalid_command, invalid_command),
+            (GET_CLIENT_CODE, invalid_command, invalid_command),
+            (GET_CLIENTS_CODE, invalid_command, invalid_command),
+            (GET_USER_CODE, allow, allow),
+            (GET_USERS_CODE, unauthenticated, allow),
+            (LOGIN_USER_CODE, invalid_command, invalid_command),
+            (LOGOUT_USER_CODE, invalid_command, invalid_command),
+            (LOGIN_REGISTER_CODE, invalid_command, invalid_command),
+            (GET_PERSONAL_ACCESS_TOKENS_CODE, unauthenticated, allow),
+            (
+                LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE,
+                invalid_command,
+                invalid_command,
+            ),
+            (POLL_MESSAGES_CODE, invalid_command, invalid_command),
+            (
+                FLUSH_UNSAVED_BUFFER_CODE,
+                feature_unavailable,
+                feature_unavailable,
+            ),
+            (GET_CONSUMER_OFFSET_CODE, invalid_command, invalid_command),
+            (GET_STREAM_CODE, allow, allow),
+            (GET_STREAMS_CODE, unauthenticated, allow),
+            (GET_TOPIC_CODE, allow, allow),
+            (GET_TOPICS_CODE, allow, allow),
+            (GET_CONSUMER_GROUP_CODE, allow, allow),
+            (GET_CONSUMER_GROUPS_CODE, allow, allow),
+            (SYNC_CONSUMER_GROUP_CODE, invalid_command, invalid_command),
+            (
+                LOGIN_REGISTER_WITH_PAT_CODE,
+                invalid_command,
+                invalid_command,
+            ),
+            (DESCRIBE_OPTIONS_CODE, unauthenticated, allow),
+        ]
+    }
+
+    /// Every non-replicated table entry has a named decision above. A new
+    /// entry without a row fails by name, so it cannot slip past the gate
+    /// unnoticed; a row without a table entry is stale and fails too.
+    #[test]
+    fn gate_is_total_over_the_command_table() {
+        let shard = gate_shard();
+        let expected = expected_header_only_verdicts();
+        for meta in COMMAND_TABLE.iter().filter(|meta| !meta.is_replicated()) {
+            let Some((_, unbound, root)) = expected.iter().find(|row| row.0 == meta.code) else {
+                panic!(
+                    "non-replicated command {} ({}) has no ratchet row: decide it in \
+                     authorize_default_read and add the row",
+                    meta.name, meta.code
+                );
+            };
+            assert_eq!(
+                gate(&shard, meta.code, None),
+                *unbound,
+                "{} ({}) from an unbound caller",
+                meta.name,
+                meta.code
+            );
+            assert_eq!(
+                gate(&shard, meta.code, Some(DEFAULT_ROOT_USER_ID)),
+                *root,
+                "{} ({}) from root",
+                meta.name,
+                meta.code
+            );
+        }
+        for (code, _, _) in &expected {
+            assert!(
+                lookup_command(*code).is_some_and(|meta| !meta.is_replicated()),
+                "ratchet row {code} names no non-replicated table entry"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_code_is_refused_as_invalid_command() {
+        assert!(
+            lookup_command(UNKNOWN_CODE).is_none(),
+            "test needs a code absent from COMMAND_TABLE"
+        );
+        let shard = gate_shard();
+        let invalid_command = Verdict::Deny(IggyError::InvalidCommand.as_code());
+        assert_eq!(gate(&shard, UNKNOWN_CODE, None), invalid_command);
+        assert_eq!(
+            gate(&shard, UNKNOWN_CODE, Some(DEFAULT_ROOT_USER_ID)),
+            invalid_command
+        );
+    }
+
+    #[test]
+    fn replicated_code_in_a_non_replicated_frame_is_refused_as_feature_unavailable() {
+        let shard = gate_shard();
+        let feature_unavailable = Verdict::Deny(IggyError::FeatureUnavailable.as_code());
+        assert_eq!(gate(&shard, CREATE_STREAM_CODE, None), feature_unavailable);
+        assert_eq!(
+            gate(&shard, CREATE_STREAM_CODE, Some(DEFAULT_ROOT_USER_ID)),
+            feature_unavailable
+        );
+    }
 }

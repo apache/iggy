@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Encryption;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.Shared;
 
 namespace Apache.Iggy.Tests.MapperTests;
@@ -44,8 +45,7 @@ public class HeaderEncryptionTests
         Assert.True(encrypted.Length > headerBytes.Length);
 
         // Encrypted bytes must not parse as valid headers
-        var parsed = Mappers.BinaryMapper.TryMapHeaders(encrypted);
-        Assert.Null(parsed);
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(encrypted));
 
         var decrypted = encryptor.DecryptToArray(encrypted);
         Assert.Equal(headerBytes, decrypted);
@@ -62,85 +62,85 @@ public class HeaderEncryptionTests
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_invalid_first_byte()
+    public void MapHeaders_throws_on_invalid_first_byte()
     {
         var random = new byte[64];
         Random.Shared.NextBytes(random);
         random[0] = 0;
 
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(random));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(random));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_first_byte_above_range()
+    public void MapHeaders_throws_on_first_byte_above_range()
     {
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 16, 0, 0, 0 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 16, 0, 0, 0 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_empty_payload()
+    public void MapHeaders_returns_empty_on_empty_payload()
     {
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders([]));
+        Assert.Empty(Mappers.BinaryMapper.MapHeaders([]));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_truncated_key_length()
+    public void MapHeaders_throws_on_truncated_key_length()
     {
         // Valid header kind byte but not enough bytes for key length
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 2 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 2 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_zero_key_length()
+    public void MapHeaders_throws_on_zero_key_length()
     {
         // Valid kind, then key length = 0 (invalid)
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 2, 0, 0, 0, 0 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 2, 0, 0, 0, 0 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_key_length_exceeding_payload()
+    public void MapHeaders_throws_on_key_length_exceeding_payload()
     {
         // Valid kind, key length = 100 but only a few bytes remain
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 2, 100, 0, 0, 0, 1, 2 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 2, 100, 0, 0, 0, 1, 2 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_truncated_value_kind()
+    public void MapHeaders_throws_on_truncated_value_kind()
     {
         // Valid kind(2=String), key_len=1, key='A', then no value kind byte
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 2, 1, 0, 0, 0, 65 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 2, 1, 0, 0, 0, 65 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_invalid_value_kind()
+    public void MapHeaders_throws_on_invalid_value_kind()
     {
         // Valid kind(2), key_len=1, key='A', invalid value kind=0
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 2, 1, 0, 0, 0, 65, 0 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 2, 1, 0, 0, 0, 65, 0 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_truncated_value_length()
+    public void MapHeaders_throws_on_truncated_value_length()
     {
         // Valid kind(2), key_len=1, key='A', valid value kind(2), then not enough for value length
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 2, 1, 0, 0, 0, 65, 2, 1 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 2, 1, 0, 0, 0, 65, 2, 1 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_zero_value_length()
+    public void MapHeaders_throws_on_zero_value_length()
     {
         // Valid kind(2), key_len=1, key='A', valid value kind(2), value_len=0 (invalid)
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 2, 1, 0, 0, 0, 65, 2, 0, 0, 0, 0 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 2, 1, 0, 0, 0, 65, 2, 0, 0, 0, 0 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_null_on_value_length_exceeding_payload()
+    public void MapHeaders_throws_on_value_length_exceeding_payload()
     {
         // Valid kind(2), key_len=1, key='A', valid value kind(2), value_len=100 but not enough bytes
-        Assert.Null(Mappers.BinaryMapper.TryMapHeaders(new byte[] { 2, 1, 0, 0, 0, 65, 2, 100, 0, 0, 0 }));
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapHeaders(new byte[] { 2, 1, 0, 0, 0, 65, 2, 100, 0, 0, 0 }));
     }
 
     [Fact]
-    public void TryMapHeaders_returns_valid_headers_on_plaintext()
+    public void MapHeaders_returns_valid_headers_on_plaintext()
     {
         var headers = new Dictionary<Headers.HeaderKey, Headers.HeaderValue>
         {
@@ -148,14 +148,14 @@ public class HeaderEncryptionTests
         };
 
         var bytes = HeadersToBytes(headers);
-        var result = Mappers.BinaryMapper.TryMapHeaders(bytes);
+        var result = Mappers.BinaryMapper.MapHeaders(bytes);
 
         Assert.NotNull(result);
         Assert.Single(result);
     }
 
     [Fact]
-    public void TryMapHeaders_returns_valid_for_all_header_kinds()
+    public void MapHeaders_returns_valid_for_all_header_kinds()
     {
         var headers = new Dictionary<Headers.HeaderKey, Headers.HeaderValue>
         {
@@ -167,7 +167,7 @@ public class HeaderEncryptionTests
         };
 
         var bytes = HeadersToBytes(headers);
-        var result = Mappers.BinaryMapper.TryMapHeaders(bytes);
+        var result = Mappers.BinaryMapper.MapHeaders(bytes);
 
         Assert.NotNull(result);
         Assert.Equal(5, result.Count);
