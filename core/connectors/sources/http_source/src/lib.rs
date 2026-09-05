@@ -25,7 +25,7 @@ mod types;
 
 use arc_swap::{ArcSwap, Guard};
 use async_trait::async_trait;
-use axum::http::HeaderName;
+use axum::http::{HeaderName, header};
 use iggy_common::HeaderKey;
 use iggy_connector_sdk::{
     ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source,
@@ -63,11 +63,12 @@ pub const DEFAULT_MAX_BATCH_SIZE: usize = 500;
 /// connectors process along with every other plugin loaded into it. The ring
 /// is built in `new`, before the SDK ever calls `open`, so `validate` cannot
 /// be what protects it.
-pub const MAX_BUFFER_CAPACITY: usize = 1_000_000;
-/// Bounds the `Vec::with_capacity(max_batch_size)` that every `poll()` builds
-/// up front, which is what an oversized value actually costs.
+pub const BUFFER_CAPACITY_LIMIT: usize = 1_000_000;
+/// Bounds the drain loop in `poll()`, which fills a `Vec` from the bridge
+/// until it hits this many messages. Nothing is allocated up front, so an
+/// oversized value costs a longer drain rather than a large empty buffer.
 pub const MAX_BATCH_SIZE_LIMIT: usize = 100_000;
-pub const MAX_MAX_BODY_SIZE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_BODY_SIZE_BYTES_LIMIT: usize = 64 * 1024 * 1024;
 
 pub const DEFAULT_HMAC_HEADER: &str = "X-Hub-Signature-256";
 pub const DEFAULT_HMAC_PREFIX: &str = "sha256=";
@@ -468,9 +469,9 @@ impl HttpSourceConfig {
                     self.admin_listen_addr
                 ))
             })?;
-        if self.buffer_capacity == 0 || self.buffer_capacity > MAX_BUFFER_CAPACITY {
+        if self.buffer_capacity == 0 || self.buffer_capacity > BUFFER_CAPACITY_LIMIT {
             return Err(Error::InvalidConfigValue(format!(
-                "buffer_capacity {} must be between 1 and {MAX_BUFFER_CAPACITY}",
+                "buffer_capacity {} must be between 1 and {BUFFER_CAPACITY_LIMIT}",
                 self.buffer_capacity
             )));
         }
@@ -480,9 +481,9 @@ impl HttpSourceConfig {
                 self.max_batch_size
             )));
         }
-        if self.max_body_size_bytes == 0 || self.max_body_size_bytes > MAX_MAX_BODY_SIZE_BYTES {
+        if self.max_body_size_bytes == 0 || self.max_body_size_bytes > MAX_BODY_SIZE_BYTES_LIMIT {
             return Err(Error::InvalidConfigValue(format!(
-                "max_body_size_bytes {} must be between 1 and {MAX_MAX_BODY_SIZE_BYTES}",
+                "max_body_size_bytes {} must be between 1 and {MAX_BODY_SIZE_BYTES_LIMIT}",
                 self.max_body_size_bytes
             )));
         }
@@ -503,13 +504,18 @@ impl HttpSourceConfig {
             }
         }
         for header in &self.forward_headers {
+            let Ok(name) = HeaderName::from_str(header) else {
+                return Err(Error::InvalidConfigValue(format!(
+                    "forward_headers entry '{header}' is not a valid HTTP header name"
+                )));
+            };
             // Forwarding a reusable credential would copy it onto every
             // message and into the log Iggy persists. A per-body signature
             // header is fine; these are not.
-            if matches!(
-                header.to_ascii_lowercase().as_str(),
-                "authorization" | "proxy-authorization" | "cookie"
-            ) {
+            if name == header::AUTHORIZATION
+                || name == header::PROXY_AUTHORIZATION
+                || name == header::COOKIE
+            {
                 return Err(Error::InvalidConfigValue(format!(
                     "forward_headers entry '{header}' would copy a credential onto every message"
                 )));
@@ -519,16 +525,11 @@ impl HttpSourceConfig {
             // these keys lets the sender overwrite a value the pipeline
             // treats as trusted.
             if matches!(
-                header.to_ascii_lowercase().as_str(),
+                name.as_str(),
                 INSTANCE_HEADER | REMOTE_ADDR_HEADER | RECEIVED_AT_HEADER
             ) {
                 return Err(Error::InvalidConfigValue(format!(
                     "forward_headers entry '{header}' is reserved for the gateway's own metadata"
-                )));
-            }
-            if HeaderName::from_str(header).is_err() {
-                return Err(Error::InvalidConfigValue(format!(
-                    "forward_headers entry '{header}' is not a valid HTTP header name"
                 )));
             }
             if HeaderKey::try_from(header.as_str()).is_err() {
@@ -604,7 +605,7 @@ impl HttpSource {
         // Clamped rather than rejected: `new` cannot fail, and an unchecked
         // value reaches crossfire before `open` runs. `validate` still rejects
         // it, so the operator learns through `last_error` instead of an abort.
-        let buffer_capacity = config.buffer_capacity.clamp(1, MAX_BUFFER_CAPACITY);
+        let buffer_capacity = config.buffer_capacity.clamp(1, BUFFER_CAPACITY_LIMIT);
         if buffer_capacity != config.buffer_capacity {
             warn!(
                 "Clamped buffer_capacity {} to {buffer_capacity} for {CONNECTOR_NAME} connector ID: {id}",
@@ -1414,6 +1415,7 @@ mod tests {
 
     fn queued(payload: &str) -> QueuedMessage {
         QueuedMessage {
+            id: 0,
             payload: payload.as_bytes().to_vec(),
             headers: None,
         }

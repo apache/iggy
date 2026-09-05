@@ -34,6 +34,7 @@ use axum::routing::{get, post};
 use axum::{Json, serve};
 use iggy_common::{HeaderKey, HeaderValue};
 use iggy_connector_sdk::Error;
+use rand::RngExt;
 use ring::hmac;
 use secrecy::SecretString;
 use serde::Serialize;
@@ -63,6 +64,10 @@ pub const RECEIVED_AT_HEADER: &str = "iggy_http_received_at";
 /// How long the last `close()` waits for in-flight requests before abandoning
 /// the listener tasks. Bounded so a wedged connection cannot stall shutdown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `Retry-After` on a 429, in seconds. Named because a test asserts it and a
+/// bare literal in two places drifts.
+const RETRY_AFTER_SECONDS: &str = "1";
 
 /// How long a `join()` waits for a draining listener to release its address.
 /// Longer than [`SHUTDOWN_TIMEOUT`], since the drain it is waiting on is
@@ -366,8 +371,8 @@ pub(crate) async fn refresh_routes(listen_addr: &str) -> Result<(), Error> {
 
 impl SharedServer {
     async fn start(config: &HttpSourceConfig, state: Arc<ServerState>) -> Result<Self, Error> {
-        let public = bind(&config.listen_addr).await?;
-        let admin = bind(&config.admin_listen_addr).await?;
+        let public = bind("listen_addr", &config.listen_addr).await?;
+        let admin = bind("admin_listen_addr", &config.admin_listen_addr).await?;
         let (shutdown, _) = watch::channel(());
 
         // The one place this plugin owns background tasks. The runtime cannot
@@ -470,7 +475,12 @@ impl SharedServer {
     }
 }
 
-async fn bind(address: &str) -> Result<TcpListener, Error> {
+/// Binds one listener, naming the config field it came from.
+///
+/// Both the public and admin listeners come through here, so a message that
+/// always said `listen_addr` sent an operator to the wrong line of TOML when
+/// it was the admin port that collided.
+async fn bind(field: &str, address: &str) -> Result<TcpListener, Error> {
     TcpListener::bind(address).await.map_err(|error| {
         // Instances are grouped by the `listen_addr` string, so two spellings
         // of the same socket, `0.0.0.0:9090` and `127.0.0.1:9090`, are two
@@ -479,13 +489,13 @@ async fn bind(address: &str) -> Result<TcpListener, Error> {
         // shared, so name that possibility rather than only the OS error.
         let hint = if error.kind() == std::io::ErrorKind::AddrInUse {
             format!(
-                ". If another {CONNECTOR_NAME} instance is meant to share this listener, its listen_addr must match this one exactly"
+                ". If another {CONNECTOR_NAME} instance is meant to share this listener, its {field} must match this one exactly"
             )
         } else {
             String::new()
         };
         Error::InitError(format!(
-            "Failed to bind the {CONNECTOR_NAME} listener to {address}. {error}{hint}"
+            "Failed to bind the {CONNECTOR_NAME} listener for {field} to {address}. {error}{hint}"
         ))
     })
 }
@@ -693,10 +703,21 @@ async fn secret_path_outcome(
     (name, response)
 }
 
-/// Prometheus text format. Unguarded like `/admin/health`: the admin
+/// OpenMetrics text format. Unguarded like `/admin/health`: the admin
 /// listener defaults to loopback and scrapers do not carry bearer tokens.
-async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> String {
-    state.metrics.encode(&state.instances())
+///
+/// The content type is set explicitly because the body carries an `# EOF`
+/// trailer, which is OpenMetrics, not the `text/plain` a bare `String` would
+/// have been served as.
+async fn handle_admin_metrics(State(state): State<Arc<ServerState>>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        state.metrics.encode(&state.instances()),
+    )
+        .into_response()
 }
 
 /// Readiness for a load balancer: unavailable until an instance is serving.
@@ -764,8 +785,19 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
         })
         .collect();
 
+    // Derived, not a constant: this answered "ok" while `/health` was
+    // answering 503 for the same listener, which is the one moment an operator
+    // is looking at both.
+    let now = unix_now_seconds();
+    let published = state.published();
+    let ready = published.routes.serves_anything(now)
+        && !published.instances.is_empty()
+        && published
+            .instances
+            .iter()
+            .all(|instance| instance.poll_is_live(now));
     Json(AdminHealth {
-        status: "ok",
+        status: if ready { "ok" } else { "degraded" },
         instances,
         uptime_secs: state.started_at.elapsed().as_secs(),
     })
@@ -779,9 +811,11 @@ async fn handle_admin_health(State(state): State<Arc<ServerState>>) -> Response 
 fn bridge_full_response() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [(header::RETRY_AFTER, "1")],
+        [(header::RETRY_AFTER, RETRY_AFTER_SECONDS)],
+        // Not the 503's wording: an operator grepping logs has to be able to
+        // tell a full bridge from a listener that is shutting down.
         Json(ErrorResponse {
-            error: "service temporarily unavailable",
+            error: "too many requests",
         }),
     )
         .into_response()
@@ -812,6 +846,9 @@ fn enqueue(
     }
     let (headers, clamped, dropped) = message_headers(instance, request_headers, remote_addr);
     let message = QueuedMessage {
+        // Minted here, at accept time, so a replay after a NACK carries the
+        // same id rather than a fresh one.
+        id: rand::rng().random(),
         // `to_vec`, deliberately, not `Vec::from(body)`. The latter hands back
         // hyper's read buffer, which at typical webhook sizes is several times
         // the body, and the bridge is bounded by message count rather than
@@ -1060,10 +1097,48 @@ mod tests {
         config
     }
 
-    async fn open(id: u32, config: HttpSourceConfig) -> HttpSource {
-        let mut source = HttpSource::new(id, config, None);
-        source.open().await.expect("open must succeed");
-        source
+    /// Opens a source, retrying if another test took the port first.
+    ///
+    /// `free_port` binds, reads the port and releases it, so there is a window
+    /// before this bind where anything else on the machine can take it.
+    /// nextest runs each test in its own process, so no in-process bookkeeping
+    /// can close that window; retrying is what actually removes the flake.
+    async fn open(id: u32, mut config: HttpSourceConfig) -> HttpSource {
+        const ATTEMPTS: usize = 8;
+        for attempt in 1..=ATTEMPTS {
+            let mut source = HttpSource::new(id, config.clone(), None);
+            match source.open().await {
+                Ok(()) => return source,
+                Err(error) if attempt < ATTEMPTS && is_address_in_use(&error) => {
+                    config.listen_addr = format!("127.0.0.1:{}", free_port());
+                    config.admin_listen_addr = format!("127.0.0.1:{}", free_port());
+                }
+                Err(error) => panic!("open must succeed, got: {error}"),
+            }
+        }
+        unreachable!("the loop returns or panics on the last attempt")
+    }
+
+    /// The 413/400 split reads `to_bytes`'s error text, so a wording change
+    /// upstream would silently turn every oversized body into a 400. Pinned
+    /// here because axum does not expose the limit error as a type to match on.
+    #[tokio::test]
+    async fn given_an_oversized_body_when_read_should_still_say_length_limit_exceeded() {
+        let body = axum::body::Body::from(vec![0u8; 64]);
+        let error = axum::body::to_bytes(body, 8)
+            .await
+            .expect_err("a body past the limit must fail");
+        assert!(
+            error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("length limit exceeded"),
+            "oversized_body_response splits 413 from 400 on this text, got: {error}"
+        );
+    }
+
+    fn is_address_in_use(error: &Error) -> bool {
+        format!("{error}").contains("Address already in use")
     }
 
     fn signature(body: &[u8]) -> String {
@@ -1399,7 +1474,17 @@ mod tests {
             .await
             .expect("admin health must be JSON");
 
-        assert_eq!(body["status"], "ok");
+        // Derived from the same readiness `/health` reports, so the two cannot
+        // disagree. No poll has run here, which is exactly the state `/health`
+        // answers 503 for, so both say the listener is not ready.
+        let readiness = client()
+            .get(format!("{}/health", base_url(&source)))
+            .send()
+            .await
+            .expect("the request must reach the listener")
+            .status();
+        assert_eq!(readiness, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "degraded");
         let instance = &body["instances"][0];
         assert_eq!(instance["instance"], "http_github");
         assert_eq!(instance["buffer_used"], 1);

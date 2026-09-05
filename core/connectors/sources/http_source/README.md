@@ -23,7 +23,11 @@ What mitigates this in practice is the caller: webhook senders such as GitHub, S
 2. A load balancer or proxy retries a POST after a hiccup downstream of a successful enqueue.
 3. A NACK does not mean the batch never landed. The runtime NACKs a batch it sent but whose state it could not persist, and the SDK NACKs on its own result timeout while the send may still have succeeded, so the replay on the next `poll()` re-sends messages that are already on the topic. This is the window the connector itself creates, and it is the price of not dropping post-200 data.
 
-So the guarantee is best-effort in both directions: no silent-loss guarantee and no dedup guarantee. Consumers that need effectively-once processing should dedupe on the provider's delivery id (`X-GitHub-Delivery`, `svix-id`, Stripe's `event.id` in the body), which is why forwarding those headers is the default recommendation.
+So the guarantee is best-effort in both directions: no silent-loss guarantee and no dedup guarantee.
+
+Every accepted request is given a random 128-bit message id at accept time, and a batch replayed after a NACK carries the same id it had the first time. That closes the third window above for any consumer that dedupes on the Iggy message id.
+
+It does **not** close the first two. A sender that retries because it never saw the 200 produces a genuinely new request, which gets a new id. For those, dedupe on the provider's delivery id (`X-GitHub-Delivery`, `svix-id`, Stripe's `event.id` in the body), which is why forwarding those headers is the default recommendation.
 
 Stronger guarantees need an SDK change, not a connector change: at-least-once by construction requires the runtime to hand the connector a producer handle so it can await the send before answering 200. See #3039.
 
@@ -115,7 +119,7 @@ The batch is then replayed on every poll and the SDK stops the poll task after f
 | `topic_path` | string | none | Exposes `POST /topics/{topic_path}`. Unset leaves only secret-path endpoints. |
 | `auth_bearer_token` | string | none | Guards the named topic path. Unset leaves it unauthenticated, for deployments behind an authenticating gateway. |
 | `management_token` | string | none | Enables `/admin/endpoints`. Unset means the management API does not exist. |
-| `max_body_size_bytes` | usize | `1048576` | Request body limit. Routing wins over it: an oversized POST to an unknown path answers 404, not 413. On `/e/{id}` the `Bytes` extractor enforces it and the body is read before authentication, which HMAC over the raw body requires. On the named path the bearer token is checked first and the cap is applied by hand afterwards, so an unauthenticated caller never makes the process buffer. Must match across instances sharing a listener. |
+| `max_body_size_bytes` | usize | `1048576` | Request body limit, applied by the handlers rather than an extractor. Routing wins over it: an oversized POST to an unknown or revoked path answers 404 without the body being read. Must match across instances sharing a listener. |
 | `buffer_capacity` | usize | `10000` | Messages the instance bridge holds. A full bridge answers 429, which since #3855 signals either an arrival burst or a slow Iggy, since the poll loop stalls waiting for the previous batch to be acknowledged. |
 | `max_batch_size` | usize | `500` | Maximum messages a single `poll()` returns. |
 | `include_http_metadata` | bool | `true` | Adds instance, peer address, and receive time as message headers. |
@@ -138,6 +142,8 @@ Env overrides reach top-level fields only, and only under the local config provi
 Values are coerced before they are deserialized: `true`/`false` become booleans and anything that parses as a number becomes one. So `..._INSTANCE_NAME=42` or a numeric `..._TOPIC_PATH` hands a JSON number to a string field and fails the whole configuration parse, with an error that does not name the field. Quote such values into non-numeric form, or set them in TOML.
 
 `HttpSourceConfig` deliberately does not implement `Serialize`, so this connector cannot write a credential out by accident. That does **not** protect the values in your TOML: the runtime keeps plugin configuration as raw JSON and serves it verbatim from `GET /sources/{key}/configs/plugin` (and inside `/configs` and `/configs/active`), so anyone who can reach the runtime's control API can read every secret configured here. Treat that API as privileged. (`/stats` carries no plugin configuration.)
+
+`http_sink` calls its equivalent knob `max_payload_size_bytes`. The names differ deliberately: the sink's bounds an outgoing payload, this one bounds an accepted request.
 
 ## Routing
 
@@ -169,7 +175,7 @@ Content-Type: application/json
 | 404 | Unknown path, or a revoked or expired endpoint | `{"error":"not found"}` |
 | 400 | Malformed request body, e.g. the client reset mid-send | `{"error":"bad request"}` |
 | 413 | Body over `max_body_size_bytes` | `{"error":"payload too large"}` |
-| 429 | Bridge full | `{"error":"service temporarily unavailable"}` plus `Retry-After: 1` |
+| 429 | Bridge full | `{"error":"too many requests"}` plus `Retry-After: 1` |
 | 503 | `GET /health` when any instance on the listener has stopped polling, or a POST whose instance bridge has no receiver | `{"status":"unavailable"}` or `{"error":"service unavailable"}` |
 
 Revoked and expired endpoints both answer 404 rather than 410 or 403 on purpose: a leaked URL must not be usable to confirm that it was once live. The lookup runs before any credential is checked, so anything other than 404 would answer that question for an unauthenticated caller. Error bodies carry no internals; diagnostics live on the admin listener.
@@ -241,7 +247,9 @@ Rotation deliberately keeps the path: a webhook sender configures the URL once, 
 
 Revocation writes a tombstone rather than deleting the entry. The tombstone persists, so a restart against a stale TOML file cannot resurrect an endpoint someone revoked. That rests on `open()` failing when the state file cannot be decoded, rather than falling back to the TOML: the connector reports the decode failure as `last_error` and serves nothing, instead of quietly putting revoked endpoints back on the wire.
 
-The 202 means the endpoint stopped serving *now*, in memory, and that the tombstone has been accepted but not yet persisted. It is deliberately not a 204: the change reaches the runtime only on a later `poll()`, and `submitted` flips before the state leaves the plugin, so no field on this response could honestly claim durability. Watch `GET /admin/endpoints/{id}` for it. Durability follows the same path as registration below, with one asymmetry worth knowing: losing an unsaved registration fails closed, but losing an unsaved revocation fails **open**, so the endpoint would come back after a restart.
+The 202 means the endpoint stopped serving *now*, in memory, and that the tombstone has been accepted but not yet persisted. It is deliberately not a 204: the change reaches the runtime only on a later `poll()`, and `submitted` flips before the state leaves the plugin, so no field on this response could honestly claim durability. Watch `GET /admin/endpoints/{id}` for it.
+
+Durability follows the same path as registration below, with one asymmetry worth knowing: losing an unsaved registration fails closed, but losing an unsaved revocation fails **open**, so the endpoint would come back after a restart.
 
 `submitted` on `GET /admin/endpoints/{id}` is not the durability check. It flips when the mutation is handed to the runtime, which happens before the runtime persists it. A save that failed shows up as `last_error` on the connector and re-arms the flush for the next poll, so treat a revocation as final only once the connector is error-free. If it cannot reach Iggy, remove the endpoint from the TOML too.
 
@@ -306,6 +314,10 @@ A metric with no series yet is absent from the scrape rather than reported as ze
 **Revocation tombstones accumulate.** They are retained deliberately, so a revocation survives a restart and stays auditable, and nothing evicts them.
 
 Each is roughly a hundred bytes and the whole registry is rewritten on every mutation, so a deployment that churns endpoints continuously will see the state file grow over time. An instance whose endpoints are all static writes no state file until something mutates its registry. Revoking a static endpoint through the management API does exactly that, and the tombstone it writes is what stops the TOML entry coming back.
+
+Every control-plane mutation clones the whole registry, every flush clones and serializes it again, and every republish clones each endpoint into the route table.
+
+That is fine at the hundreds of endpoints this connector is sized for. A deployment near the ceiling below should expect each mutation to cost a copy of the whole registry.
 
 The registry is capped at `MAX_ENDPOINTS` (10000) per instance. At the cap the oldest revoked dynamic entries are reclaimed to make room; revoked static ones never are, because their tombstone is what outranks TOML. A registration that finds nothing reclaimable is refused with 507.
 

@@ -76,20 +76,29 @@ impl HttpSourceFixture {
         format!("sha256={}", hex::encode(hmac::sign(&key, body).as_ref()))
     }
 
-    /// Reserves an ephemeral port and releases it so the connector can bind it.
+    /// Reserves both ephemeral ports, holding each listener until both are
+    /// chosen, then releasing them so the connector can bind them.
+    ///
     /// A fixed port would collide as soon as two of these tests run at once.
-    fn reserve_port() -> Result<u16, TestBinaryError> {
-        let listener = TcpListener::bind("127.0.0.1:0").map_err(TestBinaryError::Io)?;
-        let port = listener.local_addr().map_err(TestBinaryError::Io)?.port();
-        Ok(port)
+    /// Taking them one at a time let the first be handed out again while the
+    /// second was still being picked; holding both closes that. The window
+    /// between releasing them here and the connector binding stays open, and
+    /// nothing inside this process can close it.
+    fn reserve_port_pair() -> Result<(u16, u16), TestBinaryError> {
+        let public = TcpListener::bind("127.0.0.1:0").map_err(TestBinaryError::Io)?;
+        let admin = TcpListener::bind("127.0.0.1:0").map_err(TestBinaryError::Io)?;
+        let public_port = public.local_addr().map_err(TestBinaryError::Io)?.port();
+        let admin_port = admin.local_addr().map_err(TestBinaryError::Io)?.port();
+        Ok((public_port, admin_port))
     }
 }
 
 #[async_trait]
 impl TestFixture for HttpSourceFixture {
     async fn setup() -> Result<Self, TestBinaryError> {
-        let public_addr = format!("127.0.0.1:{}", Self::reserve_port()?);
-        let admin_addr = format!("127.0.0.1:{}", Self::reserve_port()?);
+        let (public_port, admin_port) = Self::reserve_port_pair()?;
+        let public_addr = format!("127.0.0.1:{public_port}");
+        let admin_addr = format!("127.0.0.1:{admin_port}");
         Ok(Self {
             public_addr,
             admin_addr,

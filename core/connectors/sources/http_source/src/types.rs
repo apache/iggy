@@ -135,6 +135,11 @@ impl std::error::Error for EndpointIdError {}
 /// other copy to fall back on.
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
+    /// Minted when the request is accepted and carried through a replay, so a
+    /// batch the runtime NACKed and `poll()` re-sends arrives with the same id
+    /// it had the first time. Without it every message went out as wire id 0
+    /// and a consumer had nothing stable to dedupe the duplicate on.
+    pub id: u128,
     /// Raw HTTP request body bytes, exactly as received.
     pub payload: Vec<u8>,
     /// Already filtered, clamped, and converted by the handler, so draining
@@ -145,9 +150,11 @@ pub struct QueuedMessage {
 impl From<QueuedMessage> for ProducedMessage {
     fn from(message: QueuedMessage) -> Self {
         ProducedMessage {
-            // Webhook bodies carry no identifier this connector can trust as a
-            // dedupe key, and `timestamp` / `checksum` are Iggy's to fill.
-            id: None,
+            // The gateway's own id, not the sender's: a webhook body carries no
+            // identifier this connector can trust. It is stable across a replay,
+            // which is what makes the at-least-once duplicate window dedupable.
+            // `timestamp` and `checksum` stay Iggy's to fill.
+            id: Some(message.id),
             checksum: None,
             timestamp: None,
             origin_timestamp: None,
