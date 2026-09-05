@@ -382,6 +382,97 @@ impl TestFixture for PostgresSourceDeleteFixture {
     }
 }
 
+/// PostgreSQL source fixture with an exact NUMERIC tracking column.
+pub struct PostgresSourceNumericTrackingFixture {
+    container: PostgresContainer,
+}
+
+impl PostgresOps for PostgresSourceNumericTrackingFixture {
+    fn container(&self) -> &PostgresContainer {
+        &self.container
+    }
+}
+
+impl PostgresSourceOps for PostgresSourceNumericTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl PostgresSourceNumericTrackingFixture {
+    const TABLE: &'static str = "test_numeric_tracking";
+
+    pub async fn create_table(&self, pool: &Pool<Postgres>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id INTEGER PRIMARY KEY,
+                tracking_value NUMERIC NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<Postgres>, id: i32, tracking_value: &str) {
+        let query = format!(
+            "INSERT INTO {} (id, tracking_value) VALUES ($1, $2::numeric)",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(id)
+            .bind(tracking_value)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<Postgres>) -> i64 {
+        PostgresSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for PostgresSourceNumericTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = PostgresContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(
+            ENV_SOURCE_TRACKING_COLUMN.to_string(),
+            "tracking_value".to_string(),
+        );
+        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
+        envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            "../../target/debug/libiggy_connector_postgres_source".to_string(),
+        );
+        envs
+    }
+}
+
 /// PostgreSQL source fixture with processed_column marking.
 pub struct PostgresSourceMarkFixture {
     container: PostgresContainer,

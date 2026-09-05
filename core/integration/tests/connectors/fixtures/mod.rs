@@ -80,7 +80,7 @@ pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
     PostgresSourceByteaFixture, PostgresSourceCdcFixture, PostgresSourceDeleteFixture,
     PostgresSourceJsonFixture, PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
-    PostgresSourceOps,
+    PostgresSourceNumericTrackingFixture, PostgresSourceOps,
 };
 pub use quickwit::{QuickwitFixture, QuickwitOps, QuickwitPreCreatedFixture};
 pub use redshift::{

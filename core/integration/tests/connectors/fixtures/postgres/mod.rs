@@ -25,5 +25,5 @@ pub use container::{PostgresOps, PostgresSourceOps};
 pub use sink::{PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture};
 pub use source::{
     PostgresSourceByteaFixture, PostgresSourceDeleteFixture, PostgresSourceJsonFixture,
-    PostgresSourceJsonbFixture, PostgresSourceMarkFixture,
+    PostgresSourceJsonbFixture, PostgresSourceMarkFixture, PostgresSourceNumericTrackingFixture,
 };

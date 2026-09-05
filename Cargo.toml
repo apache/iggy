@@ -306,7 +306,10 @@ sqlx = { version = "0.9.0", features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
-    # "mysql": the Doris integration fixture talks to Doris over its MySQL frontend.
+    "bigdecimal",
+    # "mysql": Doris exposes a MySQL-wire frontend; the Doris sink's
+    # integration-test fixture talks to it over this driver. Cargo unifies
+    # features across the workspace, so it is declared once here.
     "mysql",
     "chrono",
     "uuid",

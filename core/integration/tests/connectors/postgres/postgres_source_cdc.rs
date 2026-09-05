@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{POLL_ATTEMPTS, POLL_INTERVAL_MS};
+use super::{
+    API_KEY, DEFAULT_SLOT, POLL_ATTEMPTS, POLL_INTERVAL_MS, SOURCE_KEY, source_stats,
+    wait_for_source_errors,
+};
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{PostgresOps, PostgresSourceCdcFixture, PostgresSourceOps};
 use iggy::prelude::IggyClient;
@@ -28,10 +31,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::sleep;
-
-const API_KEY: &str = "test-api-key";
-const SOURCE_KEY: &str = "postgres";
-const DEFAULT_SLOT: &str = "iggy_slot";
 
 #[derive(Debug, Deserialize)]
 struct CdcRecord {
@@ -73,6 +72,31 @@ async fn poll_cdc_records(
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
     received
+}
+
+async fn slot_contains_change(pool: &sqlx::PgPool, expected_value: &str) -> bool {
+    for attempt in 0..POLL_ATTEMPTS {
+        match sqlx::query_scalar::<_, String>(
+            "SELECT data FROM pg_logical_slot_peek_changes($1, NULL, NULL)",
+        )
+        .bind(DEFAULT_SLOT)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(changes) => {
+                return changes.iter().any(|change| change.contains(expected_value));
+            }
+            Err(sqlx::Error::Database(ref database_error))
+                if attempt + 1 < POLL_ATTEMPTS
+                    && database_error.code().as_deref() == Some(PG_OBJECT_IN_USE) =>
+            {
+                sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+            }
+            Err(error) => panic!("CDC replication slot should be readable: {error}"),
+        }
+    }
+
+    panic!("CDC replication slot remained active after {POLL_ATTEMPTS} attempts");
 }
 
 // End-to-end CDC coverage against a real wal_level=logical container:
@@ -231,6 +255,154 @@ async fn cdc_source_captures_insert_update_delete(
     pool.close().await;
 }
 
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn idle_cdc_source_advances_slot_to_current_wal(
+    harness: &TestHarness,
+    fixture: PostgresSourceCdcFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    wait_for_source_status(&Client::new(), &api_url, ConnectorStatus::Running).await;
+
+    sqlx::query("CHECKPOINT")
+        .execute(&pool)
+        .await
+        .expect("Failed to generate WAL without a logical table change");
+    let target_lsn: String = sqlx::query_scalar("SELECT pg_current_wal_flush_lsn()::text")
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to read current WAL flush LSN");
+
+    for _ in 0..POLL_ATTEMPTS {
+        let reached: bool = sqlx::query_scalar(
+            "SELECT confirmed_flush_lsn >= $2::pg_lsn FROM pg_replication_slots WHERE slot_name = $1",
+        )
+        .bind(DEFAULT_SLOT)
+        .bind(&target_lsn)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to read replication slot position");
+        if reached {
+            pool.close().await;
+            return;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    panic!("Idle CDC slot did not advance to WAL flush LSN {target_lsn}");
+}
+
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(connectors_runtime(config_path = "tests/connectors/postgres/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn given_cdc_change_when_iggy_crashes_should_advance_slot_only_after_redelivery(
+    harness: &mut TestHarness,
+    fixture: PostgresSourceCdcFixture,
+) {
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        .set_iggy_connection_options("reconnection_retries=0");
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let api_url = harness
+        .connectors_runtime()
+        .expect("connectors runtime")
+        .http_url();
+    let http = Client::new();
+    wait_for_source_status(&http, &api_url, ConnectorStatus::Running).await;
+    let errors_before_failure = source_stats(&http, &api_url)
+        .await
+        .expect("PostgreSQL source stats should be present")
+        .errors;
+    harness.kill_node(0).expect("Failed to kill Iggy server");
+
+    let [expected] = create_test_messages(1).try_into().unwrap();
+    fixture
+        .insert_row(
+            &pool,
+            expected.id as i32,
+            &expected.name,
+            expected.count as i32,
+            expected.amount,
+            expected.active,
+            expected.timestamp,
+        )
+        .await;
+
+    wait_for_source_errors(&http, &api_url, errors_before_failure + 2).await;
+    assert!(
+        slot_contains_change(&pool, &expected.name).await,
+        "NACKed CDC change must remain available in the replication slot"
+    );
+
+    harness
+        .server_mut()
+        .stop_dependents()
+        .expect("Failed to stop connectors runtime");
+    harness
+        .restart_node(0)
+        .expect("Failed to restart Iggy server");
+    harness
+        .server_mut()
+        .connectors_runtime_mut()
+        .expect("connectors runtime")
+        .clear_iggy_connection_options();
+    harness
+        .server_mut()
+        .start_dependents()
+        .await
+        .expect("Failed to restart connectors runtime");
+
+    let client = harness.root_client().await.unwrap();
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "cdc_send_failure_consumer".try_into().unwrap();
+    let received = poll_cdc_records(&client, &stream_id, &topic_id, &consumer_id, 1).await;
+
+    assert_eq!(received.len(), 1, "CDC change should be redelivered");
+    assert_eq!(received[0].operation_type, "INSERT");
+    assert_eq!(received[0].data["id"], serde_json::json!(expected.id));
+
+    let mut change_remains = slot_contains_change(&pool, &expected.name).await;
+    for _ in 0..POLL_ATTEMPTS {
+        if !change_remains {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        change_remains = slot_contains_change(&pool, &expected.name).await;
+    }
+    assert!(
+        !change_remains,
+        "ACKed CDC change should be consumed from the replication slot"
+    );
+
+    pool.close().await;
+}
+
 async fn wait_for_source_status(
     http: &Client,
     api_url: &str,
@@ -340,8 +512,8 @@ async fn delete_source_config_version(http: &Client, api_url: &str, version: u64
     );
 }
 
-// The connector calls pg_logical_slot_get_changes on a fixed poll interval and
-// briefly holds the slot active during each call. A drop landing in that window
+// The connector peeks changes and advances the slot on a fixed poll interval.
+// Both operations briefly hold the slot active. A drop landing in that window
 // gets ERROR 55006 (slot is active for PID ...), so retry past transient hits
 // instead of dropping while the poller is guaranteed stopped.
 const PG_OBJECT_IN_USE: &str = "55006";
@@ -376,11 +548,9 @@ async fn drop_replication_slot_retrying(pool: &sqlx::PgPool, slot: &str) {
 //    connector that silently drops every change or emits wrong data - the
 //    same silent-death shape as the slot mismatch above. Config is fixed
 //    one field at a time until restart succeeds and CDC resumes.
-// 3. Changes written while the connector is down (the slot retains WAL
-//    regardless of consumer state) - not the at-least-once crash window
-//    where the slot has already been consumed but send/state-persist
-//    hasn't happened yet. That gap remains open until the slot-peek/LSN
-//    work lands.
+// 3. Changes written while the connector is down. The slot retains WAL
+//    regardless of consumer state, then the connector peeks and advances
+//    it only after Iggy acknowledges the recovered batch.
 #[iggy_harness(
     server(connectors_runtime(config_path = "tests/connectors/postgres/source_cdc_restart.toml")),
     seed = seeds::connector_stream

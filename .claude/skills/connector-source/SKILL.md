@@ -45,24 +45,32 @@ The macro shares the source as `Arc<T>` across the FFI callback and forwarding l
 
 ### Lock discipline
 
-Never hold the state `Mutex` across upstream I/O. Canonical pattern (matches `sources/postgres_source/src/lib.rs::poll_tables`):
+Never hold the state `Mutex` across upstream I/O. Build a candidate from committed
+state, then stage it until the runtime reports the batch result:
 
 ```rust
-let cursor = { self.state.lock().await.cursor.clone() };   // brief read
-let rows = client.query(&sql, &[&cursor]).await?;           // no lock held
-let persisted = {                                           // brief write
-    let mut state = self.state.lock().await;
-    state.cursor = Some(new_cursor);
-    ConnectorState::serialize(&*state, CONNECTOR_NAME, self.id)
-};
+let mut candidate = self.state.lock().await.clone();
+let rows = client.query(&sql, &[&candidate.cursor]).await?;
+candidate.cursor = Some(new_cursor);
+let persisted = ConnectorState::serialize(&candidate, CONNECTOR_NAME, self.id)
+    .ok_or_else(|| Error::Serialization("failed to serialize source state".into()))?;
+*self.pending.lock().await = Some(candidate);
 ```
 
 ### State persistence
 
-- `ConnectorState` is `Vec<u8>` via MessagePack (`rmp_serde`). Use `ConnectorState::serialize(&state, NAME, id)` + `ConnectorState::deserialize::<State>(NAME, id)`. Both return `Option<T>` and log on failure (non-fatal).
-- Runtime saves to `{state_path}/source_{key}.state` only after a successful Iggy send. Between `poll()` returning and the runtime persisting the save, a crash leaves the same cursor for the next poll - downstream must tolerate at-least-once.
-- **Always return state in every `ProducedMessages`**, including empty polls. Empty results still need to advance watermarks (timestamp sources) or affirm "nothing new."
+- `ConnectorState` is `Vec<u8>` via MessagePack (`rmp_serde`). Use `ConnectorState::serialize(&state, NAME, id)` + `ConnectorState::deserialize::<State>(NAME, id)`.
+- `poll()` must not commit cursors or destructive work. Return messages with candidate state and keep the corresponding work staged.
+- The runtime sends the batch, persists its candidate state, then calls `on_batch_result(Ack)`. Commit staged in-memory state and external delete/mark operations only on ACK. A NACK discards the candidate so the same data can be polled again.
+- Return `state: None` for an empty poll when no watermark changed. If an empty poll advances a watermark, stage and return the new state through the same ACK handshake.
+- Treat candidate-state serialization failure as a poll error. Do not send messages without the state needed to resume them safely.
 - Keep `State` small - rewritten every batch. No unbounded vecs.
+
+The SDK allows one in-flight batch. Five consecutive NACKs stop the source and
+require a manual restart. Returning `Err` from `on_batch_result` is fatal, so
+retry transient backend failures inside the callback before returning an error.
+The callback must complete within the SDK's 30-second batch-result window, so
+bound connection acquisition and the full retry budget comfortably below 30 seconds.
 
 ### Sleep first
 
@@ -97,7 +105,7 @@ Match `ProducedMessages.schema` to the bytes in `messages[i].payload`:
 | Transient fetch failure (retry-worthy)      | `Error::Connection` or `Error::HttpRequestFailed` |
 | Permanent fetch failure (auth, schema gone) | `Error::PermanentHttpError`                       |
 | Row failed to serialize                     | `Error::Serialization(...)`                       |
-| State serialization failed                  | log + skip (non-fatal)                            |
+| State serialization failed                  | `Error::Serialization(...)`                       |
 
 Returning `Err` from `poll()` is only logged by the SDK's FFI bridge
 (`sdk/src/source.rs::handle_messages`) - the loop continues, the next
@@ -127,7 +135,7 @@ Iggy consumer-loop labels use literal API names (`offset=`, `current_offset=`).
 1. `async fn poll(&mut self)` - won't compile. Use `&self` + `Mutex<State>`.
 2. Holding `state.lock()` across the fetch I/O - blocks `close()`, causes shutdown timeouts.
 3. Forgetting to sleep - 100% CPU on idle source.
-4. Returning state only on success - state should advance on empty polls too.
+4. Committing a cursor or deleting source data in `poll()` - stage it and wait for ACK.
 5. Unbounded data in `State` - rewritten every batch. keep O(constant).
 6. `std::sync::Mutex` - blocks the executor. Use `tokio::sync::Mutex`.
 7. Not setting `ProducedMessage.id` when a stable ID exists - loses idempotency.
@@ -137,7 +145,7 @@ Iggy consumer-loop labels use literal API names (`offset=`, `current_offset=`).
 
 Mandatory four canonical source state tests (see [connector-testing](../connector-testing/SKILL.md) for the full pattern). Copy from `sources/random_source/src/lib.rs::tests`. Plus config defaults, payload building, schema selection.
 
-Integration tests under `core/integration/tests/connectors/<backend>/` for any source backed by external infra. Use `#[iggy_harness]` + a `TestFixture` backed by `testcontainers-modules`. Reference: `core/integration/tests/connectors/postgres/postgres_source.rs` (multi-mode tests) + `restart.rs` (state survives restart).
+Integration tests under `core/integration/tests/connectors/<backend>/` for any source backed by external infra. Use `#[iggy_harness]` + a `TestFixture` backed by `testcontainers-modules`. Reference: `core/integration/tests/connectors/postgres/postgres_source.rs` (multi-mode tests) + `restart.rs` (state survives restart). Exercise both ACK and NACK paths when the source stages cursors or destructive work.
 
 ## Before declaring done
 

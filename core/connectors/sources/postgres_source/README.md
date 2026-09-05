@@ -12,7 +12,7 @@ The PostgreSQL source connector fetches data from PostgreSQL databases and strea
 - **Mark as Processed**: Mark rows as processed using a boolean column
 - **Multiple Tables**: Monitor multiple tables simultaneously
 - **Batch Processing**: Fetch data in configurable batch sizes
-- **Offset Tracking**: Keep track of processed records to avoid duplicates
+- **Offset Tracking**: Resume incremental polling from the last acknowledged offset
 
 ## Configuration
 
@@ -54,7 +54,7 @@ cdc_backend = "builtin"
 | `connection_string` | string | required | PostgreSQL connection string |
 | `mode` | string | required | `polling` or `cdc` |
 | `tables` | array | required | List of tables to monitor |
-| `poll_interval` | string | `1s` | How often to poll (e.g., `1s`, `5m`) |
+| `poll_interval` | string | `10s` | How often to poll (e.g., `1s`, `5m`) |
 | `batch_size` | u32 | `1000` | Max rows per poll |
 | `tracking_column` | string | `id` | Column for incremental updates |
 | `initial_offset` | string | none | Starting value for tracking column |
@@ -73,6 +73,13 @@ cdc_backend = "builtin"
 | `verbose_logging` | bool | `false` | Log at info level instead of debug |
 | `max_retries` | u32 | `3` | Max retry attempts for transient errors |
 | `retry_delay` | string | `1s` | Base delay between retries (e.g., `500ms`, `2s`) |
+
+## Delivery Failures
+
+Delivery is at-least-once, so consumers must tolerate duplicates. A failed send
+NACKs the batch and leaves its database progress uncommitted for redelivery.
+After five consecutive NACKs, the source stops and requires a manual connector
+restart.
 
 ## Output Modes
 
@@ -209,7 +216,7 @@ LIMIT $limit
 
 ### Delete After Read
 
-Deletes rows from the source table after successful processing:
+Deletes rows from the source table only after Iggy acknowledges the batch:
 
 ```toml
 [plugin_config]
@@ -219,7 +226,7 @@ primary_key_column = "id"
 
 ### Mark as Processed
 
-Updates a boolean column instead of deleting:
+Updates a boolean column after Iggy acknowledges the batch instead of deleting:
 
 ```toml
 [plugin_config]
@@ -234,6 +241,15 @@ ALTER TABLE users ADD COLUMN is_processed BOOLEAN DEFAULT false;
 ```
 
 When `processed_column` is set, the connector automatically adds a `WHERE is_processed = FALSE` filter to the polling query, so only unprocessed rows are fetched. This improves polling efficiency as the table grows.
+
+With the generated polling query, a row whose tracking value moves past the
+batch boundary between poll and acknowledgement is left unchanged and returns
+in a later poll. Custom queries do not apply this boundary because their result
+order is not guaranteed.
+
+The connector persists the acknowledged offset before deleting or marking rows.
+If it stops in between, the rows have been delivered but may remain unchanged in
+PostgreSQL. The persisted offset prevents those rows from being selected again.
 
 ## Supported Column Types
 
@@ -254,7 +270,7 @@ The connector handles these PostgreSQL types in JSON mode:
 
 ## CDC Mode
 
-CDC requires PostgreSQL logical replication setup:
+CDC requires PostgreSQL 11 or newer and logical replication setup:
 
 1. Set `wal_level = logical` in `postgresql.conf`
 2. Restart PostgreSQL
@@ -267,6 +283,15 @@ tables = ["users", "orders"]
 capture_operations = ["INSERT", "UPDATE", "DELETE"]
 ```
 
+The connector peeks at logical changes and advances the replication slot only
+after Iggy acknowledges the batch. A failed delivery leaves the slot unchanged
+so the next poll can read the same changes again.
+
+Advancing the slot fast-forwards through the WAL range that was just peeked, so
+each acknowledged batch is decoded twice. Poll and decode errors do not change
+the connector's runtime status. Monitor `confirmed_flush_lsn`, retained WAL, and
+replication slot lag in PostgreSQL to detect a stuck CDC poller.
+
 The `pg_replicate` backend requires the `cdc_pg_replicate` feature flag at build time.
 
 ### Slot Naming
@@ -274,8 +299,9 @@ The `pg_replicate` backend requires the `cdc_pg_replicate` feature flag at build
 Each CDC connector must use a unique `replication_slot`. Setup accepts any
 pre-existing `test_decoding` slot, so two connectors pointed at the same
 database with the default `replication_slot = "iggy_slot"` will silently
-share one slot. `pg_logical_slot_get_changes` consumes changes on read, so
-each connector only sees a subset of the other's changes instead of erroring.
+share one slot. Each connector peeks from and advances the same slot after
+delivery, so one connector can move the shared position past changes that the
+other has not processed.
 Set an explicit, distinct `replication_slot` per connector instance.
 
 ### Decommissioning

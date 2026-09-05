@@ -44,6 +44,7 @@ pub struct ConnectorsRuntimeHandle {
     child_handle: Option<Child>,
     server_address: SocketAddr,
     iggy_address: Option<SocketAddr>,
+    iggy_connection_options: Option<String>,
     stdout_path: Option<PathBuf>,
     stderr_path: Option<PathBuf>,
     _port_reserver: SinglePortReserver,
@@ -80,6 +81,14 @@ impl ConnectorsRuntimeHandle {
         common::collect_logs(&self.stdout_path, &self.stderr_path)
     }
 
+    pub fn set_iggy_connection_options(&mut self, options: impl Into<String>) {
+        self.iggy_connection_options = Some(options.into());
+    }
+
+    pub fn clear_iggy_connection_options(&mut self) {
+        self.iggy_connection_options = None;
+    }
+
     fn build_envs(&mut self) {
         let state_path = self.context.connectors_runtime_state_path(self.server_id);
         self.envs.insert(
@@ -92,8 +101,12 @@ impl ConnectorsRuntimeHandle {
         );
 
         if let Some(addr) = self.iggy_address {
+            let address = self
+                .iggy_connection_options
+                .as_ref()
+                .map_or_else(|| addr.to_string(), |options| format!("{addr}?{options}"));
             self.envs
-                .insert("IGGY_CONNECTORS_IGGY_ADDRESS".to_string(), addr.to_string());
+                .insert("IGGY_CONNECTORS_IGGY_ADDRESS".to_string(), address);
         }
 
         if let Some(ref config_path) = self.config.config_path {
@@ -127,6 +140,7 @@ impl ConnectorsRuntimeHandle {
             child_handle: None,
             server_address,
             iggy_address: None,
+            iggy_connection_options: None,
             stdout_path: None,
             stderr_path: None,
             _port_reserver: reserver,
