@@ -41,6 +41,7 @@ use crate::common::server::{
     ConsumerGroupConfig, DataMaintenanceConfig, HeartbeatConfig, PersonalAccessTokenConfig,
     TelemetryConfig,
 };
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 // Same embedded TOML the shared sections read; re-exported so sibling
@@ -111,6 +112,11 @@ impl Default for ClusterConfig {
                 .repair_retry_interval
                 .parse()
                 .unwrap(),
+            repair_gap_debounce_interval: SERVER_CONFIG
+                .cluster
+                .repair_gap_debounce_interval
+                .parse()
+                .unwrap(),
             repair_chunk_max: SERVER_CONFIG.cluster.repair_chunk_max as usize,
             nodes: SERVER_CONFIG
                 .cluster
@@ -177,6 +183,8 @@ impl Default for PartitionConfig {
         PartitionConfig {
             prepare_queue_depth: partition.prepare_queue_depth as usize,
             dedup_clients_max: partition.dedup_clients_max as usize,
+            offset_reservation_lease: NonZeroU32::new(partition.offset_reservation_lease as u32)
+                .expect("the embedded config.toml carries a nonzero offset_reservation_lease"),
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,
             evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
             transfer_served_cache_bytes_max: partition
