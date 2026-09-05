@@ -189,6 +189,13 @@ fn reason_index(s: &str) -> Option<usize> {
     REASONS.iter().position(|r| *r == s)
 }
 
+const fn consumer_kind_index(kind: ConsumerKind) -> usize {
+    match kind {
+        ConsumerKind::Consumer => 0,
+        ConsumerKind::ConsumerGroup => 1,
+    }
+}
+
 /// Per-shard metric handles.
 ///
 /// Cheap to clone (`Arc` of a `Family` under the hood). Each shard owns
@@ -271,21 +278,13 @@ impl ShardMetrics {
     }
 
     pub fn record_consumer_offset_denied(&self, kind: ConsumerKind) {
-        let index = match kind {
-            ConsumerKind::Consumer => 0,
-            ConsumerKind::ConsumerGroup => 1,
-        };
-        self.consumer_offset_denied_counters[index].inc();
+        self.consumer_offset_denied_counters[consumer_kind_index(kind)].inc();
     }
 
-    #[cfg(any(test, feature = "simulator"))]
+    #[cfg(test)]
     #[must_use]
     pub fn consumer_offset_denied_value(&self, kind: ConsumerKind) -> u64 {
-        let index = match kind {
-            ConsumerKind::Consumer => 0,
-            ConsumerKind::ConsumerGroup => 1,
-        };
-        self.consumer_offset_denied_counters[index].get()
+        self.consumer_offset_denied_counters[consumer_kind_index(kind)].get()
     }
 
     /// Bumped every time a client request is answered with a retryable denial

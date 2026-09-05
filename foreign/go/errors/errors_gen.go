@@ -1586,7 +1586,7 @@ func (e CannotOpenConsumerOffsetsFile) Is(target error) bool {
 
 type TooManyConsumerOffsets struct{}
 
-func (e TooManyConsumerOffsets) Error() string { return "too many consumer offsets" }
+func (e TooManyConsumerOffsets) Error() string { return "too many consumer offsets for partition" }
 func (e TooManyConsumerOffsets) Code() Code    { return 3024 }
 func (e TooManyConsumerOffsets) Is(target error) bool {
 	_, ok := target.(TooManyConsumerOffsets)

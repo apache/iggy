@@ -628,6 +628,22 @@ where
             let _ = waiter.send(build_deny_reply_from_request_header(header, status));
         }
     }
+
+    pub async fn on_auto_commit_request(
+        &self,
+        request: Message<RoutedRequestHeader>,
+        reservation: crate::AutoCommitReservation,
+    ) {
+        let namespace = IggyNamespace::from_raw(request.header().group);
+        if self.is_tombstoned(&namespace) {
+            return;
+        }
+        if let Some(partition) = self.get_mut_by_ns(&namespace) {
+            partition
+                .on_request_with_reservation(request, None, Some(reservation))
+                .await;
+        }
+    }
 }
 
 impl<B, SB> Plane<VsrConsensus<B>> for IggyPartitions<B, SB>

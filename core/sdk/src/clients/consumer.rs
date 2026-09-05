@@ -618,6 +618,11 @@ unsafe impl Sync for IggyConsumer {}
 /// [`topic()`]: crate::prelude::IggyConsumerBuilder::topic
 /// [`without_encryptor()`]: crate::prelude::IggyConsumerBuilder::without_encryptor
 /// [`without_poll_interval()`]: crate::prelude::IggyConsumerBuilder::without_poll_interval
+///
+/// A server-side auto-commit poll can fail with `TooManyConsumerOffsets` when
+/// its consumer needs a new offset key at the partition's configured limit.
+/// The rejected poll returns no messages. Existing offset keys remain usable,
+/// and polling with server-side auto-commit disabled allocates no offset key.
 pub struct IggyConsumer {
     initialized: bool,
     shutdown: Arc<AtomicBool>,

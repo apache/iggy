@@ -506,11 +506,6 @@ impl Simulator {
     }
 
     #[must_use]
-    pub const fn consumer_offsets_max(&self) -> usize {
-        self.consumer_offsets_max
-    }
-
-    #[must_use]
     /// # Panics
     /// Panics when `replica_idx` is outside the simulated roster.
     pub fn partition_consumer_offset_counts(
@@ -1350,8 +1345,10 @@ impl Simulator {
         };
         // Partitions are driven directly, so a poll's auto-commit is never
         // replicated (the serving shard's job in the real server). Offset discarded.
-        let (fragments, _commit_offset, _auto_commit) = futures::executor::block_on(plan.execute())
-            .map_err(|_| IggyError::TooManyConsumerOffsets)?;
+        let (fragments, _commit_offset, auto_commit) = futures::executor::block_on(plan.execute())?;
+        if let Some(applied) = auto_commit {
+            applied.mark_served();
+        }
         Ok(fragments)
     }
 
@@ -1527,8 +1524,8 @@ fn materialise_partition(
         recovered_state,
         retained,
         restore_frontier,
-        PartitionMaterialisation::new(epoch, created_view),
-        consumer_offsets_max,
+        PartitionMaterialisation::new(epoch, created_view)
+            .with_consumer_offsets_max(consumer_offsets_max),
     );
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -3059,7 +3056,6 @@ mod tests {
                     None,
                     false,
                     PartitionMaterialisation::new(0, 0),
-                    partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
                 );
             });
             executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
@@ -3102,7 +3098,6 @@ mod tests {
                 None,
                 false,
                 PartitionMaterialisation::new(0, 0),
-                partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
             );
         });
         executor.run_until_stalled(POLL_BUDGET);

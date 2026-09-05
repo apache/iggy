@@ -333,7 +333,7 @@ pub enum IggyError {
     NotResolvedConsumer(Identifier) = 3022,
     #[error("Cannot open consumer offsets file for path: {0}")]
     CannotOpenConsumerOffsetsFile(String) = 3023,
-    #[error("Too many consumer offsets")]
+    #[error("Too many consumer offsets for partition")]
     TooManyConsumerOffsets = 3024,
     #[error("Segment not found")]
     SegmentNotFound = 4000,

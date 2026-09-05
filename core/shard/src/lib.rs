@@ -114,6 +114,7 @@ where
 pub struct PartitionMaterialisation {
     epoch: u64,
     created_view: u32,
+    consumer_offsets_max: usize,
 }
 
 #[cfg(feature = "simulator")]
@@ -123,7 +124,14 @@ impl PartitionMaterialisation {
         Self {
             epoch,
             created_view,
+            consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
         }
+    }
+
+    #[must_use]
+    pub const fn with_consumer_offsets_max(mut self, consumer_offsets_max: usize) -> Self {
+        self.consumer_offsets_max = consumer_offsets_max;
+        self
     }
 }
 
@@ -735,6 +743,12 @@ pub enum LifecycleFrame {
     PartitionSubmit {
         request: Message<RoutedRequestHeader>,
         reply: Sender<Option<Message<GenericHeader>>>,
+    },
+    /// Local auto-commit submission. The guard travels with the frame so an
+    /// inbox drop or admission refusal releases its provisional key directly.
+    AutoCommitSubmit {
+        request: Message<RoutedRequestHeader>,
+        reservation: partitions::AutoCommitReservation,
     },
     /// Shard 0 broadcasts after a partition-shaped metadata commit; wakes
     /// the per-shard reconciler. No payload: reconciler re-reads target
@@ -2007,6 +2021,32 @@ where
         Ok(PartitionSubmitTicket {
             receiver: reply_rx,
             target,
+        })
+    }
+
+    /// Submit an auto-commit back to the partition-owning shard's pump.
+    ///
+    /// # Errors
+    /// Returns a refusal if the local inbox cannot accept the frame.
+    pub fn submit_auto_commit_offset(
+        &self,
+        request: Message<RoutedRequestHeader>,
+        reservation: partitions::AutoCommitReservation,
+    ) -> Result<(), PartitionSubmitRefused> {
+        let frame = ShardFrame::lifecycle(LifecycleFrame::AutoCommitSubmit {
+            request,
+            reservation,
+        });
+        let sender = self
+            .senders
+            .get(usize::from(self.id))
+            .ok_or(PartitionSubmitRefused)?;
+        sender.try_send(frame).map_err(|error| {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::PARTITION,
+                crate::coordinator::classify_try_send_err(&error),
+            );
+            PartitionSubmitRefused
         })
     }
 
@@ -3966,7 +4006,6 @@ where
     // and `adopt_retained_log` are configured out and the crate does not compile.
     // The feature forwards to `partitions/simulator` instead.
     #[cfg(feature = "simulator")]
-    #[allow(clippy::too_many_arguments)]
     pub fn init_partition(
         &self,
         namespace: IggyNamespace,
@@ -3975,7 +4014,6 @@ where
         retained: Option<partitions::RetainedPartitionState>,
         restore_frontier: bool,
         materialisation: PartitionMaterialisation,
-        consumer_offsets_max: usize,
     ) where
         B: MessageBus + Clone + 'static,
         T: ShardsTable,
@@ -3983,6 +4021,7 @@ where
         let PartitionMaterialisation {
             epoch,
             created_view,
+            consumer_offsets_max,
         } = materialisation;
         let partitions = self.plane.partitions();
         if partitions.contains(&namespace) {

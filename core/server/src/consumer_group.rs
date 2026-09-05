@@ -25,7 +25,7 @@
 //! primary enriches the op here before replication, mirroring the PAT mint
 //! in [`crate::pat`] and the password hash in [`crate::users`].
 
-use crate::responses::resolve_partition_namespace;
+use crate::responses::{missing_consumer_group_error, resolve_partition_namespace};
 use crate::shell::{ShellBus, ShellShard};
 use crate::wire::{request_body, rewrite_request_body};
 use consensus::MetadataHandle;
@@ -235,9 +235,12 @@ where
             if wire.consumer.kind != KIND_CONSUMER_GROUP {
                 return Ok(request);
             }
-            let group_id =
-                resolve_group_offset_id(shard, &wire.consumer, (&wire.stream_id, &wire.topic_id))
-                    .ok_or(IggyError::InvalidIdentifier)?;
+            let group_id = resolve_group_offset_id(
+                shard,
+                &wire.consumer,
+                (&wire.stream_id, &wire.topic_id),
+            )
+            .ok_or_else(|| missing_consumer_group_error(&wire.consumer.id, &wire.topic_id))?;
             // The partition-plane group-offset key is u32 (see the documented
             // ceiling on `Topic::next_consumer_group_id`). Clamp on the
             // ~4-billion-creates overflow rather than panic this live
@@ -270,9 +273,6 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    if consumer.kind != KIND_CONSUMER_GROUP {
-        return None;
-    }
     shard
         .plane
         .metadata()

@@ -777,7 +777,7 @@
       type: string
 - name: TooManyConsumerOffsets
   code: 3024
-  format: "too many consumer offsets"
+  format: "too many consumer offsets for partition"
   fields: []
 - name: PartitionIdSpaceExhausted
   code: 3013

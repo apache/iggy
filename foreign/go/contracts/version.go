@@ -17,4 +17,4 @@
 
 package iggcon
 
-const Version = "0.9.0-edge.5"
+const Version = "0.9.0-edge.6"

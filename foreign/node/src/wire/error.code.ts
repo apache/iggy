@@ -165,7 +165,7 @@ export const translateErrorCode = (code: number): string => {
     case '3021': return "Consumer offset for consumer with ID: {0} was not found.";
     case '3022': return "Failed to resolve consumer with ID: {0}";
     case '3023': return "Cannot open consumer offsets file for path: {0}";
-    case '3024': return "Too many consumer offsets";
+    case '3024': return "Too many consumer offsets for partition";
     case '3013': return "Partition id space exhausted for this topic";
 
     // MESSAGE

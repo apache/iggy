@@ -336,7 +336,7 @@ const _: () = assert!(
         == partitions::DEFAULT_CONSUMER_OFFSETS_MAX
 );
 const _: () = assert!(
-    2 * configs::partition::PARTITION_CONSUMER_OFFSETS_CEILING
+    4 * configs::partition::PARTITION_CONSUMER_OFFSETS_CEILING
         <= partitions::CONSUMER_OFFSETS_ENTRIES_MAX as usize
 );
 const _: () =

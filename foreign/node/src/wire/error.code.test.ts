@@ -20,7 +20,7 @@ import { it } from 'node:test';
 import { translateErrorCode } from './error.code.js';
 
 it('translates the consumer-offset capacity error', () => {
-  assert.equal(translateErrorCode(3024), 'Too many consumer offsets');
+  assert.equal(translateErrorCode(3024), 'Too many consumer offsets for partition');
 });
 
 it('translates the consumer-group error range', () => {

@@ -24,8 +24,8 @@ use bytes::{BufMut, BytesMut};
 
 /// `StoreConsumerOffset` request.
 ///
-/// Adds an `ack` byte: `NoAck` = leader-local fast path, `Quorum` = VSR
-/// pipeline.
+/// The `ack` byte selects the local fast path only for `NoAck` on a
+/// single-replica partition. Replicated partitions use VSR for both values.
 ///
 /// Wire format:
 /// ```text

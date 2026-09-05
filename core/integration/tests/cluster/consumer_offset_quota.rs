@@ -141,6 +141,22 @@ async fn given_replicated_partition_when_no_ack_offsets_mutate_should_converge_a
     )
     .await;
 
+    let auto_commit_consumer = Consumer::new(Identifier::numeric(1).expect("consumer identifier"));
+    let polled = client
+        .poll_messages(
+            &stream,
+            &topic,
+            Some(PARTITION_ID),
+            &auto_commit_consumer,
+            &PollingStrategy::first(),
+            1,
+            true,
+        )
+        .await
+        .expect("auto-commit poll within limit");
+    assert_eq!(polled.messages.len(), 1);
+    wait_for_file_state(harness, stream_details.id, topic_details.id, 1, true).await;
+
     for consumer_id in 1..=4 {
         client
             .store_consumer_offset(
@@ -306,23 +322,15 @@ async fn wait_for_max_file_count(harness: &TestHarness, stream_id: u32, topic_id
     loop {
         let counts: Vec<usize> = (0..harness.cluster_size())
             .map(|node| {
-                let dir = offset_file(harness, node, stream_id, topic_id, 0)
-                    .parent()
-                    .expect("offset file has parent")
-                    .to_path_buf();
-                std::fs::read_dir(dir)
-                    .map(|entries| {
-                        entries
-                            .filter_map(Result::ok)
-                            .filter(|entry| {
-                                entry
-                                    .file_name()
-                                    .to_str()
-                                    .is_some_and(|name| name.parse::<u32>().is_ok())
-                            })
-                            .count()
-                    })
-                    .unwrap_or_default()
+                disk::consumer_offset_file_ids(
+                    &harness.node(node).data_path(),
+                    stream_id,
+                    topic_id,
+                    PARTITION_ID,
+                    ConsumerKind::Consumer,
+                )
+                .expect("consumer offset directory")
+                .len()
             })
             .collect();
         if counts.iter().all(|count| *count == max) {

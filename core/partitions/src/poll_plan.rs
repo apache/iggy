@@ -311,6 +311,9 @@ impl PollPlan {
     /// # Errors
     /// Returns a capacity error when auto-commit would create a new live-map
     /// entry after the configured per-kind bound has been reached.
+    /// The serving shard also rejects completion with `TransientNotAccepted`
+    /// if the partition disappeared or changed incarnation during disk I/O.
+    /// No fragments are returned for that rejected completion.
     pub async fn execute(
         self,
     ) -> Result<(PollFragments<4096>, u64, Option<AutoCommitApplied>), ConsumerOffsetCapacityError>
@@ -890,64 +893,37 @@ impl AutoCommitCtx {
         offset: u64,
     ) -> Result<AutoCommitApplied, ConsumerOffsetCapacityError> {
         let (kind, consumer_id) = self.kind_and_id();
+        let create = |path: Option<&str>| {
+            ConsumerOffset::new(
+                kind,
+                consumer_id,
+                offset,
+                path.map_or_else(String::new, |path| format!("{path}/{consumer_id}")),
+            )
+        };
         let previous_offset = match &self.target {
             AutoCommitTarget::Consumer {
                 offsets,
                 consumer_id,
                 create_path,
-            } => {
-                let consumer_id = *consumer_id;
-                let map: &ConsumerOffsets = offsets;
-                let guard = map.pin();
-                if let Some(existing) = guard.get(&(consumer_id as usize)) {
-                    Some(existing.offset.fetch_max(offset, Ordering::Relaxed))
-                } else {
-                    self.capacity.admit_local_map_key(guard.len())?;
-                    let created = create_path.as_deref().map_or_else(
-                        || {
-                            ConsumerOffset::new(
-                                ConsumerKind::Consumer,
-                                consumer_id,
-                                offset,
-                                String::new(),
-                            )
-                        },
-                        |path| ConsumerOffset::default_for_consumer(consumer_id, path),
-                    );
-                    created.offset.store(offset, Ordering::Relaxed);
-                    guard.insert(consumer_id as usize, created);
-                    None
-                }
-            }
+            } => apply_local_offset(
+                offsets,
+                *consumer_id as usize,
+                offset,
+                &self.capacity,
+                || create(create_path.as_deref()),
+            )?,
             AutoCommitTarget::ConsumerGroup {
                 offsets,
                 group_id,
                 create_path,
-            } => {
-                let group_id = *group_id;
-                let key = ConsumerGroupId(group_id as usize);
-                let map: &ConsumerGroupOffsets = offsets;
-                let guard = map.pin();
-                if let Some(existing) = guard.get(&key) {
-                    Some(existing.offset.fetch_max(offset, Ordering::Relaxed))
-                } else {
-                    self.capacity.admit_local_map_key(guard.len())?;
-                    let created = create_path.as_deref().map_or_else(
-                        || {
-                            ConsumerOffset::new(
-                                ConsumerKind::ConsumerGroup,
-                                group_id,
-                                offset,
-                                String::new(),
-                            )
-                        },
-                        |path| ConsumerOffset::default_for_consumer_group(key, path),
-                    );
-                    created.offset.store(offset, Ordering::Relaxed);
-                    guard.insert(key, created);
-                    None
-                }
-            }
+            } => apply_local_offset(
+                offsets,
+                ConsumerGroupId(*group_id as usize),
+                offset,
+                &self.capacity,
+                || create(create_path.as_deref()),
+            )?,
         };
         Ok(AutoCommitApplied {
             kind,
@@ -980,13 +956,7 @@ impl AutoCommitApplied {
     ) -> Result<Option<AutoCommitReservation>, ConsumerOffsetCapacityError> {
         if self
             .durable
-            .get(self.kind, self.consumer_id)
-            .is_some_and(|state| {
-                state.committed_offset >= self.offset
-                    && state
-                        .persisted_high_water
-                        .is_some_and(|high_water| self.offset <= high_water)
-            })
+            .covers(self.kind, self.consumer_id, self.offset)
         {
             return Ok(None);
         }
@@ -1007,33 +977,49 @@ impl AutoCommitApplied {
                 offsets,
                 consumer_id,
                 ..
-            } => {
-                let guard = offsets.pin();
-                if let Some(previous) = self.previous_offset {
-                    if let Some(entry) = guard.get(&(*consumer_id as usize)) {
-                        entry.offset.store(previous, Ordering::Relaxed);
-                    }
-                } else {
-                    guard.remove(&(*consumer_id as usize));
-                }
-                guard.len()
-            }
+            } => rollback_local_offset(offsets, *consumer_id as usize, self.previous_offset),
             AutoCommitTarget::ConsumerGroup {
                 offsets, group_id, ..
-            } => {
-                let guard = offsets.pin();
-                if let Some(previous) = self.previous_offset {
-                    if let Some(entry) = guard.get(&ConsumerGroupId(*group_id as usize)) {
-                        entry.offset.store(previous, Ordering::Relaxed);
-                    }
-                } else {
-                    guard.remove(&ConsumerGroupId(*group_id as usize));
-                }
-                guard.len()
-            }
+            } => rollback_local_offset(
+                offsets,
+                ConsumerGroupId(*group_id as usize),
+                self.previous_offset,
+            ),
         };
         self.capacity.rearm_map_if_below_limit(map_len);
     }
+}
+
+fn rollback_local_offset<K: Hash + Eq + Send + Sync + Copy>(
+    map: &papaya::HashMap<K, ConsumerOffset>,
+    key: K,
+    previous: Option<u64>,
+) -> usize {
+    let guard = map.pin();
+    if let Some(previous) = previous {
+        if let Some(entry) = guard.get(&key) {
+            entry.offset.store(previous, Ordering::Relaxed);
+        }
+    } else {
+        guard.remove(&key);
+    }
+    guard.len()
+}
+
+fn apply_local_offset<K: Hash + Eq + Clone + Send + Sync>(
+    map: &papaya::HashMap<K, ConsumerOffset>,
+    key: K,
+    offset: u64,
+    capacity: &ConsumerOffsetCapacity,
+    create: impl FnOnce() -> ConsumerOffset,
+) -> Result<Option<u64>, ConsumerOffsetCapacityError> {
+    let guard = map.pin();
+    if let Some(existing) = guard.get(&key) {
+        return Ok(Some(existing.offset.fetch_max(offset, Ordering::Relaxed)));
+    }
+    capacity.admit_local_map_key(guard.len())?;
+    guard.insert(key, create());
+    Ok(None)
 }
 
 /// Upsert a committed offset into a lock-free `papaya` offset map: bump an

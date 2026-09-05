@@ -276,10 +276,16 @@ pub fn configure_consumer_offsets(
         enforce_fsync,
     );
     for consumer_id in numeric_offset_file_ids(&consumer_offsets_path) {
-        partition.seed_stranded_consumer_offset(ConsumerKind::Consumer, consumer_id);
+        if partition.seed_stranded_consumer_offset(ConsumerKind::Consumer, consumer_id) {
+            warn!(stream_id, topic_id, partition_id, consumer_id, path = %consumer_offsets_path,
+                "unloaded consumer offset file retains its capacity slot until updated or deleted");
+        }
     }
     for group_id in numeric_offset_file_ids(&consumer_group_offsets_path) {
-        partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, group_id);
+        if partition.seed_stranded_consumer_offset(ConsumerKind::ConsumerGroup, group_id) {
+            warn!(stream_id, topic_id, partition_id, group_id, path = %consumer_group_offsets_path,
+                "unloaded group offset file retains its capacity slot until repaired or reclaimed");
+        }
     }
     for kind in [ConsumerKind::Consumer, ConsumerKind::ConsumerGroup] {
         let count = partition.occupied_consumer_offset_count(kind);

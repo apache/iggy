@@ -2000,12 +2000,9 @@ where
         let mut consumers = self
             .durable_consumer_offsets
             .committed_entries(ConsumerKind::Consumer);
+        let consumer_map = self.consumer_offsets.pin();
         for (consumer_id, _) in &consumers {
-            if !self
-                .consumer_offsets
-                .pin()
-                .contains_key(&(*consumer_id as usize))
-            {
+            if !consumer_map.contains_key(&(*consumer_id as usize)) {
                 return Err(
                     PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
                         kind: ConsumerKind::Consumer,
@@ -2018,12 +2015,9 @@ where
         let mut groups = self
             .durable_consumer_offsets
             .committed_entries(ConsumerKind::ConsumerGroup);
+        let group_map = self.consumer_group_offsets.pin();
         for (consumer_id, _) in &groups {
-            if !self
-                .consumer_group_offsets
-                .pin()
-                .contains_key(&ConsumerGroupId(*consumer_id as usize))
-            {
+            if !group_map.contains_key(&ConsumerGroupId(*consumer_id as usize)) {
                 return Err(
                     PartitionTransferUnavailable::ConsumerOffsetStateInconsistent {
                         kind: ConsumerKind::ConsumerGroup,
@@ -2825,6 +2819,7 @@ where
         }
         self.durable_consumer_offsets.clear();
         self.pending_consumer_offset_commits.clear();
+        self.queued_auto_commit_reservations.borrow_mut().clear();
         self.consumer_offset_capacity
             .rebuild(&self.durable_consumer_offsets, std::iter::empty());
         self.consumer_group_offset_capacity
@@ -3450,7 +3445,7 @@ pub(crate) fn strayed_offset_files(dir: Option<&str>, incoming: &[(u32, u64)]) -
         .collect()
 }
 
-fn numeric_offset_id(path: &str) -> Option<u32> {
+pub(crate) fn numeric_offset_id(path: &str) -> Option<u32> {
     Path::new(path).file_name()?.to_str()?.parse().ok()
 }
 

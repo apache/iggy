@@ -107,6 +107,49 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         .await
         .expect("consumer login");
 
+    let first_consumer = Consumer::new(Identifier::numeric(1).unwrap());
+    let polled = client
+        .poll_messages(
+            &stream,
+            &topic,
+            Some(PARTITION_ID),
+            &first_consumer,
+            &PollingStrategy::first(),
+            1,
+            true,
+        )
+        .await
+        .expect("new auto-commit consumer fits");
+    assert_eq!(polled.messages.len(), 1);
+    let first_file = harness.server().data_path().join(format!(
+        "streams/{}/topics/{}/partitions/{PARTITION_ID}/offsets/consumers/1",
+        stream_details.id, topic_details.id
+    ));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !first_file.is_file() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "auto-commit never reached its file"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        client
+            .poll_messages(
+                &stream,
+                &topic,
+                Some(PARTITION_ID),
+                &first_consumer,
+                &PollingStrategy::next(),
+                1,
+                true
+            )
+            .await
+            .expect("next poll")
+            .messages
+            .is_empty()
+    );
+
     for consumer_id in 1..=LIMIT {
         client
             .store_consumer_offset(
@@ -205,23 +248,23 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
     let (reply, _) = raw_tcp::exchange(&mut raw, &header, &unresolved_group).await;
     assert_eq!(
         raw_tcp::reply_status(&reply),
-        IggyError::InvalidIdentifier.as_code()
+        IggyError::ConsumerGroupIdNotFound(Identifier::numeric(999).unwrap(), topic.clone())
+            .as_code()
     );
 
     let offsets_dir = harness.server().data_path().join(format!(
         "streams/{}/topics/{}/partitions/{PARTITION_ID}/offsets/consumers",
         stream_details.id, topic_details.id
     ));
-    let file_count = fs::read_dir(&offsets_dir)
-        .expect("consumer offsets directory")
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.parse::<u32>().is_ok())
-        })
-        .count();
+    let file_count = integration::harness::disk::consumer_offset_file_ids(
+        &harness.server().data_path(),
+        stream_details.id,
+        topic_details.id,
+        PARTITION_ID,
+        ConsumerKind::Consumer,
+    )
+    .expect("consumer offsets directory")
+    .len();
     assert_eq!(file_count, LIMIT as usize);
     let groups_dir = offsets_dir
         .parent()
@@ -231,6 +274,28 @@ async fn given_full_consumer_offset_table_when_creating_another_should_reject_wi
         .map(|entries| entries.filter_map(Result::ok).count())
         .unwrap_or_default();
     assert_eq!(group_file_count, 0);
+
+    let named_group = StoreConsumerOffsetRequest {
+        consumer: WireConsumer::consumer_group(WireIdentifier::named("unknown-group").unwrap()),
+        stream_id: WireIdentifier::Numeric(stream_details.id),
+        topic_id: WireIdentifier::Numeric(topic_details.id),
+        partition_id: Some(PARTITION_ID),
+        offset: 0,
+        ack: AckLevel::Quorum,
+    }
+    .to_bytes();
+    let header = raw_tcp::request_header(
+        Operation::StoreConsumerOffset,
+        raw_client_id,
+        session,
+        2,
+        named_group.len(),
+    );
+    let (reply, _) = raw_tcp::exchange(&mut raw, &header, &named_group).await;
+    assert_eq!(
+        raw_tcp::reply_status(&reply),
+        IggyError::ConsumerGroupNameNotFound("unknown-group".to_owned(), topic.clone()).as_code()
+    );
 
     let http = HttpClient::login_root(harness).await;
     let response = http

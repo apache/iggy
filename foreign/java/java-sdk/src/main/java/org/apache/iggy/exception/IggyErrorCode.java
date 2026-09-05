@@ -93,6 +93,8 @@ public enum IggyErrorCode {
     // Partition errors
     PARTITION_NOT_FOUND(3007),
     PARTITION_ID_SPACE_EXHAUSTED(3013),
+
+    // Consumer offset errors
     TOO_MANY_CONSUMER_OFFSETS(3024),
 
     // Segment errors

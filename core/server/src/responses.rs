@@ -279,12 +279,6 @@ where
     }
     let partition_id = partition_id.ok_or(IggyError::InvalidIdentifier)?;
     let streams = shard.plane.metadata().mux_stm.streams();
-    if streams
-        .resolve_consumer_group_id(stream_id, topic_id, &consumer.id)
-        .is_none()
-    {
-        return Err(IggyError::InvalidIdentifier);
-    }
     #[allow(clippy::cast_possible_truncation)]
     streams
         // Commit fence: allow a pending-revoked partition (the source commits it
@@ -298,10 +292,28 @@ where
             false,
         )
         .map(|_| ())
-        .ok_or(IggyError::ConsumerGroupPartitionNotOwned(
-            client_id as u32,
-            partition_id,
-        ))
+        .ok_or_else(|| {
+            if streams
+                .resolve_consumer_group_id(stream_id, topic_id, &consumer.id)
+                .is_none()
+            {
+                missing_consumer_group_error(&consumer.id, topic_id)
+            } else {
+                IggyError::ConsumerGroupPartitionNotOwned(client_id as u32, partition_id)
+            }
+        })
+}
+
+pub fn missing_consumer_group_error(group: &WireIdentifier, topic: &WireIdentifier) -> IggyError {
+    let topic = wire_identifier_for_display(topic);
+    match group {
+        WireIdentifier::Numeric(_) => {
+            IggyError::ConsumerGroupIdNotFound(wire_identifier_for_display(group), topic)
+        }
+        WireIdentifier::String(name) => {
+            IggyError::ConsumerGroupNameNotFound(name.as_str().to_owned(), topic)
+        }
+    }
 }
 
 /// Fence a consumer-group offset op then resolve its target partition

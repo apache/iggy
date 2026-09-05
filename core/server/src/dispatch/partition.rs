@@ -51,7 +51,7 @@ use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::polling_strategy::WirePollingStrategy;
 use iggy_binary_protocol::requests::consumer_offsets::{
-    DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
+    GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::PollMessagesRequest;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
@@ -128,7 +128,7 @@ where
                             Err(error) => {
                                 shard.metrics().record_consumer_offset_denied(error.kind);
                                 warn_auto_commit_capacity(namespace, error);
-                                PartitionReadReply::Rejected(IggyError::TooManyConsumerOffsets)
+                                PartitionReadReply::Rejected(error.into())
                             }
                         };
                         let _ = reply.try_send(result);
@@ -228,7 +228,7 @@ fn spawn_poll_io<B, MJ, S, SB>(
             Err(error) => {
                 shard.metrics().record_consumer_offset_denied(error.kind);
                 warn_auto_commit_capacity(namespace, error);
-                PartitionReadReply::Rejected(IggyError::TooManyConsumerOffsets)
+                PartitionReadReply::Rejected(error.into())
             }
         };
         let _ = reply.try_send(result);
@@ -296,7 +296,7 @@ where
             shard.metrics().record_consumer_offset_denied(applied.kind);
             warn_auto_commit_capacity(namespace, error);
             applied.rollback_created();
-            return Err(IggyError::TooManyConsumerOffsets);
+            return Err(error.into());
         }
     };
     let message = match build_auto_commit_request(namespace, applied) {
@@ -313,15 +313,13 @@ where
     };
     // Routes by namespace to this same owning primary shard's inbox. The pump
     // admits it next turn exactly like a client store. `dispatch` never blocks.
-    let Ok(ticket) = shard.partition_submit(namespace, message) else {
+    if shard
+        .submit_auto_commit_offset(message, reservation)
+        .is_err()
+    {
         applied.rollback_created();
         return Err(IggyError::TransientNotAccepted);
-    };
-    let shard = Rc::clone(shard);
-    shard.bus.clone().spawn(async move {
-        let _ = shard.await_partition_submit(ticket).await;
-        drop(reservation);
-    });
+    }
     applied.mark_served();
     Ok(())
 }
@@ -449,7 +447,10 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
                 operation = ?header.operation,
                 "partition request with unresolved namespace; replying denied"
             );
-            let status = if error == IggyError::InvalidIdentifier {
+            let status = if matches!(
+                error,
+                IggyError::ConsumerGroupIdNotFound(..) | IggyError::ConsumerGroupNameNotFound(..)
+            ) {
                 error.as_code()
             } else {
                 IggyError::ResourceNotFound(String::new()).as_code()
@@ -650,22 +651,12 @@ async fn relay_partition_reply<B, MJ, S, SB>(
 }
 
 fn consumer_offset_kind(request: &Message<RoutedRequestHeader>) -> Option<ConsumerKind> {
-    let kind = match request.header().operation {
-        Operation::StoreConsumerOffset => {
-            StoreConsumerOffsetRequest::decode_from(request_body(request))
-                .ok()?
-                .consumer
-                .kind
-        }
-        Operation::DeleteConsumerOffset => {
-            DeleteConsumerOffsetRequest::decode_from(request_body(request))
-                .ok()?
-                .consumer
-                .kind
-        }
-        _ => return None,
-    };
-    ConsumerKind::from_code(kind).ok()
+    if request.header().operation != Operation::StoreConsumerOffset {
+        return None;
+    }
+    // WireConsumer starts with its kind byte. The dispatch path has already
+    // decoded and validated the complete request.
+    ConsumerKind::from_code(*request_body(request).first()?).ok()
 }
 
 /// Serve `poll_messages`: resolve the partition namespace, run the read on
